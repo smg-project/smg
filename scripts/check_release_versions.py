@@ -641,8 +641,8 @@ def report(verdict: Verdict, out: Out) -> None:
     c, name = verdict.component, out.paint("bold", verdict.component.name)
     where, n = f"({c.path}/)", f"{verdict.files_changed} file(s) changed"
     ok, warn, bad = out.paint("green", "✓"), out.paint("yellow", "!"), out.paint("red", "✗")
-    if verdict.dependency:
-        plural = "s" if "; " in verdict.dependency else ""
+    plural = "s" if "; " in (verdict.dependency or "") else ""
+    if verdict.dependency and not verdict.files_changed:
         out.line(
             f"  {warn} {name} {where} — unchanged, but its published requirement{plural}"
             f" {verdict.dependency} [{out.level(verdict.level)}]"
@@ -653,6 +653,8 @@ def report(verdict: Verdict, out: Out) -> None:
             f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}{carried})"
             f" [{out.level(verdict.level)}]"
         )
+        if verdict.dependency:
+            out.line(f"    {warn} and its published requirement{plural} {verdict.dependency}")
     elif verdict.tag_version is None:
         out.line(f"  {ok} {name} {where} — new {c.kind} (v{verdict.version}), {n}")
     elif verdict.carried_by and not verdict.files_changed:
@@ -759,69 +761,114 @@ def source_name(repo: Repo, dependent: Component, dep: Component) -> str:
 
 
 COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
-USE_TREE = re.compile(r"\buse\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*([^;]*?))?\s*;", re.S)
+USE_TREE = re.compile(r"\buse\s+(?:::)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*([^;]*?))?\s*;", re.S)
 NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
+def use_leaves(tree: str, prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str | None]]:
+    """The leaves of a ``use`` tree below the crate, each as its path segments and its ``as``
+    alias: ``a::{b, c::{d, self}}`` gives a::b, a::c::d and a::c::self."""
+    items: list[str] = []
+    depth = start = 0
+    for i, char in enumerate(tree):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            items.append(tree[start:i])
+            start = i + 1
+    items.append(tree[start:])
+    leaves: list[tuple[tuple[str, ...], str | None]] = []
+    for item in items:
+        item = item.strip()
+        if not item:
+            continue
+        if item.endswith("}"):
+            head, _, inner = item.partition("{")
+            segments = tuple(s.strip() for s in head.strip().rstrip(":").split("::") if s.strip())
+            leaves += use_leaves(inner[:-1], prefix + segments)
+            continue
+        alias = None
+        if re.search(r"\s+as\s+", item):
+            item, alias = (part.strip() for part in re.split(r"\s+as\s+", item, maxsplit=1))
+        leaves.append((prefix + tuple(s.strip() for s in item.split("::") if s.strip()), alias))
+    return leaves
 
 
 def imported_names(text: str, ident: str) -> set[str] | None:
     """The names the ``use`` statements of a source bring in from the crate ``ident``: the leaf
-    of each path, or its ``as`` alias. None when a glob import leaves them unknown."""
+    of each path or its ``as`` alias, the segment before a ``self``; ``_`` (a trait imported
+    for its methods) brings in none. None when a glob import leaves them unknown."""
     names: set[str] = set()
     for match in USE_TREE.finditer(text):
         if match[1] != ident:
             continue
-        tree = match[2] or ""
-        if "*" in tree:
-            return None
-        for item in re.sub(r"[{}]", ",", tree).split(","):
-            item = item.strip()
-            if not item or item.endswith("::"):
-                continue
-            alias = re.search(rf"\bas\s+({NAME})$", item)
-            leaf = alias[1] if alias else item.rsplit("::", 1)[-1].strip()
-            if leaf != "self" and re.fullmatch(NAME, leaf):
-                names.add(leaf)
+        for segments, alias in use_leaves(match[2] or ""):
+            if "*" in segments:
+                return None
+            if segments and segments[-1] == "self":
+                segments = segments[:-1]
+            name = alias or (segments[-1] if segments else ident)
+            if name not in ("_", ident) and re.fullmatch(NAME, name):
+                names.add(name)
     return names
 
 
 def public_spans(text: str) -> list[str]:
     """The heads of a source's public items: from a bare ``pub`` (``pub(crate)`` and its kin are
     not public) or an ``impl`` to the ``{``, ``;``, ``,`` or ``}`` that ends the head outside
-    every bracket, across wrapped lines; a ``pub enum`` or ``pub trait`` keeps its body, whose
-    variants and methods are public without the word."""
+    every bracket, across wrapped lines (``<<``, ``<=``, ``->``, ``=>`` and ``>=`` are operators,
+    not brackets). A ``pub enum`` or ``pub trait`` keeps its body, whose variants and methods are
+    public without the word; a trait ``impl`` keeps the ``type … = …;`` lines of its body."""
     spans: list[str] = []
     for match in re.finditer(r"\b(?:pub|impl)\b(?!\s*\()", text):
         start = i = match.end()
         depth = 0
         while i < len(text):
-            char = text[i]
-            if char in "([<":
+            char, before, after = text[i], text[i - 1 : i], text[i + 1 : i + 2]
+            if char == "<":
+                if after in ("<", "="):
+                    i += 2
+                    continue
                 depth += 1
-            elif char in ")]>":
-                if not (char == ">" and text[i - 1] == "-"):
-                    depth = max(depth - 1, 0)
+            elif char == ">":
+                if before in ("-", "=") or after == "=":
+                    i += 1
+                    continue
+                depth = max(depth - 1, 0)
+            elif char in "([":
+                depth += 1
+            elif char in ")]":
+                depth = max(depth - 1, 0)
             elif depth == 0 and char in "{;,}":
                 break
             i += 1
-        if i < len(text) and text[i] == "{" and re.match(r"\s*(enum|trait)\b", text[start:i]):
-            depth = 0
-            while i < len(text):
-                depth += {"{": 1, "}": -1}.get(text[i], 0)
-                i += 1
+        head = text[start:i]
+        if i < len(text) and text[i] == "{":
+            end, depth = i, 0
+            while end < len(text):
+                depth += {"{": 1, "}": -1}.get(text[end], 0)
+                end += 1
                 if depth == 0:
                     break
-        spans.append(text[start:i])
+            if re.match(r"\s*(enum|trait)\b", head):
+                head = text[start:end]
+            elif match[0] == "impl" and re.search(r"\bfor\b", head):
+                head += " ".join(re.findall(r"\btype\s+[^;]*;", text[i:end]))
+        spans.append(head)
     return spans
 
 
 def carries_in_public_api(repo: Repo, component: Component, dep: Component) -> bool:
     """Whether the crate's sources at HEAD carry the dependency in a public position: its path
-    under the name the sources use for it (``source_name``), or a name a ``use`` of it brought
-    into the file, in the head of a public item or an ``impl`` (the body of a public enum or
-    trait). A read of the text; a glob import of the dependency leaves it blind and reads as
-    carried."""
+    or the whole crate under the name the sources use for it (``source_name``), or a name a
+    ``use`` of it brought into the file, in the head of a public item or an ``impl`` (the body
+    of a public enum or trait, the associated types of a trait impl). A read of the text; a
+    glob import of the dependency leaves it blind and reads as carried."""
     ident = source_name(repo, component, dep)
     by_path = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(ident)}::")
+    whole = re.compile(rf"\s*use\s+(?:::)?{re.escape(ident)}\b")
     files = repo.git("ls-tree", "-r", "--name-only", "HEAD", "--", f"{component.path}/src")
     for path in files.splitlines():
         if not path.endswith(".rs"):
@@ -835,37 +882,40 @@ def carries_in_public_api(repo: Repo, component: Component, dep: Component) -> b
             re.compile(rf"(?<![A-Za-z0-9_:])(?:{alternatives})(?![A-Za-z0-9_])") if names else None
         )
         for span in public_spans(text):
-            if by_path.search(span) or (by_name is not None and by_name.search(span)):
+            if whole.match(span) or by_path.search(span):
+                return True
+            if by_name is not None and by_name.search(span):
                 return True
     return False
 
 
-def dependency_moves(
-    repo: Repo, tag: str, plan: Plan, crates: Sequence[Component], out: Out
-) -> None:
+def dependency_moves(repo: Repo, tag: str, plan: Plan, crates: Sequence[Component]) -> None:
     """The dependency rule, repeated until no crate moves or rises: a crate held at a published
     version (the given tag's, or another line's tag that carries it) is republished when a
     workspace dependency's new version (the plan's, where the dependency moves here) leaves a
-    requirement its published copy carries. Every requirement is judged, and the step is the
-    highest they ask: the crate's own breaking step where its public API carries the dependency,
-    patch otherwise."""
+    requirement its published copy carries, and a crate already moving for its own changes
+    takes at least the step such a requirement asks. Every requirement is judged, and the step
+    is the highest they ask: the crate's own breaking step where its public API carries the
+    dependency, patch otherwise. The move's own pin write supersedes a stale-pin sync."""
     by_name = {v.component.name: v for v in plan.verdicts if v.component.kind == "crate"}
-    held = [
-        v
+    held = {
+        v.component.name
         for v in by_name.values()
         if v.files_changed == 0
         and (v.carried_by or (v.tag_version is not None and v.version == v.tag_version))
-    ]
+    }
+    moving = {v.component.name for v in by_name.values() if v.unbumped and v.files_changed}
+    judged = [v for v in by_name.values() if v.component.name in held | moving]
     requirements = {
         v.component.name: published_requirements(repo, v.carried_by or tag, v.component, crates)
-        for v in held
+        for v in judged
     }
+    levels = {v.component.name: LEVELS.index(v.level or "patch") for v in judged if v.unbumped}
     carried: dict[tuple[str, str], bool] = {}
-    moved: dict[str, int] = {}
     changed = True
     while changed:
         changed = False
-        for verdict in held:
+        for verdict in judged:
             name, level = verdict.component.name, -1
             left: list[str] = []
             for dep, requirement in requirements[name].items():
@@ -885,15 +935,15 @@ def dependency_moves(
                 left.append(f"{dep} ^{requirement} does not accept v{new}{why}")
             if not left:
                 continue
-            verdict.dependency = "; ".join(left)
-            if level > moved.get(name, -1):
-                moved[name] = level
+            rises = level > levels.get(name, -1)
+            if name in held or rises:
+                verdict.dependency = "; ".join(left)
+            if rises:
+                levels[name] = level
                 verdict.unbumped = True
+                verdict.workspace_version = None
                 verdict.level = LEVELS[level]
                 changed = True
-    for verdict in held:
-        if verdict.component.name in moved:
-            report(verdict, out)
 
 
 def examine(
@@ -917,8 +967,6 @@ def examine(
     for component in (*crates, *packages):
         verdict = check(repo, tag, component, root_toml, tagged.get(component.name, {}))
         verdicts.append(verdict)
-        if verdict.files_changed or verdict.workspace_version is not None:
-            report(verdict, out)
 
     gateway = next((v for v in verdicts if v.component.name == GATEWAY), None)
     gateway_component = next(c for c in crates if c.name == GATEWAY)
@@ -926,7 +974,10 @@ def examine(
         "cargo", repo.read(gateway_component.version_file), gateway_component.version_file
     )
     plan = Plan(verdicts, [], target, override, gateway_version=target, cut_version=cut_version)
-    dependency_moves(repo, tag, plan, crates, out)
+    dependency_moves(repo, tag, plan, crates)
+    for verdict in verdicts:
+        if verdict.files_changed or verdict.workspace_version is not None or verdict.dependency:
+            report(verdict, out)
     if cut_version is not None:
         plan.gateway_target = cut_version
     elif gateway is not None and gateway.unbumped:
