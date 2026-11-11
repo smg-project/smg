@@ -110,7 +110,7 @@ impl CharSymbols {
             merges,
         };
         for (id, token) in entries_of(bpe, read) {
-            symbols.read_token(&token, id)?;
+            symbols.read_token(token.as_ref(), id)?;
         }
         symbols.bridge_raw_text();
         Ok(symbols)

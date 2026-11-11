@@ -381,7 +381,7 @@ fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
 /// build it.
 fn seeded(tokenizer: &HfTokenizer) -> NativeEncoder {
     let mut native = NativeEncoder::from_tokenizer(tokenizer).expect("native path");
-    native.seed_vocabulary(tokenizer.get_model());
+    native.seed_vocabulary(tokenizer.get_model(), None);
     native
 }
 

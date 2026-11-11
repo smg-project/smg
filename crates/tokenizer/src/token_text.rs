@@ -145,7 +145,7 @@ impl TokenTextTable {
     /// `None` unless the decoder is `WordPiece` or `Metaspace`; any other
     /// decoder keeps the `tokenizers` decode.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
-        Self::build_with_max_id(tokenizer, None)
+        Self::build_with_max_id(tokenizer, None, None)
     }
 
     /// `build` with the model's largest id as the file's read saw it, when
@@ -153,6 +153,7 @@ impl TokenTextTable {
     pub(crate) fn build_with_max_id(
         tokenizer: &HfTokenizer,
         model_max_id: Option<u32>,
+        listing: Option<&crate::word_cache::Listing>,
     ) -> Option<Arc<Self>> {
         let rule = Rule::of(tokenizer.get_decoder()?)?;
         // Each id through the lookups the decode uses: `id_to_token` (an added
@@ -168,7 +169,7 @@ impl TokenTextTable {
             text: String::with_capacity(ids * 6),
         };
         for id in 0..=max_id {
-            match tokenizer.id_to_token(id) {
+            match crate::word_cache::token_of(tokenizer, listing, id) {
                 None => table.push(Token::Absent, "", "")?,
                 Some(token) => {
                     let (first, later) = rule.texts(&token);
