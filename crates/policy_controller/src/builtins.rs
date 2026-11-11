@@ -329,7 +329,9 @@ impl LeastLoad {
 
     /// The expected wait of a reporting candidate once its credit work is
     /// known: the queued and running work over the drain rate, plus the convex
-    /// KV-pressure barrier. Runs after the lock is gone.
+    /// KV-pressure barrier over the running requests' share of the cache (a
+    /// full but reclaimable prefix cache is no pressure). Runs after the lock
+    /// is gone.
     fn reported_cost(&self, r: LoadRow, credit_work: f32, nominal: f32) -> f32 {
         let mean = self.mean_prefill_tokens as f32;
         let queued = if r.waiting_uncached_tokens > 0 {
@@ -343,7 +345,7 @@ impl LeastLoad {
         } else {
             nominal
         };
-        let k = r.kv_usage().clamp(0.0, 0.999_999);
+        let k = r.active_kv().clamp(0.0, 0.999_999);
         (queued + running + credit_work) / drain + self.kv_pressure_weight * k / (1.0 - k)
     }
 
@@ -1197,11 +1199,38 @@ mod tests {
         pool[0].load = Some(report(1, 0));
         pool[1].load = Some(LoadRow {
             kv_usage_permille: 900,
+            active_kv_permille: 900,
             ..report(1, 0)
         });
         let mut scores = [0.0f32; 2];
         ll.score(&RequestFacts::default(), &pool, &kept(2), &mut scores);
         assert_eq!(scores, [1.0, 0.0]);
+    }
+
+    /// A full but reclaimable prefix cache is no pressure: the idle worker
+    /// whose running requests hold none of its cache beats the busy one
+    /// holding half, whatever the raw usage says (the legacy policy's case).
+    #[test]
+    fn reclaimable_prefix_cache_does_not_make_an_idle_worker_busy() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(LoadRow {
+            kv_usage_permille: 1000,
+            active_kv_permille: 0,
+            ..report(0, 0)
+        });
+        pool[1].load = Some(LoadRow {
+            kv_usage_permille: 500,
+            active_kv_permille: 500,
+            ..report(1, 0)
+        });
+        let mut scores = [0.0f32; 2];
+        ll.score(&RequestFacts::default(), &pool, &kept(2), &mut scores);
+        assert_eq!(scores[0], 1.0, "the idle worker wins");
+        assert!(
+            scores[1] < 1.0,
+            "the busy worker's held share is the pressure"
+        );
     }
 
     #[test]
