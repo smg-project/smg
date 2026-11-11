@@ -1147,7 +1147,10 @@ mod tests {
 
     /// The queue wait is measured on the pool thread before the work and
     /// recorded there: a task behind the one held thread records at least
-    /// the time from its queueing to the hold's release, a task whose
+    /// the time from its queueing to the hold's release and at most the time
+    /// from just before its queueing to the drain's end, once every record is
+    /// in (the test's own instants bracket each wait from both sides, so a
+    /// wait measured from an instant taken too early fails too), a task whose
     /// awaiting future was dropped while it queued records its wait all the
     /// same, and the record is taken before the work runs.
     #[test]
@@ -1190,6 +1193,8 @@ mod tests {
                     let _ = dropped_tx.send(("dropped", waited, false));
                 },
             ));
+            // Stamped before the poll, so the task's own clock starts after it.
+            let dropped_before = Instant::now();
             std::future::poll_fn(|cx| {
                 let _ = dropped.as_mut().poll(cx);
                 Poll::Ready(())
@@ -1218,6 +1223,7 @@ mod tests {
                     ));
                 },
             ));
+            let awaited_before = Instant::now();
             std::future::poll_fn(|cx| {
                 let _ = awaited.as_mut().poll(cx);
                 Poll::Ready(())
@@ -1237,7 +1243,13 @@ mod tests {
             while let Some((who, waited, worked_first)) = rx.recv().await {
                 seen.insert(who, (waited, worked_first));
             }
-            for (who, queued) in [("dropped", dropped_queued), ("awaited", awaited_queued)] {
+            // Stamped once every sender is gone: each record was sent before
+            // its sender dropped, whatever order the pool ran the tasks in.
+            let done = Instant::now();
+            for (who, before, queued) in [
+                ("dropped", dropped_before, dropped_queued),
+                ("awaited", awaited_before, awaited_queued),
+            ] {
                 let (waited, _) = seen
                     .get(who)
                     .unwrap_or_else(|| panic!("{who}: no wait recorded"));
@@ -1245,6 +1257,11 @@ mod tests {
                 assert!(
                     *waited >= held,
                     "{who}: waited {waited} s, queued {held} s before the release"
+                );
+                let bracket = done.duration_since(before).as_secs_f64();
+                assert!(
+                    *waited <= bracket,
+                    "{who}: waited {waited} s, but {bracket} s passed from before its queueing to the drain's end"
                 );
             }
             let (_, worked_first) = seen["awaited"];
