@@ -662,8 +662,9 @@ def test_a_component_whose_files_went_is_named_loudly(mod, repo):
 def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     """A package that ships another directory's files through a link (the proto package ships
     the .proto files that way) ships their changes: they count as the package's, with the
-    level of the commits that made them. A link into the package itself or out of the
-    repository adds nothing."""
+    level of the commits that made them. A link that points at a link, or a target directory
+    holding one, is followed to the end of the chain. A link into the package itself or out of
+    the repository adds nothing."""
     import os
 
     root = tmp_path / "linked"
@@ -680,15 +681,22 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     os.symlink("pkg.py", root / "pkg" / "alias.py")
     os.symlink("../../elsewhere", root / "pkg" / "outside")
     os.symlink("/etc/hostname", root / "pkg" / "absolute")
+    put(root, "real/x", "x\n")
+    os.symlink("../real/x", root / "shared" / "chain")  # a link inside the target directory
+    os.symlink("real", root / "hop")  # a link to a directory ...
+    os.symlink("../hop", root / "pkg" / "through")  # ... reached through a link to that link
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "chore: initial")
     git(root, "tag", "v1.0.0")
     repo = mod.Repo(root)
-    assert repo.symlink_targets("pkg") == ["shared"]
-    assert repo.symlink_targets("pkg/") == ["shared"]
+    assert repo.symlink_targets("pkg") == ["shared", "hop", "real/x", "real"]
+    assert repo.symlink_targets("pkg/") == ["shared", "hop", "real/x", "real"]
     assert mod.component_paths(repo, mod.package("pkg", "pkg", "pkg/pyproject.toml")) == [
         "pkg/",
         "shared",
+        "hop",
+        "real/x",
+        "real",
     ]
     assert repo.symlink_targets("model_gateway") == []
 
@@ -721,3 +729,15 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     assert code == 1
     assert "  ! pkg (pkg/) — 1 file(s) changed but version not bumped (v0.1.0) [minor]" in out
     assert "1 Python package(s) with changes, 0 unchanged" in out
+
+    # a change at the end of a chain of links is the package's as much as a direct target's
+    put(root, "real/x", "x2\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "fix(real): x")
+    stream = io.StringIO()
+    code = mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    out = stream.getvalue()
+    assert code == 1
+    assert "  ! pkg (pkg/) — 2 file(s) changed but version not bumped (v0.1.0) [minor]" in out

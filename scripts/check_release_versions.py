@@ -354,23 +354,28 @@ class Repo:
         return texts
 
     def symlink_targets(self, path: str) -> list[str]:
-        """What the symlinks under ``path`` at HEAD point at, as repository paths. A link
-        into ``path`` itself, outside the repository or absolute is left out."""
-        entries = self.git("ls-tree", "-r", "-z", "HEAD", "--", path).split("\0")
-        inside = path.rstrip("/") + "/"
+        """What the symlinks under ``path`` at HEAD point at, as repository paths, followed to
+        the end of every chain: a target that is a link, or a directory holding one, adds what
+        that points at, each target read once. A link into ``path`` itself, outside the
+        repository or absolute is left out."""
+        here, inside = path.rstrip("/"), path.rstrip("/") + "/"
         targets: list[str] = []
-        for entry in entries:
-            if not entry.startswith("120000 "):
-                continue
-            link = entry.split("\t", 1)[1]
-            pointee = (self.show("HEAD", link) or "").strip()
-            if not pointee or os.path.isabs(pointee):
-                continue
-            target = os.path.normpath(os.path.join(os.path.dirname(link), pointee))
-            if target.startswith("..") or target == path.rstrip("/") or target.startswith(inside):
-                continue
-            if target not in targets:
-                targets.append(target)
+        pending = [path]
+        while pending:
+            entries = self.git("ls-tree", "-r", "-z", "HEAD", "--", pending.pop(0)).split("\0")
+            for entry in entries:
+                if not entry.startswith("120000 "):
+                    continue
+                link = entry.split("\t", 1)[1]
+                pointee = (self.show("HEAD", link) or "").strip()
+                if not pointee or os.path.isabs(pointee):
+                    continue
+                target = os.path.normpath(os.path.join(os.path.dirname(link), pointee))
+                if target.startswith("..") or target == here or target.startswith(inside):
+                    continue
+                if target not in targets:
+                    targets.append(target)
+                    pending.append(target)
         return targets
 
     def changed_since(self, tag: str, paths: Sequence[str]) -> list[str]:
