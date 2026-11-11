@@ -806,13 +806,17 @@ data:
           }
         },
         {
-          "title": "Cache-aware decisions by branch",
+          "title": "Policy decisions by branch or outcome",
           "type": "timeseries",
           "datasource": "Prometheus",
           "targets": [
             {
               "expr": "sum by (branch) (rate(smg_cache_aware_policy_branch_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}branch{{ "}}" }}"
+            },
+            {
+              "expr": "sum by (profile, outcome) (rate(smg_policy_decisions_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "legendFormat": "{{ "{{" }}profile{{ "}}" }} {{ "{{" }}outcome{{ "}}" }}"
             }
           ],
           "fieldConfig": {

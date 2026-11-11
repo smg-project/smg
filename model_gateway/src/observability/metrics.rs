@@ -1,3 +1,23 @@
+//! The gateway's Prometheus families: their descriptions (`init_metrics`),
+//! their recorders (`Metrics`) and the per-thread handles the hot paths keep.
+//!
+//! # The policy series across the policy-engine migration
+//!
+//! Under `--policy-engine engine` a profile of the policy engine decides
+//! where a legacy policy did, so the series that named the legacy policies
+//! move as the table says; a renamed label carries its old name for one
+//! release, and nothing the legacy path records is deleted before that path
+//! is.
+//!
+//! | series | this release | the next release |
+//! |---|---|---|
+//! | `smg_policy_decisions_total{model,profile,outcome,mode}` | new: one count per decision of the engine | unchanged |
+//! | `smg_worker_selection_total{worker_type,connection_mode,model,policy}` | kept; `profile` added with `policy`'s value | `policy` dropped; the value is the deciding profile's name once the engine is the default |
+//! | `smg_cache_aware_policy_branch_total`, `smg_manual_policy_branch_total`, `smg_consistent_hashing_policy_branch_total`, `smg_prefix_hash_policy_branch_total` | kept: the legacy policies record them; under the engine the outcome is in `smg_policy_decisions_total` and the deciding stage in the decision's trace | removed with the legacy policies |
+//! | `smg_cache_aware_match_ratio`, `smg_cache_tree_*`, `smg_cache_placement_entries` | kept | move with the index to the controller's job in the remote mode |
+//! | `smg_policy_inflight_reconciled_total{policy}` | kept | the label follows the selection series' rename |
+//! | `smg_worker_overload_*`, `smg_pd_admission_*`, `smg_pd_prefill_admission_*`, `smg_scheduler_*` | kept | kept |
+
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{
