@@ -3867,7 +3867,17 @@ fn the_corpus_replay_reads_a_v3_2_set_recorded_in_chat_mode_without_the_reasonin
 /// family's expected list holds no probe and the one-case set is whole.
 #[test]
 fn a_recorded_library_defect_is_reported_and_fails_once_the_library_reads_as_the_parser() {
-    let defect = &LIBRARY_DEFECTS[0];
+    // The test drives a V4.1 DSML call through a `deepseek-recipe` witness, so it needs that
+    // entry; once the stale rule retires it, the test needs a synthetic entry of its own.
+    let defect = LIBRARY_DEFECTS
+        .iter()
+        .find(|defect| {
+            defect.library == "deepseek-recipe" && defect.id.starts_with("deepseek-v4.1-flash/")
+        })
+        .expect(
+            "no deepseek-recipe defect on deepseek-v4.1-flash is recorded; give this test a \
+             synthetic entry",
+        );
     let (slug, _) = defect
         .id
         .split_once('/')
