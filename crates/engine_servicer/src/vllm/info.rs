@@ -11,7 +11,7 @@ use tracing::info;
 
 use super::{State, HEALTHY, SERVER_TYPE};
 use crate::{
-    load_report::{rank_entries, rank_entry, RankFigures},
+    load_report::{rank_entries, rank_entry, Capacity, RankFigures},
     servicer::proto_token_ids,
 };
 
@@ -177,21 +177,6 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
     }
 }
 
-/// The handshake's capacity figures every rank's entry carries.
-struct Capacity {
-    max_running_requests: i32,
-    max_total_num_tokens: i32,
-}
-
-impl Capacity {
-    fn of(state: &State) -> Self {
-        Self {
-            max_running_requests: state.shared.running_window(state.model.max_num_seqs),
-            max_total_num_tokens: state.shared.kv_capacity_tokens(),
-        }
-    }
-}
-
 /// A reported rank's entry: the snapshot's figures with, from this
 /// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
 /// token-work, prefill/generation throughput and hit rate that vLLM's stats
@@ -256,7 +241,7 @@ fn unreported_entry(state: &State, dp_rank: i32, capacity: &Capacity) -> vllm::S
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<vllm::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     let ready = client.ready_response();
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_num_seqs);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
     let (loads, _) = rank_entries(
         client.get_loads().loads,
@@ -286,7 +271,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<vllm::GetLoad
 /// engine makes it a rank); a rank past the connected ones has no entry.
 pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<vllm::SchedulerLoad> {
     let client = state.shared.engine().ok()?;
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_num_seqs);
     rank_entry(
         |index| client.rank_load(index),
         capacity.max_total_num_tokens,
