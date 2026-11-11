@@ -20,12 +20,12 @@
 //! thread's share, so a thread that encodes little holds little. A thread's
 //! table grows in place: its slots are reserved up to
 //! [`THREAD_BACKING_SLOTS`] when it is made (reserved, not written: a page
-//! of the reservation is touched when a slot in it is first used), a growth
-//! step extends the table into the reservation and places the stored
-//! entries again where they stand, and only a table that outgrows the
-//! reservation moves to a new allocation; so a thread that encodes little
-//! touches little, and a thread that encodes much pays the pages of one
-//! table, not of every table it grew through.
+//! of the reservation is touched when a growth step extends the table over
+//! it), a growth step extends the table into the reservation and places the
+//! stored entries again where they stand, and only a table that outgrows
+//! the reservation moves to a new allocation; so a thread that encodes
+//! little touches little, and a thread that encodes much pays the pages of
+//! one table, not of every table it grew through.
 
 /// Longest piece the table keys: its bytes and length fit a `u128`.
 pub(super) const SHORT_PIECE_MAX_BYTES: usize = 15;

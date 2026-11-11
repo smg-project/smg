@@ -190,7 +190,12 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// running when threads joined keeps its earlier share until it ends; the long
 /// tier reads the live share at every miss), so after threads join it is within
 /// the smaller share from its next call on, entries, packed slots and map
-/// buckets alike, and holds at most its earlier share until then, or until it
+/// buckets alike (the packed table's pages already touched inside its
+/// reservation stay resident, `THREAD_BACKING_SLOTS` slots at most, 33 bytes
+/// each, about 528 KiB per thread: more than the share's slots only once
+/// those fall under the reservation, a share under 6,144 entries, some 680
+/// threads on this total), and holds at most its earlier share until then, or
+/// until it
 /// exits if it never encodes again: right after a join the total is the earlier
 /// share times the threads that had it plus the new share times the rest, and
 /// settles as they encode. Before this bound the same ceilings were a sixteenth
@@ -332,10 +337,13 @@ impl PieceCache {
 
     /// Forgets the tiers bounded by count. The packed table keeps its slots
     /// and the map its buckets, unless `share` fell below what they were
-    /// grown for: the table is made anew when it has more slots than the
-    /// share takes, the map when its capacity is above twice the share (a
-    /// map that grew under the share stays under that, so the check never
-    /// fires at a steady share and a clear at the bound keeps the buckets).
+    /// grown for: the table is cut back to the slots the share takes when it
+    /// has more (inside its reservation the room stays, with the pages the
+    /// thread already touched, `THREAD_BACKING_SLOTS` slots at most; a table
+    /// that had moved past the reservation is made anew), the map is made
+    /// anew when its capacity is above twice the share (a map that grew under
+    /// the share stays under that, so the check never fires at a steady share
+    /// and a clear at the bound keeps the buckets).
     fn clear_short(&mut self, share: usize) {
         self.packed.clear(share);
         if self.short.capacity() > 2 * share {
@@ -2434,8 +2442,10 @@ impl NativeEncoder {
     /// fell since it last read it (threads joined) clears its count-bounded
     /// tiers here, by their entries, by the slots of its packed table or by
     /// the capacity of its map (arrays grown for the earlier share keep
-    /// their size through a clear at the bound; here they are made anew for
-    /// the share), so every thread that still encodes is within the share
+    /// their size through a clear at the bound; here the map is made anew for
+    /// the share and the packed table is cut back to the share's slots inside
+    /// its reservation, see `ShortPieceTable::clear`), so every thread that
+    /// still encodes is within the share
     /// from its next call on (the share is read here once and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that

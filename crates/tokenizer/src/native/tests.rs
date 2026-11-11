@@ -1876,8 +1876,9 @@ fn piece_caches_stay_within_their_bound_across_threads() {
 }
 
 /// A thread's packed table starts with the fewest slots, grows with the
-/// distinct pieces the thread meets up to its share, and is made anew for a
-/// smaller share (threads joined since it grew) when it is cleared.
+/// distinct pieces the thread meets up to its share, and is cut back to the
+/// slots of a smaller share (threads joined since it grew) when it is
+/// cleared.
 #[test]
 fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
     let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
@@ -1975,10 +1976,10 @@ fn a_thread_whose_share_fell_is_within_it_from_its_next_encode_on() {
 
 /// A thread's packed table grown for an earlier share keeps its slots
 /// through a clear at the bound; once the share fell below them (threads
-/// joined) the thread's next encode call makes the table anew for the
-/// share, entries within it or not.
+/// joined) the thread's next encode call cuts the table back to the slots
+/// of the share, entries within it or not.
 #[test]
-fn a_thread_whose_packed_table_outgrew_its_share_remakes_it_at_its_next_encode() {
+fn a_thread_whose_packed_table_outgrew_its_share_cuts_it_back_at_its_next_encode() {
     let mut state = 0xF00D_CAFE_DEAD_BEEFu64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
