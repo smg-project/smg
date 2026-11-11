@@ -20,7 +20,9 @@ pub enum ReservationKind {
 /// most one reservation per kind, and a release is idempotent (a completion
 /// and a late release of one lease free it once). The window is the engine's
 /// own admission bound or the configured cap; a worker that reports none has
-/// no window and the gate abstains.
+/// no window and the gate abstains. A worker the store does not know (never
+/// registered, or removed) is refused: a missing row is not a live worker
+/// without a bound.
 pub trait ReservationStore: Send + Sync {
     /// The worker's window for `kind`; `None` when it has none.
     fn window(&self, id: WorkerId, kind: ReservationKind) -> Option<u32>;

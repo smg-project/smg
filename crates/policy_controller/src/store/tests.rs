@@ -671,11 +671,30 @@ fn a_reservation_is_all_or_nothing_within_the_window_and_released_by_its_lease()
     rooms.release(b);
     assert_eq!(rooms.held(id, ReservationKind::Room), 3);
     assert_eq!(rooms.held(id, ReservationKind::Slot), 0);
+    // A live worker without a bound has no window and the gate abstains; a
+    // worker the store does not know, or dropped, is refused outright.
+    let unbounded = store
+        .upsert(WorkerFacts {
+            max_running: None,
+            ..facts("http://p:8000", 1)
+        })
+        .id();
+    assert_eq!(rooms.window(unbounded, ReservationKind::Room), None);
+    assert!(
+        rooms.try_reserve(unbounded, ReservationKind::Room, 100, LeaseId(9)),
+        "no window: the gate abstains"
+    );
     let unknown = WorkerId(77);
     assert_eq!(rooms.window(unknown, ReservationKind::Room), None);
     assert!(
-        rooms.try_reserve(unknown, ReservationKind::Room, 100, LeaseId(9)),
-        "no window: the gate abstains"
+        !rooms.try_reserve(unknown, ReservationKind::Room, 1, LeaseId(10)),
+        "a worker the store does not know is refused"
+    );
+    let revision = WorkersStore::get(&store, id).expect("the row").revision;
+    store.remove(id, revision).expect("removed");
+    assert!(
+        !rooms.try_reserve(id, ReservationKind::Room, 1, LeaseId(11)),
+        "a removed worker is refused whatever its window was"
     );
 }
 

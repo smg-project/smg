@@ -671,7 +671,18 @@ impl ReservationStore for MemoryStore {
     }
 
     fn try_reserve(&self, id: WorkerId, kind: ReservationKind, count: u32, lease: LeaseId) -> bool {
-        let window = self.window(id, kind);
+        // A worker the store does not know (never registered, or removed) is
+        // refused before its window is read: a missing row is no live worker
+        // without a bound, and a commit racing a removal gets nothing on it.
+        let window = {
+            let workers = self.workers.lock();
+            let Some(row) = workers.rows.get(&id) else {
+                return false;
+            };
+            // Both kinds read the engine's admission window today, as
+            // `window` does.
+            row.row.facts.max_running
+        };
         let mut reservations = self.reservations.lock();
         let holds_kind = reservations
             .by_lease
