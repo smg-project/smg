@@ -368,6 +368,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
+    use crate::test_support::hex;
 
     /// The reference's three steps, each stored as `f32`.
     fn reference_level(level: u8, mean: f64, std: f64) -> f32 {
@@ -508,10 +509,7 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        hex(&Sha256::digest(&bytes))
     }
 
     /// A budget of three patches: a 60x40 image is resized to 36x24 (a ratio

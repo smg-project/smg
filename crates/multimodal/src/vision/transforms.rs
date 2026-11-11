@@ -3830,7 +3830,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        assert_same_bytes, create_test_image, gradient_rgb, lcg_bytes, lcg_rgb_image,
+        assert_same_bytes, create_test_image, gradient_rgb, hex, lcg_bytes, lcg_rgb_image,
     };
 
     /// Pillow's BILINEAR output on three images of generator bytes (12x5 to
@@ -4151,10 +4151,7 @@ mod tests {
                 .iter()
                 .flat_map(|value| value.to_bits().to_le_bytes())
                 .collect();
-            let actual = Sha256::digest(&bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+            let actual = hex(&Sha256::digest(&bytes));
             assert_eq!(actual, digest, "{w}x{h} -> {out_w}x{out_h} seed {seed}");
         }
     }
@@ -5561,18 +5558,6 @@ mod tests {
             // (index, bits) where the previous evaluation parted by one ULP.
             witnesses: [(usize, u32); 4],
         }
-        fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
-            let mut state = seed;
-            (0..count)
-                .map(|_| {
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
-                    ((state >> 16) & 0xff) as u8
-                })
-                .collect()
-        }
-        fn hex(bytes: &[u8]) -> String {
-            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-        }
 
         let cases = [
             Case {
@@ -5724,18 +5709,6 @@ mod tests {
             digest: &'static str,
             // (index, bits) of four elements of the output.
             witnesses: [(usize, u32); 4],
-        }
-        fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
-            let mut state = seed;
-            (0..count)
-                .map(|_| {
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
-                    ((state >> 16) & 0xff) as u8
-                })
-                .collect()
-        }
-        fn hex(bytes: &[u8]) -> String {
-            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
 
         let cases = [
@@ -5964,12 +5937,9 @@ mod tests {
                 first_eight,
                 "{width}x{height} -> {out_w}x{out_h}: the first eight bytes"
             );
-            let hex: String = Sha256::digest(out.as_raw())
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
+            let actual = hex(&Sha256::digest(out.as_raw()));
             assert_eq!(
-                hex, digest,
+                actual, digest,
                 "{width}x{height} -> {out_w}x{out_h}: the digest"
             );
         }

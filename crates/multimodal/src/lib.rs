@@ -138,6 +138,12 @@ pub(crate) mod test_support {
         DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, bytes).expect("image size"))
     }
 
+    /// `bytes` as lowercase hex, two digits a byte: the form the kernel tests
+    /// pin their reference digests in.
+    pub(crate) fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     /// `w` by `h` RGB bytes that vary with the position and `seed`: the
     /// resamplers' parity inputs.
     pub(crate) fn gradient_rgb(w: usize, h: usize, seed: usize) -> Vec<u8> {
