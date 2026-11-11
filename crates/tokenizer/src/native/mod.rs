@@ -119,6 +119,21 @@ const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// tier is bounded by bytes, so an entry costs what it takes; a longer piece
 /// is tokenized every time.
 const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
+
+/// Bytes of an input from which the single-stage scanners walk a letter or
+/// white-space run eight bytes at a time (`Roles::run_end_as`): the scanner
+/// loop is compiled with the word scans and without, and the choice is made
+/// once per encode call on the input's length; a shorter input walks every
+/// run byte by byte through the loop as it was before the scans, and no run
+/// loop compares anything. The word scan removes the run loop's mispredicted
+/// exits, which the predictor cannot learn over a long text and holds for a
+/// short text it has just seen (counted per token on one core, single-stage
+/// vocabularies: 32 KB-500 KB texts -13..-16 % cycles for +3..+5 %
+/// instructions with the scans; 256 B and 2 KB texts +2..+7 % instructions
+/// with the scans compiled into their loop, whether or not a run takes
+/// them). The threshold is the pool path's unit size, so a long input keeps
+/// the scans on every unit it is cut into.
+const WORD_SCAN_MIN_BYTES: usize = PARALLEL_CHUNK_BYTES;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
 /// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
 /// repeated document: one with fewer distinct pieces is encoded again at the
@@ -1654,6 +1669,10 @@ impl NativeEncoder {
         framed: bool,
         at_start: bool,
     ) -> Result<Vec<u32>, Fallback> {
+        // The scanners' word scans, chosen once per call on the input's
+        // length (`WORD_SCAN_MIN_BYTES`): every unit of a long input takes
+        // them, a short input walks its runs byte by byte.
+        let words = text.len() >= WORD_SCAN_MIN_BYTES;
         // Text not in NFC under the NFC normalizer (by the library's tables,
         // as every NFC read here) is normalized gap by gap first; the units
         // then borrow from those gaps.
@@ -1691,7 +1710,7 @@ impl NativeEncoder {
                     let marker = self.marker_before(units, index, at_start);
                     let mut mapped = String::new();
                     let mut cache = self.piece_cache_for_call();
-                    self.encode_unit(model, unit, marker, &mut mapped, ids, &mut cache)
+                    self.encode_unit(model, unit, marker, words, &mut mapped, ids, &mut cache)
                 })?;
             let body: usize = parts.iter().map(Vec::len).sum();
             let mut ids = Vec::with_capacity(before.len() + body + after.len());
@@ -1708,7 +1727,15 @@ impl NativeEncoder {
         let mut cache = self.piece_cache_for_call();
         for (index, unit) in units.iter().enumerate() {
             let marker = self.marker_before(units, index, at_start);
-            self.encode_unit(model, unit, marker, &mut mapped, &mut ids, &mut cache)?;
+            self.encode_unit(
+                model,
+                unit,
+                marker,
+                words,
+                &mut mapped,
+                &mut ids,
+                &mut cache,
+            )?;
         }
         ids.extend_from_slice(after);
         Ok(ids)
@@ -1927,11 +1954,13 @@ impl NativeEncoder {
     /// before the text ([`Self::marker_before`]). `cache` is the encoding
     /// thread's piece cache ([`Self::thread_piece_cache`]), borrowed by the
     /// caller for the unit.
+    #[expect(clippy::too_many_arguments)]
     fn encode_unit(
         &self,
         model: Option<&ModelWrapper>,
         unit: &Segment<'_>,
         marker: bool,
+        words: bool,
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
@@ -1975,7 +2004,7 @@ impl NativeEncoder {
             }
             (None, [stage]) => {
                 if let Err(declined) =
-                    self.encode_single_stage(model, stage, text, mapped, ids, cache)
+                    self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
                 {
                     fallback = Some(declined);
                 }
@@ -2064,11 +2093,13 @@ impl NativeEncoder {
     /// (measured); one call per unit here is nothing against a unit's
     /// pieces.
     #[inline(never)]
+    #[expect(clippy::too_many_arguments)]
     fn encode_single_stage(
         &self,
         model: Option<&ModelWrapper>,
         stage: &Stage,
         text: &str,
+        words: bool,
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
@@ -2084,6 +2115,7 @@ impl NativeEncoder {
         // alternatives tile the text, so a gap is the rare case there.
         stage.pattern.for_each_match(
             text,
+            words,
             #[inline(always)]
             |start, end| {
                 if keep_gaps && cursor < start {
