@@ -392,10 +392,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        middleware::{
-            create_logging_layer, sse_keepalive_middleware, AccessLogFields, HttpMetricsLayer,
-            SseKeepAlive,
-        },
+        middleware::{create_logging_layer, AccessLogFields, HttpMetricsLayer, SseKeepAlive},
         observability::logging::test_support::{test_subscriber, ResponseLines},
     };
 
@@ -444,10 +441,7 @@ mod tests {
                     }
                 }),
             )
-            .route_layer(axum::middleware::from_fn_with_state(
-                SseKeepAlive::every_secs(15),
-                sse_keepalive_middleware,
-            ))
+            .route_layer(SseKeepAlive::every_secs(15).layer())
             .layer(create_logging_layer(AccessLogFields::NONE))
             .layer(HttpMetricsLayer::new(tracker))
     }

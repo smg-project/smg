@@ -1313,8 +1313,8 @@ mod field_tests {
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         middleware::{
-            auth_middleware, route_request_meta_middleware, sse_keepalive_middleware, AuthConfig,
-            HttpMetricsLayer, SseKeepAlive, TenantResolutionState,
+            auth_middleware, route_request_meta_middleware, AuthConfig, HttpMetricsLayer,
+            SseKeepAlive, TenantResolutionState,
         },
         observability::{
             inflight_tracker::InFlightRequestTracker,
@@ -1450,10 +1450,7 @@ mod field_tests {
                     }
                 }),
             )
-            .route_layer(from_fn_with_state(
-                SseKeepAlive::every_secs(15),
-                sse_keepalive_middleware,
-            ))
+            .route_layer(SseKeepAlive::every_secs(15).layer())
             .route_layer(from_fn_with_state(tenants, route_request_meta_middleware))
             .route_layer(from_fn_with_state(auth, auth_middleware))
             .layer(create_logging_layer(fields))
