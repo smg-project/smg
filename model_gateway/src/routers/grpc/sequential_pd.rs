@@ -672,6 +672,7 @@ pub(crate) async fn execute_sequential_pd(
         prefill: prefill_stream,
         decode: Box::new(decode_stream),
         prefill_guards: vec![None],
+        ledger: ledger.clone(),
         pd_timing: PdTiming {
             prefill_start,
             decode_sent,
@@ -716,6 +717,14 @@ async fn sequential_prefill_side(
     // above was read before the booking.
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
+    // The prefill side's call is counted on the ledger from here, its read
+    // from its first response to the end of its drain: a dispatch deadline
+    // that passes meanwhile is this side's to carry, in that phase, not the
+    // decode side's, which is not dispatched before the harvest (see
+    // `dispatch_timed_out`). The early returns below end the attempt with
+    // their own answer; the count they leave is reset by the next attempt
+    // and never read.
+    let call = sides.ledger.prefill_call();
     let prefill_stream = dispatch_prefill_within(
         PrefillWait {
             bound: bound.clone(),
@@ -764,6 +773,9 @@ async fn sequential_prefill_side(
             sides.prefill_label,
         ));
     }
+    // The side answered: its count is its read's from here to the end of the
+    // drain (see `PrefillCall::answered`).
+    let draining = call.answered();
 
     // Drain prefill response, harvesting connector params, the processed
     // media identity, input logprobs and the prefix-cache hit from the
@@ -806,6 +818,7 @@ async fn sequential_prefill_side(
             }
         }
     }
+    draining.ended();
     prefill_stream.mark_completed();
     // Prefill is drained: its admission slot is free while decode runs.
     drop(prefill_guard);

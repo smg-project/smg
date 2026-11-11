@@ -139,6 +139,9 @@ struct GatedScheduler {
     /// Send the first frame, then hold the stream open with nothing on
     /// it: an engine whose generation wedged after its first token.
     hold_after_first: bool,
+    /// Send every frame, then hold the stream open: a servicer slow to
+    /// close an RPC whose generation is complete.
+    hold_after_frames: bool,
     /// Send the first frame, then hold the next until the flag is set:
     /// a generation whose end the test times itself.
     gate_after_first: Option<Arc<AtomicBool>>,
@@ -317,6 +320,7 @@ impl TokenSpeedScheduler for GatedScheduler {
         let frame_gap = self.frame_gap;
         let fail_mid_stream = self.fail_mid_stream;
         let hold_after_first = self.hold_after_first;
+        let hold_after_frames = self.hold_after_frames;
         let gate_after_first = self.gate_after_first.clone();
         tokio::spawn(async move {
             if let Some(probe) = probe {
@@ -348,6 +352,11 @@ impl TokenSpeedScheduler for GatedScheduler {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
+            }
+            if hold_after_frames {
+                // The RPC stays open after its last frame for longer than
+                // any wait a test sets.
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });
         Ok(TonicResponse::new(Box::pin(ReceiverStream::new(rx))))
@@ -2207,6 +2216,44 @@ async fn start_stream(pipeline: &RequestPipeline, components: Arc<SharedComponen
     response
 }
 
+/// Start a streaming request on `pipeline` whose decode side withholds its
+/// first token, and leave it while that token is still owed. On the
+/// disaggregated shapes the response opens with the decode side's first
+/// item, or with the verdict at the side's bound (three seconds here; see
+/// `DecodeSideWatch` and the sequential shape's `DecodeBound`), so a client
+/// that leaves before it drops the request future, as a connection's close
+/// drops the handler. The decode side holds its load the whole time.
+async fn leave_while_the_first_token_is_owed(
+    pipeline: &RequestPipeline,
+    components: Arc<SharedComponents>,
+    decode: &Arc<dyn Worker>,
+) {
+    let mut request = Box::pin(pipeline.execute_completion(
+        completion_request(true),
+        None,
+        MODEL.to_string(),
+        components,
+        None,
+        None,
+        None,
+    ));
+    tokio::select! {
+        response = &mut request => panic!(
+            "the response must wait for the decode side's first token, not open with {}",
+            response.status()
+        ),
+        () = tokio::time::sleep(Duration::from_millis(500)) => {}
+    }
+    assert_eq!(
+        decode.load(),
+        1,
+        "the decode side holds its load while its first token is owed"
+    );
+    // The client leaves: the connection's close drops the handler, and the
+    // request future with it.
+    drop(request);
+}
+
 /// gRPC regular path: the client drops the stream while the engine is
 /// still prefilling. The load guard rides the response body, so the drop
 /// releases the worker's load and reports the completion at once.
@@ -2946,8 +2993,10 @@ async fn a_client_that_leaves_a_background_harmony_responses_stream_leaves_its_g
 
 /// gRPC PD path: the prefill side answers on its own and reports when its
 /// phase ends; the decode side is still owed its first token when the
-/// client leaves, and reports with the dropped body. Both sides end with
-/// their load released, exactly once each.
+/// client leaves (the response waits for that token or the side's bound,
+/// see `leave_while_the_first_token_is_owed`), and reports with the
+/// dropped request. Both sides end with their load released, exactly once
+/// each.
 #[tokio::test]
 async fn cancelled_pd_stream_reports_the_prefill_and_decode_completions() {
     let hold = completion_request(true);
@@ -2960,14 +3009,7 @@ async fn cancelled_pd_stream_reports_the_prefill_and_decode_completions() {
     let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
     let components = components(Arc::clone(&worker_registry)).await;
 
-    let response = start_stream(&pipeline, components).await;
-    assert_eq!(
-        decode.load(),
-        1,
-        "the decode side holds its load until the stream ends"
-    );
-
-    drop(response);
+    leave_while_the_first_token_is_owed(&pipeline, components, &decode).await;
 
     let mut urls = spy.wait_for(2).await;
     urls.sort();
@@ -3000,8 +3042,7 @@ async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() 
     );
     let components = components(Arc::clone(&worker_registry)).await;
 
-    let response = start_stream(&pipeline, components).await;
-    drop(response);
+    leave_while_the_first_token_is_owed(&pipeline, components, &decode).await;
 
     let mut urls = spy.wait_for(2).await;
     urls.sort();
@@ -3024,6 +3065,173 @@ async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() 
     .expect("admitted");
     drop(admitted);
     drop(hold);
+}
+
+/// gRPC PD path under prefill admission: the prefill side is drained while
+/// the decode side's first token is awaited, so its slot is free as soon as
+/// its phase ends, not when the decode side speaks. With one slot and a
+/// short queue, a second request dispatched while the first's decode side
+/// still owes its first token is admitted at once, and both stream.
+#[tokio::test]
+async fn a_pd_prefill_slot_is_free_while_the_decode_side_owes_its_first_token() {
+    const FIRST_TOKEN_AFTER: Duration = Duration::from_secs(2);
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler {
+        frame_gap: Some(FIRST_TOKEN_AFTER),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+    register_worker(&worker_registry, decode_port, WorkerType::Decode);
+    // One slot; the second request's admission waits a second at most.
+    let admission = Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(1)));
+    let pipeline =
+        completion_pipeline_with_admission(&worker_registry, Mode::PrefillDecode, Some(admission));
+    let components = components(Arc::clone(&worker_registry)).await;
+
+    let first = pipeline.execute_completion(
+        completion_request(true),
+        None,
+        MODEL.to_string(),
+        Arc::clone(&components),
+        None,
+        None,
+        None,
+    );
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                completion_request(true),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        (response, started.elapsed())
+    };
+    let (first, (second, second_took)) = tokio::join!(first, second);
+    assert_eq!(first.status(), http::StatusCode::OK);
+    assert_eq!(
+        second.status(),
+        http::StatusCode::OK,
+        "admitted while the first's decode side owes its first token: the first's prefill is drained"
+    );
+    assert!(
+        second_took < FIRST_TOKEN_AFTER + Duration::from_secs(1),
+        "the second request waited on no slot: {second_took:?}"
+    );
+}
+
+/// `response`'s streamed body read to its end within `within`: the text of
+/// every data frame, in order.
+async fn body_within(response: Response, within: Duration) -> String {
+    let mut body = response.into_body().into_data_stream();
+    let mut text = String::new();
+    tokio::time::timeout(within, async {
+        while let Some(chunk) = body.next().await {
+            text.push_str(&String::from_utf8_lossy(&chunk.expect("a body chunk")));
+        }
+    })
+    .await
+    .expect("the streamed body must end within the wait");
+    text
+}
+
+/// A decode stub's frame pacing that leaves its first token owed when the
+/// execution stage hands the pair on, so the stage, not the reader, reads the
+/// prefill side to its `Complete` while that token is waited for.
+const DECODE_FIRST_FRAME_LATE: Duration = Duration::from_millis(300);
+
+/// gRPC PD path: the prefill side's RPC stays open after its `Complete` (a
+/// servicer slow to close it) and the decode side owes its first token when
+/// the stage hands the pair on. The reader meets the `Complete` the execution
+/// stage held for it and stops there, as it did: the decode side's tokens
+/// and the stream's end come at once, not after the prefill stream's close.
+#[tokio::test]
+async fn a_pd_prefill_held_open_after_its_complete_does_not_hold_the_decode_tokens() {
+    let prefill_port = spawn_stub(GatedScheduler {
+        hold_after_frames: true,
+        ..Default::default()
+    })
+    .await;
+    let decode_port = spawn_stub(GatedScheduler {
+        frame_gap: Some(DECODE_FIRST_FRAME_LATE),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+    register_worker(&worker_registry, decode_port, WorkerType::Decode);
+    let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+    let components = components(Arc::clone(&worker_registry)).await;
+
+    let started = Instant::now();
+    let response = start_stream(&pipeline, components).await;
+    let body = body_within(response, Duration::from_secs(5)).await;
+    assert!(body.contains("[DONE]"), "the stream must end: {body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the decode tokens must not wait for the prefill stream's close: {:?}",
+        started.elapsed()
+    );
+}
+
+/// gRPC PD path with `n: 2`, each prefill RPC staying open after its
+/// `Complete` and the decode side owing its first token at the hand-on: each
+/// sub-request's prefill side is held at its `Complete` for the fan-out's
+/// reader, which counts both as done; every choice streams to its end, not
+/// after the prefill streams' close.
+#[tokio::test]
+async fn a_streamed_pd_fan_out_ends_every_choice_with_its_prefill_sides_held_at_their_complete() {
+    let prefill_port = spawn_stub(GatedScheduler {
+        hold_after_frames: true,
+        ..Default::default()
+    })
+    .await;
+    let decode_port = spawn_stub(GatedScheduler {
+        frame_gap: Some(DECODE_FIRST_FRAME_LATE),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+    register_worker(&worker_registry, decode_port, WorkerType::Decode);
+    let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+    let components = components(Arc::clone(&worker_registry)).await;
+    let request: Arc<CompletionRequest> = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "prompt": "Hello world",
+            "stream": true,
+            "n": 2,
+        }))
+        .expect("completion request"),
+    );
+
+    let response = pipeline
+        .execute_completion(
+            request,
+            None,
+            MODEL.to_string(),
+            components,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = body_within(response, Duration::from_secs(5)).await;
+    assert_eq!(
+        body.matches("\"finish_reason\":\"stop\"").count(),
+        2,
+        "both choices must end: {body}"
+    );
 }
 
 // ------------------------------------------------------------------

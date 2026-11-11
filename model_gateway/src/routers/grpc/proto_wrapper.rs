@@ -230,6 +230,33 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// Whether this is a choice's `Complete` (its end, whatever the finish
+    /// reason), as against a chunk or an empty response.
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::Sglang(resp) => matches!(
+                resp.response,
+                Some(sglang::generate_response::Response::Complete(_))
+            ),
+            Self::Vllm(resp) => matches!(
+                resp.response,
+                Some(vllm::generate_response::Response::Complete(_))
+            ),
+            Self::Trtllm(resp) => matches!(
+                resp.response,
+                Some(trtllm::generate_response::Response::Complete(_))
+            ),
+            Self::Mlx(resp) => matches!(
+                resp.response,
+                Some(mlx::generate_response::Response::Complete(_))
+            ),
+            Self::TokenSpeed(resp) => matches!(
+                resp.response,
+                Some(tokenspeed::generate_response::Response::Complete(_))
+            ),
+        }
+    }
+
     /// Whether this is the engine's output: a chunk, or a complete the
     /// engine neither aborted nor failed (the Rust servicers end an aborted
     /// choice with a complete, `finish_reason` "abort", in place of a
@@ -1099,6 +1126,15 @@ impl PrefillTicket {
         })
     }
 
+    /// The side answered at `at`, reporting `cached` prompt tokens served
+    /// from the engine's prefix cache, and nothing reads its stream: the
+    /// ticket is released with that answer (a dispatch given up on with the
+    /// prefill side's first response pulled ahead, see
+    /// `book_prefill_answer_ahead` in the execution stage).
+    pub(crate) fn answered_at(mut self, cached: u64, at: Instant) {
+        self.first_response_at(cached, liveness::ms_at(at));
+    }
+
     /// The first response came back at `now_ms` on the gateway clock (the
     /// stamp its reader took for the message), reporting `cached` prompt
     /// tokens served from the engine's prefix cache.
@@ -1469,6 +1505,110 @@ mod tracked_tests {
         assert!(stream.next().await.is_none(), "and the stream stays ended");
     }
 
+    /// A prefill side read through to its `Complete` for its reader: the
+    /// chunks before it are dropped, the `Complete` is held and replayed
+    /// once, and what follows it is left as it was; an end before one is
+    /// held as `Ok(false)`; a failure before one is returned as the stream
+    /// gave it, and held for the reader too.
+    #[tokio::test]
+    async fn a_prefill_side_is_read_to_its_complete_which_stays_held_for_its_reader() {
+        type Item = Result<ProtoGenerateResponse, tonic::Status>;
+        // Items told apart by the count each carries; a `Complete` or a
+        // chunk by its shape.
+        let response = |cached_tokens, complete: bool| -> Item {
+            let response = if complete {
+                vllm::generate_response::Response::Complete(vllm::GenerateComplete {
+                    cached_tokens,
+                    ..Default::default()
+                })
+            } else {
+                vllm::generate_response::Response::Chunk(vllm::GenerateStreamChunk {
+                    cached_tokens,
+                    ..Default::default()
+                })
+            };
+            Ok(ProtoGenerateResponse::Vllm(Box::new(
+                vllm::GenerateResponse {
+                    response: Some(response),
+                },
+            )))
+        };
+        let which = |item: Option<&Item>| Some(item?.as_ref().ok()?.cached_tokens());
+        // A child yielding the items in order (each a tracked layer's replay
+        // over an empty fan-out, as the replay test above builds one).
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let side = |items: Vec<Item>| {
+            let empty = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+            let child = items.into_iter().rev().fold(empty, |inner, item| {
+                let mut layer = inner.tracked(Arc::clone(&engine), 0, false);
+                if let ProtoStream::Tracked(tracked) = &mut layer {
+                    tracked.replay = Some(Some(item));
+                }
+                layer
+            });
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+            ProtoStream::Fanout(FanoutStream::new(vec![child]))
+                .tracked_prefill_side_booked(Arc::clone(&worker), PrefillTicket::book(&worker, 16))
+        };
+
+        // A chunk, the `Complete`, a chunk after it.
+        let mut stream = side(vec![
+            response(1, false),
+            response(2, true),
+            response(3, false),
+        ]);
+        assert_eq!(
+            stream.complete_held().await.ok(),
+            Some(true),
+            "read to the `Complete`"
+        );
+        assert_eq!(
+            stream.complete_held().await.ok(),
+            Some(true),
+            "held: a second call reads nothing"
+        );
+        assert_eq!(
+            which(stream.next().await.as_ref()),
+            Some(2),
+            "the `Complete` is the reader's next item"
+        );
+        assert_eq!(
+            which(stream.next().await.as_ref()),
+            Some(3),
+            "what follows it was left unread"
+        );
+        assert!(stream.next().await.is_none(), "to the stream's end");
+
+        // An end before any `Complete`.
+        let mut stream = side(vec![response(1, false)]);
+        assert_eq!(
+            stream.complete_held().await.ok(),
+            Some(false),
+            "ended before a `Complete`"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the held end is the reader's"
+        );
+
+        // A failure before the `Complete`: returned as the stream gave it,
+        // and the reader meets it next.
+        let mut stream = side(vec![
+            response(1, false),
+            Err(tonic::Status::unavailable("retired at the rendezvous")),
+            response(2, true),
+        ]);
+        assert!(
+            matches!(stream.complete_held().await, Err(status) if status.code() == tonic::Code::Unavailable),
+            "the failure is returned"
+        );
+        assert!(
+            matches!(stream.next().await, Some(Err(status)) if status.code() == tonic::Code::Unavailable),
+            "and held for the reader"
+        );
+    }
+
     /// The parallel decode side's first item, pulled ahead while its prefill
     /// side is awaited, is held unbooked and replayed once to its reader,
     /// then the stream as it was; whatever tracks the stream then books it
@@ -1632,6 +1772,20 @@ fn reject_engine_error(
     }
 }
 
+#[cfg(test)]
+impl ProtoStream {
+    /// A side's stream whose first item is `first`, held ahead of its reader
+    /// as [`Self::first_item_ahead`] holds one, over a stream that has ended:
+    /// one response (or failure) and then the end, for the dispatch tests,
+    /// which have no engine to stream from.
+    pub(crate) fn answering_with(first: Result<ProtoGenerateResponse, tonic::Status>) -> Self {
+        Self::Ahead(Box::new(AheadStream {
+            inner: Self::Fanout(FanoutStream::new(Vec::new())),
+            first: Some(first),
+        }))
+    }
+}
+
 impl ProtoStream {
     /// Count this stream's responses as progress for `worker` (a response is
     /// progress whether it is a token of a streaming generation or the one
@@ -1757,12 +1911,47 @@ impl ProtoStream {
         first
     }
 
+    /// Read a tracked stream (a prefill side's) through to its `Complete`,
+    /// held for the reader as [`Self::first_response_within`] holds a first
+    /// item: the items before it are read as the reader would have read
+    /// them (their bookkeeping done), the reader meets the `Complete` next,
+    /// and what follows it is left unread. `Ok(true)` with the `Complete`
+    /// held; `Ok(false)` at the stream's end before one (the end held); a
+    /// failure met before one is returned, and held for the reader too. Any
+    /// other stream returns `Ok(true)` at once (the dispatch paths track a
+    /// side before they read it here).
+    pub(crate) async fn complete_held(&mut self) -> Result<bool, tonic::Status> {
+        loop {
+            let Self::Tracked(tracked) = self else {
+                return Ok(true);
+            };
+            let held = match &tracked.replay {
+                Some(Some(Ok(response))) => Some(response.is_complete()),
+                Some(Some(Err(status))) => return Err(status.clone()),
+                Some(None) => return Ok(false),
+                None => None,
+            };
+            match held {
+                Some(true) => return Ok(true),
+                // A chunk (its bookkeeping ran when it was pulled): no reader
+                // uses a prefill side's chunks.
+                Some(false) => tracked.replay = None,
+                None => {}
+            }
+            let item = self.next().await;
+            if let Self::Tracked(tracked) = self {
+                tracked.replay = Some(item);
+            }
+        }
+    }
+
     /// The stream's first item (`None`: its end), pulled ahead of its reader
     /// and held for the next [`Self::next`] as it was, unbooked: a stream
     /// tracked later books it when its reader meets it. Only for a stream
-    /// nothing tracks yet (the parallel decode side while its prefill side
-    /// is awaited). Cancel-safe: dropped before the item comes, it leaves
-    /// the stream as it was.
+    /// nothing tracks yet (a parallel side while its partner's call is
+    /// pending: the decode side for the handoff credit, the prefill side for
+    /// the decode side's deadline). Cancel-safe: dropped before the item
+    /// comes, it leaves the stream as it was.
     pub(crate) async fn first_item_ahead(
         &mut self,
     ) -> Option<&Result<ProtoGenerateResponse, tonic::Status>> {
@@ -1781,6 +1970,15 @@ impl ProtoStream {
     /// [`Self::first_item_ahead`]).
     pub(crate) fn holds_item_ahead(&self) -> bool {
         matches!(self, Self::Ahead(_))
+    }
+
+    /// The item pulled ahead of the stream's reader, if the stream holds one
+    /// (see [`Self::first_item_ahead`]); nothing is pulled here.
+    pub(crate) fn item_ahead(&self) -> Option<&Result<ProtoGenerateResponse, tonic::Status>> {
+        match self {
+            Self::Ahead(ahead) => ahead.first.as_ref(),
+            _ => None,
+        }
     }
 
     /// The worker this stream was dispatched to, when it is tracked.

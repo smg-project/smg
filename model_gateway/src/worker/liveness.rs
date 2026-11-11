@@ -114,7 +114,16 @@
 //!   yet (a burst after an idle spell, or before its first answer ever) has
 //!   shown no silence before the run began, so its side waits until the
 //!   run has gone unanswered for the time the backlog the worker held then
-//!   takes, as the pile rule gives a worker its backlog.
+//!   takes, as the pile rule gives a worker its backlog. On the parallel
+//!   dispatch shape the decode side's first output follows that handoff,
+//!   so the decode side is judged only once its prefill side has answered:
+//!   its output is due within the pair's bound, or a decode side's bound
+//!   ([`decode_side_bound`]) after the answer, whichever is later, and past
+//!   that the side is given up on only while its worker has produced
+//!   nothing for any stream within a decode side's bound
+//!   ([`parallel_decode_side_reprieve`]), under the cold-shape grace the
+//!   prefill worker is on; its request fails over to another decode worker
+//!   when one is available.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -351,8 +360,9 @@ fn decode_side_bound_with(
 pub(crate) enum SideReprieve {
     /// The worker answered another prompt, or a decode side showed one of
     /// its handoffs (see [`answered_or_handed_off`]), within the side's
-    /// bound, or a cold-shape grace is left: the side is judged again after
-    /// this.
+    /// bound (for a decode side of the parallel shape: its worker produced
+    /// output for a stream, see [`parallel_decode_side_reprieve`]), or a
+    /// cold-shape grace is left: the side is judged again after this.
     WithinBound(Duration),
     /// The worker answered nothing within the side's bound, but its current
     /// run of prompts has not answered yet and has not gone unanswered for
@@ -437,6 +447,41 @@ pub(crate) fn prefill_side_reprieve(
         worker.prefill_unanswered_run(),
         bound,
         || *backlog.get_or_init(|| backlog_bound(worker)),
+        dispatched_ago,
+    )
+}
+
+/// Where a decode side of the parallel dispatch shape past its bound stands,
+/// re-read at each check, once its prefill side has answered: before that
+/// the side's silence is the pair's, which the prefill side's rule judges.
+/// The side's first output follows the handoff its prefill side made, into
+/// a room the side was admitted to before its dispatch, so none of the
+/// decode worker's other sides stands between it and that output; yet the
+/// verdict is on the worker, not the side, as [`prefill_side_reprieve`]'s
+/// is: a request given up on here fails over to another decode worker with
+/// this one excluded, and a worker that produced output for any of its
+/// streams within the window (`decode`'s latest token or completion,
+/// [`Worker::token_progress_age`]) is backed up or slow, not frozen, so the
+/// side waits until a window has passed since that output. The window is a
+/// decode side's `bound` for the prompt ([`decode_side_bound`], the silence
+/// a stalled decode partner is judged by as well). The pair was dispatched
+/// `dispatched_ago` back: while `prefills`, the prefill worker, is on a
+/// prompt longer than any it has answered, the side is given what is left
+/// of the cold-shape grace since the dispatch, a bound at a time, as the
+/// prefill side is. A worker that has produced nothing since it was
+/// admitted has been silent for that long.
+pub(crate) fn parallel_decode_side_reprieve(
+    prefills: &Arc<dyn Worker>,
+    decode: &Arc<dyn Worker>,
+    bound: Duration,
+    dispatched_ago: Duration,
+) -> SideReprieve {
+    side_reprieve(
+        cold_shape_grace(prefills, 0),
+        Some(decode.token_progress_age()),
+        None,
+        bound,
+        || Duration::ZERO,
         dispatched_ago,
     )
 }
@@ -1600,6 +1645,80 @@ mod tests {
             "answered just now: a bound's reprieve, less the moment since: {standing:?}"
         );
         assert!(!standing.past_bound());
+    }
+
+    /// On the parallel dispatch shape a decode side past its bound, its
+    /// prefill side answered, is given up on only while its worker has
+    /// produced nothing for any stream within a decode side's window: a
+    /// worker admitted a moment ago has been silent for that moment only,
+    /// one that produced output for another stream is backed up and the
+    /// side waits the rest of a window, and a prefill worker on a prompt
+    /// longer than any it has answered gives the side what is left of the
+    /// cold-shape grace since the pair's dispatch, a window at a time. (Real
+    /// time: the workers' stamps are on the gateway clock.)
+    #[test]
+    fn a_parallel_decode_side_past_its_bound_waits_on_only_while_its_worker_produces() {
+        let window = Duration::from_millis(200);
+        let (prefill, decode) = (worker(), worker());
+        assert!(
+            matches!(
+                parallel_decode_side_reprieve(&prefill, &decode, window, Duration::ZERO),
+                SideReprieve::WithinBound(left) if left <= window
+            ),
+            "a worker admitted a moment ago has been silent for that moment only"
+        );
+        thread::sleep(window + Duration::from_millis(50));
+        let standing = parallel_decode_side_reprieve(&prefill, &decode, window, window);
+        assert!(
+            matches!(
+                standing,
+                SideReprieve::Silent { silent: Some(silent), window: judged }
+                    if silent >= window && judged == window
+            ),
+            "nothing produced for a window: given up on: {standing:?}"
+        );
+        assert!(standing.past_bound());
+        // The worker produces for another stream: the side waits the rest
+        // of a window.
+        decode.note_token_progress();
+        let standing = parallel_decode_side_reprieve(&prefill, &decode, window, window);
+        assert!(
+            matches!(standing, SideReprieve::WithinBound(left) if left > window / 2 && left <= window),
+            "output a moment ago: a window's reprieve, less the moment since: {standing:?}"
+        );
+        assert!(!standing.past_bound());
+        // The prefill worker meets a prompt longer than any it has answered:
+        // what is left of the grace since the dispatch, a window at a time,
+        // and nothing once the grace is spent.
+        prefill.note_prefill_started(256, true);
+        prefill.note_prefill_ended(256, true, Some(0));
+        prefill.note_prefill_started(1_024, true);
+        assert!(prefill.prefill_cold_shape(0));
+        thread::sleep(window + Duration::from_millis(50));
+        assert_eq!(
+            parallel_decode_side_reprieve(
+                &prefill,
+                &decode,
+                window,
+                COLD_SHAPE_GRACE - Duration::from_secs(1)
+            ),
+            SideReprieve::WithinBound(window),
+            "a second of the grace left, read a window at a time"
+        );
+        assert_eq!(
+            parallel_decode_side_reprieve(
+                &prefill,
+                &decode,
+                window,
+                COLD_SHAPE_GRACE - Duration::from_millis(100)
+            ),
+            SideReprieve::WithinBound(Duration::from_millis(100)),
+            "the last 100 ms of the grace"
+        );
+        assert!(
+            parallel_decode_side_reprieve(&prefill, &decode, window, COLD_SHAPE_GRACE).past_bound(),
+            "the grace spent: the worker's silence decides"
+        );
     }
 
     /// On the parallel shape a decode side's first output is a handoff of

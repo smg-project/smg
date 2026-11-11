@@ -72,10 +72,25 @@ pub(crate) fn is_definitive_failure(response: &Response) -> bool {
         && response.extensions().get::<UpstreamAnswer>().is_some()
 }
 
-/// What one request's attempts have told the worker pool so far.
-#[derive(Debug, Default)]
+/// What one request's attempts have told the worker pool so far. A clone is
+/// a handle to the same record: the dispatch stage's result carries the
+/// attempt's ledger to the plain collector, which samples a prefill side's
+/// breaker for it (see `ExecutionResult::PrefillDecode`).
+#[derive(Debug, Default, Clone)]
 pub(crate) struct AttemptLedger {
-    inner: Mutex<Ledger>,
+    inner: Arc<Mutex<Ledger>>,
+}
+
+/// The phase of the prefill side a dispatch waits on alone, or waited on
+/// when it was dropped (see [`AttemptLedger::prefill_phase_pending`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefillPhase {
+    /// Its call, before its answer: the sequential shape's dispatch and
+    /// first-response wait.
+    Call,
+    /// Its read to its end, after it answered: the sequential shape's drain,
+    /// the parallel shape's early read once the decode side answered.
+    Read,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +100,12 @@ struct Ledger {
     /// Engines (by base URL, so one DP rank's answer stands for its
     /// siblings) that answered the request definitively.
     answered: Vec<String>,
+    /// Prefill sides this attempt's dispatch waits on alone, before their
+    /// answer (see [`AttemptLedger::prefill_call`]).
+    prefill_calls: usize,
+    /// Prefill sides this attempt's dispatch waits on alone, read to their
+    /// end after their answer (see [`AttemptLedger::prefill_drain`]).
+    prefill_drains: usize,
 }
 
 impl AttemptLedger {
@@ -100,6 +121,50 @@ impl AttemptLedger {
             ledger.charged.push(worker.url().to_string());
         }
         worker.record_outcome(status_code);
+    }
+
+    /// The start of an attempt's dispatch: no call or read of an earlier
+    /// attempt's is in flight.
+    pub(crate) fn attempt_begins(&self) {
+        let mut ledger = self.inner.lock();
+        ledger.prefill_calls = 0;
+        ledger.prefill_drains = 0;
+    }
+
+    /// A prefill side's call the dispatch waits on alone begins (the
+    /// sequential shape, whose decode side is not dispatched before the
+    /// prefill's harvest). It is counted until [`PrefillCall::answered`]
+    /// turns it into the side's read, and a dispatch dropped by the attempt's
+    /// deadline leaves it counted, so the deadline is charged to the prefill
+    /// side the dispatch was waiting on, not to the decode side its answer
+    /// otherwise waits on (see `dispatch_timed_out`).
+    pub(crate) fn prefill_call(&self) -> PrefillCall<'_> {
+        self.inner.lock().prefill_calls += 1;
+        PrefillCall { ledger: self }
+    }
+
+    /// A prefill side's read to its end, after it answered, begins: the
+    /// parallel shape's early read once the decode side answered (the
+    /// sequential shape's drain comes through [`PrefillCall::answered`]). It
+    /// is counted until [`PrefillDrain::ended`], and a dispatch dropped by
+    /// the attempt's deadline leaves it counted, as a call is.
+    pub(crate) fn prefill_drain(&self) -> PrefillDrain<'_> {
+        self.inner.lock().prefill_drains += 1;
+        PrefillDrain { ledger: self }
+    }
+
+    /// The phase of the prefill side the dispatch waits on alone, or waited
+    /// on when it was dropped: a read when one is in flight (a batch may
+    /// hold calls and reads at once), else a call, else `None`.
+    pub(crate) fn prefill_phase_pending(&self) -> Option<PrefillPhase> {
+        let ledger = self.inner.lock();
+        if ledger.prefill_drains > 0 {
+            Some(PrefillPhase::Read)
+        } else if ledger.prefill_calls > 0 {
+            Some(PrefillPhase::Call)
+        } else {
+            None
+        }
     }
 
     /// Whether a retry attempt may select `worker`: not after it answered the
@@ -151,6 +216,47 @@ impl AttemptLedger {
         if !alternative {
             mark_non_retryable(response);
         }
+    }
+}
+
+/// A prefill side's call before its answer, counted on its attempt's ledger
+/// (see [`AttemptLedger::prefill_call`]) until the side answers; a call
+/// dropped before that, with the dispatch the deadline cut, stays counted by
+/// design.
+#[must_use = "the call is counted until the side answers"]
+pub(crate) struct PrefillCall<'a> {
+    ledger: &'a AttemptLedger,
+}
+
+impl<'a> PrefillCall<'a> {
+    /// The side answered: its count is its read's from here, until
+    /// [`PrefillDrain::ended`].
+    pub(crate) fn answered(self) -> PrefillDrain<'a> {
+        {
+            let mut ledger = self.ledger.inner.lock();
+            ledger.prefill_calls = ledger.prefill_calls.saturating_sub(1);
+            ledger.prefill_drains += 1;
+        }
+        PrefillDrain {
+            ledger: self.ledger,
+        }
+    }
+}
+
+/// A prefill side's read to its end after it answered, counted on its
+/// attempt's ledger (see [`AttemptLedger::prefill_drain`] and
+/// [`PrefillCall::answered`]) until it ends; a read dropped before that, with
+/// the dispatch the deadline cut, stays counted by design.
+#[must_use = "the read is counted until it is ended"]
+pub(crate) struct PrefillDrain<'a> {
+    ledger: &'a AttemptLedger,
+}
+
+impl PrefillDrain<'_> {
+    /// The read reached the side's end, or its failure: no longer in flight.
+    pub(crate) fn ended(self) {
+        let mut ledger = self.ledger.inner.lock();
+        ledger.prefill_drains = ledger.prefill_drains.saturating_sub(1);
     }
 }
 
@@ -295,5 +401,50 @@ mod tests {
             !is_retryable_response(&second),
             "no prefill worker is left: the answer is terminal, whatever the decode pool holds"
         );
+    }
+
+    #[test]
+    fn a_prefill_side_stays_counted_in_its_phase_until_it_ends_or_the_next_attempt_begins() {
+        let ledger = AttemptLedger::default();
+        assert_eq!(ledger.prefill_phase_pending(), None);
+        // The sequential shape: the call, then the read once the side answered.
+        let call = ledger.prefill_call();
+        assert_eq!(ledger.prefill_phase_pending(), Some(PrefillPhase::Call));
+        let read = call.answered();
+        assert_eq!(ledger.prefill_phase_pending(), Some(PrefillPhase::Read));
+        read.ended();
+        assert_eq!(
+            ledger.prefill_phase_pending(),
+            None,
+            "an ended read is out of flight"
+        );
+        // A read dropped with its dispatch (the deadline passed) stays counted,
+        // and names the phase over a call in flight at the same time.
+        {
+            let _read = ledger.prefill_drain();
+            let _call = ledger.prefill_call();
+        }
+        assert_eq!(
+            ledger.prefill_phase_pending(),
+            Some(PrefillPhase::Read),
+            "a read dropped mid-way is the deadline's to charge"
+        );
+        ledger.attempt_begins();
+        assert_eq!(
+            ledger.prefill_phase_pending(),
+            None,
+            "the next attempt starts clean"
+        );
+        // A call dropped before its answer stays counted as a call.
+        {
+            let _call = ledger.prefill_call();
+        }
+        assert_eq!(
+            ledger.prefill_phase_pending(),
+            Some(PrefillPhase::Call),
+            "a call dropped before the side answered is the deadline's to charge as a call"
+        );
+        ledger.attempt_begins();
+        assert_eq!(ledger.prefill_phase_pending(), None);
     }
 }
