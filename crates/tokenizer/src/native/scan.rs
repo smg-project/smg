@@ -273,7 +273,7 @@ impl Roles {
     /// set, which ends the run when it is ASCII and is read by
     /// [`Self::beyond`] when it is not, or the tail under eight bytes.
     #[inline(always)]
-    pub(super) fn run_end_as<const SCAN: u8>(
+    pub(super) fn run_end_as<const SCAN: u8, const WORDS: bool>(
         &self,
         text: &str,
         mut pos: usize,
@@ -286,7 +286,7 @@ impl Roles {
             );
         };
         debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
-        if self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
+        if !WORDS || self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
             return self.run_end(text, pos, bit);
         }
         let bytes = text.as_bytes();
@@ -560,23 +560,23 @@ mod tests {
                     }
                 }
                 assert_eq!(
-                    roles.run_end_as::<{ WordScan::LETTERS }>(&text, pos, 1),
+                    roles.run_end_as::<{ WordScan::LETTERS }, true>(&text, pos, 1),
                     by_bytes(1),
                     "{text:?} at {pos} letters"
                 );
                 assert_eq!(
-                    roles.run_end_as::<{ WordScan::SPACES }>(&text, pos, 2),
+                    roles.run_end_as::<{ WordScan::SPACES }, true>(&text, pos, 2),
                     by_bytes(2),
                     "{text:?} at {pos} spaces"
                 );
                 assert_eq!(
-                    roles.run_end_as::<{ WordScan::LOWER }>(&text, pos, 4),
+                    roles.run_end_as::<{ WordScan::LOWER }, true>(&text, pos, 4),
                     by_bytes(4),
                     "{text:?} at {pos} lower"
                 );
                 // The line breaks are no scan's set: the byte loop under any name.
                 assert_eq!(
-                    roles.run_end_as::<{ WordScan::SPACES }>(&text, pos, 8),
+                    roles.run_end_as::<{ WordScan::SPACES }, true>(&text, pos, 8),
                     by_bytes(8),
                     "{text:?} at {pos} breaks"
                 );
