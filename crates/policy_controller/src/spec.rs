@@ -28,11 +28,12 @@ use serde::{
 
 use crate::{
     builtins::{
-        Best, CountFirst, HasCapacity, HasRoom, Healthy, LeastLoad, LeastRequests, NotOverloaded,
-        NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, PrefixAffinity, Random,
-        RoundRobin, SessionAffinity,
+        Best, CountFirst, FewestSessions, HasCapacity, HasRoom, Healthy, LeastLoad, LeastRequests,
+        NotOverloaded, NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, PrefixAffinity,
+        Random, RoundRobin, SessionAffinity,
     },
     framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, Weighted},
+    sessions::SessionRule,
     view::Phase,
 };
 
@@ -63,9 +64,10 @@ pub const FILTERS: [&str; 5] = [
 
 /// The scorers of v1. Each has a parameter struct in this module; the ones
 /// this build lacks parse and are refused as not in this build.
-pub const SCORERS: [&str; 9] = [
+pub const SCORERS: [&str; 10] = [
     "least-load",
     "least-requests",
+    "fewest-sessions",
     "session-affinity",
     "prefix-affinity",
     "kv-pressure",
@@ -115,6 +117,12 @@ pub struct Needs {
     /// Allow-listed headers in the view.
     pub headers: bool,
     pub media: bool,
+    /// The count of session keys with a request in flight, per worker (the
+    /// `min_group` assignment and the `fewest-sessions` scorer).
+    pub active_sessions: bool,
+    /// The request's own key's in-flight count per worker (a sessions rule
+    /// with an in-flight cap).
+    pub session_in_flight: bool,
 }
 
 impl Needs {
@@ -130,6 +138,8 @@ impl Needs {
             ring: self.ring || other.ring,
             headers: self.headers || other.headers,
             media: self.media || other.media,
+            active_sessions: self.active_sessions || other.active_sessions,
+            session_in_flight: self.session_in_flight || other.session_in_flight,
         }
     }
 }
@@ -584,6 +594,7 @@ pub struct BestWithTemperatureParams {
 pub enum ScoreStage {
     LeastLoad(LeastLoadParams),
     LeastRequests(Weight),
+    FewestSessions(Weight),
     SessionAffinity(Weight),
     PrefixAffinity(PrefixAffinityParams),
     KvPressure(KvPressureParams),
@@ -599,6 +610,7 @@ impl ScoreStage {
         match self {
             Self::LeastLoad(_) => "least-load",
             Self::LeastRequests(_) => "least-requests",
+            Self::FewestSessions(_) => "fewest-sessions",
             Self::SessionAffinity(_) => "session-affinity",
             Self::PrefixAffinity(_) => "prefix-affinity",
             Self::KvPressure(_) => "kv-pressure",
@@ -613,7 +625,7 @@ impl ScoreStage {
     pub fn weight(&self) -> f32 {
         match self {
             Self::LeastLoad(p) => p.weight,
-            Self::LeastRequests(p) | Self::SessionAffinity(p) => p.weight,
+            Self::LeastRequests(p) | Self::FewestSessions(p) | Self::SessionAffinity(p) => p.weight,
             Self::PrefixAffinity(p) => p.weight,
             Self::KvPressure(p) => p.weight,
             Self::WarmupSlice(p) => p.weight,
@@ -630,6 +642,7 @@ impl ScoreStage {
         Some(match name {
             "least-load" => Self::LeastLoad(LeastLoadParams::default()),
             "least-requests" => Self::LeastRequests(Weight::default()),
+            "fewest-sessions" => Self::FewestSessions(Weight::default()),
             "session-affinity" => Self::SessionAffinity(Weight::default()),
             "prefix-affinity" => Self::PrefixAffinity(PrefixAffinityParams::default()),
             "kv-pressure" => Self::KvPressure(KvPressureParams::default()),
@@ -681,7 +694,9 @@ impl Serialize for ScoreSpec {
         let mut map = serializer.serialize_map(Some(1))?;
         match stage {
             ScoreStage::LeastLoad(p) => map.serialize_entry(stage.name(), p)?,
-            ScoreStage::LeastRequests(p) | ScoreStage::SessionAffinity(p) => {
+            ScoreStage::LeastRequests(p)
+            | ScoreStage::FewestSessions(p)
+            | ScoreStage::SessionAffinity(p) => {
                 map.serialize_entry(stage.name(), p)?;
             }
             ScoreStage::PrefixAffinity(p) => map.serialize_entry(stage.name(), p)?,
@@ -705,6 +720,7 @@ fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreStage, A::Err
     let stage = match key.as_str() {
         "least-load" => ScoreStage::LeastLoad(map.next_value()?),
         "least-requests" => ScoreStage::LeastRequests(map.next_value()?),
+        "fewest-sessions" => ScoreStage::FewestSessions(map.next_value()?),
         "session-affinity" => ScoreStage::SessionAffinity(map.next_value()?),
         "prefix-affinity" => ScoreStage::PrefixAffinity(map.next_value()?),
         "kv-pressure" => ScoreStage::KvPressure(map.next_value()?),
@@ -1029,6 +1045,17 @@ pub enum Assignment {
     Delegate,
 }
 
+/// Which of a key's two pins leads once both are routable again: the first
+/// worker the key was placed on (the manual policy's order) or the latest
+/// one it was dispatched to (the sticky override's under `delegate`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Recovery {
+    #[default]
+    Original,
+    Latest,
+}
+
 /// Sticky sessions on the binding: a keyed request stays on the worker its
 /// key was first placed on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1042,11 +1069,12 @@ pub struct SessionsSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
     /// How long an idle key stays pinned, in seconds; above zero (default
-    /// 14400).
+    /// 14400), `4294967295` for ever.
     #[serde(default = "default_ttl_s")]
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The sweep cadence of idle keys, in seconds; above zero (default 120).
+    /// The sweep cadence of idle keys, in seconds; above zero (default 120),
+    /// `4294967295` for never, allowed under a `ttl_s` for ever alone.
     #[serde(default = "default_sweep_s")]
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
@@ -1054,14 +1082,18 @@ pub struct SessionsSpec {
     #[serde(default)]
     pub assignment: Assignment,
     /// How many requests of one key a worker carries before the next steps
-    /// aside; above zero (default 2).
+    /// aside; above zero (default 2), `65535` for no cap.
     #[serde(default = "default_inflight_cap")]
     #[schemars(range(min = 1))]
     pub inflight_cap: u16,
-    /// Issue a session id to a request that carries none (default false:
-    /// the host issues none).
+    /// Issue a session id to a request that carries none (default false;
+    /// not in this build: set, it is refused by name).
     #[serde(default)]
     pub issue_session_id: bool,
+    /// Which pin leads once both of a key's pins are routable (default
+    /// `original`).
+    #[serde(default)]
+    pub recovery: Recovery,
 }
 
 fn default_ttl_s() -> u32 {
@@ -1319,6 +1351,12 @@ pub enum SpecError {
     HashIndexNeedsBoundaries { model: String },
     #[error("{path}: {reason}")]
     Reserved { path: String, reason: &'static str },
+    #[error("binding {index}: sessions {name} is not {reason}")]
+    BadSessions {
+        index: usize,
+        name: &'static str,
+        reason: &'static str,
+    },
     #[error("no profiles")]
     Empty,
     #[error("unknown preset {0:?}")]
@@ -1562,7 +1600,9 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
                 "a finite number above zero",
             )
         }
-        ScoreStage::LeastRequests(_) | ScoreStage::SessionAffinity(_) => Ok(()),
+        ScoreStage::LeastRequests(_)
+        | ScoreStage::FewestSessions(_)
+        | ScoreStage::SessionAffinity(_) => Ok(()),
         ScoreStage::PrefixAffinity(p) => {
             at.number("threshold", p.threshold, unit_interval, "between 0 and 1")?;
             at.number(
@@ -1651,6 +1691,7 @@ fn scorer_of(stage: &ScoreStage) -> Resolved<Box<dyn Scorer>> {
             p.default_throughput.unwrap_or(2000.0),
         )),
         ScoreStage::LeastRequests(_) => built_scorer(LeastRequests),
+        ScoreStage::FewestSessions(_) => built_scorer(FewestSessions),
         ScoreStage::SessionAffinity(_) => built_scorer(SessionAffinity),
         ScoreStage::PrefixAffinity(p) if p.has_parameters() => {
             Resolved::NotInBuild("the prefix-affinity parameters")
@@ -1966,8 +2007,11 @@ fn check_binding_rules(
         check_overload(overload, &at.sub("overload"))?;
     }
     if let Some(sessions) = &b.sessions {
-        check_sessions(sessions, cx, &at.sub("sessions"))?;
-        deferred.note(at.field("sessions"), "the session table");
+        let at = at.sub("sessions");
+        check_sessions(sessions, cx, &at)?;
+        if sessions.issue_session_id {
+            deferred.note(at.field("issue_session_id"), "issuing a session id");
+        }
     }
     if let Some(shadow) = &b.shadow {
         if !cx.profiles.contains_key(shadow.as_str()) {
@@ -2040,6 +2084,7 @@ fn resolve_plan(
         plan,
         profile,
         decode_profile,
+        sessions: None,
     };
     if plan == PlanName::Single {
         if b.profile.is_some() && !b.profiles.is_empty() {
@@ -2095,23 +2140,78 @@ fn resolve_plan(
 fn check_binding(
     b: &BindingSpec,
     cx: &BindingContext<'_>,
+    needs: &mut Needs,
     deferred: &mut Deferred,
 ) -> Result<Option<Binding>, SpecError> {
     let at = At::new(format!("bindings[{}]", cx.index));
     check_matcher(&b.matcher, cx, &at, deferred)?;
     check_binding_rules(b, cx, &at, deferred)?;
-    resolve_plan(b, cx, deferred)
+    let mut built = resolve_plan(b, cx, deferred)?;
+    if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
+        let rule = session_rule(sessions, cx.index, binding.plan)?;
+        needs.active_sessions |= rule.assignment == Assignment::MinGroup;
+        needs.session_in_flight |= rule.inflight_cap > 0;
+        binding.sessions = Some(rule);
+    }
+    Ok(built)
+}
+
+/// The sessions rule as the engine runs it: the schema's largest cap is no
+/// cap, its largest idle time or sweep is for ever (a sweep for ever under a
+/// finite idle time is refused, as nothing would forget the keys; an idle
+/// time for ever sweeps nothing), and the rule runs under the `single` plan
+/// alone.
+fn session_rule(
+    sessions: &SessionsSpec,
+    index: usize,
+    plan: Plan,
+) -> Result<SessionRule, SpecError> {
+    if plan != Plan::Single {
+        return Err(SpecError::BadSessions {
+            index,
+            name: "plan",
+            reason: "sessions run under the single plan",
+        });
+    }
+    let forever = |secs: u32| secs == u32::MAX;
+    if forever(sessions.sweep_s) && !forever(sessions.ttl_s) {
+        return Err(SpecError::BadSessions {
+            index,
+            name: "sweep_s",
+            reason: "finite while ttl_s is",
+        });
+    }
+    Ok(SessionRule {
+        assignment: sessions.assignment,
+        inflight_cap: if sessions.inflight_cap == u16::MAX {
+            0
+        } else {
+            sessions.inflight_cap
+        },
+        ttl_micros: (!forever(sessions.ttl_s)).then(|| u64::from(sessions.ttl_s) * 1_000_000),
+        sweep_micros: if forever(sessions.ttl_s) {
+            0
+        } else {
+            u64::from(sessions.sweep_s) * 1_000_000
+        },
+        recovery: sessions.recovery,
+    })
 }
 
 /// The ten preset names of today, as whole profiles. The ones whose stages
 /// this build does not carry yet answer `UnknownPreset`.
-pub const PRESETS: [&str; 5] = [
+pub const PRESETS: [&str; 6] = [
     "random",
     "round_robin",
     "passthrough",
     "power_of_two",
     "least_load",
+    "manual",
 ];
+
+/// The header the `manual` preset names as its session key, the gateway's
+/// routing-key header; the host feeds the key it resolved under it.
+pub const MANUAL_SESSION_HEADER: &str = "x-smg-routing-key";
 
 fn standard_filters() -> Vec<String> {
     vec![
@@ -2151,7 +2251,35 @@ impl PolicySpec {
                 score: vec!["least-load".into()],
                 pick: "best".into(),
             },
+            // Sticky sessions over a random assignment: a key stays with the
+            // first worker it was placed on, no in-flight cap, the first
+            // worker back in the lead when it recovers; the idle TTL of four
+            // hours swept each minute, as the keyed policy of today.
+            "manual" => ProfileSpec {
+                filter: standard_filters(),
+                score: vec![],
+                pick: "random".into(),
+            },
             other => return Err(SpecError::UnknownPreset(other.to_string())),
+        };
+        let manual = name == "manual";
+        let sessions = manual.then(|| SessionsSpec {
+            sticky_header: MANUAL_SESSION_HEADER.into(),
+            headers: vec![],
+            ttl_s: 14_400,
+            sweep_s: 60,
+            assignment: Assignment::Delegate,
+            inflight_cap: u16::MAX,
+            issue_session_id: false,
+            recovery: Recovery::Original,
+        });
+        let view = ViewSpec {
+            headers: if manual {
+                vec![MANUAL_SESSION_HEADER.into()]
+            } else {
+                vec![]
+            },
+            ..ViewSpec::default()
         };
         let mut profiles = BTreeMap::new();
         profiles.insert(name.to_string(), profile);
@@ -2159,12 +2287,13 @@ impl PolicySpec {
             api_version: API_VERSION.to_string(),
             generation: 1,
             kind: None,
-            view: ViewSpec::default(),
+            view,
             index: BTreeMap::new(),
             profiles,
             plans: PlansSpec::default(),
             bindings: vec![BindingSpec {
                 profile: Some(name.to_string()),
+                sessions,
                 ..BindingSpec::default()
             }],
         })
@@ -2260,7 +2389,7 @@ impl PolicySpec {
                 denied: denied_headers,
                 profiles: &positions,
             };
-            if let Some(built) = check_binding(binding, &cx, &mut deferred)? {
+            if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 bindings.push(built);
             }
         }
@@ -2280,6 +2409,7 @@ impl PolicySpec {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                sessions: None,
             });
         }
         needs.headers |= !self.view.headers.is_empty();
@@ -2389,6 +2519,9 @@ mod tests {
             let load_aware = name == "least_load" || name == "power_of_two";
             assert_eq!(engine.needs().loads, load_aware, "{name}");
             assert!(!engine.needs().events, "{name}");
+            assert_eq!(engine.needs().headers, name == "manual", "{name}");
+            assert!(!engine.needs().active_sessions, "{name}");
+            assert!(!engine.needs().session_in_flight, "{name}");
             assert!(engine.profile_for("any", Phase::Single).is_some(), "{name}");
             // One profile bound to every model and phase: the per-phase and
             // per-binding reads are the summary.
@@ -2580,6 +2713,12 @@ mod tests {
           "bindings": [ { "profile": "p", "fallback": "p" } ] }"#,
         );
         assert!(err.contains("unknown field `fallback`"), "{err}");
+        let err = parse_error(
+            r#"{ "apiVersion": "smg.policy/v1",
+          "profiles": { "p": { "pick": "random" } },
+          "bindings": [ { "profile": "p", "sessions": { "ttl": 600 } } ] }"#,
+        );
+        assert!(err.contains("unknown field `ttl`"), "{err}");
     }
 
     #[test]
@@ -2988,6 +3127,7 @@ mod tests {
         let in_build = [
             "least-load",
             "least-requests",
+            "fewest-sessions",
             "session-affinity",
             "prefix-affinity",
         ];
@@ -3143,9 +3283,15 @@ mod tests {
         let sessions = spec_with_binding(
             r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"assignment":"min_load"}}"#,
         );
+        let built = sessions
+            .validate()
+            .expect("the session table is in this build");
+        assert!(built.needs().headers && !built.needs().active_sessions);
+        assert!(built.needs().session_in_flight, "the default cap of two");
         assert_eq!(
-            not_in_build(&sessions),
-            ("bindings[0].sessions".to_string(), "the session table")
+            built.needs_for_phase(Phase::Single),
+            built.needs(),
+            "the rule's needs are the binding's phase needs"
         );
         assert_eq!(
             spec_with_binding(r#"{"profile":"p","sessions":{"sticky_header":"x-other"}}"#)
@@ -3173,6 +3319,49 @@ mod tests {
                 r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","inflight_cap":0}}"#
             )),
             "bindings[0].sessions.inflight_cap"
+        );
+        // A sweep for ever under a finite idle time would never forget a key.
+        assert_eq!(
+            spec_with_binding(
+                r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"sweep_s":4294967295}}"#
+            )
+            .validate()
+            .err(),
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "sweep_s",
+                reason: "finite while ttl_s is",
+            })
+        );
+        // An idle time for ever keeps every key and sweeps nothing, whatever
+        // the sweep says; a finite pair maps to the rule in microseconds.
+        let rule = |sessions: &str| {
+            spec_with_binding(&format!(
+                r#"{{"profile":"p","sessions":{{"sticky_header":"x-session-id",{sessions}}}}}"#
+            ))
+            .validate()
+            .expect("a sessions rule")
+            .binding("m", Phase::Single)
+            .and_then(|binding| binding.sessions)
+            .map(|rule| (rule.ttl_micros, rule.sweep_micros))
+        };
+        assert_eq!(
+            rule(r#""ttl_s":4294967295,"sweep_s":4294967295"#),
+            Some((None, 0))
+        );
+        assert_eq!(rule(r#""ttl_s":4294967295,"sweep_s":60"#), Some((None, 0)));
+        assert_eq!(
+            rule(r#""ttl_s":600,"sweep_s":60"#),
+            Some((Some(600_000_000), 60_000_000))
+        );
+        assert_eq!(
+            not_in_build(&spec_with_binding(
+                r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","issue_session_id":true}}"#
+            )),
+            (
+                "bindings[0].sessions.issue_session_id".to_string(),
+                "issuing a session id"
+            )
         );
         let err = parse_error(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}},"bindings":[{"profile":"p","sessions":{"ttl_s":1}}]}"#,

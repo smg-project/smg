@@ -46,6 +46,7 @@ pub mod builtins;
 pub mod decision;
 pub mod framework;
 pub mod lease;
+pub mod sessions;
 pub mod spec;
 pub mod store;
 pub mod view;
@@ -60,7 +61,8 @@ pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
     TransportClass,
 };
-pub use spec::{Needs, PolicySpec, SpecError, API_VERSION, PRESETS};
+pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
+pub use spec::{Needs, PolicySpec, SessionsSpec, SpecError, API_VERSION, PRESETS};
 pub use view::{
     fingerprint, Candidate, Constraints, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
     OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,

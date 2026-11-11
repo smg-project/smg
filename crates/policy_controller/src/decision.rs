@@ -4,7 +4,7 @@
 //! on its stream and the host's fallback takes over at once, so the enum
 //! never carries one.
 
-use crate::view::WorkerId;
+use crate::{sessions::SessionVerdict, view::WorkerId};
 
 /// Targets a decision carries at most: the pick and its alternates.
 pub const MAX_TARGETS: usize = 4;
@@ -67,6 +67,20 @@ impl Targets {
         self.len = 0;
     }
 
+    /// Puts `target` first and keeps the others behind it in their order; a
+    /// copy of `target` among them leaves, and so does the last one when the
+    /// list is full.
+    pub fn lead(&mut self, target: Target) {
+        let mut led = Self::new();
+        led.push(target);
+        for t in self.as_slice() {
+            if t.id != target.id {
+                led.push(*t);
+            }
+        }
+        *self = led;
+    }
+
     pub fn len(&self) -> usize {
         usize::from(self.len)
     }
@@ -121,11 +135,14 @@ pub struct Trace {
     pub generation: u64,
 }
 
-/// A pick: ordered targets and the trace.
+/// A pick: ordered targets, the trace, and what a sessions rule did with
+/// the request's key (`None` without one); the host copies the verdict onto
+/// the lease it commits.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pick {
     pub targets: Targets,
     pub trace: Trace,
+    pub session: SessionVerdict,
 }
 
 /// A shed: the reason, the stage that emptied the pool, and the pacing hint.
@@ -226,7 +243,37 @@ mod tests {
         let pick = Decision::Pick(Pick {
             targets: Targets::new(),
             trace,
+            session: SessionVerdict::None,
         });
         assert!(pick.pick().is_some());
+    }
+
+    #[test]
+    fn lead_puts_a_target_first_and_drops_its_copy_or_the_last_one() {
+        let target = |id: u64| Target {
+            position: id as u32,
+            id: WorkerId(id),
+            dp_rank: 0,
+            pair: None,
+        };
+        let mut targets = Targets::new();
+        for id in 1..=3 {
+            targets.push(target(id));
+        }
+        targets.lead(target(3));
+        let ids = |t: &Targets| t.as_slice().iter().map(|t| t.id.0).collect::<Vec<_>>();
+        assert_eq!(ids(&targets), [3, 1, 2], "a copy among them leaves");
+        let mut full = Targets::new();
+        for id in 1..=MAX_TARGETS as u64 {
+            full.push(target(id));
+        }
+        full.lead(target(9));
+        assert_eq!(full.len(), MAX_TARGETS);
+        assert_eq!(ids(&full)[0], 9, "the newcomer leads");
+        assert_eq!(
+            *ids(&full).last().expect("full"),
+            MAX_TARGETS as u64 - 1,
+            "the last one left"
+        );
     }
 }

@@ -135,7 +135,7 @@ fn normalize_costs(out: &mut [f32]) -> f32 {
 }
 
 /// Fewest requests in flight on the host.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LeastRequests;
 
 impl Lifecycle for LeastRequests {}
@@ -191,6 +191,40 @@ impl Scorer for SessionAffinity {
     fn needs(&self) -> Needs {
         Needs {
             headers: true,
+            ..Needs::default()
+        }
+    }
+}
+
+/// Fewest session keys with a request in flight on the worker (the host's
+/// count): the `min_group` assignment of a sticky session.
+#[derive(Debug, Default)]
+pub struct FewestSessions;
+
+impl Lifecycle for FewestSessions {}
+
+impl Scorer for FewestSessions {
+    fn name(&self) -> &'static str {
+        "fewest-sessions"
+    }
+
+    fn score(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        for (slot, &i) in out.iter_mut().zip(kept) {
+            *slot = f32::from(candidates[i as usize].active_sessions);
+        }
+        normalize_costs(out);
+        TieBand::NORMALIZED
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            active_sessions: true,
             ..Needs::default()
         }
     }
@@ -695,7 +729,7 @@ impl Scorer for LeastLoad {
 
 /// The best score first, ties drawn uniformly from the decision's seed, then
 /// the next best as alternates.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Best;
 
 impl Lifecycle for Best {}
@@ -829,7 +863,7 @@ impl Picker for Passthrough {
 
 /// A uniform draw over the survivors from the decision's seed, then further
 /// distinct draws as alternates.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Random;
 
 impl Lifecycle for Random {}
