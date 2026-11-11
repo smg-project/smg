@@ -915,7 +915,9 @@ async fn admin_config(State(state): State<Arc<AppState>>) -> Response {
 /// `POST /secrets/reload`: the keys read again from their files and put in
 /// force. The `admin` role alone. 409 when no key came from a file; 422
 /// when a file cannot be used, every set standing as it was; 200 with the
-/// files read and whether each set changed.
+/// files read and whether each set changed. The keys the gateway accepts
+/// alone: the shared key it sends upstream to its workers keeps the start's
+/// value until a restart.
 async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
     // The role is the control-plane gate's: it admits `admin` alone to a
     // POST before any handler, and the role matrix test pins this route.
