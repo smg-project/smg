@@ -2120,10 +2120,10 @@ impl PDRouter {
         }
     }
 
+    /// Whether the body is read for the pair policies' sake: the registry's
+    /// static answer for the two pair sides.
     fn policies_need_request_text(&self) -> bool {
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-        prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+        self.policy_registry.pair_needs_request_text()
     }
 
     /// The count request as the prefill worker receives it (its model the

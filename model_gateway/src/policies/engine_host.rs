@@ -33,8 +33,8 @@ use smg_policy_controller::{
     fingerprint,
     spec::{BindingSpec, LeastLoadParams, ProfileSpec, ScoreSpec, ScoreStage},
     Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId, LeaseKind,
-    Lifecycle, LoadRow, Membership, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts, Role,
-    Scratch, Side, SignalSource, SpecError, Target, WorkerId,
+    Lifecycle, LoadRow, Membership, Needs, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts,
+    Role, Scratch, Side, SignalSource, SpecError, Target, WorkerId,
 };
 use tracing::debug;
 
@@ -174,6 +174,13 @@ pub fn worker_id(worker: &dyn Worker) -> WorkerId {
     WorkerId(fingerprint(worker.url().as_bytes()) ^ handle.wrapping_mul(0x9e37_79b9_7f4a_7c15))
 }
 
+/// Whether stages with `needs` read the request body: its text, or the
+/// prefix hashes of either kind the host computes from it. The token hashes
+/// alone are computed from a request's token ids when it carries them.
+pub(crate) fn wants_text(needs: Needs) -> bool {
+    needs.text || needs.token_hashes || needs.text_hashes
+}
+
 thread_local! {
     /// The view of the decision in progress on this thread, reused across
     /// decisions so a decision allocates nothing after the first.
@@ -269,9 +276,8 @@ impl Decider {
         if let Some(profile) = spec.profiles.get_mut("decode") {
             tune(profile, decode);
         }
-        let default_profile = profile_of(default)?;
-        let mean_prompt_tokens = mean_prefill_of(&default_profile);
-        spec.profiles.insert("default".to_string(), default_profile);
+        spec.profiles
+            .insert("default".to_string(), profile_of(default)?);
         // The pair binding covers the two pair phases; every other phase
         // resolves to the default profile.
         for binding in &mut spec.bindings {
@@ -281,6 +287,13 @@ impl Decider {
             profile: Some("default".to_string()),
             ..BindingSpec::default()
         });
+        Self::from_spec(&spec)
+    }
+
+    /// The engine for a document: `spec` validated and hosted. A request of
+    /// unknown prompt size is booked at the mean prefill of the profile
+    /// named `default` when it prices tokens, nothing otherwise.
+    pub fn from_spec(spec: &PolicySpec) -> Result<Self, EngineHostError> {
         Ok(Self {
             engine: spec.validate()?,
             loads: RwLock::new(None),
@@ -289,7 +302,7 @@ impl Decider {
             between_check_and_booking: Mutex::new(None),
             origin: Instant::now(),
             seq: AtomicU64::new(1),
-            mean_prompt_tokens,
+            mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
         })
     }
 
@@ -803,7 +816,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::test_support,
+        config::types::ManualAssignmentMode,
+        policies::{test_support, PolicyFactory},
         worker::{
             load_state::{one_rank_load, LoadSnapshot},
             test_support::worker_of,
@@ -838,6 +852,93 @@ mod tests {
 
     fn decider(config: &PolicyConfig) -> Decider {
         Decider::from_configs(config, config, config).expect("a carried policy")
+    }
+
+    /// The host answers its static needs (the text questions, the load
+    /// poll, the stream kind) from the engine for the policies it serves,
+    /// so for every configuration the converter carries the engine's needs
+    /// for a regular placement and for both pair sides must equal the flags
+    /// of the legacy policy built from the same configuration. A
+    /// configuration the converter refuses is never answered from the
+    /// engine.
+    #[test]
+    fn a_carried_configurations_needs_equal_the_legacy_policys_flags() {
+        let configs = [
+            PolicyConfig::Random,
+            PolicyConfig::RoundRobin,
+            PolicyConfig::Passthrough,
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
+            PolicyConfig::PowerOfTwo {
+                load_metric: PowerOfTwoLoadMetric::ExpectedWait,
+            },
+            PolicyConfig::PowerOfTwo {
+                load_metric: PowerOfTwoLoadMetric::Requests,
+            },
+            PolicyConfig::PowerOfTwo {
+                load_metric: PowerOfTwoLoadMetric::LeastRequests,
+            },
+            PolicyConfig::PowerOfTwo {
+                load_metric: PowerOfTwoLoadMetric::ResidentTokens {
+                    request_tokens: 512,
+                },
+            },
+            PolicyConfig::LeastLoad {
+                kv_pressure_weight: 0.0,
+                mean_prefill_tokens: 100,
+                default_throughput: 1000.0,
+            },
+            PolicyConfig::Bucket {
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                bucket_adjust_interval_secs: 5,
+            },
+            PolicyConfig::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 600,
+                assignment_mode: ManualAssignmentMode::default(),
+            },
+            PolicyConfig::ConsistentHashing,
+            PolicyConfig::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 32,
+                cache_boundaries: vec![],
+            },
+        ];
+        let mut carried = 0;
+        for config in &configs {
+            let name = config.name();
+            let legacy = PolicyFactory::create_from_config(config);
+            let Ok(decider) = Decider::from_configs(config, config, config) else {
+                assert!(preset_name(config).is_none(), "{name} is carried");
+                continue;
+            };
+            carried += 1;
+            for phase in [Phase::Single, Phase::Prefill, Phase::Decode] {
+                let needs = decider.engine().needs_for_phase(phase);
+                assert_eq!(
+                    wants_text(needs),
+                    legacy.needs_request_text(),
+                    "{name} {phase:?}: text"
+                );
+                assert_eq!(
+                    needs.text || needs.text_hashes,
+                    legacy.needs_request_text_with_tokens(),
+                    "{name} {phase:?}: text with token ids"
+                );
+                assert_eq!(
+                    needs.loads,
+                    legacy.needs_backend_loads(),
+                    "{name} {phase:?}: loads"
+                );
+                assert_eq!(
+                    needs.events,
+                    legacy.needs_kv_events(),
+                    "{name} {phase:?}: KV events"
+                );
+            }
+        }
+        assert_eq!(carried, 7, "the five presets, power_of_two in three forms");
     }
 
     /// A removed worker's rows leave the engine's accounting with it: work

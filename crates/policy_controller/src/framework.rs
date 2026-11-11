@@ -97,6 +97,17 @@ pub struct Profile {
     pub picker: Box<dyn Picker>,
 }
 
+impl Profile {
+    /// What this profile's stages read from the host beyond the facts every
+    /// view carries. The engine's summary ([`Engine::needs`]) adds the view's
+    /// own list of headers.
+    pub fn needs(&self) -> Needs {
+        self.scorers
+            .iter()
+            .fold(Needs::default(), |needs, w| needs.or(w.scorer.needs()))
+    }
+}
+
 /// Per-decision scratch the framework owns; kept by the host per thread so a
 /// decision allocates nothing after the first.
 #[derive(Debug, Default)]
@@ -417,6 +428,21 @@ pub struct Engine {
     bindings: Vec<Binding>,
     generation: u64,
     needs: Needs,
+    /// The stages' needs of every binding that covers a phase, folded per
+    /// phase ([`Self::needs_for_phase`]), indexed by [`PHASES`].
+    phase_needs: [Needs; PHASES.len()],
+}
+
+/// Every phase, in the order [`Engine::phase_needs`] keeps them.
+const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+
+/// The profile a binding resolves `phase` to: the decode profile of a
+/// `pd-pair` plan's decode side, the binding's profile otherwise.
+fn profile_index(binding: &Binding, phase: Phase) -> u16 {
+    match (binding.plan, phase) {
+        (Plan::PdPair, Phase::Decode) => binding.decode_profile.unwrap_or(binding.profile),
+        _ => binding.profile,
+    }
 }
 
 /// The two pools of a pair decision: the open prefills and the decodes, each
@@ -434,11 +460,50 @@ impl Engine {
         generation: u64,
         needs: Needs,
     ) -> Self {
+        // Per phase, the bindings that cover it in the spec's order; a
+        // binding behind a catch-all model glob decides no request of the
+        // phase and adds nothing (the gateway's own document binds every
+        // model's pair phases before its catch-all for the regular ones).
+        let mut phase_needs = [Needs::default(); PHASES.len()];
+        for (slot, phase) in PHASES.into_iter().enumerate() {
+            for binding in bindings
+                .iter()
+                .filter(|b| b.phases.is_empty() || b.phases.contains(&phase))
+            {
+                if let Some(profile) = profiles.get(usize::from(profile_index(binding, phase))) {
+                    phase_needs[slot] = phase_needs[slot].or(profile.needs());
+                }
+                if binding.model == "*" {
+                    break;
+                }
+            }
+        }
+        // A pair's decode side is decided by the binding its prefill lookup
+        // resolves to ([`Self::decide_pair`]), not by the first binding that
+        // covers the decode phase: the decode slot also carries the decode
+        // profile of every pair binding a prefill lookup can reach.
+        let decode_slot = PHASES.iter().position(|p| *p == Phase::Decode).unwrap_or(0);
+        for binding in bindings
+            .iter()
+            .filter(|b| b.phases.is_empty() || b.phases.contains(&Phase::Prefill))
+        {
+            if binding.plan == Plan::PdPair {
+                if let Some(profile) =
+                    profiles.get(usize::from(profile_index(binding, Phase::Decode)))
+                {
+                    phase_needs[decode_slot] = phase_needs[decode_slot].or(profile.needs());
+                }
+            }
+            if binding.model == "*" {
+                break;
+            }
+        }
         Self {
             profiles,
             bindings,
             generation,
             needs,
+            phase_needs,
         }
     }
 
@@ -446,9 +511,47 @@ impl Engine {
         self.generation
     }
 
-    /// What the host must feed before any request exists.
+    /// What the host must feed before any request exists: every profile's
+    /// stages and the view's own list of headers.
     pub fn needs(&self) -> Needs {
         self.needs
+    }
+
+    /// What a decision of `phase` for `model` reads: the needs of the stages
+    /// of the profile its binding resolves to, nothing when no binding
+    /// matches. A decode decision may also be the decode side of a pair,
+    /// whose profile the prefill lookup names ([`Self::decide_pair`]); the
+    /// decode answer carries that profile's needs too. The host reads it per
+    /// worker, at registration, to choose the worker's stream.
+    pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
+        let own = self
+            .profile_for(model, phase)
+            .map(|(_, profile)| profile.needs())
+            .unwrap_or_default();
+        match phase {
+            Phase::Decode => own.or(self.pair_decode_needs(model)),
+            _ => own,
+        }
+    }
+
+    /// The needs of the decode profile of the pair binding `model`'s prefill
+    /// lookup resolves to, nothing when that binding is not a pair.
+    fn pair_decode_needs(&self, model: &str) -> Needs {
+        self.binding(model, Phase::Prefill)
+            .filter(|b| b.plan == Plan::PdPair)
+            .and_then(|b| {
+                self.profiles
+                    .get(usize::from(profile_index(b, Phase::Decode)))
+            })
+            .map(Profile::needs)
+            .unwrap_or_default()
+    }
+
+    /// What some decision of `phase` may read, over every binding that
+    /// covers the phase: the host's answer to "does any regular placement
+    /// read the request text" and its kin, read at apply.
+    pub fn needs_for_phase(&self, phase: Phase) -> Needs {
+        self.phase_needs[PHASES.iter().position(|p| *p == phase).unwrap_or(0)]
     }
 
     pub fn profiles(&self) -> &[Profile] {
@@ -463,10 +566,7 @@ impl Engine {
     /// The profile a request resolves to for its phase.
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {
         let binding = self.binding(model, phase)?;
-        let index = match (binding.plan, phase) {
-            (Plan::PdPair, Phase::Decode) => binding.decode_profile.unwrap_or(binding.profile),
-            _ => binding.profile,
-        };
+        let index = profile_index(binding, phase);
         self.profiles.get(usize::from(index)).map(|p| (index, p))
     }
 
