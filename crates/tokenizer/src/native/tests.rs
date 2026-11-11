@@ -412,6 +412,44 @@ fn every_shape_gets_a_native_path() {
     }
 }
 
+/// A vocabulary without a token for one byte (some files lack one for a
+/// byte no text of theirs holds) keeps its merge table: the pieces that
+/// hold the byte are the model's, every other piece merges in the table.
+#[test]
+fn a_byte_without_a_token_leaves_its_pieces_to_the_model() {
+    let mut state = 0xB17E_0000_0000_0001u64;
+    let shape = &shapes()[0];
+    let mut tokenizer = tokenizer_of(shape, &mut state);
+    // The vertical tab's token taken out: no pool text holds the byte, so
+    // no merge names it.
+    let gone = bytes_char()[0x0B].to_string();
+    let mut model = serde_json::to_value(tokenizer.get_model()).expect("the model as JSON");
+    let vocab = model["vocab"].as_object_mut().expect("the vocabulary");
+    assert!(vocab.remove(&gone).is_some(), "the byte's token was there");
+    tokenizer.with_model(serde_json::from_value::<BPE>(model).expect("a model without it"));
+    let native = seeded(&tokenizer);
+    assert!(native
+        .merges
+        .as_ref()
+        .is_some_and(|table| table.lacks_a_token_for(b"\x0b")));
+    for text in [
+        "plain words here",
+        "a\u{b}b",
+        " \u{b} \u{b}\u{b}x",
+        "tabs\tand\u{b}more words",
+    ] {
+        let reference = tokenizer
+            .encode(text, false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        let ids = native
+            .encode(Some(tokenizer.get_model()), text, false)
+            .unwrap_or_else(|fallback| panic!("declined {text:?} as {fallback:?}"));
+        assert_eq!(ids, reference, "{text:?}");
+    }
+}
+
 #[test]
 fn shapes_outside_the_path_are_declined() {
     let mut state = 0x1234_5678_9ABC_DEF1u64;
