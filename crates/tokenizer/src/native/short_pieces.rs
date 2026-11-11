@@ -17,7 +17,15 @@
 //! the pieces it met in a table of its own (see `native`), which starts at
 //! [`MIN_SLOTS`] and grows as the thread meets pieces (by four up to
 //! `GROW_BY_FOUR_UP_TO` slots, by two above), up to the slots for the
-//! thread's share, so a thread that encodes little holds little.
+//! thread's share, so a thread that encodes little holds little. A thread's
+//! table grows in place: its slots are reserved up to
+//! [`THREAD_BACKING_SLOTS`] when it is made (reserved, not written: a page
+//! of the reservation is touched when a slot in it is first used), a growth
+//! step extends the table into the reservation and places the stored
+//! entries again where they stand, and only a table that outgrows the
+//! reservation moves to a new allocation; so a thread that encodes little
+//! touches little, and a thread that encodes much pays the pages of one
+//! table, not of every table it grew through.
 
 /// Longest piece the table keys: its bytes and length fit a `u128`.
 pub(super) const SHORT_PIECE_MAX_BYTES: usize = 15;
@@ -36,6 +44,14 @@ const MAX_IDS: usize = 15;
 /// Fewest slots a table has, whatever it was sized for; a thread's table
 /// starts here and grows.
 pub(super) const MIN_SLOTS: usize = 64;
+/// Slots reserved for a thread's table when it is made: the size a thread
+/// reaches over its first few thousand pieces. The reservation is not
+/// written until a growth step extends the table into it, so a thread of
+/// few pieces touches the pages of its small table alone, and a thread that
+/// grows to the reservation touches its pages once, where growth through
+/// new tables touched every table's (measured: the tables grown through
+/// were 97 % of a cold call's page faults under threads).
+pub(super) const THREAD_BACKING_SLOTS: usize = 16_384;
 
 /// Slots up to which a table grows by four at a time (the entries placed
 /// again over that growth are a fourth of what doublings place); above them
@@ -188,16 +204,17 @@ pub(super) struct ShortPieceTable {
 }
 
 impl ShortPieceTable {
-    /// A table of [`MIN_SLOTS`] slots: what a thread starts with and grows
-    /// (see [`Self::insert`]).
+    /// A thread's table: [`MIN_SLOTS`] slots in a reservation of
+    /// [`THREAD_BACKING_SLOTS`], grown in place (see [`Self::insert`]).
     pub(super) fn new() -> Self {
-        Self::with_slots(MIN_SLOTS)
+        Self::with_slots(MIN_SLOTS, THREAD_BACKING_SLOTS)
     }
 
     /// A table for about `entries` pieces: the slots that hold them under the
-    /// fill bound.
+    /// fill bound, and no reservation beyond them.
     pub(super) fn for_entries(entries: usize) -> Self {
-        Self::with_slots(Self::slots_for(entries))
+        let slots = Self::slots_for(entries);
+        Self::with_slots(slots, slots)
     }
 
     /// The slots a table for about `entries` pieces has: a power of two that
@@ -206,14 +223,26 @@ impl ShortPieceTable {
         (entries * 4 / 3 + 1).next_power_of_two().max(MIN_SLOTS)
     }
 
-    fn with_slots(slots: usize) -> Self {
+    /// A table of `slots` slots with room for `reserved` before it has to
+    /// move; the room is capacity, not written.
+    fn with_slots(slots: usize, reserved: usize) -> Self {
+        let mut tags = Vec::with_capacity(reserved.max(slots));
+        tags.resize(slots, EMPTY_TAG);
+        let mut entries = Vec::with_capacity(reserved.max(slots));
+        entries.resize(slots, Entry::EMPTY);
         Self {
-            tags: vec![EMPTY_TAG; slots],
-            entries: vec![Entry::EMPTY; slots],
+            tags,
+            entries,
             spill: Vec::new(),
             len: 0,
             mask: slots - 1,
         }
+    }
+
+    /// Slots the table can grow to before it moves.
+    #[cfg(test)]
+    fn backing(&self) -> usize {
+        self.entries.capacity()
     }
 
     /// Entries stored.
@@ -377,40 +406,86 @@ impl ShortPieceTable {
     }
 
     /// Grows the slots (by four up to `GROW_BY_FOUR_UP_TO`, by two above, to
-    /// `most` at the most) and places every stored entry again. A tag does
-    /// not depend on the slot count, so the tags move with their entries.
+    /// `most` at the most) in place: the table extends into its reservation
+    /// (past the reservation it moves, as a `Vec` does) and every stored
+    /// entry is placed again where it stands ([`Self::place_again`]). A tag
+    /// does not depend on the slot count, so the tags move with their
+    /// entries.
     fn grow(&mut self, most: usize) {
-        let slots = self.entries.len();
-        let slots = if slots < GROW_BY_FOUR_UP_TO {
-            slots * 4
+        let old = self.entries.len();
+        let slots = if old < GROW_BY_FOUR_UP_TO {
+            old * 4
         } else {
-            slots * 2
+            old * 2
         }
         .min(most);
-        let tags = std::mem::replace(&mut self.tags, vec![EMPTY_TAG; slots]);
-        let entries = std::mem::replace(&mut self.entries, vec![Entry::EMPTY; slots]);
+        self.tags.resize(slots, EMPTY_TAG);
+        self.entries.resize(slots, Entry::EMPTY);
         self.mask = slots - 1;
-        for (tag, entry) in tags.into_iter().zip(entries) {
-            if tag == EMPTY_TAG {
-                continue;
+        self.place_again(old);
+    }
+
+    /// Places the entries stored in the first `old` slots again under the
+    /// current mask, in the table as it is: no second table, no copy of the
+    /// whole. Every stored slot of the old range starts pending. A pending
+    /// entry's probe from its new home walks over placed slots and stops at
+    /// the first empty or pending one: its own slot means it is placed, an
+    /// empty slot takes it (its old slot empties), a pending slot swaps
+    /// entries with it (that slot is placed, this one is pending again with
+    /// the other entry). Each step places one slot, so the pass ends. A
+    /// placed entry's probe path holds placed slots only, which never
+    /// change afterwards, and never crosses a pending slot (the probe stops
+    /// there), so every path is whole once no slot is pending.
+    fn place_again(&mut self, old: usize) {
+        let mut pending = vec![0u64; old.div_ceil(64)];
+        for slot in 0..old {
+            if self.tags[slot] != EMPTY_TAG {
+                pending[slot / 64] |= 1u64 << (slot % 64);
             }
-            let (mut slot, _) = self.first_slot(ShortPieceKey(entry.key & KEY_MASK));
-            while self.tags[slot] != EMPTY_TAG {
-                slot = (slot + 1) & self.mask;
+        }
+        let is_pending = |pending: &[u64], slot: usize| {
+            slot < old && pending[slot / 64] & (1u64 << (slot % 64)) != 0
+        };
+        for slot in 0..old {
+            while is_pending(&pending, slot) {
+                let key = ShortPieceKey(self.entries[slot].key & KEY_MASK);
+                let (mut at, _) = self.first_slot(key);
+                while self.tags[at] != EMPTY_TAG && !is_pending(&pending, at) {
+                    at = (at + 1) & self.mask;
+                }
+                if at == slot {
+                    pending[slot / 64] &= !(1u64 << (slot % 64));
+                } else if self.tags[at] == EMPTY_TAG {
+                    self.tags[at] = self.tags[slot];
+                    self.entries[at] = self.entries[slot];
+                    self.tags[slot] = EMPTY_TAG;
+                    pending[slot / 64] &= !(1u64 << (slot % 64));
+                } else {
+                    self.tags.swap(slot, at);
+                    self.entries.swap(slot, at);
+                    pending[at / 64] &= !(1u64 << (at % 64));
+                }
             }
-            self.tags[slot] = tag;
-            self.entries[slot] = entry;
         }
     }
 
     /// Forgets every piece. The slots stay allocated, only the tags are
     /// cleared (an empty tag is an empty slot whatever its entry holds),
     /// unless the table has more slots than `bound` entries take: then it is
-    /// made anew for `bound`, which fell since the table grew.
+    /// cut back to the slots for `bound`, which fell since the table grew
+    /// (inside a thread's reservation the room stays for the next growth; a
+    /// table that had moved past it is made anew, so the large allocation
+    /// goes).
     pub(super) fn clear(&mut self, bound: usize) {
-        if self.slots() > Self::slots_for(bound) {
-            *self = Self::for_entries(bound);
-            return;
+        let slots = Self::slots_for(bound);
+        if self.slots() > slots {
+            if self.entries.capacity() > THREAD_BACKING_SLOTS.max(slots) {
+                *self = Self::with_slots(slots, THREAD_BACKING_SLOTS);
+                return;
+            }
+            self.tags.truncate(slots);
+            self.entries.truncate(slots);
+            self.mask = slots - 1;
         }
         self.tags.fill(EMPTY_TAG);
         self.spill.clear();
@@ -701,9 +776,10 @@ mod tests {
     }
 
     /// A table keeps its slots through a clear for a bound they fit, and is
-    /// made anew for a bound that fell below them.
+    /// cut back to the slots for a bound that fell below them, inside the
+    /// reservation it keeps.
     #[test]
-    fn a_clear_for_a_smaller_bound_makes_the_table_anew() {
+    fn a_clear_for_a_smaller_bound_cuts_the_table_back() {
         let mut table = ShortPieceTable::new();
         for i in 0..1000u32 {
             assert!(table.insert(key(&i.to_le_bytes()), &[i], 1000));
@@ -716,11 +792,57 @@ mod tests {
         assert_eq!(table.slots(), 2048, "a bound the slots fit keeps them");
         table.clear(100);
         assert_eq!(table.slots(), ShortPieceTable::slots_for(100));
+        assert_eq!(
+            table.backing(),
+            THREAD_BACKING_SLOTS,
+            "the reservation stays"
+        );
         assert_eq!(table.len(), 0);
         assert!(table.spill.is_empty());
         assert_eq!(ids_of(&table, &7u32.to_le_bytes()), None);
         assert!(table.insert(key(b"a"), &[2], 100));
         assert_eq!(ids_of(&table, b"a"), Some(vec![2]));
+    }
+
+    /// A thread's table grows through every step inside its reservation
+    /// without moving, every stored piece reads back after every step, and
+    /// the step past the reservation moves it.
+    #[test]
+    fn a_thread_table_grows_in_place_up_to_its_reservation_and_moves_past_it() {
+        let mut table = ShortPieceTable::new();
+        assert_eq!(table.backing(), THREAD_BACKING_SLOTS);
+        let bound = 100_000;
+        let mut stored = 0usize;
+        let mut sizes = vec![table.slots()];
+        while table.slots() <= THREAD_BACKING_SLOTS {
+            let before = table.slots();
+            assert!(table.insert(key(&stored.to_le_bytes()), &[stored as u32, 1], bound));
+            stored += 1;
+            if table.slots() != before {
+                sizes.push(table.slots());
+                if table.slots() <= THREAD_BACKING_SLOTS {
+                    assert_eq!(table.backing(), THREAD_BACKING_SLOTS, "grown in place");
+                }
+                for i in 0..stored {
+                    assert_eq!(
+                        ids_of(&table, &i.to_le_bytes()),
+                        Some(vec![i as u32, 1]),
+                        "{i} after growing to {}",
+                        table.slots()
+                    );
+                }
+            }
+        }
+        assert_eq!(sizes, [64, 256, 1024, 4096, 8192, 16_384, 32_768]);
+        assert!(table.backing() >= 32_768);
+        assert_eq!(table.len(), stored);
+        table.clear(100);
+        assert_eq!(
+            table.backing(),
+            THREAD_BACKING_SLOTS,
+            "made anew inside the reservation"
+        );
+        assert_eq!(table.slots(), ShortPieceTable::slots_for(100));
     }
 
     #[test]
