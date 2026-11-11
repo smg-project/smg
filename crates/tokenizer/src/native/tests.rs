@@ -32,7 +32,7 @@ use tokenizers::{
 use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
 use super::{
-    sentencepiece::{MERGE_SCRATCH_SYMBOLS, WORD_MARKER},
+    sentencepiece::{CharSymbols, MERGE_SCRATCH_SYMBOLS, WORD_MARKER},
     short_pieces::{ShortPieceKey, ShortPieceTable, MIN_SLOTS},
     *,
 };
@@ -1566,6 +1566,43 @@ fn the_seed_holds_every_short_vocabulary_entry_with_the_models_ids() {
         }
         assert_eq!(native.seed.len(), seeded, "{}", shape.name);
         assert!(seeded > 256, "{}: {seeded}", shape.name);
+    }
+}
+
+/// The sentencepiece seed holds every short vocabulary entry with the ids
+/// the model gives it (the pass merges the entry's symbols over the
+/// character-symbol table instead of asking the model), and nothing else.
+#[test]
+fn the_sentencepiece_seed_holds_every_short_vocabulary_entry_with_the_models_ids() {
+    let mut state = 0x5EED_5EED_5EED_5EEDu64;
+    for shape in sentencepiece_shapes() {
+        let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        let mut seeded = 0;
+        for entry in tokenizer.get_vocab(false).keys() {
+            let Some(key) = CharSymbols::entry_key(entry) else {
+                continue;
+            };
+            let expected: Vec<u32> = model
+                .tokenize(entry)
+                .expect("the model tokenizes its own entry")
+                .iter()
+                .map(|token| token.id)
+                .collect();
+            let mut ids = Vec::new();
+            assert!(
+                native.seed.ids_into(key, &mut ids),
+                "{}: {entry:?} is not seeded",
+                shape.name
+            );
+            assert_eq!(ids, expected, "{}: {entry:?}", shape.name);
+            seeded += 1;
+        }
+        assert_eq!(native.seed.len(), seeded, "{}", shape.name);
+        // Every synthetic entry is space-free and at most 15 raw bytes, so
+        // the key takes them all: the seeded count is the vocabulary's.
+        assert_eq!(seeded, tokenizer.get_vocab_size(false), "{}", shape.name);
     }
 }
 

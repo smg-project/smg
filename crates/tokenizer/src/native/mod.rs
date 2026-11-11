@@ -261,6 +261,16 @@ impl SeededIds {
     }
 }
 
+/// A seed job's scratch: the ids an entry merges to and, on the
+/// sentencepiece path, its initial symbols; one per rayon job (a split of
+/// 2048 entries or more), reused across the entries it reads, so the pass
+/// allocates nothing per entry.
+#[derive(Default)]
+struct SeedScratch {
+    ids: Vec<u32>,
+    symbols: Vec<u32>,
+}
+
 /// One vocabulary entry as the pass over the vocabulary reads it: a short
 /// piece with its ids, for the seed, or the bytes of a long one, for the
 /// filter the whole-piece lookup consults (see `long_entries`).
@@ -1271,11 +1281,13 @@ impl NativeEncoder {
     /// The vocabulary's own pieces with their ids, the table every thread
     /// reads before its own cache: each entry of the model's vocabulary whose
     /// spelling maps back from the byte-level alphabet to 1..=15 raw bytes,
-    /// with the ids the model gives that spelling, exactly what a cache miss
-    /// on the piece computes (its own id under `ignore_merges`, else the
-    /// merge result, which is several ids for an entry the merges do not
-    /// reach). An entry with a character outside the alphabet is no
-    /// byte-level piece; one the model declines, or whose ids the table
+    /// with the ids a cache miss on the piece computes: its own id under
+    /// `ignore_merges` (the whole-piece lookup finds an entry before any
+    /// merge), else the merge of its symbols over the table the misses merge
+    /// over (the model's ids by the table's contract, several for an entry
+    /// the merges do not reach); through the model itself on a path without
+    /// a table of its own. An entry with a character outside the alphabet is
+    /// no byte-level piece; one the model declines, or whose ids the table
     /// cannot hold, is left to the miss path. A model with merge dropout
     /// tokenizes at random and gets no seed. The entries are read by id, on
     /// the caller's rayon pool when the load runs on one, else on a pool of
@@ -1283,22 +1295,28 @@ impl NativeEncoder {
     /// of the vocabulary either way.
     ///
     /// Called once the model's word cache is bounded (see `word_cache`): the
-    /// words the seed merges would otherwise fill that cache on every thread
-    /// of the pool, and the crate never clears a thread's cache of a dropped
-    /// model.
+    /// words a seed read through the model merges would otherwise fill that
+    /// cache on every thread of the pool, and the crate never clears a
+    /// thread's cache of a dropped model.
     pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper) {
-        (self.seed, self.seed_covers_short_entries, self.long_entries) =
-            Self::vocabulary_seed(model, &self.alphabet, self.chars.is_some());
+        (self.seed, self.seed_covers_short_entries, self.long_entries) = Self::vocabulary_seed(
+            model,
+            &self.alphabet,
+            self.merges.as_ref(),
+            self.chars.as_deref(),
+        );
     }
 
     /// The table [`Self::seed_vocabulary`] reads, and whether every id of
     /// `0..vocab_size` was an entry (so the table holds every short entry).
     /// On the sentencepiece path (`chars`) an entry's spelling is its own
-    /// text: its key is its raw form (`CharSymbols::entry_key`).
+    /// text: its key is its raw form (`CharSymbols::entry_key`). `merges` is
+    /// the byte-level path's own table, when it has one.
     fn vocabulary_seed(
         model: &ModelWrapper,
         alphabet: &[char; 256],
-        chars: bool,
+        merges: Option<&MergeTable>,
+        chars: Option<&CharSymbols>,
     ) -> (ShortPieceTable, bool, Option<LongEntryFilter>) {
         let ModelWrapper::BPE(bpe) = model else {
             return (ShortPieceTable::for_entries(0), false, None);
@@ -1312,22 +1330,41 @@ impl NativeEncoder {
         for (byte, &c) in alphabet.iter().enumerate() {
             byte_of[c as usize] = Some(byte as u8);
         }
-        // One id's read: `None` for an id that is no entry, else the seeded
-        // piece, the bytes of a long byte-level piece, or `None` inside for
-        // an entry that is no byte-level piece.
-        let read = |id: u32| -> Option<Option<Seeded>> {
-            let entry = bpe.id_to_token(id)?;
-            let seeded = (|| {
-                let ids_of = |entry: &str| {
-                    let mut ids = SeededIds::default();
+        // The ids of one entry (`piece` its raw bytes on the byte-level
+        // path): what a miss on it computes, see above. The model is asked
+        // only where the path has no table: it allocates a word and a token
+        // list per call.
+        let ids_of = |id: u32, entry: &str, piece: &[u8], scratch: &mut SeedScratch| {
+            let mut ids = SeededIds::default();
+            if bpe.ignore_merges {
+                ids.push(id)?;
+                return Some(ids);
+            }
+            scratch.ids.clear();
+            match (chars, merges) {
+                (Some(chars), _) => chars.merge(entry, &mut scratch.symbols, &mut scratch.ids),
+                (None, Some(table)) => table.merge(piece, &mut scratch.ids),
+                (None, None) => {
                     for token in &model.tokenize(entry).ok()? {
                         ids.push(token.id)?;
                     }
-                    Some(ids)
-                };
-                if chars {
+                    return Some(ids);
+                }
+            }
+            for &id in &scratch.ids {
+                ids.push(id)?;
+            }
+            Some(ids)
+        };
+        // One id's read: `None` for an id that is no entry, else the seeded
+        // piece, the bytes of a long byte-level piece, or `None` inside for
+        // an entry that is no byte-level piece.
+        let read = |id: u32, scratch: &mut SeedScratch| -> Option<Option<Seeded>> {
+            let entry = bpe.id_to_token(id)?;
+            let seeded = (|| {
+                if chars.is_some() {
                     let key = CharSymbols::entry_key(&entry)?;
-                    return Some(Seeded::Short(key, ids_of(entry.as_str())?));
+                    return Some(Seeded::Short(key, ids_of(id, &entry, &[], scratch)?));
                 }
                 let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
                 let mut len = 0;
@@ -1350,18 +1387,23 @@ impl NativeEncoder {
                     return Some(Seeded::Long(long.into_boxed_slice()));
                 }
                 let key = ShortPieceKey::of(&piece[..len])?;
-                Some(Seeded::Short(key, ids_of(entry.as_str())?))
+                Some(Seeded::Short(
+                    key,
+                    ids_of(id, &entry, &piece[..len], scratch)?,
+                ))
             })();
             Some(seeded)
         };
         let ids = 0..bpe.get_vocab_size() as u32;
-        // One slot per id.
+        // One slot per id, written in place (the read keeps its index, so the
+        // collect is one list and no concatenation); one scratch per rayon job
+        // (2048 entries or more).
         let read_all = || {
             ids.clone()
                 .into_par_iter()
                 .with_min_len(2048)
-                .filter_map(&read)
-                .collect::<Vec<Option<Seeded>>>()
+                .map_init(SeedScratch::default, |scratch, id| read(id, scratch))
+                .collect::<Vec<Option<Option<Seeded>>>>()
         };
         // A caller that is a worker of a rayon pool already (the Python
         // binding loads on its own, sized by its host) reads on that pool,
@@ -1384,20 +1426,24 @@ impl NativeEncoder {
                         %error,
                         "could not build the vocabulary seed's pool; reading on the calling thread"
                     );
-                    (ids.filter_map(&read).collect::<Vec<_>>(), 1)
+                    let mut scratch = SeedScratch::default();
+                    (ids.map(|id| read(id, &mut scratch)).collect::<Vec<_>>(), 1)
                 }
             }
         };
-        let covers = entries.len() == bpe.get_vocab_size();
+        // An id that was an entry has a slot that is `Some`; the seeded pieces
+        // are the inner `Some`s.
+        let covers = entries.iter().filter(|read| read.is_some()).count() == bpe.get_vocab_size();
         let short = entries
             .iter()
             .flatten()
+            .flatten()
             .filter(|seeded| matches!(seeded, Seeded::Short(..)))
             .count();
-        let long = entries.iter().flatten().count() - short;
+        let long = entries.iter().flatten().flatten().count() - short;
         let mut table = ShortPieceTable::for_entries(short);
         let mut filter = LongEntryFilter::for_entries(long);
-        for seeded in entries.iter().flatten() {
+        for seeded in entries.iter().flatten().flatten() {
             match seeded {
                 Seeded::Short(key, ids) => {
                     table.insert(*key, ids.as_slice(), short);
@@ -1405,7 +1451,7 @@ impl NativeEncoder {
                 Seeded::Long(bytes) => filter.insert(bytes),
             }
         }
-        let filter = (covers && !chars).then_some(filter);
+        let filter = (covers && chars.is_none()).then_some(filter);
         tracing::debug!(
             entries = table.len(),
             slots = table.slots(),
