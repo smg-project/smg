@@ -9,7 +9,7 @@ use crate::routers::{
     error as grpc_error,
     grpc::{
         common::stages::BuildStage,
-        context::{BuildOutput, ExecutionPlanKind, RequestContext, RequestType},
+        context::{BuildOutput, PlanSettings, RequestContext, RequestType},
     },
 };
 
@@ -26,10 +26,10 @@ pub(crate) struct ChatGenerateRequestBuildingStage {
 }
 
 impl ChatGenerateRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
+    pub fn new(settings: PlanSettings) -> Self {
         Self {
-            chat_stage: ChatRequestBuildingStage::new(inject_pd_metadata, plan_kind),
-            generate_stage: GenerateRequestBuildingStage::new(inject_pd_metadata, plan_kind),
+            chat_stage: ChatRequestBuildingStage::new(settings),
+            generate_stage: GenerateRequestBuildingStage::new(settings),
         }
     }
 }
