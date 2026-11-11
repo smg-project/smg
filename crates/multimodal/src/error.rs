@@ -213,9 +213,9 @@ pub enum MediaErrorCode {
     /// media parameter out of range (`fps`, `max_long_side_pixel`), a decode
     /// over the work bound (`SMG_VIDEO_MAX_DECODE_PIXELS`) or over the
     /// decoder's time budget. Not a host's trouble: the request itself is
-    /// what to fix, and the message says what fits (a shorter clip, a smaller
-    /// frame budget). How long a decode takes also depends on this side's
-    /// load, so the code is not a promise that a retry can never help.
+    /// what to fix; a video's message says what fits (a shorter clip, a
+    /// smaller frame budget). How long a decode takes also depends on this
+    /// side's load, so the code is not a promise that a retry can never help.
     InvalidRequest,
     /// `media_fetch_failed`: a fetch or read that was attempted failed: a
     /// host that cannot be resolved or does not deliver within the fetch
