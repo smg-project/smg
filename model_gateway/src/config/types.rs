@@ -128,7 +128,10 @@ pub struct RouterConfig {
     /// counted in the same `smg_http_connections_rejected_total`. `0` is no
     /// bound. The bound is the admin listener's own, so the control plane
     /// stays reachable while the data plane is saturated, and a client that
-    /// reaches the admin listener cannot hold it open without limit.
+    /// reaches the admin listener cannot hold it open without limit. Needs
+    /// `admin_port` (the validator refuses the bound without it). Probes on
+    /// the admin port fall under the bound like any connection;
+    /// `health_check_port` is the listener no bound covers.
     #[serde(default)]
     pub admin_max_connections: usize,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default

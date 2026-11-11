@@ -1387,6 +1387,16 @@ impl ConfigValidator {
                 return Err(ConfigError::invalid_value("admin_host", admin_host, reason));
             }
         }
+        // The bound is the admin listener's own: without a port there is no
+        // listener for it to bound, and nothing would say so.
+        if config.admin_max_connections > 0 && config.admin_port.is_none() {
+            return Err(ConfigError::invalid_value(
+                "admin_max_connections",
+                config.admin_max_connections,
+                "--admin-max-connections needs --admin-port: the admin listener exists only \
+                 with a port",
+            ));
+        }
 
         // Each listener needs its own port. Two of them on one port used to
         // bind the first, answer, and die at the second bind with a raw
@@ -5422,6 +5432,7 @@ mod tests {
     fn an_admin_connection_limit_above_the_permit_maximum_is_rejected() {
         let config = |admin_max_connections: usize| RouterConfig {
             admin_max_connections,
+            admin_port: Some(30004),
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker:8000".to_string()],
             },
@@ -5440,6 +5451,38 @@ mod tests {
                 assert_eq!(field, "admin_max_connections");
                 assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
                 assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid admin_max_connections, got {other:?}"),
+        }
+    }
+
+    /// The bound is the admin listener's own: without `admin_port` there is
+    /// no listener to bound, so a bound without the port is refused by name
+    /// (as a host without the port is); with the port, or without a bound,
+    /// the settings pass.
+    #[test]
+    fn an_admin_connection_bound_without_an_admin_port_is_rejected() {
+        let config = |admin_max_connections: usize, admin_port: Option<u16>| RouterConfig {
+            admin_max_connections,
+            admin_port,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for (bound, port) in [(0, None), (16, Some(30004))] {
+            ConfigValidator::validate(&config(bound, port))
+                .unwrap_or_else(|e| panic!("bound {bound} with port {port:?}: {e}"));
+        }
+        match ConfigValidator::validate(&config(16, None)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "admin_max_connections");
+                assert_eq!(value, "16");
+                assert!(reason.contains("--admin-port"), "{reason}");
             }
             other => panic!("expected an invalid admin_max_connections, got {other:?}"),
         }
