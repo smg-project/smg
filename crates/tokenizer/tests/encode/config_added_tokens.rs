@@ -5,8 +5,9 @@
 //! its id decodes to its text, and the id is known to the gateway's bound.
 //! A token both files name is held once; one the model's table holds as a
 //! plain piece becomes an added token on the table's id; a declared id the
-//! pipeline cannot place is refused at load, as on the vocab.json +
-//! merges.txt path.
+//! pipeline cannot place leaves that token out with a warning and the rest
+//! load (the vocab.json + merges.txt path, where the configuration is the
+//! only source of the ids, refuses it instead).
 
 #![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
 
@@ -171,20 +172,32 @@ fn a_declared_token_the_table_holds_as_a_piece_becomes_an_added_token() {
 }
 
 #[test]
-fn a_declared_id_the_pipeline_cannot_place_refuses_the_load() {
+fn a_declared_id_the_pipeline_cannot_place_leaves_that_token_out() {
     let dir = TempDir::new().expect("a temp dir");
-    let error = match load(
+    // Id 0 is the table's `hello`, id 7 is past the next free id (3); id 3 fits.
+    let tokenizer = load(
         &dir,
         &tokenizer_json(&[], &FILE_TOKENS),
-        config(&[(2, "<|im_start|>"), (7, "<|audio_start|>")]),
-    ) {
-        Ok(_) => panic!("an id past the next free one must refuse the load"),
-        Err(error) => error.to_string(),
-    };
-    assert!(
-        error.contains("'<|audio_start|>' expected ID 7, got Some(3)"),
-        "unexpected error: {error}"
-    );
+        config(&[
+            (0, "<|pad|>"),
+            (2, "<|im_start|>"),
+            (3, "<|audio_end|>"),
+            (7, "<|audio_start|>"),
+        ]),
+    )
+    .expect("the checkpoint loads as it did without the configuration's tokens");
+
+    assert_eq!(tokenizer.token_to_id("hello"), Some(0));
+    assert_eq!(tokenizer.token_to_id("<|audio_end|>"), Some(3));
+    assert_eq!(tokenizer.token_to_id("<|pad|>"), None);
+    assert_eq!(tokenizer.token_to_id("<|audio_start|>"), None);
+    // The left-out tokens are not in the pipeline's added vocabulary: text,
+    // as tokenizer.json alone reads them; the one that fits is.
+    let added = tokenizer.tokenizers_pipeline().get_added_vocabulary();
+    assert!(added.get_vocab().get("<|pad|>").is_none());
+    assert!(added.get_vocab().get("<|audio_start|>").is_none());
+    assert_eq!(added.get_vocab().get("<|audio_end|>"), Some(&3));
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 4);
 }
 
 #[test]

@@ -494,6 +494,20 @@ impl EncoderCore {
     }
 }
 
+/// What a configured token the pipeline cannot place on its declared id
+/// means to the loader (the rule is on `add_config_tokens`).
+#[derive(Clone, Copy)]
+enum MisplacedToken {
+    /// The configuration is the only source of the added tokens
+    /// (vocab.json + merges.txt): the load fails, as it always has.
+    RefusesTheLoad,
+    /// tokenizer.json holds the model's added tokens; the configuration's
+    /// extras ride along where they fit, and one that does not is left out
+    /// with a warning, as every configured token was before this path read
+    /// the configuration.
+    IsLeftOut,
+}
+
 impl HuggingFaceTokenizer {
     /// The path this tokenizer's encodes take, chosen at load (see
     /// [`EncodePath`]).
@@ -660,7 +674,11 @@ impl HuggingFaceTokenizer {
         tokenizer.with_post_processor(Some(ByteLevel::default().trim_offsets(false)));
 
         let added_tokens = Self::config_added_tokens(&config, &config_path)?;
-        Self::add_config_tokens(&mut tokenizer, &added_tokens)?;
+        Self::add_config_tokens(
+            &mut tokenizer,
+            &added_tokens,
+            MisplacedToken::RefusesTheLoad,
+        )?;
 
         Ok(tokenizer)
     }
@@ -720,18 +738,31 @@ impl HuggingFaceTokenizer {
     /// piece goes through the add and keeps the table's id, which makes it
     /// an added token (matched whole, dropped by a skip-special decode) as
     /// the configuration says. The pipeline assigns new ids in order past
-    /// the highest it holds, so a token that lands elsewhere than declared
-    /// is an error on both paths: a token left out would be a silent
-    /// disagreement with the engine's tokenizer on the ids the gateway
-    /// sends. Returns how many tokens were added.
+    /// the highest it holds (or from the table's size), so where a token
+    /// would land is known before the add; one that would land elsewhere
+    /// than declared is what `misplaced` says: refused where the
+    /// configuration is the only source of the ids, left out with a
+    /// warning on the tokenizer.json path, where the file's tokens stand
+    /// and the configuration's extras ride along where they fit (a
+    /// checkpoint that declares `</think>` on an id the table holds for
+    /// another piece loads as it always did, that token as text). Returns
+    /// how many tokens were added.
     fn add_config_tokens<M: Model>(
         tokenizer: &mut TokenizerOf<M>,
         config_tokens: &[(u32, AddedToken)],
+        misplaced: MisplacedToken,
     ) -> Result<usize> {
+        let table = u32::try_from(tokenizer.get_vocab_size(false))
+            .map_err(|_| Error::msg("the model's table exceeds the u32 id range"))?;
+        let added = tokenizer.get_added_vocabulary();
+        let mut next_id = added
+            .get_added_tokens_decoder()
+            .keys()
+            .max()
+            .map_or(table, |max| if *max >= table { max + 1 } else { table });
         let mut missing: Vec<(u32, AddedToken)> = Vec::new();
-        let added = tokenizer.get_added_vocabulary().get_vocab();
         for (id, token) in config_tokens {
-            match added.get(&token.content) {
+            match added.get_vocab().get(&token.content) {
                 Some(held) if held == id => {}
                 Some(held) => {
                     warn!(
@@ -741,7 +772,34 @@ impl HuggingFaceTokenizer {
                         "tokenizer_config.json and the pipeline disagree on an added token's id; the pipeline's id stands"
                     );
                 }
-                None => missing.push((*id, token.clone())),
+                None => {
+                    // A piece the table holds keeps the table's id; a new token takes the next one.
+                    let table_id = tokenizer.token_to_id(&token.content);
+                    let lands_on = table_id.unwrap_or(next_id);
+                    if lands_on != *id {
+                        match misplaced {
+                            MisplacedToken::RefusesTheLoad => {
+                                return Err(Error::msg(format!(
+                                    "Added token '{}' expected ID {id}, got Some({lands_on}): tokenizer_config.json declares an id the pipeline cannot place (a new token takes the next id past the ones held; a piece the model holds keeps the model's id)",
+                                    token.content
+                                )));
+                            }
+                            MisplacedToken::IsLeftOut => {
+                                warn!(
+                                    token = %token.content,
+                                    config_id = id,
+                                    would_land_on = lands_on,
+                                    "tokenizer_config.json declares an added token on an id the pipeline cannot place; the token is left out, as tokenizer.json alone reads it"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    if table_id.is_none() {
+                        next_id += 1;
+                    }
+                    missing.push((*id, token.clone()));
+                }
             }
         }
         if missing.is_empty() {
@@ -754,7 +812,7 @@ impl HuggingFaceTokenizer {
             let actual_id = tokenizer.token_to_id(&token.content);
             if actual_id != Some(*expected_id) {
                 return Err(Error::msg(format!(
-                    "Added token '{}' expected ID {expected_id}, got {actual_id:?}: tokenizer_config.json declares an id the pipeline cannot place (a new token takes the next id past the ones held; a piece the model holds keeps the model's id)",
+                    "Added token '{}' expected ID {expected_id}, got {actual_id:?}: the pipeline placed it elsewhere than the loader's placement rule says",
                     token.content
                 )));
             }
@@ -868,7 +926,12 @@ impl HuggingFaceTokenizer {
         // The configuration's added tokens the file lacks join the pipeline
         // before the ties settle and the encode path is chosen (the rule is
         // on `add_config_tokens`).
-        Self::add_config_tokens(&mut tokenizer, &config_result.added_tokens).map_err(|error| {
+        Self::add_config_tokens(
+            &mut tokenizer,
+            &config_result.added_tokens,
+            MisplacedToken::IsLeftOut,
+        )
+        .map_err(|error| {
             Error::msg(format!(
                 "Failed to load tokenizer: the configuration's added tokens did not apply: {error}"
             ))
