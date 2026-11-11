@@ -3875,23 +3875,27 @@ def test_sync_versions_moves_main_to_the_next_development_version_when_a_release
 def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sandbox) -> None:
     """A release branch raises the floor a package puts on another of ours when it ships fields the
     code reads (the servicer's floor on the proto package). After the release, main's floor follows
-    the branch's, the line as the branch wrote it; a floor on a package that is not ours is left to
+    the branch's, the requirement as the branch wrote it, on a line of its own or inline in an
+    extra, the rest of the line staying main's; a floor on a package that is not ours is left to
     the maintainer; a floor main already raised higher stays; a second run changes nothing."""
     floor = '    "smg-grpc-proto>=0.4.0",  # the fields the servicer reads\n'
+    extra = 'mlx = ["smg-grpc-proto>=0.4.0", "mlx>=0.22.0"]\n'
     repo.commit_main(
         "chore(servicer): the floors",
         "grpc_servicer/pyproject.toml",
         '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n'
-        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n',
+        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}',
     )
     repo.cut()
-    # the branch's bump raised both floors with what it published (by hand, as a cut's review does)
+    # the branch's bump raised the floors with what it published (by hand, as a cut's review does):
+    # the dependencies entry on its line, the extra's inline requirement, and one that is not ours
     repo.git("switch", "--quiet", "release/1.14")
     raised = '    "smg-grpc-proto>=0.5.0",  # 0.5.0 adds the fields the servicer reads\n'
     repo.put(
         "grpc_servicer/pyproject.toml",
         repo.read("grpc_servicer/pyproject.toml")
         .replace(floor, raised)
+        .replace(extra, 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.23.0"]\n')
         .replace('"grpcio>=1.60"', '"grpcio>=1.70"'),
     )
     repo.git("add", "-A")
@@ -3907,9 +3911,12 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     )
     assert done.returncode == 0, done.stderr
     text = repo.read("grpc_servicer/pyproject.toml")
-    assert raised in text, text
+    followed = '    "smg-grpc-proto>=0.5.0",  # the fields the servicer reads\n'
+    assert followed in text, text  # the requirement is the branch's, the comment stays main's
+    assert 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.22.0"]\n' in text, text
     assert '"grpcio>=1.60"' in text, "a floor on a package that is not ours is the maintainer's"
-    assert "grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0" in done.stdout
+    assert done.stdout.count("grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0") == 2
+    assert "0.4.0 -> 0.5.0 (requirement 2)" in done.stdout, done.stdout
     again = subprocess.run(
         [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
         cwd=repo.work,
@@ -3919,7 +3926,8 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     )
     assert again.returncode == 0 and "already follows" in again.stdout, again.stdout
     # a floor main raised above the branch's stays where main put it
-    higher = text.replace(raised, '    "smg-grpc-proto>=0.6.0",  # main went further\n')
+    higher = text.replace(followed, '    "smg-grpc-proto>=0.6.0",  # main went further\n')
+    assert higher != text
     repo.put("grpc_servicer/pyproject.toml", higher)
     kept = subprocess.run(
         [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],

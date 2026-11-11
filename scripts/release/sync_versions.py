@@ -33,8 +33,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION_PARTS = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+)|-(dev))?$")
-# a dependency floor line of a pyproject: the indent and quote, the name, the floor, the rest of the line
-FLOOR = re.compile(r'^(\s*")([A-Za-z0-9_.-]+)>=(\d+\.\d+\.\d+)(".*)$')
+# a quoted dependency floor of a pyproject, wherever it sits on a line (a dependencies entry on a
+# line of its own, an extra's inline array): the name, the floor, the rest of the requirement
+FLOOR = re.compile(r'"([A-Za-z0-9_.-]+)>=(\d+\.\d+\.\d+)([^"]*)"')
 
 
 def _checker():
@@ -62,13 +63,12 @@ def version_key(version: str) -> tuple[int, ...]:
 
 
 def floors(text: str, names: set[str]) -> dict[str, list[tuple[str, str]]]:
-    """Per package name of ours, the floor lines of ``text`` in order: each line as written and
-    the floor it names."""
+    """Per package name of ours, the floor requirements of ``text`` in order of appearance: each
+    quoted requirement as written and the floor it names."""
     found: dict[str, list[tuple[str, str]]] = {}
-    for line in text.split("\n"):
-        match = FLOOR.match(line)
-        if match and match[2] in names:
-            found.setdefault(match[2], []).append((line, match[3]))
+    for match in FLOOR.finditer(text):
+        if match[1] in names:
+            found.setdefault(match[1], []).append((match[0], match[2]))
     return found
 
 
@@ -145,33 +145,36 @@ def main(argv: list[str] | None = None) -> int:
         if component.dep_key:
             pin(component.dep_key, theirs)
 
-    # the floors a package puts on another of ours: its k-th floor line for a name takes the
-    # release's k-th, as the release wrote it, when the release's floor is higher
+    # the floors a package puts on another of ours: its k-th requirement on a name, wherever it
+    # sits on a line, takes the release's k-th as the release wrote it, when the release's floor
+    # is higher; the rest of the line (a comment, the other requirements of an extra) stays
     names = {component.name for component in crv.PACKAGES}
     for component in crv.PACKAGES:
         theirs_text = repo.show(ref, component.version_file)
         if theirs_text is None or not (ROOT / component.version_file).is_file():
             continue
         theirs = floors(theirs_text, names)
-        lines = repo.read(component.version_file).split("\n")
+        text = repo.read(component.version_file)
         seen: dict[str, int] = {}
-        changed = False
-        for i, line in enumerate(lines):
-            match = FLOOR.match(line)
-            if not match or match[2] not in names:
+        pieces: list[str] = []
+        end = 0
+        for match in FLOOR.finditer(text):
+            name, floor = match[1], match[2]
+            if name not in names:
                 continue
-            k = seen.get(match[2], 0)
-            seen[match[2]] = k + 1
-            if k >= len(theirs.get(match[2], [])):
+            k = seen.get(name, 0)
+            seen[name] = k + 1
+            if k >= len(theirs.get(name, [])):
                 continue
-            their_line, their_floor = theirs[match[2]][k]
-            if version_key(their_floor) <= version_key(match[3]):
+            their_requirement, their_floor = theirs[name][k]
+            if version_key(their_floor) <= version_key(floor):
                 continue
-            lines[i] = their_line
-            moved.append(f"{component.version_file} {match[2]}>=: {match[3]} -> {their_floor}")
-            changed = True
-        if changed:
-            repo.write(component.version_file, "\n".join(lines))
+            pieces += [text[end : match.start()], their_requirement]
+            end = match.end()
+            nth = f" (requirement {k + 1})" if k else ""
+            moved.append(f"{component.version_file} {name}>=: {floor} -> {their_floor}{nth}")
+        if end:
+            repo.write(component.version_file, "".join(pieces) + text[end:])
 
     if moved:
         print(f"sync_versions: {len(moved)} version line(s) follow {ref}:")
