@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
@@ -403,14 +404,17 @@ impl VideoClip {
         self.sampling.as_ref()
     }
 
-    pub fn materialized_frames(&self) -> Result<Vec<DynamicImage>, String> {
+    /// The clip's frames: lent when the decode produced them, materialised
+    /// from the RGB video otherwise.
+    pub fn materialized_frames(&self) -> Result<Cow<'_, [DynamicImage]>, String> {
         if !self.frames.is_empty() {
-            return Ok(self.frames.clone());
+            return Ok(Cow::Borrowed(&self.frames));
         }
         self.rgb_video
             .as_ref()
             .ok_or_else(|| "video clip has no decoded frames".to_string())?
             .to_dynamic_images()
+            .map(Cow::Owned)
     }
 
     pub fn raw_bytes(&self) -> &[u8] {
