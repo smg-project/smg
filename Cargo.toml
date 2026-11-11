@@ -65,7 +65,7 @@ http = "1.4.2"
 lru = "0.18.0"
 memchr = "2"
 num-traits = "0.2"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 rand = "0.10.1"
 reqwest = { version = "0.13.4", default-features = false }
 serde = { version = "1.0" }
