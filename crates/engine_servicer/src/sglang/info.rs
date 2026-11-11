@@ -11,7 +11,7 @@ use std::{
 use futures::StreamExt;
 use openai_protocol::worker::SchedulerLoadSnapshot;
 use prost_types::Timestamp;
-use smg_grpc_client::sglang_proto as sg;
+use smg_grpc_client::{media_identity::sglang as contract, sglang_proto as sg};
 use tonic::Status;
 
 use super::{embed, generate, State};
@@ -181,7 +181,7 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     }
     if let Some(key) = super::media_identity::key(state) {
         server_args.fields.insert(
-            smg_grpc_client::sglang_media_identity::LABEL.to_string(),
+            contract::LABEL.to_string(),
             prost_types::Value {
                 kind: Some(prost_types::value::Kind::StringValue(key.to_string())),
             },
