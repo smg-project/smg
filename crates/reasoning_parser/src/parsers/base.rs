@@ -97,8 +97,7 @@ impl ReasoningParser for BaseReasoningParser {
                 // Decide after leading whitespace and any partial opener.
                 let token = &self.config.think_start_token;
                 let trimmed = current_text.trim_start();
-                if trimmed.is_empty() || (trimmed.len() < token.len() && token.starts_with(trimmed))
-                {
+                if trimmed.is_empty() || self.is_partial_token(trimmed) {
                     return Ok(ParserResult::default());
                 }
                 if trimmed.starts_with(token) {

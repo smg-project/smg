@@ -2926,6 +2926,18 @@ async fn qwen3_stream_strips_generated_think_tag_after_leading_whitespace() {
 }
 
 #[tokio::test]
+async fn qwen3_stream_closes_an_empty_think_block_after_leading_whitespace() {
+    let events = reasoning_tool_events(
+        serde_json::json!("auto"),
+        " </think>answer",
+        CharacterTokenizer::with_closed_prefill_think_block(),
+    )
+    .await;
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), " ");
+    assert_eq!(chat_text(&events, 0, "content"), "answer");
+}
+
+#[tokio::test]
 async fn qwen3_stream_preserves_literal_think_tag_in_answer_without_generated_opener() {
     let events = reasoning_tool_events(
         serde_json::json!("auto"),
