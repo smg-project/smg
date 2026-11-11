@@ -124,6 +124,26 @@ pub(crate) fn calls(events: &[Event]) -> Vec<(String, String)> {
     calls
 }
 
+/// The calls as (index, name, arguments), the fragments of each joined onto the
+/// last call started; an arguments event before any call is left out.
+pub(crate) fn indexed_calls(events: &[Event]) -> Vec<(u32, String, String)> {
+    let mut calls: Vec<(u32, String, String)> = Vec::new();
+    for event in events {
+        match event {
+            Event::ToolCallStart { index, name, .. } => {
+                calls.push((*index, name.clone(), String::new()));
+            }
+            Event::ToolCallArguments { json, .. } => {
+                if let Some(last) = calls.last_mut() {
+                    last.2.push_str(json);
+                }
+            }
+            _ => {}
+        }
+    }
+    calls
+}
+
 /// The engine's finish: its reason as the engine gave it (the adapters refine it to
 /// `tool_calls`), and the calls counted.
 pub(crate) fn finish(events: &[Event]) -> (FinishReason, u32) {
@@ -563,4 +583,47 @@ pub(crate) fn weather_declared() -> Declared {
             "days": {"type": "integer"},
         }}),
     )])
+}
+
+/// The events a test writes by hand: the tool-call events with the id and the
+/// empty source the adapters do not read, and the engine's finish with no
+/// reasoning tokens.
+pub(crate) mod events {
+    use crate::event::{Event, FinishReason, Text};
+
+    /// A call's start, `call_<index>` as its id.
+    pub(crate) fn call(index: u32, name: &str) -> Event<'static> {
+        Event::ToolCallStart {
+            index,
+            id: format!("call_{index}"),
+            name: name.into(),
+            source: Text::default(),
+        }
+    }
+
+    /// A fragment of a call's arguments.
+    pub(crate) fn arguments(index: u32, json: &str) -> Event<'static> {
+        Event::ToolCallArguments {
+            index,
+            json: json.to_owned().into(),
+            source: Text::default(),
+        }
+    }
+
+    /// A call's end.
+    pub(crate) fn end(index: u32) -> Event<'static> {
+        Event::ToolCallEnd {
+            index,
+            source: Text::default(),
+        }
+    }
+
+    /// The engine's finish with the calls counted and no reasoning tokens.
+    pub(crate) fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
+        Event::Finish {
+            reason,
+            tool_calls,
+            reasoning_tokens: 0,
+        }
+    }
 }

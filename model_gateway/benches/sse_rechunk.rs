@@ -3,11 +3,20 @@
 //! that is re-sliced, and a tool call's arguments in pieces. Every case
 //! feeds a whole stream through a fresh stage and flushes its tail.
 
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use smg::routers::common::sse_rechunk::SseRechunker;
+use smg::routers::common::sse_rechunk::{RechunkPolicy, SseRechunker};
+
+/// MiniMax's contract numbers, the one policy the gateway runs
+/// (`routers::grpc::wire::minimax::RECHUNK`, which a bench cannot reach).
+const POLICY: RechunkPolicy = RechunkPolicy {
+    slice_chars: 160,
+    emit_threshold: 80,
+    min_tail_chars: 5,
+    idle_flush: Duration::from_millis(250),
+};
 
 fn content_event(text: &str) -> Bytes {
     Bytes::from(format!(
@@ -25,7 +34,7 @@ fn arguments_event(text: &str) -> Bytes {
 
 /// Feeds `frames` through a fresh stage; the bytes it produced.
 fn run(frames: &[Bytes]) -> usize {
-    let mut stage = SseRechunker::new();
+    let mut stage = SseRechunker::new(POLICY);
     let mut produced = 0;
     for frame in frames {
         produced += stage.feed(frame.clone()).len();

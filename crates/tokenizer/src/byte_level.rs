@@ -14,10 +14,10 @@
 //! the window's already-emitted prefix always consists of complete
 //! sequences, so the lossy decode of the pending bytes alone is the text the
 //! reference would emit: the same pieces at the same tokens, and over a
-//! whole stream exactly `decode(all_ids)`, except at the end: the pending
-//! buffer holds at most the bytes since the last emission, normally one
-//! partial character, and the stream's end releases it as `decode` renders
-//! the same bytes minus a character the end cut short (see `cut_start`).
+//! whole stream exactly `decode(all_ids)`: the pending buffer holds at most
+//! the bytes since the last emission, normally one partial character, and
+//! the stream's end releases it as `decode` renders the same bytes, a
+//! character the end cut short as one replacement character.
 
 use std::{
     borrow::Cow,
@@ -458,8 +458,9 @@ fn settled(text: &str) -> bool {
 /// before it render as `String::from_utf8_lossy` renders them, a complete
 /// character as it is and an invalid sequence (a stray byte the model wrote)
 /// as the replacement character; the bytes from it on are the start of a
-/// character the model never finished, and a stream's end releases nothing
-/// for them.
+/// character the model never finished, which a byte-level stream's end
+/// renders as one replacement character, as `decode` does, and which a
+/// ByteFallback vocabulary's window counts to keep off its end.
 pub(crate) fn cut_start(bytes: &[u8]) -> usize {
     let mut index = 0;
     while index < bytes.len() {
@@ -542,14 +543,11 @@ impl IncrementalDecoder for ByteLevelIncremental {
         // The emitted text ends at a character boundary, so the pending
         // bytes alone are the tail `decode` renders for the whole stream:
         // the complete characters among them as they are, an invalid
-        // sequence as the replacement character. A sequence the end cut
-        // short is left out: it is the start of a character the model never
-        // finished, and a replacement character for it would be ours.
-        let kept = &self.pending[..cut_start(&self.pending)];
-        let released = !kept.is_empty();
-        out.push_str(&String::from_utf8_lossy(kept));
+        // sequence and a sequence the end cut short (the start of a
+        // character the model never finished) as the replacement character.
+        out.push_str(&String::from_utf8_lossy(&self.pending));
         self.pending.clear();
-        Ok(released)
+        Ok(true)
     }
 
     fn reset(&mut self) {
@@ -975,6 +973,42 @@ pub(crate) mod tests {
         dec.step(c3).expect("step");
         dec.reset();
         assert!(dec.pending().is_empty());
+    }
+
+    /// A character the end of the stream cut short, two, three and four
+    /// bytes long, and a lone continuation byte: the end renders each as
+    /// `decode` renders the same ids, one replacement character after the
+    /// text before it, and holds the bytes until then.
+    #[test]
+    fn the_end_renders_a_cut_character_as_decode_does() {
+        let tokenizer = byte_level_tokenizer();
+        let table = ByteLevelTable::build(&tokenizer).expect("table");
+        let id = |token: &str| tokenizer.token_to_id(token).expect("token");
+        let h = id("h");
+        let cases: [(Vec<u32>, &str); 4] = [
+            (vec![h, id("Ã")], "h\u{FFFD}"),
+            (vec![h, id("Ġà"), id("¤")], "h \u{FFFD}"),
+            (vec![h, id("ðŁ"), id(&byte_token(0x98))], "h\u{FFFD}"),
+            (vec![h, id("©")], "h\u{FFFD}"),
+        ];
+        for (ids, text) in cases {
+            let mut dec = ByteLevelIncremental::new(Arc::clone(&table), false, UnknownId::Drop);
+            let mut out = String::new();
+            for &id in &ids {
+                dec.step_into(id, &mut out).expect("step");
+            }
+            assert_eq!(out, "h", "{ids:?}: the cut bytes are held");
+            assert!(dec.finish_into(&mut out).expect("finish"));
+            assert_eq!(out, text, "{ids:?}");
+            assert_eq!(
+                out,
+                tokenizer.decode(&ids, false).expect("decode"),
+                "{ids:?}: as decode renders the ids"
+            );
+            assert!(dec.pending().is_empty());
+            assert!(!dec.finish_into(&mut out).expect("a second finish"));
+            assert_eq!(out, text);
+        }
     }
 
     /// The three piece-timing shapes the reference fixtures exercise, each

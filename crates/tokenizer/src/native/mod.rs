@@ -195,8 +195,9 @@ const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
 /// Inputs at least this long are encoded unit by unit on the thread pool (a
-/// text between added tokens, or a chunk of one cut at a stable boundary);
-/// shorter inputs would spend more on the hand-offs than they save.
+/// text between added tokens, or a chunk of one cut at a stable boundary)
+/// when the pool has more than one thread (see `worth_the_pool`); shorter
+/// inputs would spend more on the hand-offs than they save.
 const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
@@ -451,11 +452,17 @@ fn is_nfc(text: &str) -> bool {
 /// it is in NFC already: only a stretch that is not settled and not in NFC
 /// goes through the crate's normalizer (its iterator reports a byte-offset
 /// shift with each character, which this path has no use for), the other
-/// stretches are copied.
-fn nfc(text: &str) -> Cow<'_, str> {
+/// stretches are copied. A stretch is read by the quick check where the
+/// caller has one (its tables place most characters; the library reads the
+/// windows they cannot), by the library's check otherwise.
+fn nfc<'a>(text: &'a str, quick: Option<&NfcQuick>) -> Cow<'a, str> {
+    let in_nfc = |stretch: &str| match quick {
+        Some(quick) => quick.is_nfc(stretch),
+        None => unicode_normalization_alignments::is_nfc(stretch),
+    };
     let mut owned: Option<String> = None;
     for (start, stretch, settled) in stretches(text) {
-        if settled || unicode_normalization_alignments::is_nfc(stretch) {
+        if settled || in_nfc(stretch) {
             if let Some(out) = &mut owned {
                 out.push_str(stretch);
             }
@@ -1229,7 +1236,7 @@ impl NativeEncoder {
             if token.normalized {
                 let content = match normalizer {
                     Normalizer::None => token.content.clone(),
-                    Normalizer::Nfc => nfc(&token.content).into_owned(),
+                    Normalizer::Nfc => nfc(&token.content, None).into_owned(),
                 };
                 normalized.push((content, id));
             } else {
@@ -1572,7 +1579,8 @@ impl NativeEncoder {
     /// declines, found after the pieces before it were tokenized, so that
     /// the error surfaces from the `tokenizers` encode. A long input is
     /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
-    /// the same code per unit. `model` is the model behind the vocabulary,
+    /// the same code per unit, when the pool has more than one thread (see
+    /// [`Self::worth_the_pool`]). `model` is the model behind the vocabulary,
     /// read for the whole-piece lookup of `ignore_merges` and for the
     /// pieces of a model whose merge table declined; `None` for a
     /// vocabulary read from ranks ([`Self::from_ranks`]), whose table is
@@ -1583,12 +1591,17 @@ impl NativeEncoder {
         text: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_with(
-            model,
-            text,
-            text.len() >= PARALLEL_MIN_BYTES,
-            add_special_tokens,
-        )
+        self.encode_with(model, text, Self::worth_the_pool(text), add_special_tokens)
+    }
+
+    /// Whether `text` is encoded through the thread pool: long enough
+    /// (`PARALLEL_MIN_BYTES`) and a pool with more than one thread to cut
+    /// it for. A pool of one thread (a process pinned to one core, a
+    /// container with one CPU) encodes the units one after the other and
+    /// pays the cut, the Vec per unit and the join for nothing: 5 % of the
+    /// cycles and 140 allocations per encode of 2 MB on one core, measured.
+    fn worth_the_pool(text: &str) -> bool {
+        text.len() >= PARALLEL_MIN_BYTES && rayon::current_num_threads() > 1
     }
 
     /// The ids of `text` with no added token cut out of it and no frame:
@@ -1607,7 +1620,7 @@ impl NativeEncoder {
         self.encode_units(
             model,
             text,
-            text.len() >= PARALLEL_MIN_BYTES,
+            Self::worth_the_pool(text),
             false,
             false,
             at_start,
@@ -1783,7 +1796,8 @@ impl NativeEncoder {
     /// normalization changed.
     fn nfc_gaps<'t>(&self, text: &'t str, added: bool) -> Vec<Gap<'t>> {
         let mut gaps = Vec::new();
-        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| gaps.push(Gap::Text(nfc(text)));
+        let quick = self.nfc_quick.as_ref();
+        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| gaps.push(Gap::Text(nfc(text, quick)));
         match self.raw_added.as_ref().filter(|_| added) {
             Some(raw) => raw.split(text, |segment| match segment {
                 Segment::Added(id) => gaps.push(Gap::Added(id)),

@@ -34,9 +34,17 @@
 //! Video decodes through the media connector under the family's own sampling rule;
 //! audio through the in-process decoder.
 //!
+//! The harness runs the gateway's allocator: jemalloc with the options the `smg`
+//! executable and both bindings export, so a cell reads the page-return policy
+//! production runs. Under the system allocator the large transient buffers of a 1080p
+//! image (about 20 MB on the torch-exact path) went back to the OS after every image
+//! and were faulted in again on the next, which charged a kernel for that policy
+//! rather than for its own work.
+//!
 //! The output is JSON Lines. The first line, `{"kind":"meta",...}`, names the
 //! architecture, the core count, the decoders found at runtime (TurboJPEG, libwebp),
-//! the crate's preprocessing pool and the vector-kernel paths this build takes. Then one
+//! the crate's preprocessing pool, the vector-kernel paths this build takes and the
+//! allocator. Then one
 //! `{"kind":"row",...}` per class: the per-item latency of every stage (median and p90
 //! over all threads' iterations), the wall time, the throughput, the process CPU time
 //! per item (every thread and the pool included), the byte counts (encoded, decoded,
@@ -87,6 +95,46 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
+
+// The gateway's allocator and its options (`SERVER_MALLOC_CONF` in the
+// gateway's metrics module, the bytes the `smg` executable and both bindings
+// export; this crate sits below the gateway, so the string is repeated here).
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; an immutable NUL-terminated byte string, read alone by jemalloc and the meta line"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 100] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
+
+/// The allocator this build runs, for the meta line.
+fn allocator() -> &'static str {
+    if cfg!(all(not(target_env = "msvc"), not(target_env = "musl"))) {
+        "jemalloc"
+    } else {
+        "system: jemalloc is not built in on this target"
+    }
+}
+
+/// The options exported to jemalloc, the bytes themselves without the NUL
+/// (`None` where jemalloc is not built in). The environment's
+/// `_RJEM_MALLOC_CONF`, read after them and winning per key, is recorded
+/// beside them so a results file names both inputs.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+fn allocator_conf() -> Option<&'static str> {
+    std::str::from_utf8(&MALLOC_CONF[..MALLOC_CONF.len() - 1]).ok()
+}
+
+/// See the jemalloc form above: nothing is exported on this target.
+#[cfg(not(all(not(target_env = "msvc"), not(target_env = "musl"))))]
+fn allocator_conf() -> Option<&'static str> {
+    None
+}
 
 const USAGE: &str = "mm_baseline: SMG's media pipeline per class, stage by stage\n\
     \n\
@@ -821,6 +869,9 @@ fn meta(options: &Options) -> Value {
         "libwebp_version": webp_native::webp_version(),
         "pool_threads": pool,
         "vector_kernels": vector_kernels,
+        "allocator": allocator(),
+        "allocator_conf": allocator_conf(),
+        "allocator_env": env::var("_RJEM_MALLOC_CONF").ok(),
         "wire": format!("{:?}", options.wire),
         "transparency": format!("{:?}", options.transparency),
         "threads": options.threads,

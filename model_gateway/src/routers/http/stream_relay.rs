@@ -5,9 +5,12 @@
 //! error after a successful head is accounted to its source and, when the
 //! head was SSE, ended with the typed error event on its own frame; the load
 //! guard rides in the body's own stream; a client that leaves ends the
-//! upstream read. The regular relay re-chunks SSE deltas when the provider
-//! profile asks; the decode relay reads each chunk through a hook (the
-//! prefill log-probability merge and the `[DONE]` cut).
+//! upstream read. The regular relay re-chunks SSE deltas when the wire of
+//! the model the client asked for asks, by the wire's numbers; the decode
+//! relay reads each chunk through a hook (the prefill log-probability merge
+//! and the `[DONE]` cut).
+
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -26,7 +29,7 @@ use super::stream_failure::{
 use crate::{
     routers::common::{
         sse::SSE_CHANNEL_BUFFER,
-        sse_rechunk::{NoopObserver, SseRechunker, IDLE_FLUSH},
+        sse_rechunk::{NoopObserver, SseRechunker},
     },
     worker::{GuardedStream, WorkerLoadGuard},
 };
@@ -39,7 +42,7 @@ pub(crate) struct ChunkStep {
 }
 
 /// How the relay reads each upstream chunk: as it is; through the SSE
-/// re-chunker the regular router's provider profile asks for; or through
+/// re-chunker the regular router's wire asks for; or through
 /// the decode side's hook (the prefill log-probability merge and the
 /// `[DONE]` cut). One of the three, so a re-chunker's held text can never be
 /// cut short by a hook that ends the relay.
@@ -59,6 +62,14 @@ impl ChunkMode {
     /// Whether the re-chunker holds text an idle flush should release.
     fn has_pending(&self) -> bool {
         matches!(self, Self::Rechunk(rechunker) if rechunker.has_pending())
+    }
+
+    /// The re-chunker's idle flush; the timer is never armed without one.
+    fn idle_flush(&self) -> Duration {
+        match self {
+            Self::Rechunk(rechunker) => rechunker.policy().idle_flush,
+            Self::Plain | Self::Hook(_) => Duration::ZERO,
+        }
     }
 
     /// The re-chunker's tail at the stream's end, or nothing.
@@ -135,7 +146,8 @@ where
             let mut relayed: u64 = 0;
             let mut sent_tail = SentTail::default();
             // One timer, reset per chunk, instead of a fresh sleep per token.
-            let idle = tokio::time::sleep(IDLE_FLUSH);
+            let idle_flush = mode.idle_flush();
+            let idle = tokio::time::sleep(idle_flush);
             tokio::pin!(idle);
             // One wait for the client's leaving, kept across the chunks: a
             // `closed()` built per `select!` round registers a waiter on the
@@ -146,7 +158,7 @@ where
                 tokio::select! {
                     chunk = stream.next() => {
                         if let ChunkMode::Rechunk(_) = mode {
-                            idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                            idle.as_mut().reset(tokio::time::Instant::now() + idle_flush);
                         }
                         match chunk {
                             // An empty upstream chunk must not become an empty
@@ -222,7 +234,7 @@ where
                         }
                     },
                     () = &mut idle, if mode.has_pending() => {
-                        idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                        idle.as_mut().reset(tokio::time::Instant::now() + idle_flush);
                         if let ChunkMode::Rechunk(rechunker) = &mut mode {
                             let tail = rechunker.flush_pending();
                             if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {

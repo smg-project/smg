@@ -43,8 +43,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, captured_logs, http_get, next_batch, servicer_config,
-        Bounded,
+        assert_bucket_edges, assert_golden, captured_logs, handshake_address, http_get, next_batch,
+        servicer_config, Bounded,
     },
     ServicerError,
 };
@@ -82,14 +82,6 @@ fn config(
         servicer: servicer_config(dir, handshake),
         model,
     }
-}
-
-/// The handshake endpoint of one test: an IPC socket under its own
-/// directory. A probed TCP port is not reserved, so two tests running in
-/// parallel could pick the same one and a mock engine would handshake with
-/// the other test's servicer and wait forever for its INIT.
-fn handshake_address(dir: &std::path::Path) -> String {
-    format!("ipc://{}", dir.join("handshake").display())
 }
 
 /// The handshake endpoint is free again: ZMQ unlinks the ipc socket file once

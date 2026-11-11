@@ -1511,6 +1511,9 @@ impl Usage {
         self.prompt_tokens_details = Some(PromptTokenUsageInfo {
             cached_tokens,
             audio_tokens: None,
+            text_tokens: None,
+            image_tokens: None,
+            cache_write_tokens: None,
         });
         self
     }
@@ -1562,6 +1565,9 @@ impl Usage {
             .get_or_insert(PromptTokenUsageInfo {
                 cached_tokens: 0,
                 audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
             });
         prompt.audio_tokens.get_or_insert(0);
         let completion = self.completion_tokens_details.get_or_insert_default();
@@ -1586,6 +1592,7 @@ pub struct CompletionTokensDetails {
     pub audio_tokens: Option<u32>,
     pub accepted_prediction_tokens: Option<u32>,
     pub rejected_prediction_tokens: Option<u32>,
+    pub text_tokens: Option<u32>,
 }
 
 /// Usage information (used by rerank and other endpoints)
@@ -1602,9 +1609,15 @@ pub struct UsageInfo {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PromptTokenUsageInfo {
+    /// Prompt tokens read from the cache. The public API defaults the key to
+    /// zero, so details an upstream writes without it read as none cached.
+    #[serde(default)]
     pub cached_tokens: u32,
     #[serde(default)]
     pub audio_tokens: Option<u32>,
+    pub text_tokens: Option<u32>,
+    pub image_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2110,6 +2123,9 @@ mod tests {
             Some(PromptTokenUsageInfo {
                 cached_tokens: 0,
                 audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
             })
         ));
     }
@@ -2364,6 +2380,60 @@ mod tests {
     fn zero_speculative_counts_leave_usage_untouched() {
         let usage = Usage::from_counts(10, 20).with_speculative_tokens(0, 0);
         assert!(usage.completion_tokens_details.is_none());
+    }
+
+    /// The public API defaults `cached_tokens` to zero: prompt details an
+    /// upstream writes without the key read as none cached, where the usage,
+    /// and the completion around it, failed to parse.
+    #[test]
+    fn prompt_details_without_cached_tokens_read_as_none_cached() {
+        let usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12,
+            "prompt_tokens_details": {"audio_tokens": 0}
+        }))
+        .expect("a usage without cached_tokens parses");
+        let details = usage.prompt_tokens_details.expect("details");
+        assert_eq!(details.cached_tokens, 0);
+        assert_eq!(details.audio_tokens, Some(0));
+    }
+
+    /// The newer counters an upstream reports, on the prompt and on the
+    /// completion, are written back as they arrived.
+    #[test]
+    fn the_newer_token_counters_of_an_upstream_usage_are_kept() {
+        let sent = json!({
+            "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12,
+            "prompt_tokens_details": {
+                "cached_tokens": 4, "audio_tokens": 0, "text_tokens": 7,
+                "image_tokens": 2, "cache_write_tokens": 5
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 0, "audio_tokens": 0, "accepted_prediction_tokens": 0,
+                "rejected_prediction_tokens": 0, "text_tokens": 3
+            }
+        });
+        let usage: Usage = serde_json::from_value(sent.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&usage).unwrap(), sent);
+    }
+
+    /// A usage the gateway builds is written as before: the newer counters stay
+    /// off the wire unless an upstream reported them.
+    #[test]
+    fn a_built_usage_is_written_without_the_newer_counters() {
+        let usage = Usage::from_counts(3, 4)
+            .with_cached_tokens(0)
+            .with_complete_details();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({
+                "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+                "completion_tokens_details": {
+                    "reasoning_tokens": 0, "audio_tokens": 0,
+                    "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0
+                }
+            })
+        );
     }
 
     #[test]
