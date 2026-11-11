@@ -80,7 +80,7 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams,
+        common::{header_utils, realtime::ws::RealtimeQueryParams},
         error as route_error,
         gateway::Gateway,
         grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
@@ -460,18 +460,28 @@ fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Re
     else {
         return Ok(());
     };
-    let interleaved = headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|beta| beta.trim().starts_with("interleaved-thinking"));
+    let interleaved = header_utils::anthropic_beta_named(headers, "interleaved-thinking");
     if interleaved || *budget_tokens < body.max_tokens {
         Ok(())
     } else {
         Err(route_error::bad_request(
             "thinking_budget_exceeds_max_tokens",
             "`max_tokens` must be greater than `thinking.budget_tokens`",
+        ))
+    }
+}
+
+/// A thread turn names the message-threads beta, as the public API requires
+/// (`anthropic-beta: message-threads-2026-08-12`). That header is what tells
+/// the body layer to parse the request before the route, so a `thread` field
+/// without it is refused here with the public API's own 400.
+fn check_thread_beta(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
+    if body.thread.is_none() || header_utils::anthropic_beta_named(headers, "message-threads") {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "thread_beta_required",
+            "`thread` requires the `anthropic-beta: message-threads-2026-08-12` header",
         ))
     }
 }
@@ -487,6 +497,9 @@ async fn v1_messages(
         return refused;
     }
     if let Err(refused) = check_thinking_budget(&headers, &body) {
+        return refused;
+    }
+    if let Err(refused) = check_thread_beta(&headers, &body) {
         return refused;
     }
     let model = body.model.clone();
@@ -3389,6 +3402,39 @@ mod tests {
         );
         assert!(check_thinking_budget(&interleaved, &request(1024, 1024)).is_ok());
         assert!(check_thinking_budget(&interleaved, &request(1024, 8192)).is_ok());
+    }
+
+    /// A `thread` field needs the message-threads beta header, as the public
+    /// API requires; a request without `thread` needs no header.
+    #[test]
+    fn a_thread_field_needs_the_message_threads_beta_header() {
+        let request = |thread: bool| -> CreateMessageRequest {
+            let mut body = serde_json::json!({
+                "model": "m", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if thread {
+                body["thread"] = serde_json::json!({"type": "create"});
+            }
+            serde_json::from_value(body).unwrap()
+        };
+        let plain = HeaderMap::new();
+        assert!(check_thread_beta(&plain, &request(false)).is_ok());
+        let refused = check_thread_beta(&plain, &request(true)).expect_err("refused");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&refused),
+            "thread_beta_required"
+        );
+
+        let mut named = HeaderMap::new();
+        named.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static(
+                "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
+            ),
+        );
+        assert!(check_thread_beta(&named, &request(true)).is_ok());
     }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
