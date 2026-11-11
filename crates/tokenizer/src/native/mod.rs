@@ -246,9 +246,10 @@ impl SeededIds {
     }
 }
 
-/// A seed worker's scratch: the ids an entry merges to and, on the
-/// sentencepiece path, its initial symbols; one per worker, reused across
-/// the entries it reads, so the pass allocates nothing per entry.
+/// A seed job's scratch: the ids an entry merges to and, on the
+/// sentencepiece path, its initial symbols; one per rayon job (a split of
+/// 2048 entries or more), reused across the entries it reads, so the pass
+/// allocates nothing per entry.
 #[derive(Default)]
 struct SeedScratch {
     ids: Vec<u32>,
@@ -1312,7 +1313,7 @@ impl NativeEncoder {
         // The ids of one entry (`piece` its raw bytes on the byte-level
         // path): what a miss on it computes, see above. The model is asked
         // only where the path has no table: it allocates a word and a token
-        // list per call and, through its cache, kept every entry it merged.
+        // list per call.
         let ids_of = |id: u32, entry: &str, piece: &[u8], scratch: &mut SeedScratch| {
             let mut ids = SeededIds::default();
             if bpe.ignore_merges {
@@ -1375,7 +1376,8 @@ impl NativeEncoder {
         };
         let ids = 0..bpe.get_vocab_size() as u32;
         // One slot per id, written in place (the read keeps its index, so the
-        // collect is one list and no concatenation); one scratch per worker.
+        // collect is one list and no concatenation); one scratch per rayon job
+        // (2048 entries or more).
         let read_all = || {
             ids.clone()
                 .into_par_iter()
