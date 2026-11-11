@@ -11,7 +11,11 @@ pub(crate) mod utils;
 // Re-export commonly used items
 pub(crate) use background::{spawn_unstored_sweeper, BackgroundResponses, BackgroundStream};
 pub(crate) use context::ResponsesContext;
-pub(crate) use driven::{build_sse_response_driven, driven_channel, DrivenBody, Reading};
+#[cfg(test)]
+pub(crate) use driven::DrivenBody;
+pub(crate) use driven::{
+    build_sse_response_driven, build_sse_response_driven_with, driven_channel, Reading, ReadingEnd,
+};
 pub(crate) use history::load_history;
 pub(crate) use streaming::{
     await_stream_startup, body_guards, build_sse_response, build_sse_response_from_stream,

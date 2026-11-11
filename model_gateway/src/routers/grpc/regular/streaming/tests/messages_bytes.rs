@@ -313,6 +313,7 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
             )
             .await;
         assert!(result.is_ok(), "{result:?}");
+        ReadingEnd::Complete
     };
     let mut body = DrivenBody::new(Box::pin(reading), rx);
     // `message_start` (the body's own yield follows it), then the frame
