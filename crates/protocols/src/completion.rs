@@ -54,7 +54,12 @@ pub struct CompletionRequest {
     #[validate(range(min = 0, max = 20))]
     pub logprobs: Option<u32>,
 
-    /// The maximum number of tokens to generate
+    /// The maximum number of tokens to generate. A zero is a request in its
+    /// own right, not a value to refuse: with `echo` and `logprobs` it scores
+    /// the prompt and generates nothing (the loglikelihood shape evaluation
+    /// harnesses send), a prefill-only turn for the engines that take one.
+    /// The bound starts at zero for that reason, where the chat route's
+    /// starts at one.
     #[validate(range(min = 0))]
     pub max_tokens: Option<u32>,
 
@@ -614,6 +619,21 @@ mod tests {
         assert!(back.ignore_eos);
         assert!(back.return_hidden_states);
         assert!(!back.skip_special_tokens);
+    }
+
+    /// A `max_tokens` of zero is the prompt-scoring request (`echo` with
+    /// `logprobs`, nothing generated): it validates, and the zero stays a
+    /// zero on the request that goes to the wire, so the bound keeps
+    /// starting at zero where the chat route's starts at one.
+    #[test]
+    fn max_tokens_zero_is_the_prompt_scoring_request_and_validates() {
+        let scoring = req(serde_json::json!({"echo": true, "logprobs": 1, "max_tokens": 0}));
+        assert!(
+            scoring.validate().is_ok(),
+            "max_tokens 0 with echo and logprobs is a request, not a refused value"
+        );
+        assert_eq!(scoring.max_tokens, Some(0), "the zero is kept as written");
+        assert!(scoring.echo, "echo rides with it");
     }
 
     fn prompt(value: Value) -> Result<CompletionPrompt, String> {

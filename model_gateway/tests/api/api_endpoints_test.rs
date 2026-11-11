@@ -412,6 +412,54 @@ mod generation_tests {
 
         ctx.shutdown().await;
     }
+
+    /// `/v1/completions` serves a `max_tokens` of zero: it is the
+    /// prompt-scoring request (`echo` with `logprobs`, nothing generated),
+    /// so the gateway forwards the zero to the worker as written, where the
+    /// chat route refuses its own `max_tokens: 0`.
+    #[tokio::test]
+    async fn test_v1_completions_max_tokens_zero_reaches_the_worker_as_written() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18114, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18114,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "prompt": "hello",
+            "max_tokens": 0,
+            "echo": true,
+            "logprobs": 1
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "max_tokens 0 is a request, not a refused value"
+        );
+        let forwarded = recorder.only_body();
+        assert_eq!(
+            forwarded["max_tokens"], 0,
+            "the zero reaches the worker as written: {forwarded}"
+        );
+        assert_eq!(forwarded["echo"], true, "echo rides with it: {forwarded}");
+
+        ctx.shutdown().await;
+    }
 }
 
 #[cfg(test)]
