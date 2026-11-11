@@ -353,11 +353,42 @@ class Repo:
             position += size + 1
         return texts
 
+    def resolve_path(self, path: str) -> tuple[str | None, list[str]]:
+        """``path`` at HEAD with every symlink along it resolved, one component at a time: a
+        prefix that is a link has its pointee spliced in where it sits, ``..`` is collapsed only
+        once the component before it is resolved, and the links crossed come back beside the
+        result. None when the path leaves the repository, reaches an absolute pointee or loops."""
+        resolved: list[str] = []
+        crossed: list[str] = []
+        remaining = path.split("/")
+        while remaining:
+            part = remaining.pop(0)
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not resolved:
+                    return None, crossed
+                resolved.pop()
+                continue
+            candidate = "/".join([*resolved, part])
+            if not self.git("ls-tree", "HEAD", "--", candidate).startswith("120000 "):
+                resolved.append(part)
+                continue
+            if candidate in crossed:
+                return None, crossed
+            crossed.append(candidate)
+            pointee = (self.show("HEAD", candidate) or "").strip()
+            if not pointee or os.path.isabs(pointee):
+                return None, crossed
+            remaining = [*pointee.split("/"), *remaining]
+        return "/".join(resolved), crossed
+
     def symlink_targets(self, path: str) -> list[str]:
         """What the symlinks under ``path`` at HEAD point at, as repository paths, followed to
-        the end of every chain: a target that is a link, or a directory holding one, adds what
-        that points at, each target read once. A link into ``path`` itself, outside the
-        repository or absolute is left out."""
+        the end of every chain: a target that is a link, a directory holding one, or a path
+        running through a directory link adds what that points at, with the links crossed on
+        the way, each read once. A link into ``path`` itself, outside the repository or
+        absolute is left out."""
         here, inside = path.rstrip("/"), path.rstrip("/") + "/"
         targets: list[str] = []
         pending = [path]
@@ -370,12 +401,13 @@ class Repo:
                 pointee = (self.show("HEAD", link) or "").strip()
                 if not pointee or os.path.isabs(pointee):
                     continue
-                target = os.path.normpath(os.path.join(os.path.dirname(link), pointee))
-                if target.startswith("..") or target == here or target.startswith(inside):
-                    continue
-                if target not in targets:
-                    targets.append(target)
-                    pending.append(target)
+                target, crossed = self.resolve_path(os.path.join(os.path.dirname(link), pointee))
+                for found in [*crossed, target]:
+                    if found is None or found == here or found.startswith(inside):
+                        continue
+                    if found not in targets:
+                        targets.append(found)
+                        pending.append(found)
         return targets
 
     def changed_since(self, tag: str, paths: Sequence[str]) -> list[str]:

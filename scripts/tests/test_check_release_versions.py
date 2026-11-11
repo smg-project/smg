@@ -662,9 +662,9 @@ def test_a_component_whose_files_went_is_named_loudly(mod, repo):
 def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     """A package that ships another directory's files through a link (the proto package ships
     the .proto files that way) ships their changes: they count as the package's, with the
-    level of the commits that made them. A link that points at a link, or a target directory
-    holding one, is followed to the end of the chain. A link into the package itself or out of
-    the repository adds nothing."""
+    level of the commits that made them. A link that points at a link, a target directory
+    holding one, or a link whose path runs through a directory link is followed to the end of
+    the chain. A link into the package itself or out of the repository adds nothing."""
     import os
 
     root = tmp_path / "linked"
@@ -682,21 +682,23 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     os.symlink("../../elsewhere", root / "pkg" / "outside")
     os.symlink("/etc/hostname", root / "pkg" / "absolute")
     put(root, "real/x", "x\n")
+    put(root, "real/y", "y\n")
     os.symlink("../real/x", root / "shared" / "chain")  # a link inside the target directory
     os.symlink("real", root / "hop")  # a link to a directory ...
     os.symlink("../hop", root / "pkg" / "through")  # ... reached through a link to that link
+    os.symlink("../hop/y", root / "pkg" / "p")  # ... and a path that runs through it
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "chore: initial")
     git(root, "tag", "v1.0.0")
     repo = mod.Repo(root)
-    assert repo.symlink_targets("pkg") == ["shared", "hop", "real/x", "real"]
-    assert repo.symlink_targets("pkg/") == ["shared", "hop", "real/x", "real"]
+    assert repo.resolve_path("pkg/../hop/y") == ("real/y", ["hop"])
+    assert repo.resolve_path("pkg/../../elsewhere") == (None, [])
+    chain = ["hop", "real/y", "shared", "real", "real/x"]
+    assert repo.symlink_targets("pkg") == chain
+    assert repo.symlink_targets("pkg/") == chain
     assert mod.component_paths(repo, mod.package("pkg", "pkg", "pkg/pyproject.toml")) == [
         "pkg/",
-        "shared",
-        "hop",
-        "real/x",
-        "real",
+        *chain,
     ]
     assert repo.symlink_targets("model_gateway") == []
 
@@ -741,3 +743,15 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     out = stream.getvalue()
     assert code == 1
     assert "  ! pkg (pkg/) — 2 file(s) changed but version not bumped (v0.1.0) [minor]" in out
+
+    # and so is a change behind a link whose path runs through a directory link
+    put(root, "real/y", "y2\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "fix(real): y")
+    stream = io.StringIO()
+    mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    assert "  ! pkg (pkg/) — 3 file(s) changed but version not bumped (v0.1.0) [minor]" in (
+        stream.getvalue()
+    )
