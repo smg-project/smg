@@ -17,6 +17,9 @@ use crate::validated::Normalizable;
 // The native Generate API (one engine's own format)
 // ============================================================================
 
+/// A request to the native generate route: the input as text, token ids or
+/// embeddings with its media, the model, the sampling parameters, and the
+/// log-probability, hidden-state, session and adapter options.
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
@@ -338,6 +341,8 @@ pub enum GenerateFinishReason {
     Other(Value),
 }
 
+/// The kind of a generate finish reason as the wire names it: `length` (the
+/// token cap reached) or `stop` (a stop condition met).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum GenerateFinishType {

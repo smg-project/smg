@@ -21,6 +21,9 @@ fn current_timestamp() -> i64 {
 // Rerank API
 // ============================================================================
 
+/// A request to the rerank route: the query, the documents to rank against it,
+/// the model, how many of the best to return and whether to return the
+/// documents' text.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_rerank_request"))]
 pub struct RerankRequest {
