@@ -42,8 +42,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
+    response::Response,
 };
 use futures::{future::BoxFuture, FutureExt};
 use openai_protocol::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse};
@@ -60,6 +59,7 @@ use tracing::{debug, info, warn};
 use super::ResponsesContext;
 use crate::routers::{
     common::{
+        json_response,
         persistence_utils::{self, build_stored_response, extract_input_items},
         sse::{sse_channel, SseSender},
     },
@@ -1049,7 +1049,7 @@ async fn cancel_with(
                         response_id,
                         "Background response closed as cancelled; no task runs it on this gateway"
                     );
-                    (StatusCode::OK, Json(raw)).into_response()
+                    json_response(&raw)
                 }
                 Ok(Transition::Terminal(raw)) => answer_for_closed(raw),
                 Ok(Transition::Missing) => error::not_found(
@@ -1098,7 +1098,7 @@ fn response_not_found(id: &str) -> Response {
 /// the `cancelled` object, or the refusal its status earns.
 fn answer_for_closed(raw: Value) -> Response {
     match raw["status"].as_str().unwrap_or("unknown") {
-        "cancelled" => (StatusCode::OK, Json(raw)).into_response(),
+        "cancelled" => json_response(&raw),
         "completed" | "incomplete" => error::bad_request(
             "response_already_completed",
             "Cannot cancel completed response",
@@ -1115,6 +1115,7 @@ fn answer_for_closed(raw: Value) -> Response {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use axum::response::IntoResponse;
     use smg_data_connector::{MemoryResponseStorage, ResponseStorageError};
     use tokio::sync::oneshot;
 

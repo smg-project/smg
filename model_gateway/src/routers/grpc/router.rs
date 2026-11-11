@@ -1,11 +1,7 @@
 use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use axum::{
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::{http::HeaderMap, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -822,11 +818,7 @@ impl GrpcRouter {
             )
             .await
         {
-            Ok(input_tokens) => (
-                StatusCode::OK,
-                Json(CountMessageTokensResponse { input_tokens }),
-            )
-                .into_response(),
+            Ok(input_tokens) => json_response(&CountMessageTokensResponse { input_tokens }),
             Err(refused) => refused,
         }
     }
