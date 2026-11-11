@@ -485,12 +485,13 @@ pub enum ResponseFormat {
     Text,
     #[serde(rename = "json_object")]
     JsonObject,
-    /// A schema the answer is held to. Behind a pointer, as the tag's object
-    /// below is: a format is then two words wherever a request or a route
-    /// task holds one. Inline, the schema's 128 bytes had put the Gateway's
-    /// chat route task, which holds a request's format three times over its
-    /// awaits, over the allocator's 3,584-byte class edge on every chat
-    /// request. A text or json_object format allocates nothing.
+    // The schema rides behind a pointer, as the tag's object below does: a
+    // format is then two words wherever a request or a route task holds one.
+    // Inline, the schema's 128 bytes had put the Gateway's chat route task,
+    // which holds a request's format three times over its awaits, over the
+    // allocator's 3,584-byte class edge on every chat request. A text or
+    // json_object format allocates nothing. No `///` here: the variant's doc
+    // would become its description in the generated OpenAPI document.
     #[serde(rename = "json_schema")]
     JsonSchema { json_schema: Box<JsonSchemaFormat> },
     /// A structural tag: JSON held to a schema between the tags it names, free
@@ -500,7 +501,8 @@ pub enum ResponseFormat {
     #[serde(rename = "structural_tag")]
     StructuralTag {
         /// Every key but `type`, in the order they arrived; written back the
-        /// same. Behind a pointer, as the schema above is.
+        /// same.
+        // Behind a pointer, as the schema above is.
         #[serde(flatten)]
         spec: Box<Map<String, Value>>,
     },
