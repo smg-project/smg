@@ -9,7 +9,13 @@
 //! as the start read it, and a reload rebuilds the serving map from that
 //! fixed part and the files'.
 
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -355,7 +361,8 @@ pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::
     let (wake, woken) = mpsc::channel(1);
     let mut watches = Vec::new();
     for (dir, names) in reloader.files.by_directory() {
-        let watch = DirectoryWatch::start(&dir, names.clone(), wake.clone())?;
+        let watch = DirectoryWatch::start(&dir, names.clone(), wake.clone())
+            .map_err(|error| watch_refused(&dir, error))?;
         watches.push(Watched {
             dir,
             names,
@@ -376,6 +383,18 @@ pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::
     )]
     let handle = task::spawn(watch_loop(reloader, wake, woken, watches));
     Ok(handle)
+}
+
+/// The start's refusal for a key directory that cannot be watched. The watch
+/// crate's own error names no path for the likely causes, the inotify
+/// limits, so this one names the flag and the directory.
+fn watch_refused(dir: &Path, error: notify::Error) -> notify::Error {
+    // The kind alone: a path the error carries is the directory itself.
+    let cause = notify::Error::new(error.kind);
+    notify::Error::generic(&format!(
+        "--secrets-auto-reload: cannot watch {}: {cause}",
+        dir.display()
+    ))
 }
 
 /// One watched directory of key files; `watch` is `None` while the directory
@@ -428,8 +447,6 @@ async fn watch_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use smg_auth::{ApiKeyEntry, Role};
 
     use super::*;
@@ -968,6 +985,42 @@ mod tests {
             time::sleep(Duration::from_millis(50)).await;
         }
         handle.abort();
+    }
+
+    /// A key directory that cannot be watched refuses the start by the
+    /// flag and the directory, named once, never by a bare OS error.
+    #[tokio::test]
+    async fn a_directory_that_cannot_be_watched_is_refused_by_flag_and_directory() {
+        let dir = tempfile::tempdir().expect("a directory");
+        // A regular file where the key's directory should be.
+        let blocker = write(dir.path(), "a-file", "");
+        let reloader = Arc::new(
+            SecretReloader::new(
+                SecretFiles {
+                    api_key: Some(blocker.join("key")),
+                    ..SecretFiles::default()
+                },
+                &sources(SecretSource::File, None),
+                Some("k-one"),
+                &[],
+                AuthConfig::new(Some("k-one".into())),
+                None,
+            )
+            .expect("a file source"),
+        );
+        let error = start_auto_reload(reloader).expect_err("a file is no directory to watch");
+        let text = error.to_string();
+        let directory = blocker.display().to_string();
+        assert!(
+            text.starts_with("--secrets-auto-reload: cannot watch "),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches(&directory).count(),
+            1,
+            "the directory once: {text}"
+        );
+        assert!(text.ends_with("not a directory"), "{text}");
     }
 
     #[test]
