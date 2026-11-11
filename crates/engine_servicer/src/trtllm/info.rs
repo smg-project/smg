@@ -8,7 +8,7 @@ use tonic::Status;
 
 use super::{State, HEALTHY};
 use crate::{
-    load_report::{rank_entries, rank_entry, RankFigures},
+    load_report::{rank_entries, rank_entry, Capacity, RankFigures},
     load_tracker::LoadEstimate,
 };
 
@@ -134,7 +134,7 @@ fn world_of(tensor: i32, pipeline: i32, context: i32) -> i32 {
 /// rank the request names alone when it names one.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_running_requests);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
     let (loads, _) = rank_entries(
         client.get_loads().loads,
@@ -161,7 +161,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoads
 /// shim makes it a rank); a rank past the connected ones has no entry.
 pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<trt::SchedulerLoad> {
     let client = state.shared.engine().ok()?;
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_running_requests);
     rank_entry(
         |index| client.rank_load(index),
         capacity.max_total_num_tokens,
@@ -170,24 +170,6 @@ pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<trt::Sche
         |load, figures| reported_entry(state, load, figures, &capacity),
         |rank| unreported_entry(state, rank, &capacity),
     )
-}
-
-/// The capacity figures every rank's entry carries: the running window and
-/// the KV capacity the servicer knows.
-struct Capacity {
-    max_running_requests: i32,
-    max_total_num_tokens: i32,
-}
-
-impl Capacity {
-    fn of(state: &State) -> Self {
-        Self {
-            max_running_requests: state
-                .shared
-                .running_window(state.model.max_running_requests),
-            max_total_num_tokens: state.shared.kv_capacity_tokens(),
-        }
-    }
 }
 
 /// One rank's entry from its figures and the servicer's own estimate for it.
