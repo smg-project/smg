@@ -1043,10 +1043,17 @@ async fn execute_parallel_pd(
     // The prefill side's silence is bounded from its dispatch: a call that
     // returns no stream, or a stream with nothing on it, within the bound
     // fails the attempt instead of holding the request (and the decode room
-    // the admission gate claimed for it) until its own timeout.
+    // the admission gate claimed for it) until its own timeout. A side whose
+    // embeddings come from an encode worker has the encoder's forward and
+    // the transfer in front of its first response as well.
     let prefill_worker = workers.prefill_worker();
-    let bound = prefill_worker
-        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
+    let bound = prefill_worker.and_then(|worker| {
+        if prefill_request.awaits_encode() {
+            PrefillBound::behind_encode(worker, sides.prompt_tokens, prefill_start)
+        } else {
+            PrefillBound::at(worker, sides.prompt_tokens, prefill_start)
+        }
+    });
     // Each side owns its client handle (a cheap channel clone, the same one
     // batched dispatch takes per sub-request) so the side still in flight when
     // its partner fails can be moved off the request path.
@@ -1657,12 +1664,36 @@ impl PrefillBound {
         prompt_tokens: u64,
         dispatched: Instant,
     ) -> Option<Self> {
+        let bound = liveness::prefill_side_bound(worker, prompt_tokens)?;
+        Self::on(worker, prompt_tokens, bound, dispatched)
+    }
+
+    /// [`Self::at`] for a side whose embeddings come from an encode worker:
+    /// a worker that has answered nothing gets what is left of the
+    /// cold-shape grace, its first prompt being the encoder's first as well
+    /// (see [`liveness::prefill_side_bound_behind_encode`]). A stalled
+    /// decode partner is read once the side's bound has passed, as under
+    /// the cold-shape grace: at the grace while it is in force.
+    pub(crate) fn behind_encode(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        dispatched: Instant,
+    ) -> Option<Self> {
+        let bound = liveness::prefill_side_bound_behind_encode(worker, prompt_tokens)?;
+        Self::on(worker, prompt_tokens, bound, dispatched)
+    }
+
+    /// A bound of `bound` from `dispatched` on a side of `prompt_tokens` to
+    /// `worker`, a stalled decode partner judged by a decode side's bound
+    /// for the same prompt.
+    fn on(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        bound: Duration,
+        dispatched: Instant,
+    ) -> Option<Self> {
         let partner_bound = liveness::decode_side_bound(worker, prompt_tokens)?;
-        Self::of(
-            liveness::prefill_side_bound(worker, prompt_tokens)?,
-            dispatched,
-        )
-        .map(|bound| Self {
+        Self::of(bound, dispatched).map(|bound| Self {
             partner_bound,
             ..bound
         })
@@ -2734,6 +2765,139 @@ pub(crate) mod tests {
         assert!(
             is_retryable_response(&response),
             "another prefill worker may take the request"
+        );
+    }
+
+    /// The first media prompt of a fresh deployment (95 tokens) dispatched to
+    /// a prefill worker that has answered nothing, with the encoder's first
+    /// forward in front of its answer: the side as `dispatch_prefill_within`
+    /// drives it under `bound`, answering as `side` does (the stubs answer
+    /// with a failure of their own, which passes through as a late side's
+    /// does, or never).
+    async fn first_media_prompt(
+        prefill: &Arc<dyn Worker>,
+        bound: PrefillBound,
+        side: SideDispatch,
+    ) -> StreamResult {
+        dispatch_prefill_within(
+            Some(bound),
+            side,
+            Some(Arc::clone(prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-first-image".to_string(),
+            95,
+        )
+        .await
+    }
+
+    /// The first media request of a fresh encode-prefill-decode deployment:
+    /// the prefill side's first response waits on the encoder's first
+    /// forward and the transfer before the prefill worker's own, and its
+    /// worker has answered nothing. A plain side's bound (a request that
+    /// carries no encode rooms) gives it up at the threshold while the
+    /// encoder still runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_under_a_plain_bound_is_given_up_on_while_the_encoder_runs() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let plain = PrefillBound::at(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            plain.bound,
+            Duration::from_secs(3),
+            "a plain side on a worker that has answered nothing: the threshold"
+        );
+        let answer = answers_after(Duration::from_millis(3_500));
+        let status = failure(first_media_prompt(&prefill, plain, answer).await);
+        assert!(
+            is_prefill_silence(&status),
+            "given up on at the threshold while the encoder runs: {status:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_millis(3_500),
+            "at the threshold, before the answer: {elapsed:?}"
+        );
+    }
+
+    /// The same first media request behind an encode worker: the side's
+    /// bound is the cold-shape grace, so the answer that comes at 3.5 s
+    /// passes through, and a stalled decode partner is still judged by a
+    /// decode side's bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_behind_an_encode_worker_waits_out_the_encoders_first_forward()
+    {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let encoder_forward = Duration::from_millis(3_500);
+        let started = tokio::time::Instant::now();
+        let behind =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            behind.bound,
+            Duration::from_secs(120),
+            "behind an encode worker: the cold-shape grace"
+        );
+        assert_eq!(
+            behind.partner_bound,
+            Duration::from_secs(3),
+            "the partner's own bound is unchanged; it is read once the side's bound has passed, as under the cold-shape grace"
+        );
+        let answer = answers_after(encoder_forward);
+        let status = failure(first_media_prompt(&prefill, behind, answer).await);
+        assert!(
+            !is_prefill_silence(&status),
+            "the side's answer passed through: {status:?}"
+        );
+        assert_eq!(status.message(), "late side");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= encoder_forward && elapsed < Duration::from_secs(4),
+            "the answer's own time, not a verdict: {elapsed:?}"
+        );
+    }
+
+    /// A first media request behind an encode worker whose prefill side
+    /// never answers is still given up on, at the grace and not later, with
+    /// the verdict naming the window it was judged against.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_behind_an_encode_worker_that_never_answers_is_given_up_on_at_the_grace(
+    ) {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let behind =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        let status = failure(first_media_prompt(&prefill, behind, never_answers()).await);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            status
+                .message()
+                .contains("never answered (a 120.0s window)"),
+            "the verdict names the grace it was judged against: {status:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(120) && elapsed < Duration::from_secs(121),
+            "given up on at the grace, not later: {elapsed:?}"
+        );
+        // The grace is spent: a run released without an answer leaves its
+        // silence on the worker's book, and the next side reads the
+        // threshold. The side given up on above still holds its prompt (its
+        // stream never ends here; the late failure would release it), so the
+        // test releases it, then banks a run the grace long, stamped forward
+        // (the gateway clock is young in a test).
+        prefill.note_prefill_ended(95, true, None);
+        let t0 = liveness::now_ms().max(1);
+        prefill.note_prefill_started_at(95, true, t0);
+        prefill.note_prefill_ended_at(95, true, None, t0 + 120_000);
+        let spent =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            spent.bound,
+            Duration::from_secs(3),
+            "the grace spent: the threshold until the worker answers"
         );
     }
 

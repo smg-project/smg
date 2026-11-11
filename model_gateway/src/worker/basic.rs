@@ -722,6 +722,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         None
     }
 
+    /// How long the worker's prompts have gone unanswered since its latest
+    /// first response: [`Self::prefill_unanswered_run`] with the idle spells
+    /// still left out but read whether or not a prompt is pending, so a
+    /// worker that was given up on and holds nothing still reports the
+    /// silence it owes. Zero after an answer, for a worker never dispatched
+    /// to, or for one that does not track its runs.
+    fn prefill_unanswered_total(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// Whether the engine behind the worker is on a prompt shape it has not
     /// shown it runs: a prompt pending on the worker, or one of `tokens`
     /// about to be dispatched, longer than any the worker has answered since
@@ -1878,6 +1888,10 @@ impl Worker for BasicWorker {
 
     fn prefill_unanswered_run(&self) -> Option<Duration> {
         self.runtime.load().prefill_unanswered_run()
+    }
+
+    fn prefill_unanswered_total(&self) -> Duration {
+        self.runtime.load().prefill_unanswered_total()
     }
 
     fn prefill_cold_shape(&self, tokens: u64) -> bool {

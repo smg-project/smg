@@ -928,6 +928,19 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Whether the prefill side's embeddings come from an encode worker: the
+    /// request carries the encode rendezvous rooms the prefill worker waits
+    /// on before its own forward (see [`Self::set_encode_bootstrap_info`]).
+    pub(crate) fn awaits_encode(&self) -> bool {
+        match self {
+            Self::TokenSpeed(req) => req
+                .encode_bootstrap_info
+                .as_ref()
+                .is_some_and(|info| !info.items.is_empty()),
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => false,
+        }
+    }
+
     /// Set the PD prefill->decode KV rendezvous params (TokenSpeed only).
     ///
     /// The gateway sends identical params to both the prefill and decode worker:
@@ -952,5 +965,42 @@ impl ProtoGenerateRequest {
                 tracing::warn!("set_kv_bootstrap_info called on non-TokenSpeed request, ignoring");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prefill side's request says its embeddings come from an encode
+    /// worker while it carries encode rendezvous rooms; its pixel-free decode
+    /// clone, whose rooms are cleared, waits on the prefill's handoff instead,
+    /// and a request with no rooms never did.
+    #[test]
+    fn a_request_awaits_encode_only_while_it_carries_encode_rooms() {
+        let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
+        assert!(!request.awaits_encode(), "no rooms, no encode wait");
+        request.set_encode_bootstrap_info(Vec::new());
+        assert!(
+            !request.awaits_encode(),
+            "an empty room list is no encode wait"
+        );
+        request.set_encode_bootstrap_info(vec![EncodeItemBootstrapInfo {
+            item_index: 0,
+            bootstrap_host: "encode-worker".to_string(),
+            bootstrap_port: 9000,
+            bootstrap_room: 41,
+        }]);
+        assert!(
+            request.awaits_encode(),
+            "the prefill side waits on the encoder"
+        );
+        let mut decode = request.clone_without_mm_pixels();
+        decode.clear_encode_bootstrap_info();
+        assert!(
+            !decode.awaits_encode(),
+            "the decode side waits on the prefill's handoff, not on the encoder"
+        );
+        assert!(request.awaits_encode(), "the prefill side still does");
     }
 }
