@@ -190,7 +190,14 @@ fn tcp_socket_addresses(
 /// masked whole (`tcp://***@host:port`), since the text reaches the start-up
 /// log and the add-worker route's answer, and a userinfo may be a secret.
 fn masked(url: &str) -> String {
-    let (prefix, authority) = url.split_once("://").unwrap_or(("", url));
+    // The first `://` is the scheme separator only when what precedes it can
+    // be a scheme: a schemeless string may carry `://` later (in its path, or
+    // in a malformed userinfo), and that one must not move the split past
+    // the userinfo.
+    let (prefix, authority) = match url.split_once("://") {
+        Some((scheme, rest)) if !scheme.contains(['@', '/', '?', '#']) => (scheme, rest),
+        _ => ("", url),
+    };
     match authority.rsplit_once('@') {
         Some((_, host_port)) if prefix.is_empty() => format!("***@{host_port}"),
         Some((_, host_port)) => format!("{prefix}://***@{host_port}"),
@@ -560,6 +567,34 @@ mod tests {
         let err = zmq_handshake_address("ipc:///tmp/w", Some("tcp://user:secret@10.0.0.5:30500"))
             .unwrap_err();
         assert!(err.contains("without userinfo"), "{err}");
+    }
+
+    /// A schemeless override that carries `://` later in the string (its
+    /// path) is still masked at its userinfo: the later separator does not
+    /// move the split, so the refusal never writes the secret.
+    #[test]
+    fn a_schemeless_override_with_a_later_separator_is_masked() {
+        assert_eq!(masked("user:secret@host/x://y"), "***@host/x://y");
+        let err =
+            zmq_handshake_address("ipc:///tmp/w", Some("user:secret@host/x://y")).unwrap_err();
+        assert!(err.contains("***@host/x://y"), "{err}");
+        assert!(!err.contains("secret"), "{err}");
+    }
+
+    /// A `://` inside a `tcp://` URL's path leaves the mask at the userinfo,
+    /// and the URL is refused for the userinfo with the secret masked.
+    #[test]
+    fn a_separator_inside_the_path_does_not_move_the_mask() {
+        assert_eq!(
+            masked("tcp://user:secret@10.0.0.5:31000/x://y"),
+            "tcp://***@10.0.0.5:31000/x://y"
+        );
+        let err =
+            zmq_socket_addresses("tcp://user:secret@10.0.0.5:31000/x://y", Handshake::Derived)
+                .unwrap_err();
+        assert!(err.contains("without userinfo"), "{err}");
+        assert!(err.contains("tcp://***@10.0.0.5:31000/x://y"), "{err}");
+        assert!(!err.contains("secret"), "{err}");
     }
 
     #[tokio::test]

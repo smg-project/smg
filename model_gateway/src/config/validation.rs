@@ -297,10 +297,16 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         }
     }
     // A tcp:// worker URL is what the ZMQ sockets bind, where a userinfo
-    // (`user:secret@`) has no meaning at all: refused. (A gRPC worker URL's
-    // userinfo is accepted and named by [`unused_credentials_warning`], at
-    // start-up and at registration, where a log line is seen.)
-    if scheme == "tcp" && Endpoint::parse(url).is_ok_and(|endpoint| endpoint.has_credentials()) {
+    // (`user:secret@`) has no meaning at all: refused, by the adapter's own
+    // reading (an `@` anywhere after the scheme), so that nothing the
+    // validator passes is refused at registration instead, whatever the
+    // `Endpoint` grammar makes of the rest of the string. (A gRPC worker
+    // URL's userinfo is accepted and named by [`unused_credentials_warning`],
+    // at start-up and at registration, where a log line is seen.)
+    if url
+        .strip_prefix("tcp://")
+        .is_some_and(|authority| authority.contains('@'))
+    {
         return Err(ConfigError::invalid_value(
             "worker_url",
             Endpoint::redacted_str(url),
@@ -3612,6 +3618,23 @@ mod tests {
             assert!(!text.contains("secret"), "{text}");
         }
         assert!(validate_worker_url("tcp://10.0.0.5:31000").is_ok());
+    }
+
+    /// What the ZMQ adapter refuses for a userinfo, the validator refuses
+    /// first: a `tcp://` URL with an `@` that the endpoint grammar reads as
+    /// something else (a rank suffix after it, an empty userinfo) is refused
+    /// here, masked, instead of passing to a refusal at registration.
+    #[test]
+    fn a_tcp_worker_url_the_adapter_refuses_is_refused_by_the_validator() {
+        for url in ["tcp://user:secret@host:1@2", "tcp://@host:31000"] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("takes no userinfo"), "{url}: {text}");
+            assert!(!text.contains("secret"), "{url}: {text}");
+        }
+        let text = validate_worker_url("tcp://user:secret@host:1@2")
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("tcp://***@host:1@2"), "{text}");
     }
 
     /// A `grpc://` worker URL with userinfo stays accepted and earns the one
