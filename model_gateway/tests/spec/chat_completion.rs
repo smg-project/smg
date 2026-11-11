@@ -559,12 +559,12 @@ fn test_validate_response_format_json_schema_schema_not_object() {
                 name: None,
             }],
             response_format: Some(ResponseFormat::JsonSchema {
-                json_schema: JsonSchemaFormat {
+                json_schema: Box::new(JsonSchemaFormat {
                     description: None,
                     name: name.to_string(),
                     schema,
                     strict: None,
-                },
+                }),
             }),
             ..Default::default()
         }

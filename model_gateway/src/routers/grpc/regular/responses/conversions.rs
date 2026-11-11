@@ -650,12 +650,12 @@ fn map_text_to_response_format(text: Option<&TextConfig>) -> Option<ResponseForm
             description,
             strict,
         } => Some(ResponseFormat::JsonSchema {
-            json_schema: JsonSchemaFormat {
+            json_schema: Box::new(JsonSchemaFormat {
                 description: description.clone(),
                 name: name.clone(),
                 schema: schema.clone(),
                 strict: *strict,
-            },
+            }),
         }),
     }
 }

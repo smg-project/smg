@@ -485,8 +485,14 @@ pub enum ResponseFormat {
     Text,
     #[serde(rename = "json_object")]
     JsonObject,
+    /// A schema the answer is held to. Behind a pointer, as the tag's object
+    /// below is: a format is then two words wherever a request or a route
+    /// task holds one. Inline, the schema's 128 bytes had put the Gateway's
+    /// chat route task, which holds a request's format three times over its
+    /// awaits, over the allocator's 3,584-byte class edge on every chat
+    /// request. A text or json_object format allocates nothing.
     #[serde(rename = "json_schema")]
-    JsonSchema { json_schema: JsonSchemaFormat },
+    JsonSchema { json_schema: Box<JsonSchemaFormat> },
     /// A structural tag: JSON held to a schema between the tags it names, free
     /// text around them. The engines' grammar compilers read the object itself,
     /// in more than one spelling (`structures` with `triggers`, or a `format`),
@@ -494,9 +500,9 @@ pub enum ResponseFormat {
     #[serde(rename = "structural_tag")]
     StructuralTag {
         /// Every key but `type`, in the order they arrived; written back the
-        /// same.
+        /// same. Behind a pointer, as the schema above is.
         #[serde(flatten)]
-        spec: Map<String, Value>,
+        spec: Box<Map<String, Value>>,
     },
 }
 
@@ -752,7 +758,9 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                         if let Some(Schema::Kept(kept)) = schema.filter(|_| !schema_twice) {
                             spec.insert("json_schema".to_owned(), Value::from(kept));
                         }
-                        ResponseFormat::StructuralTag { spec }
+                        ResponseFormat::StructuralTag {
+                            spec: Box::new(spec),
+                        }
                     }
                     ResponseFormatKind::JsonSchema => {
                         let json_schema = match schema {
@@ -779,7 +787,9 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                             // second key: the value's own error comes first
                             return Err(de::Error::duplicate_field("json_schema"));
                         }
-                        ResponseFormat::JsonSchema { json_schema }
+                        ResponseFormat::JsonSchema {
+                            json_schema: Box::new(json_schema),
+                        }
                     }
                 })
             }
@@ -2858,6 +2868,42 @@ mod tests {
         );
     }
 
+    /// The two kinds that carry a value carry it behind a pointer: a format is
+    /// two words wherever one is held (the Gateway's chat route task holds a
+    /// request's format three times over its awaits, and the schema's 128
+    /// bytes inline had put that task's box over the allocator's 3,584-byte
+    /// class edge on every chat request), and the text written back is the
+    /// text read.
+    #[test]
+    fn a_response_formats_schema_and_tag_ride_behind_a_pointer_each() {
+        assert_eq!(size_of::<ResponseFormat>(), 2 * size_of::<usize>());
+        assert_eq!(
+            size_of::<Option<ResponseFormat>>(),
+            size_of::<ResponseFormat>()
+        );
+        let schema_text = concat!(
+            r#"{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object"},"#,
+            r#""strict":true,"description":"d"}}"#
+        );
+        let tag_text = r#"{"type":"structural_tag","structures":[],"triggers":["<w>"]}"#;
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text).expect(text);
+        let schema = read(schema_text);
+        let ResponseFormat::JsonSchema { json_schema } = &schema else {
+            panic!("{schema:?}");
+        };
+        assert_eq!(size_of_val(json_schema), size_of::<usize>());
+        assert_eq!(json_schema.description.as_deref(), Some("d"));
+        let tag = read(tag_text);
+        let ResponseFormat::StructuralTag { spec } = &tag else {
+            panic!("{tag:?}");
+        };
+        assert_eq!(size_of_val(spec), size_of::<usize>());
+        assert_eq!(spec.keys().collect::<Vec<_>>(), ["structures", "triggers"]);
+        for (format, text) in [(&schema, schema_text), (&tag, tag_text)] {
+            assert_eq!(serde_json::to_string(format).expect("writes"), text);
+        }
+    }
+
     /// A structural tag is carried as it arrived: every key but `type`, in
     /// the order they came, in whichever spelling the engine's grammar
     /// compiler takes (`structures` with `triggers`, or a `format`), unknown
@@ -2871,7 +2917,7 @@ mod tests {
     fn a_structural_tag_response_format_is_kept_as_it_arrived() {
         let read = |text: &str| serde_json::from_str::<ResponseFormat>(text).expect(text);
         let spec_of = |format: &ResponseFormat| match format {
-            ResponseFormat::StructuralTag { spec } => spec.clone(),
+            ResponseFormat::StructuralTag { spec } => (**spec).clone(),
             other => panic!("{other:?}"),
         };
         let structures = concat!(
@@ -2969,14 +3015,16 @@ mod tests {
             ResponseFormat::Text,
             ResponseFormat::JsonObject,
             ResponseFormat::JsonSchema {
-                json_schema: JsonSchemaFormat {
+                json_schema: Box::new(JsonSchemaFormat {
                     description: None,
                     name: "answer".to_owned(),
                     schema: json!({"type": "object"}),
                     strict: None,
-                },
+                }),
             },
-            ResponseFormat::StructuralTag { spec: Map::new() },
+            ResponseFormat::StructuralTag {
+                spec: Box::default(),
+            },
         ];
         assert_eq!(formats.len(), ResponseFormatKind::ALL.len());
         for (format, kind) in formats.iter().zip(ResponseFormatKind::ALL) {
