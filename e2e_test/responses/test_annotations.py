@@ -228,7 +228,8 @@ def openai_direct_client():
 # a required job into its cap with every test that ran green. The poll uses the two calls every
 # SDK version has (the SDK's own bounded poll is a keyword of a later version, and the harness
 # project is installed into the engine venvs, whose engines pin their own SDK), on a client copy
-# with a short per-request timeout, so a request in flight cannot outlive the wait.
+# with a short per-request timeout: a request in flight at the deadline overruns it by at most
+# that timeout and the client's two retries (about a minute and a half), not ten minutes.
 _VECTOR_STORE_INDEX_DEADLINE_S = 300
 _VECTOR_STORE_POLL_INTERVAL_S = 2.0
 _VECTOR_STORE_POLL_REQUEST_TIMEOUT_S = 30.0
