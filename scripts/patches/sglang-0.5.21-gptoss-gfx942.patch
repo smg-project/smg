@@ -1,0 +1,287 @@
+--- a/python/sglang/srt/layers/quantization/__init__.py
++++ b/python/sglang/srt/layers/quantization/__init__.py
+@@ -35,7 +35,10 @@
+ )
+ from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+ from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+-from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
++from sglang.srt.layers.quantization.mxfp4 import (
++    Mxfp4Config,
++    _gfx942_gptoss_bf16_available,
++)
+ from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
+ from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import Mxfp4W4A4Config
+ from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
+@@ -94,7 +97,13 @@
+ # GEMM, which consumes the packed e2m1 + ue8m0 g32 checkpoint layout directly.
+ # Other backends without that kernel keep the existing "unknown quantization
+ # method" error rather than falling through to a bf16 upcast.
+-if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
++if (
++    is_cpu()
++    or is_cuda()
++    or _is_gfx95_supported
++    or is_xpu()
++    or _gfx942_gptoss_bf16_available()
++):
+     BASE_QUANTIZATION_METHODS.update(
+         {
+             "mxfp4": Mxfp4Config,
+--- a/python/sglang/srt/layers/quantization/mxfp4.py
++++ b/python/sglang/srt/layers/quantization/mxfp4.py
+@@ -18,6 +18,8 @@
+ from __future__ import annotations
+ 
+ import os
++import logging
++import re
+ from dataclasses import replace
+ from functools import lru_cache
+ from typing import TYPE_CHECKING, List, Optional
+@@ -199,6 +201,102 @@
+ _is_xpu = is_xpu()
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+ _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
++
++_GFX942_GPTOSS_BF16_ENV = "SGLANG_GPTOSS_MXFP4_BF16_FALLBACK"
++logger = logging.getLogger(__name__)
++
++
++def _gfx942_gptoss_bf16_requested() -> bool:
++    value = os.environ.get(_GFX942_GPTOSS_BF16_ENV, "0")
++    if value not in ("0", "1"):
++        raise ValueError(f"{_GFX942_GPTOSS_BF16_ENV} must be 0 or 1")
++    return value == "1"
++
++
++def _gfx942_gptoss_bf16_available() -> bool:
++    if not _gfx942_gptoss_bf16_requested() or not _is_hip:
++        return False
++    if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx942":
++        return False
++    if os.environ.get("SGLANG_USE_AITER") != "0":
++        raise ValueError(
++            "GPTOSS gfx942 BF16 fallback requires explicit SGLANG_USE_AITER=0"
++        )
++    return True
++
++
++def _validate_gfx942_gptoss_bf16_model(model_path, hf_config, quantization):
++    if not _gfx942_gptoss_bf16_requested():
++        return
++    path = str(model_path).rstrip("/")
++    original = path == "openai/gpt-oss-20b" or bool(
++        re.fullmatch(
++            r"/models/hub/models--openai--gpt-oss-20b/snapshots/[0-9a-f]{40}", path
++        )
++    )
++    if (
++        not original
++        or getattr(hf_config, "model_type", None) != "gpt_oss"
++        or quantization != "mxfp4"
++    ):
++        raise ValueError(
++            "GPTOSS gfx942 BF16 fallback requires original openai/gpt-oss-20b MXFP4 checkpoint"
++        )
++    if not _gfx942_gptoss_bf16_available():
++        raise ValueError(
++            "GPTOSS BF16 fallback is restricted to explicitly opted-in gfx942"
++        )
++
++
++def _validate_gfx942_gptoss_bf16_runtime():
++    if not _gfx942_gptoss_bf16_available() or _use_aiter:
++        raise ValueError(
++            "GPTOSS gfx942 BF16 fallback requires AITER disabled before engine import"
++        )
++    configured = get_exec().moe
++    backend = get_moe_runner_backend()
++    # Runtime flags may not yet be seeded at quant-config creation. The
++    # published CLI must still explicitly select triton, never user AUTO.
++    if configured.moe_runner_backend != "triton" or not (
++        backend.is_triton() or backend.is_auto()
++    ):
++        raise ValueError(
++            "GPTOSS gfx942 BF16 fallback requires explicit generic triton runner"
++        )
++    if configured.moe_a2a_backend != "none" or not get_moe_a2a_backend().is_none():
++        raise ValueError("GPTOSS gfx942 BF16 fallback does not support MoE all-to-all")
++
++
++def _dequant_gfx942_gptoss_weight(weight, scale):
++    # Reuse the existing original-MXFP4 decoder, not a new quantizer/checkpoint.
++    from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
++
++    if (
++        weight.dtype != torch.uint8
++        or scale.dtype != torch.uint8
++        or weight.ndim != 3
++        or scale.ndim != 3
++    ):
++        raise ValueError("Expected original uint8 packed MXFP4 expert weight and scale")
++    e, n, packed = weight.shape
++    if (
++        e == 0
++        or n == 0
++        or packed == 0
++        or packed % 16
++        or tuple(scale.shape) != (e, n, packed // 16)
++    ):
++        raise ValueError("Original MXFP4 expert weight/scale block layout mismatch")
++    result = dequant_mxfp4(
++        weight.reshape(e, n, packed // 16, 16), scale, torch.bfloat16
++    )
++    if not bool(torch.isfinite(result).all()):
++        raise ValueError(
++            "Non-finite original MXFP4 values cannot be represented by this BF16 fallback"
++        )
++    return result.contiguous()
++
++
+ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+ _is_cpu_amx_available = cpu_has_amx_support()
+ 
+@@ -296,16 +394,31 @@
+         self,
+         ignored_layers: Optional[list[str]] = None,
+         is_checkpoint_mxfp4_serialized: bool = False,
++        use_gfx942_bf16_fallback: bool = False,
+     ):
+         super().__init__()
++        self.use_gfx942_bf16_fallback = use_gfx942_bf16_fallback
+         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+         self.ignored_layers = ignored_layers
+ 
+     @classmethod
+     def from_config(cls, config):
+-
+         quant_method = cls.get_from_keys(config, ["quant_method"])
+         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
++
++        if _gfx942_gptoss_bf16_requested():
++            if quant_method != "mxfp4":
++                raise ValueError(
++                    "Only original serialized MXFP4 is allowed for GPTOSS BF16 fallback"
++                )
++            hf_config = config.get("hf_config")
++            _validate_gfx942_gptoss_bf16_model(
++                getattr(hf_config, "_name_or_path", ""), hf_config, quant_method
++            )
++            _validate_gfx942_gptoss_bf16_runtime()
++            return cls(
++                is_checkpoint_mxfp4_serialized=True, use_gfx942_bf16_fallback=True
++            )
+ 
+         if _is_hip:
+             if is_gfx95_supported():
+@@ -342,7 +455,6 @@
+     def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> Optional[QuantizeMethodBase]:
+-
+         from sglang.srt.layers.linear import LinearBase
+         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+@@ -358,7 +470,10 @@
+                 return UnquantizedLinearMethod()
+         elif isinstance(layer, FusedMoE):
+             if self.is_checkpoint_mxfp4_serialized:
+-                return Mxfp4MoEMethod(prefix=prefix)
++                return Mxfp4MoEMethod(
++                    prefix=prefix,
++                    use_gfx942_bf16_fallback=self.use_gfx942_bf16_fallback,
++                )
+             else:
+                 return Mxfp4DynamicQuantMoEMethod()
+         else:
+@@ -374,8 +489,12 @@
+     def __init__(
+         self,
+         prefix: str,
++        use_gfx942_bf16_fallback: bool = False,
+     ):
+         super().__init__()
++        self.use_gfx942_bf16_fallback = use_gfx942_bf16_fallback
++        if use_gfx942_bf16_fallback:
++            _validate_gfx942_gptoss_bf16_runtime()
+ 
+         self.prefix = prefix
+         self.topk_indices_dtype = None
+@@ -437,6 +556,10 @@
+         with_bias: bool = False,
+         **extra_weight_attrs,
+     ):
++        if self.use_gfx942_bf16_fallback:
++            _validate_gfx942_gptoss_bf16_runtime()
++            if not with_bias:
++                raise ValueError("Original GPTOSS fallback requires both expert biases")
+         self.num_experts = num_experts
+         weight_dtype = torch.uint8
+         scale_dtype = torch.uint8
+@@ -619,6 +742,33 @@
+             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+ 
+     def process_weights_after_loading(self, layer):
++        if self.use_gfx942_bf16_fallback:
++            _validate_gfx942_gptoss_bf16_runtime()
++            if not self.with_bias or not self.moe_runner_config.gate_up_interleaved:
++                raise ValueError(
++                    "Original GPTOSS interleaved weights and both biases are required"
++                )
++            if (
++                self.moe_runner_config.activation != "silu"
++                or self.moe_runner_config.gemm1_alpha is None
++                or self.moe_runner_config.gemm1_clamp_limit is None
++            ):
++                raise ValueError(
++                    "Original GPTOSS alpha/clamped SwiGLU contract is required"
++                )
++            w13 = _dequant_gfx942_gptoss_weight(
++                layer.w13_weight, layer.w13_weight_scale
++            )
++            w2 = _dequant_gfx942_gptoss_weight(layer.w2_weight, layer.w2_weight_scale)
++            layer.w13_weight = Parameter(w13, requires_grad=False)
++            layer.w2_weight = Parameter(w2, requires_grad=False)
++            del layer.w13_weight_scale
++            del layer.w2_weight_scale
++            layer._gfx942_gptoss_bf16_loaded = True
++            logger.warning(
++                "Original GPTOSS MXFP4 checkpoint reconstructed to BF16 on gfx942; functional compatibility, not native FP4 hardware execution"
++            )
++            return
+         if self.use_marlin and not self.use_mega_moe:
+             from sglang.srt.layers.quantization.marlin_utils import (
+                 check_moe_marlin_supports_layer,
+@@ -1580,6 +1730,24 @@
+         layer: torch.nn.Module,
+         dispatch_output: StandardDispatchOutput,
+     ) -> CombineInput:
++        if self.use_gfx942_bf16_fallback:
++            _validate_gfx942_gptoss_bf16_runtime()
++            if (
++                not getattr(layer, "_gfx942_gptoss_bf16_loaded", False)
++                or not self.runner.runner_backend.is_triton()
++            ):
++                raise ValueError(
++                    "GPTOSS BF16 weights must be loaded before generic triton execution"
++                )
++            return self.runner.run(
++                dispatch_output,
++                TritonMoeQuantInfo(
++                    w13_weight=layer.w13_weight,
++                    w2_weight=layer.w2_weight,
++                    b13=layer.w13_weight_bias,
++                    b2=layer.w2_weight_bias,
++                ),
++            )
+ 
+         from sglang.srt.layers.moe.token_dispatcher import (
+             DispatchOutputChecker,
+@@ -1805,7 +1973,6 @@
+         params_dtype: torch.dtype,
+         **extra_weight_attrs,
+     ):
+-
+         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+ 
+         w13_weight = torch.nn.Parameter(

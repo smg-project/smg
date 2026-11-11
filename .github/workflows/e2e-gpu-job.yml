@@ -171,6 +171,9 @@ jobs:
     env:
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
+      # Only the fixed-image AMD SGLang row installs this checked SDK fallback.
+      # The harness applies its environment and MoE flags to original GPT-OSS 20B only.
+      E2E_SGLANG_GPTOSS_MXFP4_BF16: ${{ inputs.final_environment_check && '1' || '0' }}
       E2E_STARTUP_PROFILE: ${{ inputs.startup_profile }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}

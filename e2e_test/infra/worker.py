@@ -465,6 +465,25 @@ class Worker:
         features = spec.get("features", [])
 
         if self.engine == "sglang":
+            if self._sglang_mxfp4_fallback():
+                configured = list(spec.get("sglang_args", [])) + list(self.extra_engine_args or [])
+                if any(
+                    arg.split("=", 1)[0] in ("--moe-runner-backend", "--moe-a2a-backend")
+                    for arg in configured
+                ):
+                    raise ValueError(
+                        "The fixed GPT-OSS fallback owns its generic Triton/none MoE flags"
+                    )
+                spec = {
+                    **spec,
+                    "sglang_args": [
+                        *spec.get("sglang_args", []),
+                        "--moe-runner-backend",
+                        "triton",
+                        "--moe-a2a-backend",
+                        "none",
+                    ],
+                }
             if self.mode == ConnectionMode.ZMQ:
                 # The launcher validates the complete engine argument list
                 # (it refuses a DP launch this wire does not carry yet), so
@@ -502,6 +521,13 @@ class Worker:
         if self.extra_engine_args:
             cmd.extend(self.extra_engine_args)
         return cmd
+
+    def _sglang_mxfp4_fallback(self) -> bool:
+        return (
+            self.engine == "sglang"
+            and self.model_id == "openai/gpt-oss-20b"
+            and os.environ.get("E2E_SGLANG_GPTOSS_MXFP4_BF16") == "1"
+        )
 
     def _build_sglang_cmd(
         self, model_path: str, tp_size: int, features: list[str], spec: dict
@@ -1085,6 +1111,16 @@ class Worker:
 
         if self.extra_env:
             env.update(self.extra_env)
+        if self._sglang_mxfp4_fallback():
+            required = {"SGLANG_USE_AITER": "0", "SGLANG_GPTOSS_MXFP4_BF16_FALLBACK": "1"}
+            if self.extra_env and any(
+                key in self.extra_env and self.extra_env[key] != value
+                for key, value in required.items()
+            ):
+                raise ValueError(
+                    "The fixed GPT-OSS fallback requires AITER disabled and its explicit opt-in"
+                )
+            env.update(required)
         return env
 
     def read_log(self) -> str:

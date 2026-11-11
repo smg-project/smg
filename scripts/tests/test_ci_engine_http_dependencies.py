@@ -985,6 +985,21 @@ def _fixed_cohort_before_native(tmp_path, monkeypatch, *, pip_status=0):
     from types import SimpleNamespace
 
     verifier = load_cohort_verifier()
+    # Supply the new SDK source context alongside the existing closed native
+    # fixtures. Exercise its real pair verifier, without importing SGLang.
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    import ci_sglang_mxfp4_fallback as sdk_patch
+
+    sdk_root = tmp_path / "sglang-sdk"
+    fixture_pins = {}
+    for name in sdk_patch.FILES:
+        source = sdk_root / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(("fixture SDK source: " + name + "\n").encode())
+        fixture_pins[name] = (hashlib.sha256(source.read_bytes()).hexdigest(), "0" * 64)
+    monkeypatch.setattr(sdk_patch, "FILES", fixture_pins)
+    monkeypatch.setattr(sdk_patch, "sdk_root", lambda: sdk_root)
+    monkeypatch.setenv(sdk_patch.ROW_ENV, "0")
     monkeypatch.setattr(sys, "pycache_prefix", None)
     venv = tmp_path / "venv"
     root = venv / "lib/python3.12/site-packages"
@@ -1207,6 +1222,7 @@ def test_direct_verify_checks_pip_after_real_filesystem_and_cpu_guards(
     else:
         verifier.verify(report)
     assert len(pip_calls) == 1
+    assert report["gptoss_mxfp4_sdk"]["state"] == "original"
     _, options = pip_calls[0]
     assert options["capture_output"] is True
     assert options["text"] is True and options["timeout"] == 60

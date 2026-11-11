@@ -170,6 +170,9 @@ def verify(report):
         f"ERROR: SGLang ROCm cohort versions differ: {differences!r}; "
         f"{native_diagnostic}full cohort observed={versions!r} expected={expected_versions!r}",
     )
+    from ci_sglang_mxfp4_fallback import verify_installed
+
+    report["gptoss_mxfp4_sdk"] = verify_installed()
     root = Path(sysconfig.get_path("purelib")).resolve()
     require(root.is_relative_to(Path("/opt/venv")), "Unexpected site-packages")
     installed, record_names = {}, set()

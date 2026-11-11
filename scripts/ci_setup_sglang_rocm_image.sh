@@ -115,6 +115,10 @@ if [ "$verify_only" -eq 0 ]; then
 
 fi
 
+if [ "$verify_only" -eq 0 ] && [ "${E2E_SGLANG_GPTOSS_MXFP4_BF16:-0}" = 1 ]; then
+    python3 "$SCRIPT_DIR/ci_sglang_mxfp4_fallback.py"
+fi
+
 python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" "${verify_output[@]}"
 
 # Carry the observed image version into the next Actions step.
