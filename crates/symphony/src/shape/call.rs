@@ -428,8 +428,10 @@ impl Assembler {
     /// with `UnterminatedRegion`, the whitespace around it dropped and the whitespace between its
     /// words kept; a value that never began is said to be none before the end, as one cut short
     /// is. Tagged parameters close as at the end of the text: those still undecided are decided
-    /// there, the bytes no parameter took are dropped as wrapping, and the arguments' object is
-    /// closed.
+    /// there, the bytes no parameter took are dropped as wrapping, the arguments' object is
+    /// closed, and the cut is said once before the call's end, as the tagged and JSON syntaxes say
+    /// theirs: `Malformed` with `UnterminatedRegion`, its text the bytes of a parameter the cut
+    /// left open (a tag the stream ended inside), none when the cut fell between parameters.
     pub fn finish(mut self, declared: &Declared, out: &mut Events) {
         let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return;
@@ -437,7 +439,11 @@ impl Assembler {
         let ends = match body {
             Body::Value(value) => value.finish(out),
             Body::Params(params) => {
-                params.finish(declared, out);
+                let open = params.finish(declared, out);
+                out.push(Event::Malformed {
+                    text: Text::uncounted(open),
+                    why: MalformedReason::UnterminatedRegion,
+                });
                 true
             }
         };
@@ -886,6 +892,13 @@ mod tests {
         Event::Dropped {
             text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
+        }
+    }
+
+    fn malformed(text: &str) -> Event<'static> {
+        Event::Malformed {
+            text: Text::uncounted(text.to_owned()),
+            why: MalformedReason::UnterminatedRegion,
         }
     }
 
@@ -1755,26 +1768,38 @@ mod tests {
             [
                 wrapper("<c>"),
                 start("f", ""),
-                member("{\"a\": 1", "<k=a>1</k>  "),
-                wrapper("<k=b>2"),
-                closed(),
+                member("{\"a\": 1}", "<k=a>1</k>  "),
+                malformed("<k=b>2"),
                 end(""),
                 length.clone(),
             ],
-            "the parameter whose end waited for more whitespace is whole at the end, the one the \
-             cut left unfinished is dropped, and the object closes"
+            "the parameter whose end waited for more whitespace is whole at the end, the object \
+             closes over it, and the one the cut left open is the cut's marker, its bytes \
+             malformed, not wrapping"
         );
         assert_eq!(
             run_after(&format, "", "<c><k=b>2", EngineFinish::Length),
             [
                 wrapper("<c>"),
                 start("f", ""),
-                wrapper("<k=b>2"),
                 member("{}", ""),
+                malformed("<k=b>2"),
+                end(""),
+                length.clone(),
+            ],
+            "a call cut before any parameter finished closes with no arguments and says the cut"
+        );
+        assert_eq!(
+            run_after(&format, "", "<c><k=a>1</k>\n", EngineFinish::Length),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1}", "<k=a>1</k>\n"),
+                malformed(""),
                 end(""),
                 length,
             ],
-            "a call cut before any parameter finished closes with no arguments"
+            "a cut between parameters is said with a marker of no bytes, as the tagged syntax says it"
         );
         let stopped = table(tagged(closed_by_tag(), Pattern::default())).closes_at_stop("call");
         assert_eq!(
@@ -1882,6 +1907,7 @@ mod tests {
                 member("{\"a\": 1", "<k=a>1</k>"),
                 wrapper("\n</c>"),
                 closed(),
+                malformed(""),
                 end(""),
                 Event::Finish {
                     reason,
@@ -1897,7 +1923,7 @@ mod tests {
             ),
             cut(crate::event::FinishReason::Stop),
             "without the row the stop does not close the region, which is cut and closes as at \
-             the end of the text"
+             the end of the text, saying the cut once before its end"
         );
         assert_eq!(
             run_after(&format, "", "<c><k=a>1</k>\n</c>", EngineFinish::Length),
