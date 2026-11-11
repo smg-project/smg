@@ -24,7 +24,7 @@ thiserror = { workspace = true }
 criterion = "0.8"
 # The corpus test reads YAML documents; the gateway reads its spec file with
 # the same crate.
-serde_yaml = "0.9"
+serde_yaml = { workspace = true }
 
 [[bench]]
 name = "decision"
