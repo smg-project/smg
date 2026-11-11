@@ -100,6 +100,22 @@ pub async fn serve_with_listener_until(
         tracing::error!("grpc worker {addr:?} cannot load script: {e}");
         return;
     }
+    // A prefill worker's bootstrap port, numbered by the worker's port offset:
+    // bound before the worker joins the fleet and serves, as an engine's
+    // bootstrap server is up when its health answers; a port that cannot be
+    // bound stops the worker as its own port would, and a worker that never
+    // served is in no registry.
+    let bootstrap_port = addr
+        .map(|a| a.port())
+        .and_then(|port| port.checked_sub(cfg.grpc_base_port))
+        .and_then(|index| cfg.bootstrap_port_for(index));
+    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("grpc worker {addr:?} {e}");
+            return;
+        }
+    };
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `grpc:<port>` for the oracle and admin API.
     let name = format!("grpc:{}", addr.map(|a| a.port()).unwrap_or(0));
@@ -115,21 +131,6 @@ pub async fn serve_with_listener_until(
         cfg.kv_zmq_for(index, 0)
             .map(|kv| crate::kv_zmq::serve(rank.engine.clone(), kv))
     });
-    // A prefill worker's bootstrap port, numbered by the same offset: bound
-    // before the worker serves, as an engine's bootstrap server is up when
-    // its health answers; a port that cannot be bound stops the worker as its
-    // own port would.
-    let bootstrap_port = addr
-        .map(|a| a.port())
-        .and_then(|port| port.checked_sub(cfg.grpc_base_port))
-        .and_then(|index| cfg.bootstrap_port_for(index));
-    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            tracing::error!("grpc worker {addr:?} {e}");
-            return;
-        }
-    };
     let max_message_bytes = cfg.grpc_max_message_bytes;
     // The stop reaches the service's streams that have no end of their own
     // (a KV-event subscription) before the server's graceful shutdown

@@ -252,8 +252,14 @@ The unit tests decode both wires with the Rust relay's own normalizer
 engines do not expose:
 
 - `GET /admin/health` — `ok`;
-- `GET /admin/fleet` — every engine (`grpc:<port>` / `http:<port>` /
-  `zmq:<index>`) with cache size, load, cached blocks and preemptions;
+- `GET /admin/fleet` — every worker of the process (`grpc:<port>` /
+  `http:<port>` / `zmq:<index>`): a realistic engine with cache size, load,
+  cached blocks and preemptions under `"engine": "realistic"` and, in a
+  canned process, each listener with its name under `"engine": "canned"`
+  alone (a realistic process lists its engines alone, since a listener
+  registers before its engine spawns; a listener joins the fleet once its
+  bootstrap port, when it has one, is bound, so a worker that stopped at
+  that bind is never listed);
 - `GET /admin/requests?since=<seq>&limit=<n>` — admitted requests with the
   serving worker, prompt/cached tokens, queue wait and the **arrival-time
   oracle**: the most cached tokens any worker of the process held when the

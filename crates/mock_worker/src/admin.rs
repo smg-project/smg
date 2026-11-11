@@ -2,7 +2,9 @@
 //! benchmark needs that real engines do not expose, and the fault hooks a
 //! recovery test switches on.
 //!
-//! - `GET /admin/fleet`: every registered engine with its cache size and load.
+//! - `GET /admin/fleet`: every worker of the process: a realistic engine with
+//!   its cache size and load and, in a canned process, each listener with its
+//!   name and mode.
 //! - `GET /admin/requests?since=<seq>&limit=<n>`: admitted-request records
 //!   (`request_id`, serving worker, prompt/cached/oracle tokens, queue wait),
 //!   oldest first, `seq` strictly greater than `since`.
@@ -347,26 +349,61 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
 }
 
 async fn fleet(State(state): State<Arc<AdminState>>) -> Json<Value> {
-    let workers: Vec<Value> = engine::fleet_engines()
-        .iter()
-        .map(|e| {
-            let load = e.load();
-            json!({
-                "worker": e.name(),
-                "cache_blocks": e.cache_keys().len(),
-                "block_size": state.cfg.engine.block_size,
-                "num_running_reqs": load.num_running_reqs,
-                "num_waiting_reqs": load.num_waiting_reqs,
-                "num_waiting_uncached_tokens": load.num_waiting_uncached_tokens,
-                "token_usage": load.token_usage,
-                "cache_hit_rate": load.cache_hit_rate,
-                "num_cached_blocks": load.num_cached_blocks,
-                "num_preemptions": load.num_preemptions,
-                "num_kv_batches": load.num_kv_batches,
-            })
-        })
-        .collect();
-    Json(json!({ "workers": workers }))
+    Json(json!({ "workers": fleet_rows(&state.cfg) }))
+}
+
+/// One row per worker of the process, in name order: a realistic engine with
+/// its load (a data-parallel rank is a row of its own, named `<worker>:r<k>`)
+/// and, in a canned process, each listener with its name and mode alone, since
+/// no engine stands behind it. A listener registers its name when it starts,
+/// before a realistic engine spawns (a ZMQ rank's after its handshake), so a
+/// realistic process lists its engines alone and a canned fleet counts here as
+/// it serves; an engine no listener claims is listed after them.
+fn fleet_rows(cfg: &Config) -> Vec<Value> {
+    let engines = engine::fleet_engines();
+    let mut listed = vec![false; engines.len()];
+    let mut rows = Vec::with_capacity(engines.len());
+    for worker in script::registered() {
+        let mut found = false;
+        for (index, e) in engines.iter().enumerate() {
+            let rank_of_worker = e
+                .name()
+                .strip_prefix(worker.as_str())
+                .is_some_and(|rest| rest.starts_with(":r"));
+            if e.name() == worker || rank_of_worker {
+                rows.push(engine_row(e, cfg));
+                listed[index] = true;
+                found = true;
+            }
+        }
+        if !found && !cfg.realistic {
+            rows.push(json!({ "worker": worker, "engine": "canned" }));
+        }
+    }
+    for (index, e) in engines.iter().enumerate() {
+        if !listed[index] {
+            rows.push(engine_row(e, cfg));
+        }
+    }
+    rows
+}
+
+fn engine_row(e: &Engine, cfg: &Config) -> Value {
+    let load = e.load();
+    json!({
+        "worker": e.name(),
+        "engine": "realistic",
+        "cache_blocks": e.cache_len(),
+        "block_size": cfg.engine.block_size,
+        "num_running_reqs": load.num_running_reqs,
+        "num_waiting_reqs": load.num_waiting_reqs,
+        "num_waiting_uncached_tokens": load.num_waiting_uncached_tokens,
+        "token_usage": load.token_usage,
+        "cache_hit_rate": load.cache_hit_rate,
+        "num_cached_blocks": load.num_cached_blocks,
+        "num_preemptions": load.num_preemptions,
+        "num_kv_batches": load.num_kv_batches,
+    })
 }
 
 async fn requests(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
@@ -681,6 +718,121 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// A listener whose bootstrap port is taken stops before it serves, and
+    /// the fleet never lists it: a worker joins the registries and spawns its
+    /// engine once that port is bound.
+    #[tokio::test]
+    async fn a_listener_that_cannot_bind_its_bootstrap_port_never_joins_the_fleet() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to occupy");
+        let taken_port = taken.local_addr().expect("address").port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the worker's port");
+        let port = listener.local_addr().expect("address").port();
+        let cfg = std::sync::Arc::new(Config {
+            host: "127.0.0.1".to_string(),
+            grpc_base_port: port,
+            grpc_count: 1,
+            realistic: true,
+            role: Some(crate::config::Role::Prefill),
+            bootstrap_base_port: Some(taken_port),
+            ..Config::default()
+        });
+        // The worker stops at the bind: serving returns instead of running on.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::grpc::serve_with_listener(std::sync::Arc::clone(&cfg), listener),
+        )
+        .await
+        .expect("the worker stops at the bootstrap bind");
+        let name = format!("grpc:{port}");
+        assert!(
+            !script::registered().contains(&name),
+            "a worker that never served is registered"
+        );
+        assert!(
+            engine::fleet_engines().iter().all(|e| e.name() != name),
+            "a worker that never served spawned its engine"
+        );
+        assert!(
+            fleet_rows(&cfg).iter().all(|row| row["worker"] != name),
+            "a worker that never served is listed: {:?}",
+            fleet_rows(&cfg)
+        );
+        drop(taken);
+    }
+
+    #[tokio::test]
+    async fn the_fleet_lists_canned_listeners_beside_the_engines() {
+        // The registries are process-wide; the names below are this test's own.
+        script::register("http:fleet-canned");
+        script::register("grpc:fleet-real");
+        script::register("grpc:fleet-dp");
+        let engines = [
+            Engine::spawn_named(
+                engine::EngineParams::default(),
+                "grpc:fleet-real".into(),
+                true,
+            ),
+            Engine::spawn_named(
+                engine::EngineParams::default(),
+                "grpc:fleet-dp:r0".into(),
+                true,
+            ),
+            Engine::spawn_named(
+                engine::EngineParams::default(),
+                "grpc:fleet-dp:r1".into(),
+                true,
+            ),
+            // No listener registered this name: the engine is listed after the claimed ones.
+            Engine::spawn_named(
+                engine::EngineParams::default(),
+                "grpc:fleet-orphan".into(),
+                true,
+            ),
+        ];
+        let cfg = Config::default();
+        let rows = fleet_rows(&cfg);
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row["worker"] == name)
+                .cloned()
+                .expect("a row for the name")
+        };
+        let canned = row("http:fleet-canned");
+        assert_eq!(canned["engine"], "canned");
+        assert!(
+            canned.get("num_running_reqs").is_none(),
+            "a canned row carries no load"
+        );
+        let real = row("grpc:fleet-real");
+        assert_eq!(real["engine"], "realistic");
+        assert_eq!(real["num_running_reqs"], 0);
+        assert_eq!(real["block_size"], json!(cfg.engine.block_size));
+        // A data-parallel worker lists its ranks, each once, and no canned row of its own.
+        assert_eq!(row("grpc:fleet-dp:r0")["engine"], "realistic");
+        assert_eq!(row("grpc:fleet-dp:r1")["engine"], "realistic");
+        let named = |name: &str| rows.iter().filter(|row| row["worker"] == name).count();
+        assert_eq!((named("grpc:fleet-dp"), named("grpc:fleet-real")), (0, 1));
+        assert_eq!(named("grpc:fleet-orphan"), 1);
+        assert_eq!(row("grpc:fleet-orphan")["engine"], "realistic");
+        // A realistic process lists its engines alone: a listener registers before
+        // its engine spawns, so a name without an engine is not a canned worker there.
+        let realistic = fleet_rows(&Config {
+            realistic: true,
+            ..Config::default()
+        });
+        assert!(realistic.iter().all(|row| row["engine"] == "realistic"));
+        let listed = |name: &str| realistic.iter().filter(|row| row["worker"] == name).count();
+        assert_eq!(
+            (listed("http:fleet-canned"), listed("grpc:fleet-orphan")),
+            (0, 1)
+        );
+        drop(engines);
     }
 
     #[test]
