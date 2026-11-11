@@ -28,7 +28,9 @@ pub trait Filter: Send + Sync + Debug {
     /// Drops from `kept` (positions into `candidates`, in order) the rows this
     /// filter refuses, in place: one call per decision, with [`Filter::keep`]
     /// inlined into the loop. A filter that answers for the whole pool at
-    /// once overrides it.
+    /// once overrides it, and must drop exactly the rows [`Filter::keep`]
+    /// refuses: the pair plan's partner and routable passes still ask `keep`
+    /// row by row.
     fn retain(
         &self,
         facts: &RequestFacts<'_>,
@@ -190,12 +192,16 @@ fn filter(
     } = set;
     let kept = &mut buf.kept;
     kept.clear();
-    kept.extend(0..candidates.len() as u32);
-    if let Some(k) = class {
-        kept.retain(|&i| candidates[i as usize].pair_class == k);
-        if kept.is_empty() {
-            return Some("partners");
+    match class {
+        Some(k) => {
+            kept.extend(
+                (0..candidates.len() as u32).filter(|&i| candidates[i as usize].pair_class == k),
+            );
+            if kept.is_empty() {
+                return Some("partners");
+            }
         }
+        None => kept.extend(0..candidates.len() as u32),
     }
     if kept.is_empty() {
         return Some("none");
@@ -217,7 +223,9 @@ fn filter(
         buf.before_soft.extend_from_slice(kept);
         soft.retain(facts, candidates, cx, kept);
         if kept.is_empty() {
-            std::mem::swap(kept, &mut buf.before_soft);
+            // Copied back, not swapped: a swap would hand `kept` the backup's
+            // smaller buffer, and the next decision would grow it again.
+            kept.extend_from_slice(&buf.before_soft);
         }
     }
     None
@@ -618,6 +626,8 @@ impl Engine {
                     if scratch.classes.is_empty() {
                         return shed(ShedReason::NoEndpoints, "partnered", prefill_shed.trace);
                     }
+                    // An empty decode pool is that class for every prefill:
+                    // its "none" falls through to the prefill's shed.
                     if let Some(stage) = filter(
                         decode_profile,
                         &decode_facts,
@@ -628,7 +638,9 @@ impl Engine {
                             class: None,
                             partnered: Some(&scratch.classes),
                         },
-                    ) {
+                    )
+                    .filter(|&stage| stage != "none")
+                    {
                         return shed(reason_of(stage), stage, prefill_shed.trace);
                     }
                 }
@@ -1216,6 +1228,28 @@ mod tests {
                 assert_eq!(shed.emptied_by, "partnered", "no decode of the class");
             }
             other => panic!("an empty class answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pair_with_no_decode_at_all_is_dropped_as_unpartnered() {
+        // An empty decode pool is a class with no decode for every prefill:
+        // the prefill's own "partnered" shed stands, where the decode side's
+        // filter alone would name "none".
+        let engine = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let mut prefills = [candidate(0, 0)];
+        prefills[0].pair_class = 7;
+        match decide_pair(&engine, &prefills, &[]) {
+            Decision::Shed(shed) => {
+                assert_eq!(shed.emptied_by, "partnered", "no decode of any class");
+                assert_eq!(shed.reason, ShedReason::NoEndpoints);
+            }
+            other => panic!("an empty decode pool answered {other:?}"),
         }
     }
 

@@ -1630,6 +1630,38 @@ mod tests {
     }
 
     #[test]
+    fn the_four_best_of_sixty_four_rows_are_picked_in_order_wherever_they_sit() {
+        // The five-best array fills on the first rows and shifts for every
+        // better one after it; the four best must come out in order whether
+        // they sit scattered in a rising pool or arrive last, rising.
+        let pool: Vec<Candidate> = (0..64).map(|i| candidate(i, 0)).collect();
+        let kept = kept(64);
+        let mut scattered: Vec<f32> = (0..64).map(|i| 0.1 + 0.004 * i as f32).collect();
+        for (position, score) in [(7usize, 1.0f32), (40, 0.99), (63, 0.98), (22, 0.97)] {
+            scattered[position] = score;
+        }
+        let mut last_rising: Vec<f32> = (0..64).map(|i| 0.1 + 0.004 * i as f32).collect();
+        for (position, score) in [(60usize, 0.96f32), (61, 0.97), (62, 0.98), (63, 0.99)] {
+            last_rising[position] = score;
+        }
+        for (scores, expected) in [
+            (scattered, [7u32, 40, 63, 22]),
+            (last_rising, [63, 62, 61, 60]),
+        ] {
+            for seed in 0..8u64 {
+                let facts = RequestFacts {
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let mut out = Targets::new();
+                Best.pick(&facts, &pool, &kept, &scores, TieBand::NORMALIZED, &mut out);
+                let order: Vec<u32> = out.iter().map(|t| t.position).collect();
+                assert_eq!(order, expected, "seed {seed}");
+            }
+        }
+    }
+
+    #[test]
     fn a_wide_band_ties_against_the_best_score_and_not_the_running_best() {
         let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
         let scores = [0.95f32, 1.0, 0.92];

@@ -99,6 +99,38 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
 }
 
 #[test]
+fn a_decision_after_a_soft_filter_fallback_allocates_nothing() {
+    // Every healthy row tried: the soft not-tried stage empties the
+    // survivors and the stage before it is restored. The decision after
+    // that fallback finds its scratch sized still.
+    let engine = engine_of("round_robin");
+    let view = fleet(64);
+    let tried: Vec<WorkerId> = view
+        .iter()
+        .filter(|c| c.health.healthy)
+        .map(|c| c.id)
+        .collect();
+    let first = RequestFacts {
+        tried: &tried,
+        ..facts(1)
+    };
+    let next = RequestFacts {
+        tried: &tried,
+        ..facts(2)
+    };
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    engine
+        .decide(&first, &pool(64), &view, &cx, &mut scratch)
+        .pick()
+        .expect("the restored survivors route");
+    let (decision, allocations) =
+        allocations_during(|| engine.decide(&next, &pool(64), &view, &cx, &mut scratch));
+    assert!(decision.pick().is_some());
+    assert_eq!(allocations, 0, "the decision after a fallback allocated");
+}
+
+#[test]
 fn a_decision_over_credited_rows_allocates_nothing() {
     let engine = engine_of("least_load");
     let view = fleet(512);
