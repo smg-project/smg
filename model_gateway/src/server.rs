@@ -2522,7 +2522,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
-    // The reload of the keys a file gave, sharing the sets the layers read.
+    // Serving routes accept both the shared key and per-tenant keys, so the
+    // rate limiter (and anything else keyed on tenant identity) can tell
+    // tenants apart. Admin/worker-management routes must NOT accept tenant
+    // keys when falling back to simple API-key auth (no control-plane auth
+    // configured) — a tenant credential must not be able to reach
+    // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
+    let serving_auth_config = app_context.gateway_auth.clone();
+    let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
+
+    // The reload of the keys a file gave, sharing the sets the layers read:
+    // the serving set, the control-plane set, and the admin routes' fallback
+    // when no control-plane keys are configured, so a rotated shared key
+    // leaves the admin routes too.
     let secrets = crate::secrets::SecretReloader::new(
         config.secret_files.clone(),
         &config.secret_sources,
@@ -2532,6 +2544,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         control_plane_auth_state
             .as_ref()
             .map(|state| state.keys.clone()),
+        control_plane_auth_state
+            .is_none()
+            .then(|| admin_auth_config.clone()),
     )
     .map(Arc::new);
     // `--secrets-auto-reload`: the key files watched, a change reloading
@@ -2595,15 +2610,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 "request-id".to_string(),
             ]
         });
-
-    // Serving routes accept both the shared key and per-tenant keys, so the
-    // rate limiter (and anything else keyed on tenant identity) can tell
-    // tenants apart. Admin/worker-management routes must NOT accept tenant
-    // keys when falling back to simple API-key auth (no control-plane auth
-    // configured) — a tenant credential must not be able to reach
-    // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
-    let serving_auth_config = app_context.gateway_auth.clone();
-    let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // The admin listener's address, when the control plane has a listener of
     // its own (`--admin-port`); its bind host defaults to the data listener's.
