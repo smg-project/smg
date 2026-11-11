@@ -225,6 +225,27 @@ pub enum SchedulerWire {
 }
 
 impl SchedulerWire {
+    /// The field of this wire's generate request that carries a disaggregated
+    /// request's KV rendezvous (the prefill side's bootstrap server and the
+    /// room both sides meet under, or the vLLM connector's parameters).
+    pub fn rendezvous_field(self) -> &'static str {
+        match self {
+            Self::TokenSpeed => "kv_bootstrap_info",
+            Self::Vllm => "kv_transfer_params_json",
+            Self::Sglang => "disaggregated_params",
+        }
+    }
+
+    /// Whether the gateway names the rendezvous to this wire's prefill side
+    /// as well as its decode side. TokenSpeed and SGLang send one bootstrap
+    /// triple to both halves of a pair. vLLM's connector parameters go to the
+    /// decode side, which pulls the KV from the prefill they name, and reach
+    /// the prefill only when the gateway relays a connector's own, so a
+    /// prefill on that wire takes a request without them.
+    pub fn prefill_takes_rendezvous(self) -> bool {
+        !matches!(self, Self::Vllm)
+    }
+
     /// The wire as the flag spells it, and as the gateway names the runtime.
     pub fn as_str(self) -> &'static str {
         match self {

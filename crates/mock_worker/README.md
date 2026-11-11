@@ -333,10 +333,10 @@ process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
 <url> <bootstrap port> --decode <url>`) runs with no engine behind it. The
 gateway detects the mock by the scheduler service it serves (or, on the HTTP
 wire, by its model list) and runs that wire's PD protocol: both sides get the
-same request, with the rendezvous the gateway mints (`kv_bootstrap_info` on
-the gRPC wires; `bootstrap_host`, `bootstrap_port` and `bootstrap_room` in
-the request body on the HTTP wire, whose PD router is its own code path), and
-the client reads the decode side's output.
+same request, with the rendezvous the gateway mints (the wire's rendezvous
+field on the gRPC wires, named below; `bootstrap_host`, `bootstrap_port` and
+`bootstrap_room` in the request body on the HTTP wire, whose PD router is its
+own code path), and the client reads the decode side's output.
 
 - A **prefill** worker answers every request with the prompt side's
   completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
@@ -351,14 +351,21 @@ the client reads the decode side's output.
   scripted: the answers a test states go to the decode side) and advertises
   `disaggregation_mode: decode`.
 
-- On the HTTP wire either side refuses a request that carries no
-  `bootstrap_room` (a 400, as the engines' disaggregated servers answer one),
-  and a prefill worker one whose `bootstrap_port` is not the port it bound:
-  its decode partner would rendezvous elsewhere for the handoff this mock
-  stands in for. A missing or null `bootstrap_port` reads as the engines'
-  default, 8998 (what the gateway sends for a prefill worker registered
-  without a port): the worker on that port takes it, one on another
-  refuses it.
+- Either side refuses a request that carries no rendezvous, as the engines'
+  disaggregated servers answer one: on the HTTP wire a 400 for a missing
+  `bootstrap_room`, on the gRPC wires `InvalidArgument` for a missing
+  `kv_bootstrap_info` (TokenSpeed), `disaggregated_params` (SGLang) or
+  `kv_transfer_params_json` (vLLM, the typed `kv_transfer_params` also
+  taken), or for a named rendezvous without a host or a port (a room of 0 is
+  one the gateway can mint, and is taken). On the
+  vLLM wire the decode side alone refuses: the gateway names the pair to it,
+  and the prefill request carries the connector's parameters only when a
+  connector relays them. A prefill worker refuses one whose bootstrap port is
+  not the port it bound: its decode partner would rendezvous elsewhere for
+  the handoff this mock stands in for. On the HTTP wire a missing or null
+  `bootstrap_port` reads as the engines' default, 8998 (what the gateway sends
+  for a prefill worker registered without a port): the worker on that port
+  takes it, one on another refuses it.
 
 No KV moves between the two: the decode side has the prompt. ZMQ workers
 take no role, and one process gives the role to one wire's workers (worker
