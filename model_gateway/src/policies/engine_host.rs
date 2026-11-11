@@ -2547,6 +2547,120 @@ mod tests {
         );
     }
 
+    /// The pair path under a sequence drawn before the capture: the router
+    /// draws, captures the prefills and the partners, a decode's retirement
+    /// lands, then the pair decision over the stale partners runs under the
+    /// drawn sequence and its commit books nothing on the retired decode. A
+    /// pair request without a drawn sequence is numbered afresh.
+    #[test]
+    fn a_pair_commit_under_a_sequence_drawn_before_the_retirement_books_nothing() {
+        let decider = decider(&PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        });
+        let prefills = vec![worker_of("http://p0:8000", WorkerType::Prefill)];
+        let decodes = [
+            worker_of("http://d0:8000", WorkerType::Decode),
+            worker_of("http://d1:8000", WorkerType::Decode),
+        ];
+        let idle = || one_rank_load(0, 0.1, 2000.0);
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (prefills[0].url().to_string(), idle()),
+            (decodes[0].url().to_string(), idle()),
+            (decodes[1].url().to_string(), idle()),
+        ]));
+        decider.set_load_receiver(Some(rx));
+        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { decodes.to_vec() };
+        let pair_request = |prompt_tokens| HostRequest {
+            phase: Phase::Prefill,
+            prompt_tokens,
+            ..request()
+        };
+        let leading_decode = || {
+            let (decision, _, _) = decider.decide_pair(
+                &pair_request(512),
+                &prefills,
+                &|_| true,
+                &partners,
+                false,
+                &[],
+            );
+            decision
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .and_then(|t| t.pair)
+                .map(|p| p.decode_position)
+        };
+        // One small booking on the second decode first, so the first one
+        // leads strictly and the pair below takes it.
+        let (decision, lease, _) = decider.decide_pair(
+            &pair_request(1),
+            &prefills,
+            &|_| true,
+            &partners,
+            false,
+            &[],
+        );
+        decider
+            .commit(&lease, &decision, Side::Prefill, |t| {
+                t.pair.is_some_and(|p| p.decode_position == 1)
+            })
+            .expect("the second decode is booked");
+        assert_eq!(
+            leading_decode(),
+            Some(0),
+            "the first decode leads while idle"
+        );
+        // The router's order: the sequence, then the captures (the partners
+        // still list the first decode), then its retirement lands, then the
+        // decision over the stale partners.
+        let sequence = decider.begin();
+        decider.on_worker_removed(decodes[0].as_ref());
+        let under_sequence = HostRequest {
+            sequence: Some(sequence),
+            ..pair_request(512)
+        };
+        let (decision, lease, _) =
+            decider.decide_pair(&under_sequence, &prefills, &|_| true, &partners, false, &[]);
+        assert_eq!(
+            lease.id, sequence,
+            "the pair decision runs under the drawn sequence"
+        );
+        let taken = decider
+            .commit(&lease, &decision, Side::Prefill, |_| true)
+            .expect("the dispatch itself proceeds");
+        assert_eq!(
+            taken.pair.map(|p| p.decode_position),
+            Some(0),
+            "the pair took the retired decode from the stale partners"
+        );
+        // The retired decode still leads: the request's booking would have
+        // lost it to the one-token booking on the other decode.
+        assert_eq!(
+            leading_decode(),
+            Some(0),
+            "the retired decode reads idle: no commit under the drawn sequence booked on it"
+        );
+        // A pair request with no drawn sequence is numbered afresh.
+        let (_, fresh, _) = decider.decide_pair(
+            &pair_request(512),
+            &prefills,
+            &|_| true,
+            &partners,
+            false,
+            &[],
+        );
+        assert!(
+            fresh.id.0 > sequence.0,
+            "a pair request without a drawn sequence draws a new one: {:?} after {:?}",
+            fresh.id,
+            sequence
+        );
+    }
+
     /// A retirement that lands while a commit runs, after its check and
     /// before its booking, waits for the booking: the check and the booking
     /// hold the retirement record's lock together, so the row the booking
