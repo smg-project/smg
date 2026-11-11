@@ -94,10 +94,16 @@ impl ReasoningParser for BaseReasoningParser {
 
         if !self.stripped_think_start {
             if self.in_reasoning {
-                // A pre-armed response may repeat the opener at its start. Once
-                // the first text arrives, later literal openers are content.
-                if let Some(rest) = current_text.strip_prefix(&self.config.think_start_token) {
-                    current_text = rest.to_string();
+                // Decide after leading whitespace and any partial opener.
+                let token = &self.config.think_start_token;
+                let trimmed = current_text.trim_start();
+                if trimmed.is_empty() || (trimmed.len() < token.len() && token.starts_with(trimmed))
+                {
+                    return Ok(ParserResult::default());
+                }
+                if trimmed.starts_with(token) {
+                    let start = current_text.len() - trimmed.len();
+                    current_text.replace_range(start..start + token.len(), "");
                     self.buffer.clone_from(&current_text);
                 }
                 self.stripped_think_start = true;

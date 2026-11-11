@@ -2914,6 +2914,18 @@ async fn qwen3_stream_strips_generated_think_tag_when_template_has_closed_block(
 }
 
 #[tokio::test]
+async fn qwen3_stream_strips_generated_think_tag_after_leading_whitespace() {
+    let events = reasoning_tool_events(
+        serde_json::json!("auto"),
+        "\n <think>plan</think>answer",
+        CharacterTokenizer::with_closed_prefill_think_block(),
+    )
+    .await;
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "\n plan");
+    assert_eq!(chat_text(&events, 0, "content"), "answer");
+}
+
+#[tokio::test]
 async fn qwen3_stream_preserves_literal_think_tag_in_answer_without_generated_opener() {
     let events = reasoning_tool_events(
         serde_json::json!("auto"),
