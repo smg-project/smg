@@ -2425,6 +2425,96 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  e2e-go-bindings-amd:
+    name: e2e-go-bindings-amd
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_GO_LEGS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-go-bindings != 'true'
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+    container:
+      image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      E2E_ENGINE: sglang
+      E2E_RUNTIME: sglang
+      E2E_GPU_VENDOR: amd
+      E2E_GPU_TIER: '1'
+      E2E_MIN_SELECTED: '23'
+      E2E_AMD_REQUIRE_PASSING_CALL: '1'
+      E2E_STARTUP_TIMEOUT: '900'
+      ROUTER_LOCAL_MODEL_PATH: /models
+      E2E_LOG_DIR: e2e-logs-go-amd
+      SMG_SGLANG_ROCM_IMAGE: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Mark owned processes
+        run: echo "E2E_JOB_MARKER=go-amd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+      - name: Setup repaired SGLang ROCm environment
+        id: setup
+        run: |
+          test -s scripts/ci_verify_sglang_rocm_cohort.py
+          bash scripts/ci_setup_sglang_rocm_image.sh
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.24'
+          cache: true
+          cache-dependency-path: bindings/golang/go.sum
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
+        with:
+          go-ffi-library: 'true'
+          client-types: 'true'
+      - name: Install wheel and test dependencies
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh
+      - name: Verify prepared environment and FFI
+        run: |
+          mkdir -p e2e-logs-go-amd
+          python3 -m pip check
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs-go-amd/prepared-environment.json
+          command -v gcc
+          test -s bindings/golang/target/release/libsmg_go.so
+      - name: Download Go SDK model
+        run: bash scripts/ci_download_model.sh meta-llama/Llama-3.2-1B-Instruct
+      - name: Run original Go OAI server assertions
+        timeout-minutes: 45
+        run: |
+          export CGO_LDFLAGS="-L$(pwd)/bindings/golang/target/release"
+          export LD_LIBRARY_PATH="$(pwd)/bindings/golang/target/release:${LD_LIBRARY_PATH:-}"
+          SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 \
+            pytest --reruns 2 --reruns-delay 5 e2e_test/bindings_go -s -vv \
+              --junitxml=e2e-logs-go-amd/junit.xml
+      - name: Verify final SGLang environment
+        if: always() && steps.setup.outcome == 'success'
+        run: |
+          python3 -m pip check
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs-go-amd/final-environment.json
+      - name: Reap owned processes
+        if: always() && env.E2E_JOB_MARKER != ''
+        run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
+      - name: Upload Go AMD results and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-bindings-amd-${{ github.run_id }}-${{ github.run_attempt }}
+          path: e2e-logs-go-amd/
+          retention-days: 7
+          if-no-files-found: warn
+
   go-bindings-benchmark:
     name: go-bindings-benchmark
     needs: build-wheel
@@ -2481,7 +2571,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-go-bindings-amd]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2572,7 +2662,8 @@ jobs:
                 "${{ needs.e2e-cpu-mock.result }}" =~ $bad || \
                 "${{ needs.e2e-vendor.result }}" =~ $bad || \
                 "${{ needs.go-unit-tests.result }}" =~ $bad || \
-                "${{ needs.go-bindings-e2e.result }}" =~ $bad ]]; then
+                "${{ needs.go-bindings-e2e.result }}" =~ $bad || \
+                "${{ needs.e2e-go-bindings-amd.result }}" =~ $bad ]]; then
             echo "One or more jobs failed or were cancelled"
             exit 1
           else
