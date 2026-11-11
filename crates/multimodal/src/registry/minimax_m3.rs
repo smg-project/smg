@@ -1313,6 +1313,29 @@ mod tests {
     }
 
     #[test]
+    fn the_legacy_map_slices_the_video_pixels_by_their_patch_count() {
+        let layouts = MiniMaxM3VisionSpec.field_layouts();
+        assert_eq!(
+            layouts.get("pixel_values_videos"),
+            Some(&FieldLayout::flat("patches_per_video"))
+        );
+        assert_eq!(
+            layouts.get("pixel_values"),
+            Some(&FieldLayout::flat("patches_per_image"))
+        );
+        for key in [
+            "image_grid_thw",
+            "patches_per_image",
+            "video_grid_thw",
+            "patches_per_video",
+            "video_second_per_grid",
+        ] {
+            assert_eq!(layouts.get(key), Some(&FieldLayout::Batched), "{key}");
+        }
+        assert_eq!(layouts.len(), 7);
+    }
+
+    #[test]
     fn clips_sampled_at_different_rates_join_into_one_batch() {
         let spec = MiniMaxM3VisionSpec;
         let layouts = spec
