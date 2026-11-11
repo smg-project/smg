@@ -970,44 +970,23 @@ mod tests {
 
     #[test]
     fn a_proto_block_becomes_its_engine_and_content_hashes() {
-        let block = KvBlock {
-            block_hash: 42,
-            token_ids: vec![1, 2, 3, 4],
-            block_size: 4,
-            lora_id: None,
-            cache_level: None,
-            ..Default::default()
-        };
-        let stored = convert_kv_block(&block, XXH3_SEED);
+        let proto = block(42, &[1, 2, 3, 4]);
+        let stored = convert_kv_block(&proto, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash::from(42i64));
         assert_eq!(stored.content_hash, compute_content_hash(&[1, 2, 3, 4]));
     }
 
     #[test]
     fn a_negative_engine_hash_keeps_its_bits() {
-        let block = KvBlock {
-            block_hash: -1,
-            token_ids: vec![10, 20],
-            block_size: 2,
-            lora_id: None,
-            cache_level: None,
-            ..Default::default()
-        };
-        let stored = convert_kv_block(&block, XXH3_SEED);
+        let proto = block(-1, &[10, 20]);
+        let stored = convert_kv_block(&proto, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash(u64::MAX));
     }
 
     #[test]
     fn a_block_without_tokens_hashes_the_empty_content() {
-        let block = KvBlock {
-            block_hash: 100,
-            token_ids: vec![],
-            block_size: 0,
-            lora_id: None,
-            cache_level: None,
-            ..Default::default()
-        };
-        let stored = convert_kv_block(&block, XXH3_SEED);
+        let proto = block(100, &[]);
+        let stored = convert_kv_block(&proto, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash::from(100i64));
         assert_eq!(stored.content_hash, compute_content_hash(&[]));
     }
@@ -1018,24 +997,7 @@ mod tests {
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let stored = KvBlocksStored {
-            blocks: vec![
-                KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![10, 20, 30, 40],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-                KvBlock {
-                    block_hash: 2,
-                    token_ids: vec![50, 60, 70, 80],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-            ],
+            blocks: vec![block(1, &[10, 20, 30, 40]), block(2, &[50, 60, 70, 80])],
             parent_block_hash: None,
             ..Default::default()
         };
@@ -1051,28 +1013,14 @@ mod tests {
         let mut wb = WorkerIndexState::default();
 
         let stored1 = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(1, &[10, 20, 30, 40])],
             parent_block_hash: None,
             ..Default::default()
         };
         KvEventMonitor::apply_stored(&stored1, w1, &indexer, &mut wb);
 
         let stored2 = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 2,
-                token_ids: vec![50, 60, 70, 80],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(2, &[50, 60, 70, 80])],
             parent_block_hash: Some(1),
             ..Default::default()
         };
@@ -1088,14 +1036,7 @@ mod tests {
 
         // Pass parent_block_hash for an untracked worker — should fallback to no parent.
         let stored = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(1, &[10, 20, 30, 40])],
             parent_block_hash: Some(999),
             ..Default::default()
         };
@@ -1110,24 +1051,7 @@ mod tests {
         let mut wb = WorkerIndexState::default();
 
         let stored = KvBlocksStored {
-            blocks: vec![
-                KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![10, 20, 30, 40],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-                KvBlock {
-                    block_hash: 2,
-                    token_ids: vec![50, 60, 70, 80],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-            ],
+            blocks: vec![block(1, &[10, 20, 30, 40]), block(2, &[50, 60, 70, 80])],
             parent_block_hash: None,
             ..Default::default()
         };
@@ -1149,14 +1073,7 @@ mod tests {
         let mut wb = WorkerIndexState::default();
 
         let stored = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(1, &[10, 20, 30, 40])],
             parent_block_hash: None,
             ..Default::default()
         };
@@ -1175,14 +1092,7 @@ mod tests {
         let event = KvCacheEvent {
             event_id: 1,
             data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                blocks: vec![KvBlock {
-                    block_hash: 42,
-                    token_ids: vec![1, 2, 3, 4],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                }],
+                blocks: vec![block(42, &[1, 2, 3, 4])],
                 parent_block_hash: None,
                 ..Default::default()
             })),
@@ -1201,14 +1111,7 @@ mod tests {
         let stored_event = KvCacheEvent {
             event_id: 1,
             data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                blocks: vec![KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![1, 2, 3, 4],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                }],
+                blocks: vec![block(1, &[1, 2, 3, 4])],
                 parent_block_hash: None,
                 ..Default::default()
             })),
@@ -1237,14 +1140,7 @@ mod tests {
             &KvCacheEvent {
                 event_id: 1,
                 data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                    blocks: vec![KvBlock {
-                        block_hash: 1,
-                        token_ids: vec![1, 2, 3, 4],
-                        block_size: 4,
-                        lora_id: None,
-                        cache_level: None,
-                        ..Default::default()
-                    }],
+                    blocks: vec![block(1, &[1, 2, 3, 4])],
                     parent_block_hash: None,
                     ..Default::default()
                 })),
@@ -1282,14 +1178,19 @@ mod tests {
 
     const TOKENS: [u32; 4] = [10, 20, 30, 40];
 
+    /// A block of these tokens at this hash, as wide as its tokens, the rest default.
+    fn block(hash: i64, tokens: &[u32]) -> KvBlock {
+        KvBlock {
+            block_hash: hash,
+            token_ids: tokens.to_vec(),
+            block_size: tokens.len() as i32,
+            ..Default::default()
+        }
+    }
+
     fn stored_event(hash: i64, tokens: &[u32]) -> KvBlocksStored {
         KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: hash,
-                token_ids: tokens.to_vec(),
-                block_size: tokens.len() as i32,
-                ..Default::default()
-            }],
+            blocks: vec![block(hash, tokens)],
             ..Default::default()
         }
     }
@@ -2156,14 +2057,7 @@ mod tests {
         tokens: &[u32],
     ) -> KvCacheEvent {
         store_event(KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: hash,
-                token_ids: tokens.to_vec(),
-                block_size: tokens.len() as i32,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(hash, tokens)],
             parent_block_hash: parent,
             group_idx: Some(group),
             kv_cache_spec_kind: Some("sliding_window".to_string()),
