@@ -24,6 +24,22 @@ pub trait Filter: Send + Sync + Debug {
     fn soft(&self) -> bool {
         false
     }
+
+    /// Drops from `kept` (positions into `candidates`, in order) the rows this
+    /// filter refuses, in place: one call per decision, with [`Filter::keep`]
+    /// inlined into the loop. A filter that answers for the whole pool at
+    /// once overrides it, and must drop exactly the rows [`Filter::keep`]
+    /// refuses: the pair plan's partner and routable passes still ask `keep`
+    /// row by row.
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        kept.retain(|&i| self.keep(facts, &candidates[i as usize], cx));
+    }
 }
 
 /// The band within which scores tie: rows whose combined score is within it
@@ -118,14 +134,16 @@ pub struct Scratch {
     classes: Vec<u32>,
 }
 
-/// The buffers of one profile run: the survivors, their combined scores and
-/// one scorer's stage. A pair decision keeps the prefill's apart from the
-/// decode side's, so the prefill's survivors stay for the next prefill target.
+/// The buffers of one profile run: the survivors, their combined scores, one
+/// scorer's stage and the survivors a soft filter restores when it would
+/// leave nothing. A pair decision keeps the prefill's apart from the decode
+/// side's, so the prefill's survivors stay for the next prefill target.
 #[derive(Debug, Default)]
 struct Buffers {
     kept: Vec<u32>,
     scores: Vec<f32>,
     stage: Vec<f32>,
+    before_soft: Vec<u32>,
 }
 
 impl Scratch {
@@ -165,14 +183,17 @@ fn combine(
     TieBand(band)
 }
 
-/// The filters over `candidates`: the hard ones, then each soft one as long
-/// as it leaves something. Returns the name of the filter that emptied the
-/// pool, if one did.
+/// The filters over `candidates`, stage by stage in profile order, each one
+/// pass over the survivors so far: the pair class, the partnered test, the
+/// hard filters, then each soft filter as long as it leaves something.
+/// Returns the name of the stage that emptied the pool, if one did (design
+/// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
+/// a class with no decode by the partners.
 fn filter(
     profile: &Profile,
     facts: &RequestFacts<'_>,
     cx: &Constraints<'_>,
-    kept: &mut Vec<u32>,
+    buf: &mut Buffers,
     set: Set<'_>,
 ) -> Option<&'static str> {
     let Set {
@@ -180,71 +201,45 @@ fn filter(
         class,
         partnered,
     } = set;
+    let kept = &mut buf.kept;
     kept.clear();
-    kept.extend((0..candidates.len() as u32).filter(|&i| {
-        let c = &candidates[i as usize];
-        class.is_none_or(|k| c.pair_class == k)
-            && partnered.is_none_or(|p| p.binary_search(&c.pair_class).is_ok())
-            && profile
-                .filters
-                .iter()
-                .filter(|f| !f.soft())
-                .all(|f| f.keep(facts, c, cx))
-    }));
-    if kept.is_empty() {
-        return Some(emptied_by(profile, facts, cx, kept, set));
-    }
-    for soft in profile.filters.iter().filter(|f| f.soft()) {
-        if kept
-            .iter()
-            .any(|&i| soft.keep(facts, &candidates[i as usize], cx))
-        {
-            kept.retain(|&i| soft.keep(facts, &candidates[i as usize], cx));
+    match class {
+        Some(k) => {
+            kept.extend(
+                (0..candidates.len() as u32).filter(|&i| candidates[i as usize].pair_class == k),
+            );
+            if kept.is_empty() {
+                return Some("partners");
+            }
         }
+        None => kept.extend(0..candidates.len() as u32),
     }
-    None
-}
-
-/// The hard filter that left nothing (design 4.2: a shed names the stage that
-/// emptied the pool). The stages run again in profile order over the pool
-/// (the pair class, then the partnered test, then the hard filters) and the
-/// first after which no row survives is named; the pool is empty at this
-/// point, so the second walk costs a pick nothing. A pool with no candidate
-/// was emptied by no stage, a class with no decode by the partners.
-fn emptied_by(
-    profile: &Profile,
-    facts: &RequestFacts<'_>,
-    cx: &Constraints<'_>,
-    kept: &mut Vec<u32>,
-    set: Set<'_>,
-) -> &'static str {
-    let Set {
-        candidates,
-        class,
-        partnered,
-    } = set;
-    kept.clear();
-    kept.extend(
-        (0..candidates.len() as u32)
-            .filter(|&i| class.is_none_or(|k| candidates[i as usize].pair_class == k)),
-    );
     if kept.is_empty() {
-        return if class.is_some() { "partners" } else { "none" };
+        return Some("none");
     }
     if let Some(p) = partnered {
         kept.retain(|&i| p.binary_search(&candidates[i as usize].pair_class).is_ok());
         if kept.is_empty() {
-            return "partnered";
+            return Some("partnered");
         }
     }
     for hard in profile.filters.iter().filter(|f| !f.soft()) {
-        kept.retain(|&i| hard.keep(facts, &candidates[i as usize], cx));
+        hard.retain(facts, candidates, cx, kept);
         if kept.is_empty() {
-            return hard.name();
+            return Some(hard.name());
         }
     }
-    kept.clear();
-    "none"
+    for soft in profile.filters.iter().filter(|f| f.soft()) {
+        buf.before_soft.clear();
+        buf.before_soft.extend_from_slice(kept);
+        soft.retain(facts, candidates, cx, kept);
+        if kept.is_empty() {
+            // Copied back, not swapped: a swap would hand `kept` the backup's
+            // smaller buffer, and the next decision would grow it again.
+            kept.extend_from_slice(&buf.before_soft);
+        }
+    }
+    None
 }
 
 fn trace_of(
@@ -262,24 +257,31 @@ fn trace_of(
         generation: pool.generation,
         ..Trace::default()
     };
-    let mut order: [usize; TRACE_TOP] = [usize::MAX; TRACE_TOP];
-    for slot in 0..TRACE_TOP.min(kept.len()) {
-        let mut best: Option<usize> = None;
-        for (i, &score) in scores.iter().enumerate() {
-            if order[..slot].contains(&i) {
-                continue;
-            }
-            if best.is_none_or(|b| score > scores[b]) {
-                best = Some(i);
-            }
+    // One pass: a row enters the top when it beats the lowest row kept, and
+    // moves above a kept row only when strictly better, so equal scores keep
+    // the scan's order (the earlier row ahead).
+    let mut top: [(usize, f32); TRACE_TOP] = [(0, f32::NEG_INFINITY); TRACE_TOP];
+    let mut len = 0usize;
+    for (i, &score) in scores.iter().enumerate() {
+        if len == TRACE_TOP && score <= top[TRACE_TOP - 1].1 {
+            continue;
         }
-        let Some(i) = best else {
-            break;
+        let mut slot = if len < TRACE_TOP {
+            len += 1;
+            len - 1
+        } else {
+            TRACE_TOP - 1
         };
-        order[slot] = i;
-        trace.top[slot] = (candidates[kept[i] as usize].id, scores[i]);
-        trace.top_len = slot as u8 + 1;
+        while slot > 0 && score > top[slot - 1].1 {
+            top[slot] = top[slot - 1];
+            slot -= 1;
+        }
+        top[slot] = (i, score);
     }
+    for (slot, &(i, score)) in top.iter().enumerate().take(len) {
+        trace.top[slot] = (candidates[kept[i] as usize].id, score);
+    }
+    trace.top_len = len as u8;
     trace
 }
 
@@ -326,7 +328,7 @@ fn run_profile(
     buf: &mut Buffers,
 ) -> Decision {
     let candidates = set.candidates;
-    if let Some(emptied_by) = filter(profile, facts, cx, &mut buf.kept, set) {
+    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
         return shed(
             reason_of(emptied_by),
             emptied_by,
@@ -707,34 +709,38 @@ impl Engine {
                     scratch.classes.sort_unstable();
                     scratch.classes.dedup();
                     if routable == 0 {
-                        let stage = emptied_by(
+                        let stage = filter(
                             prefill_profile,
                             &prefill_facts,
                             cx,
-                            &mut scratch.single.kept,
+                            &mut scratch.single,
                             Set {
                                 candidates: prefills,
                                 class: None,
                                 partnered: None,
                             },
-                        );
+                        )
+                        .unwrap_or("none");
                         return shed(reason_of(stage), stage, prefill_shed.trace);
                     }
                     if scratch.classes.is_empty() {
                         return shed(ShedReason::NoEndpoints, "partnered", prefill_shed.trace);
                     }
-                    let stage = emptied_by(
+                    // An empty decode pool is that class for every prefill:
+                    // its "none" falls through to the prefill's shed.
+                    if let Some(stage) = filter(
                         decode_profile,
                         &decode_facts,
                         decode_cx,
-                        &mut scratch.decode.kept,
+                        &mut scratch.decode,
                         Set {
                             candidates: decodes,
                             class: None,
                             partnered: Some(&scratch.classes),
                         },
-                    );
-                    if stage != "none" {
+                    )
+                    .filter(|&stage| stage != "none")
+                    {
                         return shed(reason_of(stage), stage, prefill_shed.trace);
                     }
                 }
@@ -934,6 +940,37 @@ mod tests {
         assert_eq!(pick.trace.survivors, 3);
         assert_eq!(pick.trace.top[0].0, WorkerId(101));
         assert_eq!(pick.trace.top_len, 3);
+    }
+
+    #[test]
+    fn the_trace_lists_equal_scores_in_the_pools_order_and_keeps_the_three_best() {
+        // Four idle workers behind one busy one: the three idle rows the
+        // trace names come in the pool's order, and the busy row stays out.
+        let engine = engine();
+        let pool = [
+            candidate(0, 3),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+            candidate(4, 0),
+        ];
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let mut scratch = Scratch::new();
+        let decision = engine.decide(
+            &facts,
+            &PoolFacts::default(),
+            &pool,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        let trace = decision.trace();
+        assert_eq!(trace.top_len, 3);
+        let named: Vec<WorkerId> = trace.top.iter().map(|(id, _)| *id).collect();
+        assert_eq!(named, vec![WorkerId(101), WorkerId(102), WorkerId(103)]);
+        assert!(trace.top.iter().all(|(_, score)| *score == 1.0));
     }
 
     #[test]
@@ -1291,6 +1328,28 @@ mod tests {
                 assert_eq!(shed.emptied_by, "partnered", "no decode of the class");
             }
             other => panic!("an empty class answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pair_with_no_decode_at_all_is_dropped_as_unpartnered() {
+        // An empty decode pool is a class with no decode for every prefill:
+        // the prefill's own "partnered" shed stands, where the decode side's
+        // filter alone would name "none".
+        let engine = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let mut prefills = [candidate(0, 0)];
+        prefills[0].pair_class = 7;
+        match decide_pair(&engine, &prefills, &[]) {
+            Decision::Shed(shed) => {
+                assert_eq!(shed.emptied_by, "partnered", "no decode of any class");
+                assert_eq!(shed.reason, ShedReason::NoEndpoints);
+            }
+            other => panic!("an empty decode pool answered {other:?}"),
         }
     }
 

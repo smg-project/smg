@@ -45,7 +45,7 @@ filter = "^policy_engine/"
 # pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
 # gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
 # bench target of its own.
-sources = ["crates/policy_controller/benches/decision.rs"]
+sources = ["crates/policy_controller/benches/decision.rs", "crates/policy_controller/benches/common/mod.rs"]
 
 # The first gate whose pattern matches an id decides its threshold.
 [[gate]]

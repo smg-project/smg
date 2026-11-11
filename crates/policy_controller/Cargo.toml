@@ -36,5 +36,9 @@ wit-parser = { version = "0.258.3", default-features = false, features = ["std"]
 name = "decision"
 harness = false
 
+[[bench]]
+name = "contention"
+harness = false
+
 [lints]
 workspace = true
