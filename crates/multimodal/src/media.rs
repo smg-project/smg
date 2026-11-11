@@ -71,6 +71,9 @@ static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODE_PIXELS: OnceLock<u64> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static FFMPEG_PASSTHROUGH_FLAG: OnceLock<[&'static str; 2]> = OnceLock::new();
+/// What keeps this process from decoding video, probed once (see
+/// [`missing_video_decoder`]).
+static VIDEO_DECODER_GAP: OnceLock<Option<String>> = OnceLock::new();
 static ACTIVE_VIDEO_DECODES: AtomicUsize = AtomicUsize::new(0);
 static AVAILABLE_DECODE_CPUS: OnceLock<usize> = OnceLock::new();
 const MAX_DECODER_THREADS: usize = 8;
@@ -1338,6 +1341,69 @@ fn decode_video_with_opencv_bytes_logged(
         }
     }
     result
+}
+
+/// What keeps this process from decoding video, if anything, probed once:
+/// without the `opencv-video` feature a clip is decoded by the `ffmpeg` and
+/// `ffprobe` executables on PATH, and `SMG_VIDEO_DECODE_BACKEND` may name a
+/// backend this build does not have. `None` when video decodes here. A
+/// gateway reads it at start-up (one log line) and refuses a video part up
+/// front, the request's own answer, instead of failing the request's decode
+/// with a server error on every clip; a worker-side pipeline reads it the
+/// same way. The binaries on PATH do not change underneath a process.
+pub fn missing_video_decoder() -> Option<&'static str> {
+    VIDEO_DECODER_GAP
+        .get_or_init(probe_video_decoder_gap)
+        .as_deref()
+}
+
+fn probe_video_decoder_gap() -> Option<String> {
+    match video_decode_backend_override() {
+        Some("opencv") => {
+            if cfg!(feature = "opencv-video") {
+                return None;
+            }
+            return Some(
+                "SMG_VIDEO_DECODE_BACKEND=opencv requires the opencv-video feature".to_string(),
+            );
+        }
+        Some("ffmpeg") => {}
+        Some(backend) => {
+            return Some(format!(
+                "unsupported SMG_VIDEO_DECODE_BACKEND={backend}; expected auto, opencv, or ffmpeg"
+            ));
+        }
+        None => {
+            if cfg!(feature = "opencv-video") {
+                return None;
+            }
+        }
+    }
+    let missing: Vec<String> = ["ffmpeg", "ffprobe"]
+        .into_iter()
+        .filter(|program| !executable_runs(program))
+        .map(|program| format!("{program} executable"))
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{} not found; install ffmpeg to decode video_url inputs",
+            missing.join(" and ")
+        ))
+    }
+}
+
+/// Whether `program -version` can be started from PATH (a blocking probe,
+/// run once at start-up).
+fn executable_runs(program: &str) -> bool {
+    std::process::Command::new(program)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn video_decode_backend_override() -> Option<&'static str> {

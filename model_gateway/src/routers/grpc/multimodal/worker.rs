@@ -33,7 +33,7 @@ use super::{
     media_verdict, mm_settings,
     pixel_cache::pixel_cache_with_budget,
     plan::{prepare_placeholder_tokens, validate_rendered_media_anchors, MediaPlan},
-    process::process_multimodal_plan,
+    process::{process_multimodal_plan, VideoDecoderUnavailable},
     RegistryTokenizer,
 };
 use crate::{
@@ -999,6 +999,9 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
         .chain()
         .any(|cause| cause.downcast_ref::<ItemOverEncoderBudget>().is_some())
     {
+        return WorkerMediaError::Invalid(message);
+    }
+    if VideoDecoderUnavailable::is(&error) {
         return WorkerMediaError::Invalid(message);
     }
     if let Some(fetch) = media_verdict(&error) {
@@ -1994,6 +1997,16 @@ mod tests {
         assert!(matches!(classify(decoder), WorkerMediaError::Internal(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
+        // A video part on a process without a video decoder is refused as
+        // the caller's up front (known at start-up), not as the worker's.
+        let no_decoder = anyhow::Error::new(VideoDecoderUnavailable {
+            why: "ffmpeg executable not found; install ffmpeg to decode video_url inputs",
+        })
+        .context("Failed to process the plan");
+        assert!(matches!(
+            classify(no_decoder),
+            WorkerMediaError::Invalid(message) if message.contains("ffmpeg executable not found")
+        ));
         // An item above the engine's encoder budget is the caller's, with the
         // item's size and the budget in the message, at any depth of the chain.
         let over_budget = anyhow::Error::new(ItemOverEncoderBudget {
