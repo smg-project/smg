@@ -189,8 +189,8 @@ impl Normalizable for GenerateRequest {
 }
 
 /// Validation function for GenerateRequest: a body with no prompt at all is
-/// refused, and an empty `input_ids` is refused as the chat route refuses an
-/// empty `messages`.
+/// refused, an empty `input_ids` is refused as the chat route refuses an
+/// empty `messages`, and a negative id in `input_ids` is refused.
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
     // A body with no prompt at all is refused. `input_embeds` is a prompt on
     // the paths that forward the body as-is, and a body with both `text` and
