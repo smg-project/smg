@@ -1033,19 +1033,7 @@ impl ResponseProcessor {
         // Tool use blocks (convert from OpenAI ToolCall format)
         if let Some(calls) = &tool_calls {
             for tc in calls {
-                let input = if let Some(args) = tc.function.arguments.as_deref() {
-                    serde_json::from_str(args).unwrap_or_else(|e| {
-                        warn!(
-                            function = "process_non_streaming_messages_response",
-                            tool_call_id = %tc.id,
-                            error = %e,
-                            "Failed to parse tool call arguments, defaulting to empty object"
-                        );
-                        serde_json::Value::Object(serde_json::Map::new())
-                    })
-                } else {
-                    serde_json::Value::Object(serde_json::Map::new())
-                };
+                let input = tool_use_input(tc.function.arguments.as_deref(), &tc.id);
 
                 content_blocks.push(messages::ContentBlock::ToolUse {
                     id: utils::message_utils::anthropic_tool_use_id(&tc.id),
@@ -1611,6 +1599,79 @@ fn messages_usage_from_counts(
     match thinking_tokens {
         Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens),
         None => usage,
+    }
+}
+
+/// The `input` of a `tool_use` block from the arguments a tool call carries:
+/// the parsed object as it is, or an empty object when the arguments are
+/// missing, are not valid JSON, or are valid JSON that is not an object (a
+/// double-encoded or bare string, an array). The Messages contract makes
+/// `input` an object and the request side refuses anything else, so an answer
+/// never carries a value a client could not send back as history; the
+/// fallback is named once in the log, as the parse failure always was. (The
+/// Symphony reader refuses such a message instead; see
+/// `read_messages_with_symphony`.)
+fn tool_use_input(arguments: Option<&str>, tool_call_id: &str) -> serde_json::Value {
+    let empty = || serde_json::Value::Object(serde_json::Map::new());
+    let Some(args) = arguments else {
+        return empty();
+    };
+    let why = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(value) if value.is_object() => return value,
+        Ok(other) => {
+            let kind = match other {
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Bool(_) => "boolean",
+                _ => "null",
+            };
+            format!("the arguments are valid JSON but not an object ({kind})")
+        }
+        Err(e) => e.to_string(),
+    };
+    warn!(
+        function = "process_non_streaming_messages_response",
+        tool_call_id = %tool_call_id,
+        error = %why,
+        "Failed to parse tool call arguments, defaulting to empty object"
+    );
+    empty()
+}
+
+#[cfg(test)]
+mod tool_use_input_tests {
+    use serde_json::json;
+
+    use super::tool_use_input;
+
+    /// An answer's `tool_use.input` is always an object, as the request side
+    /// requires it: the parsed object as it is; an empty object for missing
+    /// arguments, arguments that are not JSON, and arguments that are JSON
+    /// but not an object (a double-encoded string, a bare string, an array, a
+    /// number, null).
+    #[test]
+    fn a_tool_use_input_is_always_an_object() {
+        assert_eq!(
+            tool_use_input(Some(r#"{"city":"Paris"}"#), "call_1"),
+            json!({"city": "Paris"})
+        );
+        assert_eq!(tool_use_input(Some("{}"), "call_1"), json!({}));
+        for arguments in [
+            None,
+            Some("not json"),
+            Some(r#""{\"city\":\"Paris\"}""#),
+            Some(r#""Paris""#),
+            Some(r#"["Paris"]"#),
+            Some("1"),
+            Some("null"),
+        ] {
+            assert_eq!(
+                tool_use_input(arguments, "call_1"),
+                json!({}),
+                "{arguments:?}"
+            );
+        }
     }
 }
 
