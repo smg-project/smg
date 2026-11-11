@@ -15,6 +15,7 @@ use tokenizers::{
     },
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
+        digits::Digits,
         metaspace::{Metaspace, PrependScheme},
         sequence::Sequence,
         split::{Split, SplitPattern},
@@ -369,6 +370,32 @@ fn shapes() -> Vec<Shape> {
             ],
             added: &[("<think>", false), ("<|tool_call_start|>", false)],
         },
+        // `Digits` before the `ByteLevel` with its own regex: every numeric
+        // character its own piece, the rest cut by the byte-level pattern.
+        Shape {
+            name: "digits-then-byte-level-regex",
+            nfc: false,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
+        // `Digits` in runs before a split and the `ByteLevel`.
+        Shape {
+            name: "digit-runs",
+            nfc: false,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+        },
         // Added tokens with a space inside, matched after normalization
         // (the default of `add_tokens`): a cut at that space would turn
         // the token into pieces.
@@ -442,9 +469,17 @@ fn every_shape_gets_a_native_path() {
         let expected_stages = shape
             .pre_tokenizers
             .iter()
-            .filter(|p| matches!(p, PreTokenizerWrapper::Split(_)))
+            .filter(|p| {
+                matches!(
+                    p,
+                    PreTokenizerWrapper::Split(_) | PreTokenizerWrapper::Digits(_)
+                )
+            })
             .count()
-            + usize::from(shape.name == "byte-level-regex");
+            + usize::from(matches!(
+                shape.pre_tokenizers.last(),
+                Some(PreTokenizerWrapper::ByteLevel(byte_level)) if byte_level.use_regex
+            ));
         assert_eq!(
             native.expect("native").stages.len(),
             expected_stages,
@@ -526,8 +561,77 @@ fn shapes_outside_the_path_are_declined() {
     tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
     assert_eq!(
         declined(&tokenizer),
-        "no pre-tokenizer (the path needs ByteLevel, after any Split stages)"
+        "no pre-tokenizer (the path needs ByteLevel, after any split stages)"
     );
+}
+
+/// The `Digits` stage holds exactly what `char::is_numeric` accepts, the
+/// reference's test, over every scalar value: the toolchain's numeric set,
+/// not the engine's `\p{N}` (another Unicode version); a toolchain bump that
+/// widens the set fails here, not in the ids.
+#[test]
+fn the_digits_stage_holds_what_is_numeric_accepts() {
+    let stage = NativeEncoder::split_stage(&serde_json::json!(
+        {"type": "Digits", "individual_digits": true}
+    ))
+    .expect("the digits stage");
+    let mut text = String::new();
+    for code in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(code) else {
+            continue;
+        };
+        text.clear();
+        text.push(c);
+        let native = stage.pattern.find_iter(&text).next() == Some((0, text.len()));
+        assert_eq!(native, c.is_numeric(), "U+{code:04X}");
+    }
+}
+
+/// Two numeric characters the regex engine's `\p{N}` table lacks (U+11DE0
+/// and U+11DE1, numeric to the toolchain), with a merge across their
+/// boundary in the vocabulary: the reference's `Digits` under
+/// `individual_digits` cuts between them, so the merge never applies, and
+/// the native stage cuts there too.
+#[test]
+fn digits_the_engine_table_lacks_are_cut_apart_before_a_merge_across_them() {
+    let mut state = 0xD161_7000_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "digits-then-byte-level-regex")
+        .expect("the shape");
+    let mut tokenizer = tokenizer_of(&shape, &mut state);
+    let table = bytes_char();
+    let mut vocab = Vocab::default();
+    let mut alphabet: Vec<char> = table.to_vec();
+    alphabet.sort_unstable();
+    for ch in alphabet {
+        let id = vocab.len() as u32;
+        vocab.insert(ch.to_string(), id);
+    }
+    // The last byte of U+11DE0 and the first byte of U+11DE1, merged.
+    let (a, b) = (table[0xA0].to_string(), table[0xF0].to_string());
+    let id = vocab.len() as u32;
+    vocab.insert(format!("{a}{b}"), id);
+    let merges: Merges = vec![(a, b)];
+    tokenizer.with_model(
+        BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .expect("bpe"),
+    );
+    let native = seeded(&tokenizer);
+    for text in [
+        "\u{11DE0}\u{11DE1}",
+        "x\u{11DE0}\u{11DE1}y",
+        "\u{11DE0} \u{11DE1}",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
 }
 
 #[test]
