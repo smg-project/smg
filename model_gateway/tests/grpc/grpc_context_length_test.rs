@@ -333,3 +333,152 @@ async fn regular_over_long_chat_prompt_is_a_400() {
 
     assert_context_length_rejection(response).await;
 }
+
+/// A disaggregated pair's budget is the decode side's to hold: the prefill
+/// side runs one token. With a prefill window narrower than the decode
+/// window, a budget within the decode window is forwarded and one beyond it
+/// is refused naming the decode window; the prompt stays bound by the
+/// narrower side.
+#[tokio::test]
+async fn pd_budget_is_bound_by_the_decode_window_not_the_prefill_window() {
+    let (prefill_window, decode_window) = (CONTEXT_LENGTH, CONTEXT_LENGTH * 8);
+    let router = pd_router(Some(prefill_window), Some(decode_window)).await;
+    let tenant = tenant();
+    for (budget, expected) in [
+        (prefill_window * 2, StatusCode::OK),
+        (decode_window + 1, StatusCode::BAD_REQUEST),
+    ] {
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "prompt": prompt_of(prefill_window as usize / 4),
+            "max_tokens": budget,
+        }))
+        .expect("a completion request");
+        let response = router.route_completion(None, &tenant, request, MODEL).await;
+        let status = response.status();
+        let body = read_body(response).await;
+        assert_eq!(status, expected, "budget {budget}: {body}");
+        if expected == StatusCode::BAD_REQUEST {
+            assert!(
+                body.contains(&format!("{decode_window} tokens")) && body.contains("max_tokens"),
+                "the refusal names the decode window and the field: {body}"
+            );
+            assert!(!body.contains(PREFILL_FAILED), "{body}");
+        }
+    }
+    let over_long = router
+        .route_completion(
+            None,
+            &tenant,
+            completion(prefill_window as usize + 1, false),
+            MODEL,
+        )
+        .await;
+    assert_context_length_rejection(over_long).await;
+}
+
+/// A completion budget the window could never hold is a client mistake on
+/// every route that names one, whatever the model's provider profile: the
+/// gateway refuses it before any engine sees it (the mock engines accept
+/// anything), naming the window and the budget, and forwards a budget that
+/// fits. The input's share of the window stays with the engine, as before.
+#[tokio::test]
+async fn regular_budget_beyond_the_window_is_a_400_on_every_route() {
+    use openai_protocol::{
+        generate::GenerateRequest, messages::CreateMessageRequest, responses::ResponsesRequest,
+    };
+
+    let router = regular_router(Some(CONTEXT_LENGTH)).await;
+    let tenant = tenant();
+    let prompt = prompt_of(2);
+    let user = prompt.as_str();
+    for beyond in [true, false] {
+        let budget = if beyond {
+            CONTEXT_LENGTH + 1
+        } else {
+            CONTEXT_LENGTH
+        };
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": user}],
+            "max_tokens": budget,
+        }))
+        .expect("a chat request");
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "prompt": user,
+            "max_tokens": budget,
+        }))
+        .expect("a completion request");
+        let messages: CreateMessageRequest = serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "max_tokens": budget,
+            "messages": [{"role": "user", "content": user}],
+        }))
+        .expect("a messages request");
+        let responses: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "input": user,
+            "store": false,
+            "max_output_tokens": budget,
+        }))
+        .expect("a responses request");
+        let generate: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "text": user,
+            "sampling_params": {"max_new_tokens": budget},
+        }))
+        .expect("a generate request");
+        let answers = [
+            ("chat", router.route_chat(None, &tenant, chat, MODEL).await),
+            (
+                "completions",
+                router
+                    .route_completion(None, &tenant, completion, MODEL)
+                    .await,
+            ),
+            (
+                "messages",
+                router.route_messages(None, &tenant, messages, MODEL).await,
+            ),
+            (
+                "responses",
+                router
+                    .route_responses(None, &tenant, responses, MODEL)
+                    .await,
+            ),
+            (
+                "generate",
+                router.route_generate(None, &tenant, generate, MODEL).await,
+            ),
+        ];
+        for (route, response) in answers {
+            let status = response.status();
+            let body = read_body(response).await;
+            if !beyond {
+                assert_eq!(status, StatusCode::OK, "{route}: {body}");
+                continue;
+            }
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {body}");
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|error| panic!("{route}: {error}: {body}"));
+            assert_eq!(
+                json["error"]["code"], CONTEXT_LENGTH_EXCEEDED,
+                "{route}: {body}"
+            );
+            let message = json["error"]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{route}: no message in {body}"));
+            assert!(
+                message.contains(&format!("{CONTEXT_LENGTH} tokens"))
+                    && message.contains(&format!("{budget} tokens for the completion"))
+                    && message.contains("max_tokens"),
+                "{route}: the refusal names the window, the budget and the field: {message}"
+            );
+            assert!(
+                !body.contains(PREFILL_FAILED),
+                "{route}: a client mistake must not be reported as a worker failure: {body}"
+            );
+        }
+    }
+}

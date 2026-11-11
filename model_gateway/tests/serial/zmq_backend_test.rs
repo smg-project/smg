@@ -652,3 +652,76 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
         }
     }
 }
+
+/// A completion budget the window could never hold is refused at the gateway
+/// on the direct ZMQ lane too, where no engine frontend sits behind the
+/// gateway to refuse it: `400 context_length_exceeded` naming the window,
+/// the budget and the field, before the engine is asked; a budget that fits
+/// is served.
+#[tokio::test]
+#[serial]
+async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
+    const WINDOW: u32 = 64;
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines(&fixture.handshake, 1);
+    let config = grpc_router_config()
+        .regular_mode(vec![])
+        .random_policy()
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .max_concurrent_requests(64)
+        .queue_timeout_secs(60)
+        .disable_retries()
+        .build_unchecked();
+    let worker = Arc::new(
+        BasicWorkerBuilder::new(fixture.worker_url.clone())
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Zmq)
+            .runtime_type(RuntimeType::Vllm)
+            .zmq_handshake_address(fixture.handshake.clone())
+            .zmq_request_timeout(Duration::from_secs(60))
+            .model(ModelCard::new(MODEL).with_context_length(WINDOW))
+            .health_config(health_checks_off())
+            .build(),
+    );
+    let router =
+        build_grpc_router(config, MODEL, vec![Arc::clone(&worker) as Arc<dyn Worker>]).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ZMQ handshake never completed against the mock engine"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let chat = |max_tokens: u32| -> openai_protocol::chat::ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello world"}],
+            "max_tokens": max_tokens,
+        }))
+        .expect("a chat request")
+    };
+
+    let response = router
+        .route_chat(None, &test_meta(), chat(WINDOW + 1), MODEL)
+        .await;
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+        .await
+        .expect("response body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("a json error");
+    assert_eq!(json["error"]["code"], "context_length_exceeded", "{json}");
+    let message = json["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains(&format!("{WINDOW} tokens"))
+            && message.contains(&format!("{} tokens for the completion", WINDOW + 1))
+            && message.contains("max_tokens"),
+        "the refusal names the window, the budget and the field: {message}"
+    );
+
+    let response = router
+        .route_chat(None, &test_meta(), chat(WINDOW), MODEL)
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+}
