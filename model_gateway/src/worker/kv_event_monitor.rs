@@ -308,14 +308,20 @@ impl KvEventMonitor {
                 return;
             }
             // A stream started for another object under this URL, which the
-            // registry has replaced: stop it (the removal path, awaited to its
-            // end) and start one for the object given, on the next turn.
+            // registry has replaced: take it out of the slot on this same turn
+            // of the lock (a removal by URL after the lock could take a stream
+            // a concurrent add started in between; the reservation left here
+            // makes that add wait instead), stop it and await its end outside
+            // the lock, and start one for the object given, on the next turn.
             // Dropped in that wait, this add leaves the slot to the old task
             // (the reservation lifts itself) and starts nothing.
             if matches!(handles.get(&url), Some(Slot::Active(sub)) if !sub.streams_for(worker)) {
+                let stale = Self::begin_removal(&mut handles, &url);
                 drop(handles);
                 info!(worker_url = %Endpoint::redacted_str(&url), "Restarting KV event subscription for a re-registered worker");
-                self.on_worker_removed(&url).await;
+                if let Some(sub) = stale {
+                    self.finish_removal(&url, sub).await;
+                }
                 continue;
             }
             let mut done = match handles.get(&url) {
@@ -548,29 +554,45 @@ impl KvEventMonitor {
     pub async fn on_worker_removed(&self, worker_url: &str) {
         let subscription = {
             let mut handles = self.worker_handles.lock().await;
-            match handles.remove(worker_url) {
-                Some(Slot::Active(sub)) => {
-                    handles.insert(
-                        worker_url.to_string(),
-                        Slot::Removing(Reservation {
-                            id: sub.id,
-                            done: sub.done.clone(),
-                        }),
-                    );
-                    Some(sub)
-                }
-                Some(removing @ Slot::Removing(_)) => {
-                    // Another removal of the same URL is already under way.
-                    handles.insert(worker_url.to_string(), removing);
-                    None
-                }
-                None => None,
-            }
+            Self::begin_removal(&mut handles, worker_url)
         };
 
         let Some(sub) = subscription else {
             return;
         };
+        self.finish_removal(worker_url, sub).await;
+    }
+
+    /// Under the slot lock: the URL's active subscription taken out, its
+    /// reservation left in the slot for the adds that come before its task
+    /// has ended; `None` for an empty slot or a removal already under way.
+    fn begin_removal(
+        handles: &mut HashMap<String, Slot>,
+        worker_url: &str,
+    ) -> Option<WorkerSubscription> {
+        match handles.remove(worker_url) {
+            Some(Slot::Active(sub)) => {
+                handles.insert(
+                    worker_url.to_string(),
+                    Slot::Removing(Reservation {
+                        id: sub.id,
+                        done: sub.done.clone(),
+                    }),
+                );
+                Some(sub)
+            }
+            Some(removing @ Slot::Removing(_)) => {
+                // Another removal of the same URL is already under way.
+                handles.insert(worker_url.to_string(), removing);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Outside the lock: the taken subscription told to stop and awaited to
+    /// its end; the gauge lowered while the slot still holds its reservation.
+    async fn finish_removal(&self, worker_url: &str, sub: WorkerSubscription) {
         info!(worker_url = %Endpoint::redacted_str(worker_url), "Stopping KV event subscription");
         // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
         let _ = sub.shutdown_tx.send(());
@@ -603,6 +625,17 @@ impl KvEventMonitor {
     }
 
     /// Stop all subscriptions and clean up.
+    /// The ids under a URL's slot: the active subscription's, or the
+    /// reservation's of a removal under way.
+    #[cfg(test)]
+    async fn slot_ids(&self, worker_url: &str) -> (Option<u64>, Option<u64>) {
+        match self.worker_handles.lock().await.get(worker_url) {
+            Some(Slot::Active(sub)) => (Some(sub.id), None),
+            Some(Slot::Removing(held)) => (None, Some(held.id)),
+            None => (None, None),
+        }
+    }
+
     pub async fn stop(&self) {
         let subscriptions: Vec<(String, WorkerSubscription)> = {
             let mut handles = self.worker_handles.lock().await;
@@ -1153,6 +1186,65 @@ mod tests {
         wait_until(
             "the new subscription interns its worker in the fresh index",
             || after.worker_id(&url).is_some(),
+        )
+        .await;
+        monitor.stop().await;
+    }
+
+    /// The restart of a stream started for another object reserves the slot
+    /// on the turn of the lock that found it: before the old task has ended,
+    /// the slot holds that stream's reservation and not an active stream, and
+    /// a further add for the URL waits on the reservation instead of removing
+    /// by URL, so a stream started in between is never the one a stale
+    /// restart stops.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_restart_reserves_the_slot_before_it_waits_for_the_old_task() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let url = REFUSING_URL;
+        let first = refusing_grpc_worker();
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Loads)
+            .await;
+        let (active, removing) = monitor.slot_ids(url).await;
+        let stopped = active.expect("the first add started a stream");
+        assert_eq!(removing, None);
+        let old = Arc::downgrade(&first);
+        drop(first);
+
+        let second = refusing_grpc_worker();
+        let third = refusing_grpc_worker();
+        {
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let mut restart =
+                std::pin::pin!(monitor.on_worker_added(&second, SubscriptionKind::Loads));
+            assert!(
+                std::future::Future::poll(restart.as_mut(), &mut cx).is_pending(),
+                "the restart waits for the old task to end"
+            );
+            assert_eq!(
+                monitor.slot_ids(url).await,
+                (None, Some(stopped)),
+                "the stopped stream's reservation holds the slot through the wait"
+            );
+            let mut later =
+                std::pin::pin!(monitor.on_worker_added(&third, SubscriptionKind::Loads));
+            assert!(
+                std::future::Future::poll(later.as_mut(), &mut cx).is_pending(),
+                "an add on a reserved slot waits for the removal under way"
+            );
+            assert_eq!(
+                monitor.slot_ids(url).await,
+                (None, Some(stopped)),
+                "the waiting add removes nothing"
+            );
+        }
+        assert!(logs_contain(
+            "Restarting KV event subscription for a re-registered worker"
+        ));
+        wait_until(
+            "the old task ends on its own and releases its object",
+            || old.upgrade().is_none(),
         )
         .await;
         monitor.stop().await;
