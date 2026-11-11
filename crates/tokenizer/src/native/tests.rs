@@ -11,7 +11,7 @@ use tokenizers::{
     },
     normalizers::{
         unicode::{NFC, NFKC},
-        NormalizerWrapper, Replace,
+        NormalizerWrapper, Replace, Sequence as NormalizerSequence,
     },
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
@@ -2884,6 +2884,8 @@ fn sentencepiece_model(state: &mut u64) -> BPE {
 struct SentencepieceShape {
     name: &'static str,
     replace: bool,
+    /// The `Replace` as the one step of a `Sequence`, as some files write it.
+    sequence: bool,
     split: bool,
     metaspace: Option<PrependScheme>,
     /// The post-processor frames the ids with `<s>`.
@@ -2895,6 +2897,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "replace-split",
             replace: true,
+            sequence: false,
             split: true,
             metaspace: None,
             bos: true,
@@ -2902,6 +2905,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "replace",
             replace: true,
+            sequence: false,
             split: false,
             metaspace: None,
             bos: false,
@@ -2909,6 +2913,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-first",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::First),
             bos: true,
@@ -2916,6 +2921,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-always",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Always),
             bos: false,
@@ -2923,9 +2929,18 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-never",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Never),
             bos: false,
+        },
+        SentencepieceShape {
+            name: "replace-in-sequence",
+            replace: true,
+            sequence: true,
+            split: false,
+            metaspace: None,
+            bos: true,
         },
     ]
 }
@@ -2933,10 +2948,14 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
 fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTokenizer {
     let mut tokenizer = HfTokenizer::new(sentencepiece_model(state));
     if shape.replace {
+        let replace = Replace::new(" ", "\u{2581}").expect("a Replace normalizer");
+        let normalizer: NormalizerWrapper = if shape.sequence {
+            NormalizerSequence::new(vec![replace.into()]).into()
+        } else {
+            replace.into()
+        };
         tokenizer
-            .with_normalizer(Some(
-                Replace::new(" ", "\u{2581}").expect("a Replace normalizer"),
-            ))
+            .with_normalizer(Some(normalizer))
             .expect("normalizer");
     }
     if shape.split {
