@@ -4,6 +4,16 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ## Unreleased
 
+### Changed
+
+- Breaking: on `ChatMessage::Assistant`, `function_call` is `Option<Box<FunctionCallResponse>>`,
+  and the provider extension's `tools` is `Option<Box<serde_json::Value>>`. The assistant turn is
+  the enum's largest variant, so the two rarely-present values had grown every chat message to
+  272 bytes (176 before the refusal, the audio reference and the function call were kept), and
+  a history of four or eight turns moved up one allocator size class on every chat request.
+  Behind a pointer each, a message is 168 bytes and the history is back in its class; the wire
+  shape and the schema are unchanged.
+
 ### Removed
 
 - Breaking: the fifty-two builder constructors nothing in this repository uses are removed, with
