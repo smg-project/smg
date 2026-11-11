@@ -30,9 +30,16 @@ use smg_policy_controller::{
     Candidate, Constraints, Engine, Lease, Lifecycle, PoolFacts, RequestFacts, Scratch, Side,
 };
 
-/// The presets with a stateful stage behind a lock (the credit tally, the
-/// rotation table) and the lock-free control.
-const PRESETS: [&str; 3] = ["least_load", "round_robin", "passthrough"];
+/// The presets with a stateful stage (the credit tally, the rotation table)
+/// and the stateless control; `round_robin_churn` decides over a survivor
+/// set that differs per decision (one tried exclusion rotating through the
+/// pool), the rotation table's slot-claim path.
+const PRESETS: [&str; 4] = [
+    "least_load",
+    "round_robin",
+    "round_robin_churn",
+    "passthrough",
+];
 const THREADS: [usize; 2] = [1, 8];
 const SIZES: [usize; 2] = [64, 512];
 
@@ -46,6 +53,7 @@ fn decide_and_book(
     cx: &Constraints<'_>,
     thread: u64,
     iters: u64,
+    churn: bool,
 ) -> Duration {
     let mut scratch = Scratch::new();
     // Dated at the decision's clock, after every row's sample: the credit
@@ -57,11 +65,13 @@ fn decide_and_book(
     };
     let mut seed = thread << 48;
     let decide = |seed: u64, scratch: &mut Scratch| {
+        let tried = [view[(seed % view.len() as u64) as usize].id];
         let facts = RequestFacts {
             model: "m",
             prompt_tokens: 512,
             seed,
             now_micros: 1_000_000,
+            tried: if churn { &tried } else { &[] },
             ..RequestFacts::default()
         };
         let decision = engine.decide(&facts, pool, black_box(view), cx, scratch);
@@ -83,7 +93,8 @@ fn decide_and_book(
 fn decide_threads(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine_threads");
     for preset in PRESETS {
-        let engine = common::engine_of(preset);
+        let engine = common::engine_of(preset.strip_suffix("_churn").unwrap_or(preset));
+        let churn = preset.ends_with("_churn");
         for &n in &SIZES {
             let fleet = common::fleet(n);
             let mut view = Vec::with_capacity(n);
@@ -105,7 +116,7 @@ fn decide_threads(c: &mut Criterion) {
                                     .map(|t| {
                                         let (engine, view, pool, cx) = (&engine, &view, &pool, &cx);
                                         s.spawn(move || {
-                                            decide_and_book(engine, view, pool, cx, t, iters)
+                                            decide_and_book(engine, view, pool, cx, t, iters, churn)
                                         })
                                     })
                                     .collect();

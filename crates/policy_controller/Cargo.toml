@@ -11,6 +11,10 @@ categories = ["algorithms"]
 [dependencies]
 # No workspace crate: the engine knows nothing about its host (a gateway, a
 # controller, a binding).
+# The stateful stages' tables are read by every deciding thread and replaced
+# whole on the rare write (a rank's first dispatch, a membership change, a
+# survivor set seen first): a load costs no shared write.
+arc-swap = "1.9.1"
 parking_lot = { workspace = true }
 rustc-hash = "2"
 # The spec's JSON schema is generated from its types; serde_json renders it

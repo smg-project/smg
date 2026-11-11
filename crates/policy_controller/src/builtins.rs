@@ -2,9 +2,17 @@
 //! Every stateful one keeps its state behind the lifecycle alone, and none
 //! allocates per decision.
 
-use std::collections::{HashMap, VecDeque};
+use std::{
+    cell::Cell,
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-use parking_lot::Mutex;
+use arc_swap::ArcSwap;
+use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -222,43 +230,170 @@ impl Scorer for PrefixAffinity {
     }
 }
 
-/// Dispatches to one rank row no report reflects yet, oldest first.
-#[derive(Debug, Default)]
+/// Dispatches to one rank row no report reflects yet, oldest first within
+/// each lane. What a decision reads (the held token-work and requests) rides
+/// one atomic word, so deciding threads read a row without a lock. The
+/// dispatches themselves sit in [`DISPATCH_LANES`] lanes, each behind its own
+/// lock and fed by the threads mapped to it: concurrent dispatches to one row
+/// (deciders that read the same minimum book the same rank) rarely share a
+/// lock. `oldest_micros` tells a decision whether its report's sample reaches
+/// any held dispatch without taking one.
+#[derive(Debug)]
 struct SinceReport {
-    tokens: u64,
-    requests: u64,
-    dispatches: VecDeque<(u64, u32)>,
+    /// The held token-work in the high bits and the held requests in the low
+    /// [`REQUEST_BITS`]: one word, so a reader never sees a torn pair.
+    held: AtomicU64,
+    /// The instant of the oldest held dispatch over every lane; `u64::MAX`
+    /// when none. A dispatch lowers it under its lane's lock; a release
+    /// recomputes it under every lane's lock, so it never reads above a held
+    /// dispatch.
+    oldest_micros: AtomicU64,
+    lanes: [DispatchLane; DISPATCH_LANES],
 }
 
-/// Dispatches kept per rank row between reports.
-const SINCE_REPORT_KEPT: usize = 8_192;
+/// A lane's dispatches: the instant and the token-work of each, oldest first.
+type Dispatches = VecDeque<(u64, u32)>;
+
+/// One lane of a row's dispatches, on a cache line of its own: the threads
+/// mapped to it append here, and its traffic never invalidates another lane.
+#[derive(Debug)]
+#[repr(align(64))]
+struct DispatchLane {
+    dispatches: Mutex<Dispatches>,
+    /// The instant of this lane's oldest dispatch; `u64::MAX` when none.
+    oldest_micros: AtomicU64,
+}
+
+/// Lanes per rank row. A deciding thread keeps the lane it drew first; a
+/// host with more deciding threads than lanes shares them.
+const DISPATCH_LANES: usize = 8;
+
+/// Dispatches kept per rank row between reports, over its lanes: a dispatch
+/// past the bound retires the oldest in its own lane, so the bound holds
+/// within the lane count.
+const SINCE_REPORT_KEPT: u64 = 8_192;
+
+/// The low bits of [`SinceReport::held`] that count requests: room for the
+/// kept dispatches, with the token-work above them.
+const REQUEST_BITS: u32 = 16;
+const REQUEST_MASK: u64 = (1 << REQUEST_BITS) - 1;
+
+thread_local! {
+    /// The lane this thread's dispatches take, drawn once from a shared
+    /// position: deciding threads spread over the lanes in arrival order.
+    static LANE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+static NEXT_LANE: AtomicUsize = AtomicUsize::new(0);
+
+fn lane_of_this_thread() -> usize {
+    LANE.with(|lane| {
+        lane.get().unwrap_or_else(|| {
+            let drawn = NEXT_LANE.fetch_add(1, Ordering::Relaxed) % DISPATCH_LANES;
+            lane.set(Some(drawn));
+            drawn
+        })
+    })
+}
+
+impl Default for DispatchLane {
+    fn default() -> Self {
+        Self {
+            dispatches: Mutex::new(Dispatches::new()),
+            oldest_micros: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl DispatchLane {
+    fn publish_oldest(&self, dispatches: &Dispatches) {
+        let oldest = dispatches.front().map_or(u64::MAX, |&(at, _)| at);
+        self.oldest_micros.store(oldest, Ordering::Release);
+    }
+}
+
+impl Default for SinceReport {
+    fn default() -> Self {
+        Self {
+            held: AtomicU64::new(0),
+            oldest_micros: AtomicU64::new(u64::MAX),
+            lanes: Default::default(),
+        }
+    }
+}
 
 impl SinceReport {
-    fn record(&mut self, at_micros: u64, tokens: u32) {
-        if self.dispatches.len() >= SINCE_REPORT_KEPT {
-            self.pop_oldest();
-        }
-        self.dispatches.push_back((at_micros, tokens));
-        self.tokens += u64::from(tokens);
-        self.requests += 1;
+    /// One dispatch as the held word counts it.
+    fn weight(tokens: u32) -> u64 {
+        u64::from(tokens) << REQUEST_BITS | 1
     }
 
-    fn pop_oldest(&mut self) {
-        if let Some((_, tokens)) = self.dispatches.pop_front() {
-            self.tokens -= u64::from(tokens);
-            self.requests -= 1;
+    fn record(&self, at_micros: u64, tokens: u32) {
+        let lane = &self.lanes[lane_of_this_thread()];
+        let mut dispatches = lane.dispatches.lock();
+        if self.held.load(Ordering::Relaxed) & REQUEST_MASK >= SINCE_REPORT_KEPT {
+            self.pop_oldest(&mut dispatches);
+        }
+        dispatches.push_back((at_micros, tokens));
+        self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
+        lane.publish_oldest(&dispatches);
+        // Under the lane's lock: a release, which holds every lane, never
+        // recomputes the row's oldest past this dispatch. Dispatch instants
+        // mostly rise, so this is a read.
+        if at_micros < self.oldest_micros.load(Ordering::Acquire) {
+            self.oldest_micros.fetch_min(at_micros, Ordering::AcqRel);
         }
     }
 
-    /// Release the dispatches made at or before the report's sample.
-    fn release_through(&mut self, sampled_at_micros: u64) {
-        while self
-            .dispatches
-            .front()
-            .is_some_and(|&(at, _)| at <= sampled_at_micros)
-        {
-            self.pop_oldest();
+    fn pop_oldest(&self, dispatches: &mut Dispatches) {
+        if let Some((_, tokens)) = dispatches.pop_front() {
+            self.held.fetch_sub(Self::weight(tokens), Ordering::Relaxed);
         }
+    }
+
+    /// The held token-work and requests once the dispatches made at or
+    /// before the report's sample are released. A sample that reaches none
+    /// of them reads the word alone.
+    fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
+        if self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros {
+            self.release_through(sampled_at_micros);
+        }
+        let held = self.held.load(Ordering::Relaxed);
+        (held >> REQUEST_BITS, held & REQUEST_MASK)
+    }
+
+    /// Releases every lane's dispatches made at or before the sample and
+    /// recomputes the row's oldest, under every lane's lock in lane order,
+    /// so no dispatch lands between the lanes' reads and the store.
+    fn release_through(&self, sampled_at_micros: u64) {
+        let mut held_lanes: [Option<MutexGuard<'_, Dispatches>>; DISPATCH_LANES] =
+            [const { None }; DISPATCH_LANES];
+        for (slot, lane) in held_lanes.iter_mut().zip(&self.lanes) {
+            let mut dispatches = lane.dispatches.lock();
+            while dispatches
+                .front()
+                .is_some_and(|&(at, _)| at <= sampled_at_micros)
+            {
+                self.pop_oldest(&mut dispatches);
+            }
+            lane.publish_oldest(&dispatches);
+            *slot = Some(dispatches);
+        }
+        let oldest = self
+            .lanes
+            .iter()
+            .map(|lane| lane.oldest_micros.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(u64::MAX);
+        self.oldest_micros.store(oldest, Ordering::Release);
+    }
+
+    /// Dispatches held over every lane, for tests and dumps.
+    fn len(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| lane.dispatches.lock().len())
+            .sum()
     }
 }
 
@@ -274,13 +409,18 @@ type RankKey = (WorkerId, u16);
 /// The expected wait: token-work over drain rate plus a convex KV-pressure
 /// barrier, the since-report dispatch credit water-filling arrivals between
 /// reports. The host's in-flight count floors the report. The credit tally is
-/// per rank row.
+/// per rank row: a decision and a dispatch to a rank the tally knows load the
+/// map without a shared write (a read-write lock's reader count is one, and
+/// eight deciders queued on it); a rank's first dispatch and a membership
+/// change replace the map whole, which is rare. Within a row the dispatches
+/// take per-thread lanes: deciders that read the same minimum book the same
+/// rank, and one lock there queued them too.
 #[derive(Debug)]
 pub struct LeastLoad {
     pub kv_pressure_weight: f32,
     pub mean_prefill_tokens: u32,
     pub default_throughput: f32,
-    tally: Mutex<FxHashMap<RankKey, SinceReport>>,
+    tally: ArcSwap<FxHashMap<RankKey, Arc<SinceReport>>>,
 }
 
 impl LeastLoad {
@@ -293,7 +433,7 @@ impl LeastLoad {
             } else {
                 1.0
             },
-            tally: Mutex::new(FxHashMap::default()),
+            tally: ArcSwap::from_pointee(FxHashMap::default()),
         }
     }
 
@@ -301,19 +441,41 @@ impl LeastLoad {
     /// for tests and dumps.
     pub fn held(&self, worker: WorkerId) -> usize {
         self.tally
-            .lock()
+            .load()
             .iter()
             .filter(|((id, _), _)| *id == worker)
-            .map(|(_, d)| d.dispatches.len())
+            .map(|(_, since)| since.len())
             .sum()
     }
 
     /// Dispatches no report reflects yet on one rank of `worker`.
     pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
         self.tally
-            .lock()
+            .load()
             .get(&(worker, dp_rank))
-            .map_or(0, |d| d.dispatches.len())
+            .map_or(0, |since| since.len())
+    }
+
+    /// One rank's held word as a decision reads it: token-work and requests.
+    #[cfg(test)]
+    fn held_word_at(&self, worker: WorkerId, dp_rank: u16) -> (u64, u64) {
+        self.tally
+            .load()
+            .get(&(worker, dp_rank))
+            .map_or((0, 0), |since| {
+                let held = since.held.load(Ordering::Relaxed);
+                (held >> REQUEST_BITS, held & REQUEST_MASK)
+            })
+    }
+
+    /// The tally without the ranks `gone` names: the map replaced whole, as a
+    /// membership change is rare and a decision never waits on it.
+    fn forget(&self, gone: impl Fn(&RankKey) -> bool) {
+        self.tally.rcu(|tally| {
+            let mut next = FxHashMap::clone(tally);
+            next.retain(|rank, _| !gone(rank));
+            next
+        });
     }
 
     /// A reporting candidate's dispatch credit as token-work: the since-report
@@ -390,11 +552,24 @@ impl Lifecycle for LeastLoad {
             Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
         };
         let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
-        let mut tally = self.tally.lock();
-        tally
-            .entry(rank)
-            .or_default()
-            .record(dispatched_micros, lease.tokens);
+        // A rank the tally knows is credited on its own entry; the first
+        // dispatch to a rank enters it (another dispatch may have entered it
+        // meanwhile: the entry the map holds is the one credited).
+        if let Some(since) = self.tally.load().get(&rank) {
+            since.record(dispatched_micros, lease.tokens);
+            return;
+        }
+        self.tally.rcu(|tally| {
+            if tally.contains_key(&rank) {
+                return Arc::clone(tally);
+            }
+            let mut next = FxHashMap::clone(tally);
+            next.insert(rank, Arc::new(SinceReport::default()));
+            Arc::new(next)
+        });
+        if let Some(since) = self.tally.load().get(&rank) {
+            since.record(dispatched_micros, lease.tokens);
+        }
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
@@ -406,7 +581,7 @@ impl Lifecycle for LeastLoad {
             Membership::Removed(id)
             | Membership::Replaced { old: id, .. }
             | Membership::Resized(id) => {
-                self.tally.lock().retain(|(worker, _), _| worker != id);
+                self.forget(|(worker, _)| worker == id);
             }
             // A snapshot (every worker of every pool, after a resync) stands
             // for removals that may never have arrived: only its ids keep a
@@ -414,9 +589,7 @@ impl Lifecycle for LeastLoad {
             Membership::Snapshot(ids) => {
                 let mut sorted: Vec<u64> = ids.iter().map(|w| w.0).collect();
                 sorted.sort_unstable();
-                self.tally
-                    .lock()
-                    .retain(|(worker, _), _| sorted.binary_search(&worker.0).is_ok());
+                self.forget(|(worker, _)| sorted.binary_search(&worker.0).is_err());
             }
             Membership::Added(_) | Membership::Relabelled(_) => {}
         }
@@ -445,25 +618,22 @@ impl Scorer for LeastLoad {
         } else {
             self.default_throughput
         };
-        // One short lock: the tally is read, the dispatches a report reflects
-        // are released, and each reporting row's credit work is written; the
-        // divisions and the KV barrier run after the lock is gone. A row
-        // without a report is marked and costed after the peer baseline is
-        // known. No allocation.
+        // One load of the tally: each reporting row's held work is read
+        // (released first when its report's sample reaches a dispatch) and
+        // its credit work written; the divisions and the KV barrier run after
+        // the load is gone. A row without a report is marked and costed after
+        // the peer baseline is known. No allocation.
         let mut reporting = 0usize;
         {
-            let mut tally = self.tally.lock();
+            let tally = self.tally.load();
             for (slot, &i) in out.iter_mut().zip(kept) {
                 let c = &candidates[i as usize];
                 *slot = match c.load {
                     Some(_) => {
-                        let (tokens, requests) = match tally.get_mut(&(c.id, c.dp_rank)) {
-                            Some(d) => {
-                                d.release_through(c.load_sampled_at_micros);
-                                (d.tokens, d.requests)
-                            }
-                            None => (0, 0),
-                        };
+                        let (tokens, requests) =
+                            tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                                since.credit_through(c.load_sampled_at_micros)
+                            });
                         reporting += 1;
                         self.credit_work(c, tokens, requests)
                     }
@@ -866,22 +1036,39 @@ impl Picker for PowerOfTwoCountFirst {
 }
 
 /// A rotation per survivor set, keyed by the set's rows (id and DP rank) in
-/// order; a set seen first starts from a shared advancing position. The table
-/// holds 4096 sets and is cleared when full, so no decision walks
-/// it: a set seen again after a clear starts from the shared position.
+/// order; a set seen first starts from a shared advancing position. The
+/// rotations live in a fixed table of 4,096 words the key indexes, each
+/// holding a tag of the key and the set's next position: a
+/// decision over a known set advances its word, a set seen first claims its
+/// slot in place, and a set whose slot another set holds takes it over, so
+/// the other starts from the shared position when seen again (the
+/// forgetting a full table had, per slot). No path takes a lock or
+/// allocates; two sets racing for one slot may take one position from each
+/// other's rotation.
 #[derive(Debug)]
 pub struct RoundRobin {
-    sets: Mutex<RotationTable>,
+    slots: Box<[AtomicU64]>,
+    next_start: AtomicU64,
 }
 
-#[derive(Debug, Default)]
-struct RotationTable {
-    rotations: HashMap<u64, u64>,
-    next_start: u64,
-}
+/// Words of the rotation table: the top [`SLOT_BITS`] of the mixed key pick
+/// one, and the 31 bits below them are the word's tag.
+const SLOT_BITS: u32 = 12;
+const ROTATION_SLOTS: usize = 1 << SLOT_BITS;
 
-/// Distinct survivor sets one instance keeps a rotation for.
-const MAX_TRACKED_SETS: usize = 4096;
+/// The odd multiplier that mixes a key before it is split into a slot and a
+/// tag, so two sets that differ in one row's rank (the key's top bits) take
+/// different slots.
+const KEY_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// A word no set has claimed: its tag has bit 31 set, which no key's tag has.
+const EMPTY_SLOT: u64 = u64::MAX;
+
+/// The low bits of a rotation word that hold the set's next position; the
+/// tag sits above them. A position that wraps changes the tag, and the set
+/// starts again from the shared position.
+const POSITION_BITS: u32 = 32;
+const POSITION_MASK: u64 = (1 << POSITION_BITS) - 1;
 
 impl Default for RoundRobin {
     fn default() -> Self {
@@ -892,7 +1079,10 @@ impl Default for RoundRobin {
 impl RoundRobin {
     pub fn new() -> Self {
         Self {
-            sets: Mutex::new(RotationTable::default()),
+            slots: (0..ROTATION_SLOTS)
+                .map(|_| AtomicU64::new(EMPTY_SLOT))
+                .collect(),
+            next_start: AtomicU64::new(0),
         }
     }
 
@@ -910,20 +1100,37 @@ impl RoundRobin {
         h
     }
 
+    /// The key's slot and its tag in place: the mixed key's top bits and the
+    /// 31 below them, so every bit of the key reaches both.
+    fn slot_of(key: u64) -> (usize, u64) {
+        let mixed = key.wrapping_mul(KEY_MIX);
+        let slot = (mixed >> (64 - SLOT_BITS)) as usize;
+        let tag = (mixed >> (64 - SLOT_BITS - 31)) & 0x7FFF_FFFF;
+        (slot, tag << POSITION_BITS)
+    }
+
     fn advance(&self, key: u64) -> u64 {
-        let mut table = self.sets.lock();
-        if let Some(next) = table.rotations.get_mut(&key) {
-            let position = *next;
-            *next += 1;
-            return position;
+        let (index, tag) = Self::slot_of(key);
+        let slot = &self.slots[index];
+        let mut word = slot.load(Ordering::Relaxed);
+        loop {
+            if word & !POSITION_MASK == tag {
+                return slot.fetch_add(1, Ordering::Relaxed) & POSITION_MASK;
+            }
+            // A set seen first, or one whose slot another set holds: it takes
+            // the slot from the shared position. Another decision may have
+            // claimed the slot meanwhile: its word is read again.
+            let start = self.next_start.fetch_add(1, Ordering::Relaxed) & POSITION_MASK;
+            match slot.compare_exchange(
+                word,
+                tag | ((start + 1) & POSITION_MASK),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return start,
+                Err(now) => word = now,
+            }
         }
-        if table.rotations.len() >= MAX_TRACKED_SETS {
-            table.rotations.clear();
-        }
-        let start = table.next_start;
-        table.next_start += 1;
-        table.rotations.insert(key, start + 1);
-        start
     }
 }
 
@@ -1006,6 +1213,26 @@ mod tests {
             &mut out,
         );
         assert!(out.first().is_some());
+    }
+
+    #[test]
+    fn a_set_whose_slot_another_set_takes_starts_again_from_the_shared_position() {
+        // Keys a and b share a slot under different tags; c takes another
+        // slot. A fresh table's shared position runs 0, 1, 2, ... per claim.
+        let rr = RoundRobin::new();
+        let a = 0x0123_4567_89ab_cdefu64;
+        let (slot_a, tag_a) = RoundRobin::slot_of(a);
+        let b = (1u64..)
+            .find(|&k| k != a && RoundRobin::slot_of(k).0 == slot_a)
+            .expect("a key sharing a's slot");
+        assert_ne!(RoundRobin::slot_of(b).1, tag_a, "b's tag differs");
+        let c = (1u64..)
+            .find(|&k| RoundRobin::slot_of(k).0 != slot_a)
+            .expect("a key in another slot");
+        assert_eq!([rr.advance(a), rr.advance(a), rr.advance(a)], [0, 1, 2]);
+        assert_eq!([rr.advance(b), rr.advance(b)], [1, 2], "b takes the slot");
+        assert_eq!([rr.advance(a), rr.advance(a)], [2, 3], "a starts again");
+        assert_eq!([rr.advance(c), rr.advance(c)], [3, 4], "c's own slot");
     }
 
     #[test]
@@ -1659,6 +1886,60 @@ mod tests {
                 assert_eq!(order, expected, "seed {seed}");
             }
         }
+    }
+
+    #[test]
+    fn concurrent_dispatches_and_decisions_keep_the_tally_exact() {
+        // Eight threads each book 500 dispatches on their own rank and on
+        // one shared rank while deciding in between; the count held per
+        // rank is exact at the end, both in the lanes and in the held word a
+        // decision reads, and a report sampled after every dispatch
+        // releases them all.
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool: Vec<Candidate> = (0..9).map(|i| candidate(i, 0)).collect();
+        for c in &mut pool {
+            c.load = Some(report(0, 0));
+            c.load_sampled_at_micros = 1_000;
+        }
+        let kept: Vec<u32> = (0..9).collect();
+        std::thread::scope(|s| {
+            for t in 0..8u32 {
+                let (ll, pool, kept) = (&ll, &pool, &kept);
+                s.spawn(move || {
+                    let lease = Lease {
+                        issued_micros: 2_000,
+                        tokens: 7,
+                        ..Lease::default()
+                    };
+                    let mut scores = vec![0.0f32; 9];
+                    for n in 0..500 {
+                        ll.on_dispatched(&lease, &target_of(&pool[t as usize]), Side::Single, 0);
+                        ll.on_dispatched(&lease, &target_of(&pool[8]), Side::Single, 0);
+                        if n % 50 == 0 {
+                            ll.score(&RequestFacts::default(), pool, kept, &mut scores);
+                        }
+                    }
+                });
+            }
+        });
+        for c in &pool[..8] {
+            assert_eq!(ll.held(c.id), 500, "{:?}", c.id);
+            assert_eq!(ll.held_word_at(c.id, 0), (3_500, 500), "{:?}", c.id);
+        }
+        assert_eq!(ll.held(pool[8].id), 4_000, "the shared rank");
+        assert_eq!(
+            ll.held_word_at(pool[8].id, 0),
+            (28_000, 4_000),
+            "the shared rank's word"
+        );
+        let mut sampled = pool.clone();
+        for c in &mut sampled {
+            c.load_sampled_at_micros = 3_000;
+        }
+        let mut scores = vec![0.0f32; 9];
+        ll.score(&RequestFacts::default(), &sampled, &kept, &mut scores);
+        assert!(sampled.iter().all(|c| ll.held(c.id) == 0));
+        assert!(sampled.iter().all(|c| ll.held_word_at(c.id, 0) == (0, 0)));
     }
 
     #[test]
