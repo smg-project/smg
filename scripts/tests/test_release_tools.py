@@ -3875,8 +3875,9 @@ def test_sync_versions_moves_main_to_the_next_development_version_when_a_release
 def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sandbox) -> None:
     """A release branch raises the floor a package puts on another of ours when it ships fields the
     code reads (the servicer's floor on the proto package). After the release, main's floor follows
-    the branch's, the requirement as the branch wrote it, on a line of its own or inline in an
-    extra, the rest of the line staying main's; a floor on a package that is not ours is left to
+    the branch's: the whole line, comment included, where the requirement is alone on its line
+    (the comment states the floor's reason), the requirement alone where it sits inline in an
+    extra, the rest of that line staying main's; a floor on a package that is not ours is left to
     the maintainer; a floor main already raised higher stays; a second run changes nothing."""
     floor = '    "smg-grpc-proto>=0.4.0",  # the fields the servicer reads\n'
     extra = 'mlx = ["smg-grpc-proto>=0.4.0", "mlx>=0.22.0"]\n'
@@ -3911,8 +3912,8 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     )
     assert done.returncode == 0, done.stderr
     text = repo.read("grpc_servicer/pyproject.toml")
-    followed = '    "smg-grpc-proto>=0.5.0",  # the fields the servicer reads\n'
-    assert followed in text, text  # the requirement is the branch's, the comment stays main's
+    # the branch's whole line: its comment states the new floor's reason
+    assert raised in text, text
     assert 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.22.0"]\n' in text, text
     assert '"grpcio>=1.60"' in text, "a floor on a package that is not ours is the maintainer's"
     assert done.stdout.count("grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0") == 2
@@ -3926,7 +3927,7 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     )
     assert again.returncode == 0 and "already follows" in again.stdout, again.stdout
     # a floor main raised above the branch's stays where main put it
-    higher = text.replace(followed, '    "smg-grpc-proto>=0.6.0",  # main went further\n')
+    higher = text.replace(raised, '    "smg-grpc-proto>=0.6.0",  # main went further\n')
     assert higher != text
     repo.put("grpc_servicer/pyproject.toml", higher)
     kept = subprocess.run(
