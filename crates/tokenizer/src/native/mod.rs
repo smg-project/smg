@@ -42,8 +42,9 @@
 //! their kin) has no `ByteLevel` stage and no stages here at all: the text
 //! between two added tokens is one word of the model, which the module
 //! [`sentencepiece`] cuts into pieces no merge crosses, with the word marker
-//! for the text's spaces and, by the `Metaspace` scheme, before it; the
-//! pieces take the same cache, seed and merge table, from character symbols.
+//! for the text's spaces and, by the `Metaspace` scheme or the `Prepend`
+//! normalizer, before it; the pieces take the same cache, seed and merge
+//! table, from character symbols.
 //!
 //! The shape is checked once at load time; a tokenizer that does not fit
 //! (another normalizer, a pre-tokenizer or regex construct outside the
@@ -1000,10 +1001,14 @@ impl NativeEncoder {
     /// the word marker by a `Replace` normalizer alone (a `Split` on the
     /// space behind it cuts nothing then, and is accepted) or by the
     /// `Metaspace` pre-tokenizer of the Llama class with no normalizer, whose
-    /// prepend scheme places the marker; anything else declines, as does an
-    /// added token matched after the `Replace` with a space or a marker in
-    /// it (matched on the raw text here, its spelling would not be the one
-    /// `tokenizers` matches after the normalizer).
+    /// prepend scheme places the marker, or by a `Prepend` of the marker
+    /// before the `Replace` (the legacy conversion's shape), which places it
+    /// before every text; anything else declines, as does an added token
+    /// matched after the `Replace` with a space or a marker in it (matched
+    /// on the raw text here, its spelling would not be the one `tokenizers`
+    /// matches after the normalizer), and any added token matched after the
+    /// `Prepend` (a text after it gets no marker there; one after a raw
+    /// added token does).
     fn sentencepiece_from<M: Model + ModelView>(
         tokenizer: &TokenizerOf<M>,
         pre_tokenizer: &Value,
@@ -1015,6 +1020,12 @@ impl NativeEncoder {
             tokenizer.get_post_processor(),
         )?)?;
         let (raw, normalized) = Self::added_tokens_of(tokenizer, Normalizer::None)?;
+        if marker == Marker::Every && !normalized.is_empty() {
+            return Err(Declined::from(
+                "a byte-fallback vocabulary with an added token matched after the Prepend \
+                 normalizer",
+            ));
+        }
         if replaces
             && normalized
                 .iter()
@@ -1070,28 +1081,37 @@ impl NativeEncoder {
     /// Where the word marker comes from on a byte-fallback vocabulary, and
     /// whether a `Replace` normalizer puts it for the spaces (true in the
     /// answer; the `Metaspace` pre-tokenizer does so itself): `Never` under
-    /// the normalizer, the scheme of the pre-tokenizer without one; or why
-    /// the pipeline declines.
+    /// the normalizer, `Every` under a `Prepend` of the marker before it, the
+    /// scheme of the pre-tokenizer without one; or why the pipeline declines.
     fn marker_from(normalizer: &Value, pre_tokenizer: &Value) -> Result<(Marker, bool), Declined> {
         let replace = serde_json::json!(
             {"type": "Replace", "pattern": {"String": " "}, "content": WORD_MARKER.to_string()}
         );
-        // Alone, or as the one step of a `Sequence`, as some conversions
-        // write it.
-        let replaces = *normalizer == replace
-            || normalizer.get("type").and_then(Value::as_str) == Some("Sequence")
-                && normalizer
-                    .get("normalizers")
-                    .and_then(Value::as_array)
-                    .is_some_and(|steps| matches!(steps.as_slice(), [step] if *step == replace));
+        let prepend = serde_json::json!({"type": "Prepend", "prepend": WORD_MARKER.to_string()});
+        // Alone, as the one step of a `Sequence`, as some conversions write
+        // it, or after a `Prepend` of the marker (the legacy conversion's
+        // shape, which puts the marker before every text).
+        let steps = match normalizer.get("type").and_then(Value::as_str) {
+            Some("Sequence") => normalizer
+                .get("normalizers")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice),
+            _ => None,
+        };
+        let prepends =
+            matches!(steps, Some([first, second]) if *first == prepend && *second == replace);
+        let replaces =
+            prepends || *normalizer == replace || matches!(steps, Some([step]) if *step == replace);
         if !(normalizer.is_null() || replaces) {
             return Err(Declined::from(
-                "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) \
-                 or none",
+                "a byte-fallback vocabulary with a normalizer other than Replace(space, marker), \
+                 alone or after Prepend(marker), or none",
             ));
         }
         if pre_tokenizer.is_null() {
-            return if replaces {
+            return if prepends {
+                Ok((Marker::Every, true))
+            } else if replaces {
                 Ok((Marker::Never, true))
             } else {
                 Err(Declined::from(
@@ -1105,6 +1125,7 @@ impl NativeEncoder {
             // No space is left after the normalizer: the split cuts nothing.
             "Split"
                 if replaces
+                    && !prepends
                     && field("pattern") == Some(&serde_json::json!({"String": " "}))
                     && field("behavior").and_then(Value::as_str) == Some("MergedWithPrevious")
                     && field("invert").and_then(Value::as_bool) == Some(false) =>
@@ -1125,6 +1146,10 @@ impl NativeEncoder {
                     ))),
                 }
             }
+            other if prepends => Err(Declined::from(format!(
+                "a byte-fallback vocabulary with the pre-tokenizer {other} under the Prepend \
+                 normalizer (the path takes that normalizer with none)"
+            ))),
             other => Err(Declined::from(format!(
                 "a byte-fallback vocabulary with the pre-tokenizer {other} (only none or a Split \
                  on the space after the Replace normalizer, or Metaspace without split)"
@@ -2459,8 +2484,11 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) {
         let bytes = text.as_bytes();
-        // A text that starts with a space or a marker has its marker already.
-        let mut leading = marker && !(text.starts_with(' ') || text.starts_with(WORD_MARKER));
+        // A text that starts with a space or a marker has its marker already,
+        // unless the normalizer prepends one regardless.
+        let mut leading = marker
+            && (chars.prepends_to_a_marked_text()
+                || !(text.starts_with(' ') || text.starts_with(WORD_MARKER)));
         if leading && chars.cuts_at(&[b' ', bytes[0]], 1) {
             self.tokenize_leading_piece(chars, "", mapped, ids, cache);
             leading = false;

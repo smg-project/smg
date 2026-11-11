@@ -3101,6 +3101,9 @@ struct SentencepieceShape {
     sequence: bool,
     split: bool,
     metaspace: Option<PrependScheme>,
+    /// A `Prepend` of the marker before the `Replace`, in a `Sequence`: the
+    /// legacy conversion's shape.
+    prepend: bool,
     /// The post-processor frames the ids with `<s>`.
     bos: bool,
 }
@@ -3113,6 +3116,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: true,
             metaspace: None,
+            prepend: false,
             bos: true,
         },
         SentencepieceShape {
@@ -3121,6 +3125,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: false,
             metaspace: None,
+            prepend: false,
             bos: false,
         },
         SentencepieceShape {
@@ -3129,6 +3134,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: false,
             metaspace: Some(PrependScheme::First),
+            prepend: false,
             bos: true,
         },
         SentencepieceShape {
@@ -3137,6 +3143,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Always),
+            prepend: false,
             bos: false,
         },
         SentencepieceShape {
@@ -3145,6 +3152,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Never),
+            prepend: false,
             bos: false,
         },
         SentencepieceShape {
@@ -3153,6 +3161,16 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: true,
             split: false,
             metaspace: None,
+            prepend: false,
+            bos: true,
+        },
+        SentencepieceShape {
+            name: "prepend-replace",
+            replace: true,
+            sequence: true,
+            split: false,
+            metaspace: None,
+            prepend: true,
             bos: true,
         },
     ]
@@ -3162,7 +3180,13 @@ fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTok
     let mut tokenizer = HfTokenizer::new(sentencepiece_model(state));
     if shape.replace {
         let replace = Replace::new(" ", "\u{2581}").expect("a Replace normalizer");
-        let normalizer: NormalizerWrapper = if shape.sequence {
+        let normalizer: NormalizerWrapper = if shape.prepend {
+            NormalizerSequence::new(vec![
+                Prepend::new("\u{2581}".to_owned()).into(),
+                replace.into(),
+            ])
+            .into()
+        } else if shape.sequence {
             NormalizerSequence::new(vec![replace.into()]).into()
         } else {
             replace.into()
@@ -3191,9 +3215,10 @@ fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTok
         ByteFallback::new().into(),
         Fuse::new().into(),
     ];
-    if shape
-        .metaspace
-        .is_some_and(|scheme| scheme != PrependScheme::Never)
+    if shape.prepend
+        || shape
+            .metaspace
+            .is_some_and(|scheme| scheme != PrependScheme::Never)
     {
         decoder.push(Strip::new(' ', 1, 0).into());
     }
@@ -3208,10 +3233,13 @@ fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTok
             AddedToken::from("</s>", true),
         ])
         .expect("special tokens");
+    // Under the `Prepend` an added token matched after normalization is
+    // declined: that shape takes the raw ones alone.
     tokenizer
         .add_tokens(
             SENTENCEPIECE_ADDED
                 .iter()
+                .filter(|(_, normalized)| !(shape.prepend && *normalized))
                 .map(|(s, normalized)| AddedToken::from(*s, false).normalized(*normalized)),
         )
         .expect("added tokens");
@@ -3707,16 +3735,20 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         .expect("normalizer");
     assert_eq!(
         declined(&tokenizer),
-        "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
+        "a byte-fallback vocabulary with a normalizer other than Replace(space, marker), alone \
+         or after Prepend(marker), or none"
     );
-    // The Replace in a Sequence with another step: the one-step sequence is
-    // the only sequence the path takes (a Prepend before the Replace is the
-    // legacy conversion's shape, which this path would read without the
-    // prepended marker).
+    // The Replace in a Sequence with another step: the one-step sequence and
+    // the Prepend of the marker before the Replace are the sequences the
+    // path takes; another step, another prepended text or the two steps in
+    // the other order are not.
     let replace =
         || NormalizerWrapper::from(Replace::new(" ", "\u{2581}").expect("a Replace normalizer"));
+    let prepend = |text: &str| NormalizerWrapper::from(Prepend::new(text.to_owned()));
     for steps in [
-        vec![Prepend::new("\u{2581}".to_owned()).into(), replace()],
+        vec![prepend("\u{2581}"), replace(), NormalizerWrapper::NFC(NFC)],
+        vec![prepend(" "), replace()],
+        vec![replace(), prepend("\u{2581}")],
         vec![replace(), NormalizerWrapper::NFC(NFC)],
     ] {
         let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
@@ -3725,9 +3757,37 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
             .expect("normalizer");
         assert_eq!(
             declined(&tokenizer),
-            "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
+            "a byte-fallback vocabulary with a normalizer other than Replace(space, marker), \
+             alone or after Prepend(marker), or none"
         );
     }
+    // A pre-tokenizer under the Prepend, and an added token matched after it.
+    let prepended = shapes
+        .iter()
+        .position(|shape| shape.prepend)
+        .expect("the prepend shape");
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[prepended], &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Split(
+        Split::new(
+            SplitPattern::String(" ".to_owned()),
+            SplitDelimiterBehavior::MergedWithPrevious,
+            false,
+        )
+        .expect("split"),
+    )));
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with the pre-tokenizer Split under the Prepend normalizer \
+         (the path takes that normalizer with none)"
+    );
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[prepended], &mut state);
+    tokenizer
+        .add_tokens([AddedToken::from("[note]", false).normalized(true)])
+        .expect("added token");
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with an added token matched after the Prepend normalizer"
+    );
     // Neither the Replace nor a Metaspace.
     let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
     tokenizer

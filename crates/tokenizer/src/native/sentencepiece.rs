@@ -45,7 +45,8 @@ const BRIDGE_WORDS: usize = 256 * 256 / 64;
 pub(super) const MERGE_SCRATCH_SYMBOLS: usize = 4_096;
 
 /// Where the word marker is prepended: the `Metaspace` prepend scheme
-/// (`Never` for a `Replace` normalizer too, which prepends nothing).
+/// (`Never` for a `Replace` normalizer too, which prepends nothing), or
+/// the `Prepend` normalizer (`Every`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Marker {
     Never,
@@ -54,6 +55,11 @@ pub(super) enum Marker {
     First,
     /// Before every text between added tokens.
     Always,
+    /// Before every text between added tokens, one that starts with a space
+    /// or the marker too: the `Prepend` normalizer, which prepends to the
+    /// whole normalized text where `Metaspace` prepends only to one that
+    /// does not start with the marker.
+    Every,
 }
 
 /// The symbols a piece of a byte-fallback vocabulary starts from, where its
@@ -194,9 +200,16 @@ impl CharSymbols {
     pub(super) fn prepends(&self, starts_text: bool, at_input_start: bool) -> bool {
         match self.marker {
             Marker::Never => false,
-            Marker::Always => starts_text,
+            Marker::Always | Marker::Every => starts_text,
             Marker::First => at_input_start,
         }
+    }
+
+    /// Whether the marker goes before a text that already starts with a
+    /// space or the marker (the `Prepend` normalizer puts it there;
+    /// `Metaspace` does not).
+    pub(super) fn prepends_to_a_marked_text(&self) -> bool {
+        self.marker == Marker::Every
     }
 
     /// Whether no cut goes between the raw bytes `prev` and `cur` (see the
