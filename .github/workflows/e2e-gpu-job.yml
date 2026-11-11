@@ -188,7 +188,7 @@ jobs:
         run: |
           test "$GPU_VENDOR" = amd
           : "${AMD_CI_GPU_LEASE_ID:?shared GPU admission hook is missing}"
-          python3 -c 'import os, torch; assert torch.cuda.device_count() == int(os.environ["AMD_CI_GPU_COUNT"])'
+          python3 -c 'import os; from pathlib import Path; assert len(list(Path("/dev/dri").glob("renderD*"))) == int(os.environ["AMD_CI_GPU_COUNT"])'
 
       - name: Checkout code
         uses: actions/checkout@v7

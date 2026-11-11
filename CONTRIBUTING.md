@@ -211,12 +211,20 @@ workflow change to review.
 enablement gates still apply. The flag defaults off; benchmarks, PD and NVIDIA
 jobs retain their existing paths.
 
+The reusable workflow's `gpu_lease` input is not tied to chat tests: any
+compatible single-host AMD caller can supply `gpu_lease: true`, its existing
+`gpu_tier` and the matching pre-admitted runner label. The runner's lease size
+must match that tier. Test paths and filters remain normal workflow inputs;
+adding a caller requires no new admission implementation. The chat row is the
+first opt-in consumer, not an allowlist in the lease mechanism.
+
 Enable only after deploying and qualifying shared admission from
 [vllm-router-ci](https://github.com/andyluo7/vllm-router-ci). The dedicated runner
 must acquire its GPU lease **before accepting the job**, then use the installed
 Actions container hook to supply render devices, CPU/RAM limits and `/models`.
 The reusable job supplies an image without legacy Docker options and checks the
-lease marker and visible GPU count. Do not attach this label to a legacy runner
+lease marker and mounted render-device count without importing an engine. Do
+not attach this label to a legacy runner
 or allocate devices in a workflow step: the job container already exists then.
 
 The shared container has private PID, IPC and network namespaces. Before enabling,
