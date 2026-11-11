@@ -231,15 +231,13 @@ impl ExternalRouterAdapter {
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
         let (reservation, denial) = tenant_rate_limit::reserve(
-            self.rate_limit_manager.as_deref(),
-            Some(tenant_meta),
-            model_id,
             tenant_rate_limit::estimate(
                 self.rate_limit_manager.as_deref(),
                 Some(tenant_meta),
                 &request,
                 None,
             ),
+            model_id,
         )
         .await;
         let response = match denial {

@@ -309,12 +309,16 @@ pub(crate) struct TenantReservation {
     samples_per_prompt: u32,
 }
 
-/// What a tenant reservation charges for one request: the reserve-time
-/// estimate of its input tokens and the answers each prompt gets, read from
-/// the request before any dispatch ([`estimate`]), so the reservation itself
-/// borrows nothing of the request across its await.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TenantEstimate {
+/// What a tenant reservation charges for one request, with the limiter and
+/// the tenant it was gated on: the reserve-time estimate of the request's
+/// input tokens and the answers each prompt gets, read from the request
+/// before any dispatch ([`estimate`]), so the reservation itself borrows
+/// nothing of the request across its await and cannot be asked for with a
+/// limiter, a tenant and an estimate that were not gated together.
+#[derive(Clone, Copy)]
+pub(crate) struct TenantEstimate<'a> {
+    manager: &'a RateLimitManager,
+    tenant_meta: &'a TenantRequestMeta,
     estimated_input_tokens: u32,
     samples_per_prompt: u32,
 }
@@ -324,39 +328,37 @@ pub(crate) struct TenantEstimate {
 /// tenant), so the estimate is read only when a reservation will use it.
 /// `routing_text` is the request's routing text when routing already
 /// extracted it ([`TenantCharge::estimated_input_tokens`]).
-pub(crate) fn estimate<T: TenantCharge>(
-    manager: Option<&RateLimitManager>,
-    tenant_meta: Option<&TenantRequestMeta>,
+pub(crate) fn estimate<'a, T: TenantCharge>(
+    manager: Option<&'a RateLimitManager>,
+    tenant_meta: Option<&'a TenantRequestMeta>,
     request: &T,
     routing_text: Option<&str>,
-) -> Option<TenantEstimate> {
-    (manager.is_some() && tenant_meta.is_some()).then(|| TenantEstimate {
+) -> Option<TenantEstimate<'a>> {
+    Some(TenantEstimate {
+        manager: manager?,
+        tenant_meta: tenant_meta?,
         estimated_input_tokens: request.estimated_input_tokens(routing_text),
         samples_per_prompt: request.samples_per_prompt(),
     })
 }
 
 /// Reserve `estimate` once per logical request, before any dispatch: every
-/// attempt dispatches under this one reservation. With a limiter, a tenant to
-/// charge and an estimate, either the reservation or the denial, which is the
-/// request's answer, never retried; `(None, None)` for a request outside the
-/// limiter (no limiter configured, a route that charges no tenant, hence no
-/// estimate).
+/// attempt dispatches under this one reservation. Either the reservation or
+/// the denial, which is the request's answer, never retried; `(None, None)`
+/// for a request outside the limiter (no estimate: no limiter configured, or
+/// a route that charges no tenant).
 pub(crate) async fn reserve(
-    manager: Option<&RateLimitManager>,
-    tenant_meta: Option<&TenantRequestMeta>,
+    estimate: Option<TenantEstimate<'_>>,
     model_id: &str,
-    estimate: Option<TenantEstimate>,
 ) -> (Option<TenantReservation>, Option<Response>) {
-    let (Some(manager), Some(tenant_meta), Some(estimate)) = (manager, tenant_meta, estimate)
-    else {
+    let Some(estimate) = estimate else {
         return (None, None);
     };
     let cell = RateLimitCell::new();
     match cell
         .reserve(
-            manager,
-            tenant_meta,
+            estimate.manager,
+            estimate.tenant_meta,
             model_id,
             estimate.estimated_input_tokens,
         )

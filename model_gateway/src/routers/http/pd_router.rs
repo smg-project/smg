@@ -680,15 +680,13 @@ impl PDRouter {
         // policy routes a completions batch on its first prompt alone
         // (`PdRoute::routing_inputs`), and the tenant is charged for them all.
         let (reservation, denial) = tenant_rate_limit::reserve(
-            self.rate_limit_manager.as_deref(),
-            tenant_meta,
-            model,
             tenant_rate_limit::estimate(
                 self.rate_limit_manager.as_deref(),
                 tenant_meta,
                 &original_request,
                 None,
             ),
+            model,
         )
         .await;
 

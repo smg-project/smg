@@ -98,7 +98,7 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
-            tenant_rate_limit::{self, TenantCharge, TenantEstimate, TenantReservation},
+            tenant_rate_limit::{self, TenantCharge, TenantReservation},
         },
         BodyPolicy, RouterTrait,
     },
@@ -497,9 +497,7 @@ impl Router {
                 .as_ref()
                 .unwrap_or(&self.retry_config);
             let outcome = self.begin_route(route, model_id, is_stream);
-            let (reservation, denial) = self
-                .reserve_tenant_estimate(tenant_meta, model_id, estimate)
-                .await;
+            let (reservation, denial) = tenant_rate_limit::reserve(estimate, model_id).await;
             // The state the attempts share; `TypedAttempt` names each piece.
             let tried = parking_lot::Mutex::new(Vec::new());
             let ledger = AttemptLedger::default();
@@ -591,27 +589,6 @@ impl Router {
             model_label: Cow::Borrowed(model_label),
             endpoint,
         }
-    }
-
-    /// Reserve the tenant's estimate once per logical request, before any
-    /// dispatch: every attempt dispatches under this one reservation. With
-    /// the rate limiter on and a tenant to charge, either the reservation or
-    /// the denial, which is the request's answer, never retried; `(None,
-    /// None)` for a request outside the limiter (`tenant_rate_limit::reserve`;
-    /// `estimate` is `None` then, read before the request moved into its lease).
-    async fn reserve_tenant_estimate(
-        &self,
-        tenant_meta: Option<&TenantRequestMeta>,
-        model_id: &str,
-        estimate: Option<TenantEstimate>,
-    ) -> (Option<TenantReservation>, Option<Response>) {
-        tenant_rate_limit::reserve(
-            self.rate_limit_manager.as_deref(),
-            tenant_meta,
-            model_id,
-            estimate,
-        )
-        .await
     }
 
     /// The one dispatch of a request with retries disabled: the lease frees
