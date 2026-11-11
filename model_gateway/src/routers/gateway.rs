@@ -16,7 +16,12 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, HeaderValue},
+    response::Response,
+};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -43,12 +48,13 @@ use crate::{
     app_context::AppContext,
     config::RoutingMode,
     middleware::TenantRequestMeta,
+    policies::PolicyRegistry,
     routers::{
-        common::body_policy::REASON_MODEL_SELECTION,
+        common::{body_policy::REASON_MODEL_SELECTION, header_utils::ROUTING_KEY_HINT_MAX_BYTES},
         error as route_error,
         factory::{router_ids, RouterId},
         grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
-        message_threads::MessageThreads,
+        message_threads::{MessageThreads, ThreadTurn},
         BodyPolicy, RouterFactory, RouterTrait,
     },
     server::ServerConfig,
@@ -138,6 +144,9 @@ pub struct Gateway {
     /// The message threads of the Messages route: resolved before the
     /// family routers see a request, stored after one answers.
     threads: MessageThreads,
+    /// The policies' reading of the routing key, for a thread turn's lineage
+    /// key; `None` where a gateway is built without them (tests).
+    policies: Option<Arc<PolicyRegistry>>,
 }
 
 /// The answer when no router serves a request: the JSON error object, a 404
@@ -156,7 +165,15 @@ impl Gateway {
             mounts: Mutex::new(()),
             enable_igw: false,
             threads: MessageThreads::new(),
+            policies: None,
         }
+    }
+
+    /// The gateway with the policies a thread turn's routing key is read
+    /// through: the registry the routers select workers with.
+    pub fn with_policies(mut self, policies: Arc<PolicyRegistry>) -> Self {
+        self.policies = Some(policies);
+        self
     }
 
     fn try_register(
@@ -180,7 +197,8 @@ impl Gateway {
         config: &ServerConfig,
         app_context: &Arc<AppContext>,
     ) -> Result<Arc<Self>, String> {
-        let mut gateway = Self::new(app_context.worker_registry.clone());
+        let mut gateway = Self::new(app_context.worker_registry.clone())
+            .with_policies(app_context.policy_registry.clone());
         gateway.enable_igw = config.router_config.enable_igw;
         let gateway = Arc::new(gateway);
 
@@ -549,8 +567,43 @@ impl Gateway {
         }
     }
 
+    /// Under the routing-key override a plain request routes on its `rid`
+    /// lineage; a thread turn's `rid` is the minted message id by the time a
+    /// router reads it, so its client's key rides the configured routing-key
+    /// header instead, when the request set none. The headers with that key,
+    /// or `None` when nothing changes: no policies, the override off, no
+    /// client `rid`, a routing-key header already set (it wins), or a key
+    /// that is no header value.
+    fn thread_lineage_headers(
+        &self,
+        headers: Option<&HeaderMap>,
+        turn: Option<&ThreadTurn>,
+    ) -> Option<HeaderMap> {
+        let policies = self.policies.as_ref()?;
+        let rid = turn?.trace()?;
+        let key = policies.derive_rid_key(Some(rid))?;
+        if policies.resolve_routing_key(headers).is_some() {
+            return None;
+        }
+        let name = policies.routing_key_header()?.clone();
+        // The header carries the client's rid itself: placement strips its
+        // lineage suffixes once, as `derive_rid_key` does for a plain
+        // request, so both paths key a nested rid alike. A rid over the
+        // header's byte cap goes as the derived key, which fits it.
+        let carried = if rid.len() <= ROUTING_KEY_HINT_MAX_BYTES {
+            rid
+        } else {
+            key
+        };
+        let value = HeaderValue::from_str(carried).ok()?;
+        let mut with_key = headers.cloned().unwrap_or_default();
+        with_key.insert(name, value);
+        Some(with_key)
+    }
+
     /// A thread turn: resolved before the router sees it (a create as it
-    /// came, a continue as the rebuilt conversation), stored after the
+    /// came, a continue as the rebuilt conversation), routed under its
+    /// client's lineage key where the override asks one, stored after the
     /// router answers.
     async fn route_messages_thread(
         &self,
@@ -567,6 +620,8 @@ impl Gateway {
             Ok(resolved) => resolved,
             Err(refused) => return refused,
         };
+        let lineage = self.thread_lineage_headers(headers, turn.as_ref());
+        let headers = lineage.as_ref().or(headers);
         let response = match self.select_messages_router(body.max_tokens, model_id) {
             Some(router) => {
                 router
@@ -1084,6 +1139,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::{RouteRequestMeta, TenantKey},
         routers::{factory::router_ids, tests::error_shape},
         worker::{
@@ -2279,5 +2335,148 @@ mod tests {
             .select_router_for_request(Some("model-alias"))
             .expect("alias should select the PD router");
         assert_eq!(router.router_type(), "pd");
+    }
+
+    /// A router double that records the headers of each Messages request it
+    /// is handed and answers 200 with an empty body.
+    #[derive(Debug, Default)]
+    struct HeaderRecordingRouter {
+        seen: Mutex<Vec<Option<HeaderMap>>>,
+    }
+
+    #[async_trait]
+    impl RouterTrait for HeaderRecordingRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_messages(
+            &self,
+            headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: CreateMessageRequest,
+            _model_id: &str,
+        ) -> Response {
+            self.seen.lock().unwrap().push(headers.cloned());
+            StatusCode::OK.into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    impl HeaderRecordingRouter {
+        /// The headers of the last request this router was handed.
+        fn last_headers(&self) -> Option<HeaderMap> {
+            self.seen
+                .lock()
+                .unwrap()
+                .last()
+                .expect("a request was routed")
+                .clone()
+        }
+
+        /// The routing key of the last request this router was handed.
+        fn last_routing_key(&self) -> Option<String> {
+            let seen = self.seen.lock().unwrap();
+            let headers = seen.last().expect("a request was routed").as_ref()?;
+            let key = headers.get("x-smg-routing-key")?;
+            Some(key.to_str().expect("a text key").to_string())
+        }
+    }
+
+    /// A gateway over one recording router, its policies built with the
+    /// routing-key override on or off.
+    fn recording_gateway(override_on: bool) -> (Gateway, Arc<HeaderRecordingRouter>) {
+        let config = RoutingKeyOverrideConfig {
+            enabled: override_on,
+            ..Default::default()
+        };
+        let policies = PolicyRegistry::with_override(PolicyConfig::RoundRobin, config);
+        let gateway =
+            Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
+        let recorder = Arc::new(HeaderRecordingRouter::default());
+        gateway.register_router(router_ids::HTTP_REGULAR, recorder.clone());
+        gateway.set_default_router(router_ids::HTTP_REGULAR);
+        (gateway, recorder)
+    }
+
+    /// Under the routing-key override a thread turn routes on its client's
+    /// `rid` lineage, as a plain request does: the header carries the rid
+    /// itself when the request set none, so placement's one strip gives the
+    /// plain request's key, nested suffixes included; a header the client set
+    /// wins; without the override, a client `rid` or a `thread`, nothing is
+    /// added.
+    #[tokio::test]
+    async fn a_thread_turn_carries_its_client_lineage_as_the_routing_key_under_the_override() {
+        use serde_json::json;
+
+        let turn = |rid: serde_json::Value, thread: bool| -> CreateMessageRequest {
+            let mut request = json!({
+                "model": "m", "max_tokens": 8, "rid": rid,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if thread {
+                request["thread"] = json!({"type": "create"});
+            }
+            body(request)
+        };
+        let meta = test_tenant_meta();
+
+        let (gateway, seen) = recording_gateway(true);
+        let policies = gateway.policies.clone().expect("policies");
+        let placed = |seen: &HeaderRecordingRouter| -> Option<String> {
+            let headers = seen.last_headers()?;
+            policies
+                .sticky_header_key(Some(&headers))
+                .map(str::to_string)
+        };
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(
+            seen.last_routing_key().as_deref(),
+            Some("conv_t2"),
+            "the header carries the rid itself"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some("conv"),
+            "placed once stripped"
+        );
+
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t1_t2"), true), "m")
+            .await;
+        assert_eq!(
+            placed(&seen).as_deref(),
+            policies.derive_rid_key(Some("conv_t1_t2")),
+            "a nested suffix keys as the plain request does"
+        );
+        assert_eq!(placed(&seen).as_deref(), Some("conv_t1"));
+
+        let mut mine = HeaderMap::new();
+        mine.insert("x-smg-routing-key", "mine".parse().unwrap());
+        gateway
+            .route_messages(Some(&mine), &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(placed(&seen).as_deref(), Some("mine"));
+
+        gateway
+            .route_messages(None, &meta, turn(json!(null), true), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "no client rid");
+
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), false), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "a plain request");
+
+        let (gateway, seen) = recording_gateway(false);
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "the override off");
     }
 }

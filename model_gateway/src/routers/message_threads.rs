@@ -281,6 +281,15 @@ pub(crate) struct ThreadTurn {
     record: Option<TurnRecord>,
 }
 
+impl ThreadTurn {
+    /// The client's `rid`, when it sent one: the trace id, and the lineage a
+    /// routing key is derived from, since the request's own `rid` is the
+    /// minted message id by the time a router reads it.
+    pub(crate) fn trace(&self) -> Option<&str> {
+        self.trace.as_deref()
+    }
+}
+
 /// What a stored turn's record holds besides the answer, taken from the
 /// request before the thread's history is spliced into it; `thread` is the
 /// token minted at the create turn, which every turn of the thread carries.

@@ -11,6 +11,7 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
+use smg::config::{RouterConfig, RoutingKeyOverrideConfig};
 use tower::ServiceExt;
 
 use crate::common::{
@@ -212,5 +213,74 @@ async fn test_v1_messages_thread_without_the_beta_header_is_refused() {
         "the turn with the header is served"
     );
 
+    ctx.shutdown().await;
+}
+
+/// Under the routing-key override the turns of one client lineage pin to one
+/// worker: four create turns whose `rid`s share a base, with no routing-key
+/// header, all reach the worker the first one was placed on, where round
+/// robin alone would spread them over both.
+#[tokio::test]
+async fn test_v1_messages_thread_turns_of_one_lineage_pin_to_one_worker_under_the_override() {
+    let recorders = [RequestRecorder::new(), RequestRecorder::new()];
+    let ports = [18966, 18967];
+    for (port, recorder) in ports.iter().zip(&recorders) {
+        set_request_recorder(*port, Arc::clone(recorder));
+    }
+    let mut config = RouterConfig::builder()
+        .regular_mode(vec![])
+        .round_robin_policy()
+        .routing_key_override(RoutingKeyOverrideConfig {
+            enabled: true,
+            ..Default::default()
+        })
+        .host("127.0.0.1")
+        .port(3003)
+        .max_payload_size(256 * 1024 * 1024)
+        .request_timeout_secs(600)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .max_concurrent_requests(64)
+        .queue_timeout_secs(60)
+        .build_unchecked();
+    config.health_check.disable_health_check = true;
+    let workers = ports
+        .iter()
+        .map(|port| MockWorkerConfig {
+            port: *port,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        })
+        .collect();
+    let ctx = AppTestContext::new_with_config(config, workers).await;
+    let app = ctx.create_app();
+
+    for turn in 1..=4 {
+        let (status, answer) = post(
+            &app,
+            "/v1/messages",
+            &json!({
+                "model": "mock-model",
+                "max_tokens": 16,
+                "rid": format!("conv_t{turn}"),
+                "messages": [{"role": "user", "content": "hi"}],
+                "thread": {"type": "create"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+    }
+
+    let counts: Vec<usize> = recorders
+        .iter()
+        .map(|recorder| recorder.bodies().len())
+        .collect();
+    assert_eq!(counts.iter().sum::<usize>(), 4, "{counts:?}");
+    assert!(
+        counts.contains(&4),
+        "one lineage, one worker; the turns spread as {counts:?}"
+    );
     ctx.shutdown().await;
 }

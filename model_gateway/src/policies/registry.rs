@@ -412,6 +412,12 @@ impl PolicyRegistry {
             .find_map(|name| extract_routing_key_hint_named(headers, name))
     }
 
+    /// The header the gateway sets a key under itself: the first configured
+    /// routing-key name, the one [`Self::resolve_routing_key`] reads first.
+    pub(crate) fn routing_key_header(&self) -> Option<&HeaderName> {
+        self.routing_key_headers.first()
+    }
+
     /// A key that is nothing but suffix keys as itself, like the rid path.
     fn strip_header_key(raw: &str) -> &str {
         let stripped = strip_lineage_suffixes(raw);
