@@ -561,8 +561,30 @@ fn shapes_outside_the_path_are_declined() {
     tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
     assert_eq!(
         declined(&tokenizer),
-        "no pre-tokenizer (the path needs ByteLevel, after any Split stages)"
+        "no pre-tokenizer (the path needs ByteLevel, after any split stages)"
     );
+}
+
+/// The `Digits` stage holds exactly what `char::is_numeric` accepts, the
+/// reference's test, over every scalar value: the toolchain's numeric set,
+/// not the engine's `\p{N}` (another Unicode version); a toolchain bump that
+/// widens the set fails here, not in the ids.
+#[test]
+fn the_digits_stage_holds_what_is_numeric_accepts() {
+    let stage = NativeEncoder::split_stage(&serde_json::json!(
+        {"type": "Digits", "individual_digits": true}
+    ))
+    .expect("the digits stage");
+    let mut text = String::new();
+    for code in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(code) else {
+            continue;
+        };
+        text.clear();
+        text.push(c);
+        let native = stage.pattern.find_iter(&text).next() == Some((0, text.len()));
+        assert_eq!(native, c.is_numeric(), "U+{code:04X}");
+    }
 }
 
 #[test]

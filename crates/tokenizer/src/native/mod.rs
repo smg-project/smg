@@ -105,6 +105,36 @@ use crate::{
 const BYTE_LEVEL_PATTERN: &str =
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 
+/// A class of the code points of `ranges` as a pattern: one character a
+/// piece, or one run of them under `runs`. ASCII members other than letters
+/// and digits are escaped (the class syntax's own characters among them),
+/// the rest stand as the ranges they are.
+fn class_pattern(ranges: &[(char, char)], runs: bool) -> String {
+    let mut pattern = String::with_capacity(4 * ranges.len() + 4);
+    pattern.push('[');
+    for &(start, end) in ranges {
+        if start.is_ascii() {
+            for c in start..=end {
+                if !c.is_ascii_alphanumeric() {
+                    pattern.push('\\');
+                }
+                pattern.push(c);
+            }
+        } else {
+            pattern.push(start);
+            if end > start {
+                pattern.push('-');
+                pattern.push(end);
+            }
+        }
+    }
+    pattern.push(']');
+    if runs {
+        pattern.push('+');
+    }
+    pattern
+}
+
 /// Pieces up to this many bytes are cached per thread by their count (see
 /// `PIECE_CACHE_CAPACITY`): those of up to `SHORT_PIECE_MAX_BYTES` in a
 /// packed table, the longer ones in a map; longer pieces still, up to
@@ -1578,7 +1608,7 @@ impl NativeEncoder {
     fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
         if pre_tokenizer.is_null() {
             return Err(Declined::from(
-                "no pre-tokenizer (the path needs ByteLevel, after any Split stages)",
+                "no pre-tokenizer (the path needs ByteLevel, after any split stages)",
             ));
         }
         let items: Vec<&Value> = match type_of("pre-tokenizer", pre_tokenizer)? {
@@ -1617,8 +1647,10 @@ impl NativeEncoder {
     /// One `Split` before the `ByteLevel` as a stage: a regex or a literal
     /// the pattern engine takes, `Isolated`, or `Removed` inverted. A
     /// `Digits` is the `Isolated` split on numeric characters, each one a
-    /// piece under `individual_digits`, else each run (the reference splits
-    /// on `char::is_numeric`, the `\p{N}` category).
+    /// piece under `individual_digits`, else each run: the reference splits
+    /// on `char::is_numeric`, the toolchain's numeric set
+    /// ([`unicode::STD_NUMERIC`]), which is not the engine's `\p{N}` (the
+    /// regex engine's Unicode version).
     fn split_stage(split: &Value) -> Result<Stage, Declined> {
         match type_of("pre-tokenizer stage", split)? {
             "Split" => {}
@@ -1626,9 +1658,10 @@ impl NativeEncoder {
                 let each = split
                     .get("individual_digits")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let pattern = if each { r"\p{N}" } else { r"\p{N}+" };
-                return Pattern::parse(pattern)
+                    .ok_or_else(|| {
+                        Declined::from("a Digits without a boolean individual_digits")
+                    })?;
+                return Pattern::parse(&class_pattern(unicode::STD_NUMERIC, !each))
                     .map(|pattern| Stage {
                         pattern,
                         keep_gaps: true,
@@ -1637,7 +1670,7 @@ impl NativeEncoder {
             }
             other => {
                 return Err(Declined::from(format!(
-                    "pre-tokenizer {other} before the ByteLevel (only Split)"
+                    "pre-tokenizer {other} before the ByteLevel (only Split or Digits)"
                 )))
             }
         }

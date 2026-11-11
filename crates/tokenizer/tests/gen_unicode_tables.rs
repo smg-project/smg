@@ -16,17 +16,14 @@ fn matches_whole(re: &SysRegex, text: &str) -> bool {
         .is_some_and(|(start, end)| start == 0 && end == text.len())
 }
 
-fn ranges_of(pattern: &str) -> Vec<(u32, u32)> {
-    let re = SysRegex::new(pattern).expect("pattern compiles");
-    let mut buf = String::new();
+/// The code points `accepts` holds, as ranges.
+fn ranges_where(mut accepts: impl FnMut(char) -> bool) -> Vec<(u32, u32)> {
     let mut ranges: Vec<(u32, u32)> = Vec::new();
     for code in 0u32..=0x10FFFF {
         let Some(c) = char::from_u32(code) else {
             continue;
         };
-        buf.clear();
-        buf.push(c);
-        if matches_whole(&re, &buf) {
+        if accepts(c) {
             match ranges.last_mut() {
                 Some((_, end)) if *end + 1 == code => *end = code,
                 _ => ranges.push((code, code)),
@@ -34,6 +31,16 @@ fn ranges_of(pattern: &str) -> Vec<(u32, u32)> {
         }
     }
     ranges
+}
+
+fn ranges_of(pattern: &str) -> Vec<(u32, u32)> {
+    let re = SysRegex::new(pattern).expect("pattern compiles");
+    let mut buf = String::new();
+    ranges_where(|c| {
+        buf.clear();
+        buf.push(c);
+        matches_whole(&re, &buf)
+    })
 }
 
 #[test]
@@ -94,5 +101,24 @@ fn print_unicode_tables() {
     println!("];");
     let apostrophe = ranges_of("(?i:')");
     assert_eq!(apostrophe, vec![(0x27, 0x27)], "apostrophe must not fold");
+    // `Digits` splits on `char::is_numeric`: the toolchain's numeric set,
+    // which is not the regex engine's `\p{N}` when their Unicode versions
+    // differ; the native stage takes the set from std.
+    let numeric = ranges_where(char::is_numeric);
+    println!();
+    println!(
+        "/// The toolchain's `char::is_numeric` set ({} ranges): what `Digits` splits on;",
+        numeric.len()
+    );
+    println!("/// the regex engine's `\\p{{N}}` is another Unicode version.");
+    println!("pub(super) const STD_NUMERIC: &[(char, char)] = &[");
+    for chunk in numeric.chunks(4) {
+        let items: Vec<String> = chunk
+            .iter()
+            .map(|(a, b)| format!("('\\u{{{a:x}}}', '\\u{{{b:x}}}')"))
+            .collect();
+        println!("    {},", items.join(", "));
+    }
+    println!("];");
     println!("// END GENERATED");
 }
