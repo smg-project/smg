@@ -27,7 +27,8 @@ pub struct SessionRule {
     /// Idle time after which a key's pins are forgotten; `None` for never.
     pub ttl_micros: Option<u64>,
     /// How often idle keys are swept, on the decision clock; `0` for never
-    /// (a rule without a TTL).
+    /// (a rule without a TTL). The table sweeps at the shortest interval
+    /// among its rules ([`SessionTable::new`]).
     pub sweep_micros: u64,
     pub recovery: Recovery,
 }
@@ -118,21 +119,23 @@ pub struct SessionTable {
     shards: Vec<Mutex<FxHashMap<u64, Entry>>>,
     /// The decision clock at the next sweep.
     next_sweep_micros: AtomicU64,
-}
-
-impl Default for SessionTable {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// The sweep interval: the shortest among the rules of the engine's
+    /// bindings, so no rule's interval defers another rule's expiry; `0`
+    /// never sweeps (no rule has a TTL).
+    sweep_micros: u64,
 }
 
 impl SessionTable {
-    pub fn new() -> Self {
+    /// A table swept every `sweep_micros` on the decision clock: the
+    /// shortest sweep interval among the rules that look keys up in it, `0`
+    /// when none sweeps.
+    pub fn new(sweep_micros: u64) -> Self {
         Self {
             shards: (0..SHARDS)
                 .map(|_| Mutex::new(FxHashMap::default()))
                 .collect(),
             next_sweep_micros: AtomicU64::new(0),
+            sweep_micros,
         }
     }
 
@@ -142,11 +145,18 @@ impl SessionTable {
 
     /// The pins of `key` at a decision taken at `now_micros` under `rule`,
     /// the key touched (its TTL renewed, its recovery rule recorded) and the
-    /// table swept when a sweep is due. A key never seen has empty pins.
+    /// table swept when a sweep is due. A key never seen, or one whose TTL
+    /// passed, has empty pins: expiry is the key's own compare, the sweep
+    /// only reclaims.
     pub(crate) fn lookup(&self, key: u64, now_micros: u64, rule: &SessionRule) -> Pins {
-        self.sweep_if_due(now_micros, rule);
+        self.sweep_if_due(now_micros);
         let mut shard = self.shard(key).lock();
         let entry = shard.entry(key).or_default();
+        if entry.expires_at_micros <= now_micros {
+            // Expired and not yet swept: the key starts over here, under the
+            // lock the sweep takes; the walk only reclaims what expired.
+            *entry = Entry::default();
+        }
         entry.touch(now_micros, rule);
         entry.pins
     }
@@ -235,17 +245,18 @@ impl SessionTable {
         }
     }
 
-    /// Forget every key whose TTL passed, once per sweep interval; a rule
-    /// without a sweep (no TTL) never walks the table.
-    fn sweep_if_due(&self, now_micros: u64, rule: &SessionRule) {
-        if rule.sweep_micros == 0 {
+    /// Forget every key whose TTL passed, once per the table's sweep
+    /// interval; a table without one (no rule has a TTL) never walks its
+    /// shards.
+    fn sweep_if_due(&self, now_micros: u64) {
+        if self.sweep_micros == 0 {
             return;
         }
         let due = self.next_sweep_micros.load(Ordering::Relaxed);
         if now_micros < due {
             return;
         }
-        let next = now_micros.saturating_add(rule.sweep_micros);
+        let next = now_micros.saturating_add(self.sweep_micros);
         if self
             .next_sweep_micros
             .compare_exchange(due, next, Ordering::Relaxed, Ordering::Relaxed)
@@ -294,7 +305,7 @@ mod tests {
 
     #[test]
     fn the_latest_dispatch_leads_and_the_one_before_it_is_the_failover() {
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         assert_eq!(table.lookup(7, 10, &RULE), [WorkerId(0); 2]);
         table.dispatched(7, false, WorkerId(1));
         assert_eq!(table.pins(7), Some([WorkerId(1), WorkerId(0)]));
@@ -318,7 +329,7 @@ mod tests {
 
     #[test]
     fn under_original_recovery_the_first_worker_keeps_the_lead() {
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(3, 10, &ORIGINAL);
         table.dispatched(3, false, WorkerId(1));
         table.lookup(3, 20, &ORIGINAL);
@@ -332,7 +343,7 @@ mod tests {
 
     #[test]
     fn idle_keys_are_swept_once_the_interval_passes() {
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(1, 0, &RULE);
         table.dispatched(1, false, WorkerId(1));
         table.lookup(2, 900, &RULE);
@@ -347,7 +358,7 @@ mod tests {
         assert_eq!(table.pins(1), None);
         assert_eq!(table.pins(2), Some([WorkerId(2), WorkerId(0)]));
         // Without a TTL nothing expires.
-        let forever = SessionTable::new();
+        let forever = SessionTable::new(0);
         let no_ttl = SessionRule {
             ttl_micros: None,
             ..RULE
@@ -358,9 +369,41 @@ mod tests {
         assert_eq!(forever.pins(1), Some([WorkerId(1), WorkerId(0)]));
     }
 
+    /// Two rules share one table: the sweep runs at the shortest interval
+    /// among them, so a rule with an hour between sweeps never defers the
+    /// expiry of another rule's keys.
+    #[test]
+    fn a_long_sweep_rule_does_not_defer_another_rules_expiry() {
+        let hourly = SessionRule {
+            ttl_micros: Some(3_600_000_000),
+            sweep_micros: 3_600_000_000,
+            ..RULE
+        };
+        let table = SessionTable::new(RULE.sweep_micros.min(hourly.sweep_micros));
+        table.lookup(1, 0, &hourly);
+        table.dispatched(1, false, WorkerId(1));
+        table.lookup(2, 0, &RULE);
+        table.dispatched(2, false, WorkerId(2));
+        // Past the short rule's TTL the next decision sweeps its key; the
+        // hourly key stays.
+        assert_eq!(table.lookup(2, 2_000, &RULE), [WorkerId(0); 2]);
+        assert_eq!(table.pins(1), Some([WorkerId(1), WorkerId(0)]));
+    }
+
+    /// A key whose TTL passed is forgotten at its next lookup even when no
+    /// sweep ran since: the compare is the key's own, the walk only reclaims.
+    #[test]
+    fn an_expired_key_is_forgotten_at_its_lookup_before_any_sweep() {
+        let rarely = SessionTable::new(1_000_000);
+        rarely.lookup(1, 0, &RULE);
+        rarely.dispatched(1, false, WorkerId(1));
+        assert_eq!(rarely.lookup(1, 500, &RULE), [WorkerId(1), WorkerId(0)]);
+        assert_eq!(rarely.lookup(1, 2_000, &RULE), [WorkerId(0); 2]);
+    }
+
     #[test]
     fn an_empty_key_or_target_writes_nothing() {
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         table.dispatched(0, false, WorkerId(1));
         table.dispatched(4, false, WorkerId(0));
         assert!(table.is_empty());
@@ -372,7 +415,7 @@ mod tests {
     /// keyed by the decision instant and consumed by its own dispatch alone.
     #[test]
     fn a_respill_verdict_travels_with_its_decision_past_another_decisions_reading() {
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(9, 10, &RULE);
         table.dispatched(9, false, WorkerId(1));
         table.lookup(9, 20, &RULE);
@@ -399,7 +442,7 @@ mod tests {
 
     #[test]
     fn the_first_claim_stands_for_a_fresh_key_and_for_a_key_whose_pins_are_down() {
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         let none = [WorkerId(0); 2];
         let seen = table.lookup(5, 10, &ORIGINAL);
         assert_eq!(table.claim(5, seen, WorkerId(3)), WorkerId(3), "the first");
@@ -441,7 +484,7 @@ mod tests {
     /// the claim instead, and the normal rule follows after it.
     #[test]
     fn a_claim_whose_commit_landed_elsewhere_is_withdrawn_before_the_pins_move() {
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(1, 10, &ORIGINAL);
         table.dispatched(1, false, WorkerId(1));
         let seen = table.lookup(1, 20, &ORIGINAL);
@@ -455,7 +498,7 @@ mod tests {
         );
         // Under the latest-first recovery the claim led; the alternate leads
         // instead and the owner stays the failover.
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(2, 10, &RULE);
         table.dispatched(2, false, WorkerId(1));
         let seen = table.lookup(2, 20, &RULE);
@@ -478,7 +521,7 @@ mod tests {
 
     #[test]
     fn a_forgotten_worker_leaves_every_pin_and_a_key_with_no_pin_left_leaves_the_table() {
-        let table = SessionTable::new();
+        let table = SessionTable::new(RULE.sweep_micros);
         for (key, first, second) in [(1, 1, 2), (2, 2, 0), (3, 2, 1), (4, 3, 0)] {
             table.lookup(key, 10, &ORIGINAL);
             table.dispatched(key, false, WorkerId(first));

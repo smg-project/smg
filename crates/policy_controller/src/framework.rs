@@ -475,6 +475,18 @@ fn session_needs(binding: &Binding) -> Needs {
         })
 }
 
+/// The shortest sweep interval among the bindings' sessions rules, the
+/// session table's cadence; `0` when no rule sweeps.
+fn shortest_sweep(bindings: &[Binding]) -> u64 {
+    bindings
+        .iter()
+        .filter_map(|b| b.sessions.as_ref())
+        .map(|rule| rule.sweep_micros)
+        .filter(|sweep| *sweep > 0)
+        .min()
+        .unwrap_or(0)
+}
+
 /// The stages a sessions rule places a key by when its binding's profile does
 /// not decide (every assignment but `delegate`).
 #[derive(Debug, Default)]
@@ -540,13 +552,14 @@ impl Engine {
                 break;
             }
         }
+        let sessions = SessionTable::new(shortest_sweep(&bindings));
         Self {
             profiles,
             bindings,
             generation,
             needs,
             phase_needs,
-            sessions: SessionTable::new(),
+            sessions,
             assignment: AssignmentStages::default(),
         }
     }
@@ -2441,6 +2454,73 @@ mod tests {
         );
         pool[0].health.healthy = true;
         assert_eq!(place_keyed(&engine, &pool, 7, 30).position, 0);
+    }
+
+    /// Two bindings' rules share the engine's table, which sweeps at the
+    /// shorter of their intervals: once the short rule's TTL and interval
+    /// passed, its idle key is gone from the table while the hourly key
+    /// stays, whichever binding's decision ran the sweep.
+    #[test]
+    fn the_table_sweeps_at_the_shortest_interval_of_the_bindings_rules() {
+        let hourly = SessionRule {
+            ttl_micros: Some(3_600_000_000),
+            sweep_micros: 3_600_000_000,
+            ..SESSIONS
+        };
+        let short = SessionRule {
+            ttl_micros: Some(1_000),
+            sweep_micros: 1_000,
+            ..SESSIONS
+        };
+        let binding = |model: &str, rule: SessionRule| Binding {
+            model: model.into(),
+            phases: vec![],
+            plan: Plan::Single,
+            profile: 0,
+            decode_profile: None,
+            sessions: Some(rule),
+        };
+        let engine = Engine::new(
+            vec![least_requests_profile()],
+            vec![binding("a", hourly), binding("b", short)],
+            1,
+            Needs::default(),
+        );
+        let pool = vec![candidate(0, 1), candidate(1, 4)];
+        let place = |model: &'static str, key: u64, now: u64| {
+            let facts = RequestFacts {
+                model,
+                session_key: Identity::hashed(key),
+                now_micros: now,
+                ..RequestFacts::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut scratch,
+            );
+            let pick = decision.pick().expect("a pick");
+            let target = *pick.targets.first().expect("a target");
+            let lease = Lease {
+                session_key: Identity::hashed(key).hash,
+                session: pick.session,
+                issued_micros: now,
+                ..Lease::default()
+            };
+            engine.on_dispatched(&lease, &target, Side::Single, 0);
+        };
+        place("a", 1, 0);
+        place("b", 2, 0);
+        place("b", 3, 2_000);
+        assert_eq!(
+            engine.sessions().len(),
+            2,
+            "the hourly key and the fresh one stay, the short key was swept"
+        );
+        assert!(engine.sessions.pins(Identity::hashed(2).hash).is_none());
     }
 
     #[test]
