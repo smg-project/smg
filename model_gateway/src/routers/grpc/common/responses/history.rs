@@ -205,7 +205,9 @@ fn replays(item: &ResponseInputOutputItem) -> bool {
 /// as an unreplayed item is ([`unreplayed_kind`]): the turn was answered
 /// without them, and a continuation refused on them until the client edits a
 /// chain it cannot edit is a conversation the client cannot carry on. A
-/// request's own input is not filtered and keeps its refusal.
+/// request's own input is not filtered and keeps its refusal, and so does a
+/// conversation item the client added itself (no response wrote it, so no
+/// pipeline ever answered without its parts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayInto {
     /// The chat conversion (`responses_to_chat`).
@@ -448,11 +450,20 @@ async fn conversation_items(
     if cut {
         stored.drain(..stored.len() - MAX_CONVERSATION_HISTORY_ITEMS);
     }
+    // A row a stored response wrote was answered without the parts the
+    // pipeline never carried; a row the client added to the conversation
+    // itself (no response id) was answered by nobody and keeps every part,
+    // so the conversion refuses it as it would the request's own.
     let items: Vec<ResponseInputOutputItem> = stored
         .iter()
-        .filter_map(conversation_item_as_input)
-        .filter(replays)
-        .map(|item| replayed_parts(item, into))
+        .filter_map(|row| {
+            let item = conversation_item_as_input(row).filter(replays)?;
+            Some(if row.response_id.is_some() {
+                replayed_parts(item, into)
+            } else {
+                item
+            })
+        })
         .collect();
     if !cut {
         return Ok(items);
@@ -718,7 +729,7 @@ pub(crate) mod tests {
     /// conversation alike: the turn was answered without it, and a chain
     /// cannot be edited. The request's own input is not filtered.
     #[tokio::test]
-    async fn a_stored_parts_the_pipeline_never_carried_is_left_out_of_the_replay() {
+    async fn a_stored_part_the_pipeline_never_carried_is_left_out_of_the_replay() {
         let stores = Stores::with_conversation().await;
         let user_turn: ResponseInputOutputItem = serde_json::from_value(json!({
             "type": "message", "id": "msg_u1", "role": "user", "content": [
@@ -1055,6 +1066,58 @@ pub(crate) mod tests {
         let items = replayed_items(&stores, "go on").await;
         assert_eq!(shape(&items), ["function_call:call_B", "message:user"]);
         assert_eq!(input_item_id(&items[0]), Some(row.id.0.as_str()));
+    }
+
+    /// A message the client added to the conversation itself (no response
+    /// wrote it) keeps every part when the history loads, so a generation
+    /// over that conversation meets the conversion's refusal instead of a
+    /// silent trim; the same parts in a turn a stored response wrote are
+    /// left out as never carried.
+    #[tokio::test]
+    async fn a_conversation_item_the_client_added_keeps_its_parts_for_the_refusal() {
+        let stores = Stores::with_conversation().await;
+        let conv_id = ConversationId::from("conv_1");
+        let parts = json!([
+            {"type": "input_text", "text": "Read this."},
+            {"type": "input_file", "filename": "notes.txt", "file_data": "aGVsbG8="},
+            {"type": "input_image", "file_id": "file_1"},
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+        ]);
+        for (response_id, expected) in [
+            (
+                None,
+                vec!["input_text", "input_file", "input_image", "input_image"],
+            ),
+            (
+                Some("resp_0".to_string()),
+                vec!["input_text", "input_image"],
+            ),
+        ] {
+            let row = stores
+                .conversation_items
+                .create_item(NewConversationItem {
+                    id: None,
+                    response_id: response_id.clone(),
+                    item_type: "message".to_string(),
+                    role: Some("user".to_string()),
+                    content: parts.clone(),
+                    status: Some("completed".to_string()),
+                    tenant: None,
+                })
+                .await
+                .expect("the row is created");
+            stores
+                .conversation_items
+                .link_item(&conv_id, &row.id, chrono::Utc::now())
+                .await
+                .expect("the row is linked");
+            let items = replayed_items(&stores, "go on").await;
+            let loaded = items
+                .iter()
+                .find(|item| input_item_id(item) == Some(row.id.0.as_str()))
+                .expect("the row reloads");
+            assert_eq!(part_types(loaded), expected, "response_id {response_id:?}");
+        }
     }
 
     /// The items a request that continues `conv_1` with the message `text`
