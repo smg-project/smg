@@ -263,6 +263,8 @@ helm install smg deploy/helm/smg \
   --set router.tenantRateLimit.configMap.name=smg-rate-limit
 ```
 
+The gateway reads both files once at start. An edit of a ConfigMap reaches the mounted file through the kubelet's symlink swap, but it takes effect on the next `kubectl rollout restart` of the router Deployment; the mounts stay whole ConfigMaps for a later file watch.
+
 #### Store URLs
 
 The connection URL of the history store (`history.postgres.url`, `history.redis.url`) carries the database password, so the chart writes it into a chart-managed Secret and the router pod gets it as the environment variable the gateway reads (`SMG_POSTGRES_DB_URL`, `SMG_REDIS_URL`); the URL is never in the pod's arguments, so it is not in the Deployment object, the process listing or `/proc`. A URL managed outside the chart's values comes from an existing Secret the same way:
