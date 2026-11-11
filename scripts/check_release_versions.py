@@ -8,7 +8,10 @@ symlinks under its path point at: a package that ships another directory's files
 a link (the proto package ships crates/grpc_client/proto that way) ships their changes
 too, so they move its version. A version is bumped when no release tag
 ``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
-code: the registries take a version once. Then the files that must mirror the gateway's
+code: the registries take a version once. A crate held at its published version is
+republished when a workspace dependency's new version leaves the requirement its published
+copy carries (cargo's caret): at a patch step, or at the dependency's step when the crate's
+public API carries the dependency. Then the files that must mirror the gateway's
 version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
 ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch), stepped past the
 versions release tags carry, and, on request, applied.
@@ -41,6 +44,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -451,6 +455,8 @@ class Verdict:
     unbumped: bool = False  # the version is a release tag's, carried there with other code
     level: str | None = None  # the bump asked for when the version was not bumped
     workspace_version: str | None = None  # the root's entry when it disagrees
+    # why a held crate moves: the published requirement a dependency's new version leaves
+    dependency: str | None = None
 
 
 def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
@@ -635,7 +641,12 @@ def report(verdict: Verdict, out: Out) -> None:
     c, name = verdict.component, out.paint("bold", verdict.component.name)
     where, n = f"({c.path}/)", f"{verdict.files_changed} file(s) changed"
     ok, warn, bad = out.paint("green", "✓"), out.paint("yellow", "!"), out.paint("red", "✗")
-    if verdict.unbumped:
+    if verdict.dependency:
+        out.line(
+            f"  {warn} {name} {where} — unchanged, but its published requirement {verdict.dependency}"
+            f" [{out.level(verdict.level)}]"
+        )
+    elif verdict.unbumped:
         carried = f", {verdict.carried_by}'s" if verdict.carried_by else ""
         out.line(
             f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}{carried})"
@@ -653,6 +664,115 @@ def report(verdict: Verdict, out: Out) -> None:
         out.line(
             f"    {bad} workspace Cargo.toml has {c.dep_key} v{verdict.workspace_version}, expected v{verdict.version}"
         )
+
+
+def caret_accepts(requirement: str, version: str) -> bool:
+    """Whether cargo's default requirement on ``requirement`` (a caret) accepts ``version``: not
+    older, and the same major; the same minor below 1.0; the same patch below 0.1."""
+    old = tuple(int(n) for n in requirement.split("-")[0].split("."))
+    new = tuple(int(n) for n in version.split("-")[0].split("."))
+    if new < old:
+        return False
+    if old[0] > 0:
+        return new[0] == old[0]
+    if old[1] > 0:
+        return new[:2] == old[:2]
+    return new == old
+
+
+def move_level(old: str, new: str) -> str:
+    """The step a move from ``old`` to ``new`` is."""
+    before = [int(n) for n in old.split("-")[0].split(".")]
+    after = [int(n) for n in new.split("-")[0].split(".")]
+    if after[0] != before[0]:
+        return "major"
+    return "minor" if after[1] != before[1] else "patch"
+
+
+def published_requirements(
+    repo: Repo, tag: str, component: Component, crates: Sequence[Component]
+) -> dict[str, str]:
+    """A crate's requirements on the workspace crates as its copy at the tag carries them, per
+    crate name: the root's pin for a ``workspace = true`` entry, the entry's own version
+    otherwise. Dev-dependencies are not published requirements."""
+    manifest = next(
+        (text for path in with_legacy(component.version_file) if (text := repo.show(tag, path))),
+        None,
+    )
+    if manifest is None:
+        return {}
+    try:
+        parsed = tomllib.loads(manifest)
+    except tomllib.TOMLDecodeError:
+        return {}
+    root = repo.show(tag, "Cargo.toml") or ""
+    by_key = {c.dep_key or c.name: c.name for c in crates}
+    requirements: dict[str, str] = {}
+    for section in ("dependencies", "build-dependencies"):
+        for key, spec in parsed.get(section, {}).items():
+            key = spec.get("package", key) if isinstance(spec, dict) else key
+            name = by_key.get(key)
+            if name is None or name == component.name:
+                continue
+            if isinstance(spec, dict) and spec.get("workspace"):
+                pinned = workspace_dep_version(root, key)
+            else:
+                pinned = spec.get("version") if isinstance(spec, dict) else spec
+            if isinstance(pinned, str) and SEMVER.match(pinned):
+                requirements[name] = pinned
+    return requirements
+
+
+def carries_in_public_api(repo: Repo, component: Component, dep: str) -> bool:
+    """Whether the crate's sources at HEAD name the dependency in a public item (a ``pub use``
+    of it, or its path in a ``pub`` signature): a read of the text, the step then follows the
+    dependency's."""
+    ident = dep.replace("-", "_")
+    pattern = (
+        rf"^[[:space:]]*pub[[:space:]]+(use[[:space:]]+{ident}(::|;|[[:space:]])"
+        rf"|[^;]*[^A-Za-z0-9_]{ident}::)"
+    )
+    result = repo._run("grep", "-q", "-E", pattern, "HEAD", "--", f"{component.path}/src")
+    return result.returncode == 0
+
+
+def dependency_moves(
+    repo: Repo, tag: str, plan: Plan, crates: Sequence[Component], out: Out
+) -> None:
+    """The dependency rule, repeated until no crate moves: a crate held at its tag version is
+    republished when a workspace dependency's new version (the plan's, where the dependency
+    moves here) leaves the requirement its published copy carries; at a patch step, or at the
+    dependency's step when the crate's public API carries the dependency."""
+    by_name = {v.component.name: v for v in plan.verdicts if v.component.kind == "crate"}
+    held = [
+        v
+        for v in by_name.values()
+        if v.tag_version is not None and v.version == v.tag_version and v.files_changed == 0
+    ]
+    moved = True
+    while moved:
+        moved = False
+        for verdict in held:
+            if verdict.unbumped:
+                continue
+            for dep, requirement in published_requirements(
+                repo, tag, verdict.component, crates
+            ).items():
+                target = by_name.get(dep)
+                if target is None:
+                    continue
+                new = plan.new_version(target) if target.unbumped else target.version
+                if caret_accepts(requirement, new):
+                    continue
+                carried = carries_in_public_api(repo, verdict.component, dep)
+                verdict.unbumped = True
+                verdict.level = move_level(requirement, new) if carried else "patch"
+                verdict.dependency = f"{dep} ^{requirement} does not accept v{new}" + (
+                    "; its public API carries the dependency" if carried else ""
+                )
+                report(verdict, out)
+                moved = True
+                break
 
 
 def examine(
@@ -685,6 +805,7 @@ def examine(
         "cargo", repo.read(gateway_component.version_file), gateway_component.version_file
     )
     plan = Plan(verdicts, [], target, override, gateway_version=target, cut_version=cut_version)
+    dependency_moves(repo, tag, plan, crates, out)
     if cut_version is not None:
         plan.gateway_target = cut_version
     elif gateway is not None and gateway.unbumped:
@@ -708,7 +829,7 @@ def examine(
             1
             for v in verdicts
             if v.component.kind == kind
-            and bool(v.files_changed or v.workspace_version is not None) == changed
+            and bool(v.files_changed or v.workspace_version is not None or v.dependency) == changed
         )
 
     out.line()

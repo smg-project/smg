@@ -307,6 +307,120 @@ def test_the_verdicts(mod, repo):
     assert "Proposed fixes" not in out, "--check never proposes"
 
 
+def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_requirement(
+    mod, tmp_path
+):
+    """A crate unchanged since the tag can still be unpublishable: its published copy requires
+    a workspace dependency at the version the root pinned at the tag (a caret), and the cut moves
+    that dependency past it. The plan moves such a crate at a patch step, or at the dependency's
+    step when the crate's public API carries the dependency; a patch move of a dependency, and
+    a dev-dependency, move nothing."""
+    root = tmp_path / "deps"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    pins = {"kappa": "0.2.0", "lambda": "1.0.0", "omega": "0.3.0", "sigma": "0.1.0", "rho": "1.0.0"}
+    put(root, "Cargo.toml", root_manifest(pins))
+    put(root, "crates/kappa/Cargo.toml", manifest("kappa", "0.2.0"))
+    put(root, "crates/kappa/src/lib.rs", "pub struct Thing;\n")
+    put(root, "crates/lambda/Cargo.toml", manifest("lambda", "1.0.0"))
+    put(root, "crates/lambda/src/lib.rs", "// lambda\n")
+    deps = "\n[dependencies]\nkappa = { workspace = true }\n"
+    put(root, "crates/omega/Cargo.toml", manifest("omega", "0.3.0") + deps)
+    put(root, "crates/omega/src/lib.rs", "fn uses(_thing: kappa::Thing) {}\n")
+    put(root, "crates/sigma/Cargo.toml", manifest("sigma", "0.1.0") + deps)
+    put(root, "crates/sigma/src/lib.rs", "pub use kappa::Thing;\n")
+    put(
+        root,
+        "crates/rho/Cargo.toml",
+        manifest("rho", "1.0.0")
+        + "\n[dependencies]\nlambda = { workspace = true }\n\n[dev-dependencies]\nkappa = { workspace = true }\n",
+    )
+    put(root, "crates/rho/src/lib.rs", "pub use kappa::Thing;\n")
+    put(root, "model_gateway/Cargo.toml", manifest("smg", "1.0.0"))
+    put(root, "model_gateway/src/main.rs", "fn main() {}\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore: initial")
+    git(root, "tag", "v1.0.0")
+    put(root, "crates/kappa/src/lib.rs", "pub struct Thing;\npub struct More;\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "feat(kappa): more")
+    put(root, "crates/lambda/src/lib.rs", "// lambda 2\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "fix(lambda): less")
+
+    assert mod.caret_accepts("1.0.0", "1.0.1") and mod.caret_accepts("1.2.0", "1.9.9")
+    assert not mod.caret_accepts("1.2.0", "2.0.0") and not mod.caret_accepts("1.2.0", "1.1.9")
+    assert mod.caret_accepts("0.2.0", "0.2.5") and not mod.caret_accepts("0.2.0", "0.3.0")
+    assert mod.caret_accepts("0.0.3", "0.0.3") and not mod.caret_accepts("0.0.3", "0.0.4")
+    assert mod.move_level("0.2.0", "0.3.0") == "minor"
+    assert mod.move_level("1.2.3", "2.0.0") == "major"
+    assert mod.move_level("1.2.3", "1.2.4") == "patch"
+
+    crates = (
+        mod.crate("smg", "model_gateway"),
+        mod.crate("kappa", "crates/kappa", "kappa"),
+        mod.crate("lambda", "crates/lambda", "lambda"),
+        mod.crate("omega", "crates/omega", "omega"),
+        mod.crate("sigma", "crates/sigma", "sigma"),
+        mod.crate("rho", "crates/rho", "rho"),
+    )
+    repo = mod.Repo(root)
+    assert mod.published_requirements(repo, "v1.0.0", crates[3], crates) == {"kappa": "0.2.0"}
+    assert mod.published_requirements(repo, "v1.0.0", crates[5], crates) == {"lambda": "1.0.0"}
+
+    def check(mode="check"):
+        stream = io.StringIO()
+        code = mod.run(
+            root, "v1.0.0", mode, None, mod.Out(stream), crates=crates, packages=(), mirrors=()
+        )
+        return code, stream.getvalue()
+
+    code, out = check()
+    assert code == 1
+    assert (
+        "  ! kappa (crates/kappa/) — 1 file(s) changed but version not bumped (v0.2.0) [minor]"
+        in out
+    )
+    assert (
+        "  ! omega (crates/omega/) — unchanged, but its published requirement kappa ^0.2.0"
+        " does not accept v0.3.0 [patch]" in out
+    )
+    assert (
+        "  ! sigma (crates/sigma/) — unchanged, but its published requirement kappa ^0.2.0"
+        " does not accept v0.3.0; its public API carries the dependency [minor]" in out
+    )
+    assert "rho" not in out, (
+        "lambda 1.0.1 sits inside ^1.0.0, and a dev-dependency is not published"
+    )
+    assert "Summary: 4 crate(s) with changes, 2 unchanged" in out
+    assert "4 issue(s) found." in out
+
+    code, out = check("plan")
+    assert code == 0
+    assert "  patch omega v0.3.0 → v0.3.1 (crates/omega/Cargo.toml)" in out
+    assert "  minor sigma v0.1.0 → v0.2.0 (crates/sigma/Cargo.toml)" in out
+    assert "  minor kappa v0.2.0 → v0.3.0 (crates/kappa/Cargo.toml)" in out
+
+    code, out = check("fix")
+    assert code == 0, out
+    root_toml = (root / "Cargo.toml").read_text()
+    for name, version in (
+        ("kappa", "0.3.0"),
+        ("lambda", "1.0.1"),
+        ("omega", "0.3.1"),
+        ("sigma", "0.2.0"),
+    ):
+        assert (
+            mod.read_version("cargo", (root / f"crates/{name}/Cargo.toml").read_text(), "")
+            == version
+        )
+        assert mod.workspace_dep_version(root_toml, name) == version
+    assert mod.read_version("cargo", (root / "crates/rho/Cargo.toml").read_text(), "") == "1.0.0"
+    code, out = check()
+    assert code == 0, out
+    assert "All versions consistent." in out
+
+
 def test_the_installed_packages_version_file_is_a_checked_mirror(mod):
     """smg.__version__ is read from bindings/python/src/smg/version.py; the bump writes it and this check reads it."""
     mirror = next(m for m in mod.MIRRORS if m.file == "bindings/python/src/smg/version.py")
