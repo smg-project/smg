@@ -45,7 +45,7 @@ struct ProfileRun {
 
 /// What the admin operations did on one worker, and what an encode worker
 /// served (its completions reach no engine and no script, so the admin API
-/// is where a bed reads that the encode leg ran).
+/// is where a bed reads that the encode side ran).
 pub struct AdminOps {
     name: String,
     flushes: AtomicU64,
@@ -114,7 +114,7 @@ impl AdminOps {
 
     /// One encoder completion served by an encode worker (`encodes` in the
     /// status): the gateway's own per-worker request count does not see the
-    /// vLLM encode leg, so a bed reads it here.
+    /// vLLM encode side, so a bed reads it here.
     pub fn record_encode(&self) {
         self.encodes.fetch_add(1, Ordering::Relaxed);
     }

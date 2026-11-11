@@ -1,4 +1,4 @@
-//! The encoder-cache handoff checks of an encode-prefill-decode leg, as the
+//! The encoder-cache handoff checks of an encode-prefill-decode request, as the
 //! Python servicer runs them per connector: a consumer's pixel-less batches
 //! need a usable handle for every media item, a producer's completion carries
 //! the request's media identity, and a CPU connector's producer must return a
@@ -25,11 +25,11 @@ const GRID_KEYS: [&str; 4] = [
     "video_second_per_grid",
 ];
 
-/// The refusal of a consumer's leg whose handles do not cover its pixel-less
+/// The refusal of a consumer's request whose handles do not cover its pixel-less
 /// media, in the Python servicer's words.
 const HANDLES_SHORT: &str = "multimodal payload carries grid tensors but no pixel_values and \
                              ec_transfer_params_json is not usable for every pixel-less media \
-                             item; a pixel-less leg requires a handoff";
+                             item; a pixel-less request requires a handoff";
 
 /// Whether the engine consumes encoder caches (the prefill side), off the
 /// launcher's role.
@@ -68,7 +68,7 @@ fn valid_cpu_handle(handle: Option<&Value>) -> bool {
 /// the request: every pixel-less batch carries its hashes, and per connector
 /// each hash has what the engine fetches by (a CPU connector's address, a
 /// Mooncake transfer id per occurrence; any other connector takes a non-empty
-/// object). A leg with encoder-cache parameters may not rely on remote KV
+/// object). A request with encoder-cache parameters may not rely on remote KV
 /// alone, as the Python servicer rules; one without pixel-less batches needs
 /// no handle.
 pub(super) fn check_consumer_handoff(
@@ -139,7 +139,7 @@ fn handles_cover(missing: &[&vllm::MultimodalInputs], connector: &str, params: &
 /// modality and the grid tensors with inline payloads), for a request
 /// whose batches all carry pixels and hashes. A media-reference request gets
 /// its identity from the media stage instead; a request without batches, or
-/// a pixel-less one (the consumer's leg), gets none.
+/// a pixel-less one (the consumer's request), gets none.
 pub(super) fn producer_identity(
     req: &vllm::GenerateRequest,
     model: &VllmModelInfo,
