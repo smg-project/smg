@@ -373,7 +373,9 @@ class Router:
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When
             enabled, the router can manage multiple models simultaneously with per-model
             load balancing policies. Default: False
-        api_key: The api key used for the authorization with the worker. Default: None
+        api_key: The key the gateway requires from its own callers on the serving
+            routes. A worker added through POST /workers carries its own key in its
+            spec. Default: None
         log_dir: Directory to store log files. If None, logs are only output to
             console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.

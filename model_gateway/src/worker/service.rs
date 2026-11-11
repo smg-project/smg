@@ -881,7 +881,12 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
-        let worker = self.worker_registry.get_by_url(&url);
+        // A data-parallel engine's group answers to its bare URL: the first
+        // rank stands for the group's provider and labels.
+        let worker = self
+            .worker_registry
+            .get_by_url(&url)
+            .or_else(|| self.dp_group_for_url(&url).into_iter().next());
         // Only a PATCH of labels edits what a provider publishes. Decided
         // before the body is validated, as for a PUT, so reserved labels sent
         // to a discovered worker are told where to make the change.
@@ -1390,6 +1395,37 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+    }
+
+    /// A PATCH by a data-parallel group's ID (the bare URL the POST answered
+    /// with) keeps the checks a plain worker's PATCH gets: no row sits under
+    /// the bare URL, so the group's first rank stands for its provider and
+    /// its labels.
+    #[tokio::test]
+    async fn update_worker_by_a_groups_id_keeps_the_provider_check() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let rank = BasicWorkerBuilder::new("http://10.0.0.14:8000")
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .dp_config(0, 2)
+            .labels(HashMap::from([(
+                DISCOVERY_PROVIDER_LABEL.to_string(),
+                "provider-a".to_string(),
+            )]))
+            .build();
+        registry.register(Arc::new(rank)).unwrap();
+        let group_id = registry.reserve_id_for_url("http://10.0.0.14:8000");
+        let service = make_service(Arc::clone(&registry));
+        let update: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k": "v"}})).expect("an update");
+        let err = service
+            .update_worker(group_id.as_str(), update)
+            .await
+            .expect_err("a provider-owned group");
+        assert!(
+            matches!(&err, WorkerServiceError::DiscoveryOwned { provider, .. } if provider == "provider-a"),
+            "{err}"
+        );
     }
 
     /// A worker over the cap through the labels discovered at registration

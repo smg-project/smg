@@ -5,8 +5,13 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::json;
-use smg::{config::RouterConfig, routers::RouterFactory};
+use smg::{
+    config::RouterConfig,
+    routers::RouterFactory,
+    worker::{BasicWorkerBuilder, Worker, WorkerType as CoreWorkerType},
+};
 use tower::ServiceExt;
 
 use crate::common::{
@@ -505,6 +510,46 @@ mod model_info_tests {
         assert!(body_json.get("port").is_some());
         assert!(body_json.get("max_num_batched_tokens").is_some());
         assert!(body_json.get("schedule_policy").is_some());
+
+        ctx.shutdown().await;
+    }
+
+    /// A data-parallel engine's rows carry their rank in the URL; the GET
+    /// proxies reach the engine through a row's base URL.
+    #[tokio::test]
+    async fn test_get_server_info_through_a_rank_row() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18203,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let base = ctx.worker_urls[0].clone();
+        let registry = &ctx.app_context.worker_registry;
+        registry.remove_by_url(&base).expect("the plain worker");
+        let rank = BasicWorkerBuilder::new(&base)
+            .worker_type(CoreWorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .dp_config(0, 2)
+            .status(WorkerStatus::Ready)
+            .build();
+        assert_ne!(rank.url(), base, "the row's URL carries its rank");
+        registry.register(Arc::new(rank));
+
+        let app = ctx.create_app();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_server_info")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the proxy reached the engine through the row's base URL"
+        );
 
         ctx.shutdown().await;
     }
