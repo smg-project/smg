@@ -395,6 +395,17 @@ impl PDRouter {
                         *response.headers_mut() = response_headers;
                         response
                     }
+                    // The request's own timeout running out mid-body ends the
+                    // request as it does on every other body read of these
+                    // routers (504 under its code), never as the worker's
+                    // transport failing.
+                    Err(e) if is_request_timeout(&e) => {
+                        error!("Response body read timed out: {}", e);
+                        request_timeout_response(format!(
+                            "Failed to read response body: {}",
+                            cause(&e)
+                        ))
+                    }
                     Err(e) => {
                         error!("Failed to read response body: {}", e);
                         error::bad_gateway(
