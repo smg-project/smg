@@ -54,7 +54,11 @@ use tokenizers::{
     Model,
 };
 
-use crate::{encode_path::Declined, tiktoken::MAX_BYTE_LEVEL_TABLE_IDS, word_cache::ReadBpe};
+use crate::{
+    encode_path::Declined,
+    tiktoken::MAX_BYTE_LEVEL_TABLE_IDS,
+    word_cache::{entries_of, ReadBpe},
+};
 
 mod preformed;
 mod serialized;
@@ -359,22 +363,12 @@ impl MergeTable {
                     .map(|c| byte_of.get(c as usize).copied().flatten())
                     .collect()
             };
-            // The entries by id where the read gave the largest one, else
-            // through a clone of the vocabulary map.
-            let raws = match read.and_then(|read| read.max_id) {
-                Some(max_id) => (0..=max_id)
-                    .filter_map(|id| {
-                        bpe.id_to_token(id)
-                            .and_then(|token| raw_of(&token))
-                            .map(|raw| (id, raw))
-                    })
-                    .collect(),
-                None => bpe
-                    .get_vocab()
-                    .into_iter()
-                    .filter_map(|(token, id)| raw_of(&token).map(|raw| (id, raw)))
-                    .collect(),
-            };
+            // The entries by id where the read says the ids are the range,
+            // else through a clone of the vocabulary map.
+            let raws = entries_of(bpe, read)
+                .into_iter()
+                .filter_map(|(id, token)| raw_of(&token).map(|raw| (id, raw)))
+                .collect();
             table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         }
         Ok(table)

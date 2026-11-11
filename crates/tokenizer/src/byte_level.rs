@@ -135,7 +135,12 @@ fn span(start: usize, end: usize) -> (u32, u32) {
 pub(crate) fn max_token_id(tokenizer: &HfTokenizer, model_max_id: Option<u32>) -> Option<u32> {
     match model_max_id {
         Some(model) => {
-            let added = tokenizer.get_added_tokens_decoder().keys().copied().max();
+            let added = tokenizer
+                .get_added_vocabulary()
+                .get_added_tokens_decoder()
+                .keys()
+                .copied()
+                .max();
             Some(added.map_or(model, |added| added.max(model)))
         }
         None => tokenizer.get_vocab(true).values().copied().max(),

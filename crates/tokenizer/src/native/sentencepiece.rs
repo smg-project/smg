@@ -19,13 +19,16 @@
 //! time is written in the vocabulary's form for the merge alone.
 
 use rustc_hash::FxHashMap;
-use tokenizers::{models::ModelWrapper, Model};
+use tokenizers::models::ModelWrapper;
 
 use super::{
     merge::{ByteTokens, MergeTable},
     short_pieces::ShortPieceKey,
 };
-use crate::{encode_path::Declined, word_cache::ReadBpe};
+use crate::{
+    encode_path::Declined,
+    word_cache::{entries_of, ReadBpe},
+};
 
 /// The word marker of a sentencepiece vocabulary.
 pub(super) const WORD_MARKER: char = '\u{2581}';
@@ -105,19 +108,8 @@ impl CharSymbols {
             marker,
             merges,
         };
-        match read.and_then(|read| read.max_id) {
-            Some(max_id) => {
-                for id in 0..=max_id {
-                    if let Some(token) = bpe.id_to_token(id) {
-                        symbols.read_token(&token, id)?;
-                    }
-                }
-            }
-            None => {
-                for (token, id) in bpe.get_vocab() {
-                    symbols.read_token(&token, id)?;
-                }
-            }
+        for (id, token) in entries_of(bpe, read) {
+            symbols.read_token(&token, id)?;
         }
         symbols.bridge_raw_text();
         Ok(symbols)

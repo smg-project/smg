@@ -1420,3 +1420,128 @@ fn a_run_of_one_character_overflows_the_stack_arrays_and_a_pair_no_token_holds_i
         assert_eq!(ids, model_ids(&bpe, &alphabet, text.as_bytes()), "{text}");
     }
 }
+
+/// The model as its section reads into the loading model (the one-pass
+/// read the loader's tables take their merges and largest id from).
+fn read_of(bpe: &BPE) -> crate::word_cache::LateBoundModel {
+    let json =
+        serde_json::to_string(&ModelWrapper::BPE(bpe.clone())).expect("the model serializes");
+    serde_json::from_str(&json).expect("the loading model reads its section")
+}
+
+/// The one-pass read of a model section holds the merges as the ids the
+/// built model resolves them to and the vocabulary's largest id, and the
+/// table built from it is the table built from the model; a merge whose
+/// product the vocabulary spells otherwise (a subword prefix) leaves the
+/// pairs unread, and the table declines from the model as without a read.
+#[test]
+fn the_read_of_a_section_builds_the_table_the_model_builds() {
+    use crate::word_cache::ModelView;
+    let bpe = model_with(&[("a", "b"), ("ab", "c"), ("d", "e")], false);
+    let late = read_of(&bpe);
+    let read = late.read().expect("a BPE section leaves a read");
+    let merges = MergeTable::merges_of(late.wrapper(), &bpe).expect("the merges resolve");
+    assert_eq!(read.pairs.as_deref(), Some(merges.as_slice()));
+    assert_eq!(read.max_id, bpe.get_vocab().values().copied().max());
+    let with = MergeTable::from_model(late.wrapper(), ByteTokens::Alphabet, Some(read))
+        .expect("the table loads from the read");
+    let without = MergeTable::from_model(late.wrapper(), ByteTokens::Alphabet, None)
+        .expect("the table loads from the model");
+    assert_eq!(
+        (with.merges(), with.bytes(), with.preformed_characters()),
+        (
+            without.merges(),
+            without.bytes(),
+            without.preformed_characters()
+        )
+    );
+    for piece in [&b"abc"[..], b"ab", b"cab", b"de", b"xyz", b"abcde"] {
+        assert_eq!(
+            table_ids(&with, piece),
+            table_ids(&without, piece),
+            "{piece:?}"
+        );
+    }
+
+    let mut vocab = Vocab::default();
+    for (id, token) in ["a", "_b", "ab"].into_iter().enumerate() {
+        vocab.insert(token.to_owned(), id as u32);
+    }
+    let prefixed = BPE::builder()
+        .vocab_and_merges(vocab, vec![("a".to_owned(), "_b".to_owned())])
+        .continuing_subword_prefix("_".to_owned())
+        .build()
+        .expect("a BPE with a subword prefix");
+    let late = read_of(&prefixed);
+    let read = late.read().expect("a BPE section leaves a read");
+    assert_eq!(
+        read.pairs, None,
+        "a merge the vocabulary spells otherwise is left to the model"
+    );
+    assert_eq!(read.max_id, Some(2));
+    assert_eq!(
+        MergeTable::from_model(late.wrapper(), ByteTokens::Alphabet, Some(read)).err(),
+        MergeTable::from_model(late.wrapper(), ByteTokens::Alphabet, None).err()
+    );
+}
+
+/// The entries read by id are the vocabulary's entries when the ids are the
+/// range `0..n`; a vocabulary numbered elsewhere (a byte-fallback one at
+/// 2^31) or two tokens on one id take the vocabulary walk, as a model
+/// without a read.
+#[test]
+fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
+    use crate::word_cache::{entries_of, ModelView};
+    fn sorted(mut entries: Vec<(u32, String)>) -> Vec<(u32, String)> {
+        entries.sort();
+        entries
+    }
+    let walk = |bpe: &BPE| {
+        sorted(
+            bpe.get_vocab()
+                .into_iter()
+                .map(|(token, id)| (id, token))
+                .collect(),
+        )
+    };
+
+    let dense = model_with(&[("a", "b")], false);
+    let late = read_of(&dense);
+    assert_eq!(sorted(entries_of(&dense, late.read())), walk(&dense));
+    assert_eq!(sorted(entries_of(&dense, None)), walk(&dense));
+
+    let mut vocab = Vocab::default();
+    vocab.insert("<unk>".to_owned(), 0);
+    for byte in 0..=255u8 {
+        vocab.insert(format!("<0x{byte:02X}>"), 1 + u32::from(byte));
+    }
+    vocab.insert("a".to_owned(), 1 << 31);
+    vocab.insert("b".to_owned(), (1 << 31) + 1);
+    vocab.insert("ab".to_owned(), (1 << 31) + 2);
+    let sparse = BPE::builder()
+        .vocab_and_merges(vocab, vec![("a".to_owned(), "b".to_owned())])
+        .byte_fallback(true)
+        .unk_token("<unk>".to_owned())
+        .build()
+        .expect("a byte-fallback BPE numbered at 2^31");
+    let late = read_of(&sparse);
+    assert_eq!(
+        late.read().and_then(|read| read.max_id),
+        Some((1 << 31) + 2)
+    );
+    assert_eq!(sorted(entries_of(&sparse, late.read())), walk(&sparse));
+
+    let mut vocab = Vocab::default();
+    for (token, id) in [("a", 0), ("b", 0), ("c", 2)] {
+        vocab.insert(token.to_owned(), id);
+    }
+    let doubled = BPE::builder()
+        .vocab_and_merges(vocab, Vec::new())
+        .build()
+        .expect("a BPE with two tokens on one id");
+    let late = read_of(&doubled);
+    assert_eq!(late.read().and_then(|read| read.max_id), Some(2));
+    let entries = sorted(entries_of(&doubled, late.read()));
+    assert_eq!(entries.len(), 3, "both tokens of the shared id");
+    assert_eq!(entries, walk(&doubled));
+}

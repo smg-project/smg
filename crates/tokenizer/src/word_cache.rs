@@ -129,6 +129,30 @@ impl ReadBpe {
     }
 }
 
+/// The model's vocabulary as `(id, token)` entries. By id when the read's
+/// largest id says the ids are the range `0..n` for the vocabulary's `n`
+/// entries (one lookup per id, no clone of the map) and that walk finds all
+/// `n` of them (two tokens on one id would hide one); otherwise a walk of
+/// the map, as for a model without a read. A vocabulary numbered sparsely
+/// never pays a walk of its id range.
+pub(crate) fn entries_of(bpe: &BPE, read: Option<&ReadBpe>) -> Vec<(u32, String)> {
+    let n = bpe.get_vocab_size();
+    if let Some(max_id) = read.and_then(|read| read.max_id) {
+        if max_id as usize + 1 == n {
+            let by_id: Vec<(u32, String)> = (0..=max_id)
+                .filter_map(|id| bpe.id_to_token(id).map(|token| (id, token)))
+                .collect();
+            if by_id.len() == n {
+                return by_id;
+            }
+        }
+    }
+    bpe.get_vocab()
+        .into_iter()
+        .map(|(token, id)| (id, token))
+        .collect()
+}
+
 impl LateBoundModel {
     /// Sets the words the BPE model caches per thread once built (other
     /// model kinds have no such cache).
