@@ -41,8 +41,8 @@ use tonic_health::pb::{
 use super::*;
 use crate::{
     testing::{
-        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, next_batch,
-        servicer_config, Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, handshake_address, http_get,
+        next_batch, servicer_config, Bounded,
     },
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeRelease, EncoderDispatchErrorReq, ServicerError, SglangEncodeDispatcher,
@@ -78,14 +78,6 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
         encode_dispatcher: None,
         media_processor: None,
     }
-}
-
-/// The handshake endpoint of one test: an IPC socket under its own
-/// directory. A probed TCP port is not reserved, so two tests running in
-/// parallel could pick the same one and a mock engine would handshake with
-/// the other test's servicer and wait forever for its INIT.
-fn handshake_address(dir: &std::path::Path) -> String {
-    format!("ipc://{}", dir.join("handshake").display())
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
