@@ -408,7 +408,7 @@ impl HarmonyStreamingProcessor {
     /// Emit a chunk delta from Harmony channels
     #[expect(clippy::too_many_arguments)]
     async fn emit_chunk_delta(
-        delta: &HarmonyChannelDelta,
+        delta: HarmonyChannelDelta,
         index: u32,
         is_first: bool,
         dispatch: &context::DispatchMetadata,
@@ -422,22 +422,24 @@ impl HarmonyStreamingProcessor {
             Self::emit_role_chunk(index, dispatch, original_request, tx, encoder).await?;
         }
 
-        // Emit content delta (role is always None for content chunks)
+        // Emit content delta (role is always None for content chunks); the
+        // delta's texts move into the chunk.
         let chat_delta = ChatMessageDelta {
             role: None,
-            content: delta.final_delta.clone(),
-            tool_calls: delta.commentary_delta.as_ref().map(|tc_delta| {
+            content: delta.final_delta,
+            tool_calls: delta.commentary_delta.map(|tc_delta| {
+                let tool_type = tc_delta.id.is_some().then(|| "function".to_string());
                 vec![ToolCallDelta {
                     index: tc_delta.index as u32,
-                    id: tc_delta.id.clone(),
-                    tool_type: tc_delta.id.as_ref().map(|_| "function".to_string()),
-                    function: tc_delta.function.as_ref().map(|f| FunctionCallDelta {
-                        name: f.name.clone(),
-                        arguments: f.arguments.clone(),
+                    id: tc_delta.id,
+                    tool_type,
+                    function: tc_delta.function.map(|f| FunctionCallDelta {
+                        name: f.name,
+                        arguments: f.arguments,
                     }),
                 }]
             }),
-            reasoning_content: delta.analysis_delta.clone(),
+            reasoning_content: delta.analysis_delta,
         };
 
         // Build and emit chunk
@@ -1623,7 +1625,7 @@ impl ChatDecode {
         let is_first = self.is_firsts.get(&index).copied().unwrap_or(false);
         if has_payload || is_first || bare_logprobs {
             HarmonyStreamingProcessor::emit_chunk_delta(
-                &delta,
+                delta,
                 index,
                 is_first,
                 dispatch,
@@ -1777,7 +1779,7 @@ impl ChatDecode {
         };
         if flushed.analysis_delta.is_some() || flushed.final_delta.is_some() {
             HarmonyStreamingProcessor::emit_chunk_delta(
-                &flushed,
+                flushed,
                 index,
                 false,
                 dispatch,
