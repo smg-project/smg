@@ -176,9 +176,12 @@ mod tests {
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry},
-        workflow::steps::local::{
-            create_worker_removal_workflow_data, RemoveFromPolicyRegistryStep,
-            RemoveFromWorkerRegistryStep,
+        workflow::{
+            data::WorkerRemovalWorkflowData,
+            steps::local::{
+                create_worker_removal_workflow_data, RemoveFromPolicyRegistryStep,
+                RemoveFromWorkerRegistryStep,
+            },
         },
     };
 
@@ -224,7 +227,7 @@ mod tests {
     async fn remove_from_registries(
         app_context: &Arc<AppContext>,
         worker: Arc<dyn Worker>,
-    ) -> WorkflowContext<crate::workflow::data::WorkerRemovalWorkflowData> {
+    ) -> WorkflowContext<WorkerRemovalWorkflowData> {
         let url = worker.url().to_string();
         let mut data =
             create_worker_removal_workflow_data(url.clone(), None, Arc::clone(app_context));

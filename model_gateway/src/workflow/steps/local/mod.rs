@@ -442,7 +442,7 @@ mod dp_removal_tests {
 #[cfg(test)]
 mod tests {
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, TokenizerRegistry};
-    use wfaas::{StepExecutor, StepId, WorkflowContext, WorkflowInstanceId};
+    use wfaas::{StepId, WorkflowContext, WorkflowInstanceId};
 
     use super::*;
     use crate::{
