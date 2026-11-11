@@ -105,7 +105,7 @@ impl TenantCharge for ChatCompletionRequest {
                         .iter()
                         .flatten()
                         .map(|call| &call.function)
-                        .chain(function_call)
+                        .chain(function_call.as_deref())
                         .filter_map(|function| function.arguments.as_deref())
                         .map(word_count)
                         .sum();
