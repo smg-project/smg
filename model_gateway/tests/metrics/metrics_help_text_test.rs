@@ -40,6 +40,7 @@ async fn every_smg_family_has_help_text() {
     Metrics::record_worker_manual_policy_branch("vacant");
     Metrics::record_worker_consistent_hashing_policy_branch("routing_key_hit");
     Metrics::record_worker_prefix_hash_policy_branch("ring_hit");
+    Metrics::record_policy_decision("help-model", "default", "pick", "embedded");
     Metrics::set_worker_routing_keys_active(worker, 1);
     Metrics::record_pd_admission_wait();
     Metrics::record_pd_admission_shed();
