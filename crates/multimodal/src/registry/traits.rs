@@ -287,10 +287,13 @@ pub trait ModelProcessorSpec: Send + Sync {
     }
 
     /// Whether the family sizes its source images itself before the processor
-    /// runs (the long-side rule of [`crate::minimax_resize`]): the gateway
-    /// then plans the geometry when it fetches and marks the frame as sized
-    /// for the processor. `false` for a family whose processor takes the
-    /// source as decoded.
+    /// runs. `true` opts the family into the MiniMax rule of
+    /// [`crate::minimax_resize`]: the gateway then plans the geometry when it
+    /// fetches and marks the frame as sized for the processor. On an SGLang
+    /// worker it also opts into that rule's day-0 image and video preprocessor
+    /// overrides, applied when the worker loads the model's configs. A family
+    /// with a different source rule needs its own answer, not this one. `false`
+    /// for a family whose processor takes the source as decoded.
     fn resizes_source_images(&self) -> bool {
         false
     }
