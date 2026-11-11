@@ -1196,6 +1196,7 @@ fn build_external_worker_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm::{WasmModuleDescriptor, WasmModuleType};
 
     /// A job line writes a worker's address masked and a non-address name as
     /// it is; a job type the list does not name counts as a worker's, so a
@@ -1225,6 +1226,31 @@ mod tests {
         ] {
             assert_eq!(Job::shown_worker(job_type, name), name, "{job_type}");
         }
+    }
+
+    /// A wasm module job's key is the uuid the submitter assigned (the
+    /// registration) or named (the removal): the in-flight claim, the status
+    /// entry and the outcome waiter hang on it, so a second submission for
+    /// one uuid is refused while the first runs, and the answer names the
+    /// module the job registered.
+    #[test]
+    fn a_wasm_module_jobs_key_is_the_module_uuid() {
+        let module_uuid = uuid::Uuid::now_v7();
+        let descriptor = WasmModuleDescriptor {
+            name: "twin".to_string(),
+            file_path: "/tmp/twin.wasm".to_string(),
+            module_type: WasmModuleType::Middleware,
+            attach_points: Vec::new(),
+            add_result: None,
+        };
+        let registration = Job::AddWasmModule {
+            config: Box::new(WasmModuleConfigRequest::new(descriptor, module_uuid)),
+        };
+        assert_eq!(registration.worker_url(), module_uuid.to_string());
+        let removal = Job::RemoveWasmModule {
+            request: Box::new(WasmModuleRemovalRequest::new(module_uuid)),
+        };
+        assert_eq!(removal.worker_url(), module_uuid.to_string());
     }
 
     /// A finished job's outcome reaches the waiter under its key once, and
