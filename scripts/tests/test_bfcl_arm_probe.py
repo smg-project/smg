@@ -400,9 +400,15 @@ def test_real_slow_http_cannot_overrun_the_whole_probe_budget(tmp_path, phase, m
     assert result.returncode == (1 if mode == "--wait-ready" else 0), result.stderr
     rows = [json.loads(line) for line in (tmp_path / "arm_b_state.log").read_text().splitlines()]
     assert len(rows) == 1
-    assert "error" in rows[0]["readiness"]
+    # The deadline error is the proof the probe gave up inside its budget, whether
+    # or not the server was ever reached (urllib can wrap the TimeoutError).
+    assert rows[0]["readiness"]["error"] in ("TimeoutError", "URLError")
     assert not probe.ready(rows[0]["readiness"])
-    assert len(calls) == 1  # No further I/O once the shared caller budget is spent.
+    # No further I/O once the shared caller budget is spent: the server saw at most
+    # one request. None when the budget was spent before the probe's first connect
+    # (a slow runner spends the 10 ms budget before the socket opens), one when the
+    # trickle was cut; never two. The count is not a clock.
+    assert len(calls) <= 1
     assert "PRIVATE" not in json.dumps(rows)
 
 
