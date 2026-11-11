@@ -12,7 +12,10 @@ mod request_format_tests {
     use async_trait::async_trait;
     use axum::{
         body::Body,
-        http::{header::CONTENT_TYPE, HeaderMap, Request, StatusCode},
+        http::{
+            header::{CONTENT_ENCODING, CONTENT_TYPE},
+            HeaderMap, Request, StatusCode,
+        },
         response::{IntoResponse, Response},
     };
     use openai_protocol::chat::ChatCompletionRequest;
@@ -79,6 +82,76 @@ mod request_format_tests {
         // The router forwards effort verbatim and injects no default; the chat
         // template applies its own default when it is absent.
         assert!(reasoning_effort.is_none());
+    }
+
+    /// `{"model":"mock-model","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`
+    /// under `gzip -n -9` (90 bytes): a valid chat request under a content
+    /// coding the gateway does not decode.
+    const GZIP_CHAT_BODY: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xab, 0x56, 0xca, 0xcd, 0x4f, 0x49, 0xcd, 0x51, 0xb2, 0x02, 0xd2, 0xc9, 0xd9, 0xba, 0x10, 0x8e, 0x8e, 0x52, 0x6e, 0x6a, 0x71, 0x71, 0x62, 0x7a, 0x6a, 0xb1, 0x92, 0x55, 0x74, 0xb5, 0x52, 0x51, 0x7e, 0x4e, 0x2a, 0x50, 0x41, 0x69, 0x71, 0x6a, 0x11, 0x50, 0x2a, 0x39, 0x3f, 0xaf, 0x24, 0x35, 0xaf, 0x04, 0x28, 0x90, 0x91, 0xa9, 0x54, 0x1b, 0x0b, 0x54, 0x9b, 0x58, 0x11, 0x5f, 0x92, 0x9f, 0x9d, 0x9a, 0x07, 0x54, 0x6d, 0x58, 0x0b, 0x00, 0x1b, 0x7f, 0x8c, 0xf1, 0x51, 0x00, 0x00, 0x00
+    ];
+
+    /// A request body under a content coding the gateway does not decode is
+    /// refused by the coding's name (`415`, the envelope, the remedy) before
+    /// any parser reads it; the same request under `identity` reaches the
+    /// router. Red over the edge as it stood: the gzip bytes reached the JSON
+    /// extractor and were refused as malformed JSON (`400 invalid_json`).
+    #[tokio::test]
+    async fn a_request_body_under_a_content_coding_is_refused_by_its_coding_before_the_parser() {
+        let capture = Arc::new(CapturingChatRouter::default());
+        let app_context = create_test_app_context().await;
+        let app = create_test_app_with_context(capture.clone(), app_context);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_ENCODING, "gzip")
+                    .body(Body::from(GZIP_CHAT_BODY))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a gzip body is refused by its coding, not parsed as JSON"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(envelope["error"]["type"], "invalid_request_error", "{envelope}");
+        assert_eq!(envelope["error"]["code"], "json_parse_error", "{envelope}");
+        let message = envelope["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("'gzip'") && message.contains("identity"),
+            "the message names the coding and the remedy: {message}"
+        );
+        assert!(
+            capture.request.lock().unwrap().is_none(),
+            "the router never saw the encoded request"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_ENCODING, "identity")
+                    .body(Body::from(
+                        r#"{"model":"mock-model","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "identity is no coding");
+        assert!(capture.request.lock().unwrap().is_some());
     }
 
     #[tokio::test]
