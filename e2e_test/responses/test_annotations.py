@@ -222,35 +222,35 @@ def openai_direct_client():
 
 
 # How long the fixture waits for the provider to index the attached file. Indexing takes
-# seconds on a normal day and took 10 to 17 minutes on a slow one; the SDK's poll has no
-# deadline of its own, and the lane that runs this suite has a 30-minute cap with about
-# 20 minutes of setup and other tests inside it. A file still indexing at the deadline
-# skips the class with the reason in the log, instead of running a required job into its
-# cap with every test that ran green. The bounded poll's keyword exists on the SDK from openai
-# 3.14; the harness lists the package with no floor, since its project installs into the engine
-# venvs and the engines pin their own SDK versions, and an older SDK fails loudly here, at the
-# fixture's setup, with an unexpected keyword.
+# seconds on a normal day and took 10 to 17 minutes on a slow one; the lane that runs this
+# suite has a 30-minute cap with about 20 minutes of setup and other tests inside it. A file
+# still indexing at the deadline skips the class with the reason in the log, instead of running
+# a required job into its cap with every test that ran green. The poll uses the two calls every
+# SDK version has (the SDK's own bounded poll is a keyword of a later version, and the harness
+# project is installed into the engine venvs, whose engines pin their own SDK), on a client copy
+# with a short per-request timeout, so a request in flight cannot outlive the wait.
 _VECTOR_STORE_INDEX_DEADLINE_S = 300
+_VECTOR_STORE_POLL_INTERVAL_S = 2.0
 _VECTOR_STORE_POLL_REQUEST_TIMEOUT_S = 30.0
 
 
 def _index_vector_store_file(client, vector_store_id: str, file_id: str) -> None:
     """Attach the file to the vector store and wait, bounded, for the provider to index it."""
-    # The SDK reads its deadline between polls only; a request in flight runs to the
-    # client's own timeout (ten minutes, retried), so the poll's client gets a short one.
     poll_client = client.with_options(timeout=_VECTOR_STORE_POLL_REQUEST_TIMEOUT_S)
-    try:
-        vs_file = poll_client.vector_stores.files.create_and_poll(
-            vector_store_id=vector_store_id,
-            file_id=file_id,
-            max_wait_seconds=_VECTOR_STORE_INDEX_DEADLINE_S,
-        )
-    except TimeoutError:
-        pytest.skip(
-            f"vector store file {file_id} is still in_progress after "
-            f"{_VECTOR_STORE_INDEX_DEADLINE_S}s: the provider's indexing is slow, not the "
-            "gateway; the file_citation tests need the indexed store and are skipped"
-        )
+    vs_file = poll_client.vector_stores.files.create(
+        vector_store_id=vector_store_id, file_id=file_id
+    )
+    deadline = time.monotonic() + _VECTOR_STORE_INDEX_DEADLINE_S
+    while vs_file.status == "in_progress":
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.skip(
+                f"vector store file {file_id} is still in_progress after "
+                f"{_VECTOR_STORE_INDEX_DEADLINE_S}s: the provider's indexing is slow, not the "
+                "gateway; the file_citation tests need the indexed store and are skipped"
+            )
+        time.sleep(min(_VECTOR_STORE_POLL_INTERVAL_S, remaining))
+        vs_file = poll_client.vector_stores.files.retrieve(file_id, vector_store_id=vector_store_id)
     if vs_file.status != "completed":
         pytest.fail(f"vector store file {file_id} indexing {vs_file.status}: {vs_file.last_error}")
 
