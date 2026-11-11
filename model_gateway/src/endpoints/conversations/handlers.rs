@@ -14,7 +14,7 @@ use smg_data_connector::{
     ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
     SortOrder, StorageFailure,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::routers::{
     common::{openai_bridge, persistence_utils::item_to_json},
@@ -189,9 +189,17 @@ fn apply_metadata_patches(
 // ============================================================================
 
 /// `POST /v1/conversations`: the conversation is scoped to the caller's
-/// `tenant`.
+/// `tenant`. Its `items`, when the request carries any, are stored and linked
+/// through the path of `POST /v1/conversations/{id}/items` (the same bounds,
+/// refusals and `warnings`), so a conversation created with items and one
+/// created empty and given the same items list the same. An item refused
+/// before any store is asked (the bounds, an unsupported type, a message
+/// without a role) leaves no conversation behind; one the stores refuse (an
+/// unknown reference, an id of another tenant) deletes the conversation just
+/// created, so a refused create creates nothing.
 pub async fn create_conversation(
     storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     tenant: Option<&str>,
     body: Value,
 ) -> Response {
@@ -199,6 +207,20 @@ pub async fn create_conversation(
         Ok(m) => m,
         Err(msg) => return bad_request(msg),
     };
+    let items = match items_of(&body, false) {
+        Ok(items) => items,
+        Err(response) => return response,
+    };
+    // What the item parser refuses it refuses without a store: say so before
+    // the conversation exists (an `item_reference` is resolved by the store).
+    for item in items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("item_reference"))
+    {
+        if let Err(message) = parse_item_from_value(item, tenant) {
+            return bad_request(message);
+        }
+    }
 
     let new_conv = NewConversation {
         id: None,
@@ -206,13 +228,34 @@ pub async fn create_conversation(
         tenant: tenant.map(str::to_string),
     };
 
-    match storage.create_conversation(new_conv).await {
-        Ok(conversation) => {
-            info!(conversation_id = %conversation.id.0, "Created conversation");
-            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
+    let conversation = match storage.create_conversation(new_conv).await {
+        Ok(conversation) => conversation,
+        Err(e) => return store_error("Failed to create conversation", &e),
+    };
+    info!(conversation_id = %conversation.id.0, "Created conversation");
+    let mut answer = conversation_to_json(&conversation);
+    if !items.is_empty() {
+        match store_items(item_storage, &conversation.id, items, tenant).await {
+            Ok((_, warnings)) => {
+                if !warnings.is_empty() {
+                    if let Some(obj) = answer.as_object_mut() {
+                        obj.insert("warnings".to_string(), json!(warnings));
+                    }
+                }
+            }
+            Err(response) => {
+                if let Err(e) = storage.delete_conversation(&conversation.id).await {
+                    warn!(
+                        conversation_id = %conversation.id.0,
+                        error = %e,
+                        "A conversation whose items were refused could not be deleted"
+                    );
+                }
+                return response;
+            }
         }
-        Err(e) => store_error("Failed to create conversation", &e),
     }
+    (StatusCode::OK, Json(answer)).into_response()
 }
 
 pub async fn get_conversation(
@@ -364,55 +407,15 @@ pub async fn create_conversation_items(
         return response;
     }
 
-    let items_array = match body.get("items").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return bad_request("Missing or invalid 'items' field"),
+    let items = match items_of(&body, true) {
+        Ok(items) => items,
+        Err(response) => return response,
     };
-
-    if items_array.len() > MAX_ITEMS_PER_REQUEST {
-        return bad_request(format!(
-            "Cannot add more than {MAX_ITEMS_PER_REQUEST} items at a time"
-        ));
-    }
-
-    // Bounded before any store is asked, for the whole batch: the stores' id columns are
-    // this wide, and a later item's over-long id must not leave earlier items behind.
-    if let Some(id_str) = items_array
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str))
-        .find(|id| id.len() > MAX_ITEM_ID_LENGTH)
-    {
-        return item_id_above_max_length(id_str);
-    }
-
-    let mut created_items = Vec::new();
-    let mut warnings = Vec::new();
-    let mut link_pairs = Vec::new();
-    let mut seen_ids = HashSet::new();
-    // One stamp per item, each later than the one before: the stores order a conversation's
-    // items by `added_at`, so the items of this call list in the order the request gave them.
-    let mut stamps = AddedAtSequence::new();
-
-    for item_val in items_array {
-        let added_at = stamps.next_added_at();
-        match process_item(item_storage, &conversation_id, item_val, added_at, tenant).await {
-            Ok((item_json, item_id, warning)) => {
-                if seen_ids.insert(item_id.0.clone()) {
-                    link_pairs.push((item_id, added_at));
-                }
-                created_items.push(item_json);
-                if let Some(w) = warning {
-                    warnings.push(w);
-                }
-            }
+    let (created_items, warnings) =
+        match store_items(item_storage, &conversation_id, items, tenant).await {
+            Ok(stored) => stored,
             Err(response) => return response,
-        }
-    }
-
-    // Batch-link all items in a single operation
-    if let Err(e) = item_storage.link_items(&conversation_id, &link_pairs).await {
-        return store_error("Failed to link items to conversation", &e);
-    }
+        };
 
     let mut response = json!({
         "object": "list",
@@ -429,6 +432,74 @@ pub async fn create_conversation_items(
     }
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// The `items` of a request body: the array, its per-request bound and the
+/// id-length bound, read before any store is asked. An absent or null field is
+/// the refusal when `required` (the add-items route) and an empty batch
+/// otherwise (the create route, whose `items` are optional).
+fn items_of(body: &Value, required: bool) -> Result<&[Value], Response> {
+    let items_array: &[Value] = match body.get("items") {
+        Some(Value::Array(items)) => items,
+        None | Some(Value::Null) if !required => &[],
+        _ => return Err(bad_request("Missing or invalid 'items' field")),
+    };
+
+    if items_array.len() > MAX_ITEMS_PER_REQUEST {
+        return Err(bad_request(format!(
+            "Cannot add more than {MAX_ITEMS_PER_REQUEST} items at a time"
+        )));
+    }
+
+    // Bounded before any store is asked, for the whole batch: the stores' id columns are
+    // this wide, and a later item's over-long id must not leave earlier items behind.
+    if let Some(id_str) = items_array
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .find(|id| id.len() > MAX_ITEM_ID_LENGTH)
+    {
+        return Err(item_id_above_max_length(id_str));
+    }
+    Ok(items_array)
+}
+
+/// The items of one request stored and linked into `conversation_id` in the
+/// order given: each item as the public API lists it, and the warnings of the
+/// item types accepted but not implemented. A refused item ends the batch with
+/// its refusal.
+async fn store_items(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: &ConversationId,
+    items: &[Value],
+    tenant: Option<&str>,
+) -> Result<(Vec<Value>, Vec<String>), Response> {
+    let mut created_items = Vec::new();
+    let mut warnings = Vec::new();
+    let mut link_pairs = Vec::new();
+    let mut seen_ids = HashSet::new();
+    // One stamp per item, each later than the one before: the stores order a conversation's
+    // items by `added_at`, so the items of this call list in the order the request gave them.
+    let mut stamps = AddedAtSequence::new();
+
+    for item_val in items {
+        let added_at = stamps.next_added_at();
+        let (item_json, item_id, warning) =
+            process_item(item_storage, conversation_id, item_val, added_at, tenant).await?;
+        if seen_ids.insert(item_id.0.clone()) {
+            link_pairs.push((item_id, added_at));
+        }
+        created_items.push(item_json);
+        if let Some(w) = warning {
+            warnings.push(w);
+        }
+    }
+
+    // Batch-link all items in a single operation
+    item_storage
+        .link_items(conversation_id, &link_pairs)
+        .await
+        .map_err(|e| store_error("Failed to link items to conversation", &e))?;
+    Ok((created_items, warnings))
 }
 
 /// Process a single item for creation. Returns (json, item_id, warning).
@@ -903,6 +974,147 @@ mod tests {
             .unwrap());
     }
 
+    /// A conversation created with `items` lists them, in the order given, as
+    /// a conversation created empty and given the same items does; the
+    /// accepted-but-unimplemented types answer the add-items route's
+    /// `warnings`; a batch the add-items route refuses before any store (over
+    /// the bound, an unsupported type, a malformed field) creates no
+    /// conversation, and one the store refuses leaves none behind.
+    #[tokio::test]
+    async fn a_conversation_created_with_items_lists_them_as_the_add_items_route_stores_them() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let two = json!([
+            {"type": "message", "role": "user", "content": "first"},
+            {"type": "message", "role": "assistant", "content": "second"}
+        ]);
+        let shape = |listed: &Value| -> Vec<Value> {
+            listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| json!([item["type"], item["role"], item["content"], item["status"]]))
+                .collect()
+        };
+
+        let response = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"items": two, "metadata": {"a": "b"}}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json_of(response).await;
+        assert_eq!(created["object"], "conversation", "{created}");
+        assert_eq!(created["metadata"]["a"], "b", "{created}");
+        assert!(created.get("warnings").is_none(), "{created}");
+        let with_items = created["id"].as_str().unwrap().to_string();
+        let listed = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &with_items,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed["data"].as_array().map(Vec::len), Some(2), "{listed}");
+        assert_eq!(listed["data"][0]["content"][0]["text"], "first", "{listed}");
+        assert_eq!(
+            listed["data"][1]["content"][0]["text"], "second",
+            "{listed}"
+        );
+
+        let with_null =
+            create_conversation(&conversations, &items, None, json!({"items": null})).await;
+        assert_eq!(
+            with_null.status(),
+            StatusCode::OK,
+            "a null items field is an absent one"
+        );
+        let empty =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let then_added = empty["id"].as_str().unwrap().to_string();
+        let added = create_conversation_items(
+            &conversations,
+            &items,
+            None,
+            &then_added,
+            json!({"items": two}),
+        )
+        .await;
+        assert_eq!(added.status(), StatusCode::OK);
+        let listed_after = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &then_added,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            shape(&listed),
+            shape(&listed_after),
+            "{listed}\n{listed_after}"
+        );
+
+        let response = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"items": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let warned = json_of(response).await;
+        assert_eq!(
+            warned["warnings"].as_array().map(Vec::len),
+            Some(1),
+            "{warned}"
+        );
+
+        let before = conversations.stored_record_count();
+        let too_many: Vec<Value> = (0..=MAX_ITEMS_PER_REQUEST)
+            .map(|i| json!({"type": "message", "role": "user", "content": format!("m{i}")}))
+            .collect();
+        for (body, status) in [
+            (json!({"items": too_many}), StatusCode::BAD_REQUEST),
+            (
+                json!({"items": [{"type": "bogus"}]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                json!({"items": [{"type": "message", "content": "no role"}]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (json!({"items": "first"}), StatusCode::BAD_REQUEST),
+            (
+                json!({"items": [{"type": "item_reference", "id": "msg_nowhere"}]}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = create_conversation(&conversations, &items, None, body.clone()).await;
+            assert_eq!(response.status(), status, "{body}");
+            assert_eq!(
+                conversations.stored_record_count(),
+                before,
+                "a refused create creates nothing: {body}"
+            );
+        }
+    }
+
     const A: Option<&str> = Some("header:tenant-a");
     const B: Option<&str> = Some("header:tenant-b");
 
@@ -917,7 +1129,8 @@ mod tests {
             Arc::new(MemoryConversationStorage::new());
         let items: Arc<dyn ConversationItemStorage> =
             Arc::new(MemoryConversationItemStorage::new());
-        let created = json_of(create_conversation(&conversations, A, json!({})).await).await;
+        let created =
+            json_of(create_conversation(&conversations, &items, A, json!({})).await).await;
         let conv_id = created["id"].as_str().unwrap().to_string();
         let added = json_of(
             create_conversation_items(
@@ -1018,7 +1231,8 @@ mod tests {
     #[tokio::test]
     async fn another_tenants_item_cannot_be_referenced_or_adopted() {
         let (conversations, items, _conv_a, item_a) = conversation_of_a().await;
-        let created = json_of(create_conversation(&conversations, B, json!({})).await).await;
+        let created =
+            json_of(create_conversation(&conversations, &items, B, json!({})).await).await;
         let conv_b = created["id"].as_str().unwrap().to_string();
 
         let reference = json!({"items": [{"type": "item_reference", "id": item_a}]});
@@ -1042,7 +1256,8 @@ mod tests {
         assert_eq!(listed["data"].as_array().map(Vec::len), Some(0));
 
         // The owner references its own item into a second conversation of its own.
-        let created = json_of(create_conversation(&conversations, A, json!({})).await).await;
+        let created =
+            json_of(create_conversation(&conversations, &items, A, json!({})).await).await;
         let conv_a2 = created["id"].as_str().unwrap().to_string();
         let reference = json!({"items": [{"type": "item_reference", "id": item_a}]});
         let answer =
@@ -1058,7 +1273,8 @@ mod tests {
             Arc::new(MemoryConversationStorage::new());
         let items: Arc<dyn ConversationItemStorage> =
             Arc::new(MemoryConversationItemStorage::new());
-        let created = json_of(create_conversation(&conversations, None, json!({})).await).await;
+        let created =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
         let conv_id = created["id"].as_str().unwrap().to_string();
         for caller in [None, A] {
             assert_eq!(

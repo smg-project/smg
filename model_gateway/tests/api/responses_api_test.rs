@@ -936,9 +936,13 @@ async fn test_conversations_crud_basic() {
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
-    let create_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_body.clone())
-            .await;
+    let create_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_body.clone(),
+    )
+    .await;
     assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
@@ -1012,8 +1016,13 @@ async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
@@ -1036,8 +1045,13 @@ async fn items_added_with_string_content_are_listed_as_typed_parts(
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1134,8 +1148,13 @@ async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -2216,8 +2235,13 @@ async fn test_conversation_items_create_and_get() {
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     assert_eq!(conv_resp.status(), StatusCode::OK);
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
@@ -2322,6 +2346,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
         let conv = conversation_json(
             conversations::create_conversation(
                 &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
                 None,
                 serde_json::json!({}),
             )
@@ -2471,8 +2496,13 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
     };
 
     let conv = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = conv["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2508,8 +2538,13 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 
     // The same reference into another conversation links the item there, once.
     let other = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let other_id = other["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2551,8 +2586,13 @@ async fn test_conversation_items_delete() {
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2652,8 +2692,13 @@ async fn test_conversation_items_max_limit() {
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2698,8 +2743,13 @@ async fn test_conversation_items_unsupported_type() {
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2742,18 +2792,26 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
-    let conv_a_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await;
+    let conv_a_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let conv_a_json: serde_json::Value = serde_json::from_slice(&conv_a_bytes).unwrap();
     let conv_a_id = conv_a_json["id"].as_str().unwrap();
 
-    let conv_b_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await;
+    let conv_b_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
         .await
         .unwrap();
