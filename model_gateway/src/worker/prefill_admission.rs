@@ -366,8 +366,9 @@ struct PrefillAdmissionInner {
 
 struct PrefillAdmissionState {
     waiters: VecDeque<Arc<PrefillWaiter>>,
-    /// Counts releases, so a request that decided outside the lock can
-    /// tell at its queue entry whether a slot freed unseen meanwhile.
+    /// Counts releases and capacity changes, so a request that decided
+    /// outside the lock can tell at its queue entry whether a slot may have
+    /// freed unseen meanwhile.
     releases: u64,
 }
 
@@ -607,8 +608,8 @@ impl PrefillAdmission {
             state.waiters.push_back(Arc::clone(&waiter));
             Metrics::set_pd_prefill_admission_queued(state.waiters.len());
             // The entry's new head decides at once when a slot may have
-            // freed unseen: a release since its read found no waiter to
-            // wake, or it never read the window (it arrived behind a queue
+            // freed unseen: a release or a capacity change since its read
+            // found no waiter to wake, or it never read the window (it arrived behind a queue
             // that drained meanwhile). Otherwise the next release finds it
             // at the front, and it waits.
             let decide_now =
@@ -739,9 +740,12 @@ impl PrefillAdmission {
     }
 
     /// Wake the queue head after worker registration, removal, replacement, or
-    /// health state changes can affect its selection result.
+    /// health state changes can affect its selection result. The change counts
+    /// as a release too: a newcomer deciding outside the lock at that moment
+    /// has no entry to wake yet, and its entry reads the count to decide at
+    /// once rather than sleep until the recheck.
     pub fn notify_capacity_changed(&self) {
-        if let Some(waiter) = self.inner.head_waiter() {
+        if let Some(waiter) = self.inner.capacity_changed() {
             waiter.notify.notify_one();
         }
     }
@@ -804,8 +808,11 @@ enum QueuedAttempt<T> {
 }
 
 impl PrefillAdmissionInner {
-    fn head_waiter(&self) -> Option<Arc<PrefillWaiter>> {
-        self.state.lock().waiters.front().cloned()
+    /// A capacity change counted as a release, and the head to wake for it.
+    fn capacity_changed(&self) -> Option<Arc<PrefillWaiter>> {
+        let mut state = self.state.lock();
+        state.releases = state.releases.wrapping_add(1);
+        state.waiters.front().cloned()
     }
 
     fn release(
@@ -2019,6 +2026,47 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(decisions.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "admitted without a wait on the recheck interval"
+        );
+        assert_eq!(admission.queued_requests(), 0);
+        assert_eq!(worker.load(), 1);
+        drop(admitted);
+    }
+
+    /// A worker's registration or health change lands while a newcomer
+    /// decides outside the lock, after its read and before its queue entry:
+    /// the notification finds no waiter to wake, so the entry must learn of
+    /// it as it learns of a release, and the new head decides at once
+    /// instead of sleeping until the recheck interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_capacity_change_before_the_queue_entry_admits_the_new_head_at_once() {
+        let admission = PrefillAdmission::new(1, 1, Duration::from_secs(10));
+        let worker = worker("http://prefill-decided-capacity-change-before-entry");
+        let decisions = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let admitted = admission
+            .admit_decided(
+                None,
+                || true,
+                |window| {
+                    if decisions.fetch_add(1, Ordering::Relaxed) == 0 {
+                        // The worker comes up while this decision is in
+                        // flight; nobody is queued yet to be woken.
+                        admission.notify_capacity_changed();
+                        PrefillProposal::AtCapacity
+                    } else {
+                        assert!(window.has_capacity(&worker));
+                        PrefillProposal::Proposed(())
+                    }
+                },
+                |capacity, ()| capacity.select(Arc::clone(&worker), ()),
+            )
+            .await
+            .unwrap();
         assert_eq!(decisions.load(Ordering::Relaxed), 2);
         assert_eq!(
             tokio::time::Instant::now(),
