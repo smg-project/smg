@@ -526,9 +526,14 @@ pub struct Best;
 impl Lifecycle for Best {}
 
 /// Push the kept positions in descending score order, ties by draw: per slot
+/// the rows within the band of the best remaining score are one tie, drawn
+/// from uniformly. One pass keeps the five best scores (equal scores in scan
+/// order); while the next best is below the band of the best remaining, that
+/// row stands alone in its band and is the slot's pick with no draw spent.
+/// From the first band that holds several rows on, a slot costs two passes:
 /// the best remaining score is found first, then the rows within the band of
-/// it are one tie, drawn from uniformly. The taken slots live in a fixed
-/// array: nothing is allocated.
+/// it are drawn from. The taken slots live in a fixed array: nothing is
+/// allocated.
 fn push_ranked(
     facts: &RequestFacts<'_>,
     candidates: &[Candidate],
@@ -537,9 +542,38 @@ fn push_ranked(
     band: TieBand,
     out: &mut Targets,
 ) {
+    let slots = MAX_TARGETS.min(kept.len());
+    let mut best_five: [(usize, f32); MAX_TARGETS + 1] =
+        [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
+    let mut len = 0usize;
+    for (i, &s) in scores.iter().enumerate() {
+        if len == best_five.len() && s <= best_five[len - 1].1 {
+            continue;
+        }
+        let mut at = if len < best_five.len() {
+            len += 1;
+            len - 1
+        } else {
+            best_five.len() - 1
+        };
+        while at > 0 && s > best_five[at - 1].1 {
+            best_five[at] = best_five[at - 1];
+            at -= 1;
+        }
+        best_five[at] = (i, s);
+    }
     let mut draw = Draw::new(facts.seed);
     let mut taken = [usize::MAX; MAX_TARGETS];
-    for slot in 0..MAX_TARGETS.min(kept.len()) {
+    let mut filled = 0usize;
+    while filled < slots
+        && (filled + 1 >= len || best_five[filled + 1].1 < best_five[filled].1 - band.0)
+    {
+        let (i, _) = best_five[filled];
+        taken[filled] = i;
+        out.push(target_of(&candidates[kept[i] as usize]));
+        filled += 1;
+    }
+    for slot in filled..slots {
         let mut top = f32::NEG_INFINITY;
         for (i, &s) in scores.iter().enumerate() {
             if !taken[..slot].contains(&i) && s > top {
@@ -1550,6 +1584,49 @@ mod tests {
         ll.on_dispatched(&lease, &pair, Side::Decode, 0);
         ll.on_membership(&Membership::Removed(WorkerId(7)));
         assert_eq!(ll.held(WorkerId(7)), 0);
+    }
+
+    #[test]
+    fn single_bands_are_taken_in_order_and_a_shared_band_behind_them_is_drawn_from() {
+        // Two rows alone in their bands lead every pick in order; the three
+        // rows that share the next band take the third slot by the seed, and
+        // the fourth slot is another of them.
+        let pool = [
+            candidate(0, 0),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+            candidate(4, 0),
+        ];
+        let scores = [0.9f32, 1.0, 0.5, 0.5, 0.5];
+        let mut thirds = [0u32; 5];
+        for seed in 0..300u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut out = Targets::new();
+            Best.pick(
+                &facts,
+                &pool,
+                &kept(5),
+                &scores,
+                TieBand::NORMALIZED,
+                &mut out,
+            );
+            let order: Vec<u32> = out.iter().map(|t| t.position).collect();
+            assert_eq!(&order[..2], &[1, 0], "seed {seed}: {order:?}");
+            assert_eq!(order.len(), 4, "seed {seed}");
+            assert!(
+                order[2] >= 2 && order[3] >= 2 && order[2] != order[3],
+                "seed {seed}: {order:?}"
+            );
+            thirds[order[2] as usize] += 1;
+        }
+        assert!(
+            thirds[2] > 50 && thirds[3] > 50 && thirds[4] > 50,
+            "the shared band is drawn from: {thirds:?}"
+        );
     }
 
     #[test]
