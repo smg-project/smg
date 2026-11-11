@@ -59,6 +59,11 @@ struct Entry {
     /// under a rule without a TTL.
     expires_at_micros: u64,
     recovery: Recovery,
+    /// The pin a decision's claim wrote before any dispatch confirmed it;
+    /// `WorkerId(0)` when none stands. A dispatch of the key to it confirms
+    /// it; one elsewhere withdraws it, so a claim whose commit never came
+    /// cannot push a worker that served out of the pins.
+    claim: WorkerId,
 }
 
 impl Entry {
@@ -74,6 +79,16 @@ impl Entry {
     fn front(&mut self, target: WorkerId) {
         if self.pins[0] != target {
             self.pins = [target, self.pins[0]];
+        }
+    }
+
+    /// Withdraws `claim` from the pins (the pin behind it moves up): its
+    /// commit never came and another worker served the key.
+    fn withdraw(&mut self, claim: WorkerId) {
+        if self.pins[0] == claim {
+            self.pins = [self.pins[1], WorkerId(0)];
+        } else if self.pins[1] == claim {
+            self.pins[1] = WorkerId(0);
         }
     }
 
@@ -142,8 +157,9 @@ impl SessionTable {
     /// another decision moved the pins since this one read them (`seen`),
     /// the newcomer among them is the claim to follow instead, when it is
     /// among this decision's survivors; the pin of record is returned. The
-    /// claim is the one pin made before a commit; one whose commit never
-    /// comes stands until a later dispatch moves it or the TTL sweeps it.
+    /// claim is the one pin made before a commit, and it is marked as such:
+    /// the key's next dispatch confirms it or withdraws it (`dispatched`),
+    /// the TTL sweeps it otherwise.
     pub(crate) fn claim(&self, key: u64, seen: Pins, target: WorkerId) -> WorkerId {
         if key == 0 || target == WorkerId(0) {
             return target;
@@ -155,6 +171,7 @@ impl SessionTable {
                 Recovery::Latest => entry.front(target),
                 Recovery::Original => entry.append(target),
             }
+            entry.claim = target;
             return target;
         }
         entry
@@ -177,6 +194,13 @@ impl SessionTable {
         }
         let mut shard = self.shard(key).lock();
         let entry = shard.entry(key).or_default();
+        // Any dispatch of the key settles a standing claim: to the claimed
+        // worker it is confirmed, elsewhere it is withdrawn, so a claim whose
+        // commit never came cannot rotate a worker that served out of the pins.
+        let claim = std::mem::replace(&mut entry.claim, WorkerId(0));
+        if claim != WorkerId(0) && claim != target {
+            entry.withdraw(claim);
+        }
         if entry.pins[0] == target {
             return;
         }
@@ -409,6 +433,47 @@ mod tests {
             "no key, no claim"
         );
         assert_eq!(table.len(), 2);
+    }
+
+    /// The owner is down, the decision claims B, the commit refuses B and
+    /// dispatches the alternate C: the claim is withdrawn and the owner keeps
+    /// its slot (B served nothing); a dispatch to the claimed worker confirms
+    /// the claim instead, and the normal rule follows after it.
+    #[test]
+    fn a_claim_whose_commit_landed_elsewhere_is_withdrawn_before_the_pins_move() {
+        let table = SessionTable::new();
+        table.lookup(1, 10, &ORIGINAL);
+        table.dispatched(1, false, WorkerId(1));
+        let seen = table.lookup(1, 20, &ORIGINAL);
+        assert_eq!(table.claim(1, seen, WorkerId(2)), WorkerId(2));
+        assert_eq!(table.pins(1), Some([WorkerId(1), WorkerId(2)]));
+        table.dispatched(1, false, WorkerId(3));
+        assert_eq!(
+            table.pins(1),
+            Some([WorkerId(1), WorkerId(3)]),
+            "the owner keeps the lead, the alternate is the failover"
+        );
+        // Under the latest-first recovery the claim led; the alternate leads
+        // instead and the owner stays the failover.
+        let table = SessionTable::new();
+        table.lookup(2, 10, &RULE);
+        table.dispatched(2, false, WorkerId(1));
+        let seen = table.lookup(2, 20, &RULE);
+        assert_eq!(table.claim(2, seen, WorkerId(2)), WorkerId(2));
+        assert_eq!(table.pins(2), Some([WorkerId(2), WorkerId(1)]));
+        table.dispatched(2, false, WorkerId(3));
+        assert_eq!(table.pins(2), Some([WorkerId(3), WorkerId(1)]));
+        // A dispatch to the claimed worker confirms the claim.
+        let seen = table.lookup(2, 30, &RULE);
+        assert_eq!(table.claim(2, seen, WorkerId(4)), WorkerId(4));
+        table.dispatched(2, false, WorkerId(4));
+        assert_eq!(table.pins(2), Some([WorkerId(4), WorkerId(3)]));
+        table.dispatched(2, false, WorkerId(5));
+        assert_eq!(
+            table.pins(2),
+            Some([WorkerId(5), WorkerId(4)]),
+            "a confirmed claim served: the normal rule moves it"
+        );
     }
 
     #[test]

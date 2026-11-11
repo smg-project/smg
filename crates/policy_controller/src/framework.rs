@@ -2407,6 +2407,42 @@ mod tests {
         );
     }
 
+    /// The owner is down; the decision claims the best survivor, the commit
+    /// refuses it and dispatches the alternate: the owner keeps its pin, the
+    /// alternate is the failover, and the owner leads again once it is back.
+    #[test]
+    fn an_alternate_commit_withdraws_the_claim_and_keeps_the_owner() {
+        let engine = session_engine(SessionRule {
+            recovery: Recovery::Original,
+            ..SESSIONS
+        });
+        let key = Identity::hashed(7).hash;
+        let mut pool = vec![candidate(0, 1), candidate(1, 4), candidate(2, 2)];
+        let owner = place_keyed(&engine, &pool, 7, 10);
+        assert_eq!(owner.position, 0);
+        pool[0].health.healthy = false;
+        let decision = decide_keyed(&engine, &pool, 7, 20);
+        let pick = decision.pick().expect("a pick");
+        let claimed = pick.targets.first().expect("a target").id;
+        let alternate = pick.targets.as_slice()[1];
+        assert_ne!(alternate.id, claimed);
+        assert_eq!(engine.sessions.pins(key), Some([owner.id, claimed]));
+        let lease = Lease {
+            session_key: key,
+            session: pick.session,
+            issued_micros: 20,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &alternate, Side::Single, 0);
+        assert_eq!(
+            engine.sessions.pins(key),
+            Some([owner.id, alternate.id]),
+            "the claim is withdrawn, the owner keeps the lead"
+        );
+        pool[0].health.healthy = true;
+        assert_eq!(place_keyed(&engine, &pool, 7, 30).position, 0);
+    }
+
     #[test]
     fn a_key_whose_pins_are_all_down_is_claimed_at_its_decision_too() {
         let engine = session_engine(SESSIONS);
