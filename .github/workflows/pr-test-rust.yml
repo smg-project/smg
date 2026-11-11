@@ -460,6 +460,15 @@ jobs:
           bash scripts/ci_apt_update.sh $sudo
           bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends ffmpeg
 
+      # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
+      - name: Install libjpeg-turbo
+        if: contains(matrix.needs, 'turbojpeg')
+        run: |
+          sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
+          export DEBIAN_FRONTEND=noninteractive
+          bash scripts/ci_apt_update.sh $sudo
+          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends libturbojpeg
+
       - name: Build the Rust tests
         timeout-minutes: 40
         run: |
@@ -472,6 +481,9 @@ jobs:
           # Where ffmpeg is installed, the video container agreement tests must
           # run: a missing tool or encoder fails them instead of skipping them.
           SMG_REQUIRE_VIDEO_TOOLS: ${{ contains(matrix.needs, 'ffmpeg') && '1' || '' }}
+          # Where libjpeg-turbo is installed, the TurboJPEG decode tests must
+          # run: a library that does not load fails them instead of skipping them.
+          SMG_REQUIRE_TURBOJPEG: ${{ contains(matrix.needs, 'turbojpeg') && '1' || '' }}
         run: |
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
@@ -570,7 +582,17 @@ jobs:
           rustup component add clippy
           cargo clippy -p llm-multimodal -p kv-index --all-targets -- -D warnings
 
+      # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
+      - name: Install libjpeg-turbo
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends libturbojpeg
+
       - name: Test the crates with AArch64-only code
+        env:
+          # The library is installed above: the TurboJPEG decode tests must run.
+          SMG_REQUIRE_TURBOJPEG: '1'
         run: |
           source "$HOME/.cargo/env"
           cargo test -p llm-multimodal -p kv-index

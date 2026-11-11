@@ -75,6 +75,32 @@ pub(crate) mod test_support {
     /// an encoder they use is missing.
     pub(crate) const REQUIRE_VIDEO_TOOLS: &str = "SMG_REQUIRE_VIDEO_TOOLS";
 
+    /// Set to a non-empty value where libjpeg-turbo must be installed (CI
+    /// sets it on the jobs that install the library): the TurboJPEG decode
+    /// tests then fail, instead of skipping, when the library does not load.
+    pub(crate) const REQUIRE_TURBOJPEG: &str = "SMG_REQUIRE_TURBOJPEG";
+
+    /// Whether the TurboJPEG library loads, for a test that needs it: where
+    /// it does not, a failure where [`REQUIRE_TURBOJPEG`] is set, else a
+    /// skip said on stderr, so a run with the library present cannot pass
+    /// `test` without running it.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skip says so; the harness shows it under --nocapture"
+    )]
+    pub(crate) fn turbojpeg_or_skip(test: &str) -> bool {
+        if crate::jpeg_turbo::turbojpeg_available() {
+            return true;
+        }
+        let required = std::env::var_os(REQUIRE_TURBOJPEG).is_some_and(|value| !value.is_empty());
+        assert!(
+            !required,
+            "libturbojpeg not found, and {REQUIRE_TURBOJPEG} is set: {test}"
+        );
+        eprintln!("libturbojpeg not found: skipping {test}");
+        false
+    }
+
     /// Reports that `missing` keeps a test or a case from running: a failure
     /// where [`REQUIRE_VIDEO_TOOLS`] is set, a skip said on stderr elsewhere.
     #[expect(

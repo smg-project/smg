@@ -37,7 +37,7 @@ shopt -s inherit_errexit
 
 GATEWAY_SHARDS=3
 
-# shard | path filter | extra setup (comma-separated: golden, ffmpeg, postgres, wasm-fixtures) | test step timeout (minutes)
+# shard | path filter | extra setup (comma-separated: golden, ffmpeg, turbojpeg, postgres, wasm-fixtures) | test step timeout (minutes)
 SHARDS='
 gateway-unit rust-gateway    ffmpeg                 20
 gateway-1    rust-gateway    -                      20
@@ -45,7 +45,7 @@ gateway-2    rust-gateway    -                      20
 gateway-3    rust-gateway    -                      20
 bindings     rust-bindings   -                      20
 tokenizer    rust-tokenizer  -                      20
-multimodal   rust-multimodal golden,ffmpeg          20
+multimodal   rust-multimodal golden,ffmpeg,turbojpeg 20
 symphony     rust-symphony   -                      20
 agentic      rust-agentic    postgres,wasm-fixtures 20
 protocols    rust-protocols  -                      20
