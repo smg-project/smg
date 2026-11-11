@@ -2126,23 +2126,29 @@ impl PDRouter {
         self.policy_registry.pair_needs_request_text()
     }
 
+    /// The text the placement policies read from a count request, if they
+    /// read any, with the request handed back by value: the route's local is
+    /// moved here and back, never borrowed, so it keeps no slot in the task.
+    fn count_tokens_routing_text(
+        body: CountMessageTokensRequest,
+        policies_need_text: bool,
+    ) -> (Option<String>, CountMessageTokensRequest) {
+        let text = policies_need_text.then(|| body.extract_text_for_routing());
+        (text, body)
+    }
+
     /// The count request as the prefill worker receives it (its model the
-    /// canonical one) and the text the placement policies read, if they read
-    /// any: both taken before the send, so the request itself does not ride
-    /// in the route's task across it.
+    /// canonical one), serialized once a worker is selected, so a refusal
+    /// for want of a worker serializes nothing and the request still does not
+    /// ride in the route's task across the send.
     fn count_tokens_wire(
         mut body: CountMessageTokensRequest,
         canonical_model: Option<&str>,
-        policies_need_text: bool,
-    ) -> (Option<String>, serde_json::Result<Bytes>) {
-        let request_text = policies_need_text.then(|| body.extract_text_for_routing());
+    ) -> serde_json::Result<Bytes> {
         if let Some(canonical_model) = canonical_model {
             canonical_model.clone_into(&mut body.model);
         }
-        (
-            request_text,
-            serialize_json_sized(&body, None).map(Bytes::from),
-        )
+        serialize_json_sized(&body, None).map(Bytes::from)
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
@@ -2760,14 +2766,12 @@ impl RouterTrait for PDRouter {
         // holds the tokenizer and prompt template) and no KV handoff.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        // The request is serialized before the send and never borrowed here:
-        // a borrowed local keeps its slot in the task across the awaits that
-        // follow, a second copy of the request per count.
-        let (request_text, wire) = Self::count_tokens_wire(
-            body,
-            canonical_model.as_deref(),
-            self.policies_need_request_text(),
-        );
+        // The request is never borrowed here: a borrowed local keeps its slot
+        // in the task across the awaits that follow, a second copy of the
+        // request per count. It is moved out for its routing text, moved back,
+        // and serialized once a worker is selected.
+        let (request_text, body) =
+            Self::count_tokens_routing_text(body, self.policies_need_request_text());
         let Some(worker) = placement::select_single(
             &self.worker_registry,
             &self.policy_registry,
@@ -2790,7 +2794,7 @@ impl RouterTrait for PDRouter {
             );
         };
 
-        let body = match wire {
+        let body = match Self::count_tokens_wire(body, canonical_model.as_deref()) {
             Ok(bytes) => bytes,
             Err(e) => return Self::handle_serialization_error(e),
         };
@@ -4050,7 +4054,7 @@ mod tests {
     }
 
     #[test]
-    fn count_tokens_wire_reads_the_text_before_the_canonical_model_goes_on_the_wire() {
+    fn count_tokens_wire_reads_the_text_then_forwards_the_canonical_model() {
         let body: CountMessageTokensRequest = serde_json::from_value(json!({
             "model": "alias",
             "messages": [{"role": "user", "content": "count me"}],
@@ -4058,17 +4062,21 @@ mod tests {
         .unwrap();
         let expected_text = body.extract_text_for_routing();
 
-        let (text, wire) = PDRouter::count_tokens_wire(body.clone(), Some("canonical"), true);
+        let (text, body) = PDRouter::count_tokens_routing_text(body, true);
         assert_eq!(text.as_deref(), Some(expected_text.as_str()));
-        let forwarded: Value = serde_json::from_slice(&wire.unwrap()).unwrap();
+        let forwarded: Value = serde_json::from_slice(
+            &PDRouter::count_tokens_wire(body.clone(), Some("canonical")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(forwarded["model"], "canonical");
 
-        let (text, wire) = PDRouter::count_tokens_wire(body, None, false);
+        let (text, body) = PDRouter::count_tokens_routing_text(body, false);
         assert!(
             text.is_none(),
             "no policy reads the text, so none is extracted"
         );
-        let forwarded: Value = serde_json::from_slice(&wire.unwrap()).unwrap();
+        let forwarded: Value =
+            serde_json::from_slice(&PDRouter::count_tokens_wire(body, None).unwrap()).unwrap();
         assert_eq!(
             forwarded["model"], "alias",
             "without a canonical model the request's own goes on the wire"
