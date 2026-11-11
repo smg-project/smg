@@ -440,8 +440,10 @@ ones), the keyed answers under its prompt's key. Nothing found is a miss,
 counted per worker, and the request goes to the canned or realistic engine as
 if no script existed. A scripted answer is served by the wire, not by the
 engine simulator: no load, no KV events, no request record. The prompt's text
-is what an HTTP worker was sent (a message's string content or the `text` of
-its parts, a prompt string or the strings of a prompt array); a gRPC worker
+is what an HTTP worker was sent (the Messages request's top-level `system`,
+a string or text blocks, read ahead of the messages; a message's string
+content or the `text` of its parts; a prompt string or the strings of a
+prompt array); a gRPC worker
 reads the rendered text the gateway sends beside the ids (`original_text`)
 and decodes the ids with its `--tokenizer` only when that is empty, as a ZMQ
 worker always does. Either reads the prompt only while answers filed under a
@@ -460,7 +462,11 @@ chunk of its own, then `[DONE]`; or one JSON body; on `/v1/messages` the pieces 
 `content_block_delta` events between `message_start` and `message_stop`, the
 `message_delta` carrying the stop reason, a text stop as `stop_sequence` (a
 token-id stop is none) and the output usage, with no usage chunk and no
-`[DONE]`) and keys its prompt on its synthetic ids, one
+`[DONE]`; a scripted or armed `error` finish answers a 500 there, as the
+Messages shape has no `error` stop reason, and the gateway retries a 500 on
+another worker, so a scripted error on this route takes the next queued
+answer with it, while the completion routes pass a scripted `error` through
+as a 200 with its finish reason) and keys its prompt on its synthetic ids, one
 per whitespace word of the prompt text (`http::synth_token_ids`). An answer
 without `output_ids` is encoded on the token wires with the worker's
 `--tokenizer`, which must then name local tokenizer files (a directory with

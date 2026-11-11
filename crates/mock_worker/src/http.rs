@@ -819,7 +819,8 @@ impl MessageAnswer {
     async fn response(self, model: &str, stream: bool, in_flight: InFlight) -> Response {
         // An HTTP worker has no engine-failure frame on its wire and the Messages
         // shape has no `error` stop reason: an `error` finish, armed or scripted,
-        // answers a 500 here, as the completion routes' cut does.
+        // answers a 500 here. The completion routes cut an armed one the same
+        // way and pass a scripted one through as a 200 with its finish reason.
         if self.finish_reason == "error" {
             return injected_error(500);
         }
