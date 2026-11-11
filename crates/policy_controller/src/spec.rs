@@ -2464,6 +2464,31 @@ mod tests {
         assert_eq!(engine.needs_for_phase(Phase::Decode), Needs::default());
         assert_eq!(engine.needs_for_phase(Phase::Single), loads);
         assert_eq!(engine.needs_for_phase(Phase::Encode), loads);
+
+        // A decode-phase binding before the pair binding decides the decode
+        // requests that come alone; a pair's decode side is decided by the
+        // binding its prefill lookup resolves to, with that pair's decode
+        // profile. The decode needs carry both.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "decode-only": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "prefill": { "filter": ["healthy"], "pick": "round-robin" },
+            "decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "default": { "filter": ["healthy"], "pick": "round-robin" }
+          },
+          "bindings": [
+            { "match": { "model": "*", "phase": ["decode"] }, "profile": "decode-only" },
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), loads.or(headers));
+        assert_eq!(engine.needs_for("other", Phase::Decode), loads);
+        assert_eq!(engine.needs_for("pd/x", Phase::Prefill), Needs::default());
+        assert_eq!(engine.needs_for_phase(Phase::Decode), loads.or(headers));
+        assert_eq!(engine.needs_for_phase(Phase::Prefill), Needs::default());
     }
 
     #[test]

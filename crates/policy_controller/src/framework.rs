@@ -478,6 +478,26 @@ impl Engine {
                 }
             }
         }
+        // A pair's decode side is decided by the binding its prefill lookup
+        // resolves to ([`Self::decide_pair`]), not by the first binding that
+        // covers the decode phase: the decode slot also carries the decode
+        // profile of every pair binding a prefill lookup can reach.
+        let decode_slot = PHASES.iter().position(|p| *p == Phase::Decode).unwrap_or(0);
+        for binding in bindings
+            .iter()
+            .filter(|b| b.phases.is_empty() || b.phases.contains(&Phase::Prefill))
+        {
+            if binding.plan == Plan::PdPair {
+                if let Some(profile) =
+                    profiles.get(usize::from(profile_index(binding, Phase::Decode)))
+                {
+                    phase_needs[decode_slot] = phase_needs[decode_slot].or(profile.needs());
+                }
+            }
+            if binding.model == "*" {
+                break;
+            }
+        }
         Self {
             profiles,
             bindings,
@@ -499,11 +519,31 @@ impl Engine {
 
     /// What a decision of `phase` for `model` reads: the needs of the stages
     /// of the profile its binding resolves to, nothing when no binding
-    /// matches. The host reads it per worker, at registration, to choose the
-    /// worker's stream.
+    /// matches. A decode decision may also be the decode side of a pair,
+    /// whose profile the prefill lookup names ([`Self::decide_pair`]); the
+    /// decode answer carries that profile's needs too. The host reads it per
+    /// worker, at registration, to choose the worker's stream.
     pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
-        self.profile_for(model, phase)
+        let own = self
+            .profile_for(model, phase)
             .map(|(_, profile)| profile.needs())
+            .unwrap_or_default();
+        match phase {
+            Phase::Decode => own.or(self.pair_decode_needs(model)),
+            _ => own,
+        }
+    }
+
+    /// The needs of the decode profile of the pair binding `model`'s prefill
+    /// lookup resolves to, nothing when that binding is not a pair.
+    fn pair_decode_needs(&self, model: &str) -> Needs {
+        self.binding(model, Phase::Prefill)
+            .filter(|b| b.plan == Plan::PdPair)
+            .and_then(|b| {
+                self.profiles
+                    .get(usize::from(profile_index(b, Phase::Decode)))
+            })
+            .map(Profile::needs)
             .unwrap_or_default()
     }
 
