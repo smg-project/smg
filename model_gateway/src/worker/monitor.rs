@@ -582,6 +582,38 @@ impl WorkerMonitor {
         record: &EngineLoad,
         received_at: Instant,
     ) {
+        self.merge_rank_record(worker, dp_rank, record, received_at, true);
+    }
+
+    /// One rank's record from the gateway's own read of the worker (a poll
+    /// of one rank, a scrape), received at `received_at`: merged over the
+    /// worker's report in place as a pushed record is, so a rank whose
+    /// pushed record waits for the window keeps it, and published at the
+    /// window. The read is no stream: it writes no push receipt, so the
+    /// poll decision stays the poll's, and it leaves the liveness cadence
+    /// alone. Its sample instant is the receipt less the record's age with
+    /// no one-way margin: the reader aged it.
+    pub(crate) fn apply_read_load(
+        self: &Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        self.merge_rank_record(worker, dp_rank, record, received_at, false);
+    }
+
+    /// The in-place merge behind both: `pushed` marks a stream's record,
+    /// which alone carries the one-way margin, the cadence mark and the
+    /// receipt.
+    fn merge_rank_record(
+        self: &Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+        pushed: bool,
+    ) {
         if dp_rank < 0
             || worker
                 .dp_rank()
@@ -589,18 +621,21 @@ impl WorkerMonitor {
         {
             return;
         }
-        let age = Duration::from_millis(u64::from(record.age_ms)) + PUSHED_ONE_WAY_MARGIN;
+        let mut age = Duration::from_millis(u64::from(record.age_ms));
+        if pushed {
+            age += PUSHED_ONE_WAY_MARGIN;
+            // The stream pushes: silence from this worker is judged by the
+            // stream's cadence from now on (`liveness`, the stale rule).
+            worker.note_load_record();
+        }
         let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
         let url = worker.url();
-        // The stream pushes: silence from this worker is judged by the
-        // stream's cadence from now on (`liveness`, the stale rule).
-        worker.note_load_record();
         // The poll decision reads the receipt, not the sample's age: a record
         // that arrives is a stream that works, whatever the engine's clock.
         // A worker's entries are made on its first record; the lookups that
         // find them copy no key.
         let mut reports = self.pushed_reports.lock();
-        {
+        if pushed {
             let mut receipts = self.pushed_at.lock();
             if let Some(ranks) = receipts.get_mut(url) {
                 ranks.insert(dp_rank, received_at);
@@ -637,7 +672,15 @@ impl WorkerMonitor {
         };
         report.sampled_at = Some(sampled_at);
         // What a poll does with a fresh report, read off the worker's own.
-        self.apply_overload_verdict(worker, Some(&*report), "pushed record");
+        self.apply_overload_verdict(
+            worker,
+            Some(&*report),
+            if pushed {
+                "pushed record"
+            } else {
+                "read record"
+            },
+        );
         liveness::on_load_report(
             worker,
             report.total_waiting_reqs(),

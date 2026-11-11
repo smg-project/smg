@@ -789,34 +789,16 @@ impl LoadSink for HostStores {
         let (Some(monitor), Some(worker)) = (self.monitor(), self.resolve(id)) else {
             return;
         };
-        let role = role_of(*worker.worker_type());
+        let record = engine_load_of(row, role_of(*worker.worker_type()));
         match source {
             LoadSource::Stream | LoadSource::Relay(_) => {
-                let record = engine_load_of(row, role);
                 monitor.apply_pushed_load(&worker, i32::from(rank), &record, received_at);
             }
-            // The gateway's own read of one rank takes the poll's path, which
-            // writes no push receipt, over the worker's other published ranks.
+            // The gateway's own read of one rank merges where the stream's
+            // records land, with no push receipt: the poll stays, and a rank
+            // whose pushed record waits for the window keeps it.
             LoadSource::Poll | LoadSource::Scrape => {
-                let read = scheduler_entry_of(rank, row, role);
-                let mut loads: Vec<SchedulerLoadSnapshot> = monitor
-                    .load_snapshot()
-                    .report(worker.url())
-                    .map(|(report, _)| {
-                        report
-                            .loads
-                            .iter()
-                            .filter(|entry| entry.dp_rank != read.dp_rank)
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                loads.push(read);
-                monitor.ingest_polled_report(
-                    &worker,
-                    polled_report_of(loads, received_at),
-                    received_at,
-                );
+                monitor.apply_read_load(&worker, i32::from(rank), &record, received_at);
             }
         }
     }
@@ -835,10 +817,18 @@ impl LoadSink for HostStores {
             return;
         };
         let role = role_of(*worker.worker_type());
+        // A member of a data-parallel group speaks for its own rank: a row
+        // for another rank is dropped, as the stream path drops a record
+        // for one.
+        let own = worker.dp_rank();
         let loads: Vec<SchedulerLoadSnapshot> = rows
             .iter()
+            .filter(|(rank, _)| own.is_none_or(|own| usize::from(*rank) == own))
             .map(|&(rank, row)| scheduler_entry_of(rank, row, role))
             .collect();
+        if loads.is_empty() && !rows.is_empty() {
+            return;
+        }
         monitor.ingest_polled_report(&worker, polled_report_of(loads, polled_at), polled_at);
     }
 
@@ -1341,7 +1331,7 @@ mod tests {
     /// stays, while a stream record of the same worker suppresses it.
     #[test]
     fn a_scrape_record_writes_no_receipt_so_the_poll_stays_through_the_host() {
-        let (runtime, registry, _monitor, host) = monitor_host();
+        let (runtime, registry, monitor, host) = monitor_host();
         let _enter = runtime.enter();
         let worker = ready_worker("http://w:8000", "m");
         registry.register(Arc::clone(&worker)).expect("registered");
@@ -1354,6 +1344,7 @@ mod tests {
             ..LoadRow::default()
         };
         host.record(id, 0, row, t0, LoadSource::Scrape);
+        monitor.flush_pushed();
         assert_eq!(
             host.load(id, 0).map(|sample| sample.row.running),
             Some(4),
@@ -1370,6 +1361,132 @@ mod tests {
             PollMode::Suppressed,
             "the stream's receipt is the one read"
         );
+    }
+
+    /// A read of one rank merges where the stream's records land: a rank
+    /// whose pushed record waits for the window keeps it through another
+    /// rank's scrape, instead of taking the last publish's row back.
+    #[test]
+    fn a_scrape_of_one_rank_keeps_another_ranks_pending_push() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let t0 = Instant::now();
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        host.record(id, 0, row(4), t0, LoadSource::Stream);
+        monitor.flush_pushed();
+        assert_eq!(host.load(id, 0).map(|sample| sample.row.running), Some(4));
+        host.record(
+            id,
+            0,
+            row(9),
+            t0 + Duration::from_millis(10),
+            LoadSource::Stream,
+        );
+        host.record(
+            id,
+            1,
+            row(2),
+            t0 + Duration::from_millis(20),
+            LoadSource::Scrape,
+        );
+        monitor.flush_pushed();
+        assert_eq!(
+            host.load(id, 0).map(|sample| sample.row.running),
+            Some(9),
+            "the pending push outlives the scrape of the other rank"
+        );
+        assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(2));
+        assert_eq!(host.ranks(id), 2);
+    }
+
+    /// A scrape row's sample instant is its receipt less the row's age, as
+    /// a stream record's is: the scorer releases the dispatches made before
+    /// the engine's state was read, not before the publish.
+    #[test]
+    fn a_scrape_rows_sample_instant_is_its_receipt_less_its_age() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let received_at = Instant::now();
+        let row = LoadRow {
+            running: 4,
+            report_age_ms: 300,
+            ..LoadRow::default()
+        };
+        host.record(id, 0, row, received_at, LoadSource::Scrape);
+        monitor.flush_pushed();
+        let sample = host.load(id, 0).expect("the row");
+        assert_eq!(
+            sample.sampled_at,
+            received_at - Duration::from_millis(300),
+            "the age, with no one-way margin"
+        );
+    }
+
+    /// A member of a data-parallel group speaks for its own rank: a record
+    /// or a report row for another rank is dropped, on the read path as on
+    /// the stream's.
+    #[test]
+    fn a_members_record_and_report_keep_only_its_own_rank() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let member: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://m:8000")
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .health_config(no_health_check())
+                .dp_config(1, 2)
+                .build(),
+        );
+        member.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&member)).expect("registered");
+        let id = worker_id(member.as_ref());
+        let t0 = Instant::now();
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        host.report(id, &[(0, row(5))], t0, LoadSource::Poll);
+        assert_eq!(
+            host.ranks(id),
+            0,
+            "a report of another rank alone says nothing"
+        );
+        host.report(id, &[(0, row(5)), (1, row(3))], t0, LoadSource::Poll);
+        assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(3));
+        assert!(
+            host.load(id, 0).is_none(),
+            "the other rank's row is dropped"
+        );
+        host.record(
+            id,
+            0,
+            row(7),
+            t0 + Duration::from_secs(1),
+            LoadSource::Scrape,
+        );
+        host.record(
+            id,
+            1,
+            row(8),
+            t0 + Duration::from_secs(1),
+            LoadSource::Scrape,
+        );
+        monitor.flush_pushed();
+        assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(8));
+        assert!(
+            host.load(id, 0).is_none(),
+            "a record for the other rank is dropped"
+        );
+        assert_eq!(host.ranks(id), 1);
     }
 
     /// The store contract's eviction through the host: a worker that stays
