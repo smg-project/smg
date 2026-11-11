@@ -666,10 +666,17 @@ impl KvEventMonitor {
     /// batches up to their cursor as stale, so a relay without history
     /// leaves them as a reconnect would. A member that stands for the whole
     /// engine pools every rank, so with one on the stream, or joining,
-    /// every member is reset as for a lost history.
+    /// every member is reset as for a lost history. An engine whose batches
+    /// name no rank pools every rank the same way (`saw_unranked`: its
+    /// history rides rank 0's cursor and is every member's), so a joiner
+    /// there resets every member too; the per-rank path would leave rank
+    /// 0's cursor standing and the joiner's replay read as stale.
     pub(super) fn rejoin_members(indexer: &KvIndex, state: &mut EngineStreamState) {
         let joined = std::mem::take(&mut state.joined_late);
-        if joined.iter().any(Option::is_none) || state.members.iter().any(|m| m.rank.is_none()) {
+        if state.saw_unranked
+            || joined.iter().any(Option::is_none)
+            || state.members.iter().any(|m| m.rank.is_none())
+        {
             Self::reset_members(indexer, state, ResyncReason::RankJoined);
             return;
         }
@@ -2138,6 +2145,59 @@ mod tests {
         assert!(sim.state.history_owed.is_empty());
         assert!(!sim.state.starts_from_zero());
         assert_eq!(sim.state.resume_sequence(), 5);
+    }
+
+    /// An engine whose batches name no rank pools every rank: its history
+    /// rides rank 0's cursor and is every member's. A rank worker joining
+    /// it late resets every member, as a whole-engine member does, so the
+    /// round from zero replays that history into the joiner's index; the
+    /// per-rank path would leave rank 0's cursor standing and the replay
+    /// read as stale.
+    #[test]
+    fn a_late_rank_on_an_unranked_engine_receives_the_replayed_history() {
+        let mut sim = Sim::with_ranks(1);
+        assert_eq!(
+            sim.feed(&batch(1, None, vec![stored(None, &[1, 2])])),
+            BatchOutcome::Applied
+        );
+        assert_eq!(
+            sim.feed(&batch(2, None, vec![stored(Some(2), &[3])])),
+            BatchOutcome::Applied
+        );
+        assert!(sim.state.saw_unranked);
+        assert_eq!(sim.blocks_of(0), 3);
+
+        // Rank 1 joins after the stream delivered: the next round starts over.
+        let url = "grpc://w1:9000@1";
+        let worker_id = sim.indexer.intern_worker(url).unwrap();
+        let mut joiner = Member::new(test_worker(url), Some(worker_id));
+        joiner.rank = Some(1);
+        sim.state.members.push(joiner);
+        sim.state.joined_late.push(Some(1));
+        KvEventMonitor::rejoin_members(&sim.indexer, &mut sim.state);
+        // The next round picks its start as the subscription does: from
+        // zero while a rank owes its history, else from the cursors.
+        sim.state.starts_from_zero();
+
+        // The round replays the unranked history: both members index it.
+        assert_eq!(
+            sim.feed(&batch(1, None, vec![stored(None, &[1, 2])])),
+            BatchOutcome::Applied,
+            "the replayed history is not stale to a reset cursor"
+        );
+        assert_eq!(
+            sim.feed(&batch(2, None, vec![stored(Some(2), &[3])])),
+            BatchOutcome::Applied
+        );
+        assert_eq!(
+            (sim.blocks_of(0), sim.blocks_of(1)),
+            (3, 3),
+            "the joiner's index receives the replayed unranked blocks"
+        );
+        assert!(
+            sim.state.history_owed.is_empty(),
+            "every member was reset; no rank owes a history of its own"
+        );
     }
 
     /// A gap in the round from zero (the first batch past an incumbent's
