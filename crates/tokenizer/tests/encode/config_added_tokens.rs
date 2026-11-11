@@ -223,17 +223,19 @@ fn a_content_declared_on_two_ids_is_held_on_the_first() {
 #[test]
 fn an_entry_without_text_takes_no_id() {
     let dir = TempDir::new().expect("a temp dir");
-    // The empty entry is no token and uses no id: `<|audio_end|>` on 3 is the
-    // next token and lands there.
+    // The empty entry sits on the next free id (3), where a placement that
+    // counted it would queue it and the check after the add would find no
+    // token there. It is no token and takes no id, so `<|audio_end|>` on 4
+    // would land on 3: left out, and the load goes through.
     let tokenizer = load(
         &dir,
         &tokenizer_json(&[], &FILE_TOKENS),
-        config(&[(0, ""), (2, "<|im_start|>"), (3, "<|audio_end|>")]),
+        config(&[(2, "<|im_start|>"), (3, ""), (4, "<|audio_end|>")]),
     )
     .expect("the checkpoint loads");
 
-    assert_eq!(tokenizer.token_to_id("<|audio_end|>"), Some(3));
-    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 4);
+    assert_eq!(tokenizer.token_to_id("<|audio_end|>"), None);
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 3);
 }
 
 #[test]
