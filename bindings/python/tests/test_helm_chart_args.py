@@ -1332,6 +1332,40 @@ def test_control_plane_keys_from_an_existing_secret():
 
 
 @needs_helm
+def test_a_custom_control_plane_secret_key_is_read_from_one_value():
+    """``auth.controlPlane.secretKey`` on the chart-managed Secret names the
+    Secret's data key, the mount's item and the file the flag reads: the three
+    render from the one value."""
+    _, documents = render(
+        f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}",
+        "auth.controlPlane.secretKey=keys.txt",
+    )
+    (secret,) = [
+        d
+        for d in documents
+        if d["kind"] == "Secret" and d["metadata"]["name"] == "smg-control-plane"
+    ]
+    assert secret["stringData"] == {"keys.txt": CONTROL_PLANE_KEYS}
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert (
+        args[args.index("--control-plane-api-keys-file") + 1] == "/etc/smg/control-plane/keys.txt"
+    )
+    (volume,) = [v for v in pod["spec"]["volumes"] if v["name"] == "control-plane"]
+    assert volume["secret"] == {
+        "secretName": "smg-control-plane",
+        "items": [{"key": "keys.txt", "path": "keys.txt"}],
+    }
+
+
+@needs_helm
+def test_an_unknown_control_plane_value_fails_the_render():
+    """The schema closes ``auth.controlPlane``: a misspelt key is refused at
+    render, where an open object would render no control-plane keys at all."""
+    assert "existingsecret" in render_error("auth.controlPlane.existingsecret=cp-keys")
+
+
+@needs_helm
 def test_without_control_plane_keys_nothing_names_them():
     _, documents = render()
     pod = router_pod(documents)
