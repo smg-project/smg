@@ -7,6 +7,8 @@ This module handles:
   session-scoped worker pool (``infra.worker_pool``) doesn't have to
   evict-and-restart between consecutive classes that share a backend.
 - Session teardown: Stop all pooled workers on session finish.
+- Rerun record: name every case pytest-rerunfailures ran again (the terminal
+  summary, the run page's annotations, ``reruns.txt`` under ``E2E_LOG_DIR``).
 """
 
 from __future__ import annotations
@@ -122,10 +124,12 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
     # ``hooks.py`` is not itself a conftest — only the functions conftest.py
-    # re-imports act as hooks — so the selection and passing-call reporter is
-    # registered here as a plugin object instead.
+    # re-imports act as hooks — so the selection and passing-call reporter and
+    # the rerun reporter are registered here as plugin objects instead.
     if not config.pluginmanager.has_plugin("e2e_selection_reporter"):
         config.pluginmanager.register(_SelectionReporter(), "e2e_selection_reporter")
+    if not config.pluginmanager.has_plugin("e2e_rerun_reporter"):
+        config.pluginmanager.register(_RerunReporter(), "e2e_rerun_reporter")
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +543,79 @@ class _SelectionReporter:
             # exit here would replace that error's own message and exit code.
             return
         _enforce_selection_floor(len(session.items))
+
+
+# The most of a failure's first line a rerun record keeps: an assertion that
+# quotes a response body can run to kilobytes, and the record is one line.
+_REASON_CHARS = 200
+
+
+def _first_failure_line(report: pytest.TestReport) -> str:
+    """The first line of a failed report's reason, at most ``_REASON_CHARS``
+    long: the crash message of its traceback (``AssertionError: ...``), else
+    the first line of its text."""
+    crash = getattr(report.longrepr, "reprcrash", None)
+    text = crash.message if crash is not None else report.longreprtext
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()[:_REASON_CHARS]
+    return "(no failure text)"
+
+
+def _annotation(record: str) -> str:
+    """The GitHub Actions warning command carrying one rerun record: the
+    runner reads it from the step's output and lists it on the run page."""
+    message = record.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return f"::warning title=e2e rerun::{message}"
+
+
+class _RerunReporter:
+    """Record the reruns of a session.
+
+    pytest-rerunfailures logs a failed attempt it will run again with the
+    outcome ``rerun``. A case that passes on its rerun is green on the row,
+    and the ``RERUN`` mark inside the step log is its only trace. This plugin
+    keeps every rerun (the case, the attempt, the first line of its failure)
+    and puts it where a green row is read: an ``e2e reruns: N`` count and one
+    ``e2e rerun:`` line per rerun in the terminal summary, a warning
+    annotation per rerun on the run page under GitHub Actions, and
+    ``reruns.txt`` under ``E2E_LOG_DIR``, the directory a row's worker logs
+    are uploaded from.
+    """
+
+    def __init__(self) -> None:
+        # Keyed by case and attempt: a call failure and a teardown failure of
+        # one attempt are two rerun reports of one rerun, and the first names it.
+        self.reruns: dict[tuple[str, int], str] = {}
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.outcome != "rerun":
+            return
+        # The plugin counts the attempts before this one on the report.
+        attempt = getattr(report, "rerun", 0) + 1
+        self.reruns.setdefault((report.nodeid, attempt), _first_failure_line(report))
+
+    def records(self) -> list[str]:
+        """One record per rerun: the case, the attempt and its first failure line."""
+        return [
+            f"{nodeid} attempt {attempt} failed: {reason}"
+            for (nodeid, attempt), reason in self.reruns.items()
+        ]
+
+    def pytest_terminal_summary(self, terminalreporter: pytest.TerminalReporter) -> None:
+        records = self.records()
+        lines = [f"e2e rerun: {record}" for record in records]
+        terminalreporter.write_line(f"e2e reruns: {len(records)}")
+        for line in lines:
+            terminalreporter.write_line(line)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            for record in records:
+                terminalreporter.write_line(_annotation(record))
+        log_dir = os.environ.get("E2E_LOG_DIR")
+        if lines and log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, "reruns.txt"), "w", encoding="utf-8") as file:
+                file.write("\n".join(lines) + "\n")
 
 
 def pytest_collection_modifyitems(
