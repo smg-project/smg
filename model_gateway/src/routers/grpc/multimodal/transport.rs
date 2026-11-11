@@ -490,6 +490,7 @@ fn encoder_dtype_label(worker: &dyn Worker) -> Option<String> {
     encoder_dtype_label_with_backend(worker, backend.as_deref())
 }
 
+/// Preserve explicit labels; infer a dtype only when all connected engines agree.
 fn encoder_dtype_label_with_backend(
     worker: &dyn Worker,
     backend: Option<&BackendClient>,
@@ -508,7 +509,12 @@ fn encoder_dtype_label_with_backend(
     let BackendClient::Zmq(client) = backend? else {
         return None;
     };
-    client.ready_response()?.multimodal_encoder_dtype.clone()
+    let dtype = client.ready_response()?.multimodal_encoder_dtype.as_ref()?;
+    client
+        .engines()
+        .iter()
+        .all(|engine| engine.ready_response.multimodal_encoder_dtype.as_ref() == Some(dtype))
+        .then(|| dtype.clone())
 }
 
 /// The router's own encoder dtype overrides, read once from the environment.
@@ -915,7 +921,7 @@ mod tests {
     }
 
     /// A real ZMQ handshake supplies SGLang's dtype without an explicit label;
-    /// overrides win and old schedulers retain float32. Before the handshake,
+    /// overrides win and old or disagreeing schedulers retain float32. Before the handshake,
     /// the one-pass planner must not freeze a layout in the legacy precision.
     #[tokio::test]
     async fn sglang_zmq_dtype_comes_from_the_handshake_unless_overridden() {
@@ -939,32 +945,56 @@ mod tests {
         assert_eq!(shared_image_wire_dtype(&[pending], &policy), None);
 
         for (advertised, explicit, expected) in [
-            (Some("bfloat16"), None, EncoderDtype::BFloat16),
-            (Some("float16"), None, EncoderDtype::Float16),
-            (Some("bfloat16"), Some("float32"), EncoderDtype::Float32),
-            (None, None, EncoderDtype::Float32),
+            (vec![Some("bfloat16")], None, EncoderDtype::BFloat16),
+            (vec![Some("float16"); 2], None, EncoderDtype::Float16),
+            (vec![Some("bfloat16"); 2], None, EncoderDtype::BFloat16),
+            (vec![None; 2], None, EncoderDtype::Float32),
+            (
+                vec![Some("bfloat16"), Some("float32")],
+                None,
+                EncoderDtype::Float32,
+            ),
+            (
+                vec![Some("float16"), Some("bfloat16")],
+                None,
+                EncoderDtype::Float32,
+            ),
+            (vec![Some("bfloat16"), None], None, EncoderDtype::Float32),
+            (vec![None, Some("bfloat16")], None, EncoderDtype::Float32),
+            (
+                vec![Some("bfloat16"), Some("float32")],
+                Some("float16"),
+                EncoderDtype::Float16,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
             let (handshake, input, output) = (ep("hs"), ep("in"), ep("out"));
-            let ready = EngineCoreReadyResponse {
-                multimodal_encoder_dtype: advertised.map(str::to_string),
-                ..default_ready_response()
-            };
-            let (client, engine) = tokio::join!(
+            let count = advertised.len();
+            let ranks = advertised.into_iter().enumerate().map(|(rank, dtype)| {
+                connect_to_frontend(
+                    &handshake,
+                    EngineId::from_engine_index(rank as u32),
+                    EngineCoreReadyResponse {
+                        multimodal_encoder_dtype: dtype.map(str::to_string),
+                        ..default_ready_response()
+                    },
+                )
+            });
+            let (client, engines) = tokio::join!(
                 ZmqEngineClient::connect(
                     &handshake,
                     &input,
                     &output,
-                    1,
+                    count,
                     "m".to_string(),
                     EosTokenIds::default(),
                     RuntimeType::Sglang,
                     Duration::from_secs(10)
                 ),
-                connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
+                futures::future::join_all(ranks),
             );
-            let _engine = engine.unwrap();
+            let _engines: Vec<_> = engines.into_iter().map(Result::unwrap).collect();
             let mut builder = BasicWorkerBuilder::new(ep("worker"))
                 .runtime_type(RuntimeType::Sglang)
                 .connection_mode(ConnectionMode::Zmq)
