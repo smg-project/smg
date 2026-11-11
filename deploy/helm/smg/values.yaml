@@ -239,7 +239,8 @@ router:
   #    and the limits YAML comes from a ConfigMap of yours, mounted whole at
   #    /etc/smg/rate-limit and read with --tenant-rate-limit-config (the key
   #    names the file). Enabled without a ConfigMap is refused at render: the
-  #    gateway requires the file with the flag.
+  #    gateway requires the file with the flag. A ConfigMap without enabled is
+  #    refused too: the gateway would ignore it with a warning at start-up.
   tenantRateLimit:
     enabled: false
     configMap:

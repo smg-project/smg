@@ -1408,12 +1408,16 @@ def test_admission_config_maps_mount_whole_and_render_their_flags():
             "router.priorityScheduler.configMap.name=smg-scheduler",
             "router.priorityScheduler.enabled",
         ),
+        (
+            "router.tenantRateLimit.configMap.name=smg-rate-limit",
+            "router.tenantRateLimit.enabled",
+        ),
     ],
 )
 def test_admission_config_the_gateway_would_refuse_or_ignore_is_refused_at_render(setting, words):
     """The rate limit enabled without its YAML fails at the gateway's start,
-    and a scheduler table without the scheduler is ignored with a warning;
-    the chart refuses both where the values are written."""
+    and a limits or scheduler table without its flag is ignored with a
+    warning; the chart refuses all three where the values are written."""
     assert words in render_error(setting)
 
 

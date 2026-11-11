@@ -2355,6 +2355,8 @@ mod tests {
             "a=b",
             "--priority-scheduler-config",
             "/dev/null",
+            "--tenant-rate-limit-config",
+            "/dev/null",
         ])
         .ignored_companions(&prefill, &encode);
         for flag in [
@@ -2366,6 +2368,7 @@ mod tests {
             "--encode-policy",
             "--selector",
             "--priority-scheduler-config",
+            "--tenant-rate-limit-config",
         ] {
             assert!(
                 ignored.iter().any(|m| m.starts_with(flag)),
@@ -2426,6 +2429,9 @@ mod tests {
             "a=b",
             "--priority-scheduler-enabled",
             "--priority-scheduler-config",
+            "/dev/null",
+            "--tenant-rate-limit-enabled",
+            "--tenant-rate-limit-config",
             "/dev/null",
         ])
         .ignored_companions(&prefill, &[]);
