@@ -737,6 +737,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
+    use crate::test_support::{hex, lcg_bytes};
 
     fn config(max_tokens: usize) -> PreProcessorConfig {
         PreProcessorConfig::from_json(&format!(
@@ -1116,18 +1117,6 @@ mod tests {
             digest: &'static str,
             // (index, Pillow's byte, the reference's byte) where the two kernels part.
             differing: &'static [(usize, u8, u8)],
-        }
-        fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
-            let mut state = seed;
-            (0..count)
-                .map(|_| {
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
-                    ((state >> 16) & 0xff) as u8
-                })
-                .collect()
-        }
-        fn hex(bytes: &[u8]) -> String {
-            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
 
         let cases = [

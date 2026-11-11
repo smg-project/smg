@@ -319,7 +319,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::{encoder_inputs::EncoderDtype, vision::preprocessor_config::PatchSize};
+    use crate::{
+        encoder_inputs::EncoderDtype,
+        test_support::{hex, lcg_rgb_image},
+        vision::preprocessor_config::PatchSize,
+    };
 
     fn create_test_image(width: u32, height: u32) -> DynamicImage {
         let mut img = RgbImage::new(width, height);
@@ -346,26 +350,6 @@ mod tests {
                 "do_normalize":true,"do_convert_rgb":true}"#,
         )
         .unwrap()
-    }
-
-    /// Interleaved RGB bytes from a linear congruential generator: the same
-    /// pixels the reference run that pinned the digests below was given.
-    fn lcg_image(width: u32, height: u32, seed: u32) -> DynamicImage {
-        let mut state = seed;
-        let bytes = (0..width * height * 3)
-            .map(|_| {
-                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
-                ((state >> 16) & 0xff) as u8
-            })
-            .collect();
-        DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, bytes).unwrap())
-    }
-
-    fn sha256_hex(bytes: &[u8]) -> String {
-        Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
     }
 
     #[test]
@@ -488,7 +472,7 @@ mod tests {
     #[test]
     fn a_same_size_batch_stays_bytes() {
         let processor = PixtralProcessor::new();
-        let images = [create_test_image(200, 150), lcg_image(200, 150, 9)];
+        let images = [create_test_image(200, 150), lcg_rgb_image(200, 150, 9)];
 
         let result = processor
             .preprocess(&images.iter().collect::<Vec<_>>())
@@ -679,16 +663,20 @@ mod tests {
                 "fe2efb3ca17a4f269e87df85834b550e9bfc5f96968b24470617a1215c764c4c",
             ),
         ] {
-            let image = lcg_image(width, height, seed);
+            let image = lcg_rgb_image(width, height, seed);
             let result = processor.preprocess(&[&image]).unwrap();
             assert_eq!(result.encoder_input.shape(), &shape, "{width}x{height}");
             assert_eq!(
-                sha256_hex(&result.encoder_input.write_as(EncoderDtype::Float32)),
+                hex(&Sha256::digest(
+                    result.encoder_input.write_as(EncoderDtype::Float32)
+                )),
                 f32_digest,
                 "{width}x{height} f32"
             );
             assert_eq!(
-                sha256_hex(&result.encoder_input.write_as(EncoderDtype::BFloat16)),
+                hex(&Sha256::digest(
+                    result.encoder_input.write_as(EncoderDtype::BFloat16)
+                )),
                 bf16_digest,
                 "{width}x{height} bf16"
             );
