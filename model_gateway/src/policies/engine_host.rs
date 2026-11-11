@@ -14,14 +14,17 @@
 //! the host (`routers::common::placement::select_from`) and the encode items
 //! of an encode-prefill-decode request through [`Decider::decide_encode_items`]
 //! (the gRPC worker-selection stage); the pair and admission paths follow in
-//! later steps. A removed worker's rows leave the
-//! engine's accounting with it ([`Decider::on_worker_removed`], from the
-//! policy registry's removal path), and its session pins go with them: a key
-//! whose owner was removed keeps its failover as the owner, a key with no pin
-//! left is placed afresh. A worker re-registered at the same address is a new
-//! id to the engine, so its old keys do not come back to it (the legacy maps
-//! pin by URL and give them back). The rest of the membership feed (added,
-//! replaced, resized, snapshot) follows in a later step.
+//! later steps. A removed or replaced worker's rows leave the engine's
+//! accounting with it ([`Decider::on_worker_removed`] and
+//! [`Decider::on_worker_replaced`], from the workflow's removal, registration
+//! and property-update steps), and its session pins go with them: a key whose
+//! owner was removed keeps its failover as the owner, a key with no pin left
+//! is placed afresh. A worker re-registered at the same address is a new id
+//! to the engine, so its old keys do not come back to it (the legacy maps pin
+//! by URL and give them back). Mesh imports, which the registry rebuilds and
+//! removes without a workflow, do not reach these hooks yet; they and the
+//! rest of the membership feed (added, resized, snapshot) follow in a later
+//! step.
 //!
 //! A session (the routing-key header, else the rid-derived key) is a
 //! binding's `sessions` rule in the engine: the `manual` policy pins every
