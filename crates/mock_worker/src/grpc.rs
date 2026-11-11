@@ -180,15 +180,27 @@ pub async fn serve_with_listener_until(
         // default, as the engine servicers run.
         // The one scheduler service of the configured wire: the gateway's
         // detection asks each wire's health check in turn and takes the
-        // first that answers, so a second service here would name the
+        // first that answers, so another wire's scheduler here would name the
         // worker's runtime for it.
         let mut builder = Server::builder();
         let routes = match wire {
-            SchedulerWire::TokenSpeed => builder.add_service(
-                tokenspeed::Server::new(service)
-                    .max_decoding_message_size(max_message_bytes)
-                    .max_encoding_message_size(max_message_bytes),
-            ),
+            // An encode worker on this wire mounts the engine's encoder service
+            // beside the scheduler's, as the servicer does: the gateway's encode
+            // request is that service's `Encode`.
+            SchedulerWire::TokenSpeed => {
+                let encoder = (service.cfg.role == Some(Role::Encode)).then(|| {
+                    tokenspeed::EncoderServer::new(service.clone())
+                        .max_decoding_message_size(max_message_bytes)
+                        .max_encoding_message_size(max_message_bytes)
+                });
+                builder
+                    .add_service(
+                        tokenspeed::Server::new(service)
+                            .max_decoding_message_size(max_message_bytes)
+                            .max_encoding_message_size(max_message_bytes),
+                    )
+                    .add_optional_service(encoder)
+            }
             SchedulerWire::Vllm => builder.add_service(
                 vllm::Server::new(service)
                     .max_decoding_message_size(max_message_bytes)
