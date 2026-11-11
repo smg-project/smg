@@ -728,7 +728,8 @@ mod history_tests {
             "{shapes:?}"
         );
         let refused = conversions::responses_to_chat(&loaded)
-            .expect_err("a result no call before it issued is a malformed history");
+            .expect_err("a result no call before it issued is a malformed history")
+            .to_string();
         assert!(refused.contains("call_unknown"), "{refused}");
     }
 

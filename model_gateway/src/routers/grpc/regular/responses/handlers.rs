@@ -184,10 +184,7 @@ async fn route_responses_streaming(
     let chat_request = match conversions::responses_to_chat(&modified_request) {
         Ok(req) => Arc::new(req),
         Err(e) => {
-            return error::bad_request(
-                "convert_request_failed",
-                format!("Failed to convert request: {e}"),
-            );
+            return error::bad_request(e.code(), format!("Failed to convert request: {e}"));
         }
     };
 
