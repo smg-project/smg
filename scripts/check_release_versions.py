@@ -9,8 +9,8 @@ a link (the proto package ships crates/grpc_client/proto that way) ships their c
 too, so they move its version. A version is bumped when no release tag
 ``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
 code: the registries take a version once. A crate held at its published version is
-republished when a workspace dependency's new version leaves the requirement its published
-copy carries (cargo's caret): at a patch step, or at the dependency's step when the crate's
+republished when a workspace dependency's new version leaves a requirement its published
+copy carries (cargo's caret): at a patch step, or at its own breaking step when the crate's
 public API carries the dependency. Then the files that must mirror the gateway's
 version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
 ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch), stepped past the
@@ -642,9 +642,10 @@ def report(verdict: Verdict, out: Out) -> None:
     where, n = f"({c.path}/)", f"{verdict.files_changed} file(s) changed"
     ok, warn, bad = out.paint("green", "✓"), out.paint("yellow", "!"), out.paint("red", "✗")
     if verdict.dependency:
+        plural = "s" if "; " in verdict.dependency else ""
         out.line(
-            f"  {warn} {name} {where} — unchanged, but its published requirement {verdict.dependency}"
-            f" [{out.level(verdict.level)}]"
+            f"  {warn} {name} {where} — unchanged, but its published requirement{plural}"
+            f" {verdict.dependency} [{out.level(verdict.level)}]"
         )
     elif verdict.unbumped:
         carried = f", {verdict.carried_by}'s" if verdict.carried_by else ""
@@ -680,17 +681,19 @@ def caret_accepts(requirement: str, version: str) -> bool:
     return new == old
 
 
-def move_level(old: str, new: str) -> str:
-    """The step a move from ``old`` to ``new`` is."""
-    before = [int(n) for n in old.split("-")[0].split(".")]
-    after = [int(n) for n in new.split("-")[0].split(".")]
-    if after[0] != before[0]:
-        return "major"
-    return "minor" if after[1] != before[1] else "patch"
+LEVELS = ("patch", "minor", "major")
+
+
+def breaking_level(version: str) -> str:
+    """The step that leaves a version's own caret: major from 1.0 on, minor at 0.y, patch at 0.0.z."""
+    if not SEMVER.match(version):
+        raise Fatal(f"the dependency rule only steps X.Y.Z versions, got: {version}")
+    major, minor, _ = (int(part) for part in version.split("."))
+    return "major" if major else "minor" if minor else "patch"
 
 
 def manifest_at(repo: Repo, ref: str, component: Component) -> dict:
-    """The component's manifest at the ref, parsed; empty when it is not there or not TOML."""
+    """The component's manifest at the ref, parsed; empty when it is not there."""
     text = next(
         (text for path in with_legacy(component.version_file) if (text := repo.show(ref, path))),
         None,
@@ -699,32 +702,43 @@ def manifest_at(repo: Repo, ref: str, component: Component) -> dict:
         return {}
     try:
         return tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
-        return {}
+    except tomllib.TOMLDecodeError as error:
+        raise Fatal(f"{component.version_file} at {ref} is not TOML: {error}") from None
+
+
+def dependency_entries(manifest: dict) -> list[tuple[str, object]]:
+    """The entries of a manifest's published dependency tables: ``[dependencies]`` and
+    ``[build-dependencies]``, at the top and under every ``[target.<cfg>]``; dev-dependencies
+    are not published requirements."""
+    tables = [manifest, *(t for t in manifest.get("target", {}).values() if isinstance(t, dict))]
+    return [
+        (key, spec)
+        for table in tables
+        for section in ("dependencies", "build-dependencies")
+        for key, spec in table.get(section, {}).items()
+    ]
 
 
 def published_requirements(
-    repo: Repo, tag: str, component: Component, crates: Sequence[Component]
+    repo: Repo, ref: str, component: Component, crates: Sequence[Component]
 ) -> dict[str, str]:
-    """A crate's requirements on the workspace crates as its copy at the tag carries them, per
-    crate name: the root's pin for a ``workspace = true`` entry, the entry's own version
-    otherwise. Dev-dependencies are not published requirements."""
-    parsed = manifest_at(repo, tag, component)
-    root = repo.show(tag, "Cargo.toml") or ""
+    """A crate's requirements on the workspace crates as its copy at the ref (the release tag
+    that carries its version) carries them, per crate name: the root's pin for a
+    ``workspace = true`` entry, the entry's own version otherwise."""
+    root = repo.show(ref, "Cargo.toml") or ""
     by_key = {c.dep_key or c.name: c.name for c in crates}
     requirements: dict[str, str] = {}
-    for section in ("dependencies", "build-dependencies"):
-        for key, spec in parsed.get(section, {}).items():
-            key = spec.get("package", key) if isinstance(spec, dict) else key
-            name = by_key.get(key)
-            if name is None or name == component.name:
-                continue
-            if isinstance(spec, dict) and spec.get("workspace"):
-                pinned = workspace_dep_version(root, key)
-            else:
-                pinned = spec.get("version") if isinstance(spec, dict) else spec
-            if isinstance(pinned, str) and SEMVER.match(pinned):
-                requirements[name] = pinned
+    for key, spec in dependency_entries(manifest_at(repo, ref, component)):
+        key = spec.get("package", key) if isinstance(spec, dict) else key
+        name = by_key.get(key)
+        if name is None or name == component.name:
+            continue
+        if isinstance(spec, dict) and spec.get("workspace"):
+            pinned = workspace_dep_version(root, key)
+        else:
+            pinned = spec.get("version") if isinstance(spec, dict) else spec
+        if isinstance(pinned, str) and SEMVER.match(pinned):
+            requirements[name] = pinned
     return requirements
 
 
@@ -734,68 +748,152 @@ def source_name(repo: Repo, dependent: Component, dep: Component) -> str:
     workspace entry's), else the dependency's library name (``[lib] name``, by default the
     package name). Both manifests are read at HEAD, with the sources."""
     key = dep.dep_key or dep.name
-    manifest = manifest_at(repo, "HEAD", dependent)
-    for section in ("dependencies", "build-dependencies"):
-        for own_key, spec in manifest.get(section, {}).items():
-            package = spec.get("package") if isinstance(spec, dict) else None
-            if package == dep.name or (package is None and own_key == key):
-                key = own_key
+    for own_key, spec in dependency_entries(manifest_at(repo, "HEAD", dependent)):
+        package = spec.get("package") if isinstance(spec, dict) else None
+        if package == dep.name or (package is None and own_key == key):
+            key = own_key
     if key != dep.name:
         return key.replace("-", "_")
     lib = manifest_at(repo, "HEAD", dep).get("lib", {})
     return lib.get("name") or dep.name.replace("-", "_")
 
 
+COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+USE_TREE = re.compile(r"\buse\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*([^;]*?))?\s*;", re.S)
+NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
+def imported_names(text: str, ident: str) -> set[str] | None:
+    """The names the ``use`` statements of a source bring in from the crate ``ident``: the leaf
+    of each path, or its ``as`` alias. None when a glob import leaves them unknown."""
+    names: set[str] = set()
+    for match in USE_TREE.finditer(text):
+        if match[1] != ident:
+            continue
+        tree = match[2] or ""
+        if "*" in tree:
+            return None
+        for item in re.sub(r"[{}]", ",", tree).split(","):
+            item = item.strip()
+            if not item or item.endswith("::"):
+                continue
+            alias = re.search(rf"\bas\s+({NAME})$", item)
+            leaf = alias[1] if alias else item.rsplit("::", 1)[-1].strip()
+            if leaf != "self" and re.fullmatch(NAME, leaf):
+                names.add(leaf)
+    return names
+
+
+def public_spans(text: str) -> list[str]:
+    """The heads of a source's public items: from a bare ``pub`` (``pub(crate)`` and its kin are
+    not public) or an ``impl`` to the ``{``, ``;``, ``,`` or ``}`` that ends the head outside
+    every bracket, across wrapped lines; a ``pub enum`` or ``pub trait`` keeps its body, whose
+    variants and methods are public without the word."""
+    spans: list[str] = []
+    for match in re.finditer(r"\b(?:pub|impl)\b(?!\s*\()", text):
+        start = i = match.end()
+        depth = 0
+        while i < len(text):
+            char = text[i]
+            if char in "([<":
+                depth += 1
+            elif char in ")]>":
+                if not (char == ">" and text[i - 1] == "-"):
+                    depth = max(depth - 1, 0)
+            elif depth == 0 and char in "{;,}":
+                break
+            i += 1
+        if i < len(text) and text[i] == "{" and re.match(r"\s*(enum|trait)\b", text[start:i]):
+            depth = 0
+            while i < len(text):
+                depth += {"{": 1, "}": -1}.get(text[i], 0)
+                i += 1
+                if depth == 0:
+                    break
+        spans.append(text[start:i])
+    return spans
+
+
 def carries_in_public_api(repo: Repo, component: Component, dep: Component) -> bool:
-    """Whether the crate's sources at HEAD name the dependency in a public item (a ``pub use``
-    of it, or its path in a ``pub`` signature), under the name the sources use for it
-    (``source_name``): a read of the text, the step then follows the dependency's."""
+    """Whether the crate's sources at HEAD carry the dependency in a public position: its path
+    under the name the sources use for it (``source_name``), or a name a ``use`` of it brought
+    into the file, in the head of a public item or an ``impl`` (the body of a public enum or
+    trait). A read of the text; a glob import of the dependency leaves it blind and reads as
+    carried."""
     ident = source_name(repo, component, dep)
-    pattern = (
-        rf"^[[:space:]]*pub[[:space:]]+(use[[:space:]]+{ident}(::|;|[[:space:]])"
-        rf"|[^;]*[^A-Za-z0-9_]{ident}::)"
-    )
-    result = repo._run("grep", "-q", "-E", pattern, "HEAD", "--", f"{component.path}/src")
-    return result.returncode == 0
+    by_path = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(ident)}::")
+    files = repo.git("ls-tree", "-r", "--name-only", "HEAD", "--", f"{component.path}/src")
+    for path in files.splitlines():
+        if not path.endswith(".rs"):
+            continue
+        text = COMMENTS.sub(" ", repo.show("HEAD", path) or "")
+        names = imported_names(text, ident)
+        if names is None:
+            return True
+        alternatives = "|".join(map(re.escape, sorted(names)))
+        by_name = (
+            re.compile(rf"(?<![A-Za-z0-9_:])(?:{alternatives})(?![A-Za-z0-9_])") if names else None
+        )
+        for span in public_spans(text):
+            if by_path.search(span) or (by_name is not None and by_name.search(span)):
+                return True
+    return False
 
 
 def dependency_moves(
     repo: Repo, tag: str, plan: Plan, crates: Sequence[Component], out: Out
 ) -> None:
-    """The dependency rule, repeated until no crate moves: a crate held at its tag version is
-    republished when a workspace dependency's new version (the plan's, where the dependency
-    moves here) leaves the requirement its published copy carries; at a patch step, or at the
-    dependency's step when the crate's public API carries the dependency."""
+    """The dependency rule, repeated until no crate moves or rises: a crate held at a published
+    version (the given tag's, or another line's tag that carries it) is republished when a
+    workspace dependency's new version (the plan's, where the dependency moves here) leaves a
+    requirement its published copy carries. Every requirement is judged, and the step is the
+    highest they ask: the crate's own breaking step where its public API carries the dependency,
+    patch otherwise."""
     by_name = {v.component.name: v for v in plan.verdicts if v.component.kind == "crate"}
     held = [
         v
         for v in by_name.values()
-        if v.tag_version is not None and v.version == v.tag_version and v.files_changed == 0
+        if v.files_changed == 0
+        and (v.carried_by or (v.tag_version is not None and v.version == v.tag_version))
     ]
-    moved = True
-    while moved:
-        moved = False
+    requirements = {
+        v.component.name: published_requirements(repo, v.carried_by or tag, v.component, crates)
+        for v in held
+    }
+    carried: dict[tuple[str, str], bool] = {}
+    moved: dict[str, int] = {}
+    changed = True
+    while changed:
+        changed = False
         for verdict in held:
-            if verdict.unbumped:
-                continue
-            for dep, requirement in published_requirements(
-                repo, tag, verdict.component, crates
-            ).items():
+            name, level = verdict.component.name, -1
+            left: list[str] = []
+            for dep, requirement in requirements[name].items():
                 target = by_name.get(dep)
                 if target is None:
                     continue
                 new = plan.new_version(target) if target.unbumped else target.version
                 if caret_accepts(requirement, new):
                     continue
-                carried = carries_in_public_api(repo, verdict.component, target.component)
+                if (name, dep) not in carried:
+                    carried[name, dep] = carries_in_public_api(
+                        repo, verdict.component, target.component
+                    )
+                step = breaking_level(verdict.version) if carried[name, dep] else "patch"
+                level = max(level, LEVELS.index(step))
+                why = ", carried in its public API" if carried[name, dep] else ""
+                left.append(f"{dep} ^{requirement} does not accept v{new}{why}")
+            if not left:
+                continue
+            verdict.dependency = "; ".join(left)
+            if level > moved.get(name, -1):
+                moved[name] = level
                 verdict.unbumped = True
-                verdict.level = move_level(requirement, new) if carried else "patch"
-                verdict.dependency = f"{dep} ^{requirement} does not accept v{new}" + (
-                    "; its public API carries the dependency" if carried else ""
-                )
-                report(verdict, out)
-                moved = True
-                break
+                verdict.level = LEVELS[level]
+                changed = True
+    for verdict in held:
+        if verdict.component.name in moved:
+            report(verdict, out)
 
 
 def examine(

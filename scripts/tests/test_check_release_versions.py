@@ -312,10 +312,14 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
 ):
     """A crate unchanged since the tag can still be unpublishable: its published copy requires
     a workspace dependency at the version the root pinned at the tag (a caret), and the cut moves
-    that dependency past it. The plan moves such a crate at a patch step, or at the dependency's
-    step when the crate's public API carries the dependency; a patch move of a dependency, and
-    a dev-dependency, move nothing. The sources name a dependency by its library name (``kap``
-    for the package ``kappa`` here), or by the key of a rename (``kap_alias``)."""
+    that dependency past it. The plan moves such a crate at a patch step, or at its own breaking
+    step when its public API carries the dependency (a 0.x crate at minor, a 1.x crate at
+    major); every requirement is judged and the highest step wins, on later passes too; a patch
+    move of a dependency, and a dev-dependency, move nothing. The sources name a dependency by
+    its library name (``kap`` for the package ``kappa`` here) or by the key of a rename
+    (``kap_alias``), and carry it in a public position through its path or through a name a
+    private ``use`` brought in, across wrapped lines; a crate held at another line's tag is read
+    at that tag; a target table is a dependency table; a manifest that is not TOML is fatal."""
     root = tmp_path / "deps"
     root.mkdir()
     git(root, "init", "-q", "-b", "main")
@@ -326,6 +330,11 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "sigma": "0.1.0",
         "rho": "1.0.0",
         "tau": "0.1.0",
+        "phi": "0.4.0",
+        "chi": "1.2.0",
+        "psi": "0.2.0",
+        "nu": "0.3.0",
+        "eta": "0.5.0",
     }
     put(root, "Cargo.toml", root_manifest(pins))
     put(root, "crates/kappa/Cargo.toml", manifest("kappa", "0.2.0") + '\n[lib]\nname = "kap"\n')
@@ -340,6 +349,23 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     renamed = '\n[dependencies]\nkap_alias = { package = "kappa", path = "../kappa", version = "0.2.0" }\n'
     put(root, "crates/tau/Cargo.toml", manifest("tau", "0.1.0") + renamed)
     put(root, "crates/tau/src/lib.rs", "pub use kap_alias::Thing;\n")
+    put(root, "crates/phi/Cargo.toml", manifest("phi", "0.4.0") + deps)
+    holder = "use kap::Thing;\n\npub struct Holder {\n    pub thing: Thing,\n}\n"
+    put(root, "crates/phi/src/lib.rs", holder)
+    put(root, "crates/chi/Cargo.toml", manifest("chi", "1.2.0") + deps)
+    put(
+        root,
+        "crates/chi/src/lib.rs",
+        "use kap::Thing;\n\npub fn make(\n    first: u8,\n    _thing: Thing,\n) -> u8 {\n    first\n}\n",
+    )
+    both = "\n[dependencies]\nkappa = { workspace = true }\nsigma = { workspace = true }\n"
+    put(root, "crates/psi/Cargo.toml", manifest("psi", "0.2.0") + both)
+    put(root, "crates/psi/src/lib.rs", "fn uses(_thing: kap::Thing) {}\npub use sigma::Thing;\n")
+    unix = "\n[target.'cfg(unix)'.dependencies]\nkappa = { workspace = true }\n"
+    put(root, "crates/nu/Cargo.toml", manifest("nu", "0.3.0") + unix)
+    put(root, "crates/nu/src/lib.rs", "pub use kap::Thing;\n")
+    put(root, "crates/eta/Cargo.toml", manifest("eta", "0.5.0") + deps)
+    put(root, "crates/eta/src/lib.rs", "fn uses(_thing: kap::Thing) {}\n")
     put(
         root,
         "crates/rho/Cargo.toml",
@@ -352,6 +378,12 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "chore: initial")
     git(root, "tag", "v1.0.0")
+    # eta's patch went out on another line's tag, and nothing of eta changed since
+    put(root, "crates/eta/Cargo.toml", manifest("eta", "0.5.1") + deps)
+    put(root, "Cargo.toml", root_manifest({**pins, "eta": "0.5.1"}))
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore(release): eta 0.5.1")
+    git(root, "tag", "v1.0.1")
     put(root, "crates/kappa/src/lib.rs", "pub struct Thing;\npub struct More;\n")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "feat(kappa): more")
@@ -363,26 +395,45 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     assert not mod.caret_accepts("1.2.0", "2.0.0") and not mod.caret_accepts("1.2.0", "1.1.9")
     assert mod.caret_accepts("0.2.0", "0.2.5") and not mod.caret_accepts("0.2.0", "0.3.0")
     assert mod.caret_accepts("0.0.3", "0.0.3") and not mod.caret_accepts("0.0.3", "0.0.4")
-    assert mod.move_level("0.2.0", "0.3.0") == "minor"
-    assert mod.move_level("1.2.3", "2.0.0") == "major"
-    assert mod.move_level("1.2.3", "1.2.4") == "patch"
+    assert mod.breaking_level("1.2.3") == "major"
+    assert mod.breaking_level("0.3.1") == "minor"
+    assert mod.breaking_level("0.0.3") == "patch"
+    uses = "use kap::{Thing, Other as O};\nuse kap::table::Table;\nuse x::Y;\n"
+    assert mod.imported_names(uses, "kap") == {"Thing", "O", "Table"}
+    assert mod.imported_names("use kap::prelude::*;\n", "kap") is None
+    spans = mod.public_spans(
+        "pub(crate) fn hidden() {}\npub fn shown(\n    a: Vec<(u8, u8)>,\n) -> Result<X, Y> {}\n"
+        "pub enum E {\n    A(Z),\n}\nimpl From<W> for E {}\n"
+    )
+    assert [span.split()[0] for span in spans] == ["fn", "enum", "From<W>"]
+    assert "Result<X, Y>" in spans[0] and "A(Z)" in spans[1]
 
     crates = (
         mod.crate("smg", "model_gateway"),
         mod.crate("kappa", "crates/kappa", "kappa"),
         mod.crate("lambda", "crates/lambda", "lambda"),
         mod.crate("omega", "crates/omega", "omega"),
+        # psi before sigma: its requirement on sigma fails on a later pass only
+        mod.crate("psi", "crates/psi", "psi"),
         mod.crate("sigma", "crates/sigma", "sigma"),
         mod.crate("rho", "crates/rho", "rho"),
         mod.crate("tau", "crates/tau", "tau"),
+        mod.crate("phi", "crates/phi", "phi"),
+        mod.crate("chi", "crates/chi", "chi"),
+        mod.crate("nu", "crates/nu", "nu"),
+        mod.crate("eta", "crates/eta", "eta"),
     )
+    by_name = {c.name: c for c in crates}
     repo = mod.Repo(root)
-    assert mod.published_requirements(repo, "v1.0.0", crates[3], crates) == {"kappa": "0.2.0"}
-    assert mod.published_requirements(repo, "v1.0.0", crates[5], crates) == {"lambda": "1.0.0"}
-    assert mod.published_requirements(repo, "v1.0.0", crates[6], crates) == {"kappa": "0.2.0"}
-    assert mod.source_name(repo, crates[4], crates[1]) == "kap"
-    assert mod.source_name(repo, crates[6], crates[1]) == "kap_alias"
-    assert mod.source_name(repo, crates[5], crates[2]) == "lambda"
+    for name in ("omega", "tau", "nu"):
+        requirements = mod.published_requirements(repo, "v1.0.0", by_name[name], crates)
+        assert requirements == {"kappa": "0.2.0"}, name
+    assert mod.published_requirements(repo, "v1.0.0", by_name["rho"], crates) == {"lambda": "1.0.0"}
+    assert mod.source_name(repo, by_name["sigma"], by_name["kappa"]) == "kap"
+    assert mod.source_name(repo, by_name["tau"], by_name["kappa"]) == "kap_alias"
+    assert mod.source_name(repo, by_name["rho"], by_name["lambda"]) == "lambda"
+    for name, carried in (("omega", False), ("sigma", True), ("phi", True), ("chi", True)):
+        assert mod.carries_in_public_api(repo, by_name[name], by_name["kappa"]) is carried, name
 
     def check(mode="check"):
         stream = io.StringIO()
@@ -397,29 +448,35 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "  ! kappa (crates/kappa/) — 1 file(s) changed but version not bumped (v0.2.0) [minor]"
         in out
     )
+    left = "unchanged, but its published requirement kappa ^0.2.0 does not accept v0.3.0"
+    assert f"  ! omega (crates/omega/) — {left} [patch]" in out
+    assert f"  ! sigma (crates/sigma/) — {left}, carried in its public API [minor]" in out
+    assert f"  ! tau (crates/tau/) — {left}, carried in its public API [minor]" in out
+    assert f"  ! phi (crates/phi/) — {left}, carried in its public API [minor]" in out
+    assert f"  ! chi (crates/chi/) — {left}, carried in its public API [major]" in out
+    assert f"  ! nu (crates/nu/) — {left}, carried in its public API [minor]" in out
+    assert f"  ! eta (crates/eta/) — {left} [patch]" in out
     assert (
-        "  ! omega (crates/omega/) — unchanged, but its published requirement kappa ^0.2.0"
-        " does not accept v0.3.0 [patch]" in out
-    )
-    assert (
-        "  ! sigma (crates/sigma/) — unchanged, but its published requirement kappa ^0.2.0"
-        " does not accept v0.3.0; its public API carries the dependency [minor]" in out
-    )
-    assert (
-        "  ! tau (crates/tau/) — unchanged, but its published requirement kappa ^0.2.0"
-        " does not accept v0.3.0; its public API carries the dependency [minor]" in out
+        "  ! psi (crates/psi/) — unchanged, but its published requirements kappa ^0.2.0 does not"
+        " accept v0.3.0; sigma ^0.1.0 does not accept v0.2.0, carried in its public API [minor]"
+        in out
     )
     assert "rho" not in out, (
         "lambda 1.0.1 sits inside ^1.0.0, and a dev-dependency is not published"
     )
-    assert "Summary: 5 crate(s) with changes, 2 unchanged" in out
-    assert "5 issue(s) found." in out
+    assert "Summary: 10 crate(s) with changes, 2 unchanged" in out
+    assert "10 issue(s) found." in out
 
     code, out = check("plan")
     assert code == 0
     assert "  patch omega v0.3.0 → v0.3.1 (crates/omega/Cargo.toml)" in out
     assert "  minor sigma v0.1.0 → v0.2.0 (crates/sigma/Cargo.toml)" in out
     assert "  minor tau v0.1.0 → v0.2.0 (crates/tau/Cargo.toml)" in out
+    assert "  minor phi v0.4.0 → v0.5.0 (crates/phi/Cargo.toml)" in out
+    assert "  major chi v1.2.0 → v2.0.0 (crates/chi/Cargo.toml)" in out
+    assert "  minor psi v0.2.0 → v0.3.0 (crates/psi/Cargo.toml)" in out
+    assert "  minor nu v0.3.0 → v0.4.0 (crates/nu/Cargo.toml)" in out
+    assert "  patch eta v0.5.1 → v0.5.2 (crates/eta/Cargo.toml)" in out
     assert "  minor kappa v0.2.0 → v0.3.0 (crates/kappa/Cargo.toml)" in out
 
     code, out = check("fix")
@@ -431,6 +488,11 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         ("omega", "0.3.1"),
         ("sigma", "0.2.0"),
         ("tau", "0.2.0"),
+        ("phi", "0.5.0"),
+        ("chi", "2.0.0"),
+        ("psi", "0.3.0"),
+        ("nu", "0.4.0"),
+        ("eta", "0.5.2"),
     ):
         assert (
             mod.read_version("cargo", (root / f"crates/{name}/Cargo.toml").read_text(), "")
@@ -441,6 +503,12 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     code, out = check()
     assert code == 0, out
     assert "All versions consistent." in out
+
+    put(root, "crates/xi/Cargo.toml", "[package\nname = 'xi'\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore(xi): a manifest that is not TOML")
+    with pytest.raises(mod.Fatal, match="crates/xi/Cargo.toml at HEAD is not TOML"):
+        mod.manifest_at(repo, "HEAD", mod.crate("xi", "crates/xi"))
 
 
 def test_the_installed_packages_version_file_is_a_checked_mirror(mod):
