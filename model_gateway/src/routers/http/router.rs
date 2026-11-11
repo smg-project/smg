@@ -6534,6 +6534,81 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         drop(listener);
     }
+
+    /// A worker that answers the chat route with `body` as one sized SSE
+    /// answer: hyper writes the `Content-Length` an upstream that knows its
+    /// length would.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_sized_sse_worker(body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                move || async move { ([(CONTENT_TYPE, "text/event-stream")], body) },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Re-slicing changes the body's length: a re-sliced stream reaches the
+    /// client without the upstream's `Content-Length` and with its text
+    /// whole, while a plain relay keeps the header with the bytes it copies.
+    #[tokio::test]
+    async fn a_re_sliced_stream_drops_the_upstreams_content_length() {
+        use openai_protocol::validated::Normalizable;
+
+        const BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: [DONE]\n\n";
+        let url = spawn_sized_sse_worker(BODY).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for (model, keeps_length) in [("MiniMax-M3", false), ("served-plain-relay-model", true)] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                response.headers().contains_key(CONTENT_LENGTH),
+                keeps_length,
+                "{model}: the Content-Length of a sized upstream answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let text: String = sse_events(std::str::from_utf8(&bytes).unwrap())
+                .iter()
+                .filter_map(|event| event.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .filter_map(|json| {
+                    json["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(text, "Hello", "{model}: the text is whole");
+        }
+    }
 }
 
 #[cfg(test)]
