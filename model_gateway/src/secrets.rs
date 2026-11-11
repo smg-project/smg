@@ -221,7 +221,10 @@ impl SecretReloader {
     /// Read every file, check the serving set that would be in force by the
     /// start's rules, then put the sets in force: a file that cannot be used
     /// stops the reload before any swap. A request in flight finishes under
-    /// the set it took.
+    /// the set it took. The sets are the keys the gateway accepts: the shared
+    /// key it sends upstream to its workers is the start's until a restart,
+    /// so a secret the gateway and its workers share is rotated with a
+    /// restart of the gateway.
     pub fn reload(&self) -> Result<ReloadReport, BadFile> {
         let _turn = self.turn.lock();
         let mut report = ReloadReport::default();
