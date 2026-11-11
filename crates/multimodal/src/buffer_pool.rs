@@ -16,7 +16,7 @@
 //! ([`EncoderInput::into_bytes_as`](crate::encoder_inputs::EncoderInput::into_bytes_as)).
 //!
 //! Geometry: a length between [`SMALLEST`] and [`LARGEST`] is served from the
-//! class of its next power of two (seven classes, 1 MiB to 64 MiB), so one
+//! class of its next power of two (nine classes, 256 KiB to 64 MiB), so one
 //! class serves every length up to its size and the pages past the length
 //! are never touched; a length outside the range is allocated as before. The
 //! pool holds at most [`BOUND`] bytes of capacity in all, process-wide; a
@@ -42,7 +42,9 @@ use bytes::Bytes;
 use image::DynamicImage;
 
 /// The shortest buffer the pool serves; a shorter one is allocated as before.
-pub const SMALLEST: usize = 1 << 20;
+/// The smallest image wire a processor emits per request, a single 336x336
+/// tile in bfloat16 (677,376 bytes), sits in the 1 MiB class above this floor.
+pub const SMALLEST: usize = 256 << 10;
 /// The longest buffer the pool serves; a longer one is allocated as before.
 pub const LARGEST: usize = 64 << 20;
 /// The capacity the pool holds in all, the idle buffers of every class
@@ -268,6 +270,21 @@ mod tests {
     }
 
     #[test]
+    fn the_smallest_image_wire_is_served_from_the_pool() {
+        // A single 336x336 tile on the bfloat16 wire, the smallest image wire
+        // a processor emits per request; below the former 1 MiB floor it was
+        // allocated zero-filled on every request.
+        let wire = 3 * 336 * 336 * 2;
+        assert_eq!(class_capacity(wire), Some(1 << 20));
+        let pool = BufferPool::new();
+        let first = pool.take(wire);
+        let address = first.as_ptr();
+        pool.recycle(first);
+        let again = pool.take(wire);
+        assert_eq!(again.as_ptr(), address);
+    }
+
+    #[test]
     fn a_recycled_buffer_serves_the_next_take_of_its_class_at_the_new_length() {
         let pool = BufferPool::new();
         let first = pool.take(3 * SMALLEST / 2);
@@ -361,7 +378,8 @@ mod tests {
             let address = pixels.as_ptr();
             let rgb = image::RgbImage::from_raw(1024, 1024, pixels).expect("sized");
             recycle_image(DynamicImage::ImageRgb8(rgb));
-            assert_eq!(MINE.held(), 4 * SMALLEST);
+            // The 4 MiB class of a 3 MiB buffer, whatever the floor.
+            assert_eq!(MINE.held(), 4 << 20);
             let again = take(1024 * 1024 * 3);
             assert_eq!(again.as_ptr(), address);
             let wide = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(1024, 1024);

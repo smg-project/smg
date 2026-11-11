@@ -9,7 +9,7 @@
 //! allocates into the window. The decode's own calls depend on which decoder is loaded
 //! (TurboJPEG and libwebp are runtime bindings; their C allocations never reach this
 //! allocator), so the decode pin counts the large buffers only, per decoder: the TurboJPEG
-//! binding decodes a frame of a megabyte or more into a buffer from the pool, the fallback
+//! binding decodes a frame of 256 KiB or more into a buffer from the pool, the fallback
 //! decoder allocates its own.
 //! The warm pass returns its buffers the way a request does (the frame dropped, the wire
 //! payload sent), so the pins hold the steady state of the buffer pool: a decoded frame or a
@@ -234,7 +234,7 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
 ///
 /// - decode: the large buffers of the decode (the decoded frame, the decoder's own planes,
 ///   a copy of a large encoded file; a small input decodes under the threshold), per
-///   decoder (`Frames`): the TurboJPEG binding takes a frame of a megabyte or more from the
+///   decoder (`Frames`): the TurboJPEG binding takes a frame of 256 KiB or more from the
 ///   buffer pool, where the warm pass left one, the fallback decoder allocates it. The
 ///   calls are not pinned: they differ between the two decoders in their bookkeeping.
 /// - copy: one call, one large buffer: the gateway's per-frame clone before the processor
@@ -356,20 +356,20 @@ const PINS: &[Pin] = &[
         },
         copy: (1, 0),
         preprocess_calls: Calls {
-            scalar: 1051,
-            neon: 1052,
-            portable: 1049,
-            avx2: 1053,
-            avx512: 1053,
+            scalar: 1050,
+            neon: 1051,
+            portable: 1048,
+            avx2: 1052,
+            avx512: 1052,
         },
-        preprocess_large: 1,
+        preprocess_large: 0,
         serialize_calls: 0,
     },
     Pin {
         class: "jpeg-grayscale",
         decode_large: Frames {
             fallback: 1,
-            turbo: 1,
+            turbo: 0,
         },
         copy: (1, 1),
         preprocess_calls: Calls {
@@ -390,13 +390,13 @@ const PINS: &[Pin] = &[
         },
         copy: (1, 0),
         preprocess_calls: Calls {
-            scalar: 1051,
-            neon: 1052,
-            portable: 1049,
-            avx2: 1053,
-            avx512: 1053,
+            scalar: 1050,
+            neon: 1051,
+            portable: 1048,
+            avx2: 1052,
+            avx512: 1052,
         },
-        preprocess_large: 1,
+        preprocess_large: 0,
         serialize_calls: 0,
     },
     Pin {
