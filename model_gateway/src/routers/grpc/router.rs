@@ -52,7 +52,9 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
-    routers::{error, grpc::regular::symphony::template::Templates, RouterTrait},
+    routers::{
+        common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
+    },
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -534,7 +536,7 @@ impl GrpcRouter {
                 serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
             } else {
                 match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
-                    Ok(response) => Json(response).into_response(),
+                    Ok(response) => json_response(&response),
                     Err(error_response) => error_response,
                 }
             }
@@ -685,7 +687,7 @@ impl GrpcRouter {
                 }),
             );
         }
-        (StatusCode::OK, Json(queued)).into_response()
+        json_response(&queued)
     }
 
     /// Main route_embeddings implementation
@@ -960,7 +962,7 @@ impl GrpcRouter {
             container: None,
         };
         if !stream {
-            return (StatusCode::OK, Json(message)).into_response();
+            return json_response(&message);
         }
 
         let events = [
