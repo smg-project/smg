@@ -8,6 +8,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::submit_tokenizer_job::tokenizer_source;
 use crate::{
+    app_context::AppContext,
     worker::{basic::merge_labels, Worker},
     workflow::data::WorkerRemovalWorkflowData,
 };
@@ -45,6 +46,11 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        // The gateway manages no tokenizer when autoload is off: every entry
+        // is the operator's, as the registration step leaves them.
+        if app_context.router_config.disable_tokenizer_autoload {
+            return Ok(StepResult::Skip);
+        }
         // The workers found and the ones the registry step removed, since a
         // same-URL replacement during the drain is the one removed.
         let removed: Vec<&Arc<dyn Worker>> = context
@@ -54,18 +60,36 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
             .flatten()
             .chain(&context.data.removed_workers)
             .collect();
-        // The gateway manages no tokenizer when autoload is off: every entry
-        // is the operator's, as the registration step leaves them.
-        if app_context.router_config.disable_tokenizer_autoload {
-            return Ok(StepResult::Skip);
+        let mut released = 0usize;
+        for model_id in Self::candidates(app_context, &removed) {
+            if Self::release(app_context, &model_id).await {
+                released += 1;
+            }
         }
+        debug!(
+            "Released {} tokenizer(s) of the removed workers' models",
+            released
+        );
+
+        Ok(StepResult::Success)
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+impl ReleaseTokenizerStep {
+    /// The models whose tokenizer is to leave: the primary model of a removed
+    /// worker on the gRPC pipeline (the registration step loads for that
+    /// pipeline alone, under the primary alone; a worker of another shape
+    /// loaded none), served by no worker any more, whose entry's source is
+    /// the one a removed worker of the model loads it from.
+    fn candidates(app_context: &AppContext, removed: &[&Arc<dyn Worker>]) -> Vec<String> {
         let router = &app_context.router_config;
         let mut asked: HashSet<String> = HashSet::new();
-        let mut released = 0usize;
-        for worker in &removed {
-            // The registration step loads a tokenizer for a worker on the gRPC
-            // pipeline alone, under its primary model id; a worker of another
-            // shape loaded none, so nothing of its leaves.
+        let mut candidates = Vec::new();
+        for worker in removed {
             if !worker.connection_mode().uses_grpc_pipeline() {
                 continue;
             }
@@ -99,48 +123,44 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
                 );
                 continue;
             }
-            let Some(entry) = app_context.tokenizer_registry.remove(&model_id) else {
-                continue;
-            };
-            // A worker of the model whose registration landed between the
-            // read above and this remove serves the model again: the entry
-            // goes back as it was (its registration job reads it as already
-            // loaded), the multimodal config untouched.
-            if app_context.worker_registry.contains_model(&model_id) {
-                let tokenizer = Arc::clone(&entry.tokenizer);
-                if let Err(error) = app_context
-                    .tokenizer_registry
-                    .load(&entry.id, &entry.name, &entry.source, || async {
-                        Ok(tokenizer)
-                    })
-                    .await
-                {
-                    warn!(
-                        model = %model_id,
-                        "A model registered again under the release of its tokenizer could not take it back: {error}"
-                    );
-                }
-                continue;
-            }
-            app_context.multimodal_config_registry.remove(&entry.id);
-            released += 1;
-            info!(
-                model = %model_id,
-                tokenizer_id = %entry.id,
-                source = %entry.source,
-                "Released the tokenizer of a model no worker serves"
-            );
+            candidates.push(model_id);
         }
-        debug!(
-            "Released {} tokenizer(s) of the removed workers' models",
-            released
-        );
-
-        Ok(StepResult::Success)
+        candidates
     }
 
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false
+    /// Removes the model's entry and the multimodal config keyed by it, unless
+    /// a worker of the model appeared since the candidates were read (its
+    /// registration's tokenizer job read the entry as already loaded): then
+    /// the entry goes back as it was, under its own id, and the config stays.
+    /// Whether the entry left.
+    async fn release(app_context: &AppContext, model_id: &str) -> bool {
+        let Some(entry) = app_context.tokenizer_registry.remove(model_id) else {
+            return false;
+        };
+        if app_context.worker_registry.contains_model(model_id) {
+            let tokenizer = Arc::clone(&entry.tokenizer);
+            if let Err(error) = app_context
+                .tokenizer_registry
+                .load(&entry.id, &entry.name, &entry.source, || async {
+                    Ok(tokenizer)
+                })
+                .await
+            {
+                warn!(
+                    model = %model_id,
+                    "A model registered again under the release of its tokenizer could not take it back: {error}"
+                );
+            }
+            return false;
+        }
+        app_context.multimodal_config_registry.remove(&entry.id);
+        info!(
+            model = %model_id,
+            tokenizer_id = %entry.id,
+            source = %entry.source,
+            "Released the tokenizer of a model no worker serves"
+        );
+        true
     }
 }
 
@@ -199,8 +219,12 @@ mod tests {
             .unwrap();
     }
 
-    /// The removal workflow's steps after the drain, in the workflow's order.
-    async fn remove(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
+    /// The removal workflow's registry steps after the drain, in the
+    /// workflow's order, with the context they leave for the release step.
+    async fn remove_from_registries(
+        app_context: &Arc<AppContext>,
+        worker: Arc<dyn Worker>,
+    ) -> WorkflowContext<crate::workflow::data::WorkerRemovalWorkflowData> {
         let url = worker.url().to_string();
         let mut data =
             create_worker_removal_workflow_data(url.clone(), None, Arc::clone(app_context));
@@ -215,6 +239,12 @@ mod tests {
             .execute(&mut context)
             .await
             .unwrap();
+        context
+    }
+
+    /// The removal workflow's steps after the drain, the release included.
+    async fn remove(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
+        let mut context = remove_from_registries(app_context, worker).await;
         ReleaseTokenizerStep.execute(&mut context).await.unwrap();
     }
 
@@ -322,5 +352,28 @@ mod tests {
             app_context.tokenizer_registry.contains("m"),
             "an HTTP worker's registration loaded no tokenizer"
         );
+    }
+
+    /// A registration that lands between the step's read of the candidates
+    /// and its remove, its tokenizer job reading the entry as already loaded:
+    /// the entry goes back as it was, under its own id, and the model's
+    /// requests find it.
+    #[tokio::test]
+    async fn a_registration_under_the_release_keeps_the_entry() {
+        let app_context = app_context();
+        let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
+        tokenizer(&app_context, "m", "/tok/m").await;
+        let id = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
+        remove_from_registries(&app_context, Arc::clone(&first)).await;
+
+        let candidates = ReleaseTokenizerStep::candidates(&app_context, &[&first]);
+        assert_eq!(candidates, vec!["m".to_string()]);
+        // The registration that lands now: its worker, then its tokenizer job.
+        worker(&app_context, "http://w2:8000", "m", "/tok/m");
+        tokenizer(&app_context, "m", "/tok/m").await;
+
+        assert!(!ReleaseTokenizerStep::release(&app_context, "m").await);
+        let entry = app_context.tokenizer_registry.get_by_name("m").unwrap();
+        assert_eq!(entry.id, id, "the entry went back as it was");
     }
 }
