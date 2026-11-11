@@ -665,8 +665,9 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     level of the commits that made them. A link that points at a link, a target directory
     holding one, or a link whose path runs through a directory link is followed to the end of
     the chain; a directory link crossed on the way counts, what lies behind it beyond the path
-    does not; a link crossed twice on one path is no loop, a loop ends at the hop limit. A link
-    into the package itself or out of the repository adds nothing."""
+    does not, and a directory reached through crossed links is read for the links it holds; a
+    link crossed twice on one path is no loop, a loop ends at the hop limit. A link into the
+    package itself or out of the repository adds nothing."""
     import os
 
     root = tmp_path / "linked"
@@ -694,16 +695,34 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     os.symlink("loop_b", root / "loop_a")
     os.symlink("loop_a", root / "loop_b")
     os.symlink("../loop_a", root / "pkg" / "l")  # a genuine loop
+    put(root, "real2/a", "a\n")
+    put(root, "real3/f", "f\n")
+    put(root, "real3/g", "g\n")  # shipped by nothing
+    os.symlink("real2", root / "hop2")
+    os.symlink("../hop2", root / "pkg" / "through")  # a link to a link to a directory ...
+    os.symlink("../real3/f", root / "real2" / "inner")  # ... that holds a link
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "chore: initial")
     git(root, "tag", "v1.0.0")
     repo = mod.Repo(root)
     assert repo.resolve_path("pkg/../hop/y") == ("real/y", ["hop"])
     assert repo.resolve_path("pkg/../hop/z") == ("real/y", ["hop", "real/z", "hop"])
+    assert repo.resolve_path("pkg/../hop2") == ("real2", ["hop2"])
     assert repo.resolve_path("pkg/../../elsewhere") == (None, [])
     looped, crossed = repo.resolve_path("pkg/../loop_a")
     assert looped is None and len(crossed) == 40 and set(crossed) == {"loop_a", "loop_b"}
-    chain = ["loop_a", "loop_b", "hop", "real/y", "real/z", "shared", "real/x"]
+    chain = [
+        "loop_a",
+        "loop_b",
+        "hop",
+        "real/y",
+        "real/z",
+        "shared",
+        "hop2",
+        "real2",
+        "real/x",
+        "real3/f",
+    ]
     assert repo.symlink_targets("pkg") == chain
     assert repo.symlink_targets("pkg/") == chain
     assert mod.component_paths(repo, mod.package("pkg", "pkg", "pkg/pyproject.toml")) == [
