@@ -24,7 +24,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
     },
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
@@ -34,14 +34,17 @@ use smg_policy_controller::{
     store::identity,
     Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId, LeaseKind,
     Lifecycle, LoadRow, Membership, Needs, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts,
-    Role, Scratch, ShedReason, Side, SignalSource, SpecError, Target, WorkerId,
+    Role, Scratch, ShedReason, Side, SignalSource, SpecError, Target, Targets, WorkerId,
 };
 use tracing::debug;
 
 use crate::{
     config::{PolicyConfig, PowerOfTwoLoadMetric},
-    observability::metrics::Metrics,
-    policies::host_stores::HostStores,
+    observability::{cache_trace, metrics::Metrics},
+    policies::{
+        explain::{DecisionRecord, DecisionRing},
+        host_stores::HostStores,
+    },
     routers::common::pd_admission,
     worker::{
         expected_wait::DEFAULT_MEAN_PREFILL_TOKENS,
@@ -90,6 +93,15 @@ fn static_label(name: &str) -> &'static str {
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
     names.insert(leaked);
     leaked
+}
+
+/// Microseconds since the Unix epoch, for a decision record's stamp.
+fn unix_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Why the engine cannot serve a policy configuration in this build.
@@ -288,6 +300,8 @@ pub struct Decider {
     /// The profiles' names as the decision counter's `profile` label, by
     /// the engine's position, resolved once here.
     profile_labels: Box<[&'static str]>,
+    /// The records of the decisions a request asked to see, for `Explain`.
+    explain: DecisionRing,
 }
 
 impl std::fmt::Debug for Decider {
@@ -365,7 +379,14 @@ impl Decider {
             seq: AtomicU64::new(1),
             mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
             profile_labels,
+            explain: DecisionRing::new(),
         })
+    }
+
+    /// The record of decision `id` (the id the trace header names), when the
+    /// request asked for its trace and the ring still holds it.
+    pub fn explain(&self, id: u64) -> Option<DecisionRecord> {
+        self.explain.find(id)
     }
 
     /// The `profile` label of a decision: the deciding profile's name, or
@@ -378,16 +399,58 @@ impl Decider {
     }
 
     /// What every decision leaves behind: one count under
-    /// `smg_policy_decisions_total`, by the profile that decided and the
-    /// outcome, with labels resolved once per profile.
-    fn observe(&self, request: &HostRequest<'_>, decision: &Decision) {
-        let profile = self.profile_label(decision.trace().profile);
-        Metrics::record_policy_decision(
-            request.model,
-            profile,
-            outcome_label(decision),
-            POLICY_MODE,
-        );
+    /// `smg_policy_decisions_total`, and, for a request that asked for its
+    /// trace (or a process that captures every one), its record in the ring
+    /// and in the request's routing evidence, where the trace header names
+    /// the decision id `Explain` is asked with. An untraced decision costs
+    /// the count and one capture check.
+    fn observe(
+        &self,
+        request: &HostRequest<'_>,
+        phase: Phase,
+        decision: &Decision,
+        id: LeaseId,
+        pool_size: usize,
+        excluded: usize,
+    ) {
+        let trace = decision.trace();
+        let profile = self.profile_label(trace.profile);
+        let outcome = outcome_label(decision);
+        Metrics::record_policy_decision(request.model, profile, outcome, POLICY_MODE);
+        if !cache_trace::enabled() {
+            return;
+        }
+        cache_trace::prediction(serde_json::json!({
+            "source": "policy_engine",
+            "decision_id": id.0,
+            "profile": profile,
+            "outcome": outcome,
+            "stage": trace.stage,
+            "survivors": trace.survivors,
+            "generation": trace.generation,
+        }));
+        self.explain.record(DecisionRecord {
+            decision_id: id.0,
+            at_unix_micros: unix_micros(),
+            // The exact name: the ring is bounded, so it needs no label interning,
+            // whose cap folds unseen names into `other`.
+            model: Arc::from(request.model),
+            phase,
+            profile: trace.profile,
+            outcome,
+            stage: trace.stage,
+            survivors: trace.survivors,
+            pool_size: u32::try_from(pool_size).unwrap_or(u32::MAX),
+            attempt: u8::try_from(request.tried.len()).unwrap_or(u8::MAX),
+            excluded: u8::try_from(excluded).unwrap_or(u8::MAX),
+            seed: trace.seed,
+            generation: trace.generation,
+            top: trace.top,
+            top_len: trace.top_len,
+            targets: decision
+                .pick()
+                .map_or_else(Targets::new, |pick| pick.targets),
+        });
     }
 
     pub fn engine(&self) -> &Engine {
@@ -614,7 +677,14 @@ impl Decider {
                 ..Constraints::default()
             };
             let decision = self.engine.decide(&facts, &pool, candidates, &cx, scratch);
-            self.observe(request, &decision);
+            self.observe(
+                request,
+                request.phase,
+                &decision,
+                id,
+                workers.len(),
+                excluded.len(),
+            );
             (
                 decision,
                 self.lease(id, now, request.prompt_tokens, session_key),
@@ -718,7 +788,14 @@ impl Decider {
                 scratch,
             )
         });
-        self.observe(request, &decision);
+        self.observe(
+            request,
+            Phase::Prefill,
+            &decision,
+            id,
+            prefills.len(),
+            excluded.len(),
+        );
         (
             decision,
             self.lease(id, now, request.prompt_tokens, session_key),

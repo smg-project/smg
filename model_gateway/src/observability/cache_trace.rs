@@ -375,14 +375,44 @@ fn gateway_header(value: &Value) -> Option<String> {
             })
         })
         .collect();
-    let header = json!({
+    let mut header = json!({
         "schema": value["schema"], "root_id": value["root_id"],
         "dispatch_id": value["dispatch_id"], "attempt": value["attempt"],
         "engine_ids": value["engine_ids"], "engine_ids_complete": value["engine_ids_complete"],
         "selections": selections, "truncated": value["truncated"],
-    })
-    .to_string();
+    });
+    // A refused response names its status where a dispatch names its attempt.
+    if let Some(status) = value.get("status") {
+        header["status"] = status.clone();
+    }
+    let header = header.to_string();
     (header.len() <= 2048 && header.is_ascii()).then_some(header)
+}
+
+/// The `x-smg-cache-trace` header of a refused response, for the request
+/// that asked for its trace (or a process whose header switch is on): the
+/// selections the capture holds, each with its prediction, under the
+/// response's `status`. A shed decision's record is in the ring; this is how
+/// its id reaches the client, where a dispatch would have carried it.
+pub(crate) fn refusal_header(root_id: Option<&str>, status: u16) -> Option<String> {
+    if !enabled() {
+        return None;
+    }
+    CAPTURE
+        .try_with(|capture| {
+            let mut capture = capture.borrow_mut();
+            if !(header_enabled() || capture.header_requested) || capture.selections.is_empty() {
+                return None;
+            }
+            let value = json!({
+                "schema": 1, "root_id": root_id, "status": status,
+                "selections": std::mem::take(&mut capture.selections),
+                "truncated": capture.truncated,
+            });
+            gateway_header(&value)
+        })
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn failure(root_id: Option<&str>, status: u16) {

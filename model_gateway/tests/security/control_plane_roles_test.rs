@@ -31,6 +31,7 @@ const READ_ROUTES: &[(&str, &str)] = &[
     ("GET", "/get_loads"),
     ("GET", "/v1/tokenizers"),
     ("GET", "/wasm"),
+    ("GET", "/policy/explain/1"),
 ];
 
 /// Mutating control-plane routes: `admin` only.

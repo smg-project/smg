@@ -394,6 +394,7 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/stop_profile"),
     ("POST", "/heap_profile"),
     ("GET", "/get_loads"),
+    ("GET", "/policy/explain/{id}"),
     ("POST", "/parse/function_call"),
     ("POST", "/parse/reasoning"),
     ("POST", "/wasm"),
@@ -1109,6 +1110,90 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         "/get_loads".to_string(),
         PathItem {
             get: Some(loads_operation("getLoadsLegacy", "Deprecated alias of /loads").deprecated()),
+            ..PathItem::default()
+        },
+    );
+
+    // GET /policy/explain/{id}: the policy engine's record of one traced decision
+    let explain_worker = serde_json::json!({
+        "worker_id": {"type": "string", "description": "The worker's id, sixteen hex digits"},
+        "worker": {
+            "type": ["string", "null"],
+            "description": "The worker's address, credentials redacted; null once it left the pool"
+        }
+    });
+    let explain_rows = |more: Value, required: Value| {
+        let mut properties = explain_worker.clone();
+        for (name, schema) in more.as_object().into_iter().flatten() {
+            properties[name.as_str()] = schema.clone();
+        }
+        serde_json::json!({"type": "object", "properties": properties, "required": required})
+    };
+    let explain_target = explain_rows(
+        serde_json::json!({
+            "position": {"type": "integer", "minimum": 0},
+            "dp_rank": {"type": "integer", "minimum": 0}
+        }),
+        serde_json::json!(["worker_id", "worker", "position", "dp_rank"]),
+    );
+    let mut explain_pair_target = explain_target.clone();
+    explain_pair_target["properties"]["decode"] = explain_target;
+    explain_pair_target["properties"]["decode"]["description"] =
+        Value::from("The decode side of a pair; absent on a single-side target");
+    let explain_record = serde_json::json!({
+        "type": "object",
+        "description": "The decision as the engine recorded it",
+        "properties": {
+            "decision_id": {"type": "integer", "minimum": 0},
+            "at_unix_micros": {"type": "integer", "minimum": 0},
+            "model": {"type": "string"},
+            "phase": {"type": "string", "enum": ["single", "prefill", "decode", "encode"]},
+            "profile": {
+                "type": ["string", "null"],
+                "description": "The profile that decided; null when no binding matched"
+            },
+            "outcome": {
+                "type": "string",
+                "enum": ["pick", "queue", "saturated", "flow_limit", "no_endpoints", "policy_declined", "deadline"]
+            },
+            "stage": {
+                "type": "string",
+                "description": "The picker or filter that settled the decision; binding for a miss"
+            },
+            "survivors": {"type": "integer", "minimum": 0},
+            "pool_size": {"type": "integer", "minimum": 0},
+            "attempt": {"type": "integer", "minimum": 0},
+            "excluded": {"type": "integer", "minimum": 0},
+            "seed": {"type": "integer", "minimum": 0},
+            "generation": {"type": "integer", "minimum": 0},
+            "top": {
+                "type": "array",
+                "description": "The best-scored candidates, best first",
+                "items": explain_rows(
+                    serde_json::json!({"score": {"type": "number"}}),
+                    serde_json::json!(["worker_id", "worker", "score"])
+                )
+            },
+            "targets": {"type": "array", "description": "The pick's targets in order", "items": explain_pair_target}
+        },
+        "required": [
+            "decision_id", "at_unix_micros", "model", "phase", "profile", "outcome", "stage", "survivors",
+            "pool_size", "attempt", "excluded", "seed", "generation", "top", "targets"
+        ]
+    });
+    paths.insert(
+        "/policy/explain/{id}".to_string(),
+        PathItem {
+            get: Some(operation(
+                "explainPolicyDecision",
+                "The policy engine's record of one traced decision, by its id",
+                Some(vec![path_param("id")]),
+                None,
+                refused_with(
+                    inline_response("The decision as the engine recorded it", explain_record),
+                    &error_name,
+                ),
+            )),
             ..PathItem::default()
         },
     );
