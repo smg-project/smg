@@ -1048,7 +1048,7 @@ pub(crate) struct ResponseState {
     /// Responses API iteration result (Harmony only, for tool loop
     /// orchestration). Behind a pointer: the field is empty on every other
     /// path, and the dispatch context is boxed once per request; inline, its
-    /// 208 bytes (two usage objects among them) had pushed that box over the
+    /// 208 bytes (a usage object among them) had pushed that box over the
     /// allocator's 2,560-byte class edge on every chat, completion and
     /// Messages request.
     pub responses_iteration_result: Option<Box<super::harmony::ResponsesIterationResult>>,
