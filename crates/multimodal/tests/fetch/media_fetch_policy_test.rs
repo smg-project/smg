@@ -69,6 +69,24 @@ fn serve_png() -> (u16, Arc<AtomicUsize>) {
     serve_png_on("127.0.0.1:0").expect("bind loopback")
 }
 
+/// The PNG origin on 127.0.0.1 and, where the host has an IPv6 loopback, on
+/// [::1] at the same port: a name resolves to either family first, and a
+/// by-name fetch must find this origin whichever it tries. `[::1]:port` can
+/// be held by another socket while `127.0.0.1:port` is free, so the pair is
+/// drawn again until both bind.
+fn serve_png_on_both_loopbacks() -> (u16, Arc<AtomicUsize>, Option<Arc<AtomicUsize>>) {
+    if TcpListener::bind("[::1]:0").is_err() {
+        let (port, hits) = serve_png();
+        return (port, hits, None);
+    }
+    (0..16)
+        .find_map(|_| {
+            let (port, hits) = serve_png();
+            serve_png_on(&format!("[::1]:{port}")).map(|(_, hits6)| (port, hits, Some(hits6)))
+        })
+        .expect("a port free on both loopbacks in sixteen draws")
+}
+
 /// A redirector on 127.0.0.1: every request answers `status` with
 /// `Location: <target(port, n)>`.
 fn serve_redirect(
@@ -190,7 +208,7 @@ async fn a_redirect_within_the_policy_is_followed() {
 /// resolves to it.
 #[tokio::test]
 async fn a_loopback_target_is_refused_unless_private_hosts_are_allowed() {
-    let (port, hits) = serve_png();
+    let (port, hits, hits6) = serve_png_on_both_loopbacks();
     let strict = connector(None, false);
 
     let error = fetch(&strict, format!("http://127.0.0.1:{port}/img.png"))
@@ -231,8 +249,8 @@ async fn a_loopback_target_is_refused_unless_private_hosts_are_allowed() {
         ),
         "{error}"
     );
-    if let Some((port6, hits6)) = serve_png_on("[::1]:0") {
-        let error = fetch(&strict, format!("http://[::1]:{port6}/img.png"))
+    if let Some(hits6) = &hits6 {
+        let error = fetch(&strict, format!("http://[::1]:{port}/img.png"))
             .await
             .expect_err("the IPv6 loopback is refused");
         assert!(
@@ -263,7 +281,13 @@ async fn a_loopback_target_is_refused_unless_private_hosts_are_allowed() {
             .expect("allowed by the opt-in, by name"),
         (1, 1)
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // The two fetches reached the origin on one loopback or the other: which
+    // family the name resolves to first is the host's, not the test's.
+    let served = hits.load(Ordering::SeqCst)
+        + hits6
+            .as_ref()
+            .map_or(0, |hits6| hits6.load(Ordering::SeqCst));
+    assert_eq!(served, 2, "both opt-in fetches reached the origin");
 }
 
 /// A chain of more than ten redirects is refused where a client's default

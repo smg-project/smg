@@ -208,7 +208,11 @@ pub struct TiktokenTokenizer {
     native: Option<Arc<NativeEncoder>>,
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
-    reverse_vocab: HashMap<TokenIdType, String>,
+    /// The added tokens' texts by id (`added_tokens_decoder`), read before
+    /// the encoder by `id_to_token`: an added token shadows a rank sharing
+    /// its id, as `vocab` and the other backend order them. Empty for a
+    /// built-in encoding.
+    added_texts: HashMap<TokenIdType, String>,
     vocab_size: usize,
     chat_template: ChatTemplateState,
     eos_token_ids: Vec<TokenIdType>,
@@ -335,7 +339,7 @@ impl TiktokenTokenizer {
             native: None,
             special_tokens,
             vocab: HashMap::new(),
-            reverse_vocab: HashMap::new(),
+            added_texts: HashMap::new(),
             vocab_size,
             chat_template: ChatTemplateState::empty(),
             eos_token_ids: Vec::new(), // No directory path in from_model
@@ -477,8 +481,9 @@ impl TiktokenTokenizer {
         )
     }
 
-    /// The tokenizer over a file's vocabulary: the engines over its ranks and
-    /// the vocabulary maps, then what the directory beside it gives (the chat
+    /// The tokenizer over a file's vocabulary: the engines over its ranks, the
+    /// text-to-id map and the added tokens' texts, then what the directory
+    /// beside it gives (the chat
     /// template from an explicit path, else the configuration's, else a file
     /// beside the vocabulary; the EOS ids; the renderer).
     fn from_vocabulary(
@@ -503,7 +508,8 @@ impl TiktokenTokenizer {
             specials.iter().map(|(k, &v)| (k.clone(), v)).collect();
 
         // Calculate true vocab size from max token ID (handles sparse/reserved IDs),
-        // build string-based vocab maps (borrows the ranks), then pass the ranks by value to CoreBPE
+        // build the text-to-id map (borrowing the ranks) and the added tokens' texts
+        // by id, then pass the ranks by value to CoreBPE
         let vocab_size = ranks
             .values()
             .copied()
@@ -511,7 +517,11 @@ impl TiktokenTokenizer {
             .max()
             .map(|id| id as usize + 1)
             .unwrap_or(0);
-        let (vocab, reverse_vocab) = build_vocab_maps(&ranks, &specials);
+        let vocab = build_vocab_map(&ranks, &specials);
+        let added_texts: HashMap<TokenIdType, String> = specials
+            .iter()
+            .map(|(text, &id)| (id, text.clone()))
+            .collect();
         let native = Self::native_encoder(&ranks, &pattern, &specials);
         let tokenizer = Arc::new(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?);
         // Counted and announced once the file's own encoder has loaded too,
@@ -590,7 +600,7 @@ impl TiktokenTokenizer {
             native,
             special_tokens,
             vocab,
-            reverse_vocab,
+            added_texts,
             vocab_size,
             chat_template,
             eos_token_ids,
@@ -838,29 +848,24 @@ fn load_tiktoken_bpe(path: &str) -> Result<FxHashMap<Vec<u8>, Rank>> {
 }
 
 /// Build string-level vocab from byte-level encoder + added tokens.
-fn build_vocab_maps(
+/// The text tokens by their text (a rank whose bytes are not UTF-8 has no
+/// entry), the added tokens with them. The other direction, an id's text,
+/// is read from the file's own encoder (`id_to_token`), which holds every
+/// rank's bytes and the special tokens already.
+fn build_vocab_map(
     encoder: &FxHashMap<Vec<u8>, Rank>,
     added_tokens: &HashMap<String, TokenIdType>,
-) -> (HashMap<String, TokenIdType>, HashMap<TokenIdType, String>) {
-    let capacity = encoder.len() + added_tokens.len();
-    let mut vocab = HashMap::with_capacity(capacity);
-    let mut reverse_vocab = HashMap::with_capacity(capacity);
-
-    // BPE tokens (only valid UTF-8 sequences get string entries)
+) -> HashMap<String, TokenIdType> {
+    let mut vocab = HashMap::with_capacity(encoder.len() + added_tokens.len());
     for (token_bytes, &rank) in encoder {
         if let Ok(token_str) = std::str::from_utf8(token_bytes) {
             vocab.insert(token_str.to_string(), rank);
-            reverse_vocab.insert(rank, token_str.to_string());
         }
     }
-
-    // Special/added tokens (always valid UTF-8)
     for (token_str, &id) in added_tokens {
         vocab.insert(token_str.clone(), id);
-        reverse_vocab.insert(id, token_str.clone());
     }
-
-    (vocab, reverse_vocab)
+    vocab
 }
 
 /// The largest id range a dense per-id byte table is built for. Every real
@@ -1295,7 +1300,17 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
-        self.reverse_vocab.get(&id).cloned()
+        // An added token first (it shadows a rank sharing its id, as the
+        // text-to-id map ordered them), then the file's encoder, which holds
+        // every rank's bytes and the special tokens; an id whose bytes are
+        // not text has no token string, as before.
+        if let Some(text) = self.added_texts.get(&id) {
+            return Some(text.clone());
+        }
+        self.tokenizer
+            .decode_bytes(&[id])
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1810,12 +1825,13 @@ mod tests {
         assert_eq!(special_tokens.eos_token.as_ref().unwrap(), "<|endoftext|>");
     }
 
+    /// A built-in encoding keeps no text map, so `token_to_id` answers
+    /// nothing there; `id_to_token` reads the encoder and answers anyway.
     #[test]
-    fn test_builtin_tokenizer_has_empty_vocab_maps() {
+    fn a_built_in_encoding_answers_an_id_from_its_encoder_and_no_text() {
         let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
-        // Built-in path: vocab maps are empty, token_to_id returns None
         assert_eq!(tokenizer.token_to_id("hello"), None);
-        assert_eq!(tokenizer.id_to_token(0), None);
+        assert_eq!(tokenizer.id_to_token(0).as_deref(), Some("!"));
     }
 
     #[test]
@@ -1836,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_vocab_maps() {
+    fn test_build_vocab_map() {
         let mut encoder = FxHashMap::default();
         encoder.insert(b"hello".to_vec(), 42u32);
         encoder.insert(vec![0xFF, 0xFE], 99u32); // invalid UTF-8
@@ -1844,18 +1860,66 @@ mod tests {
         let mut added = HashMap::new();
         added.insert("<|special|>".to_string(), 1000u32);
 
-        let (vocab, reverse_vocab) = build_vocab_maps(&encoder, &added);
+        let vocab = build_vocab_map(&encoder, &added);
 
         // Valid UTF-8 token present
         assert_eq!(vocab.get("hello"), Some(&42));
-        assert_eq!(reverse_vocab.get(&42), Some(&"hello".to_string()));
 
         // Invalid UTF-8 token excluded from vocab
         assert!(!vocab.contains_key("\u{FFFD}")); // not lossy-inserted
 
         // Added token present
         assert_eq!(vocab.get("<|special|>"), Some(&1000));
-        assert_eq!(reverse_vocab.get(&1000), Some(&"<|special|>".to_string()));
+    }
+
+    /// `id_to_token` answers what the text map used to hold: a rank whose
+    /// bytes are text, an added token's text, and nothing for a rank whose
+    /// bytes are not text or an id the file does not have.
+    #[test]
+    fn an_id_reads_its_text_from_the_encoder_as_the_map_held_it() {
+        let dir = split_vocabulary_dir();
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        for byte in 0u32..256 {
+            let expected = std::str::from_utf8(&[byte as u8]).ok().map(str::to_owned);
+            assert_eq!(tokenizer.id_to_token(byte), expected, "rank {byte}");
+        }
+        assert_eq!(
+            tokenizer.id_to_token(256),
+            None,
+            "a rank whose bytes are not text"
+        );
+        assert_eq!(tokenizer.id_to_token(300).as_deref(), Some("[EOS]"));
+        assert_eq!(tokenizer.id_to_token(301).as_deref(), Some("<|open|>"));
+        assert_eq!(
+            tokenizer.id_to_token(400),
+            None,
+            "an id the file does not have"
+        );
+    }
+
+    /// An id that is both a rank and an added token answers the added token,
+    /// as the text map did (it inserted the added tokens last) and as the
+    /// other backend orders them; the text-to-id map keeps both texts.
+    #[test]
+    fn an_added_token_shadows_a_rank_sharing_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tiktoken.model"),
+            full_byte_tiktoken_model(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder": {
+                "65": {"content": "<|shadow|>", "special": false}
+            }}"#,
+        )
+        .unwrap();
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert_eq!(tokenizer.id_to_token(65).as_deref(), Some("<|shadow|>"));
+        assert_eq!(tokenizer.id_to_token(66).as_deref(), Some("B"));
+        assert_eq!(tokenizer.token_to_id("<|shadow|>"), Some(65));
+        assert_eq!(tokenizer.token_to_id("A"), Some(65));
     }
 
     #[test]

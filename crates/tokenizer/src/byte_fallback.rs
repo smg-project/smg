@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer as HfTokenizer;
 
-use crate::traits::TokenIdType;
+use crate::{byte_level::max_token_id, traits::TokenIdType};
 
 /// What an id contributes to a decode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,6 +50,15 @@ impl PieceTable {
     /// then `ByteFallback` and `Fuse`, then an optional `Strip(" ", 1, 0)`;
     /// any other chain keeps the `tokenizers` decode.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
+        Self::build_with_max_id(tokenizer, None)
+    }
+
+    /// [`Self::build`] with the model's largest id as the file's read saw
+    /// it, when it did (see `byte_level::max_token_id`).
+    pub(crate) fn build_with_max_id(
+        tokenizer: &HfTokenizer,
+        model_max_id: Option<u32>,
+    ) -> Option<Arc<Self>> {
         let chain = serde_json::to_value(tokenizer.get_decoder()?).ok()?;
         let decoders = chain.get("decoders")?.as_array()?;
         let replace = serde_json::json!(
@@ -73,7 +82,7 @@ impl PieceTable {
         // Each id through the lookups the decode uses: `id_to_token` (an added
         // token before a model piece that shares its id) and the added
         // vocabulary's own notion of special, as the byte-level table does.
-        let max_id = tokenizer.get_vocab(true).values().copied().max()?;
+        let max_id = max_token_id(tokenizer, model_max_id)?;
         let added = tokenizer.get_added_vocabulary();
         let ids = max_id as usize + 1;
         let mut offsets = Vec::with_capacity(ids + 1);

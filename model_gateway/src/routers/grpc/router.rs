@@ -724,14 +724,17 @@ impl GrpcRouter {
         .await
     }
 
-    /// Main route_messages implementation
-    async fn route_messages_impl(
+    /// The Messages request as the pipeline takes it: its `model` field
+    /// canonical, in the `Arc` the request context holds, with the canonical
+    /// model id. Done before the async hops of [`Self::route_messages_impl`],
+    /// as [`Self::chat_request_for_pipeline`] does for chat, so that only the
+    /// handle travels through their state machines, not a copy of the request
+    /// per hop.
+    fn messages_request_for_pipeline(
         &self,
-        headers: Option<&HeaderMap>,
-        tenant_meta: &TenantRequestMeta,
         body: CreateMessageRequest,
         model_id: &str,
-    ) -> Response {
+    ) -> (Arc<CreateMessageRequest>, String) {
         debug!("Processing messages request for model: {}", model_id);
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
@@ -739,9 +742,19 @@ impl GrpcRouter {
         // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
-        canonical_body.model = model_id_cloned.clone();
-        let canonical_body = Arc::new(canonical_body);
+        canonical_body.model.clone_from(&model_id_cloned);
+        (Arc::new(canonical_body), model_id_cloned)
+    }
 
+    /// Main route_messages implementation, over the request
+    /// [`Self::messages_request_for_pipeline`] prepared.
+    async fn route_messages_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        canonical_body: Arc<CreateMessageRequest>,
+        model_id_cloned: String,
+    ) -> Response {
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
         // No worker takes part, so the answer carries no rate-limit
@@ -1284,6 +1297,7 @@ impl RouterTrait for GrpcRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
+        let (body, model_id) = self.messages_request_for_pipeline(body, model_id);
         self.route_messages_impl(headers, tenant_meta, body, model_id)
             .await
     }

@@ -1186,6 +1186,41 @@ fn decoded_whole(
     text
 }
 
+/// Every case read four ways: the full decode, `Sequence`'s deltas and
+/// finish, the stop decoder's deltas and batch, and the non-streaming path,
+/// each against the case's full or streamed text.
+fn assert_decodes(
+    tokenizer: &Arc<dyn crate::TokenizerTrait>,
+    cases: &[(&[u32], bool, &str, &str)],
+) {
+    for &(ids, skip, full, streamed) in cases {
+        assert_eq!(
+            tokenizer.decode(ids, skip).unwrap(),
+            full,
+            "ids={ids:?} skip={skip}"
+        );
+        let (deltas, finish) = sequence_deltas(tokenizer, ids, skip);
+        assert_eq!(
+            deltas.concat() + &finish,
+            streamed,
+            "ids={ids:?} skip={skip}: deltas {deltas:?}, finish {finish:?}"
+        );
+        let (deltas, batch, _) =
+            stream_all(tokenizer, ids, crate::StopSequenceConfig::default(), skip);
+        assert_eq!(
+            deltas.concat(),
+            streamed,
+            "stop decoder: ids={ids:?} skip={skip}"
+        );
+        assert_eq!(batch, full, "stop decoder batch: ids={ids:?} skip={skip}");
+        assert_eq!(
+            decoded_whole(tokenizer, ids, skip),
+            streamed,
+            "whole: ids={ids:?} skip={skip}"
+        );
+    }
+}
+
 /// A byte-fallback stream that ends while its window holds a byte run: the
 /// end releases what is text (a literal replacement character, a character
 /// complete before the cut bytes, a stray byte as the full decode's
@@ -1214,24 +1249,11 @@ fn byte_fallback_stream_end_releases_held_text_but_not_a_cut_character() {
         (stray_then_lead, "\u{FFFD}".repeat(2), "\u{FFFD}"),
         (lead_then_special, "\u{FFFD}".into(), ""),
     ];
-    for (ids, full, streamed) in &cases {
-        assert_eq!(tokenizer.decode(ids, true).unwrap(), *full, "ids={ids:?}");
-        let (deltas, finish) = sequence_deltas(&tokenizer, ids, true);
-        assert_eq!(
-            deltas.concat() + &finish,
-            *streamed,
-            "ids={ids:?}: deltas {deltas:?}, finish {finish:?}"
-        );
-        let (deltas, batch, _) =
-            stream_all(&tokenizer, ids, crate::StopSequenceConfig::default(), true);
-        assert_eq!(deltas.concat(), *streamed, "stop decoder: ids={ids:?}");
-        assert_eq!(batch, *full, "stop decoder batch: ids={ids:?}");
-        assert_eq!(
-            decoded_whole(&tokenizer, ids, true),
-            *streamed,
-            "whole: ids={ids:?}"
-        );
-    }
+    let cases: Vec<(&[u32], bool, &str, &str)> = cases
+        .iter()
+        .map(|(ids, full, streamed)| (ids.as_slice(), true, full.as_str(), *streamed))
+        .collect();
+    assert_decodes(&tokenizer, &cases);
 }
 
 /// A byte-level stream that ends while its decoder still holds bytes: the
@@ -1310,32 +1332,7 @@ fn byte_level_stream_end_renders_a_cut_character_as_decode_does() {
             "hello\u{FFFD}<|im_end|>",
         ),
     ];
-    for (ids, skip, full, streamed) in cases {
-        assert_eq!(
-            tokenizer.decode(ids, skip).unwrap(),
-            full,
-            "ids={ids:?} skip={skip}"
-        );
-        let (deltas, finish) = sequence_deltas(&tokenizer, ids, skip);
-        assert_eq!(
-            deltas.concat() + &finish,
-            streamed,
-            "ids={ids:?} skip={skip}: deltas {deltas:?}, finish {finish:?}"
-        );
-        let (deltas, batch, _) =
-            stream_all(&tokenizer, ids, crate::StopSequenceConfig::default(), skip);
-        assert_eq!(
-            deltas.concat(),
-            streamed,
-            "stop decoder: ids={ids:?} skip={skip}"
-        );
-        assert_eq!(batch, full, "stop decoder batch: ids={ids:?} skip={skip}");
-        assert_eq!(
-            decoded_whole(&tokenizer, ids, skip),
-            streamed,
-            "whole: ids={ids:?} skip={skip}"
-        );
-    }
+    assert_decodes(&tokenizer, &cases);
     // The steps hold what the reference holds; the end releases the held
     // bytes, the cut character as its replacement character.
     let (deltas, finish) = sequence_deltas(&tokenizer, &[hello, world, continuation], false);
@@ -1407,32 +1404,7 @@ fn byte_level_in_a_sequence_decoder_ends_the_same_way() {
         ),
         (&[lead, special], true, "\u{FFFD}", "\u{FFFD}"),
     ];
-    for (ids, skip, full, streamed) in cases {
-        assert_eq!(
-            tokenizer.decode(ids, skip).unwrap(),
-            full,
-            "ids={ids:?} skip={skip}"
-        );
-        let (deltas, finish) = sequence_deltas(&tokenizer, ids, skip);
-        assert_eq!(
-            deltas.concat() + &finish,
-            streamed,
-            "ids={ids:?} skip={skip}: deltas {deltas:?}, finish {finish:?}"
-        );
-        let (deltas, batch, _) =
-            stream_all(&tokenizer, ids, crate::StopSequenceConfig::default(), skip);
-        assert_eq!(
-            deltas.concat(),
-            streamed,
-            "stop decoder: ids={ids:?} skip={skip}"
-        );
-        assert_eq!(batch, full, "stop decoder batch: ids={ids:?} skip={skip}");
-        assert_eq!(
-            decoded_whole(&tokenizer, ids, skip),
-            streamed,
-            "whole: ids={ids:?} skip={skip}"
-        );
-    }
+    assert_decodes(&tokenizer, &cases);
 }
 
 /// A seeded byte-level sequence: the seed is prompt text, so a sequence that

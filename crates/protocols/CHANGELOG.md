@@ -4,6 +4,16 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ## Unreleased
 
+### Changed
+
+- Breaking: on `ChatMessage::Assistant`, `function_call` is `Option<Box<FunctionCallResponse>>`,
+  and the provider extension's `tools` is `Option<Box<serde_json::Value>>`. The assistant turn is
+  the enum's largest variant, so the two rarely-present values had grown every chat message to
+  272 bytes (176 before the refusal, the audio reference and the function call were kept), and
+  a history of four or eight turns moved up one allocator size class on every chat request.
+  Behind a pointer each, a message is 168 bytes and the history is back in its class; the wire
+  shape and the schema are unchanged.
+
 ### Removed
 
 - Breaking: the fifty-two builder constructors nothing in this repository uses are removed, with
@@ -39,6 +49,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
   choice it does not expect. A choice with log probabilities is written as before.
+- A `json_schema` response format keeps its `description` when the request is written back for an
+  upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
+  reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
+  `text.format` description into the Chat request it builds, but a gRPC engine still gets only the
+  format's schema, as before. Breaking: `JsonSchemaFormat` gains `description: Option<String>`.
 - A usage object whose `prompt_tokens_details` leaves out `cached_tokens` parses, with no tokens
   cached, as the public API defaults the key. The crate refused the whole usage, and the
   completion around it, with ``missing field `cached_tokens` ``. The newer counters an upstream

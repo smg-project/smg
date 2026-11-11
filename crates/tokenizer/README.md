@@ -325,8 +325,8 @@ like-for-like.
 ## Known Limitations & Future Work
 - SentencePiece (`.model`) and GGUF tokenizers are detected but deliberately unimplemented.
 - `Encoding::Plain` is a general-purpose `Vec<u32>` container used by mock tokenizers and cache merge logic.
-- Built-in `TiktokenTokenizer` models (via `from_model_name`) have empty vocab maps, so
-  `token_to_id`/`id_to_token` return `None`. Hub-loaded models (via `from_dir`) have full mappings.
+- Built-in `TiktokenTokenizer` models (via `from_model_name`) keep no text-to-id map, so
+  `token_to_id` returns `None`; `id_to_token` reads the encoder and answers. Hub-loaded models (via `from_dir`) answer both.
 - There is no metrics or batching layer inside this module; the router records metrics elsewhere.
 - Dynamic batching / sequence pooling code that earlier READMEs mentioned never landed in Rust.
 

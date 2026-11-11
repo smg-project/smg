@@ -22,7 +22,8 @@ use std::{
 };
 
 use gateway_launch::{
-    base_args, free_ports, launch, log_with_line, serial, Until, EXIT_TIMEOUT, IP,
+    base_args, free_ports, launch, log_with_line, serial, served_connection, Until, EXIT_TIMEOUT,
+    IP,
 };
 
 use crate::gateway_launch;
@@ -191,9 +192,11 @@ fn the_admin_listener_refuses_connections_beyond_its_bound_at_accept() {
     }
     assert_eq!(status_of(admin, "/health"), Some(200), "under the bound");
 
-    // One idle connection holds the bound; the next is closed at accept.
-    let held = TcpStream::connect_timeout(&admin, Duration::from_millis(500))
-        .expect("the connection within the bound");
+    // One served connection, kept open, holds the bound; the next is closed
+    // at accept. Its answer proves it holds the permit before the probe: a
+    // bare connect returns before the acceptor has admitted it, and the
+    // `/health` connection above may still hold the permit for a moment.
+    let held = served_connection(admin, EXIT_TIMEOUT);
     assert_eq!(
         status_of(admin, "/health"),
         None,

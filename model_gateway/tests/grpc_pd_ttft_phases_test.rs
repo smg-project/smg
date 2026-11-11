@@ -11,7 +11,8 @@
 //! Every streaming route (chat, Messages, completions) anchors its own time to
 //! first token and generation duration at the prefill dispatch as well: on the
 //! sequential pair they carry both workers' delays, not the decode worker's
-//! alone.
+//! alone. A collected answer, with no first token to time, anchors its one
+//! generation record there too.
 //!
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
@@ -469,4 +470,62 @@ fn the_messages_route_anchors_at_the_prefill_dispatch_under_held_headers() {
 #[test]
 fn the_completions_route_anchors_at_the_prefill_dispatch_under_held_headers() {
     route_anchors_at_the_prefill_dispatch(Route::Completions, true);
+}
+
+/// A collected (non-streaming) chat answer on the sequential pair: its one
+/// record, the generation duration, is anchored at the prefill dispatch, so it
+/// carries both workers' delays. A clock read when the answer is collected
+/// would carry neither.
+#[test]
+fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
+    let rendered = render_after(|| async {
+        let prefill =
+            start_mock_engine(HeldHeadersEngine::eager(PREFILL_DELAY, OUTPUT_TOKENS)).await;
+        let decode = start_mock_engine(HeldHeadersEngine::eager(DECODE_DELAY, OUTPUT_TOKENS)).await;
+        let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
+        let request = serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello world"}],
+            "max_tokens": 8,
+        }))
+        .unwrap();
+        let response = router.route_chat(None, &tenant(), request, MODEL).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("response body");
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+    });
+    let labels = ["endpoint=\"chat\""];
+    let (Some(count), Some(generation)) = (
+        metrics_capture::sample(
+            &rendered,
+            "smg_router_generation_duration_seconds",
+            "count",
+            &labels,
+        ),
+        metrics_capture::sample(
+            &rendered,
+            "smg_router_generation_duration_seconds",
+            "sum",
+            &labels,
+        ),
+    ) else {
+        panic!("chat: the generation record is missing:\n{rendered}");
+    };
+    report(
+        &format!("collected chat: generation={generation}"),
+        &Phases::of(&rendered, RuntimeType::Vllm.as_str()),
+    );
+    assert_eq!(count, 1.0, "chat: one generation record:\n{rendered}");
+    let floor = (PREFILL_DELAY + DECODE_DELAY).as_secs_f64();
+    assert!(
+        generation >= floor,
+        "chat: generation duration {generation} s carries both workers' delays ({floor} s)"
+    );
 }
