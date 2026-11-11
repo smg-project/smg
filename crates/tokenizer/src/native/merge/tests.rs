@@ -1436,6 +1436,7 @@ fn section_of(
     vocab: &Vocab,
     merges: &[(&str, &str)],
     byte_fallback: bool,
+    unk_token: Option<&str>,
 ) -> crate::word_cache::LateBoundModel {
     let vocab: std::collections::BTreeMap<&str, u32> = vocab
         .iter()
@@ -1443,7 +1444,7 @@ fn section_of(
         .collect();
     let section = serde_json::json!({
         "type": "BPE",
-        "unk_token": "<unk>",
+        "unk_token": unk_token,
         "byte_fallback": byte_fallback,
         "vocab": vocab,
         "merges": merges,
@@ -1544,7 +1545,7 @@ fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
     vocab.insert("a".to_owned(), 1 << 31);
     vocab.insert("b".to_owned(), (1 << 31) + 1);
     vocab.insert("ab".to_owned(), (1 << 31) + 2);
-    let late = section_of(&vocab, &[("a", "b")], true);
+    let late = section_of(&vocab, &[("a", "b")], true, Some("<unk>"));
     let sparse = BPE::builder()
         .vocab_and_merges(vocab, vec![("a".to_owned(), "b".to_owned())])
         .byte_fallback(true)
@@ -1565,11 +1566,15 @@ fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
     for (token, id) in [("a", 0), ("b", 0), ("c", 2)] {
         vocab.insert(token.to_owned(), id);
     }
+    // From the section's text: the built model's serializer writes one token
+    // per id, so a read through it would see a gap at 1 rather than the
+    // shared id 0, and the gap check, not the duplicate check, would clear
+    // `dense`.
+    let late = section_of(&vocab, &[], false, None);
     let doubled = BPE::builder()
         .vocab_and_merges(vocab, Vec::new())
         .build()
         .expect("a BPE with two tokens on one id");
-    let late = read_of(&doubled);
     assert_eq!(late.read().and_then(|read| read.max_id), Some(2));
     assert!(late.read().is_some_and(|read| !read.dense));
     let entries = sorted(entries_of(&doubled, late.read()).collect());
