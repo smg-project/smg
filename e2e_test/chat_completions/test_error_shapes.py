@@ -15,7 +15,7 @@ worker's fault hook answers the request with a 400 and a JSON body, which
 puts the relay's rule on every pull request's CPU row.
 
 Usage:
-    E2E_RUNTIME=sglang pytest e2e_test/chat_completions/test_error_shapes.py -v
+    E2E_RUNTIME=sglang E2E_ENGINE=sglang pytest e2e_test/chat_completions/test_error_shapes.py -v
     E2E_RUNTIME=mock E2E_ENGINE=mock pytest e2e_test/chat_completions/test_error_shapes.py -v
 """
 
