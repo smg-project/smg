@@ -2938,6 +2938,9 @@ mod native_loads_tests {
             realistic: false,
             ..mock_worker::config::Config::default()
         });
+        // A port an earlier test's engine served on keeps that engine's
+        // overrides; this engine starts from fresh ones.
+        mock_worker::overrides::fresh_for_port(port);
         #[expect(
             clippy::disallowed_methods,
             reason = "test engine: the server task lives for the test process"
