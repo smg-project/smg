@@ -9,25 +9,32 @@ fn the_video_decoder_gap_names_the_executable_that_is_missing() {
     if cfg!(feature = "opencv-video") || std::env::var_os("SMG_VIDEO_DECODE_BACKEND").is_some() {
         return;
     }
-    let ffmpeg = executable_runs("ffmpeg");
-    let ffprobe = executable_runs("ffprobe");
+    let ffmpeg = executable_starts("ffmpeg");
+    let ffprobe = executable_starts("ffprobe");
+    let not_found =
+        |r: &std::io::Result<()>| matches!(r, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     match missing_video_decoder() {
         None => assert!(
-            ffmpeg && ffprobe,
+            ffmpeg.is_ok() && ffprobe.is_ok(),
             "no gap reported while a decoder executable is missing"
         ),
         Some(why) => {
             assert!(
-                !(ffmpeg && ffprobe),
+                ffmpeg.is_err() || ffprobe.is_err(),
                 "a gap reported while both executables run: {why}"
             );
-            assert_eq!(why.contains("ffmpeg executable"), !ffmpeg, "{why}");
-            assert_eq!(why.contains("ffprobe executable"), !ffprobe, "{why}");
-            assert!(
+            assert_eq!(why.contains("ffmpeg "), ffmpeg.is_err(), "{why}");
+            assert_eq!(why.contains("ffprobe "), ffprobe.is_err(), "{why}");
+            // The install hint is for a binary that is not there; one that is
+            // there but cannot run is told that instead.
+            assert_eq!(
                 why.ends_with("install ffmpeg to decode video_url inputs"),
+                not_found(&ffmpeg) || not_found(&ffprobe),
                 "{why}"
             );
         }
     }
-    assert!(!executable_runs("an-executable-this-host-does-not-have"));
+    assert!(not_found(&executable_starts(
+        "an-executable-this-host-does-not-have"
+    )));
 }

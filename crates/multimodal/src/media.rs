@@ -1379,31 +1379,39 @@ fn probe_video_decoder_gap() -> Option<String> {
             }
         }
     }
-    let missing: Vec<String> = ["ffmpeg", "ffprobe"]
-        .into_iter()
-        .filter(|program| !executable_runs(program))
-        .map(|program| format!("{program} executable"))
-        .collect();
-    if missing.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "{} not found; install ffmpeg to decode video_url inputs",
-            missing.join(" and ")
-        ))
+    let mut gaps = Vec::new();
+    let mut not_found = false;
+    for program in ["ffmpeg", "ffprobe"] {
+        match executable_starts(program) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                not_found = true;
+                gaps.push(format!("{program} executable not found"));
+            }
+            Err(e) => gaps.push(format!("{program} could not be started: {e}")),
+        }
     }
+    if gaps.is_empty() {
+        return None;
+    }
+    let mut why = gaps.join("; ");
+    if not_found {
+        why.push_str("; install ffmpeg to decode video_url inputs");
+    }
+    Some(why)
 }
 
 /// Whether `program -version` can be started from PATH (a blocking probe,
-/// run once at start-up).
-fn executable_runs(program: &str) -> bool {
+/// run once at start-up); the error says why not, split as the decode
+/// path's own spawn is: `NotFound` apart from a binary that cannot run.
+fn executable_starts(program: &str) -> std::io::Result<()> {
     std::process::Command::new(program)
         .arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok()
+        .map(|_| ())
 }
 
 fn video_decode_backend_override() -> Option<&'static str> {

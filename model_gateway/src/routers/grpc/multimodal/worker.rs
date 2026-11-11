@@ -33,7 +33,7 @@ use super::{
     media_verdict, mm_settings,
     pixel_cache::pixel_cache_with_budget,
     plan::{prepare_placeholder_tokens, validate_rendered_media_anchors, MediaPlan},
-    process::{process_multimodal_plan, VideoDecoderUnavailable},
+    process::process_multimodal_plan,
     RegistryTokenizer,
 };
 use crate::{
@@ -1001,9 +1001,6 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
     {
         return WorkerMediaError::Invalid(message);
     }
-    if VideoDecoderUnavailable::is(&error) {
-        return WorkerMediaError::Invalid(message);
-    }
     if let Some(fetch) = media_verdict(&error) {
         return classify_fetch(fetch, message);
     }
@@ -1056,7 +1053,7 @@ mod tests {
 
     use llm_tokenizer::MockTokenizer;
 
-    use super::*;
+    use super::{super::process::VideoDecoderUnavailable, *};
 
     /// Set to a non-empty value where the video tools must be installed (CI sets
     /// it on the shards that install ffmpeg): the tests that decode a clip then
@@ -1997,15 +1994,17 @@ mod tests {
         assert!(matches!(classify(decoder), WorkerMediaError::Internal(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
-        // A video part on a process without a video decoder is refused as
-        // the caller's up front (known at start-up), not as the worker's.
+        // A video part on a worker whose host lacks the video decoder is
+        // refused up front as this host's own fault (INTERNAL on the wire),
+        // which the router replays on another worker, as the decode's
+        // DecoderUnavailable was before the short-circuit.
         let no_decoder = anyhow::Error::new(VideoDecoderUnavailable {
             why: "ffmpeg executable not found; install ffmpeg to decode video_url inputs",
         })
         .context("Failed to process the plan");
         assert!(matches!(
             classify(no_decoder),
-            WorkerMediaError::Invalid(message) if message.contains("ffmpeg executable not found")
+            WorkerMediaError::Internal(message) if message.contains("ffmpeg executable not found")
         ));
         // An item above the engine's encoder budget is the caller's, with the
         // item's size and the budget in the message, at any depth of the chain.

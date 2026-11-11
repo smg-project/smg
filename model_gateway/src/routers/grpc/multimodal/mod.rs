@@ -418,7 +418,7 @@ pub(crate) fn report_jpeg_decoder() {
             None => tracing::info!("video decode has its decoder"),
             Some(why) => tracing::warn!(
                 "video input cannot be decoded by this process: {why}; a request with a video \
-                 part is refused as 400 invalid_multimodal_request until it can"
+                 part is refused up front until it can"
             ),
         }
     });
