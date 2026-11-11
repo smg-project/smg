@@ -94,34 +94,65 @@ pub(crate) fn serialize_json_sized<T: serde::Serialize>(
     Ok(buf)
 }
 
-/// The first allocation of a typed JSON answer's body: a chat completion,
-/// a Messages answer or a JSON-schema answer of a few hundred bytes fits it
-/// whole, a larger one grows from here instead of from 128 bytes.
-const JSON_ANSWER_CAPACITY: usize = 1024;
+/// The capacity a thread's JSON answer buffer keeps between answers: a chat
+/// completion, a Messages answer or a JSON-schema answer of a few hundred
+/// bytes fits it many times over; the buffer a larger answer grew goes with
+/// that answer.
+const JSON_ANSWER_RETAINED: usize = 64 * 1024;
 
-/// A typed answer as a JSON response: serialized once into a `Vec<u8>`
-/// (serde's own sink, one `extend_from_slice` per write) that starts at
-/// [`JSON_ANSWER_CAPACITY`], handed to the body by refcount, with the
-/// `application/json` content type. `axum::Json` writes the same bytes
+thread_local! {
+    /// The buffer a thread's typed JSON answers are serialized into.
+    static JSON_ANSWER_BUFFER: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A typed answer as a JSON response: serialized once into the thread's
+/// buffer (serde's own sink, one `extend_from_slice` per write) and copied
+/// once into a body of exactly its size, with the `application/json`
+/// content type. That is one allocation per answer: a buffer sized per
+/// answer and handed to the body by refcount cost two, the buffer and the
+/// shared header `Bytes::from` boxes for a buffer with spare capacity, and
+/// grew again for a body past its size. `axum::Json` writes the same bytes
 /// through `BytesMut::with_capacity(128).writer()`: the `bytes` writer
 /// adapter slices every write to the buffer's remaining room before it
 /// appends, which prices the one-byte JSON tokens (2.5 % of a chat
 /// request's user instructions on the mock bed), and the 128-byte start
 /// reallocates and copies a 700-byte body three times. A value that does
 /// not serialize answers as axum does: a 500 with the error's text.
-pub(crate) fn json_response<T: serde::Serialize>(value: &T) -> axum::response::Response {
+pub fn json_response<T: serde::Serialize>(value: &T) -> axum::response::Response {
+    JSON_ANSWER_BUFFER.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buffer) => {
+            buffer.clear();
+            let result = serde_json::to_writer(&mut *buffer, value);
+            let response = json_answer(&buffer, result);
+            if buffer.capacity() > JSON_ANSWER_RETAINED {
+                *buffer = Vec::new();
+            }
+            response
+        }
+        // A serializer that answers while this thread's buffer is borrowed
+        // (none does today): a buffer of this answer's own.
+        Err(_) => {
+            let mut buffer = Vec::new();
+            let result = serde_json::to_writer(&mut buffer, value);
+            json_answer(&buffer, result)
+        }
+    })
+}
+
+/// The response of a serialized answer, compiled once for every `T`.
+fn json_answer(body: &[u8], result: serde_json::Result<()>) -> axum::response::Response {
     use axum::{
         http::{header, HeaderValue, StatusCode},
         response::IntoResponse,
     };
-    let mut buf = Vec::with_capacity(JSON_ANSWER_CAPACITY);
-    match serde_json::to_writer(&mut buf, value) {
+    match result {
         Ok(()) => (
             [(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )],
-            bytes::Bytes::from(buf),
+            bytes::Bytes::copy_from_slice(body),
         )
             .into_response(),
         Err(error) => (

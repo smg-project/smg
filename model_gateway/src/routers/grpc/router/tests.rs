@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{http::StatusCode, response::IntoResponse};
 use http::header::{HeaderValue, RETRY_AFTER};
 use llm_tokenizer::factory;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
