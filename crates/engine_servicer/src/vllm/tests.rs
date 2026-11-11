@@ -291,6 +291,19 @@ async fn harness_with(
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     config.media_processor = media_processor;
+    started(dir, handshake, config, tokenizer).await
+}
+
+/// The servicer started on `config` (with `tokenizer` when a test brings
+/// its own), one mock engine handshaken on `handshake` and waited for, the
+/// client connected: the single-engine harness [`harness_with`] and
+/// [`metrics_harness_with`] hand back.
+async fn started(
+    dir: tempfile::TempDir,
+    handshake: String,
+    config: VllmServicerConfig,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+) -> Harness {
     let server = match tokenizer {
         Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
         None => VllmServicerServer::start(config),
@@ -5058,28 +5071,7 @@ async fn metrics_harness_with(
     let mut config = config(dir.path(), &handshake, model);
     config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
     config.media_processor = media_processor;
-    let server = match tokenizer {
-        Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
-        None => VllmServicerServer::start(config),
-    }
-    .expect("servicer starts");
-    let engine = connect_to_frontend(
-        &handshake,
-        EngineId::from_engine_index(0),
-        default_ready_response(),
-    )
-    .await
-    .expect("mock engine handshake");
-    wait_until(|| server.engine_ready()).await;
-    let client = VllmEngineClient::new(grpc_channel(server.address()).await);
-    let (engine_in, engine_out) = engine.split();
-    Harness {
-        server,
-        engine_in,
-        engine_out,
-        client,
-        _dir: dir,
-    }
+    started(dir, handshake, config, tokenizer).await
 }
 
 /// One scrape of the servicer's metrics listener.

@@ -940,7 +940,10 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
-    use crate::{encoder_inputs::EncoderDtype, test_support::create_test_image};
+    use crate::{
+        encoder_inputs::EncoderDtype,
+        test_support::{create_test_image, hex, lcg_rgb_image},
+    };
 
     #[test]
     fn test_llava_processor_default() {
@@ -1240,23 +1243,6 @@ mod tests {
         assert_eq!(tensor.as_slice().unwrap(), expected.as_slice().unwrap());
     }
 
-    /// The seeded bytes the reference constants below were produced from: a
-    /// 31-bit linear congruential generator, one byte per step.
-    fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
-        let mut state = seed;
-        (0..count)
-            .map(|_| {
-                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
-                ((state >> 16) & 0xff) as u8
-            })
-            .collect()
-    }
-
-    fn lcg_image(width: u32, height: u32, seed: u32) -> DynamicImage {
-        let data = lcg_bytes((width * height * 3) as usize, seed);
-        DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, data).unwrap())
-    }
-
     /// The checkpoint's `preprocessor_config.json` the reference ran with.
     fn reference_config() -> PreProcessorConfig {
         PreProcessorConfig::from_json(
@@ -1269,10 +1255,6 @@ mod tests {
                 "size": {"shortest_edge": 336}}"#,
         )
         .unwrap()
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     fn f32_at(bytes: &[u8], index: usize) -> f32 {
@@ -1429,7 +1411,7 @@ mod tests {
         ];
         let processor = LlavaProcessor::new().with_preprocessor_config(&reference_config());
         for case in &cases {
-            let image = lcg_image(case.width, case.height, case.seed);
+            let image = lcg_rgb_image(case.width, case.height, case.seed);
             let result = processor.preprocess(&[&image]).unwrap();
             assert_eq!(result.encoder_input.shape(), &[1, 3, 336, 336]);
             assert_pinned(&result.encoder_input.write_as(EncoderDtype::Float32), case);
@@ -1469,7 +1451,7 @@ mod tests {
         ];
         let processor = LlavaNextProcessor::new().with_preprocessor_config(&reference_config());
         for case in &cases {
-            let image = lcg_image(case.width, case.height, case.seed);
+            let image = lcg_rgb_image(case.width, case.height, case.seed);
             let result = processor.preprocess(&[&image]).unwrap();
             assert_eq!(result.encoder_input.shape(), &[1, 3, 3, 336, 336]);
             assert_pinned(&result.encoder_input.write_as(EncoderDtype::Float32), case);

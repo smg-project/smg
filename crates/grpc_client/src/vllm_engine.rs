@@ -240,8 +240,8 @@ impl VllmEngineClient {
         let mut constraints = Vec::new();
 
         let format = body_format(request, set_aside)?;
-        if let Some(schema) = format.schema {
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema));
+        if let Some(constraint) = Self::constraint_of(format.format) {
+            constraints.push(constraint);
         }
 
         // vLLM supports: json_schema, regex, grammar, structural_tag, json_object, choice
@@ -491,6 +491,9 @@ impl VllmEngineClient {
             ConstraintKind::JsonSchema => proto::sampling_params::Constraint::JsonSchema(value),
             ConstraintKind::Regex => proto::sampling_params::Constraint::Regex(value),
             ConstraintKind::Ebnf => proto::sampling_params::Constraint::Grammar(value),
+            ConstraintKind::StructuralTag => {
+                proto::sampling_params::Constraint::StructuralTag(value)
+            }
         })
     }
 
@@ -1023,6 +1026,10 @@ mod tests {
             (
                 ConstraintKind::Ebnf,
                 proto::sampling_params::Constraint::Grammar("v".to_string()),
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                proto::sampling_params::Constraint::StructuralTag("v".to_string()),
             ),
         ] {
             assert_eq!(

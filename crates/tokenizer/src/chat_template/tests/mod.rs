@@ -936,6 +936,22 @@ fn strftime_now_writes_the_render_instant() {
     assert!(error.contains("strftime_now"), "{error}");
 }
 
+/// A render that names no instant reads the clock when the template first
+/// writes it, once: every `strftime_now` of the render writes the same
+/// instant, down to the nanosecond.
+#[test]
+fn strftime_now_reads_one_instant_per_render() {
+    let template = "{{ strftime_now('%s.%f') }}|{{ strftime_now('%s.%f') }}";
+    let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+    let messages: [serde_json::Value; 0] = [];
+    let rendered = processor
+        .apply_chat_template(&messages, ChatTemplateParams::default())
+        .unwrap();
+    let (first, second) = rendered.split_once('|').unwrap();
+    assert_eq!(first, second, "{rendered}");
+    assert!(first.contains('.'), "{rendered}");
+}
+
 /// Jinja2's `dict()` is Python's: it builds a map from nothing, from a
 /// mapping or from an iterable of key/value pairs, keyword arguments are
 /// written over the result, and a repeated key keeps its first position

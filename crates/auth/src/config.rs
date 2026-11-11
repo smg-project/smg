@@ -231,17 +231,17 @@ impl ControlPlaneAuthConfig {
     /// Find an API key by its value and return the entry if found.
     /// Uses constant-time hash comparison to prevent timing attacks.
     pub fn find_api_key(&self, key: &str) -> Option<&ApiKeyEntry> {
-        find_entry(&self.api_keys, key)
+        matching_index(&self.api_keys, key).and_then(|index| self.api_keys.get(index))
     }
 }
 
-/// The entry `key` matches: every entry is checked and none is skipped,
-/// so the scan's duration tells nothing of which key matched.
-fn find_entry<'a>(entries: &'a [ApiKeyEntry], key: &str) -> Option<&'a ApiKeyEntry> {
+/// The position of the entry `key` matches: every entry is checked and none
+/// is skipped, so the scan's duration tells nothing of which key matched.
+fn matching_index(entries: &[ApiKeyEntry], key: &str) -> Option<usize> {
     let mut found = None;
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         if entry.verify(key) {
-            found = Some(entry);
+            found = Some(index);
         }
     }
     found
@@ -277,9 +277,13 @@ impl ApiKeySet {
         self.entries.load().is_empty()
     }
 
-    /// The entry `key` matches in the set in force, if any.
-    pub fn find(&self, key: &str) -> Option<ApiKeyEntry> {
-        find_entry(&self.entries.load(), key).cloned()
+    /// The entry `key` matches in the set in force, if any, read through
+    /// the snapshot the lookup took: nothing of the entry is copied, and a
+    /// reload during the request leaves the match readable.
+    pub fn find(&self, key: &str) -> Option<ApiKeyMatch> {
+        let entries = self.entries.load_full();
+        let index = matching_index(&entries, key)?;
+        Some(ApiKeyMatch { entries, index })
     }
 
     /// Put `entries` in force and return the set they replace; a request
@@ -292,6 +296,28 @@ impl ApiKeySet {
 impl std::fmt::Debug for ApiKeySet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.entries.load().iter()).finish()
+    }
+}
+
+/// The entry a lookup matched, held through the set snapshot the lookup
+/// took: it reads as the entry, and the set may be replaced while a request
+/// holds it.
+pub struct ApiKeyMatch {
+    entries: Arc<Vec<ApiKeyEntry>>,
+    index: usize,
+}
+
+impl std::ops::Deref for ApiKeyMatch {
+    type Target = ApiKeyEntry;
+
+    fn deref(&self) -> &ApiKeyEntry {
+        &self.entries[self.index]
+    }
+}
+
+impl std::fmt::Debug for ApiKeyMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
     }
 }
 
@@ -399,5 +425,39 @@ mod tests {
         assert!(debug_str.contains("[REDACTED]"));
         // Should not contain the key or hash bytes
         assert!(!debug_str.contains("secret"));
+    }
+
+    #[test]
+    fn a_match_is_the_entry_whose_key_matched() {
+        let set = ApiKeySet::new(vec![
+            ApiKeyEntry::new("a", "A", "key-a", Role::Admin),
+            ApiKeyEntry::new("b", "B", "key-b", Role::User),
+            ApiKeyEntry::new("c", "C", "key-c", Role::User),
+        ]);
+        let found = set.find("key-c").expect("the last entry's key matches");
+        assert_eq!(
+            (found.id.as_str(), found.name.as_str(), found.role),
+            ("c", "C", Role::User)
+        );
+        assert_eq!(
+            set.find("key-a").map(|found| found.id.clone()).as_deref(),
+            Some("a")
+        );
+        assert!(set.find("key-d").is_none());
+    }
+
+    #[test]
+    fn a_match_reads_the_set_it_was_found_in_after_a_reload() {
+        let set = ApiKeySet::new(vec![ApiKeyEntry::new("a", "A", "key-a", Role::Admin)]);
+        let found = set
+            .find("key-a")
+            .expect("the key matches before the reload");
+        set.replace(vec![ApiKeyEntry::new("z", "Z", "key-z", Role::User)]);
+        assert_eq!(found.id, "a");
+        assert!(set.find("key-a").is_none());
+        assert_eq!(
+            set.find("key-z").map(|found| found.id.clone()).as_deref(),
+            Some("z")
+        );
     }
 }

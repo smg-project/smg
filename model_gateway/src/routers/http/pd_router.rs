@@ -4551,21 +4551,9 @@ mod tests {
             spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
 
         let router = create_test_pd_router();
-        let prefill = BasicWorkerBuilder::new(prefill_url)
-            .worker_type(WorkerType::Prefill)
-            .runtime_type(RuntimeType::Vllm)
-            .kv_connector("NixlConnector")
-            .build();
-        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
-        let decode = BasicWorkerBuilder::new(decode_url)
-            .worker_type(WorkerType::Decode)
-            .runtime_type(RuntimeType::Vllm)
-            .build();
-        decode.set_status(openai_protocol::worker::WorkerStatus::Ready);
-        router
-            .worker_registry
-            .register_or_replace(Arc::new(prefill));
-        router.worker_registry.register_or_replace(Arc::new(decode));
+        for worker in sequential_pair(prefill_url, decode_url) {
+            router.worker_registry.register_or_replace(worker);
+        }
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let chat: ChatCompletionRequest = serde_json::from_value(json!({
@@ -4622,21 +4610,9 @@ mod tests {
             spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
 
         let router = create_test_pd_router();
-        let prefill = BasicWorkerBuilder::new(prefill_url)
-            .worker_type(WorkerType::Prefill)
-            .runtime_type(RuntimeType::Vllm)
-            .kv_connector("NixlConnector")
-            .build();
-        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
-        let decode = BasicWorkerBuilder::new(decode_url)
-            .worker_type(WorkerType::Decode)
-            .runtime_type(RuntimeType::Vllm)
-            .build();
-        decode.set_status(openai_protocol::worker::WorkerStatus::Ready);
-        router
-            .worker_registry
-            .register_or_replace(Arc::new(prefill));
-        router.worker_registry.register_or_replace(Arc::new(decode));
+        for worker in sequential_pair(prefill_url, decode_url) {
+            router.worker_registry.register_or_replace(worker);
+        }
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let chat: ChatCompletionRequest = serde_json::from_value(json!({

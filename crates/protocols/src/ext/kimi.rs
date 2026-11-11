@@ -43,11 +43,12 @@ pub struct KimiUserExt {
     pub tools: Option<serde_json::Value>,
 }
 
-/// See [`KimiUserExt`].
+/// See [`KimiUserExt`]. The value rides behind a pointer: the assistant turn
+/// is the largest chat message, and the declaration is rarely there.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KimiAssistantExt {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<serde_json::Value>,
+    pub tools: Option<Box<serde_json::Value>>,
 }
 
 /// Dynamic-tool declaration on developer messages, handled like

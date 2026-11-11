@@ -2271,6 +2271,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     {
         tracing::warn!("{warning}");
     }
+    // A credential written into a gRPC worker URL is never sent: said here,
+    // once per listed URL, where the line reaches the log (the validator runs
+    // before the subscriber exists); the add-worker route says it at
+    // registration.
+    for warning in crate::config::unused_credentials_warnings(&config.router_config.mode) {
+        tracing::warn!("{warning}");
+    }
     // A rank scheduler under rank expansion chooses nothing: the operator's
     // configuration runs, with the word that one of its flags does nothing.
     if let Some(warning) = crate::config::dp_minimum_tokens_scheduler_scope_warning(

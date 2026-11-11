@@ -28,7 +28,7 @@
 
 use super::{
     cased, chain,
-    scan::{Bits, Roles},
+    scan::{Bits, Roles, WordScan},
     unicode,
 };
 
@@ -514,11 +514,24 @@ impl Pattern {
     /// compiled into it, where the iterator costs a call, a frame and an
     /// `Option` written to the stack per piece (measured: a tenth of the
     /// instructions of a warm long encode); the program keeps the iterator.
+    /// `words` says the scanners' run loops take their word scans: the loop
+    /// is compiled both ways, and the encoder chooses once per call on the
+    /// input's length (its `WORD_SCAN_MIN_BYTES`).
     #[inline(always)]
-    pub(crate) fn for_each_match<F: FnMut(usize, usize)>(&self, text: &str, mut f: F) {
+    pub(crate) fn for_each_match<F: FnMut(usize, usize)>(&self, text: &str, words: bool, mut f: F) {
         match &self.matcher {
-            Matcher::Template(scanner) => scanner.for_each_match(&self.classes, text, &mut f),
-            Matcher::Cased(scanner) => scanner.for_each_match(&self.classes, text, &mut f),
+            Matcher::Template(scanner) if words => {
+                scanner.for_each_match::<true, F>(&self.classes, text, &mut f);
+            }
+            Matcher::Template(scanner) => {
+                scanner.for_each_match::<false, F>(&self.classes, text, &mut f);
+            }
+            Matcher::Cased(scanner) if words => {
+                scanner.for_each_match::<true, F>(&self.classes, text, &mut f);
+            }
+            Matcher::Cased(scanner) => {
+                scanner.for_each_match::<false, F>(&self.classes, text, &mut f);
+            }
             Matcher::Program => {
                 for (start, end) in self.find_iter(text) {
                     f(start, end);
@@ -826,7 +839,12 @@ impl Scanner {
     /// Compiled into its callers' loops: out of line it was a call per
     /// piece, and every value the loop keeps across a call is a spill.
     #[inline(always)]
-    fn match_at(&self, classes: &[Class], text: &str, pos: usize) -> Option<usize> {
+    fn match_at<const WORDS: bool>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        pos: usize,
+    ) -> Option<usize> {
         let (c, len) = self.roles.at(text, pos)?;
         let after = pos + len;
         // 1. A clitic: the first alternative whose characters follow in order.
@@ -845,12 +863,20 @@ impl Scanner {
         if c & Role::WordPrefix.bit() != 0 {
             if let Some((d, n)) = self.roles.at(text, after) {
                 if d & Role::Word.bit() != 0 {
-                    return Some(self.roles.run_end(text, after + n, Role::Word.bit()));
+                    return Some(self.roles.run_end_as::<{ WordScan::LETTERS }, WORDS>(
+                        text,
+                        after + n,
+                        Role::Word.bit(),
+                    ));
                 }
             }
         }
         if c & Role::Word.bit() != 0 {
-            return Some(self.roles.run_end(text, after, Role::Word.bit()));
+            return Some(self.roles.run_end_as::<{ WordScan::LETTERS }, WORDS>(
+                text,
+                after,
+                Role::Word.bit(),
+            ));
         }
         // 3. Up to the bound of digits.
         if c & Role::Digit.bit() != 0 {
@@ -907,7 +933,11 @@ impl Scanner {
         // 6. Whitespace before a non-space: the greedy run gives back its last
         //    character while a non-space follows it, down to one.
         if c & Role::TrailSpace.bit() != 0 {
-            let mut end = self.roles.run_end(text, after, Role::TrailSpace.bit());
+            let mut end = self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+                text,
+                after,
+                Role::TrailSpace.bit(),
+            );
             loop {
                 match self.roles.at(text, end) {
                     Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
@@ -922,7 +952,11 @@ impl Scanner {
         }
         // 7. The whitespace run.
         if c & Role::Space.bit() != 0 {
-            return Some(self.roles.run_end(text, after, Role::Space.bit()));
+            return Some(self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+                text,
+                after,
+                Role::Space.bit(),
+            ));
         }
         None
     }
@@ -931,8 +965,21 @@ impl Scanner {
     /// [`Pattern::for_each_match`]): a position no alternative matches at
     /// is passed over by one character, as the iterator does.
     #[inline(always)]
-    fn for_each_match<F: FnMut(usize, usize)>(&self, classes: &[Class], text: &str, f: &mut F) {
-        each_match(text, |pos| self.match_at(classes, text, pos), f);
+    fn for_each_match<const WORDS: bool, F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        f: &mut F,
+    ) {
+        // The closure stays inside the encoder's loop (the compiler's budget
+        // would leave it out of line with the word scans compiled into
+        // `match_at`, and the call per piece would be back).
+        each_match(
+            text,
+            #[inline(always)]
+            |pos| self.match_at::<WORDS>(classes, text, pos),
+            f,
+        );
     }
 }
 
@@ -1116,10 +1163,10 @@ impl Iterator for Matches<'_, '_> {
             let start = self.pos;
             let end = match &self.pattern.matcher {
                 Matcher::Template(scanner) => {
-                    scanner.match_at(&self.pattern.classes, self.text, start)
+                    scanner.match_at::<false>(&self.pattern.classes, self.text, start)
                 }
                 Matcher::Cased(scanner) => {
-                    scanner.match_at(&self.pattern.classes, self.text, start)
+                    scanner.match_at::<false>(&self.pattern.classes, self.text, start)
                 }
                 Matcher::Program => self.pattern.match_at(self.text, start, &mut self.choices),
             };
@@ -2059,6 +2106,83 @@ mod tests {
                 ),
                 "{pattern}"
             );
+        }
+    }
+
+    /// The run sites name the word scans their roles carry on the real
+    /// templates: the template's letter run is the letters, the cased
+    /// template's upper and lower runs are the upper-case and the lower-case
+    /// letters, and the white-space runs of both are the white space; the
+    /// digit, punctuation and line-break roles run byte by byte. A class
+    /// change that dropped a scan would keep the ids and lose the gain; it
+    /// fails here instead.
+    #[test]
+    fn the_run_sites_name_the_scans_their_roles_carry() {
+        for pattern in [CL100K, QWEN2, QWEN35, TWO_DIGITS, ANY_DIGITS] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Template(scanner) = &parsed.matcher else {
+                panic!("the template takes its scanner: {pattern}");
+            };
+            let roles = &scanner.roles;
+            assert_eq!(
+                roles.scan_of(Role::Word.bit()),
+                WordScan::LETTERS,
+                "{pattern}"
+            );
+            for role in [Role::TrailSpace, Role::Space] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::SPACES,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [Role::Digit, Role::Punct, Role::PunctBreak, Role::Break] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::NONE,
+                    "{pattern} {role:?}"
+                );
+            }
+        }
+        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Cased(scanner) = &parsed.matcher else {
+                panic!("the cased template takes its scanner: {pattern}");
+            };
+            let roles = scanner.roles();
+            for role in [cased::Role::Upper1, cased::Role::Upper2] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::UPPER,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [cased::Role::Lower1, cased::Role::Lower2] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::LOWER,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [cased::Role::TrailSpace, cased::Role::Space] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::SPACES,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [
+                cased::Role::Digit,
+                cased::Role::Punct,
+                cased::Role::PunctBreak,
+                cased::Role::Break,
+            ] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::NONE,
+                    "{pattern} {role:?}"
+                );
+            }
         }
     }
 
