@@ -6,6 +6,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
+  `ResponseFormat::StructuralTag` carries `Box<serde_json::Map<String, Value>>`. A format had
+  grown from 104 to 128 bytes when the schema kept its description and the structural tag
+  arrived, and the Gateway's chat route task, which holds a request's format three times over
+  its awaits, moved up one allocator size class on every chat request. Behind a pointer each, a
+  format is 16 bytes, a chat request 1,040 (1,152 before), and the task is back in its class;
+  the wire shape and the schema are unchanged, and a text or json_object format allocates
+  nothing.
 - Breaking: on `ChatMessage::Assistant`, `function_call` is `Option<Box<FunctionCallResponse>>`,
   and the provider extension's `tools` is `Option<Box<serde_json::Value>>`. The assistant turn is
   the enum's largest variant, so the two rarely-present values had grown every chat message to
