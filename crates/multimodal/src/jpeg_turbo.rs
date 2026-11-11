@@ -578,14 +578,19 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
         // the component count, and four components mean CMYK: the decoder
         // takes the frame the call would not classify. The call writes that
         // refusal into the sampling before it throws; a failure with the
-        // sampling known is a header warning or the colorspace refusal, and
-        // the decode would fail the same way, so the file falls back at once.
+        // sampling known is a header warning, and the decode would end in the
+        // same warning, so the file falls back at once. A frame of two or of
+        // five and more components is refused on its sampling too, and the
+        // decoder has no colour conversion for it: three and four components
+        // alone take the fallback.
         let (w, h, cmyk) = if hdr == 0 {
             (w, h, colorspace == TJCS_CMYK || colorspace == TJCS_YCCK)
         } else if subsamp < 0 {
             match frame_header(bytes) {
-                Some(frame) => (frame.width, frame.height, frame.components == 4),
-                None => {
+                Some(frame) if matches!(frame.components, 3 | 4) => {
+                    (frame.width, frame.height, frame.components == 4)
+                }
+                _ => {
                     (tj.destroy)(handle);
                     return None;
                 }
@@ -987,6 +992,52 @@ mod tests {
         static MINE: BufferPool = BufferPool::new();
         let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
         assert!(decoded.is_none(), "a warned header falls back");
+        assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
+    }
+
+    /// A frame of two components is refused on its sampling like the
+    /// four-component file, and the decoder has no colour conversion for it:
+    /// the hand-built file cut to two components and grown to 1024x1024
+    /// answers `None` with no buffer taken, where the frame header alone
+    /// would serve the 4 MiB class.
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_two_component_frame_takes_no_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the two-component test");
+            return;
+        }
+        let mut jpeg = unequal_sampling_cmyk_jpeg();
+        // The frame header at 71: its length 20 becomes 14, the count 4
+        // becomes 2, the height and width grow, and the third and fourth
+        // component specs (six bytes from 87) go.
+        jpeg[74] = 0x0E;
+        jpeg[76..80].copy_from_slice(&[0x04, 0x00, 0x04, 0x00]);
+        jpeg[80] = 2;
+        jpeg.drain(87..93);
+        // The scan header, now at 131: its length 14 becomes 10, the count 4
+        // becomes 2, and the third and fourth component selectors (four bytes
+        // from 140) go.
+        assert_eq!(jpeg[131..133], [0xFF, 0xDA], "the scan header");
+        jpeg[134] = 0x0A;
+        jpeg[135] = 2;
+        jpeg.drain(140..144);
+        assert_eq!(
+            frame_header(&jpeg),
+            Some(FrameHeader {
+                width: 1024,
+                height: 1024,
+                components: 2
+            }),
+            "the frame header reads the two-component frame"
+        );
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
+        assert!(
+            decoded.is_none(),
+            "two components decode through no path here"
+        );
         assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
     }
 
