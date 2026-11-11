@@ -854,7 +854,7 @@ pub(crate) fn resolve_string_stops(
         ProtoGenerateRequest::Sglang(req) => {
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -864,7 +864,7 @@ pub(crate) fn resolve_string_stops(
             // not part of shared stop resolution.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -877,7 +877,7 @@ pub(crate) fn resolve_string_stops(
             // stops at EOS itself, so its translation carries no frontend ids.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
