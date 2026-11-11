@@ -574,6 +574,7 @@ async fn submit_realistic(
         request_id,
         prompt_token_ids: prompt_ids,
         max_new,
+        choice: 0,
         events: tx,
     });
     Ok(Submitted {

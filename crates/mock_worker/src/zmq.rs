@@ -836,6 +836,7 @@ pub async fn serve_until(
                             request_id,
                             prompt_token_ids: prompt,
                             max_new,
+                            choice: 0,
                             events: gen_tx,
                         }),
                         None => {

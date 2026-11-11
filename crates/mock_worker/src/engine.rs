@@ -582,6 +582,9 @@ pub struct NewRequest {
     pub prompt_token_ids: Vec<u32>,
     /// Requested output length; 0 means "use the engine default".
     pub max_new: u32,
+    /// The choice this request samples, 0 for a single one: admission salts
+    /// the output seed with it, so the n choices of one request differ.
+    pub choice: u32,
     /// Sink for this request's generation events.
     pub events: mpsc::UnboundedSender<GenEvent>,
 }
@@ -1563,9 +1566,12 @@ fn handle_msg(
             shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         }
         EngineMsg::Abort(request_id) => {
-            if let Some((tx, event)) = state.abort(&request_id, params) {
+            let aborted = state.abort(&request_id, params);
+            if !aborted.is_empty() {
                 shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
                 shared.publish(state, state.snapshot(params));
+            }
+            for (tx, event) in aborted {
                 if params.request_overhead_ms > 0.0 {
                     // Keep the terminal event behind tokens awaiting delivery.
                     let _ = shared.deliver_tx.send((Instant::now(), tx, event));
@@ -1625,6 +1631,8 @@ struct RunningReq {
     rolling_hash: u64,
     /// Output identity selected at first admission and preserved over preemption.
     token_seed: u32,
+    /// The choice this request samples (0 for a single one), carried over preemption.
+    choice: u32,
 }
 
 impl RunningReq {
@@ -1937,35 +1945,53 @@ impl SchedulerState {
         self.running.len() + self.waiting.len()
     }
 
+    /// Remove every running or queued entry carrying `request_id` (the `n`
+    /// choices of one request share it), releasing the blocks of the running
+    /// ones, and return each entry's event sink with its `abort` completion;
+    /// empty when the engine holds none.
     fn abort(
         &mut self,
         request_id: &str,
         p: &EngineParams,
-    ) -> Option<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
-        let (events, prompt_tokens, completion_tokens, cached_tokens) = if let Some(index) =
-            self.running.iter().position(|r| r.request_id == request_id)
-        {
+    ) -> Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
+        let mut gone = Vec::new();
+        let mut index = 0;
+        while index < self.running.len() {
+            if self.running[index].request_id != request_id {
+                index += 1;
+                continue;
+            }
             let r = self.running.remove(index);
             self.release(&r, p);
-            (r.events, r.prompt_tokens, r.generated, r.cached_tokens)
-        } else {
-            let index = self
-                .waiting
-                .iter()
-                .position(|w| w.req.request_id == request_id)?;
-            let w = self.waiting.remove(index)?;
+            gone.push((r.events, r.prompt_tokens, r.generated, r.cached_tokens));
+        }
+        let mut index = 0;
+        while index < self.waiting.len() {
+            if self.waiting[index].req.request_id != request_id {
+                index += 1;
+                continue;
+            }
+            let Some(w) = self.waiting.remove(index) else {
+                break;
+            };
             let (generated, cached) = w.resume.map_or((0, 0), |r| (r.generated, r.cached_tokens));
-            (w.req.events, w.prompt_tokens, generated, cached)
-        };
-        Some((
-            events,
-            GenEvent::Done {
-                finish_reason: "abort",
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-            },
-        ))
+            gone.push((w.req.events, w.prompt_tokens, generated, cached));
+        }
+        gone.into_iter()
+            .map(
+                |(events, prompt_tokens, completion_tokens, cached_tokens)| {
+                    (
+                        events,
+                        GenEvent::Done {
+                            finish_reason: "abort",
+                            prompt_tokens,
+                            completion_tokens,
+                            cached_tokens,
+                        },
+                    )
+                },
+            )
+            .collect()
     }
 
     /// Queue a request with no oracle information (tests).
@@ -2198,6 +2224,7 @@ impl SchedulerState {
                 request_id,
                 prompt_token_ids,
                 max_new,
+                choice,
                 events,
             } = w.req;
             let (reported_cached, generated, resumed_output, output_ids, token_seed) =
@@ -2231,6 +2258,13 @@ impl SchedulerState {
                             // and is independent of block size and the transport request ID.
                             OutputSeed::Prompt => w.rolling_hash,
                         };
+                        // A second and later choice of one request differs by its
+                        // index; the first keeps the seed as it was.
+                        let seed = if choice == 0 {
+                            seed
+                        } else {
+                            fnv_step(seed, choice)
+                        };
                         (cached, 0, 0, Vec::new(), seed as u32)
                     }
                 };
@@ -2256,6 +2290,7 @@ impl SchedulerState {
                 pending: Vec::new(),
                 rolling_hash: w.rolling_hash,
                 token_seed,
+                choice,
             });
             let idx = self.running.len() - 1;
             self.running[idx].held = self.running[idx].seq_keys[..cached_blocks].to_vec();
@@ -2459,6 +2494,7 @@ impl SchedulerState {
                 request_id: r.request_id,
                 prompt_token_ids: seq,
                 max_new: r.max_new,
+                choice: r.choice,
                 events: r.events,
             },
             keys,
@@ -2912,6 +2948,7 @@ mod tests {
                 request_id: id.to_string(),
                 prompt_token_ids: prompt,
                 max_new,
+                choice: 0,
                 events: tx,
             },
             rx,
@@ -3118,9 +3155,10 @@ mod tests {
                 assert_eq!(st.pool.allocated, 2, "a full block and a partial tail");
                 let cached = st.pool.cached();
 
-                let (_, event) = st.abort("cancelled", &p).expect("the request exists");
+                let aborted = st.abort("cancelled", &p);
+                assert_eq!(aborted.len(), 1, "the request exists");
                 assert!(matches!(
-                    event,
+                    aborted[0].1,
                     GenEvent::Done {
                         finish_reason: "abort",
                         ..
@@ -3131,7 +3169,7 @@ mod tests {
                 assert_eq!(st.pool.cached(), cached, "cached prefixes remain reusable");
                 assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
                 assert!(st.pool.fits(p.capacity_blocks(), p.capacity_blocks()));
-                assert!(st.abort("cancelled", &p).is_none());
+                assert!(st.abort("cancelled", &p).is_empty());
             }
         }
     }
@@ -3144,9 +3182,10 @@ mod tests {
         st.enqueue(r, &p);
         st.step(&p);
         st.preempt_last(&p);
-        let (_, event) = st.abort("preempted", &p).expect("the request is queued");
+        let aborted = st.abort("preempted", &p);
+        assert_eq!(aborted.len(), 1, "the request is queued");
         assert!(matches!(
-            event,
+            aborted[0].1,
             GenEvent::Done {
                 finish_reason: "abort",
                 prompt_tokens: 64,
@@ -3154,6 +3193,50 @@ mod tests {
                 ..
             }
         ));
+        assert!(st.is_idle());
+        assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
+    }
+
+    /// The `n` choices of one request share its id: an abort removes every
+    /// entry carrying it, running or queued, each with its own completion,
+    /// and leaves another request's entry alone.
+    #[test]
+    fn abort_removes_every_entry_with_the_request_id() {
+        let p = EngineParams {
+            block_size: 4,
+            max_batched_tokens: 4,
+            kv_capacity_tokens: 32,
+            ..EngineParams::default()
+        };
+        let mut st = SchedulerState::new();
+        let mut receivers = Vec::new();
+        for choice in 0..2 {
+            let (mut r, rx) = req("fanned", vec![7; 4], 100);
+            r.choice = choice;
+            st.enqueue(r, &p);
+            receivers.push(rx);
+        }
+        let (other, _rx) = req("other", vec![9; 4], 100);
+        st.enqueue(other, &p);
+        st.step(&p);
+        assert_eq!(
+            (st.running.len(), st.waiting.len()),
+            (1, 2),
+            "the budget admits one prompt per pass"
+        );
+
+        let aborted = st.abort("fanned", &p);
+        assert_eq!(aborted.len(), 2, "the running choice and the queued one");
+        assert!(aborted.iter().all(|(_, event)| matches!(
+            event,
+            GenEvent::Done {
+                finish_reason: "abort",
+                ..
+            }
+        )));
+        assert_eq!(st.in_flight(), 1, "the other request stays");
+        assert!(st.abort("fanned", &p).is_empty());
+        assert_eq!(st.abort("other", &p).len(), 1);
         assert!(st.is_idle());
         assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
     }
