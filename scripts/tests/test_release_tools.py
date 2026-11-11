@@ -4013,13 +4013,16 @@ def test_sync_versions_refuses_a_floor_it_cannot_pair_by_position(repo: Sandbox)
     )
     assert again.returncode == 0, again.stdout + again.stderr
     assert "ambiguous" not in again.stderr and "already follows" in again.stdout, again.stdout
-    # main dropping an extra is the same case the other way (one occurrence against two)
+    # main dropping its extras is the same case the other way (one occurrence against two)
     repo.put(
         "grpc_servicer/pyproject.toml",
-        repo.read("grpc_servicer/pyproject.toml").replace(extra.replace("0.4.0", "0.5.0"), ""),
+        repo.read("grpc_servicer/pyproject.toml")
+        .replace('tpu = ["smg-grpc-proto>=0.5.0"]\n', "")
+        .replace(extra.replace("0.4.0", "0.5.0"), ""),
     )
+    assert repo.read("grpc_servicer/pyproject.toml").count("smg-grpc-proto>=") == 1
     repo.git("add", "-A")
-    repo.git("commit", "--quiet", "-m", "chore(servicer): the mlx extra dropped")
+    repo.git("commit", "--quiet", "-m", "chore(servicer): the extras dropped")
     dropped = subprocess.run(
         [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
         cwd=repo.work,
