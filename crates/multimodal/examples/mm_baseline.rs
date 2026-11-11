@@ -17,9 +17,10 @@
 //! family from), `config_dir` (the checkpoint's `config.json` and preprocessor configs)
 //! and `files` (absolute paths, one per item of the request). Every stage runs as the
 //! gateway runs it on the router placement: the header read and the decode of every
-//! frame (`ImageFrame::decode_all`), the per-frame clone the gateway makes before the
-//! processor, the processor's one-pass write in the destination's dtype (bf16 unless
-//! `--wire` says otherwise; the two-pass path where a processor has no one-pass write),
+//! frame (`ImageFrame::decode_all`), the processor's one-pass write over the frames'
+//! own decoded pixels, borrowed as the gateway borrows them, in the destination's dtype
+//! (bf16 unless `--wire` says otherwise; the two-pass path where a processor has no
+//! one-pass write),
 //! and the move of the wire bytes (`into_bytes_as`); the wire then returns to the buffer
 //! pool as a sent payload returns it (`recycled_bytes`), so a run measures the pool's
 //! steady state rather than a fresh zeroed buffer per iteration. The pool is
@@ -299,7 +300,6 @@ enum Work {
 #[derive(Clone, Copy, Default)]
 struct Sample {
     decode_ms: f64,
-    clone_ms: f64,
     preprocess_ms: f64,
     serialize_ms: f64,
     decoded_bytes: usize,
@@ -308,7 +308,7 @@ struct Sample {
 
 impl Sample {
     fn total_ms(&self) -> f64 {
-        self.decode_ms + self.clone_ms + self.preprocess_ms + self.serialize_ms
+        self.decode_ms + self.preprocess_ms + self.serialize_ms
     }
 }
 
@@ -356,12 +356,12 @@ fn process_cpu_ms() -> f64 {
 }
 
 /// The decoded frames of `files`, header read and decode included, as the gateway makes
-/// them for one request: the frames are built from the bytes, decoded together on the
-/// preprocessing pool, then each is cloned for the processor.
+/// them for one request: the frames are built from the bytes and decoded together on the
+/// preprocessing pool; the processor then borrows their pixels.
 fn decode_images(
     files: &[Bytes],
     transparency: TransparencyPolicy,
-) -> Result<(Vec<DynamicImage>, f64, f64), String> {
+) -> Result<(Vec<Arc<ImageFrame>>, f64), String> {
     let started = Instant::now();
     let mut frames = Vec::with_capacity(files.len());
     for bytes in files {
@@ -383,26 +383,19 @@ fn decode_images(
         ));
     }
     ImageFrame::decode_all(&frames).map_err(|e| e.to_string())?;
-    let decode_ms = ms(started);
-    let cloned = Instant::now();
-    let images = frames
-        .iter()
-        .map(|frame| frame.image().cloned().map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((images, decode_ms, ms(cloned)))
+    Ok((frames, ms(started)))
 }
 
 /// The gateway's `preprocess_images`: the one-pass write in the wire's dtype when the
 /// processor has one, the two-pass path otherwise.
 fn preprocess(
     processor: &dyn VisionPreProcessor,
-    images: &[DynamicImage],
+    images: &[&DynamicImage],
     wire: EncoderDtype,
 ) -> Result<PreprocessedEncoderInputs, String> {
-    let images: Vec<&DynamicImage> = images.iter().collect();
     processor
-        .preprocess_wire(&images, wire)
-        .unwrap_or_else(|| processor.preprocess(&images))
+        .preprocess_wire(images, wire)
+        .unwrap_or_else(|| processor.preprocess(images))
         .map_err(|e| e.to_string())
 }
 
@@ -472,9 +465,13 @@ fn iterate(
     let mut sample = Sample::default();
     let (inputs, started) = match work {
         Work::Images { processor, files } => {
-            let (images, decode_ms, clone_ms) = decode_images(files, transparency)?;
+            let (frames, decode_ms) = decode_images(files, transparency)?;
             sample.decode_ms = decode_ms;
-            sample.clone_ms = clone_ms;
+            // Borrowed from the frames' own cells, as the gateway's batch path borrows them.
+            let images = frames
+                .iter()
+                .map(|frame| frame.image().map_err(|e| e.to_string()))
+                .collect::<Result<Vec<&DynamicImage>, _>>()?;
             sample.decoded_bytes = images.iter().map(|image| image.as_bytes().len()).sum();
             let started = Instant::now();
             let inputs = preprocess(processor.as_ref(), &images, wire)?;
@@ -548,9 +545,12 @@ fn facts(
     // so the pool is warm before the timed loop starts.
     let facts = match work {
         Work::Images { processor, files } => {
-            let (images, _, _) = decode_images(files, transparency)?;
-            let rgb = images.first().map(|image| sha256(image.to_rgb8().as_raw()));
-            let refs: Vec<&DynamicImage> = images.iter().collect();
+            let (frames, _) = decode_images(files, transparency)?;
+            let refs = frames
+                .iter()
+                .map(|frame| frame.image().map_err(|e| e.to_string()))
+                .collect::<Result<Vec<&DynamicImage>, _>>()?;
+            let rgb = refs.first().map(|image| sha256(image.to_rgb8().as_raw()));
             let two_pass = processor.preprocess(&refs).map_err(|e| e.to_string())?;
             let u8_sha256 = match &two_pass.encoder_input {
                 EncoderInput::U8 { patches, .. } => Some(sha256(
@@ -795,7 +795,6 @@ fn run_class(
         "cpu_ms_per_item": cpu_ms / items as f64,
         "stage_ms": {
             "decode": stage_summary(&samples, |s| s.decode_ms),
-            "clone": stage_summary(&samples, |s| s.clone_ms),
             "preprocess": stage_summary(&samples, |s| s.preprocess_ms),
             "serialize": stage_summary(&samples, |s| s.serialize_ms),
             "total": stage_summary(&samples, Sample::total_ms),
