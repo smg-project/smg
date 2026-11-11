@@ -82,7 +82,7 @@ pub(crate) mod test_support {
 
     /// Whether the TurboJPEG library loads, for a test that needs it: where
     /// it does not, a failure where [`REQUIRE_TURBOJPEG`] is set, else a
-    /// skip said on stderr, so a run with the library present cannot pass
+    /// skip said on stderr, so a run that requires the library cannot pass
     /// `test` without running it.
     #[expect(
         clippy::print_stderr,
