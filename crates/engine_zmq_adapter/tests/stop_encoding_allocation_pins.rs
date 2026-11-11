@@ -58,20 +58,24 @@ fn allocations_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
     (out, CALLS.with(Cell::get) - before)
 }
 
-/// A request's sampling params with two single-token string stops and no
-/// stop ids yet, as a chat request with `stop: ["Hello", "world"]` reaches
-/// the dispatch stage.
+/// The two single-token string stops of the pinned request, as a chat
+/// request with `stop: ["Hello", "world"]` reaches the dispatch stage.
+const TWO_STOPS: [&str; 2] = ["Hello", "world"];
+
+/// A request's sampling params with the two stops and no stop ids yet.
 fn params_with_two_stops() -> SamplingParams {
     SamplingParams {
-        stop: vec!["Hello".to_string(), "world".to_string()],
+        stop: Vec::from(TWO_STOPS.map(String::from)),
         ..SamplingParams::default()
     }
 }
 
-/// Allocation calls of taking two single-token stops off a request: the
-/// two encodings and the first push into `stop_token_ids`, and nothing for
-/// the strings themselves, which the caller keeps and the encoder borrows.
-const TAKE_TWO_STOPS_CALLS: usize = 3;
+/// Allocation calls of taking two single-token stops off a request beyond
+/// the tokenizer's own two encodes: the first push into `stop_token_ids`,
+/// and nothing for the strings themselves, which the caller keeps and the
+/// encoder borrows. The tokenizer's share is measured beside the call, so
+/// an allocation added to the mock's `encode` moves nothing here.
+const TAKE_TWO_STOPS_OWN_CALLS: usize = 1;
 
 #[test]
 fn taking_two_single_token_stops_allocates_this_much() {
@@ -79,13 +83,20 @@ fn taking_two_single_token_stops_allocates_this_much() {
     // A warm-up call pays whatever the tokenizer sets up on its first encode.
     let mut warm = params_with_two_stops();
     let _ = take_vllm_string_stops(&mut warm, Some(&tokenizer));
+    let ((), encoder_calls) = allocations_during(|| {
+        for stop in TWO_STOPS {
+            let _ = tokenizer.encode(stop, false);
+        }
+    });
     let mut params = params_with_two_stops();
     let (taken, calls) =
         allocations_during(|| take_vllm_string_stops(&mut params, Some(&tokenizer)));
-    eprintln!("take_vllm_string_stops with two single-token stops: {calls} allocation calls");
+    eprintln!(
+        "take_vllm_string_stops with two single-token stops: {calls} allocation calls, \
+         {encoder_calls} of them the tokenizer's two encodes"
+    );
     assert_eq!(
-        taken,
-        vec!["Hello".to_string(), "world".to_string()],
+        taken, TWO_STOPS,
         "the taken strings come back for the router-side decoder"
     );
     assert_eq!(
@@ -94,7 +105,8 @@ fn taking_two_single_token_stops_allocates_this_much() {
         "both single-token stops reach stop_token_ids"
     );
     assert_eq!(
-        calls, TAKE_TWO_STOPS_CALLS,
-        "taking two single-token stops allocates this much"
+        calls,
+        encoder_calls + TAKE_TWO_STOPS_OWN_CALLS,
+        "taking two single-token stops allocates this much beyond the tokenizer's encodes"
     );
 }
