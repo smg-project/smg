@@ -654,3 +654,145 @@ def test_a_component_whose_files_went_is_named_loudly(mod, repo):
     git(repo, "commit", "-q", "-m", "refactor: beta goes")
     with pytest.raises(mod.Fatal, match="crates/beta/Cargo.toml is gone: drop beta from the table"):
         run(mod, repo, tag="v1.0.0")
+
+
+# --- a component's symlinks -----------------------------------------------------
+
+
+def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
+    """A package that ships another directory's files through a link (the proto package ships
+    the .proto files that way) ships their changes: they count as the package's, with the
+    level of the commits that made them. A link that points at a link, a target directory
+    holding one, or a link whose path runs through a directory link is followed to the end of
+    the chain; a directory link crossed on the way counts, what lies behind it beyond the path
+    does not, and a directory reached through crossed links is read for the links it holds; a
+    link crossed twice on one path is no loop, a loop ends at the hop limit. A link into the
+    package itself or out of the repository adds nothing."""
+    import os
+
+    root = tmp_path / "linked"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    put(root, "Cargo.toml", root_manifest({}))
+    put(root, "model_gateway/Cargo.toml", manifest("smg", "1.0.0"))
+    put(root, "model_gateway/src/main.rs", "fn main() {}\n")
+    put(root, "pkg/pyproject.toml", '[project]\nname = "pkg"\nversion = "0.1.0"\n')
+    put(root, "pkg/pkg.py", "x = 1\n")
+    put(root, "shared/schema.proto", 'syntax = "proto3";\n')
+    put(root, "LICENSE", "license\n")
+    os.symlink("../shared", root / "pkg" / "schema")
+    os.symlink("pkg.py", root / "pkg" / "alias.py")
+    os.symlink("../../elsewhere", root / "pkg" / "outside")
+    os.symlink("/etc/hostname", root / "pkg" / "absolute")
+    put(root, "real/x", "x\n")
+    put(root, "real/y", "y\n")
+    put(root, "real/w", "w\n")  # in the linked directory, shipped by nothing
+    os.symlink("../real/x", root / "shared" / "chain")  # a link inside the target directory
+    os.symlink("real", root / "hop")  # a directory link ...
+    os.symlink("../hop/y", root / "pkg" / "p")  # ... with a path that runs through it
+    os.symlink("../hop/y", root / "real" / "z")  # a link that crosses the directory link again
+    os.symlink("../hop/z", root / "pkg" / "q")  # ... reached through it twice
+    os.symlink("loop_b", root / "loop_a")
+    os.symlink("loop_a", root / "loop_b")
+    os.symlink("../loop_a", root / "pkg" / "l")  # a genuine loop
+    put(root, "real2/a", "a\n")
+    put(root, "real3/f", "f\n")
+    put(root, "real3/g", "g\n")  # shipped by nothing
+    os.symlink("real2", root / "hop2")
+    os.symlink("../hop2", root / "pkg" / "through")  # a link to a link to a directory ...
+    os.symlink("../real3/f", root / "real2" / "inner")  # ... that holds a link
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore: initial")
+    git(root, "tag", "v1.0.0")
+    repo = mod.Repo(root)
+    assert repo.resolve_path("pkg/../hop/y") == ("real/y", ["hop"])
+    assert repo.resolve_path("pkg/../hop/z") == ("real/y", ["hop", "real/z", "hop"])
+    assert repo.resolve_path("pkg/../hop2") == ("real2", ["hop2"])
+    assert repo.resolve_path("pkg/../../elsewhere") == (None, [])
+    looped, crossed = repo.resolve_path("pkg/../loop_a")
+    assert looped is None and len(crossed) == 40 and set(crossed) == {"loop_a", "loop_b"}
+    chain = [
+        "loop_a",
+        "loop_b",
+        "hop",
+        "real/y",
+        "real/z",
+        "shared",
+        "hop2",
+        "real2",
+        "real/x",
+        "real3/f",
+    ]
+    assert repo.symlink_targets("pkg") == chain
+    assert repo.symlink_targets("pkg/") == chain
+    assert mod.component_paths(repo, mod.package("pkg", "pkg", "pkg/pyproject.toml")) == [
+        "pkg/",
+        *chain,
+    ]
+    assert repo.symlink_targets("model_gateway") == []
+
+    crates = (mod.crate("smg", "model_gateway"),)
+    packages = (mod.package("pkg", "pkg", "pkg/pyproject.toml"),)
+    stream = io.StringIO()
+    assert (
+        mod.run(
+            root,
+            "v1.0.0",
+            "check",
+            None,
+            mod.Out(stream),
+            crates=crates,
+            packages=packages,
+            mirrors=(),
+        )
+        == 0
+    )
+    assert "pkg" not in stream.getvalue(), "nothing changed since the tag"
+
+    put(root, "shared/schema.proto", 'syntax = "proto3";\nmessage M {}\n')
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "feat(shared): a message")
+    stream = io.StringIO()
+    code = mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    out = stream.getvalue()
+    assert code == 1
+    assert "  ! pkg (pkg/) — 1 file(s) changed but version not bumped (v0.1.0) [minor]" in out
+    assert "1 Python package(s) with changes, 0 unchanged" in out
+
+    # a change at the end of a chain of links is the package's as much as a direct target's
+    put(root, "real/x", "x2\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "fix(real): x")
+    stream = io.StringIO()
+    code = mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    out = stream.getvalue()
+    assert code == 1
+    assert "  ! pkg (pkg/) — 2 file(s) changed but version not bumped (v0.1.0) [minor]" in out
+
+    # and so is a change behind a link whose path runs through a directory link
+    put(root, "real/y", "y2\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "fix(real): y")
+    stream = io.StringIO()
+    mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    assert "  ! pkg (pkg/) — 3 file(s) changed but version not bumped (v0.1.0) [minor]" in (
+        stream.getvalue()
+    )
+
+    # but not a change elsewhere in the directory behind that link: the package ships one file of it
+    put(root, "real/w", "w2\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "fix(real): w")
+    stream = io.StringIO()
+    mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    assert "  ! pkg (pkg/) — 3 file(s) changed but version not bumped (v0.1.0) [minor]" in (
+        stream.getvalue()
+    )
