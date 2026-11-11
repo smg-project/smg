@@ -228,12 +228,16 @@ def openai_direct_client():
 # skips the class with the reason in the log, instead of running a required job into its
 # cap with every test that ran green.
 _VECTOR_STORE_INDEX_DEADLINE_S = 300
+_VECTOR_STORE_POLL_REQUEST_TIMEOUT_S = 30.0
 
 
 def _index_vector_store_file(client, vector_store_id: str, file_id: str) -> None:
     """Attach the file to the vector store and wait, bounded, for the provider to index it."""
+    # The SDK reads its deadline between polls only; a request in flight runs to the
+    # client's own timeout (ten minutes, retried), so the poll's client gets a short one.
+    poll_client = client.with_options(timeout=_VECTOR_STORE_POLL_REQUEST_TIMEOUT_S)
     try:
-        vs_file = client.vector_stores.files.create_and_poll(
+        vs_file = poll_client.vector_stores.files.create_and_poll(
             vector_store_id=vector_store_id,
             file_id=file_id,
             max_wait_seconds=_VECTOR_STORE_INDEX_DEADLINE_S,
