@@ -34,12 +34,7 @@ pub(super) struct KimiK3VisionSpec;
 impl KimiK3VisionSpec {
     /// The repeated pad token (`<|media_pad|>`) — `media_placeholder_token_id` in config.
     fn pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["media_placeholder_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "media_placeholder_token_id".to_string(),
-            })
+        metadata.config_token_id("media_placeholder_token_id")
     }
 }
 

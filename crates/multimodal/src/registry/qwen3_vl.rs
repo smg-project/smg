@@ -18,21 +18,11 @@ pub(super) struct Qwen3VLVisionSpec;
 
 impl Qwen3VLVisionSpec {
     fn image_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 
     fn video_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["video_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "video_token_id".to_string(),
-            })
+        metadata.config_token_id("video_token_id")
     }
 
     fn vision_start_token_id(metadata: &ModelMetadata) -> Option<TokenId> {

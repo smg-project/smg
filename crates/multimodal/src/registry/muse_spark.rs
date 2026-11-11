@@ -68,18 +68,9 @@ const DEFAULT_FRAME_TIMESTAMP_FORMAT: &str = "Time: {timestamp:.1f}s";
 pub(super) struct MuseSparkSpec;
 
 impl MuseSparkSpec {
-    fn config_token_id(metadata: &ModelMetadata, field: &str) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&[field])
-            .map(|id| id as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: field.to_string(),
-            })
-    }
-
     /// The vocabulary's spelling of a config-declared token id.
     fn token_for(metadata: &ModelMetadata, field: &str) -> RegistryResult<String> {
-        let id = Self::config_token_id(metadata, field)?;
+        let id = metadata.config_token_id(field)?;
         metadata
             .tokenizer
             .id_to_token(id as u32)
@@ -127,7 +118,7 @@ impl MuseSparkSpec {
         preprocessed: &PreprocessedEncoderInputs,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let placeholder = Self::token_for(metadata, "audio_token_id")?;
-        let audio = Self::config_token_id(metadata, "audio_token_id")?;
+        let audio = metadata.config_token_id("audio_token_id")?;
         let start = metadata.token_id(AUDIO_START)?;
         let end = metadata.token_id(AUDIO_END)?;
         Self::token_counts(preprocessed)?
@@ -158,7 +149,7 @@ impl MuseSparkSpec {
         preprocessed: &PreprocessedEncoderInputs,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let placeholder = Self::token_for(metadata, "image_token_id")?;
-        let patch = Self::config_token_id(metadata, "image_token_id")?;
+        let patch = metadata.config_token_id("image_token_id")?;
         let start = metadata.token_id(IMAGE_START)?;
         let end = metadata.token_id(IMAGE_END)?;
         Self::token_counts(preprocessed)?
@@ -279,7 +270,7 @@ impl MuseSparkSpec {
         config: &PreProcessorConfig,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let placeholder = Self::token_for(metadata, "video_token_id")?;
-        let video = Self::config_token_id(metadata, "video_token_id")?;
+        let video = metadata.config_token_id("video_token_id")?;
         let start = metadata.token_id(VIDEO_START)?;
         let end = metadata.token_id(VIDEO_END)?;
         let separator = metadata.token_id(VIDEO_SEPARATOR)?;
@@ -384,7 +375,7 @@ impl ModelProcessorSpec for MuseSparkSpec {
         match modality {
             Modality::Image => Some(ModalityHooks {
                 placeholder: |metadata| Self::token_for(metadata, "image_token_id"),
-                placeholder_id: |metadata| Self::config_token_id(metadata, "image_token_id"),
+                placeholder_id: |metadata| metadata.config_token_id("image_token_id"),
                 replacements: |metadata, preprocessed, _, _| {
                     Self::image_replacements(metadata, preprocessed)
                 },
@@ -403,7 +394,7 @@ impl ModelProcessorSpec for MuseSparkSpec {
             }),
             Modality::Video => Some(ModalityHooks {
                 placeholder: |metadata| Self::token_for(metadata, "video_token_id"),
-                placeholder_id: |metadata| Self::config_token_id(metadata, "video_token_id"),
+                placeholder_id: |metadata| metadata.config_token_id("video_token_id"),
                 replacements: Self::video_replacements,
                 layouts: || {
                     EncoderFieldLayouts::new(
@@ -420,7 +411,7 @@ impl ModelProcessorSpec for MuseSparkSpec {
             }),
             Modality::Audio => Some(ModalityHooks {
                 placeholder: |metadata| Self::token_for(metadata, "audio_token_id"),
-                placeholder_id: |metadata| Self::config_token_id(metadata, "audio_token_id"),
+                placeholder_id: |metadata| metadata.config_token_id("audio_token_id"),
                 replacements: |metadata, preprocessed, _, _| {
                     Self::audio_replacements(metadata, preprocessed)
                 },
