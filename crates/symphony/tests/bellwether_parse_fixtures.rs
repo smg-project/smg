@@ -72,9 +72,11 @@
 //! empty reasoning string for an answer without a thought is read as the reference's absent one;
 //! a case it reads differently fails the run, whatever the reference says of it, unless the case
 //! is listed in [`KNOWN_DIFFERENCES`] (a marker inside text, which each reader reads its own way:
-//! the library's reading of it is reported, not held against the parser), and a request the
-//! library refused is counted. Each set's summary line is followed by one per library that
-//! witnessed a case of it.
+//! the library's reading of it is reported, not held against the parser) or its wrong reading of
+//! the case is recorded in [`LIBRARY_DEFECTS`] (bellwether's `waivers/library_defects.toml`:
+//! reported beside the parser's reading, never held against it, and failing the run once the
+//! library reads the case as the parser does again), and a request the library refused is
+//! counted. Each set's summary line is followed by one per library that witnessed a case of it.
 //!
 //! A fourth test corrupts the recorded outputs: three seeded corruptions of every sampled case of
 //! every recorded model (a span deleted or doubled, one of the table's own markers or a cut one
@@ -1445,8 +1447,7 @@ const REASONING_PROBE: KnownDifference = KnownDifference {
     id: "parse/reasoning-with-marker-text",
     reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \
              marker parser does, and the reference keeps the marker as reasoning text \
-             (bellwether #16); the vendor library reads the split the same way and drops the \
-             stray marker where the parser keeps it as text (bellwether #298)",
+             (bellwether #16)",
     calls: 0,
     finish: "stop",
 };
@@ -2331,8 +2332,10 @@ fn parity(
             out.push_str(&format!("  {:34} {}\n", "", listed_case.reason));
         }
         // A library that read the case has to have read it as the parser did, whatever the
-        // reference says of the case; a library that refused the request read nothing, and an
-        // engine's witness reads nothing either.
+        // reference says of the case, unless its wrong reading is recorded in `LIBRARY_DEFECTS`
+        // (reported, never held against the parser, stale once it reads as the parser does); a
+        // library that refused the request read nothing, and an engine's witness reads nothing
+        // either.
         for (library, witness) in &fixture.witnesses {
             let tally = by_library.entry(library).or_default();
             match witness.said() {
@@ -2359,7 +2362,8 @@ fn parity(
                         // The library's own wrong reading, recorded with its version: reported
                         // beside the parser's reading, never held against the parser.
                         out.push_str(&format!(
-                            "  {:34} {library} reads it wrongly, as recorded: {}\n",
+                            "  {:34} {library} reads it wrongly, as recorded: {}; it read: \
+                             {read:?}\n",
                             "", defect.reason
                         ));
                         continue;
