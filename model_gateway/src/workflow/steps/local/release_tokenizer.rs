@@ -3,7 +3,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::submit_tokenizer_job::tokenizer_source;
@@ -82,16 +82,37 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
                     );
                     continue;
                 }
-                if let Some(entry) = app_context.tokenizer_registry.remove(&model_id) {
-                    app_context.multimodal_config_registry.remove(&entry.id);
-                    released += 1;
-                    info!(
-                        model = %model_id,
-                        tokenizer_id = %entry.id,
-                        source = %entry.source,
-                        "Released the tokenizer of a model no worker serves"
-                    );
+                let Some(entry) = app_context.tokenizer_registry.remove(&model_id) else {
+                    continue;
+                };
+                // A worker of the model whose registration landed between the
+                // read above and this remove serves the model again: the entry
+                // goes back as it was (its registration job reads it as
+                // already loaded), the multimodal config untouched.
+                if app_context.worker_registry.contains_model(&model_id) {
+                    let tokenizer = Arc::clone(&entry.tokenizer);
+                    if let Err(error) = app_context
+                        .tokenizer_registry
+                        .load(&entry.id, &entry.name, &entry.source, || async {
+                            Ok(tokenizer)
+                        })
+                        .await
+                    {
+                        warn!(
+                            model = %model_id,
+                            "A model registered again under the release of its tokenizer could not take it back: {error}"
+                        );
+                    }
+                    continue;
                 }
+                app_context.multimodal_config_registry.remove(&entry.id);
+                released += 1;
+                info!(
+                    model = %model_id,
+                    tokenizer_id = %entry.id,
+                    source = %entry.source,
+                    "Released the tokenizer of a model no worker serves"
+                );
             }
         }
         debug!(

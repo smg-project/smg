@@ -441,9 +441,70 @@ mod dp_removal_tests {
 
 #[cfg(test)]
 mod tests {
-    use wfaas::StepId;
+    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, TokenizerRegistry};
+    use wfaas::{StepExecutor, StepId, WorkflowContext, WorkflowInstanceId};
 
     use super::*;
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        worker::{BasicWorkerBuilder, ModelCard},
+    };
+
+    /// The removal workflow as a whole, its steps run in the definition's
+    /// order: a model's tokenizer stays while a worker of the model remains
+    /// and leaves the registry with the model's last worker.
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_models_last_worker_releases_its_tokenizer() {
+        let app_context = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
+        );
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("m"))
+                    .label("tokenizer_path", "/tok/m")
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+        app_context
+            .tokenizer_registry
+            .load(&TokenizerRegistry::generate_id(), "m", "/tok/m", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+
+        for (url, remaining) in [("http://w1:8000", true), ("http://w2:8000", false)] {
+            let workflow = create_worker_removal_workflow();
+            let mut context = WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_worker_removal_workflow_data(
+                    url.to_string(),
+                    None,
+                    Arc::clone(&app_context),
+                ),
+            );
+            for step in &workflow.steps {
+                step.executor.execute(&mut context).await.unwrap();
+            }
+            assert_eq!(
+                app_context.worker_registry.contains_model("m"),
+                remaining,
+                "a worker of the model after removing {url}"
+            );
+            assert_eq!(
+                app_context.tokenizer_registry.contains("m"),
+                remaining,
+                "the model's tokenizer after removing {url}"
+            );
+        }
+    }
 
     #[test]
     fn worker_removal_deregisters_before_policy_cleanup() {
