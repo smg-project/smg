@@ -1,7 +1,8 @@
 //! The tokenizer management routes refuse in the control plane's envelope
 //! (`{"error", "code"}`, the shape the worker routes answer): an unknown
 //! tokenizer is a 404, a name in use a 409, a body the type does not take a
-//! 400, an empty name a 400. A loaded tokenizer keeps its answer shape; a
+//! 400, an empty or whitespace name or source a 400 up front. A loaded
+//! tokenizer keeps its answer shape; a
 //! model alias tokenizes as the model it names; a load that fails stays
 //! readable under its id as `failed`, with the error.
 
@@ -226,6 +227,9 @@ async fn an_empty_tokenizer_name_is_a_400_in_the_envelope() {
     }
 }
 
+/// An empty or whitespace source is refused up front in the envelope, as the
+/// name is: the registry's load would refuse an empty one only once the job
+/// runs, after a 202, and would take a whitespace one as a source.
 #[tokio::test]
 async fn an_empty_tokenizer_source_is_a_400_in_the_envelope() {
     let app = app_with_a_loaded_tokenizer().await;

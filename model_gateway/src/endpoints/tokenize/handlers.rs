@@ -5,7 +5,8 @@
 //! A model named by an alias tokenizes as the model the worker registry
 //! resolves it to, as every serving route reads it. The management routes
 //! refuse in the control plane's envelope (`{"error", "code"}`), the shape
-//! the worker routes use; a tokenizer name must not be empty.
+//! the worker routes use; an empty or whitespace name or source is refused
+//! up front, before the load job the registry's own check would fail.
 
 use std::sync::Arc;
 
@@ -223,8 +224,9 @@ pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -
 
 /// Handle POST /v1/tokenizers - async version using job queue
 pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerRequest) -> Response {
-    // An empty name is refused: the empty name is the tokenize route's "any
-    // tokenizer" fallback, and a tokenizer loaded under it would shadow that.
+    // An empty or whitespace name is refused up front: the registry's load
+    // refuses an empty one only once the job runs, after a 202, and takes a
+    // whitespace one as a name.
     if request.name.trim().is_empty() {
         return refusal(
             StatusCode::BAD_REQUEST,
