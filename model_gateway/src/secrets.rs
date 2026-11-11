@@ -68,14 +68,31 @@ impl SecretFiles {
         self.paths().count()
     }
 
+    /// The names of the settings whose keys have a file, in the order a
+    /// reload reads the files.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.by_setting()
+            .into_iter()
+            .filter_map(|(path, name)| path.as_ref().map(|_| name))
+    }
+
     fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.by_setting()
+            .into_iter()
+            .filter_map(|(path, _)| path.as_ref())
+    }
+
+    /// Each key's file beside the name of its setting, in the order a
+    /// reload reads the files.
+    fn by_setting(&self) -> [(&Option<PathBuf>, &'static str); 3] {
         [
-            &self.api_key,
-            &self.tenant_api_keys,
-            &self.control_plane_api_keys,
+            (&self.api_key, API_KEY_FILE.field),
+            (&self.tenant_api_keys, TENANT_API_KEYS_FILE.field),
+            (
+                &self.control_plane_api_keys,
+                CONTROL_PLANE_API_KEYS_FILE.field,
+            ),
         ]
-        .into_iter()
-        .flatten()
     }
 
     /// The files by directory: what the watch of `--secrets-auto-reload`
@@ -1145,6 +1162,24 @@ mod tests {
             flagged.contains_token("flag-key") && !flagged.contains_token("t-three"),
             "the flag's key stands alone in the fallback"
         );
+    }
+
+    /// The record of `--secrets-auto-reload` names the settings whose files
+    /// are watched, in the order the reload reads them; no file, no name.
+    #[test]
+    fn the_watched_files_are_named_by_their_settings() {
+        let files = SecretFiles {
+            api_key: Some(PathBuf::from("/keys/api-key")),
+            control_plane_api_keys: Some(PathBuf::from("/keys/control-plane")),
+            ..SecretFiles::default()
+        };
+        assert_eq!(
+            files.names().collect::<Vec<_>>(),
+            ["api-key-file", "control-plane-api-keys-file"],
+            "the settings with a file, in the reload's order"
+        );
+        assert_eq!(files.count(), 2);
+        assert!(SecretFiles::default().names().next().is_none());
     }
 
     #[test]
