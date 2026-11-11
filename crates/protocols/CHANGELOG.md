@@ -53,6 +53,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A completion request with `"echo": null` is served, as the public API allows. The crate refused
+  it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
+  and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses

@@ -36,8 +36,9 @@ pub struct CompletionRequest {
     #[validate(range(min = 0, max = 20))]
     pub best_of: Option<u32>,
 
-    /// Echo back the prompt in addition to the completion
-    #[serde(default)]
+    /// Echo back the prompt in addition to the completion. A `null` reads as
+    /// the default, as the public API allows.
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
     pub echo: bool,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
@@ -131,16 +132,28 @@ pub struct CompletionRequest {
     pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub no_stop_trim: bool,
 
     /// Ignore end-of-sequence tokens during generation
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub ignore_eos: bool,
 
     /// Skip special tokens during detokenization. Serialized only when
     /// `false`: `true` is what the engine applies without the field.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
+    )]
     pub skip_special_tokens: bool,
 
     /// Path to LoRA adapter(s) for model customization
@@ -150,7 +163,11 @@ pub struct CompletionRequest {
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub return_hidden_states: bool,
 
     /// Sampling seed for deterministic outputs
@@ -579,6 +596,73 @@ mod tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["code"], "integer_above_max_value");
         assert_eq!(body["error"]["param"], "logprobs");
+    }
+
+    /// The public API allows `"echo": null`. It reads as the default and the
+    /// request is written back as one without the key is; a wrong type is
+    /// still refused.
+    #[test]
+    fn echo_null_reads_as_an_absent_echo_does() {
+        let nulled = req(serde_json::json!({"echo": null}));
+        assert!(!nulled.echo);
+        nulled.validate().expect("valid");
+        assert!(!nulled.other.contains_key("echo"));
+        assert_eq!(
+            serde_json::to_value(&nulled).expect("serialize"),
+            serde_json::to_value(req(serde_json::json!({}))).expect("serialize")
+        );
+        assert!(req(serde_json::json!({"echo": true})).echo);
+        assert!(serde_json::from_value::<CompletionRequest>(
+            serde_json::json!({"model": "m", "prompt": "hello", "echo": "yes"})
+        )
+        .is_err());
+    }
+
+    /// A client that writes an unset engine flag as `null` gets the request an
+    /// absent key gives, as the chat request does.
+    #[test]
+    fn engine_flags_read_null_as_their_default() {
+        let nulled = req(serde_json::json!({
+            "no_stop_trim": null,
+            "ignore_eos": null,
+            "skip_special_tokens": null,
+            "return_hidden_states": null
+        }));
+        assert!(!nulled.no_stop_trim);
+        assert!(!nulled.ignore_eos);
+        assert!(nulled.skip_special_tokens);
+        assert!(!nulled.return_hidden_states);
+        assert_eq!(
+            serde_json::to_value(&nulled).expect("serialize"),
+            serde_json::to_value(req(serde_json::json!({}))).expect("serialize")
+        );
+    }
+
+    /// Through the extractor every route uses, a body with `"echo": null` is
+    /// served, where it was a 400 `invalid_type`.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn an_echo_null_body_passes_the_extractor() {
+        use axum::{
+            body::Body,
+            extract::{FromRequest, Request},
+        };
+
+        use crate::validated::ValidatedJson;
+
+        let body = serde_json::json!({"model": "m", "prompt": "hello", "echo": null});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let Ok(ValidatedJson(request)) =
+            ValidatedJson::<CompletionRequest>::from_request(request, &()).await
+        else {
+            panic!("an echo of null must be accepted");
+        };
+        assert!(!request.echo);
     }
 
     #[test]
