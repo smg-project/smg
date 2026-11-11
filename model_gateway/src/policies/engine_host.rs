@@ -693,16 +693,10 @@ impl Decider {
         }
         spec.profiles
             .insert("default".to_string(), profile_of(default)?);
-        // The block size a held prefix is priced by and a hashless request
-        // is sized by: the cache-aware configuration's.
-        spec.view.block_size = [default, prefill, decode]
-            .iter()
-            .find_map(|config| match config {
-                PolicyConfig::CacheAware { block_size, .. } => {
-                    Some(u32::try_from(*block_size).unwrap_or(u32::MAX).max(1))
-                }
-                _ => None,
-            });
+        // The block size a held prefix is priced by travels in the request
+        // facts (the index's learned size on an event-fed request, the
+        // configured one on a tree-fed request); the view's own size is the
+        // crate's fallback for a host that sends none, and stays its default.
         // The plan's binding covers its phases (the pair's two, the encode
         // phase too under `epd`); every other phase resolves to the default
         // profile.
@@ -3939,11 +3933,11 @@ mod tests {
     /// The configured block size reaches the view: a held prefix is priced
     /// by it. At 64 tokens a block with a margin price of 8 tokens, a
     /// one-block holder seven requests deep stays under its margin of 8
-    /// (64 / 8) and keeps the prompt; at the view's default of 16 the same
-    /// block would price at 2, the margin would fall to 4 and the holder
-    /// would spill.
+    /// (64 / 8) and keeps the prompt; had the host not carried the
+    /// configured size into the facts, the view's default of 16 would price
+    /// the block at 2, the margin would fall to 4 and the holder would spill.
     #[test]
-    fn the_cache_aware_block_size_reaches_the_view_through_the_prefix_price() {
+    fn the_configured_block_size_reaches_the_prefix_price_through_the_facts() {
         let mut config = cache_aware_config(64);
         if let PolicyConfig::CacheAware {
             balance_prefix_margin_tokens,
@@ -3978,6 +3972,66 @@ mod tests {
                 leader(&decider, &request, &workers),
                 0,
                 "the priced prefix keeps its holder under the gate"
+            );
+        }
+    }
+
+    /// An event-fed request is counted at the index's learned block size
+    /// and its held prefix is priced at that size, not the configured one:
+    /// at a learned 128 under a configuration at 16 with a margin price of
+    /// 16 tokens, a one-block holder seven requests deep stays under its
+    /// margin of 8 (128 / 16) and keeps the prompt; at the configured 16 the
+    /// block would price at 1, the margin would fall to 4 and the holder
+    /// would spill.
+    #[test]
+    fn a_held_prefix_is_priced_at_the_learned_block_size_of_the_event_index() {
+        let mut config = cache_aware_config(16);
+        if let PolicyConfig::CacheAware {
+            balance_prefix_margin_tokens,
+            ..
+        } = &mut config
+        {
+            *balance_prefix_margin_tokens = 16;
+        }
+        let decider = decider(&config);
+        let policy = cache_aware_policy(16);
+        let workers = pool(3);
+        policy.init_workers(&workers);
+        let tokens: Vec<u32> = (1..=128).collect();
+        let indexer = Arc::new(KvIndex::chain());
+        let holder = indexer.intern_worker(workers[0].url()).expect("interned");
+        let blocks = [StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: compute_content_hash(&tokens),
+        }];
+        indexer
+            .apply_stored(holder, &blocks, None, &mut WorkerBlocks::default())
+            .expect("applied");
+        let monitor = Arc::new(KvEventMonitor::new());
+        let model = normalize_model_key(workers[0].model_id()).to_string();
+        monitor.indexers.insert(model.clone(), indexer);
+        monitor.set_block_size(&model, 128);
+        policy.set_kv_event_monitor(Some(monitor));
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            prompt_tokens: 128,
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        for _ in 0..7 {
+            workers[0].increment_load();
+        }
+        for _ in 0..20 {
+            assert_eq!(
+                leader(&decider, &request, &workers),
+                0,
+                "the priced prefix keeps its holder at the learned block size"
             );
         }
     }

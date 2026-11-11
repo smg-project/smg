@@ -1024,12 +1024,18 @@ mod tests {
         };
         assert_eq!(tuned.tokens_of(8, &text), 64.0);
         // The block size the host counted with (an index's learned 128)
-        // overrides the view's: eight blocks are 1024 tokens.
+        // overrides the view's: eight blocks are 1024 tokens, and a hashless
+        // request of 1024 tokens is eight blocks, not the view's 32.
         let learned = RequestFacts {
             block_size: 128,
+            prompt_tokens: 1024,
             ..RequestFacts::default()
         };
         assert_eq!(tuned.tokens_of(8, &learned), 1024.0);
-        assert_eq!(tuned.request_blocks(&learned), 1);
+        assert_eq!(
+            tuned.request_blocks(&learned),
+            8,
+            "1024 tokens at the learned 128 a block, not 32 at the view's 32"
+        );
     }
 }
