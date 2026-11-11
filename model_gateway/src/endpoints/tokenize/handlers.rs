@@ -233,6 +233,16 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         );
     }
 
+    // An empty source is refused too: nothing loads from it, and the job the
+    // gateway would queue could only end as failed.
+    if request.source.trim().is_empty() {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "A tokenizer source must not be empty".to_string(),
+        );
+    }
+
     // A name in use is refused; the error names the tokenizer that holds it.
     if let Some(entry) = context.tokenizer_registry.get_by_name(&request.name) {
         return refusal(

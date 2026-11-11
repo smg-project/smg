@@ -226,6 +226,23 @@ async fn an_empty_tokenizer_name_is_a_400_in_the_envelope() {
     }
 }
 
+#[tokio::test]
+async fn an_empty_tokenizer_source_is_a_400_in_the_envelope() {
+    let app = app_with_a_loaded_tokenizer().await;
+    for source in ["", "   "] {
+        let body = format!(r#"{{"name":"no-source","source":"{source}"}}"#);
+        let (status, text) = send(&app, "POST", "/v1/tokenizers", Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "source {source:?}: {text}");
+        let refusal = envelope(&text);
+        assert_eq!(refusal.code, "BAD_REQUEST", "source {source:?}");
+        assert!(
+            refusal.error.contains("source"),
+            "source {source:?}: {}",
+            refusal.error
+        );
+    }
+}
+
 /// A load the gateway accepted (202) and could not complete stays readable
 /// under its id: the status route answers `failed` with the error, instead of
 /// a 404 that reads as if the job had never existed.
@@ -233,7 +250,8 @@ async fn an_empty_tokenizer_name_is_a_400_in_the_envelope() {
 async fn a_failed_load_stays_readable_under_its_id_as_failed() {
     let app = app_with_a_loaded_tokenizer().await;
     let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("a temp dir: {e}"));
-    let source = dir.path().join("nonexistent");
+    let source = dir.path().join("tokenizer.json");
+    std::fs::write(&source, "not a tokenizer").unwrap_or_else(|e| panic!("write {source:?}: {e}"));
     let body = format!(
         r#"{{"name":"never-loads","source":"{}"}}"#,
         source.to_str().unwrap_or_else(|| panic!("a UTF-8 path"))
@@ -263,7 +281,7 @@ async fn a_failed_load_stays_readable_under_its_id_as_failed() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the load of a nonexistent path did not end in 90 s: {text}"
+            "the load of a file that is not a tokenizer did not end in 90 s: {text}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
