@@ -4,6 +4,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ## Unreleased
 
+### Added
+
+- `ChatCompletionRequest::dynamic_tools_for`, `declares_tools_for`, `effective_tool_list_for`,
+  `shared_tool_list_for` and `callable_tools_for`: the tool-set readers under a provider profile
+  the caller derived already, beside `template_thinking_for`. The readers without the suffix
+  derive the profile from the model id as before; a serving path that derives it once per
+  request no longer derives it again at each of them.
+
 ### Changed
 
 - Breaking: on `ChatMessage::Assistant`, `function_call` is `Option<Box<FunctionCallResponse>>`,
