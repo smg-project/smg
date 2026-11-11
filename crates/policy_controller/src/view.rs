@@ -295,8 +295,6 @@ pub struct Candidate {
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker.
     pub session_in_flight: u16,
-    /// Session keys with a request in flight on this worker.
-    pub active_sessions: u16,
     /// The pairing class: a decode may pair with a prefill of the same class;
     /// `0` for a worker outside any pairing. Until a store derives classes, a
     /// host keys it by the open prefill a decode partners with.
@@ -322,6 +320,10 @@ pub struct Candidate {
     pub vision: bool,
     /// Reachable from one gateway only (a host-local wire).
     pub host_local: bool,
+    /// Session keys with a request in flight on this worker. Last because the
+    /// wire numbers its fields in the record's order and this one came after
+    /// the contract's first cut.
+    pub active_sessions: u16,
 }
 
 /// Media on the request: counts and bytes, for workers that take media.

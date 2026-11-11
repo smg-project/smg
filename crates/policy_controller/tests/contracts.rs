@@ -95,6 +95,7 @@ fn candidate_record() -> &'static [&'static str] {
             ec_compatible,
             vision,
             host_local,
+            active_sessions,
         }
     )
 }
@@ -276,6 +277,7 @@ fn lease_record() -> &'static [&'static str] {
             target_index,
             generation,
             session_key,
+            session,
             issued_micros,
             tokens,
         }
@@ -561,6 +563,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("ec_compatible", Type::Bool),
                 ("vision", Type::Bool),
                 ("host_local", Type::Bool),
+                ("active_sessions", Type::Uint32),
             ],
             repeated: &[],
             optional: &[],
@@ -715,7 +718,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["issued_micros"],
+            host_only: &["session", "issued_micros"],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -804,7 +807,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["issued_micros"],
+            host_only: &["session", "issued_micros"],
             before: &[],
         },
         WitMirror {
