@@ -19,7 +19,6 @@ categories = ["web-programming", "network-programming"]
 default = ["grpc-client", "jemalloc-stats", "providers"]
 tokenizers-v1 = ["llm-tokenizer/tokenizers-v1"]
 grpc-client = []
-grpc-server = []
 jemalloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]
 jemalloc-profiling = [
     "tikv-jemallocator/profiling",
