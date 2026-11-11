@@ -31,6 +31,7 @@ use tracing::warn;
 
 use crate::routers::grpc::common::responses::{
     history::hosted_call_result,
+    streaming::OutputItemKind,
     utils::{
         custom_tool_input, custom_tool_names, cut_call, decode_reasoning_content,
         encode_reasoning_content, extract_tools_from_response_tools, function_call_status,
@@ -750,8 +751,8 @@ pub(crate) fn chat_to_responses(
     // The assistant message as output items. Reasoning comes first (OpenAI
     // order), so items replayed in emitted order rebuild the same turn.
     let mut output: Vec<ResponseOutputItem> = Vec::new();
-    output.extend(reasoning_output_item(choice, &chat_resp.id, original_req));
-    output.extend(message_output_item(choice, &chat_resp.id));
+    output.extend(reasoning_output_item(choice, original_req));
+    output.extend(message_output_item(choice));
     // The cut-call read comes before the calls become items: a custom tool's
     // item carries no status.
     let cut = cut_call(
@@ -790,14 +791,13 @@ pub(crate) fn chat_to_responses(
 /// reasoned: with the opaque encrypted copy when the request asked for it.
 fn reasoning_output_item(
     choice: &ChatChoice,
-    chat_id: &str,
     original_req: &ResponsesRequest,
 ) -> Option<ResponseOutputItem> {
     let reasoning = choice.message.reasoning_content.as_ref()?;
     if reasoning.is_empty() {
         return None;
     }
-    let id = format!("reasoning_{chat_id}");
+    let id = OutputItemKind::Reasoning.new_id();
     let content = vec![ReasoningText {
         text: reasoning.clone(),
     }];
@@ -821,13 +821,13 @@ fn reasoning_output_item(
 
 /// The assistant's text as a message item, when it said any; a generation
 /// that failed leaves the message in progress.
-fn message_output_item(choice: &ChatChoice, chat_id: &str) -> Option<ResponseOutputItem> {
+fn message_output_item(choice: &ChatChoice) -> Option<ResponseOutputItem> {
     let content = choice.message.content.as_ref()?;
     if content.is_empty() {
         return None;
     }
     Some(ResponseOutputItem::Message {
-        id: format!("msg_{chat_id}"),
+        id: OutputItemKind::Message.new_id(),
         role: "assistant".to_string(),
         content: vec![ResponseContentPart::OutputText {
             text: content.clone(),
@@ -865,13 +865,13 @@ fn push_tool_call_output_items(
                     tool_call.function.arguments.as_deref().unwrap_or_default(),
                 ),
                 name,
-                id: Some(tool_call.id.clone()),
+                id: Some(OutputItemKind::CustomToolCall.new_id()),
                 namespace,
             });
             continue;
         }
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id.clone()),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id: tool_call.id.clone(),
             name,
             namespace,
@@ -1033,7 +1033,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plain["output"][0]["type"], "reasoning");
-        assert_eq!(plain["output"][0]["id"], "reasoning_chat_test");
+        assert!(
+            plain["output"][0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("rs_")),
+            "{plain}"
+        );
         assert_eq!(plain["output"][0]["content"][0]["text"], "because");
         assert!(
             plain["output"][0]["encrypted_content"].is_null(),
@@ -1977,6 +1982,8 @@ mod tests {
                 "{finish_reason}"
             );
             assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
+            let id = wire["output"][0]["id"].as_str().unwrap_or_default();
+            assert!(id.starts_with("ctc_"), "{finish_reason}: {wire}");
         }
     }
 
