@@ -241,7 +241,8 @@ mod tests {
 
     /// A decision taken while the request's capture is in scope is read back
     /// by its own id after later decisions, with its own target; a decision
-    /// outside any capture leaves no record.
+    /// outside any capture leaves no record unless a process-wide switch is
+    /// on.
     #[tokio::test]
     async fn a_traced_decision_is_read_back_by_its_id_and_an_untraced_one_is_not() {
         let decider = decider();
@@ -250,11 +251,21 @@ mod tests {
             model: "m-explain",
             ..HostRequest::default()
         };
+        // Outside a capture the ring stays empty unless a process-wide
+        // switch (`SMG_CACHE_TRACE=1`, `SMG_CACHE_TRACE_HEADER=1`) records
+        // every decision: the test holds either way.
         let (_, untraced) = decider.decide(&request, &workers, &[]);
-        assert!(
-            decider.explain(untraced.id.0).is_none(),
-            "a request that did not ask for its trace leaves no record"
-        );
+        if cache_trace::enabled() {
+            assert!(
+                decider.explain(untraced.id.0).is_some(),
+                "under a process-wide switch every decision is recorded"
+            );
+        } else {
+            assert!(
+                decider.explain(untraced.id.0).is_none(),
+                "a request that did not ask for its trace leaves no record"
+            );
+        }
 
         let ((first, first_lease), (_, second_lease)) = cache_trace::scope(true, async {
             (
