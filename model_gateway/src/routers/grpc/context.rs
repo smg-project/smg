@@ -578,6 +578,13 @@ pub(crate) enum ExecutionPlan {
         shared_request_id: String,
         requests: Vec<ProtoGenerateRequest>,
     },
+    /// Batched embedding fan-out: one backend request per input, in the
+    /// request's order, answered as one list. Sub-request ids are
+    /// `{shared_request_id}-p{i}`.
+    EmbedBatch {
+        shared_request_id: String,
+        requests: Vec<ProtoEmbedRequest>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -655,6 +662,9 @@ impl ExecutionPlan {
             }
             Self::Batch {
                 shared_request_id, ..
+            }
+            | Self::EmbedBatch {
+                shared_request_id, ..
             } => shared_request_id,
         }
     }
@@ -665,13 +675,13 @@ impl ExecutionPlan {
             | Self::PrefillDecode(_)
             | Self::EncodePrefillDecode { .. }
             | Self::Batch { .. } => "generate",
-            Self::Single(ProtoRequest::Embed(_)) => "embed",
+            Self::Single(ProtoRequest::Embed(_)) | Self::EmbedBatch { .. } => "embed",
         }
     }
 
     pub(crate) fn mode_label(&self) -> &'static str {
         match self {
-            Self::Single(_) => "single",
+            Self::Single(_) | Self::EmbedBatch { .. } => "single",
             Self::PrefillDecode(_) => "prefill_decode",
             Self::EncodePrefillDecode { .. } => "encode_prefill_decode",
             Self::Batch { kind, .. } => match kind {
@@ -691,6 +701,9 @@ impl ExecutionPlan {
             }
             Self::Batch { requests, .. } => {
                 requests.iter().map(ProtoGenerateRequest::wire_len).sum()
+            }
+            Self::EmbedBatch { requests, .. } => {
+                requests.iter().map(ProtoEmbedRequest::wire_len).sum()
             }
         }
     }
@@ -713,7 +726,7 @@ impl ExecutionPlan {
                 request.set_request_id(request_id);
                 Ok(())
             }
-            Self::Batch { .. } => {
+            Self::Batch { .. } | Self::EmbedBatch { .. } => {
                 error!(
                     function = "ExecutionPlan::set_request_id",
                     "Single id stamp on a batch plan"
@@ -736,6 +749,7 @@ impl ExecutionPlan {
                 request.token_ids()
             }
             Self::Batch { requests, .. } => requests.first().map_or(&[], |r| r.token_ids()),
+            Self::EmbedBatch { requests, .. } => requests.first().map_or(&[], |r| r.token_ids()),
         }
     }
 
@@ -747,7 +761,7 @@ impl ExecutionPlan {
             Self::Single(ProtoRequest::Generate(request))
             | Self::PrefillDecode(request)
             | Self::EncodePrefillDecode { request } => std::slice::from_mut(request).iter_mut(),
-            Self::Single(ProtoRequest::Embed(_)) => [].iter_mut(),
+            Self::Single(ProtoRequest::Embed(_)) | Self::EmbedBatch { .. } => [].iter_mut(),
             Self::Batch { requests, .. } => requests.iter_mut(),
         }
     }
@@ -801,10 +815,9 @@ pub(crate) enum PreparationOutput {
         original_text: Option<String>,
         token_ids: Vec<u32>,
     },
-    Embedding {
-        original_text: String,
-        token_ids: Vec<u32>,
-    },
+    /// The inputs of an embedding or classification request, one per input
+    /// of the batch, in the request's order.
+    Embedding { inputs: Vec<EmbeddingInput> },
     Harmony {
         token_ids: Vec<u32>,
         selection_text: String,
@@ -821,6 +834,14 @@ pub(crate) struct CompletionItem {
     pub token_ids: Vec<u32>,
 }
 
+/// One input of an embedding or classification request: a text the gateway
+/// tokenized, or the token ids the client sent (no text beside them; the
+/// engine embeds from the ids).
+pub(crate) struct EmbeddingInput {
+    pub text: Option<String>,
+    pub token_ids: Vec<u32>,
+}
+
 impl PreparationOutput {
     /// Token IDs (common to all variants). Batched completions expose the
     /// first prompt's tokens as the routing-affinity proxy.
@@ -833,11 +854,13 @@ impl PreparationOutput {
             | Self::Messages { token_ids, .. }
             | Self::Transcription { token_ids, .. }
             | Self::Generate { token_ids, .. }
-            | Self::Embedding { token_ids, .. }
             | Self::Harmony { token_ids, .. } => token_ids,
             Self::Completion { items, .. } => {
                 items.first().map_or(&[], |item| item.token_ids.as_slice())
             }
+            Self::Embedding { inputs } => inputs
+                .first()
+                .map_or(&[], |input| input.token_ids.as_slice()),
         }
     }
 
@@ -849,13 +872,15 @@ impl PreparationOutput {
         match self {
             Self::Decisions { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             Self::Completion { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
+            Self::Embedding { inputs } => inputs.iter().map(|input| input.token_ids.len()).sum(),
             other => other.token_ids().len(),
         }
     }
 
     /// Longest single input in tokens -- what the engine's context window
-    /// bounds. Every prompt of a batched `Completion` is dispatched as its own
-    /// engine request, so the window applies per item, not to their sum.
+    /// bounds. Every prompt of a batched `Completion` and every input of an
+    /// `Embedding` batch is dispatched as its own engine request, so the
+    /// window applies per item, not to their sum and not to the first alone.
     pub fn max_input_token_count(&self) -> usize {
         match self {
             Self::Decisions { items, .. } => items
@@ -866,6 +891,11 @@ impl PreparationOutput {
             Self::Completion { items, .. } => items
                 .iter()
                 .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
+            Self::Embedding { inputs } => inputs
+                .iter()
+                .map(|input| input.token_ids.len())
                 .max()
                 .unwrap_or(0),
             other => other.token_ids().len(),
@@ -892,7 +922,7 @@ impl PreparationOutput {
             } => joined_routing_text
                 .as_deref()
                 .or_else(|| items.first().map(|item| item.text.as_str())),
-            Self::Embedding { original_text, .. } => Some(original_text),
+            Self::Embedding { inputs } => inputs.first().and_then(|input| input.text.as_deref()),
             Self::Generate { original_text, .. } => original_text.as_deref(),
             Self::Harmony { selection_text, .. } => Some(selection_text),
         }
@@ -1675,8 +1705,9 @@ pub(crate) enum ExecutionResult {
         /// leaves this `None` and the streaming layer drains the stream itself.
         prefill_input_logprobs: Option<ProtoInputLogProbs>,
     },
-    /// Embedding requests return a single response, not a stream
-    Embedding { response: ProtoEmbedComplete },
+    /// An embedding request's answers, one per input in the request's
+    /// order: each a response in hand, not a stream.
+    Embedding { responses: Vec<ProtoEmbedComplete> },
     /// Batched completion fan-out: one result per prompt, in prompt order.
     Batch { results: Vec<ExecutionResult> },
 }
@@ -2224,6 +2255,29 @@ mod tests {
             joined_routing_text: None,
         };
         assert_eq!(empty.max_input_token_count(), 0);
+    }
+
+    /// An embedding batch goes to the engine one input per call, so the
+    /// window applies to its longest input: neither the first alone (which
+    /// would let a long later input through) nor their sum.
+    #[test]
+    fn max_input_token_count_is_the_longest_embedding_input() {
+        let batch = PreparationOutput::Embedding {
+            inputs: vec![
+                EmbeddingInput {
+                    text: Some("short".to_string()),
+                    token_ids: vec![1],
+                },
+                EmbeddingInput {
+                    text: None,
+                    token_ids: vec![2, 3, 4, 5, 6],
+                },
+            ],
+        };
+
+        assert_eq!(batch.max_input_token_count(), 5);
+        assert_eq!(batch.token_ids().len(), 1);
+        assert_eq!(batch.total_input_token_count(), 6);
     }
 
     #[test]

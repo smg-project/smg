@@ -111,6 +111,7 @@ fn plan_sub_requests(plan: &ExecutionPlan, workers: Option<&WorkerSelection>) ->
             width(request)
         }
         ExecutionPlan::Single(_) => 1,
+        ExecutionPlan::EmbedBatch { requests, .. } => requests.len(),
     }
 }
 
@@ -379,9 +380,12 @@ pub(crate) async fn execute_plan(
                     execute_single(req, clients, workers, ledger, dispatched_at.into_std()).await
                 }
                 ProtoRequest::Embed(req) => {
-                    execute_single_embed(req, clients, workers, ledger).await
+                    execute_embed(vec![req], clients, workers, ledger).await
                 }
             },
+            ExecutionPlan::EmbedBatch { requests, .. } => {
+                execute_embed(requests, clients, workers, ledger).await
+            }
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
                 execute_pd_dispatch(
@@ -1170,23 +1174,30 @@ pub(crate) fn start_failure_response(
     response
 }
 
-async fn execute_single_embed(
-    proto_request: ProtoEmbedRequest,
+/// The embed calls of a request, one per input, in flight together on the one
+/// worker and answered in the inputs' order (the wire takes one input per
+/// call). The first failure fails the request as a failed single call does,
+/// once every call has answered: a sibling in flight is never dropped
+/// mid-way, so the worker's own account of the calls it admitted stays whole;
+/// the worker is charged once, for the request.
+async fn execute_embed(
+    requests: Vec<ProtoEmbedRequest>,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let client = clients.single_or_mismatch("execute_single_embed")?;
+    let client = &*clients.single_or_mismatch("execute_embed")?;
 
     if let Some(worker) = workers.single() {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    let result = client.embed(proto_request).await;
+    let answers = join_all(requests.into_iter().map(|request| client.embed(request))).await;
+    let result: Result<Vec<_>, _> = answers.into_iter().collect();
     if let Some(status) = result.breaker_status() {
         workers.record_outcome(ledger, status);
     }
 
-    let complete = result.map_err(|e| {
+    let responses = result.map_err(|e| {
         if let Some(worker) = workers.single() {
             UpstreamClass::account_dispatch_failure(
                 worker.worker_type().as_metric_label(),
@@ -1196,13 +1207,13 @@ async fn execute_single_embed(
         }
         start_failure_response(
             &e,
-            "execute_single_embed",
+            "execute_embed",
             "Failed to start embedding",
             "start_embedding_failed",
         )
     })?;
 
-    Ok(ExecutionResult::Embedding { response: complete })
+    Ok(ExecutionResult::Embedding { responses })
 }
 
 /// What addresses both sides of a disaggregated dispatch: the pair and the

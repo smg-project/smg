@@ -1,6 +1,7 @@
 mod alias_pipeline;
 mod build_parity;
 mod chat_logit_bias;
+mod embeddings;
 mod generate_body;
 mod glm53;
 mod model_label;
