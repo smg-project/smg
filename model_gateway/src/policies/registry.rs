@@ -2770,6 +2770,41 @@ mod tests {
         }
     }
 
+    /// A request that names no model and runs to its end: the end reaches the
+    /// worker's model policy, so the default policy still counts the pick
+    /// until the polls clear it, at the second with nothing in flight.
+    #[test]
+    fn a_finished_request_with_no_model_leaves_the_default_policy_at_the_second_poll() {
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.4,
+            mean_prefill_tokens: 2048,
+            default_throughput: 555.0,
+        }));
+        registry.on_worker_added("llama-3", Some("least_load"));
+        let workers = [
+            ready_worker("http://a:8000", "llama-3"),
+            ready_worker("http://b:8000", "llama-3"),
+        ];
+        let sink = registry.completion_sink();
+        for worker in &workers {
+            worker.set_completion_sink(Some(Arc::clone(&sink)));
+        }
+        let held = WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        let default = registry.get_default_policy();
+        let least_load = default.as_any().downcast_ref::<LeastLoadPolicy>().unwrap();
+        assert_eq!(
+            default.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
+        drop(WorkerLoadGuard::new(Arc::clone(&workers[0]), None));
+        drop(held);
+        assert_eq!(least_load.picked_for_test(workers[0].url()), 1);
+        for picked in [1, 0] {
+            registry.reconcile_in_flight(workers[0].as_ref());
+            assert_eq!(least_load.picked_for_test(workers[0].url()), picked);
+        }
+    }
+
     #[test]
     fn reconcile_in_flight_reaches_the_policy_that_owns_the_worker_type() {
         use crate::worker::{BasicWorkerBuilder, WorkerLoadGuard};
