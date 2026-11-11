@@ -648,6 +648,17 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
     );
+    // A `Digits` after the ByteLevel: on the mapped text it would also cut
+    // at the numeric characters the map makes of six bytes beyond ASCII.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        PreTokenizerWrapper::Digits(Digits::new(true)),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
+    );
     // An added token with lstrip.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer
@@ -3374,13 +3385,19 @@ fn every_sentencepiece_shape_gets_a_native_path() {
 #[test]
 fn a_byte_level_vocabulary_with_the_byte_fallback_flag_keeps_its_path() {
     let mut state = 0xB17E_1E7E_1F1A_6000u64;
-    let shape = &shapes()[0];
-    let mut tokenizer = tokenizer_of(shape, &mut state);
-    let mut model = model(&mut state, shape.ignore_merges);
-    model.byte_fallback = true;
-    tokenizer.with_model(model);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("the byte-level path");
-    assert!(native.chars.is_none() && !native.stages.is_empty());
+    for shape in shapes() {
+        let mut tokenizer = tokenizer_of(&shape, &mut state);
+        let mut model = model(&mut state, shape.ignore_merges);
+        model.byte_fallback = true;
+        tokenizer.with_model(model);
+        let native = NativeEncoder::from_tokenizer(&tokenizer)
+            .unwrap_or_else(|declined| panic!("{}: {declined}", shape.name));
+        assert!(
+            native.chars.is_none() && !native.stages.is_empty(),
+            "{}",
+            shape.name
+        );
+    }
 }
 
 #[test]

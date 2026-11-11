@@ -940,8 +940,8 @@ impl NativeEncoder {
         let pre_tokenizer = serialized("pre-tokenizer", tokenizer.get_pre_tokenizer())?;
         // A vocabulary with byte fallback and no `ByteLevel` stage is a
         // sentencepiece-style one; a byte-level vocabulary whose file sets
-        // the flag keeps the byte-level path.
-        if bpe.byte_fallback && !Self::ends_in_byte_level(&pre_tokenizer) {
+        // the flag keeps the byte-level path, wherever its `ByteLevel` sits.
+        if bpe.byte_fallback && !Self::has_byte_level(&pre_tokenizer) {
             return Self::sentencepiece_from(tokenizer, &pre_tokenizer);
         }
         let normalizer =
@@ -1055,16 +1055,16 @@ impl NativeEncoder {
         })
     }
 
-    /// Whether a pre-tokenizer (serialized) ends in a `ByteLevel` stage, the
-    /// shape of the byte-level path ([`Self::stages_from`]).
-    fn ends_in_byte_level(pre_tokenizer: &Value) -> bool {
-        let last = match pre_tokenizer.get("pretokenizers").and_then(Value::as_array) {
-            Some(items) => items.last(),
-            None => Some(pre_tokenizer),
-        };
-        last.and_then(|item| item.get("type"))
-            .and_then(Value::as_str)
-            == Some("ByteLevel")
+    /// Whether a pre-tokenizer (serialized) holds a `ByteLevel` stage, the
+    /// shape of the byte-level path ([`Self::stages_from`], which finds the
+    /// stage by position and takes stages after it).
+    fn has_byte_level(pre_tokenizer: &Value) -> bool {
+        let is_byte_level =
+            |item: &Value| item.get("type").and_then(Value::as_str) == Some("ByteLevel");
+        match pre_tokenizer.get("pretokenizers").and_then(Value::as_array) {
+            Some(items) => items.iter().any(is_byte_level),
+            None => is_byte_level(pre_tokenizer),
+        }
     }
 
     /// Where the word marker comes from on a byte-fallback vocabulary, and
