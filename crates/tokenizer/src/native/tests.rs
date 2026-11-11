@@ -11,7 +11,7 @@ use tokenizers::{
     },
     normalizers::{
         unicode::{NFC, NFKC},
-        NormalizerWrapper, Replace, Sequence as NormalizerSequence,
+        NormalizerWrapper, Prepend, Replace, Sequence as NormalizerSequence,
     },
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
@@ -3496,6 +3496,25 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
     );
+    // The Replace in a Sequence with another step: the one-step sequence is
+    // the only sequence the path takes (a Prepend before the Replace is the
+    // legacy conversion's shape, which this path would read without the
+    // prepended marker).
+    let replace =
+        || NormalizerWrapper::from(Replace::new(" ", "\u{2581}").expect("a Replace normalizer"));
+    for steps in [
+        vec![Prepend::new("\u{2581}".to_owned()).into(), replace()],
+        vec![replace(), NormalizerWrapper::NFC(NFC)],
+    ] {
+        let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
+        tokenizer
+            .with_normalizer(Some(NormalizerSequence::new(steps)))
+            .expect("normalizer");
+        assert_eq!(
+            declined(&tokenizer),
+            "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
+        );
+    }
     // Neither the Replace nor a Metaspace.
     let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
     tokenizer
