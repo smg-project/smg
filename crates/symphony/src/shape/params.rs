@@ -25,8 +25,9 @@
 //! never finished, or a closing terminal given back to the call, as over any text no parameter
 //! takes. When the stream cuts the region, it closes the same way at the end of what arrived, as
 //! the template's reader closes a region at the end of its text: what is undecided is decided,
-//! the bytes no parameter took (a parameter the cut left unfinished) are dropped as wrapping, and
-//! the arguments' object is closed over the parameters that finished.
+//! the bytes the search passed over are dropped as wrapping, the arguments' object is closed over
+//! the parameters that finished, and the bytes of a parameter the cut left open go to the call,
+//! which says the cut once before the call's end.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -174,8 +175,8 @@ impl Params {
     }
 
     /// The stream cut the region: it closes as the template's reader closes a region at the end
-    /// of its text. What is undecided is decided as at the end of the text, the bytes no
-    /// parameter took are dropped as wrapping, and the arguments' object is closed over the
+    /// of its text. What is undecided is decided as at the end of the text, the bytes the search
+    /// passed over are dropped as wrapping, and the arguments' object is closed over the
     /// parameters that finished, `{}` where none did. Returns the bytes of a parameter the cut
     /// left open (a tag the text ended inside, or a start of the trigger), neither written nor
     /// dropped here: the call reports them with the cut. Empty when the cut fell between

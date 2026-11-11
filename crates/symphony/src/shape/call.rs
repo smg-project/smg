@@ -43,10 +43,12 @@
 //! rides in the second run's `Malformed` event, so that where the chunks were cut changes
 //! nothing. A region the stream cut is ended with what arrived. Tagged parameters close as the
 //! template's reader closes a region at the end of its text: the arguments' object is closed over
-//! the parameters that finished, and the text of one the cut left unfinished is dropped as
-//! wrapping. One JSON value or object is not closed for the client, and what was held after it
-//! comes back as `Malformed` with `UnterminatedRegion`, the whitespace between its words kept and
-//! the runs before the first word and after the last dropped as wrapping. A value that never began,
+//! the parameters that finished, and the cut is said once before the call's end by a `Malformed`
+//! with `UnterminatedRegion` that carries the bytes of a parameter the cut left open (none when
+//! it fell between parameters). One JSON value or object is not closed for the client, and what
+//! was held after it comes back as `Malformed` with `UnterminatedRegion`, the whitespace between
+//! its words kept and the runs before the first word and after the last dropped as wrapping. A
+//! value that never began,
 //! the cut or the region's close right after the header, is said to be none the same way a
 //! value cut short is, by a `Malformed` event of no bytes before the call's end
 //! ([`json::Arguments::finish`]), so that a call is never handed over whole with an empty string
@@ -1788,6 +1790,18 @@ mod tests {
                 length.clone(),
             ],
             "a call cut before any parameter finished closes with no arguments and says the cut"
+        );
+        assert_eq!(
+            run_after(&format, "", "<c><k=a>1</k>\n<k", EngineFinish::Length),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1}", "<k=a>1</k>\n"),
+                malformed("<k"),
+                end(""),
+                length.clone(),
+            ],
+            "a start of the trigger the cut left unfinished is the cut's marker, not wrapping"
         );
         assert_eq!(
             run_after(&format, "", "<c><k=a>1</k>\n", EngineFinish::Length),

@@ -60,16 +60,19 @@ fn a_shaped_call_the_stream_cuts_short_is_marked_cut_before_its_end() {
             .iter()
             .position(|event| matches!(event, Event::ToolCallEnd { .. }))
             .expect("the call ends");
-        let marker = events[..end].iter().find_map(|event| match event {
-            Event::Malformed {
-                text,
-                why: MalformedReason::UnterminatedRegion,
-            } => Some(text.text.as_ref()),
-            _ => None,
-        });
+        let markers: Vec<&str> = events[..end]
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed {
+                    text,
+                    why: MalformedReason::UnterminatedRegion,
+                } => Some(text.text.as_ref()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            marker,
-            Some(open),
+            markers,
+            [open],
             "the cut is said once before the end of the call the stream cut, its text the open \
              parameter's bytes: {events:#?}"
         );
