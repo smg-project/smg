@@ -7,7 +7,9 @@
 //! every set as it was and is refused by field and path, never by content.
 //! A key the command line or the environment gave is not a file: it stays
 //! as the start read it, and a reload rebuilds the serving map from that
-//! fixed part and the files'.
+//! fixed part and the files'. The admin routes' fallback, in force when no
+//! control-plane keys are configured, holds the shared key alone and follows
+//! it through a reload of its file.
 
 use std::{
     collections::BTreeMap,
@@ -137,6 +139,11 @@ fn entry_refusal(error: ConfigError) -> String {
 pub struct SecretReloader {
     files: SecretFiles,
     serving: AuthConfig,
+    /// The admin and worker-management routes' fallback when no control-plane
+    /// keys are configured: the shared key alone, never a tenant key. Held
+    /// when the shared key came from a file, so a reload of that file moves
+    /// it with the serving set.
+    admin_fallback: Option<AuthConfig>,
     /// The shared key when the command line or the environment gave it:
     /// every reload keeps it.
     fixed_api_key: Option<String>,
@@ -158,7 +165,9 @@ impl SecretReloader {
     /// it) and, for the control-plane keys, when control-plane
     /// authentication is on (`control_plane` is its set in force). The
     /// serving values are the start's; whichever of them a file did not
-    /// give is the fixed part every reload keeps.
+    /// give is the fixed part every reload keeps. `admin_fallback` is the
+    /// admin routes' set when no control-plane keys are configured; it is a
+    /// reload's target when the shared key came from a file.
     pub fn new(
         files: SecretFiles,
         sources: &SecretSources,
@@ -166,6 +175,7 @@ impl SecretReloader {
         tenant_api_keys: &[TenantApiKeyEntry],
         serving: AuthConfig,
         control_plane: Option<ApiKeySet>,
+        admin_fallback: Option<AuthConfig>,
     ) -> Option<Self> {
         let from_file = |source: Option<SecretSource>| source == Some(SecretSource::File);
         let files = SecretFiles {
@@ -190,6 +200,7 @@ impl SecretReloader {
             &[]
         };
         let control_plane = control_plane.filter(|_| files.control_plane_api_keys.is_some());
+        let admin_fallback = admin_fallback.filter(|_| files.api_key.is_some());
         let in_force = KeysInForce::of(
             api_key,
             tenant_api_keys,
@@ -198,6 +209,7 @@ impl SecretReloader {
         Some(Self {
             files,
             serving,
+            admin_fallback,
             fixed_api_key,
             fixed_tenants: fixed_tenants.to_vec(),
             control_plane,
@@ -298,9 +310,14 @@ impl SecretReloader {
                 return Err(BadFile(file.bad_file(path, &entry_refusal(error))));
             }
             served = Some(KeysInForce::of(api_key.as_deref(), tenants, None));
-            let keys = AuthConfig::key_map(api_key, tenants);
+            let keys = AuthConfig::key_map(api_key.clone(), tenants);
             let previous = self.serving.replace(keys.clone());
             report.serving_changed = *previous != keys;
+            // The admin routes' fallback follows the shared key alone: a
+            // tenant key never reaches it.
+            if let Some(fallback) = &self.admin_fallback {
+                fallback.replace(AuthConfig::key_map(api_key, &[]));
+            }
         }
         if let Some((set, entries)) = control_plane {
             report.control_plane_changed = set.load().as_slice() != entries.as_slice();
@@ -493,6 +510,7 @@ mod tests {
             }],
             serving.clone(),
             None,
+            None,
         )
         .expect("a file source");
 
@@ -537,6 +555,7 @@ mod tests {
             &start,
             serving.clone(),
             None,
+            None,
         )
         .expect("a file source");
         assert!(
@@ -570,6 +589,7 @@ mod tests {
             &[],
             serving.clone(),
             None,
+            None,
         )
         .expect("a file source");
         write(dir.path(), "key", "k-two\n");
@@ -596,6 +616,7 @@ mod tests {
             &[],
             serving.clone(),
             Some(set.clone()),
+            None,
         )
         .expect("file sources");
         reloader.reload().expect("the first reload");
@@ -636,6 +657,7 @@ mod tests {
             &[],
             AuthConfig::new(Some("k-one".into())),
             Some(set),
+            None,
         )
         .expect("file sources");
         assert_eq!(
@@ -676,6 +698,7 @@ mod tests {
             &start,
             AuthConfig::with_tenant_keys(Some("flag-key".into()), &start),
             None,
+            None,
         )
         .expect("a file source");
         assert_eq!(
@@ -715,6 +738,7 @@ mod tests {
             &start,
             AuthConfig::with_tenant_keys(Some("flag-key".into()), &start),
             None,
+            None,
         )
         .expect("a file source");
 
@@ -747,6 +771,7 @@ mod tests {
             &[],
             AuthConfig::new(None),
             Some(set.clone()),
+            None,
         )
         .expect("a file source");
         let same = reloader.reload().expect("reloaded");
@@ -787,6 +812,7 @@ mod tests {
             Some("flag-key"),
             &entries,
             serving.clone(),
+            None,
             None,
         )
         .expect("a file source");
@@ -835,6 +861,7 @@ mod tests {
                 &[],
                 serving.clone(),
                 None,
+                None,
             )
             .expect("a file source"),
         );
@@ -872,6 +899,7 @@ mod tests {
                 Some("k-one"),
                 &[],
                 serving.clone(),
+                None,
                 None,
             )
             .expect("a file source"),
@@ -915,6 +943,7 @@ mod tests {
                 Some("k-one"),
                 &[],
                 serving.clone(),
+                None,
                 None,
             )
             .expect("a file source"),
@@ -971,6 +1000,7 @@ mod tests {
                 &[],
                 serving.clone(),
                 None,
+                None,
             )
             .expect("a file source"),
         );
@@ -1008,6 +1038,7 @@ mod tests {
                 &[],
                 AuthConfig::new(Some("k-one".into())),
                 None,
+                None,
             )
             .expect("a file source"),
         );
@@ -1026,6 +1057,96 @@ mod tests {
         assert!(text.ends_with("not a directory"), "{text}");
     }
 
+    /// The admin routes' fallback, in force when no control-plane keys are
+    /// configured, follows the shared key through a reload of its file: the
+    /// retired key is out there too.
+    #[test]
+    fn a_shared_key_reload_moves_the_admin_fallback_with_the_serving_set() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = write(dir.path(), "key", "k-one\n");
+        let serving = AuthConfig::new(Some("k-one".into()));
+        let fallback = AuthConfig::new(Some("k-one".into()));
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                api_key: Some(file),
+                ..SecretFiles::default()
+            },
+            &sources(SecretSource::File, None),
+            Some("k-one"),
+            &[],
+            serving.clone(),
+            None,
+            Some(fallback.clone()),
+        )
+        .expect("a file source");
+        write(dir.path(), "key", "k-two\n");
+        reloader.reload().expect("reloaded");
+        assert!(serving.contains_token("k-two") && !serving.contains_token("k-one"));
+        assert!(
+            fallback.contains_token("k-two") && !fallback.contains_token("k-one"),
+            "the fallback follows the shared key"
+        );
+    }
+
+    /// A tenant key never reaches the fallback, and a shared key the flag
+    /// gave leaves the fallback as the start built it through a tenant-file
+    /// reload.
+    #[test]
+    fn the_admin_fallback_takes_the_shared_key_alone() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let key = write(dir.path(), "key", "k-one\n");
+        let tenants = write(dir.path(), "tenants", "acme:t-one\n");
+        let start = [TenantApiKeyEntry {
+            tenant_id: "acme".into(),
+            key: "t-one".into(),
+        }];
+        let fallback = AuthConfig::new(Some("k-one".into()));
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                api_key: Some(key),
+                tenant_api_keys: Some(tenants.clone()),
+                ..SecretFiles::default()
+            },
+            &sources(SecretSource::File, Some(SecretSource::File)),
+            Some("k-one"),
+            &start,
+            AuthConfig::with_tenant_keys(Some("k-one".into()), &start),
+            None,
+            Some(fallback.clone()),
+        )
+        .expect("file sources");
+        write(dir.path(), "key", "k-two\n");
+        write(dir.path(), "tenants", "acme:t-two\n");
+        reloader.reload().expect("reloaded");
+        assert!(fallback.contains_token("k-two"), "the shared key moved");
+        assert!(
+            !fallback.contains_token("t-two") && !fallback.contains_token("t-one"),
+            "no tenant key reaches the fallback"
+        );
+
+        // The shared key from the flag: the fallback is not a reload's target.
+        let flagged = AuthConfig::new(Some("flag-key".into()));
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                tenant_api_keys: Some(tenants),
+                ..SecretFiles::default()
+            },
+            &sources(SecretSource::Flag, Some(SecretSource::File)),
+            Some("flag-key"),
+            &start,
+            AuthConfig::with_tenant_keys(Some("flag-key".into()), &start),
+            None,
+            Some(flagged.clone()),
+        )
+        .expect("a file source");
+        write(dir.path(), "tenants", "beta:t-three\n");
+        reloader.reload().expect("reloaded");
+        assert!(
+            flagged.contains_token("flag-key") && !flagged.contains_token("t-three"),
+            "the flag's key stands alone in the fallback"
+        );
+    }
+
     #[test]
     fn no_key_from_a_file_means_no_reloader() {
         let files = SecretFiles {
@@ -1041,6 +1162,7 @@ mod tests {
             Some("k"),
             &[],
             AuthConfig::new(Some("k".into())),
+            None,
             None,
         )
         .is_none());
