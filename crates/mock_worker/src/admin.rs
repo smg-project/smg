@@ -729,10 +729,23 @@ mod tests {
             .await
             .expect("a port to occupy");
         let taken_port = taken.local_addr().expect("address").port();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("the worker's port");
-        let port = listener.local_addr().expect("address").port();
+        // The worker's port is drawn from the OS and kept while its name is
+        // new to the registries, which are process-wide and never forget a
+        // name: a port an earlier test's worker served would read as
+        // registered here. The listener is held through the check, so no
+        // other test takes the port meanwhile.
+        let (listener, port) = loop {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the worker's port");
+            let port = listener.local_addr().expect("address").port();
+            let name = format!("grpc:{port}");
+            let known = script::registered().contains(&name)
+                || engine::fleet_engines().iter().any(|e| e.name() == name);
+            if !known {
+                break (listener, port);
+            }
+        };
         let cfg = std::sync::Arc::new(Config {
             host: "127.0.0.1".to_string(),
             grpc_base_port: port,
