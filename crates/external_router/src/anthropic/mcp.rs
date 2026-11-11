@@ -30,11 +30,20 @@ pub(crate) struct IterationResult {
 }
 
 impl IterationResult {
-    /// Construct from a non-streaming `Message`.
-    pub(crate) fn from_message(message: &Message) -> Self {
-        let tool_use_blocks = extract_tool_calls(&message.content);
+    /// Construct from a non-streaming `Message`, taking its content: the
+    /// loop that reads the result owns the blocks from here and moves them
+    /// on (into the next round's prior blocks, or back into the message
+    /// for the final response), so the message is left with none. A round
+    /// copied them twice before (into the result, then again into the
+    /// prior blocks); what is still copied is the conversion into the next
+    /// request's input blocks and the tool calls `extract_tool_calls` reads
+    /// out of the blocks (their id, name and input), which the executor
+    /// copies once more into its inputs.
+    pub(crate) fn take_from(message: &mut Message) -> Self {
+        let content_blocks = std::mem::take(&mut message.content);
+        let tool_use_blocks = extract_tool_calls(&content_blocks);
         Self {
-            content_blocks: message.content.clone(),
+            content_blocks,
             tool_use_blocks,
             stop_reason: message.stop_reason.clone(),
         }
@@ -720,6 +729,7 @@ mod tests {
     use smg_mcp::Tool as McpTool;
 
     use super::*;
+    use crate::test_support::counting_alloc;
 
     #[test]
     fn mcp_tool_schema_keeps_the_servers_key_order() {
@@ -949,4 +959,81 @@ mod tests {
             serde_json::to_value(&before).unwrap()
         );
     }
+
+    /// A round's message as the model answers it: text, tool calls and a
+    /// thought, read from the wire shape.
+    fn round_message(blocks: usize) -> Message {
+        let content: Vec<Value> = (0..blocks)
+            .map(|i| match i % 3 {
+                0 => json!({"type": "text", "text": format!("paragraph {i} of the answer, long enough to live on the heap")}),
+                1 => json!({"type": "tool_use", "id": format!("toolu_{i}"), "name": "lookup",
+                    "input": {"query": format!("q{i}"), "limit": 10, "fields": ["a", "b", "c"]}}),
+                _ => json!({"type": "thinking", "thinking": format!("step {i}"), "signature": "sig"}),
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "content": content,
+            "model": "m", "stop_reason": "tool_use", "stop_sequence": null,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .expect("a message")
+    }
+
+    /// What a round does with the message's content: the iteration result,
+    /// the conversion into the next request's input blocks, the blocks kept
+    /// for the final response. Taken and moved, the blocks are copied once
+    /// (the conversion); the round that copied them into the result and again
+    /// into the prior blocks allocated the two copies on top. The counts are
+    /// printed for the Numbers table and the moved shape is pinned.
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the count a pin reads is printed for the Numbers table"
+    )]
+    fn a_round_takes_the_message_content_and_copies_it_once() {
+        let blocks = 6;
+        let copied = round_message(blocks);
+        let mut moved = round_message(blocks);
+        let expected = serde_json::to_value(&copied.content).expect("blocks as JSON");
+
+        // The shape before: cloned into the result, converted, cloned again.
+        let before = counting_alloc::calls();
+        let content_blocks = copied.content.clone();
+        let tool_use_blocks = extract_tool_calls(&content_blocks);
+        let assistant = build_assistant_content_blocks(&content_blocks);
+        let mut prior: Vec<ContentBlock> = Vec::new();
+        prior.extend(copied.content.clone());
+        let copied_calls = counting_alloc::calls() - before;
+        drop((content_blocks, tool_use_blocks, assistant, prior));
+
+        // The shape now: taken, converted, moved.
+        let before = counting_alloc::calls();
+        let result = IterationResult::take_from(&mut moved);
+        let assistant = build_assistant_content_blocks(&result.content_blocks);
+        let mut prior: Vec<ContentBlock> = Vec::new();
+        prior.extend(result.content_blocks);
+        let moved_calls = counting_alloc::calls() - before;
+
+        eprintln!(
+            "a round's content handling, {blocks} blocks: copied shape {copied_calls} allocation calls, moved shape {moved_calls}"
+        );
+        assert!(moved.content.is_empty(), "the message's content is taken");
+        assert_eq!(
+            serde_json::to_value(&prior).expect("blocks as JSON"),
+            expected
+        );
+        assert_eq!(assistant.len(), blocks);
+        assert_eq!(result.tool_use_blocks.len(), blocks / 3);
+        assert!(moved_calls < copied_calls, "{moved_calls} < {copied_calls}");
+        // Pinned at today's count: the conversion of the blocks (about 32
+        // calls for these six), the tool-call extraction's copies (about
+        // 25) and the prior vector's buffer (1).
+        assert_eq!(
+            moved_calls, PINNED_ROUND_CALLS,
+            "the moved shape's allocation calls changed"
+        );
+    }
+
+    /// Allocation calls of the moved shape for six blocks, today.
+    const PINNED_ROUND_CALLS: usize = 58;
 }
