@@ -1648,6 +1648,46 @@ mod tests {
         assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(9));
     }
 
+    /// A poll replayed with its old instant after a read refreshed a rank:
+    /// the rank's newest sample wins, so the read's value and instant stay
+    /// and the replay's older row is dropped for it, and the next read of
+    /// the other rank carries the first read's value under the earlier
+    /// read's instant, not the replay's value under it.
+    #[test]
+    fn a_replayed_poll_keeps_a_ranks_newer_read() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        let sample = |rank| {
+            host.load(id, rank)
+                .map(|sample| (sample.row.running, sample.sampled_at))
+        };
+        host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
+        host.record(id, 0, row(5), at(1), LoadSource::Scrape);
+        host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
+        assert_eq!(
+            sample(0),
+            Some((5, t0)),
+            "the replay's older row is dropped: rank 0 keeps the read's value, the report rank 1's instant"
+        );
+        host.record(id, 1, row(6), at(2), LoadSource::Scrape);
+        assert_eq!(
+            sample(0),
+            Some((5, at(1))),
+            "rank 0 is the read's value under the earlier read's instant"
+        );
+        assert_eq!(sample(1), Some((6, at(1))));
+        let _ = monitor;
+    }
+
     /// A read holds its worker's lock from the snapshot read through the
     /// publish: a second read of the worker waits for it, so neither
     /// publishes the other's rank from a snapshot the other has replaced.
@@ -1664,7 +1704,7 @@ mod tests {
             ..LoadRow::default()
         };
         host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
-        let lock = monitor.read_lock(worker.url());
+        let lock = monitor.rank_lock(worker.url());
         let held = lock.lock();
         let handle = runtime.handle().clone();
         let started = AtomicBool::new(false);
@@ -1715,7 +1755,7 @@ mod tests {
             ..LoadRow::default()
         };
         host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
-        let lock = monitor.read_lock(worker.url());
+        let lock = monitor.rank_lock(worker.url());
         let held_at_publish = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&held_at_publish);
         *monitor.before_read_publish.lock() = Some(Box::new(move || {
