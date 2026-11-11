@@ -210,9 +210,12 @@ pub enum MediaErrorCode {
     /// base64, a payload that is not the media it claims to be, a URL that
     /// does not parse or names no host, a host the policy refuses by name or
     /// by the address it resolves to, a local path outside the allow list, a
-    /// media parameter out of range (`fps`, `max_long_side_pixel`). Not a
-    /// host's trouble and nothing a retry would change: the request itself
-    /// is what to fix.
+    /// media parameter out of range (`fps`, `max_long_side_pixel`), a decode
+    /// over the work bound (`SMG_VIDEO_MAX_DECODE_PIXELS`) or over the
+    /// decoder's time budget. Not a host's trouble: the request itself is
+    /// what to fix, and the message says what fits (a shorter clip, a smaller
+    /// frame budget). How long a decode takes also depends on this side's
+    /// load, so the code is not a promise that a retry can never help.
     InvalidRequest,
     /// `media_fetch_failed`: a fetch or read that was attempted failed: a
     /// host that cannot be resolved or does not deliver within the fetch
@@ -225,9 +228,9 @@ pub enum MediaErrorCode {
     /// to ([`MediaConnectorError::DecodedTooLarge`]: a video's frames, an
     /// audio clip's samples), the frame list a video's picks would need
     /// ([`MediaConnectorError::FrameListTooLong`]), or the image decoder's
-    /// own limits. A bound on
-    /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_PIXELS`) is
-    /// not one: a clip over it is a fetch failure.
+    /// own limits. A bound on decode work rather than on size
+    /// (`SMG_VIDEO_MAX_DECODE_PIXELS`) is not one: a clip over it is refused
+    /// as sent, `invalid_multimodal_request`.
     TooLarge,
 }
 
@@ -568,6 +571,14 @@ mod tests {
             )),
             MediaConnectorError::AudioDecode("not audio".to_string()),
             MediaConnectorError::VideoDecode("not a video".to_string()),
+            // The decode-work bound and the decoder's time budget ride the
+            // same catch-all variants: refused as sent, on purpose.
+            MediaConnectorError::VideoDecode(
+                "video decode work 1200000000 pixels exceeds SMG_VIDEO_MAX_DECODE_PIXELS 400000000; \
+                 a shorter clip or a smaller frame budget fits it"
+                    .to_string(),
+            ),
+            MediaConnectorError::AudioDecode("ffmpeg timed out after 30 seconds".to_string()),
         ] {
             assert_eq!(error.code(), MediaErrorCode::InvalidRequest, "{error}");
             assert_eq!(error.fault(), MediaFault::Client, "{error}");
