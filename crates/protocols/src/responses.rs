@@ -9,11 +9,12 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, strict_schema_missing_additional_properties, validate_json_schema_shape,
-        validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function,
-        FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
-        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
-        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
+        default_true, json_type_name, strict_schema_missing_additional_properties,
+        validate_json_schema_shape, validate_stop, ChatLogProbs, ContextManagementEntry,
+        ConversationRef, Detail, Function, FunctionChoice, GenerationRequest, PromptCacheRetention,
+        PromptTokenUsageInfo, ResponsePrompt, StreamOptions, StringOrArray,
+        ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage,
+        UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -4035,18 +4036,6 @@ fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
         validate_json_schema_shape(name, schema)?;
     }
     Ok(())
-}
-
-/// The JSON type name used in validation messages.
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
 }
 
 /// Normalize a SimpleInputMessage to a proper Message item

@@ -7,7 +7,7 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, on_field,
+        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, json_type_name, on_field,
         validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
         ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse, FunctionChoice,
         GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
@@ -913,18 +913,6 @@ fn validate_tool_choice(
             )),
         }),
         ToolChoice::Function { .. } | ToolChoice::Value(_) => Ok(()),
-    }
-}
-
-/// The JSON type of a value, for error messages (`a string`, `an array`, ...).
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
     }
 }
 
