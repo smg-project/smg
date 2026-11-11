@@ -109,8 +109,7 @@ pub(crate) async fn serve_harmony_responses_stream(
 
         // Emit initial response.created and response.in_progress events (a
         // background stream reports response.queued between the two)
-        let event = emitter.emit_created();
-        if emitter.send_event(&event, &tx).await.is_err() {
+        if emitter.send_created(&tx).await.is_err() {
             return Ok(());
         }
         if request.background.unwrap_or(false) {
@@ -119,8 +118,7 @@ pub(crate) async fn serve_harmony_responses_stream(
                 return Ok(());
             }
         }
-        let event = emitter.emit_in_progress();
-        if emitter.send_event(&event, &tx).await.is_err() {
+        if emitter.send_in_progress(&tx).await.is_err() {
             return Ok(());
         }
 
