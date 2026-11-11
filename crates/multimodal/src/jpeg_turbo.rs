@@ -617,15 +617,26 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
             &mut subsamp,
             &mut colorspace,
         );
+        // The header call fills the dimensions once it has read the frame,
+        // before it classifies the sampling; a header it could not read
+        // leaves them at zero (3.x reports -1), and the file falls back as
+        // before, with no buffer taken and no second read on the handle.
+        if w <= 0 || h <= 0 {
+            (tj.destroy)(handle);
+            return None;
+        }
         // A CMYK or YCCK source can only come out as CMYK; everything else
-        // (YCbCr, grayscale, RGB) comes out as RGB. When the header call
-        // refuses the frame's sampling (libjpeg-turbo 2.x on components
-        // sampled unlike each other), the frame header supplies the
-        // dimensions, and four components mean CMYK: the decoder takes the
-        // frame the call would not classify.
-        let (w, h, cmyk) = if hdr == 0 && w > 0 && h > 0 {
+        // (YCbCr, grayscale, RGB) comes out as RGB. When the call read the
+        // frame and refused only its sampling (libjpeg-turbo 2.x on
+        // components sampled unlike each other), the frame header supplies
+        // the component count, and four components mean CMYK: the decoder
+        // takes the frame the call would not classify. The call writes that
+        // refusal into the sampling before it throws; a failure with the
+        // sampling known is a header warning or the colorspace refusal, and
+        // the decode would fail the same way, so the file falls back at once.
+        let (w, h, cmyk) = if hdr == 0 {
             (w, h, colorspace == TJCS_CMYK || colorspace == TJCS_YCCK)
-        } else {
+        } else if subsamp < 0 {
             match frame_header(bytes) {
                 Some(frame) => (frame.width, frame.height, frame.components == 4),
                 None => {
@@ -633,6 +644,9 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
                     return None;
                 }
             }
+        } else {
+            (tj.destroy)(handle);
+            return None;
         };
         let (wu, hu) = (w as usize, h as usize);
         let (pixel_format, channels) = if cmyk { (TJPF_CMYK, 4) } else { (TJPF_RGB, 3) };
@@ -877,8 +891,9 @@ mod tests {
     }
 
     /// The reader finds the frame header behind the tables, in a file written
-    /// by a compressor as in one built by hand, and reads nothing from a file
-    /// that ends before it or is no JPEG at all.
+    /// by a compressor as in one built by hand, steps over fill bytes, and
+    /// reads nothing from a file whose scan comes first, whose height is zero,
+    /// that ends before the frame header, or that is no JPEG at all.
     #[test]
     fn the_frame_header_reads_the_dimensions_and_the_component_count() {
         let jpeg = unequal_sampling_cmyk_jpeg();
@@ -908,6 +923,33 @@ mod tests {
             "cut inside the frame header"
         );
         assert_eq!(frame_header(b"not a jpeg"), None);
+        // Fill bytes before a marker are stepped over.
+        let mut filled = jpeg.clone();
+        filled.splice(2..2, [0xFF, 0xFF]);
+        assert_eq!(
+            frame_header(&filled),
+            Some(frame),
+            "fill bytes before a marker"
+        );
+        // A standalone marker (TEM) carries no length and is stepped over.
+        let mut standalone = jpeg.clone();
+        standalone.splice(2..2, [0xFF, 0x01]);
+        assert_eq!(
+            frame_header(&standalone),
+            Some(frame),
+            "a standalone marker before the frame header"
+        );
+        // A zero height (a file that defines it by a DNL segment) is no frame
+        // header: the height sits five bytes into the segment at 71.
+        let mut dnl = jpeg.clone();
+        dnl[76..78].copy_from_slice(&[0, 0]);
+        assert_eq!(frame_header(&dnl), None, "a zero height");
+        // The scan before any frame header.
+        assert_eq!(
+            frame_header(&[0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02]),
+            None,
+            "a scan before the frame header"
+        );
     }
 
     /// libjpeg-turbo 2.x's header call refuses a four-component frame whose
@@ -930,6 +972,79 @@ mod tests {
             rgb.pixels().all(|pixel| pixel.0 == expected),
             "every sample is 128 before the inversion: {expected:?}"
         );
+    }
+
+    /// A header the library cannot read leaves the dimensions unset, and the
+    /// decode answers `None` without taking a buffer: the hand-built file with
+    /// its precision set to 9 bits (no build reads it: 2.x wants its compiled
+    /// 8, 3.x takes 8, 12 and 16) and its frame grown to 1024x1024, which the
+    /// frame header alone would read and serve from the 4 MiB class.
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_header_the_library_cannot_read_takes_no_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the unreadable-header test");
+            return;
+        }
+        let mut jpeg = unequal_sampling_cmyk_jpeg();
+        // The frame header at 71: marker, length, precision, height, width.
+        jpeg[75] = 9;
+        jpeg[76..80].copy_from_slice(&[0x04, 0x00, 0x04, 0x00]);
+        assert_eq!(
+            frame_header(&jpeg),
+            Some(FrameHeader {
+                width: 1024,
+                height: 1024,
+                components: 4
+            }),
+            "the frame header alone still reads the frame"
+        );
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
+        assert!(decoded.is_none(), "the library cannot read a 9-bit header");
+        assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
+    }
+
+    /// A header the library read but warned about is not the sampling
+    /// refusal: the fixture with two stray bytes between its frame header and
+    /// the next segment ("extraneous bytes before marker") fails the header
+    /// call with its dimensions and sampling filled, and its decode would end
+    /// in the same warning. The file falls back at once with no buffer taken:
+    /// its frame is grown to 1024x1024, which the fallback would serve from
+    /// the 4 MiB class.
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_header_with_a_warning_takes_no_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the warned-header test");
+            return;
+        }
+        let mut jpeg = fixture("ycck_adobe_16x16_420.jpg");
+        assert!(
+            decode_jpeg_rgb(&jpeg).is_some(),
+            "the fixture itself decodes"
+        );
+        // SOI, APP14 and two quantization tables are 156 bytes; the frame
+        // header follows (marker, length, precision, height, width) and ends
+        // at 178, where the first Huffman table begins.
+        assert_eq!(
+            jpeg[178..180],
+            [0xFF, 0xC4],
+            "the fixture's first Huffman table"
+        );
+        jpeg[161..165].copy_from_slice(&[0x04, 0x00, 0x04, 0x00]);
+        jpeg.splice(178..178, [0x00, 0x00]);
+        assert_eq!(
+            frame_header(&jpeg).map(|frame| (frame.width, frame.height)),
+            Some((1024, 1024)),
+            "the frame header reads the grown frame"
+        );
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
+        assert!(decoded.is_none(), "a warned header falls back");
+        assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
     }
 
     /// The policy reads its two values in any case and spacing, names an
