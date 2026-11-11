@@ -14,10 +14,13 @@ use super::{
         chunk, collect_events, complete_with_prompt, processor, scripted_stream, CharacterTokenizer,
     },
 };
-use crate::routers::grpc::{
-    common::response_collection::collect_responses,
-    context::ExecutionResult,
-    proto_wrapper::{PrefillCachedTokens, ProtoGenerateComplete},
+use crate::routers::{
+    common::attempt_ledger::AttemptLedger,
+    grpc::{
+        common::response_collection::collect_responses,
+        context::ExecutionResult,
+        proto_wrapper::{PrefillCachedTokens, ProtoGenerateComplete},
+    },
 };
 
 /// The prompt's length; the decode side reports all but its last token as
@@ -186,6 +189,7 @@ async fn a_unary_pd_answer_reports_the_prefill_sides_cache_hit() {
         prefill,
         decode: Box::new(decode),
         prefill_guards: vec![None],
+        ledger: AttemptLedger::default(),
         pd_timing: pd_timing(),
         prefill_input_logprobs: None,
     };
