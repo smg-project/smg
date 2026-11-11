@@ -1600,7 +1600,9 @@ fn the_sentencepiece_seed_holds_every_short_vocabulary_entry_with_the_models_ids
             seeded += 1;
         }
         assert_eq!(native.seed.len(), seeded, "{}", shape.name);
-        assert!(seeded > 0, "{}: {seeded}", shape.name);
+        // Every synthetic entry is space-free and at most 15 raw bytes, so
+        // the key takes them all: the seeded count is the vocabulary's.
+        assert_eq!(seeded, tokenizer.get_vocab_size(false), "{}", shape.name);
     }
 }
 
