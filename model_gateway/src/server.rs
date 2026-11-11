@@ -303,7 +303,7 @@ async fn v1_rerank(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<V1RerankReqInput>,
+    ValidatedJson(body): ValidatedJson<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
     let model = rerank_body.model.clone();
@@ -390,7 +390,7 @@ async fn v1_embeddings(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<EmbeddingRequest>,
+    ValidatedJson(body): ValidatedJson<EmbeddingRequest>,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -538,7 +538,7 @@ async fn v1_classify(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<ClassifyRequest>,
+    ValidatedJson(body): ValidatedJson<ClassifyRequest>,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -1065,14 +1065,14 @@ async fn replace_worker(
 
 async fn v1_tokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<TokenizeRequest>,
+    ValidatedJson(request): ValidatedJson<TokenizeRequest>,
 ) -> Response {
     tokenize::tokenize(&state.context, request).await
 }
 
 async fn v1_detokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<DetokenizeRequest>,
+    ValidatedJson(request): ValidatedJson<DetokenizeRequest>,
 ) -> Response {
     tokenize::detokenize(&state.context, request).await
 }

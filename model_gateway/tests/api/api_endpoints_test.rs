@@ -2414,3 +2414,171 @@ mod single_model_tests {
         ctx.shutdown().await;
     }
 }
+
+/// Five routes whose handlers took their body through axum's plain
+/// extractor read it through the gateway's validated extractor: a body that
+/// does not parse, a wrong type and a failed rule answer the gateway's error
+/// envelope with the status and code the chat route answers, before the
+/// router sees the body.
+#[cfg(test)]
+mod validated_body_tests {
+    use super::*;
+
+    /// The status, the content type and the body of `body` posted to `path`;
+    /// a body that is not JSON is kept under `not_json`, so an assertion
+    /// names it.
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (StatusCode, String, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(CONTENT_TYPE, content_type)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"not_json": String::from_utf8_lossy(&bytes)}));
+        (status, content_type, body)
+    }
+
+    /// `body` is the gateway's envelope for a refused request: the type is
+    /// `invalid_request_error`, the code is `code`, the message a string, and
+    /// `param` names the field when the case pins one (a body that is no
+    /// object carries serde's path to the value it stopped at, or none).
+    fn assert_envelope(body: &serde_json::Value, code: &str, param: Option<&str>, context: &str) {
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "{context}: {body}"
+        );
+        assert_eq!(body["error"]["code"], code, "{context}: {body}");
+        if let Some(param) = param {
+            assert_eq!(body["error"]["param"], param, "{context}: {body}");
+        }
+        assert!(body["error"]["message"].is_string(), "{context}: {body}");
+    }
+
+    /// `/v1/rerank` runs the rules of the native route on its body before the
+    /// worker sees it: a body that passes them is served, an empty `query`
+    /// or `documents` list and a missing `query` are refused in the envelope.
+    #[tokio::test]
+    async fn v1_rerank_runs_the_rules_of_the_native_route_before_the_worker() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18121,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let served = r#"{"model":"mock-model","query":"q","documents":["a","b"]}"#;
+        let (status, _, body) = post(&app, "/v1/rerank", "application/json", served).await;
+        assert_eq!(status, StatusCode::OK, "a valid body is served: {body}");
+
+        for (refused, code, param) in [
+            (
+                r#"{"model":"mock-model","query":"","documents":["a"]}"#,
+                "invalid_value",
+                "query",
+            ),
+            (
+                r#"{"model":"mock-model","query":"q","documents":[]}"#,
+                "invalid_value",
+                "documents",
+            ),
+            (
+                r#"{"model":"mock-model","documents":["a"]}"#,
+                "missing_required_parameter",
+                "query",
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/rerank", "application/json", refused).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{refused}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), refused);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/embeddings` answers a body of the wrong shape, a body under
+    /// another content type and a body that does not parse in the envelope,
+    /// as the chat route does, not with axum's text/plain 422, 415 and 400.
+    #[tokio::test]
+    async fn v1_embeddings_answers_a_malformed_body_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (content_type, sent, code) in [
+            ("application/json", "[1,2,3]", "invalid_type"),
+            (
+                "text/plain",
+                r#"{"model":"mock-model","input":"hello"}"#,
+                "json_parse_error",
+            ),
+            (
+                "application/json",
+                r#"{"model":"mock-model","input":"#,
+                "invalid_json",
+            ),
+        ] {
+            let (status, answered_type, body) =
+                post(&app, "/v1/embeddings", content_type, sent).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{sent}: {body}");
+            assert!(
+                answered_type.starts_with("application/json"),
+                "{sent}: {answered_type}"
+            );
+            assert_envelope(&body, code, None, sent);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/classify` names the field a body misses or mistypes in the
+    /// envelope's `param`, as the chat route does.
+    #[tokio::test]
+    async fn v1_classify_names_the_refused_field_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (sent, code, param) in [
+            (
+                r#"{"model":"mock-model"}"#,
+                "missing_required_parameter",
+                "input",
+            ),
+            (r#"{"model":7,"input":"hello"}"#, "invalid_type", "model"),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/classify", "application/json", sent).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{sent}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{sent}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), sent);
+        }
+
+        ctx.shutdown().await;
+    }
+}
