@@ -806,11 +806,7 @@ impl AppContextBuilder {
                 config.routing_key_override.clone(),
             )
             .with_pd_pairing_mode(config.pd_pairing_mode)
-            .with_policy_engine(
-                config.policy_engine,
-                config.mode.get_prefill_policy(&config.policy),
-                config.mode.get_decode_policy(&config.policy),
-            ),
+            .with_policy_engine_for(config.policy_engine, &config.mode, &config.policy),
         ));
         self
     }
@@ -1580,10 +1576,10 @@ pub(crate) mod testing {
                     router_config.policy.clone(),
                     router_config.routing_key_override.clone(),
                 )
-                .with_policy_engine(
+                .with_policy_engine_for(
                     router_config.policy_engine,
-                    router_config.mode.get_prefill_policy(&router_config.policy),
-                    router_config.mode.get_decode_policy(&router_config.policy),
+                    &router_config.mode,
+                    &router_config.policy,
                 ),
             ),
             reasoning_parser_factory: None,

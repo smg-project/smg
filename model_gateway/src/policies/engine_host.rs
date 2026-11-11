@@ -11,8 +11,10 @@
 //! The rows carry what the built-in stages read; a field no stage reads yet
 //! (wire modes, zones, labels, the index's overlap) stays at its default
 //! until the step that feeds it. The regular placement sites decide through
-//! the host (`routers::common::placement::select_from`); the pair, encode and
-//! admission paths follow in later steps. A removed worker's rows leave the
+//! the host (`routers::common::placement::select_from`) and the encode items
+//! of an encode-prefill-decode request through [`Decider::decide_encode_items`]
+//! (the gRPC worker-selection stage); the pair and admission paths follow in
+//! later steps. A removed worker's rows leave the
 //! engine's accounting with it ([`Decider::on_worker_removed`], from the
 //! policy registry's removal path), and its session pins go with them: a key
 //! whose owner was removed keeps its failover as the owner, a key with no pin
@@ -47,13 +49,14 @@ use parking_lot::{Mutex, RwLock};
 use smg_policy_controller::{
     fingerprint,
     spec::{
-        BindingSpec, LeastLoadParams, ProfileSpec, ScoreSpec, ScoreStage, MANUAL_SESSION_HEADER,
+        BindingSpec, LeastLoadParams, PlanName, ProfileSpec, ScoreSpec, ScoreStage,
+        MANUAL_SESSION_HEADER,
     },
     store::identity,
     Assignment, Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId,
-    LeaseKind, Lifecycle, LoadRow, Membership, Needs, PairPools, Phase, PolicySpec, PoolFacts,
-    Recovery, RequestFacts, Role, Scratch, SessionVerdict, SessionsSpec, Side, SignalSource,
-    SpecError, Target, WorkerId,
+    LeaseKind, Lifecycle, LoadRow, MediaCounts, Membership, Needs, PairPools, Phase, PolicySpec,
+    PoolFacts, Recovery, RequestFacts, Role, Scratch, SessionVerdict, SessionsSpec, Side,
+    SignalSource, SpecError, Target, WorkerId,
 };
 use tracing::debug;
 
@@ -102,6 +105,21 @@ pub fn preset_name(config: &PolicyConfig) -> Option<&'static str> {
         PolicyConfig::PowerOfTwo { .. } => "power_of_two",
         PolicyConfig::LeastLoad { .. } => "least_load",
         PolicyConfig::Manual { .. } => "manual",
+        _ => return None,
+    })
+}
+
+/// The engine preset an encode policy configuration is served as: the three
+/// policies the encode side takes, each carried in this build; `None` for
+/// anything else. The default side keeps [`preset_name`]: the consistent
+/// hashing preset serves encode items, whose keys are content hashes, and
+/// not yet the regular path, whose keyed form (the positional target header,
+/// the implicit client keys) moves behind the view in a later step.
+pub fn encode_preset_name(config: &PolicyConfig) -> Option<&'static str> {
+    Some(match config {
+        PolicyConfig::Random => "random",
+        PolicyConfig::RoundRobin => "round_robin",
+        PolicyConfig::ConsistentHashing => "consistent_hashing",
         _ => return None,
     })
 }
@@ -311,6 +329,18 @@ pub fn worker_id(worker: &dyn Worker) -> WorkerId {
     identity(worker.url(), incarnation(worker))
 }
 
+/// The id of a worker handle and the worker's stable key for placement
+/// ([`Candidate::key`]): the id under the store's identity rule, the key
+/// one fingerprint of the registration key taken as it is, so a ring
+/// positions the worker alike across its handles and across gateway
+/// replicas while the lifecycle still prunes by handle.
+pub fn worker_identity(worker: &dyn Worker) -> (WorkerId, u32) {
+    (
+        worker_id(worker),
+        fingerprint(worker.url().as_bytes()) as u32,
+    )
+}
+
 /// Whether stages with `needs` read the request body: its text, or the
 /// prefix hashes of either kind the host computes from it. The token hashes
 /// alone are computed from a request's token ids when it carries them.
@@ -354,6 +384,23 @@ pub struct HostRequest<'a> {
     pub has_capacity: Option<CapacityCheck<'a>>,
 }
 
+/// What the encode items of one request share, as the host holds it: the
+/// two predicates the rows' bits are read from, and the request's images.
+#[derive(Clone, Copy)]
+pub struct EncodeRequest<'a> {
+    pub model: &'a str,
+    /// The encoder pairs with the chosen prefill side (its runtime and,
+    /// under a push handoff, its EC roles and connector): the row's
+    /// `ec_compatible` bit, the `epd` plan's first filter.
+    pub pairs_with_prefill: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    /// The encoder has a vision encoder: the row's `vision` bit, the plan's
+    /// second filter when the request carries images.
+    pub vision_capable: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    /// The request's image items, as the view's media count; zero lifts
+    /// the plan's vision rule.
+    pub images: u16,
+}
+
 /// The engine in the gateway process with the host's feeds.
 pub struct Decider {
     engine: Engine,
@@ -383,6 +430,9 @@ pub struct Decider {
     /// per-key counts are map reads per row, so a row carries them only when
     /// a stage reads them.
     needs: Needs,
+    /// The engine binds an encode profile: the `epd` plan decides the encode
+    /// items of an encode-prefill-decode request.
+    encode: bool,
 }
 
 impl std::fmt::Debug for Decider {
@@ -417,11 +467,33 @@ impl Decider {
         decode: &PolicyConfig,
         sticky: &RoutingKeyOverrideConfig,
     ) -> Result<Self, EngineHostError> {
+        Self::from_configs_with_encode(default, prefill, decode, None, sticky)
+    }
+
+    /// [`Decider::from_configs`] with the encode side of an
+    /// encode-prefill-decode deployment: the three sides under the `epd`
+    /// plan, the encode profile over the encode pool with the plan's
+    /// compatibility and vision rules in front of it. An encode policy the
+    /// encode side does not carry ([`encode_preset_name`]) is refused by
+    /// name.
+    pub fn from_configs_with_encode(
+        default: &PolicyConfig,
+        prefill: &PolicyConfig,
+        decode: &PolicyConfig,
+        encode: Option<&PolicyConfig>,
+        sticky: &RoutingKeyOverrideConfig,
+    ) -> Result<Self, EngineHostError> {
         let (prefill_name, decode_name) = (
             preset_name(prefill).ok_or_else(|| unsupported(prefill))?,
             preset_name(decode).ok_or_else(|| unsupported(decode))?,
         );
-        let mut spec = PolicySpec::pair_presets(prefill_name, decode_name)?;
+        let mut spec = match encode {
+            Some(encode) => {
+                let encode_name = encode_preset_name(encode).ok_or_else(|| unsupported(encode))?;
+                PolicySpec::epd_presets(encode_name, prefill_name, decode_name)?
+            }
+            None => PolicySpec::pair_presets(prefill_name, decode_name)?,
+        };
         if let Some(profile) = spec.profiles.get_mut("prefill") {
             tune(profile, prefill);
         }
@@ -430,10 +502,16 @@ impl Decider {
         }
         spec.profiles
             .insert("default".to_string(), profile_of(default)?);
-        // The pair binding covers the two pair phases; every other phase
-        // resolves to the default profile.
+        // The plan's binding covers its phases (the pair's two, the encode
+        // phase too under `epd`); every other phase resolves to the default
+        // profile.
+        let phases = if encode.is_some() {
+            vec![Phase::Encode, Phase::Prefill, Phase::Decode]
+        } else {
+            vec![Phase::Prefill, Phase::Decode]
+        };
         for binding in &mut spec.bindings {
-            binding.matcher.phase = vec![Phase::Prefill, Phase::Decode];
+            binding.matcher.phase.clone_from(&phases);
         }
         let sessions = sessions_of(default, sticky);
         if let Some(rule) = &sessions {
@@ -469,11 +547,18 @@ impl Decider {
             origin: Instant::now(),
             seq: AtomicU64::new(1),
             mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
+            encode: spec.bindings.iter().any(|b| b.plan == Some(PlanName::Epd)),
         })
     }
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Whether the engine binds an encode profile, so the encode items of an
+    /// encode-prefill-decode request are its decisions.
+    pub fn serves_encode(&self) -> bool {
+        self.encode
     }
 
     /// A worker removed from the pool takes its rows in the engine's
@@ -580,9 +665,11 @@ impl Decider {
                 )
             },
         );
+        let (id, key) = worker_identity(worker.as_ref());
         Candidate {
             position,
-            id: worker_id(worker.as_ref()),
+            id,
+            key,
             role,
             dp_rank: worker
                 .dp_rank()
@@ -711,6 +798,81 @@ impl Decider {
                 decision,
                 self.lease(id, now, request.prompt_tokens, session_key),
             )
+        })
+    }
+
+    /// Decide the encode items of one request: one view of `encoders`, with
+    /// each row's compatibility and vision bits read through the request's
+    /// predicates, and one decision per key under the `epd` plan's encode
+    /// profile. A key is an item's content hash and travels as the
+    /// decision's session key, so under the consistent-hash preset an item
+    /// lands on its key's ring owner and equal items share an encoder;
+    /// `excluded` are the ids a commit of an item just refused, for the one
+    /// re-decision of that item. The decisions come back in the keys' order
+    /// with their leases.
+    pub fn decide_encode_items(
+        &self,
+        request: &EncodeRequest<'_>,
+        encoders: &[Arc<dyn Worker>],
+        keys: &[u64],
+        excluded: &[WorkerId],
+    ) -> Vec<(Decision, Lease)> {
+        let now = Instant::now();
+        // Numbered before the view is built, one id per item: a retirement
+        // that lands during the decisions outdates every lease of this
+        // request (see `Retired`).
+        let first = self.seq.fetch_add(keys.len() as u64, Ordering::Relaxed);
+        let snapshot = self.snapshot();
+        let build = ViewBuild {
+            snapshot: snapshot.as_deref(),
+            now,
+            session_key: None,
+        };
+        VIEW.with(|view| {
+            let mut view = view.borrow_mut();
+            let View {
+                candidates,
+                scratch,
+                ..
+            } = &mut *view;
+            candidates.clear();
+            for (position, worker) in encoders.iter().enumerate() {
+                let mut row = self.candidate(&build, position as u32, worker, true, 0);
+                row.ec_compatible = (request.pairs_with_prefill)(worker);
+                row.vision = (request.vision_capable)(worker);
+                candidates.push(row);
+            }
+            let now_micros = self.micros_since_origin(now);
+            let pool = PoolFacts {
+                pool_size: encoders.len() as u32,
+                generation: self.engine.generation(),
+                ..PoolFacts::default()
+            };
+            let cx = Constraints {
+                excluded,
+                ..Constraints::default()
+            };
+            keys.iter()
+                .enumerate()
+                .map(|(item, &key)| {
+                    let session_key = Identity::hashed(key);
+                    let facts = RequestFacts {
+                        model: request.model,
+                        session_key,
+                        phase: Phase::Encode,
+                        media: MediaCounts {
+                            images: request.images,
+                            ..MediaCounts::default()
+                        },
+                        seed: self.seed(now_micros) ^ key,
+                        now_micros,
+                        ..RequestFacts::default()
+                    };
+                    let decision = self.engine.decide(&facts, &pool, candidates, &cx, scratch);
+                    let id = LeaseId(first + item as u64);
+                    (decision, self.lease(id, now, 0, session_key))
+                })
+                .collect()
         })
     }
 
@@ -2741,6 +2903,202 @@ mod tests {
                 RoutingKeyOverrideConfig::default()
             )),
             1
+        );
+    }
+
+    /// The first target's position of every decision.
+    fn positions(decided: &[(Decision, Lease)]) -> Vec<u32> {
+        decided
+            .iter()
+            .map(|(decision, _)| {
+                decision
+                    .pick()
+                    .expect("a pick")
+                    .targets
+                    .first()
+                    .expect("a target")
+                    .position
+            })
+            .collect()
+    }
+
+    /// The encode items of one request are decided over one view of the
+    /// encoders, each by its content hash: equal hashes land on one encoder
+    /// and the same keys decide the same way later. The row bits come from
+    /// the request's predicates: when one encoder pairs with the prefill
+    /// side every item lands on it, whatever its key's owner; when one
+    /// encoder has a vision encoder every image item lands on it; an image
+    /// item over encoders without one is shed by the plan's rule, a text
+    /// item takes any encoder.
+    #[test]
+    fn encode_items_are_decided_by_their_keys_over_the_encoders_that_pair_with_the_prefill() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let decider = Decider::from_configs_with_encode(
+            &round_robin,
+            &round_robin,
+            &round_robin,
+            Some(&PolicyConfig::ConsistentHashing),
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("the encode side is carried");
+        assert!(decider.serves_encode());
+        assert!(!self::decider(&round_robin).serves_encode());
+        let encoders: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| worker_of(&format!("http://e{i}:8000"), WorkerType::Encode))
+            .collect();
+        let every = |_: &Arc<dyn Worker>| true;
+        let request = EncodeRequest {
+            model: "m",
+            pairs_with_prefill: &every,
+            vision_capable: &every,
+            images: 1,
+        };
+        // Eight keys: by the ring they spread over the four encoders.
+        let keys: Vec<u64> = (0..8u64)
+            .map(|i| fingerprint(format!("image-{}", i % 7).as_bytes()))
+            .collect();
+        let decided = decider.decide_encode_items(&request, &encoders, &keys, &[]);
+        assert_eq!(decided.len(), 8);
+        let targets: Vec<Target> = decided
+            .iter()
+            .map(|(decision, lease)| {
+                decider
+                    .commit(lease, decision, Side::Encode, |_| true)
+                    .expect("an encoder")
+            })
+            .collect();
+        assert_eq!(
+            targets[0].position, targets[7].position,
+            "equal hashes share an encoder"
+        );
+        let owners: std::collections::BTreeSet<u32> = targets.iter().map(|t| t.position).collect();
+        assert!(
+            owners.len() > 1,
+            "the keys spread over the encoders: {owners:?}"
+        );
+        assert_eq!(decider.decisions(), 8, "one decision per item");
+        let before: Vec<u32> = targets.iter().map(|t| t.position).collect();
+        let again = decider.decide_encode_items(&request, &encoders, &keys, &[]);
+        assert_eq!(positions(&again), before, "the same keys land the same way");
+
+        // One encoder pairs with the prefill side: every item lands on it,
+        // whatever its key's owner (the bit's hand-off from the predicate).
+        let only_two = encoders[2].url().to_string();
+        let pairs_two = |worker: &Arc<dyn Worker>| worker.url() == only_two;
+        let paired = EncodeRequest {
+            pairs_with_prefill: &pairs_two,
+            ..request
+        };
+        let decided = decider.decide_encode_items(&paired, &encoders, &keys, &[]);
+        assert_eq!(
+            positions(&decided),
+            vec![2; 8],
+            "only the paired encoder is taken"
+        );
+
+        // One encoder has a vision encoder: every image item lands on it.
+        let only_one = encoders[1].url().to_string();
+        let sees_one = |worker: &Arc<dyn Worker>| worker.url() == only_one;
+        let sighted = EncodeRequest {
+            vision_capable: &sees_one,
+            ..request
+        };
+        let decided = decider.decide_encode_items(&sighted, &encoders, &keys, &[]);
+        assert_eq!(
+            positions(&decided),
+            vec![1; 8],
+            "only the sighted encoder takes images"
+        );
+
+        let blind = |_: &Arc<dyn Worker>| false;
+        let no_vision = EncodeRequest {
+            vision_capable: &blind,
+            ..request
+        };
+        let shed = decider.decide_encode_items(&no_vision, &encoders, &keys[..1], &[]);
+        match &shed[0].0 {
+            Decision::Shed(shed) => assert_eq!(shed.emptied_by, "vision"),
+            other => panic!("an image over encoders without a vision encoder answered {other:?}"),
+        }
+        let text = EncodeRequest {
+            images: 0,
+            ..no_vision
+        };
+        let decided = decider.decide_encode_items(&text, &encoders, &keys[..1], &[]);
+        assert!(
+            decided[0].0.pick().is_some(),
+            "a text item takes any encoder: {:?}",
+            decided[0].0
+        );
+    }
+
+    /// A commit that refused a decision's targets re-decides with them
+    /// excluded: the excluded owner's key lands on another encoder, and the
+    /// excluded id is never among the new targets.
+    #[test]
+    fn an_excluded_encoder_passes_its_key_to_the_ring_s_next_member() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let decider = Decider::from_configs_with_encode(
+            &round_robin,
+            &round_robin,
+            &round_robin,
+            Some(&PolicyConfig::ConsistentHashing),
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("the encode side is carried");
+        let encoders: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| worker_of(&format!("http://e{i}:8000"), WorkerType::Encode))
+            .collect();
+        let pairs = |_: &Arc<dyn Worker>| true;
+        let request = EncodeRequest {
+            model: "m",
+            pairs_with_prefill: &pairs,
+            vision_capable: &pairs,
+            images: 0,
+        };
+        let keys = [fingerprint(b"image-c")];
+        let first = decider.decide_encode_items(&request, &encoders, &keys, &[]);
+        let owner = *first[0]
+            .0
+            .pick()
+            .expect("a pick")
+            .targets
+            .as_slice()
+            .first()
+            .expect("a target");
+        let again = decider.decide_encode_items(&request, &encoders, &keys, &[owner.id]);
+        let pick = again[0].0.pick().expect("a pick");
+        let next = pick.targets.as_slice().first().expect("a target");
+        assert_ne!(next.position, owner.position);
+        assert!(pick.targets.as_slice().iter().all(|t| t.id != owner.id));
+    }
+
+    #[test]
+    fn an_encode_policy_the_engine_does_not_carry_is_refused_by_name() {
+        let carried = PolicyConfig::RoundRobin;
+        let uncarried = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let Err(error) = Decider::from_configs_with_encode(
+            &carried,
+            &carried,
+            &carried,
+            Some(&uncarried),
+            &RoutingKeyOverrideConfig::default(),
+        ) else {
+            panic!("an encode policy outside the encode side's three is refused");
+        };
+        assert!(error.to_string().contains("least_load"), "{error}");
+        assert_eq!(
+            encode_preset_name(&PolicyConfig::ConsistentHashing),
+            Some("consistent_hashing")
+        );
+        assert_eq!(encode_preset_name(&PolicyConfig::Random), Some("random"));
+        assert!(
+            preset_name(&PolicyConfig::ConsistentHashing).is_none(),
+            "the regular path's keyed form waits for a later step"
         );
     }
 }
