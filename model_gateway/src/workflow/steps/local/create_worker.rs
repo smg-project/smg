@@ -26,7 +26,7 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
-        basic::{merge_labels, RuntimeType, WINDOW_LABELS},
+        basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
         circuit_breaker::CircuitBreakerConfig,
         endpoint::Endpoint,
         overload::OverloadThresholds,
@@ -736,17 +736,11 @@ fn card_from_labels(
 
     // Fill context_length from whichever backend key is available
     if card.context_length.is_none() {
-        card.context_length = [
-            "context_length",
-            "max_context_length",
-            "max_model_len",
-            "max_total_tokens",
-            "max_seq_len",
-        ]
-        .iter()
-        .find_map(|k| labels.get(*k))
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&n| n > 0);
+        card.context_length = CONTEXT_WINDOW_LABELS
+            .iter()
+            .find_map(|k| labels.get(*k))
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n > 0);
     }
 
     // Fill tokenizer_path
@@ -2621,6 +2615,20 @@ mod rank_window_tests {
             Some("2048")
         );
         assert_eq!(merged.get("max_num_seqs").map(String::as_str), Some("256"));
+
+        // The context window is a family of its own under the same rule: a
+        // limit set by hand drops the engine's figure under the names the
+        // reader prefers to it, and leaves the running window alone.
+        let by_hand = labels_of(&[("max_model_len", "2048")]);
+        let engine = labels_of(&[
+            ("max_context_length", "131072"),
+            ("context_length", "131072"),
+            ("max_num_seqs", "256"),
+        ]);
+        assert_eq!(
+            merge_labels(&engine, &by_hand),
+            labels_of(&[("max_model_len", "2048"), ("max_num_seqs", "256")])
+        );
     }
 
     /// An engine that splits its running window across its attention-DP
