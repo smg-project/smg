@@ -38,24 +38,11 @@ use crate::routers::grpc::common::responses::{
     },
 };
 
-/// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
-///
-/// # Conversion Logic
-/// - `input` (text/items) → `messages` (chat messages)
-/// - `instructions` → system message (prepended)
-/// - `max_output_tokens` → `max_completion_tokens`
-/// - `stop` → `stop` (the engine's stop list and the gateway's own trim of a
-///   matched sequence both read it from the chat request)
-/// - `tools` → function tools extracted from ResponseTools
-/// - `tool_choice` → passed through from request
-/// - the sampling knobs (`temperature`, `top_p`, `frequency_penalty`, `presence_penalty`,
-///   `top_k`, `min_p`, `repetition_penalty`) → their chat twins; the three the Responses
-///   request keeps as plain values cross only when set
-/// - Response-specific fields (previous_response_id, conversation) are handled by router
 /// Why a Responses request does not convert to a chat request, and the code
 /// its refusal is answered under: a content part the chat pipeline has no
-/// form for is the chat route's own `unsupported_content_part`; every other
-/// refusal keeps `convert_request_failed`.
+/// form for, in a message or in a function output, is the chat route's own
+/// `unsupported_content_part`; every other refusal keeps
+/// `convert_request_failed`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ConversionError {
     /// An input item kind this path does not carry.
@@ -94,6 +81,20 @@ impl ConversionError {
     }
 }
 
+/// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
+///
+/// # Conversion Logic
+/// - `input` (text/items) → `messages` (chat messages)
+/// - `instructions` → system message (prepended)
+/// - `max_output_tokens` → `max_completion_tokens`
+/// - `stop` → `stop` (the engine's stop list and the gateway's own trim of a
+///   matched sequence both read it from the chat request)
+/// - `tools` → function tools extracted from ResponseTools
+/// - `tool_choice` → passed through from request
+/// - the sampling knobs (`temperature`, `top_p`, `frequency_penalty`, `presence_penalty`,
+///   `top_k`, `min_p`, `repetition_penalty`) → their chat twins; the three the Responses
+///   request keeps as plain values cross only when set
+/// - Response-specific fields (previous_response_id, conversation) are handled by router
 pub(crate) fn responses_to_chat(
     req: &ResponsesRequest,
 ) -> Result<ChatCompletionRequest, ConversionError> {
@@ -1773,6 +1774,12 @@ mod tests {
             "convert_request_failed"
         );
         assert_eq!(ConversionError::NoMessages.code(), "convert_request_failed");
+        // A function output with a part the text-only chat path cannot carry
+        // is a content-part refusal too (it used to answer convert_request_failed).
+        assert_eq!(
+            ConversionError::UnsupportedToolOutput("image".to_string()).code(),
+            "unsupported_content_part"
+        );
     }
     #[test]
     fn namespace_chat_response_roundtrips_identity() {

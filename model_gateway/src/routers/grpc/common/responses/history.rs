@@ -16,7 +16,7 @@ use axum::response::Response;
 use openai_protocol::responses::{
     from_turn_boundary, generate_id, normalize_input_item, without_outputs_of_missing_calls,
     McpToolCallError, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-    ResponsesRequest,
+    ResponsesRequest, StringOrContentParts,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -66,6 +66,7 @@ pub(crate) async fn load_history(
     stores: HistoryStores<'_>,
     request: &ResponsesRequest,
     tenant: Option<&str>,
+    into: ReplayInto,
 ) -> Result<ResponsesRequest, Response> {
     let mut history: Vec<ResponseInputOutputItem> = Vec::new();
     let mut continues = false;
@@ -75,7 +76,7 @@ pub(crate) async fn load_history(
         history.extend(
             chain
                 .iter()
-                .flat_map(|stored| stored_response_items(stored)),
+                .flat_map(|stored| stored_response_items(stored, into)),
         );
         continues = true;
     }
@@ -84,7 +85,7 @@ pub(crate) async fn load_history(
     let chain_items = history.len();
 
     if let Some(conversation) = &request.conversation {
-        history.extend(conversation_items(stores, conversation.as_id(), tenant).await?);
+        history.extend(conversation_items(stores, conversation.as_id(), tenant, into).await?);
         continues = true;
     }
 
@@ -165,7 +166,10 @@ pub(crate) fn current_input_items(input: &ResponseInput) -> Vec<ResponseInputOut
 
 /// The items a stored response replays as: its input items, then its output
 /// items, each as it was stored.
-fn stored_response_items(stored: &StoredResponse) -> Vec<ResponseInputOutputItem> {
+fn stored_response_items(
+    stored: &StoredResponse,
+    into: ReplayInto,
+) -> Vec<ResponseInputOutputItem> {
     let output = stored.raw_response.get("output").and_then(Value::as_array);
     stored
         .input
@@ -175,6 +179,7 @@ fn stored_response_items(stored: &StoredResponse) -> Vec<ResponseInputOutputItem
         .chain(output.into_iter().flatten())
         .filter_map(stored_item_as_input)
         .filter(replays)
+        .map(|item| replayed_parts(item, into))
         .collect()
 }
 
@@ -190,6 +195,69 @@ fn replays(item: &ResponseInputOutputItem) -> bool {
         }
         None => true,
     }
+}
+
+/// The pipeline a loaded history is replayed into. A stored message replays
+/// the content parts that pipeline carried when the turn was answered: the
+/// chat conversion never carried an `input_file` or an `input_image` without
+/// an `image_url` (a `file_id` is not resolvable here), the Harmony builder
+/// no `input_image` at all. Such parts are left out when the history loads,
+/// as an unreplayed item is ([`unreplayed_kind`]): the turn was answered
+/// without them, and a continuation refused on them until the client edits a
+/// chain it cannot edit is a conversation the client cannot carry on. A
+/// request's own input is not filtered and keeps its refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayInto {
+    /// The chat conversion (`responses_to_chat`).
+    Chat,
+    /// The Harmony builder.
+    Harmony,
+}
+
+impl ReplayInto {
+    /// Whether the pipeline carried `part` when a stored turn was answered.
+    fn carried(self, part: &ResponseContentPart) -> bool {
+        match part {
+            ResponseContentPart::InputFile { .. } => false,
+            ResponseContentPart::InputImage { image_url, .. } => match self {
+                Self::Chat => image_url.is_some(),
+                Self::Harmony => false,
+            },
+            ResponseContentPart::OutputText { .. }
+            | ResponseContentPart::InputText { .. }
+            | ResponseContentPart::Refusal { .. } => true,
+        }
+    }
+}
+
+/// `item` with the content parts `into` never carried left out (see
+/// [`ReplayInto`]); an item that is not a message is returned as it is.
+fn replayed_parts(mut item: ResponseInputOutputItem, into: ReplayInto) -> ResponseInputOutputItem {
+    fn keep_carried(parts: &mut Vec<ResponseContentPart>, into: ReplayInto) {
+        parts.retain(|part| {
+            let carried = into.carried(part);
+            if !carried {
+                let part_type = match part {
+                    ResponseContentPart::InputFile { .. } => "input_file",
+                    _ => "input_image",
+                };
+                debug!(
+                    part_type,
+                    "Stored message part the pipeline never carried; left out of the replay"
+                );
+            }
+            carried
+        });
+    }
+    match &mut item {
+        ResponseInputOutputItem::Message { content, .. } => keep_carried(content, into),
+        ResponseInputOutputItem::SimpleInputMessage {
+            content: StringOrContentParts::Array(parts),
+            ..
+        } => keep_carried(parts, into),
+        _ => {}
+    }
+    item
 }
 
 /// The name of a stored item's kind when neither conversion takes it as
@@ -328,6 +396,7 @@ async fn conversation_items(
     stores: HistoryStores<'_>,
     conversation_id: &str,
     tenant: Option<&str>,
+    into: ReplayInto,
 ) -> Result<Vec<ResponseInputOutputItem>, Response> {
     let conv_id = ConversationId::from(conversation_id);
     let conversation = stores
@@ -383,6 +452,7 @@ async fn conversation_items(
         .iter()
         .filter_map(conversation_item_as_input)
         .filter(replays)
+        .map(|item| replayed_parts(item, into))
         .collect();
     if !cut {
         return Ok(items);
@@ -626,6 +696,89 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// The part types of a loaded message item, for the replay assertions.
+    fn part_types(item: &ResponseInputOutputItem) -> Vec<String> {
+        let ResponseInputOutputItem::Message { content, .. } = item else {
+            panic!("a message item: {item:?}");
+        };
+        content
+            .iter()
+            .map(|part| {
+                serde_json::to_value(part).expect("a part serializes")["type"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A stored turn whose message carried a part the pipeline never took
+    /// (an `input_file`; an `input_image` without a URL; on the Harmony path
+    /// any `input_image`) replays without that part, on the chain and in the
+    /// conversation alike: the turn was answered without it, and a chain
+    /// cannot be edited. The request's own input is not filtered.
+    #[tokio::test]
+    async fn a_stored_parts_the_pipeline_never_carried_is_left_out_of_the_replay() {
+        let stores = Stores::with_conversation().await;
+        let user_turn: ResponseInputOutputItem = serde_json::from_value(json!({
+            "type": "message", "id": "msg_u1", "role": "user", "content": [
+                {"type": "input_text", "text": "Read this and look at that."},
+                {"type": "input_file", "filename": "notes.txt", "file_data": "aGVsbG8="},
+                {"type": "input_image", "file_id": "file_1"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]
+        }))
+        .expect("a user message item");
+        let turn_1 = ResponsesRequest {
+            input: ResponseInput::Items(vec![user_turn.clone()]),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
+        };
+        stores
+            .store_turn(
+                "resp_1",
+                &turn_1,
+                json!([{"type": "message", "id": "msg_1", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Read.", "annotations": []}]}]),
+            )
+            .await;
+
+        for (into, replayed) in [
+            (ReplayInto::Chat, vec!["input_text", "input_image"]),
+            (ReplayInto::Harmony, vec!["input_text"]),
+        ] {
+            for continuation in [
+                ResponsesRequest {
+                    input: ResponseInput::Items(vec![user_turn.clone()]),
+                    previous_response_id: Some("resp_1".to_string()),
+                    ..Default::default()
+                },
+                ResponsesRequest {
+                    input: ResponseInput::Items(vec![user_turn.clone()]),
+                    conversation: Some(ConversationRef::Id("conv_1".to_string())),
+                    ..Default::default()
+                },
+            ] {
+                let loaded = load_history(stores.history(), &continuation, None, into)
+                    .await
+                    .expect("the history loads");
+                let ResponseInput::Items(items) = &loaded.input else {
+                    panic!("the loaded input is an item list");
+                };
+                assert_eq!(
+                    shape(items),
+                    ["message:user", "message:assistant", "message:user"]
+                );
+                assert_eq!(part_types(&items[0]), replayed, "{into:?}: the stored turn");
+                assert_eq!(
+                    part_types(&items[2]),
+                    ["input_text", "input_file", "input_image", "input_image"],
+                    "{into:?}: the request's own input keeps every part"
+                );
+            }
+        }
+    }
+
     fn turn_1_in_conversation() -> ResponsesRequest {
         ResponsesRequest {
             input: ResponseInput::Text("What is 6*7?".to_string()),
@@ -646,7 +799,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        let loaded = load_history(stores.history(), &turn_2, None)
+        let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
             .await
             .expect("the conversation loads");
 
@@ -722,7 +875,7 @@ pub(crate) mod tests {
             conversation: Some(ConversationRef::Id("conv_1".to_string())),
             ..Default::default()
         };
-        let loaded = load_history(stores.history(), &turn_3, None)
+        let loaded = load_history(stores.history(), &turn_3, None, ReplayInto::Chat)
             .await
             .expect("the conversation loads past the rows it does not replay");
         let ResponseInput::Items(items) = &loaded.input else {
@@ -735,7 +888,7 @@ pub(crate) mod tests {
             previous_response_id: Some("resp_2".to_string()),
             ..Default::default()
         };
-        let loaded = load_history(stores.history(), &turn_3, None)
+        let loaded = load_history(stores.history(), &turn_3, None, ReplayInto::Chat)
             .await
             .expect("the chain loads past the items it does not replay");
         let ResponseInput::Items(items) = &loaded.input else {
@@ -800,7 +953,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        let loaded = load_history(stores.history(), &turn_2, None)
+        let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
             .await
             .expect("the chain loads");
 
@@ -862,7 +1015,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         ] {
-            let loaded = load_history(stores.history(), &turn_3, None)
+            let loaded = load_history(stores.history(), &turn_3, None, ReplayInto::Chat)
                 .await
                 .expect("the history loads");
             let ResponseInput::Items(items) = &loaded.input else {
@@ -912,7 +1065,7 @@ pub(crate) mod tests {
             conversation: Some(ConversationRef::Id("conv_1".to_string())),
             ..Default::default()
         };
-        let loaded = load_history(stores.history(), &request, None)
+        let loaded = load_history(stores.history(), &request, None, ReplayInto::Chat)
             .await
             .expect("the conversation loads");
         let ResponseInput::Items(items) = loaded.input else {

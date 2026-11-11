@@ -35,7 +35,7 @@ use crate::{
         error,
         grpc::common::responses::{
             collect_user_function_names, ensure_mcp_connection, load_history,
-            persist_response_if_needed, NotStored, ResponsesContext,
+            persist_response_if_needed, NotStored, ReplayInto, ResponsesContext,
         },
     },
 };
@@ -59,7 +59,13 @@ pub(super) async fn route_responses_internal(
     // 1. Load conversation history (as the caller's tenant may see it) and
     //    build modified request
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
-    let modified_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
+    let modified_request = load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Chat,
+    )
+    .await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(

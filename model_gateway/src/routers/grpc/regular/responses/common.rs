@@ -514,7 +514,7 @@ mod history_tests {
     use super::{super::conversions, *};
     use crate::routers::grpc::common::responses::{
         history::tests::{function_call_output, function_call_output_input, shape, Stores},
-        load_history,
+        load_history, ReplayInto,
     };
 
     /// Turn 2 answers the call a stored turn issued: the engine sees the
@@ -537,7 +537,7 @@ mod history_tests {
             conversation: Some(ConversationRef::Id("conv_1".to_string())),
             ..Default::default()
         };
-        let loaded = load_history(stores.history(), &turn_2, None)
+        let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
             .await
             .expect("the conversation loads");
 
@@ -650,7 +650,7 @@ mod history_tests {
             ..Default::default()
         };
 
-        let loaded = load_history(stores.history(), &turn_102, None)
+        let loaded = load_history(stores.history(), &turn_102, None, ReplayInto::Chat)
             .await
             .expect("the chain loads");
 
@@ -714,7 +714,7 @@ mod history_tests {
             ..Default::default()
         };
 
-        let loaded = load_history(stores.history(), &turn_2, None)
+        let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
             .await
             .expect("the chain loads");
 
@@ -792,7 +792,7 @@ mod history_tests {
             ..Default::default()
         };
 
-        let loaded = load_history(stores.history(), &turn_3, None)
+        let loaded = load_history(stores.history(), &turn_3, None, ReplayInto::Chat)
             .await
             .expect("the chain loads");
 
