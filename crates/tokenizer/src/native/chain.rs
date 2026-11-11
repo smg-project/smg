@@ -139,7 +139,12 @@ impl Part {
                 class: *class,
                 max: 1,
             }),
-            Node::ClassRepeat { class, min: 1, max } => Some(Self::Run {
+            Node::ClassRepeat {
+                class,
+                min: 1,
+                max,
+                possessive: false,
+            } => Some(Self::Run {
                 class: *class,
                 max: *max,
             }),

@@ -48,6 +48,12 @@ const DIGITS: &str = r"\p{N}{1,3}";
 const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
 const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// The clitic group as a letter class with the apostrophe outside it, and
+/// possessive runs (`?+`, `++`).
+const POSSESSIVE_CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
+/// The same clitic class with greedy runs, a digit cap and a one-space
+/// last alternative.
+const CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s";
 /// The cased template without the clitic group and with one digit at a
 /// time.
 const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -326,6 +332,42 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+        },
+        Shape {
+            name: "possessive-clitic-class",
+            nfc: true,
+            pre_tokenizers: vec![
+                split(
+                    POSSESSIVE_CLITIC_CLASS,
+                    SplitDelimiterBehavior::Isolated,
+                    false,
+                ),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &[
+                "<|startoftext|>",
+                "<|endoftext|>",
+                "[gMASK]",
+                "<|role_end|>",
+            ],
+            added: &[("<tool_call>", false), ("<think>", false)],
+        },
+        Shape {
+            name: "clitic-class",
+            nfc: false,
+            pre_tokenizers: vec![
+                split(CLITIC_CLASS, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: true,
+            special: &[
+                "<|startoftext|>",
+                "<|endoftext|>",
+                "<|im_start|>",
+                "<|im_end|>",
+            ],
+            added: &[("<think>", false), ("<|tool_call_start|>", false)],
         },
         // Added tokens with a space inside, matched after normalization
         // (the default of `add_tokens`): a cut at that space would turn
