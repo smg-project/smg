@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/nightly-pd.yml"
+READ_IMAGE = "example.invalid/moriio-read@sha256:" + "a" * 64
 DEFAULT_AMD_OPTIONS = (
     "--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host "
     "--shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN"
@@ -24,9 +25,12 @@ def plan(
     base_options="",
     event_name="workflow_dispatch",
     schedule="",
+    read_image=READ_IMAGE,
 ):
     workflow = yaml.safe_load(WORKFLOW.read_text())
-    script = workflow["jobs"]["plan"]["steps"][0]["run"]
+    script = next(
+        step["run"] for step in workflow["jobs"]["plan"]["steps"] if step.get("id") == "plan"
+    )
     output = tmp_path / "outputs"
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", script],
@@ -38,9 +42,11 @@ def plan(
             "AMD_ENABLED": enabled,
             "AMD_CONTAINER_OPTIONS": base_options,
             "AMD_RDMA_OPTIONS": options,
+            "AMD_MORIIO_READ_IMAGE": read_image,
             "TEST_FILTER": test_filter,
             "GITHUB_OUTPUT": str(output),
         },
+        cwd=WORKFLOW.parents[2],
         capture_output=True,
         text=True,
         check=False,
@@ -85,6 +91,7 @@ def test_explicit_read_uses_full_suite_and_captures_options_once(tmp_path, optio
                 "moriio_mode": "read",
                 "moriio_backend": "rdma",
                 "vendor": "amd",
+                "container_image": READ_IMAGE,
             }
         ],
     }
@@ -171,3 +178,29 @@ def test_read_addition_preserves_shared_node_schedule_split(
     assert [row.get("vendor", "nvidia") for row in values["matrix"]] == expected_vendors
     assert not any(row.get("moriio_mode") == "read" for row in values["matrix"])
     assert "amd_read_rdma_options_json" not in values
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "",
+        "vllm/vllm-openai-rocm:v0.31.0",
+        "bad image@sha256:" + "a" * 64,
+        "vllm/vllm-openai-rocm@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f",
+    ],
+)
+def test_read_requires_distinct_digest_image_before_gpu_matrix(tmp_path, image):
+    result, values = plan(
+        tmp_path,
+        engines="vllm-amd-moriio-read",
+        options="--device=/dev/infiniband",
+        read_image=image,
+    )
+    assert result.returncode != 0
+    assert "matrix" not in values
+
+
+def test_write_ignores_unset_read_image_and_keeps_old_image_path(tmp_path):
+    result, values = plan(tmp_path, engines="vllm-amd", read_image="")
+    assert result.returncode == 0
+    assert all("container_image" not in row for row in values["matrix"])

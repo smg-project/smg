@@ -14,6 +14,7 @@ BASELINE = (
     "e2e_test/infra/test_epd_cmd_builders.py",
 )
 COMPONENTS = (
+    ("scripts/ci_moriio_read_image.py", "scripts/tests/test_ci_moriio_read_image.py"),
     ("e2e_test/infra/cloud_credentials.py", "e2e_test/infra/test_cloud_credentials.py"),
     ("scripts/ci/validate_pr_benchmark.py", "scripts/ci/tests/test_validate_pr_benchmark.py"),
     ("e2e_test/router/test_pd_topologies.py", "e2e_test/infra/test_http_pd_pairing_protocol.py"),

@@ -35,6 +35,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       amd_read_rdma_options_json: ${{ steps.plan.outputs.amd_read_rdma_options_json }}
     steps:
+      - uses: actions/checkout@v7
       - id: plan
         env:
           ENGINES: ${{ inputs.engines }}
@@ -42,6 +43,7 @@ jobs:
           AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
           AMD_CONTAINER_OPTIONS: ${{ vars.SMG_AMD_CONTAINER_OPTIONS }}
           AMD_RDMA_OPTIONS: ${{ vars.SMG_AMD_RDMA_CONTAINER_OPTIONS }}
+          AMD_MORIIO_READ_IMAGE: ${{ vars.SMG_AMD_MORIIO_READ_IMAGE }}
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule }}
         run: |
@@ -62,12 +64,14 @@ jobs:
                 ;;
             esac
           fi
+          read_image=""
           for engine in $wanted; do
             if [ "$engine" = vllm-amd-moriio-read ]; then
               if [ -n "$TEST_FILTER" ]; then
                 echo "ERROR: READ/RDMA runs the complete topology suite; leave filter empty" >&2
                 exit 1
               fi
+              read_image=$(python3 scripts/ci_moriio_read_image.py image --image "$AMD_MORIIO_READ_IMAGE")
               python3 - <<'PY_OPTIONS'
           import os
           import re
@@ -102,14 +106,14 @@ jobs:
           # and over MoRI-IO in WRITE mode; automatic READ mode is left out
           # while its decode faults on its first transfer over XGMI on AMD's
           # MI300X runners (vllm-project/vllm#61144).
-          matrix=$(printf '%s\n' $wanted | jq -Rsc '
+          matrix=$(printf '%s\n' $wanted | jq --arg read_image "$read_image" -Rsc '
             split("\n") | map(select(length > 0)) |
             map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
                 elif . == "sglang" then [{engine: "sglang"},
                   {engine: "sglang", kv_backend: "nixl",
                    filter: "not sole_leg_outage and not survives_losing"}]
                 elif . == "vllm-amd-moriio-read" then [
-                  {engine: "vllm", kv_backend: "moriio", moriio_mode: "read", moriio_backend: "rdma", vendor: "amd"}]
+                  {engine: "vllm", kv_backend: "moriio", moriio_mode: "read", moriio_backend: "rdma", vendor: "amd", container_image: $read_image}]
                 elif . == "vllm-amd" then [
                   {engine: "vllm", kv_backend: "nixl", vendor: "amd"},
                   {engine: "vllm", kv_backend: "moriio", moriio_mode: "write", vendor: "amd"}]
@@ -235,9 +239,9 @@ jobs:
       # (scripts/ci_install_vllm.sh), which ships NIXL, UCX and MoRI. The
       # container gets the GPUs, the runner's model cache and its HF_TOKEN, but
       # no RDMA devices by default, so those rows move KV over XGMI. An explicit
-      # READ/RDMA dispatch adds verified RDMA extras to the same AMD base options.
+      # READ/RDMA uses the CPU-plan-captured image and adds RDMA extras to base options.
       gpu_vendor: ${{ matrix.vendor || 'nvidia' }}
-      container_image: ${{ matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f' || '' }}
+      container_image: ${{ matrix.container_image || (matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f' || '') }}
       container_options: ${{ matrix.moriio_backend == 'rdma' && fromJSON(needs.plan.outputs.amd_read_rdma_options_json) || (matrix.vendor == 'amd' && (vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') || '') }}
       vllm_moriio_mode: ${{ matrix.moriio_mode || '' }}
       vllm_moriio_backend: ${{ matrix.moriio_backend || (matrix.kv_backend == 'moriio' && 'xgmi' || '') }}
