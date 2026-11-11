@@ -1138,7 +1138,7 @@ impl Router {
         // The encode side takes the three policies the CLI's `--encode-policy`
         // takes; the shared validator holds the one list and reads the encode
         // policy in EPD mode. It is asked here before anything binds, for an
-        // encode policy given outside EPD as well. Converted once: the EPD arm
+        // encode policy given outside EPD as well. Converted once: the EPD branch
         // below takes this value.
         let encode_policy = self
             .encode_policy

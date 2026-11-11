@@ -1579,7 +1579,7 @@ pub(crate) fn retire_pd_side(
         match result {
             Ok(stream) => {
                 debug!(
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     "Aborting the room of an abandoned PD side"
@@ -1594,7 +1594,7 @@ pub(crate) fn retire_pd_side(
                 UpstreamClass::account_dispatch_failure(side.name(), connection, &error);
                 error!(
                     function = "retire_pd_side",
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     error = %error,
@@ -1603,7 +1603,7 @@ pub(crate) fn retire_pd_side(
             }
             Err(error) => {
                 debug!(
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     error = %error,
