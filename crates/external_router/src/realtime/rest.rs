@@ -140,7 +140,7 @@ pub async fn forward_realtime_rest(
 /// (the body bounded, the provider's account identifiers removed, its words
 /// in the log at warn).
 pub async fn proxy_response(resp: reqwest::Response, model: &str) -> Response {
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = resp.status();
     if !status.is_success() {
         return upstream_body::answer_error(resp, model).await;
     }

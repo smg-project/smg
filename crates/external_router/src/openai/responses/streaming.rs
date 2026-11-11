@@ -641,8 +641,6 @@ pub(super) async fn handle_simple_streaming_passthrough(
     };
 
     let status = response.status();
-    let status_code =
-        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     worker.record_outcome(status.as_u16());
 
@@ -652,7 +650,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
             .await
             .unwrap_or_else(|err| format!("Failed to read upstream error body: {err}"));
         let error_body = error::sanitize_error_body(&error_body);
-        return (status_code, error_body).into_response();
+        return (status, error_body).into_response();
     }
 
     let mut preserved_headers = preserve_response_headers(response.headers());
@@ -756,7 +754,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     let body_stream = ReceiverStream::new(rx);
     let mut response = Response::new(Body::from_stream(body_stream));
-    *response.status_mut() = status_code;
+    *response.status_mut() = status;
 
     let headers_mut = response.headers_mut();
     for (name, value) in &preserved_headers {
