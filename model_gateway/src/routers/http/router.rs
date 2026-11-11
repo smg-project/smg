@@ -276,8 +276,7 @@ impl Router {
 
                 match send_with_stale_conn_retry(request_builder).await {
                     Ok(res) => {
-                        let status = StatusCode::from_u16(res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let status = res.status();
 
                         // Preserve headers from backend
                         let response_headers =
@@ -1073,8 +1072,7 @@ impl Router {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let status = res.status();
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -1188,8 +1186,7 @@ impl Router {
             Err(response) => return response,
         };
 
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
 
         Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
 
@@ -1455,8 +1452,7 @@ impl Router {
         load_guard: WorkerLoadGuard,
     ) -> Response {
         let StreamRelayMode { is_stream, rechunk } = mode;
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
 
         if is_stream {
             // Preserve headers for streaming response

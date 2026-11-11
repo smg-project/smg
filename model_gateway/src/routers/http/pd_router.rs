@@ -405,8 +405,7 @@ impl PDRouter {
                 }
             }
             Ok(res) => {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let status = res.status();
                 // Use the status code to determine which error function to use
                 match status {
                     StatusCode::BAD_REQUEST => error::bad_request(
@@ -1183,8 +1182,7 @@ impl PDRouter {
     /// status's body as the envelope, not as events. An error body that
     /// cannot be read says so in the detail.
     async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
-        let status = StatusCode::from_u16(response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = response.status();
         // Taken before the body read consumes the response.
         let retry_after = response.headers().get(RETRY_AFTER).cloned();
         let detail = match response.bytes().await {
@@ -1218,8 +1216,7 @@ impl PDRouter {
         dispatch_start: Instant,
     ) -> Response {
         events::RequestReceivedEvent {}.emit();
-        let status = StatusCode::from_u16(decode_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = decode_response.status();
         if !(context.is_stream && status.is_success()) {
             Self::record_sequential_side(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
         }
@@ -1489,8 +1486,7 @@ impl PDRouter {
         };
 
         // Process decode response
-        let status = StatusCode::from_u16(decode_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = decode_response.status();
         debug!("Decode response status: {}", status);
 
         // Honest PD TTFT: dispatch to the decode response head — the first
@@ -1725,8 +1721,7 @@ impl PDRouter {
                 Ok(response) => response,
                 Err(e) => return Self::prefill_transport_failed(prefill.as_ref(), &e),
             };
-            let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let prefill_status = prefill_response.status();
             if !prefill_status.is_success() {
                 error!(
                     "Prefill server returned error status prefill_url={} status={}",
@@ -1930,8 +1925,7 @@ impl PDRouter {
                 Ok(response) => response,
                 Err(e) => return Err(Self::prefill_transport_failed(prefill.as_ref(), &e)),
             };
-            let status = StatusCode::from_u16(response.status().as_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status = response.status();
             if !status.is_success() {
                 error!(
                     "Prefill server returned error status prefill_url={} status={}",
@@ -2381,8 +2375,7 @@ impl PDRouter {
         prefill_url: &str,
         return_logprob: bool,
     ) -> Result<(StatusCode, Option<Bytes>), Response> {
-        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let prefill_status = prefill_response.status();
 
         if !prefill_status.is_success() {
             error!(
@@ -2831,8 +2824,7 @@ impl RouterTrait for PDRouter {
                 );
             }
         };
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
         let mut response_headers = header_utils::preserve_response_headers(res.headers());
         header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
         match res.bytes().await {
