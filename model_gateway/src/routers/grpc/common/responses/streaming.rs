@@ -614,16 +614,17 @@ impl ResponseStreamEventEmitter {
         let (status, incomplete_details) =
             super::utils::response_status(self.finish_reason.as_deref(), self.cut_call);
 
-        // Build base response object
+        // Build base response object; the kept items move in after the macro
+        // (the same key position), not through the macro's `to_value` copy.
         let mut response_obj = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
             "status": status,
             "background": self.background,
-            "model": self.model,
-            "output": output
+            "model": self.model
         });
+        response_obj["output"] = serde_json::Value::Array(output);
         if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
             response_obj["error"] = error;
         }
@@ -675,15 +676,17 @@ impl ResponseStreamEventEmitter {
             }
         }
 
-        json!({
+        // The response object moves into the event, not through a copy.
+        let mut event = json!({
             "type": match status {
                 ResponseStatus::Failed => ResponseEvent::FAILED,
                 ResponseStatus::Incomplete => ResponseEvent::INCOMPLETE,
                 _ => ResponseEvent::COMPLETED,
             },
-            "sequence_number": self.next_sequence(),
-            "response": response_obj
-        })
+            "sequence_number": self.next_sequence()
+        });
+        event["response"] = response_obj;
+        event
     }
 
     /// The `response.failed` terminal event of a response that ended with
@@ -2212,6 +2215,65 @@ mod tests {
         assert!(std::str::from_utf8(&typed_frames[0])
             .unwrap()
             .starts_with("event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_test\",\"object\":\"response\",\"created_at\":3,\"status\":\"in_progress\""));
+    }
+
+    /// The terminal event's keys stay in the order the `json!` maps wrote
+    /// them with the moved-in values where the copies were: `output` last of
+    /// the response object's base keys, before the usage and the request
+    /// fields; `response` last of the event's keys. The kept item is the one
+    /// the event carries.
+    #[tokio::test]
+    async fn the_terminal_event_keeps_its_key_order_with_the_moved_in_values() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        emitter.set_original_request(
+            serde_json::from_value(json!({"model": "test-model", "input": "hi"})).unwrap(),
+        );
+        let (tx, _rx) = sse_channel();
+        let (index, id) = emitter.allocate_output_index(OutputItemKind::Message);
+        let item = json!({
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hello"}],
+            "status": "completed"
+        });
+        emitter
+            .send_output_item_done(index, item.clone(), &tx)
+            .await
+            .unwrap();
+        emitter.complete_output_item(index);
+        let usage = json!({"input_tokens": 3, "output_tokens": 2, "total_tokens": 5});
+
+        let event = emitter.emit_completed(Some(&usage));
+
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            value.as_object().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(keys(&event), ["type", "sequence_number", "response"]);
+        let response_keys = keys(&event["response"]);
+        assert_eq!(
+            response_keys[..8],
+            [
+                "id",
+                "object",
+                "created_at",
+                "status",
+                "background",
+                "model",
+                "output",
+                "usage"
+            ]
+        );
+        // The request's fields follow, as the builder adds them.
+        assert!(
+            response_keys[8..].iter().any(|key| key == "store")
+                && response_keys[8..].iter().any(|key| key == "tool_choice"),
+            "{response_keys:?}"
+        );
+        assert_eq!(event["response"]["output"], json!([item]));
+        assert_eq!(event["response"]["usage"], usage);
+        assert_eq!(event["type"], ResponseEvent::COMPLETED);
     }
 
     /// The two typed output item events write the frames the `json!` events
