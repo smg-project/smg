@@ -301,9 +301,9 @@ mod generation_tests {
 
     /// The route reads its body through the gateway's validated extractor, as
     /// the chat route does: a negative temperature, a `top_p` above one, an
-    /// `n` of zero and an empty `input_ids` are refused in the error envelope
-    /// with the chat route's codes before a worker sees them, and a body
-    /// within the rules is served.
+    /// `n` of zero, an empty `input_ids` and a negative token id in it are
+    /// refused in the error envelope with the chat route's codes before a
+    /// worker sees them, and a body within the rules is served.
     #[tokio::test]
     async fn generate_refuses_the_sampling_values_the_chat_route_refuses() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -343,6 +343,11 @@ mod generation_tests {
             (
                 json!({"input_ids": [], "sampling_params": {"max_new_tokens": 4}}),
                 "empty_array",
+                "input_ids",
+            ),
+            (
+                json!({"input_ids": [1, -2, 3], "sampling_params": {"max_new_tokens": 4}}),
+                "integer_below_min_value",
                 "input_ids",
             ),
         ] {

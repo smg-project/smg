@@ -398,6 +398,28 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_input_id_is_refused_single_or_batched() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Single(vec![1, -2, 3]));
+        let err = validate_generate_request(&r).expect_err("a negative id is no token");
+        assert_eq!(err.code, "integer_below_min_value");
+        assert_eq!(
+            err.params.get("field").map(ToString::to_string).as_deref(),
+            Some("\"input_ids\"")
+        );
+        assert!(
+            err.message.as_deref().unwrap_or("").contains("-2"),
+            "the message names the offending id: {err:?}"
+        );
+
+        r.input_ids = Some(InputIds::Batch(vec![vec![1], vec![2, -3]]));
+        assert!(validate_generate_request(&r).is_err());
+
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert!(validate_generate_request(&r).is_ok());
+    }
+
+    #[test]
     fn routing_tokens_prefer_input_ids_over_text() {
         let mut r = req();
         r.text = Some("hello".to_string());
