@@ -801,16 +801,19 @@ impl GrpcRouter {
     /// tokenizer: the request is rendered through the model's chat template
     /// exactly as `/v1/messages` renders it and the prompt's token count is
     /// returned. No worker takes part, so every worker type is covered.
+    /// Takes the request by reference: an async fn that takes it by value
+    /// and borrows it across the await holds two copies of it in its task,
+    /// the captured argument and the re-bound local.
     async fn route_messages_count_tokens_impl(
         &self,
-        body: CountMessageTokensRequest,
+        body: &CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
         let model_id = self.resolve_canonical_model_id(model_id);
         match self
             .count_prompt_tokens(
                 &model_id,
-                message_utils::MessagesPrompt::from(&body),
+                message_utils::MessagesPrompt::from(body),
                 &body.chat_tools(),
                 body.tool_choice.as_ref(),
                 false,
@@ -1309,7 +1312,7 @@ impl RouterTrait for GrpcRouter {
         body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
-        self.route_messages_count_tokens_impl(body, model_id).await
+        self.route_messages_count_tokens_impl(&body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {
