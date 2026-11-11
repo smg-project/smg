@@ -1307,7 +1307,7 @@ mod responses_endpoint_tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         assert_eq!(
             err_body["error"]["code"].as_str(),

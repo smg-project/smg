@@ -120,7 +120,7 @@ class _StateManagementCloudBase:
 
     def test_previous_response_id_invalid(self, model, api_client):
         """Test using invalid previous_response_id."""
-        with pytest.raises((openai.BadRequestError, smg_client.BadRequestError)):
+        with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.create(
                 model=model,
                 input="Test",
@@ -142,7 +142,7 @@ class _StateManagementCloudBase:
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
 
-        with pytest.raises((openai.BadRequestError, smg_client.BadRequestError)):
+        with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.create(
                 model=model,
                 input="Follow up",
@@ -237,7 +237,7 @@ class TestStateManagementLocal:
 
     def test_previous_response_id_invalid(self, model, api_client):
         """Test using invalid previous_response_id."""
-        with pytest.raises((openai.BadRequestError, smg_client.BadRequestError)):
+        with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.create(
                 model=model,
                 input="Test",
@@ -331,7 +331,7 @@ class TestStateManagementLocal:
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
 
-        with pytest.raises((openai.BadRequestError, smg_client.BadRequestError)):
+        with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.create(
                 model=model,
                 input="Follow up",
@@ -370,7 +370,7 @@ class TestStateManagementGptOss:
 
     def test_previous_response_id_invalid(self, model, api_client):
         """Test using invalid previous_response_id."""
-        with pytest.raises((openai.BadRequestError, smg_client.BadRequestError)):
+        with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.create(
                 model=model,
                 input="Test",
@@ -450,7 +450,7 @@ class TestStateManagementGptOss:
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
 
-        with pytest.raises((openai.BadRequestError, smg_client.BadRequestError)):
+        with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.create(
                 model=model,
                 input="Follow up",
