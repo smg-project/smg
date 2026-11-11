@@ -329,14 +329,7 @@ mod tests {
                 .into_iter()
                 .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
         );
-        let mut body = relay_of(upstream, mode).into_body();
-        let mut frames = Vec::new();
-        while let Some(frame) = body.frame().await {
-            if let Ok(data) = frame.expect("a relayed frame").into_data() {
-                frames.push(data);
-            }
-        }
-        frames
+        frames_of(relay_of(upstream, mode).into_body()).await
     }
 
     /// An empty upstream chunk becomes no frame at all, on the plain path and
