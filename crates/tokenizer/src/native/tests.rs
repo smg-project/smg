@@ -1383,8 +1383,8 @@ fn every_shape_merges_its_misses_natively() {
 
 #[test]
 fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
-    // A vocabulary without the token of byte 0x00: the table declines the
-    // model, the path stays, and its misses take the model's own merge.
+    // A model that marks the end of a word: the table declines the model,
+    // the path stays, and its misses take the model's own merge.
     let mut state = 0x1212_3434_5656_7878u64;
     let shape = &shapes()[0];
     let mut tokenizer = tokenizer_of(shape, &mut state);
@@ -1393,8 +1393,12 @@ fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
     let mut alphabet: Vec<char> = table.to_vec();
     alphabet.sort_unstable();
     for ch in alphabet {
-        let id = vocab.len() as u32;
-        vocab.insert(ch.to_string(), id);
+        // The word-final form too, so the model keeps a word's last
+        // character and the merges below fire inside the longer words.
+        for token in [ch.to_string(), format!("{ch}</w>")] {
+            let id = vocab.len() as u32;
+            vocab.insert(token, id);
+        }
     }
     let mut merges = Merges::new();
     for (a, b) in [("a", "b"), ("b", "c"), ("ab", "c"), ("a", "bc")] {

@@ -556,6 +556,7 @@ impl MergeTable {
             + size_of_val(&*self.buckets)
             + self.pair_filter_bytes()
             + self.preformed.bytes()
+            + self.missing.as_deref().map_or(0, size_of_val)
     }
 
     /// Characters of the vocabulary a piece may start from as one symbol.
@@ -568,7 +569,7 @@ impl MergeTable {
         size_of_val(&*self.pair_filter)
     }
 
-    /// The id of `byte`'s token.
+    /// The id of `byte`'s token ([`NO_BYTE_TOKEN`] for a byte without one).
     #[inline(always)]
     pub(super) fn byte_id(&self, byte: u8) -> u32 {
         self.byte_ids[usize::from(byte)]
@@ -582,6 +583,14 @@ impl MergeTable {
         self.missing
             .as_ref()
             .is_some_and(|missing| piece.iter().any(|&byte| missing[usize::from(byte)]))
+    }
+
+    /// Bytes the vocabulary has no token for (0 over a complete alphabet),
+    /// for the load log.
+    pub(super) fn missing_bytes(&self) -> usize {
+        self.missing
+            .as_ref()
+            .map_or(0, |missing| missing.iter().filter(|&&gone| gone).count())
     }
 
     /// Pairs the table was built from (one per merge of a model; one per
@@ -745,6 +754,10 @@ impl MergeTable {
             !self.hot.is_empty(),
             "a byte-level merge on a table built for character symbols"
         );
+        debug_assert!(
+            !self.lacks_a_token_for(piece),
+            "a piece holding a byte the table has no token for is the model's"
+        );
         if piece.is_empty() {
             return;
         }
@@ -778,6 +791,10 @@ impl MergeTable {
     /// piece of a mixed unit leaves at the pays-off test.
     #[inline(never)]
     pub(super) fn merge_preformed(&self, piece: &[u8], ids: &mut Vec<u32>) -> bool {
+        debug_assert!(
+            !self.lacks_a_token_for(piece),
+            "a piece holding a byte the table has no token for is the model's"
+        );
         let pre = &self.preformed;
         if pre.is_empty() || !pre.pays_off(piece) {
             return false;

@@ -932,6 +932,7 @@ impl NativeEncoder {
                     merges = table.merges(),
                     bytes = table.bytes(),
                     preformed_characters = table.preformed_characters(),
+                    missing_bytes = table.missing_bytes(),
                     "the native encode path merges its piece-cache misses itself"
                 );
                 Some(table)
@@ -1540,6 +1541,7 @@ impl NativeEncoder {
             merges = merges.merges(),
             bytes = merges.bytes(),
             preformed_characters = merges.preformed_characters(),
+            missing_bytes = merges.missing_bytes(),
             "the native encode path merges a tiktoken vocabulary's piece-cache misses itself"
         );
         let stages = vec![Stage {
