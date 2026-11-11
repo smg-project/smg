@@ -1093,45 +1093,65 @@ pub struct JobStatus {
 }
 
 impl JobStatus {
-    /// Create a pending job status
-    pub fn pending(job_type: &str, worker_url: &str) -> Self {
+    /// A status with the given word, stamped now, with the message a
+    /// terminal status carries.
+    fn stamped(job_type: &str, worker_url: &str, status: &str, message: Option<String>) -> Self {
         Self {
             job_type: job_type.to_string(),
             worker_url: worker_url.to_string(),
-            status: "pending".to_string(),
-            message: None,
+            status: status.to_string(),
+            message,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
         }
+    }
+
+    /// Create a pending job status
+    pub fn pending(job_type: &str, worker_url: &str) -> Self {
+        Self::stamped(job_type, worker_url, "pending", None)
     }
 
     /// Create a processing job status
     pub fn processing(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "processing".to_string(),
-            message: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        }
+        Self::stamped(job_type, worker_url, "processing", None)
     }
 
     /// Create a failed job status
     pub fn failed(job_type: &str, worker_url: &str, error: String) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "failed".to_string(),
-            message: Some(error),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+        Self::stamped(job_type, worker_url, "failed", Some(error))
+    }
+}
+
+#[cfg(test)]
+mod job_status_tests {
+    use super::JobStatus;
+
+    #[test]
+    fn a_status_carries_its_word_its_message_and_a_stamp_of_now() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let pending = JobStatus::pending("AddWorker", "http://w:8000");
+        let processing = JobStatus::processing("AddWorker", "http://w:8000");
+        let failed = JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string());
+        let words = |status: &JobStatus| (status.status.clone(), status.message.clone());
+        assert_eq!(words(&pending), ("pending".to_string(), None));
+        assert_eq!(words(&processing), ("processing".to_string(), None));
+        assert_eq!(
+            words(&failed),
+            ("failed".to_string(), Some("boom".to_string()))
+        );
+        for status in [&pending, &processing, &failed] {
+            assert_eq!(status.job_type, "AddWorker");
+            assert_eq!(status.worker_url, "http://w:8000");
+            assert!(
+                (now..=now + 5).contains(&status.timestamp),
+                "stamped now, not at {}",
+                status.timestamp
+            );
         }
     }
 }
