@@ -299,6 +299,81 @@ mod generation_tests {
         ctx.shutdown().await;
     }
 
+    /// The route reads its body through the gateway's validated extractor, as
+    /// the chat route does: a negative temperature, a `top_p` above one, an
+    /// `n` of zero and an empty `input_ids` are refused in the error envelope
+    /// with the chat route's codes before a worker sees them, and a body
+    /// within the rules is served.
+    #[tokio::test]
+    async fn generate_refuses_the_sampling_values_the_chat_route_refuses() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18109,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let post = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (body, code, param) in [
+            (
+                json!({"text": "hi", "sampling_params": {"temperature": -1, "max_new_tokens": 4}}),
+                "decimal_below_min_value",
+                "sampling_params.temperature",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"top_p": 2, "max_new_tokens": 4}}),
+                "decimal_above_max_value",
+                "sampling_params.top_p",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"n": 0, "max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "sampling_params.n",
+            ),
+            (
+                json!({"input_ids": [], "sampling_params": {"max_new_tokens": 4}}),
+                "empty_array",
+                "input_ids",
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(body.clone())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                envelope["error"]["type"], "invalid_request_error",
+                "{envelope}"
+            );
+            assert_eq!(envelope["error"]["code"], code, "{envelope}");
+            assert_eq!(envelope["error"]["param"], param, "{envelope}");
+        }
+
+        let served = json!({
+            "text": "hi",
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+        });
+        let resp = app.oneshot(post(served)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a body within the rules is served"
+        );
+
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_v1_chat_completions_streaming_preserves_worker_json_error_content_type() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {

@@ -57,6 +57,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `text_tokens` in the completion details. A usage the gateway builds is written as before.
   Breaking: `PromptTokenUsageInfo` gains `text_tokens`, `image_tokens` and `cache_write_tokens`,
   and `CompletionTokensDetails` gains `text_tokens`, all `Option<u32>`.
+- `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
+  `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
+  gateway's `/generate` reads its body through the validated extractor and answers a negative
+  temperature, a `top_p` above one, an `n` of zero or an empty `input_ids` in the error envelope
+  (`400`, with `error.code` and `error.param`) where it sent them to the engine. The rule over the whole
+  request, live for the first time, refuses only a body with no prompt at all (none of `text`,
+  `input_ids`, `input_embeds`), as `missing_required_parameter`; a body with both `text` and
+  `input_ids` and an `input_embeds`-only body stay with the routers as today. The cross-field sampling rules (`min_new_tokens` above
+  `max_new_tokens`, more than one structured-output constraint) name their field in `error.param`.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a

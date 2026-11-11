@@ -223,7 +223,7 @@ async fn generate(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<GenerateRequest>,
+    ValidatedJson(body): ValidatedJson<GenerateRequest>,
 ) -> Response {
     let model = body.model.clone();
     cancel
