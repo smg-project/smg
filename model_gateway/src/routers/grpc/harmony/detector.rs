@@ -104,8 +104,9 @@ mod tests {
     }
 
     /// A card found gpt_oss by its model type after discovery, on a worker
-    /// whose metadata held none: the lazily discovered list is what the
-    /// check reads.
+    /// whose metadata held none: the lazily discovered list is what
+    /// `is_harmony_worker` reads (the registry check reads the answer its
+    /// membership snapshot kept).
     #[test]
     fn a_discovered_card_with_the_gpt_oss_model_type_is_harmony() {
         let worker = undiscovered("served-model");

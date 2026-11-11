@@ -213,10 +213,13 @@ impl ModelWorkerSnapshot {
     /// Whether a worker of this membership generation serves a Harmony
     /// model: `decide` reads the snapshot's workers on the first request
     /// after the membership change, every request after it reads the kept
-    /// answer. The cards a worker is indexed by hold for the generation (a
-    /// registration, a removal and a property rebuild each publish a new
-    /// snapshot), so the per-worker card scans run once, not per request. The
-    /// rule itself stays with the router's detector.
+    /// answer. A registration, a removal and a property rebuild each publish
+    /// a new snapshot, so the per-worker card scans run once, not per
+    /// request. A lazy model refresh (`Worker::set_models`) rewrites a
+    /// worker's cards in place without one and is read at the next
+    /// membership change; only external workers, which the gRPC pipeline
+    /// does not serve, are refreshed today. The rule itself stays with the
+    /// router's detector.
     pub(crate) fn harmony(&self, decide: impl FnOnce(&[Arc<dyn Worker>]) -> bool) -> bool {
         *self.harmony.get_or_init(|| decide(&self.all))
     }
