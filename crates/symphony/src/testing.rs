@@ -124,6 +124,26 @@ pub(crate) fn calls(events: &[Event]) -> Vec<(String, String)> {
     calls
 }
 
+/// The calls as (index, name, arguments), the fragments of each joined onto the
+/// last call started; an arguments event before any call is left out.
+pub(crate) fn indexed_calls(events: &[Event]) -> Vec<(u32, String, String)> {
+    let mut calls: Vec<(u32, String, String)> = Vec::new();
+    for event in events {
+        match event {
+            Event::ToolCallStart { index, name, .. } => {
+                calls.push((*index, name.clone(), String::new()));
+            }
+            Event::ToolCallArguments { json, .. } => {
+                if let Some(last) = calls.last_mut() {
+                    last.2.push_str(json);
+                }
+            }
+            _ => {}
+        }
+    }
+    calls
+}
+
 /// The engine's finish: its reason as the engine gave it (the adapters refine it to
 /// `tool_calls`), and the calls counted.
 pub(crate) fn finish(events: &[Event]) -> (FinishReason, u32) {
