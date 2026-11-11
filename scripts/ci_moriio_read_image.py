@@ -11,7 +11,10 @@ import os
 import re
 from pathlib import Path
 
-# Reviewed f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9 ACK-fenced producer hold.
+# Unpublished local vllm-project/vllm patch: f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9.
+# Upstream baseline: 595b1514e837ba38df7ae51c411807783e227b78.
+# Repository: https://github.com/vllm-project/vllm (not a public URL for this local commit).
+# ACK-fenced producer hold; hash reproduction and publication gap: docs/moriio-read.md.
 _SOURCE_DIR = "distributed/kv_transfer/kv_connector/v1/moriio"
 SOURCE_SHA256 = {
     f"{_SOURCE_DIR}/moriio_common.py": "61754babd34a560810106f1cdccde4e538f7bb4ab65e2c9c45937c75d414fdf9",
@@ -30,7 +33,10 @@ def read_image(value: str) -> str:
     if not IMAGE.fullmatch(value):
         raise ValueError("MoRI READ requires SMG_AMD_MORIIO_READ_IMAGE as a digest-pinned image")
     if value.rsplit(":", 1)[-1] == OLD_IMAGE_DIGEST:
-        raise ValueError("Image749 does not implement the reviewed ACK-fenced READ hold")
+        raise ValueError(
+            f"vllm/vllm-openai-rocm:v0.31.0@sha256:{OLD_IMAGE_DIGEST} "
+            "does not implement the reviewed ACK-fenced READ hold"
+        )
     return value
 
 
