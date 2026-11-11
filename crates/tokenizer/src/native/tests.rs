@@ -11,7 +11,7 @@ use tokenizers::{
     },
     normalizers::{
         unicode::{NFC, NFKC},
-        NormalizerWrapper, Replace,
+        NormalizerWrapper, Prepend, Replace, Sequence as NormalizerSequence,
     },
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
@@ -2926,6 +2926,8 @@ fn sentencepiece_model(state: &mut u64) -> BPE {
 struct SentencepieceShape {
     name: &'static str,
     replace: bool,
+    /// The `Replace` as the one step of a `Sequence`, as some files write it.
+    sequence: bool,
     split: bool,
     metaspace: Option<PrependScheme>,
     /// The post-processor frames the ids with `<s>`.
@@ -2937,6 +2939,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "replace-split",
             replace: true,
+            sequence: false,
             split: true,
             metaspace: None,
             bos: true,
@@ -2944,6 +2947,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "replace",
             replace: true,
+            sequence: false,
             split: false,
             metaspace: None,
             bos: false,
@@ -2951,6 +2955,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-first",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::First),
             bos: true,
@@ -2958,6 +2963,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-always",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Always),
             bos: false,
@@ -2965,9 +2971,18 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-never",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Never),
             bos: false,
+        },
+        SentencepieceShape {
+            name: "replace-in-sequence",
+            replace: true,
+            sequence: true,
+            split: false,
+            metaspace: None,
+            bos: true,
         },
     ]
 }
@@ -2975,10 +2990,14 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
 fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTokenizer {
     let mut tokenizer = HfTokenizer::new(sentencepiece_model(state));
     if shape.replace {
+        let replace = Replace::new(" ", "\u{2581}").expect("a Replace normalizer");
+        let normalizer: NormalizerWrapper = if shape.sequence {
+            NormalizerSequence::new(vec![replace.into()]).into()
+        } else {
+            replace.into()
+        };
         tokenizer
-            .with_normalizer(Some(
-                Replace::new(" ", "\u{2581}").expect("a Replace normalizer"),
-            ))
+            .with_normalizer(Some(normalizer))
             .expect("normalizer");
     }
     if shape.split {
@@ -3519,6 +3538,25 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
     );
+    // The Replace in a Sequence with another step: the one-step sequence is
+    // the only sequence the path takes (a Prepend before the Replace is the
+    // legacy conversion's shape, which this path would read without the
+    // prepended marker).
+    let replace =
+        || NormalizerWrapper::from(Replace::new(" ", "\u{2581}").expect("a Replace normalizer"));
+    for steps in [
+        vec![Prepend::new("\u{2581}".to_owned()).into(), replace()],
+        vec![replace(), NormalizerWrapper::NFC(NFC)],
+    ] {
+        let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
+        tokenizer
+            .with_normalizer(Some(NormalizerSequence::new(steps)))
+            .expect("normalizer");
+        assert_eq!(
+            declined(&tokenizer),
+            "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
+        );
+    }
     // Neither the Replace nor a Metaspace.
     let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
     tokenizer

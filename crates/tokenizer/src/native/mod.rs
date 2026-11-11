@@ -1045,7 +1045,14 @@ impl NativeEncoder {
         let replace = serde_json::json!(
             {"type": "Replace", "pattern": {"String": " "}, "content": WORD_MARKER.to_string()}
         );
-        let replaces = *normalizer == replace;
+        // Alone, or as the one step of a `Sequence`, as some conversions
+        // write it.
+        let replaces = *normalizer == replace
+            || normalizer.get("type").and_then(Value::as_str) == Some("Sequence")
+                && normalizer
+                    .get("normalizers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|steps| matches!(steps.as_slice(), [step] if *step == replace));
         if !(normalizer.is_null() || replaces) {
             return Err(Declined::from(
                 "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) \
