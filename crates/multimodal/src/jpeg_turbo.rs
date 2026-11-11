@@ -517,6 +517,63 @@ pub fn is_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
 }
 
+/// What a JPEG's frame header says: the dimensions and the component count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameHeader {
+    width: i32,
+    height: i32,
+    components: u8,
+}
+
+/// The frame header of a JPEG, read from its marker segments. The TurboJPEG
+/// header call reports the same when it can classify the frame's sampling;
+/// libjpeg-turbo 2.x refuses a frame whose components are sampled unlike each
+/// other (a CMYK file with subsampled inks and a full-resolution black) with
+/// "Could not determine subsampling type", though its decoder takes such a
+/// frame, so this reader stands in for the call. `None` when the scan or the
+/// end of the image comes before a frame header, or a segment is cut short.
+fn frame_header(bytes: &[u8]) -> Option<FrameHeader> {
+    if !is_jpeg(bytes) {
+        return None;
+    }
+    let mut at = 2;
+    loop {
+        let (&0xFF, &marker) = (bytes.get(at)?, bytes.get(at + 1)?) else {
+            return None;
+        };
+        match marker {
+            // A fill byte before the next marker.
+            0xFF => at += 1,
+            // Standalone markers: the restart markers, SOI and TEM.
+            0xD0..=0xD8 | 0x01 => at += 2,
+            // The scan or the end of the image, with no frame header before it.
+            0xD9 | 0xDA => return None,
+            _ => {
+                let length = usize::from(u16::from_be_bytes([
+                    *bytes.get(at + 2)?,
+                    *bytes.get(at + 3)?,
+                ]));
+                // The length counts its own two bytes.
+                let payload = bytes.get(at + 4..at + 2 + length)?;
+                // SOF0 to SOF15 carry the frame header; DHT, JPG and DAC share
+                // the range.
+                if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                    let (&[_precision, h0, h1, w0, w1, components], _) =
+                        payload.split_first_chunk::<6>()?;
+                    let (height, width) =
+                        (u16::from_be_bytes([h0, h1]), u16::from_be_bytes([w0, w1]));
+                    return (width > 0 && height > 0).then(|| FrameHeader {
+                        width: i32::from(width),
+                        height: i32::from(height),
+                        components,
+                    });
+                }
+                at += 2 + length;
+            }
+        }
+    }
+}
+
 /// Decode a JPEG to an RGB8 `DynamicImage` via libjpeg-turbo (PIL-compatible
 /// defaults). A CMYK or YCCK JPEG is decompressed to CMYK, the only output
 /// TurboJPEG offers for it, and converted with [`pil_cmyk_to_rgb`]. Returns
@@ -534,7 +591,9 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
     // - `bytes` is a live `&[u8]`; its ptr/len describe a valid immutable region
     //   for the duration of the calls (libjpeg-turbo only reads it).
     // - `buf` is an owned `Vec<u8>` whose length is exactly `w*h*channels`
-    //   (overflow-checked) from the header dimensions, with `channels` the
+    //   (overflow-checked) from the frame's dimensions (the header call's, or
+    //   the frame header's when that call refuses the sampling; the decoder
+    //   never writes past the size it is given), with `channels` the
     //   pixel size of the format requested (3 for `TJPF_RGB`, 4 for
     //   `TJPF_CMYK`); a pooled buffer has a larger capacity, the length is
     //   what matters. It is the sole alias passed to the decoder; with
@@ -558,14 +617,24 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
             &mut subsamp,
             &mut colorspace,
         );
-        if hdr != 0 || w <= 0 || h <= 0 {
-            (tj.destroy)(handle);
-            return None;
-        }
-        let (wu, hu) = (w as usize, h as usize);
         // A CMYK or YCCK source can only come out as CMYK; everything else
-        // (YCbCr, grayscale, RGB) comes out as RGB.
-        let cmyk = colorspace == TJCS_CMYK || colorspace == TJCS_YCCK;
+        // (YCbCr, grayscale, RGB) comes out as RGB. When the header call
+        // refuses the frame's sampling (libjpeg-turbo 2.x on components
+        // sampled unlike each other), the frame header supplies the
+        // dimensions, and four components mean CMYK: the decoder takes the
+        // frame the call would not classify.
+        let (w, h, cmyk) = if hdr == 0 && w > 0 && h > 0 {
+            (w, h, colorspace == TJCS_CMYK || colorspace == TJCS_YCCK)
+        } else {
+            match frame_header(bytes) {
+                Some(frame) => (frame.width, frame.height, frame.components == 4),
+                None => {
+                    (tj.destroy)(handle);
+                    return None;
+                }
+            }
+        };
+        let (wu, hu) = (w as usize, h as usize);
         let (pixel_format, channels) = if cmyk { (TJPF_CMYK, 4) } else { (TJPF_RGB, 3) };
         // Guard against absurd dimensions before allocating.
         let nbytes = match decoded_buffer_len(wu, hu, channels) {
@@ -775,6 +844,92 @@ mod tests {
             }
             assert_eq!(fnv1a(rgb.as_raw()), hash, "{name}: not PIL's pixels");
         }
+    }
+
+    /// A 16x8 four-component baseline JPEG whose first component is sampled
+    /// 2x2 and the other three 1x1: the shape a CMYK file written with chroma
+    /// subsampling takes, which libjpeg-turbo 2.x's header call cannot name.
+    /// One MCU with every coefficient zero, so every sample decodes to 128.
+    /// Built here rather than stored: a byte table would be test data.
+    fn unequal_sampling_cmyk_jpeg() -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8];
+        // DQT: one table of ones.
+        jpeg.extend([0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        jpeg.extend([1u8; 64]);
+        // SOF0: 8 bits, 8 rows, 16 columns, four components (2x2, 1x1, 1x1, 1x1).
+        jpeg.extend([0xFF, 0xC0, 0x00, 0x14, 0x08, 0x00, 0x08, 0x00, 0x10, 0x04]);
+        jpeg.extend([1, 0x22, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0]);
+        // DHT: a DC table and an AC table with one code each, for symbol 0 (a
+        // zero difference; the end of a block).
+        for class in [0x00, 0x10] {
+            jpeg.extend([0xFF, 0xC4, 0x00, 0x14, class, 1]);
+            jpeg.extend([0u8; 15]);
+            jpeg.push(0x00);
+        }
+        // SOS: the four components on tables 0 and 0, the whole spectrum.
+        jpeg.extend([
+            0xFF, 0xDA, 0x00, 0x0E, 0x04, 1, 0, 2, 0, 3, 0, 4, 0, 0, 0x3F, 0,
+        ]);
+        // Seven blocks (four of the first component, one of each other), each
+        // a zero difference and an end of block: fourteen zero bits, padded.
+        jpeg.extend([0x00, 0x03, 0xFF, 0xD9]);
+        jpeg
+    }
+
+    /// The reader finds the frame header behind the tables, in a file written
+    /// by a compressor as in one built by hand, and reads nothing from a file
+    /// that ends before it or is no JPEG at all.
+    #[test]
+    fn the_frame_header_reads_the_dimensions_and_the_component_count() {
+        let jpeg = unequal_sampling_cmyk_jpeg();
+        let frame = FrameHeader {
+            width: 16,
+            height: 8,
+            components: 4,
+        };
+        assert_eq!(frame_header(&jpeg), Some(frame));
+        assert_eq!(
+            frame_header(&fixture("ycck_adobe_16x16_420.jpg")),
+            Some(FrameHeader {
+                width: 16,
+                height: 16,
+                components: 4
+            })
+        );
+        // SOI and the quantization table are 71 bytes; the frame header follows.
+        assert_eq!(
+            frame_header(&jpeg[..71]),
+            None,
+            "cut before the frame header"
+        );
+        assert_eq!(
+            frame_header(&jpeg[..80]),
+            None,
+            "cut inside the frame header"
+        );
+        assert_eq!(frame_header(b"not a jpeg"), None);
+    }
+
+    /// libjpeg-turbo 2.x's header call refuses a four-component frame whose
+    /// black is sampled unlike its first component; the decoder takes it, so
+    /// the frame header stands in and the image decodes through the library
+    /// (the pure-Rust fallback differs from it by a few levels per pixel).
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_four_component_jpeg_with_unequal_sampling_decodes_through_turbojpeg() {
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the unequal-sampling test");
+            return;
+        }
+        let image = decode_jpeg_rgb(&unequal_sampling_cmyk_jpeg())
+            .expect("decoded through libjpeg-turbo, the header call notwithstanding");
+        let rgb = image.to_rgb8();
+        assert_eq!((rgb.width(), rgb.height()), (16, 8));
+        let expected = pil_cmyk_to_rgb(128, 128, 128, 128);
+        assert!(
+            rgb.pixels().all(|pixel| pixel.0 == expected),
+            "every sample is 128 before the inversion: {expected:?}"
+        );
     }
 
     /// The policy reads its two values in any case and spacing, names an
