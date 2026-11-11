@@ -299,7 +299,8 @@ fn trace_of(
     trace
 }
 
-fn shed(reason: ShedReason, emptied_by: &'static str, trace: Trace) -> Decision {
+fn shed(reason: ShedReason, emptied_by: &'static str, mut trace: Trace) -> Decision {
+    trace.stage = emptied_by;
     Decision::Shed(Shed {
         reason,
         emptied_by,
@@ -375,10 +376,11 @@ fn run_profile(
         band,
         &mut targets,
     );
-    let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
+    let mut trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
     if targets.is_empty() {
         return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
     }
+    trace.stage = profile.picker.name();
     Decision::Pick(Pick {
         targets,
         trace,
@@ -696,6 +698,7 @@ impl Engine {
                 ShedReason::PolicyDeclined,
                 "binding",
                 Trace {
+                    profile: Trace::NO_PROFILE,
                     seed: facts.seed,
                     generation: pool.generation,
                     ..Trace::default()
@@ -933,6 +936,7 @@ impl Engine {
     ) -> Decision {
         let PairPools { prefills, decodes } = pools;
         let bare = Trace {
+            profile: Trace::NO_PROFILE,
             seed: facts.seed,
             generation: pool.generation,
             ..Trace::default()
@@ -1284,6 +1288,52 @@ mod tests {
         assert_eq!(pick.trace.survivors, 3);
         assert_eq!(pick.trace.top[0].0, WorkerId(101));
         assert_eq!(pick.trace.top_len, 3);
+        assert_eq!(pick.trace.stage, "best", "the picker settled the pick");
+    }
+
+    /// The trace names the stage that settled the decision: the picker for
+    /// a pick, the filter that left nothing for a shed, the binding stage
+    /// (with no profile) when no binding matched the request.
+    #[test]
+    fn the_trace_names_the_stage_that_settled_the_decision() {
+        let pick = decide_single(&engine(), &[candidate(0, 1), candidate(1, 2)]);
+        assert_eq!(pick.trace().stage, "best");
+        assert_eq!(pick.trace().profile, 0);
+
+        let mut unhealthy = [candidate(0, 1)];
+        unhealthy[0].health.healthy = false;
+        match decide_single(&strict_engine(), &unhealthy) {
+            Decision::Shed(shed) => {
+                assert_eq!(shed.emptied_by, "healthy");
+                assert_eq!(
+                    shed.trace.stage, "healthy",
+                    "the shed's trace names the emptying filter"
+                );
+            }
+            other => panic!("an unhealthy pool answered {other:?}"),
+        }
+
+        let unbound = Engine::new(
+            vec![least_requests_profile()],
+            vec![Binding {
+                model: "other".into(),
+                phases: vec![],
+                plan: Plan::Single,
+                profile: 0,
+                decode_profile: None,
+                sessions: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        match decide_single(&unbound, &[candidate(0, 1)]) {
+            Decision::Shed(shed) => {
+                assert_eq!(shed.reason, ShedReason::PolicyDeclined);
+                assert_eq!(shed.trace.stage, "binding");
+                assert_eq!(shed.trace.profile, Trace::NO_PROFILE, "no profile ran");
+            }
+            other => panic!("an unbound model answered {other:?}"),
+        }
     }
 
     #[test]
