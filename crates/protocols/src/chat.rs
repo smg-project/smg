@@ -1044,7 +1044,10 @@ impl Normalizable for ChatCompletionRequest {
         ProviderProfile::for_model(&self.model).normalize_chat(self);
 
         // Migrate deprecated functions → tools
-        #[expect(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "the one read of functions: its migration to tools"
+        )]
         if self.tools.is_none() && self.functions.is_some() {
             tracing::warn!("functions is deprecated, use tools instead");
             self.tools = self.functions.as_ref().map(|functions| {
@@ -1060,7 +1063,10 @@ impl Normalizable for ChatCompletionRequest {
         }
 
         // Migrate deprecated function_call → tool_choice
-        #[expect(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "the one read of function_call: its migration to tool_choice"
+        )]
         if self.tool_choice.is_none() && self.function_call.is_some() {
             tracing::warn!("function_call is deprecated, use tool_choice instead");
             self.tool_choice = self.function_call.as_ref().map(|fc| match fc {

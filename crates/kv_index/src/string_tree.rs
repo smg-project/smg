@@ -360,10 +360,9 @@ struct EvictionEntry {
 
 impl Eq for EvictionEntry {}
 
-#[expect(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for EvictionEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.timestamp.cmp(&other.timestamp))
+        Some(self.cmp(other))
     }
 }
 

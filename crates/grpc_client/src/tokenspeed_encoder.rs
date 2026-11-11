@@ -42,7 +42,10 @@ const ENCODE_CONNS_PER_ENDPOINT: usize = 4;
 /// Round-robin cursor over an endpoint's connection pool.
 static ENCODE_CONN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod tokenspeed_encoder_proto {
     #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
     tonic::include_proto!("tokenspeed.grpc.encoder");
