@@ -221,6 +221,33 @@ def openai_direct_client():
     yield client
 
 
+# How long the fixture waits for the provider to index the attached file. Indexing takes
+# seconds on a normal day and took 10 to 17 minutes on a slow one; the SDK's poll has no
+# deadline of its own, and the lane that runs this suite has a 30-minute cap with about
+# 20 minutes of setup and other tests inside it. A file still indexing at the deadline
+# skips the class with the reason in the log, instead of running a required job into its
+# cap with every test that ran green.
+_VECTOR_STORE_INDEX_DEADLINE_S = 300
+
+
+def _index_vector_store_file(client, vector_store_id: str, file_id: str) -> None:
+    """Attach the file to the vector store and wait, bounded, for the provider to index it."""
+    try:
+        vs_file = client.vector_stores.files.create_and_poll(
+            vector_store_id=vector_store_id,
+            file_id=file_id,
+            max_wait_seconds=_VECTOR_STORE_INDEX_DEADLINE_S,
+        )
+    except TimeoutError:
+        pytest.skip(
+            f"vector store file {file_id} is still in_progress after "
+            f"{_VECTOR_STORE_INDEX_DEADLINE_S}s: the provider's indexing is slow, not the "
+            "gateway; the file_citation tests need the indexed store and are skipped"
+        )
+    if vs_file.status != "completed":
+        pytest.fail(f"vector store file {file_id} indexing {vs_file.status}: {vs_file.last_error}")
+
+
 @pytest.fixture(scope="class")
 def file_search_vector_store(openai_direct_client):
     """Create + populate a vector store, then tear it down at class scope.
@@ -237,7 +264,7 @@ def file_search_vector_store(openai_direct_client):
         buf.name = "project_astra.txt"
         file_obj = client.files.create(file=buf, purpose="assistants")
         vs = client.vector_stores.create(name="smg-e5-annotations-test")
-        client.vector_stores.files.create_and_poll(vector_store_id=vs.id, file_id=file_obj.id)
+        _index_vector_store_file(client, vs.id, file_obj.id)
         yield vs.id
     finally:
         if vs is not None:
