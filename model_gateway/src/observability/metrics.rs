@@ -13,6 +13,7 @@ use metrics_exporter_prometheus::{
 };
 use metrics_util::parse_quantiles;
 use once_cell::sync::Lazy;
+use rustc_hash::FxBuildHasher;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
@@ -29,8 +30,10 @@ use crate::{
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
 
 /// Global string interner for metric labels.
-/// Uses DashMap for lock-free concurrent access.
-static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+/// Uses DashMap (sharded read-write locks) for concurrent access; the keys are the server's own
+/// labels, so it hashes with [`FxBuildHasher`] as the registry's maps do.
+static STRING_INTERNER: Lazy<DashMap<String, Arc<str>, FxBuildHasher>> =
+    Lazy::new(|| DashMap::with_hasher(FxBuildHasher));
 
 /// Intern a string, returning a cheaply-cloneable `Arc<str>`.
 ///

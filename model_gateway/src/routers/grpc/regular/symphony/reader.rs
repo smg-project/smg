@@ -1,14 +1,12 @@
 //! The reader: Symphony's assignment to a response and the reader the drivers run over the
 //! stop decoder's output, one per choice.
 
-use std::{
-    collections::HashMap,
-    sync::{atomic::AtomicBool, Arc, LazyLock},
-};
+use std::sync::{atomic::AtomicBool, Arc, LazyLock};
 
 use llm_tokenizer::stop::StopSequenceDecoder;
 use openai_protocol::{common::Tool, profile::ProviderProfile};
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 use symphony::{
     Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
     TokenSpan,
@@ -145,11 +143,12 @@ fn variant_of(mut format: Format, no_calls: bool, no_reasoning: bool) -> Format 
 /// clone and the walks of `without_calls`: 19 allocation calls per request,
 /// 2026-10-21).
 static ASKED_VARIANTS: LazyLock<RwLock<AskedVariants>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+    LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
 /// The kept variants by the shared table's address and the ask (no calls, no
-/// reasoning).
-type AskedVariants = HashMap<(usize, bool, bool), AskedVariant>;
+/// reasoning); the key is the process's own, hashed with the Fx hasher as the
+/// gateway's other address-keyed maps are.
+type AskedVariants = FxHashMap<(usize, bool, bool), AskedVariant>;
 
 /// How many variants are kept before the map starts over: the registry's
 /// groups, the named tables and the templates' tables come to a few hundred,
