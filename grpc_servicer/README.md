@@ -169,14 +169,17 @@ performed by vLLM's own `inprocess` or `redis` processors; configure those
 through the engine's media loader settings. SGLang and TokenSpeed currently
 use the Router's media pipeline, so set the budgets on the Router for them.
 
-A fetch that fails is answered under `media_fetch_failed` by whose fault it
-is, on the Router's pipeline and the vLLM Rust worker's alike: a reference the
-request got wrong (a URL that cannot be parsed or resolved, a host that refuses
-the connection or answers 4xx, a payload that is not the media it claims to
-be) is a 400; a host that does not deliver within the budget, answers 5xx or
-breaks the transfer is a 502, so a client knows whether to retry. Neither
-counts against the worker's circuit breaker, and the Router does not replay
-either on another worker, which would meet the same host.
+Media the request got wrong as it sent it (a data URL that is malformed or not
+base64, a payload that is not the media it claims to be, a URL that does not
+parse or names a host the policy refuses, an `fps` or `max_long_side_pixel`
+out of range) is a 400 `invalid_multimodal_request`, the media stage's own
+code, on the Router's pipeline and the vLLM Rust worker's alike. A fetch that
+was attempted and failed is answered under `media_fetch_failed` by whose fault
+it is: a host that cannot be resolved, refuses the connection or answers 4xx
+is a 400; a host that does not deliver within the budget, answers 5xx or
+breaks the transfer is a 502, so a client knows whether to retry. None of
+these counts against the worker's circuit breaker, and the Router does not
+replay a fetch failure on another worker, which would meet the same host.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's

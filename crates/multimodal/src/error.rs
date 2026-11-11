@@ -204,11 +204,21 @@ pub enum MediaFault {
 /// media code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaErrorCode {
-    /// `media_fetch_failed`: the media could not be fetched or read: a URL
-    /// that cannot be parsed or is not allowed, a host that cannot be
-    /// resolved or does not deliver within the fetch budget, an origin that
-    /// refuses or fails, a transfer that broke, a payload that is not the
-    /// media it claims to be, a media parameter out of range.
+    /// `invalid_multimodal_request`: the request's media is refused as the
+    /// request sent it, under the code the media stage already answers a
+    /// modality the model does not take: a data URL that is malformed or not
+    /// base64, a payload that is not the media it claims to be, a URL that
+    /// does not parse or names no host, a host the policy refuses by name or
+    /// by the address it resolves to, a local path outside the allow list, a
+    /// media parameter out of range (`fps`, `max_long_side_pixel`). Not a
+    /// host's trouble and nothing a retry would change: the request itself
+    /// is what to fix.
+    InvalidRequest,
+    /// `media_fetch_failed`: a fetch or read that was attempted failed: a
+    /// host that cannot be resolved or does not deliver within the fetch
+    /// budget, an origin that refuses or fails, a transfer that broke, a
+    /// redirect the policy refuses or too many of them, a local file the
+    /// request names that could not be read.
     FetchFailed,
     /// `media_too_large`: the media is over a size cap: its input bytes
     /// ([`MediaConnectorError::PayloadTooLarge`]), the bytes it would decode
@@ -225,6 +235,7 @@ impl MediaErrorCode {
     /// The code as the envelope spells it.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::InvalidRequest => "invalid_multimodal_request",
             Self::FetchFailed => "media_fetch_failed",
             Self::TooLarge => "media_too_large",
         }
@@ -232,7 +243,7 @@ impl MediaErrorCode {
 
     /// The code spelled `code`, if it is one.
     pub fn parse(code: &str) -> Option<Self> {
-        [Self::FetchFailed, Self::TooLarge]
+        [Self::InvalidRequest, Self::FetchFailed, Self::TooLarge]
             .into_iter()
             .find(|candidate| candidate.as_str() == code)
     }
@@ -241,7 +252,13 @@ impl MediaErrorCode {
 impl MediaConnectorError {
     /// How the public API names this error; see [`MediaErrorCode`]. A size
     /// refusal is told apart from every other failure of the media, so a
-    /// client can tell what to shrink from what to re-host.
+    /// client can tell what to shrink from what to re-host; media refused as
+    /// the request sent it (a malformed reference or payload, a host the
+    /// policy refuses, a parameter out of range) is told apart from a fetch
+    /// that was attempted and failed, so a client can tell what to fix in
+    /// the request from what to retry. A failure of this process's own
+    /// ([`MediaFault::Internal`]) is answered with no media code; its value
+    /// here is not read.
     pub fn code(&self) -> MediaErrorCode {
         match self {
             Self::PixelBudgetExceeded { .. }
@@ -258,20 +275,20 @@ impl MediaConnectorError {
             | Self::InvalidUrl(_)
             | Self::DisallowedDomain(_)
             | Self::DisallowedAddress { .. }
-            | Self::UnresolvableHost { .. }
-            | Self::DisallowedRedirect { .. }
-            | Self::TooManyRedirects { .. }
             | Self::DisallowedLocalPath(_)
-            | Self::Http(_)
-            | Self::Io(_)
             | Self::Base64Decode(_)
             | Self::DataUrl(_)
+            | Self::Image(_)
+            | Self::AudioDecode(_)
+            | Self::VideoDecode(_) => MediaErrorCode::InvalidRequest,
+            Self::UnresolvableHost { .. }
+            | Self::DisallowedRedirect { .. }
+            | Self::TooManyRedirects { .. }
+            | Self::Http(_)
+            | Self::Io(_)
             | Self::Blocking(_)
             | Self::DecodeIo(_)
             | Self::DecoderUnavailable(_)
-            | Self::Image(_)
-            | Self::AudioDecode(_)
-            | Self::VideoDecode(_)
             | Self::Timeout { .. } => MediaErrorCode::FetchFailed,
         }
     }
@@ -491,17 +508,96 @@ mod tests {
                 host: "media.invalid".to_string(),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),
             },
-            MediaConnectorError::VideoDecode("not a video".to_string()),
             MediaConnectorError::DecodeIo(std::io::Error::other("no space left on device")),
         ] {
             assert_eq!(error.code(), MediaErrorCode::FetchFailed, "{error}");
         }
-        for code in [MediaErrorCode::FetchFailed, MediaErrorCode::TooLarge] {
+        for code in [
+            MediaErrorCode::InvalidRequest,
+            MediaErrorCode::FetchFailed,
+            MediaErrorCode::TooLarge,
+        ] {
             assert_eq!(MediaErrorCode::parse(code.as_str()), Some(code));
         }
         assert_eq!(MediaErrorCode::FetchFailed.as_str(), "media_fetch_failed");
         assert_eq!(MediaErrorCode::TooLarge.as_str(), "media_too_large");
         assert_eq!(MediaErrorCode::parse("media_ref_too_large"), None);
+    }
+
+    /// Media refused as the request sent it (a malformed data URL or
+    /// payload, a reference that does not parse or names a host the policy
+    /// refuses, a media parameter out of range) is the request's own fault
+    /// under the media stage's `invalid_multimodal_request`, apart from a
+    /// fetch or read that was attempted and failed (`media_fetch_failed`),
+    /// so a client can tell what to fix in the request from what to retry
+    /// or re-host.
+    #[test]
+    fn media_refused_as_sent_has_the_media_stages_code() {
+        for error in [
+            MediaConnectorError::InvalidMaxLongSidePixel {
+                value: 0,
+                factor: 28,
+            },
+            MediaConnectorError::InvalidSampleFps {
+                value: -1.0,
+                min: 0.2,
+                max: 5.0,
+            },
+            MediaConnectorError::InvalidImageLongSideCap { value: 0 },
+            MediaConnectorError::InvalidVideoLongSideCap {
+                value: 100,
+                factor: 28,
+                min: 150,
+                max: 3584,
+            },
+            MediaConnectorError::InvalidUrl("not a url".to_string()),
+            MediaConnectorError::DisallowedDomain("other.example".to_string()),
+            MediaConnectorError::DisallowedAddress {
+                host: "127.0.0.1".to_string(),
+                address: IpAddr::from([127, 0, 0, 1]),
+                class: "loopback",
+            },
+            MediaConnectorError::DisallowedLocalPath("/etc/hostname".to_string()),
+            MediaConnectorError::Base64Decode(base64::DecodeError::InvalidByte(0, b'!')),
+            MediaConnectorError::DataUrl("missing comma in data url".to_string()),
+            MediaConnectorError::Image(image::ImageError::Decoding(
+                image::error::DecodingError::new(
+                    image::error::ImageFormatHint::Unknown,
+                    "the image format could not be determined",
+                ),
+            )),
+            MediaConnectorError::AudioDecode("not audio".to_string()),
+            MediaConnectorError::VideoDecode("not a video".to_string()),
+        ] {
+            assert_eq!(error.code(), MediaErrorCode::InvalidRequest, "{error}");
+            assert_eq!(error.fault(), MediaFault::Client, "{error}");
+        }
+        for error in [
+            MediaConnectorError::UnresolvableHost {
+                host: "media.invalid".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            MediaConnectorError::DisallowedRedirect {
+                url: "http://media.example/a.png".to_string(),
+                target: "http://10.0.0.5/a.png".to_string(),
+                reason: "private".to_string(),
+            },
+            MediaConnectorError::TooManyRedirects {
+                url: "http://media.example/a.png".to_string(),
+                limit: 10,
+            },
+            MediaConnectorError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            MediaConnectorError::Timeout {
+                url: "https://media.example/clip.mp4".to_string(),
+                budget: Duration::from_secs(30),
+            },
+        ] {
+            assert_eq!(error.code(), MediaErrorCode::FetchFailed, "{error}");
+        }
+        assert_eq!(
+            MediaErrorCode::InvalidRequest.as_str(),
+            "invalid_multimodal_request"
+        );
     }
 
     /// A decode task that never answers is this process's fault.

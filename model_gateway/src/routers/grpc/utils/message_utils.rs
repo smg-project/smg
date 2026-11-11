@@ -7,7 +7,7 @@
 use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
-use llm_multimodal::{MediaPartOrder, Modality};
+use llm_multimodal::{MediaErrorCode, MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
     traits::{MediaHandling, PromptEncoding, Tokenizer},
@@ -315,10 +315,12 @@ pub(crate) struct MediaContext {
     pub(crate) tokenizer_source: String,
 }
 
-/// The 400 for media the request carries that cannot be prepared.
+/// The 400 for media the request carries that cannot be prepared, under the
+/// media stage's code (`MediaErrorCode::InvalidRequest`, the one the media
+/// pipeline answers media refused as the request sent it under).
 pub(crate) fn invalid_multimodal_request(error: impl Display) -> Response {
     error::bad_request(
-        "invalid_multimodal_request",
+        MediaErrorCode::InvalidRequest.as_str(),
         format!("Invalid multimodal request: {error}"),
     )
 }

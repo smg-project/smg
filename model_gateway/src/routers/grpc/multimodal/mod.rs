@@ -147,7 +147,8 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// the connector's verdict on it, the same the worker-side pipeline reports
 /// for the same failure: a failure of the request's own media (a reference it
 /// got wrong, an origin that refuses or answers 4xx, a clip over a size cap)
-/// is a 400 under the media's code (`media_fetch_failed`, `media_too_large`);
+/// is a 400 under the media's code (`invalid_multimodal_request` for media
+/// refused as the request sent it, `media_fetch_failed`, `media_too_large`);
 /// a failure of the media's host for now (an origin that does not deliver
 /// within the fetch budget, answers 5xx or breaks the transfer) a 502 under
 /// the same code, so a client can tell what to fix from what to retry, and
@@ -557,7 +558,10 @@ mod tests {
     /// A fetch that ran out of its budget and an origin that answered 5xx are
     /// the media host's trouble for now, a 502 `server_error` under
     /// `media_fetch_failed`; a host that cannot be resolved is the request's
-    /// own input, a 400 `invalid_request_error` under the same code; a clip
+    /// own input, a 400 `invalid_request_error` under the same code; a
+    /// malformed data URL, a parameter out of range and a host the policy
+    /// refuses are the request's own as sent, 400s under
+    /// `invalid_multimodal_request`; a clip
     /// over the decoded-size cap and an item over the input cap are 400s
     /// under `media_too_large`; a scratch file that failed on this side and
     /// a preprocessing task that died are 500 `server_error`s; a failure with
@@ -615,6 +619,33 @@ mod tests {
                 }),
                 StatusCode::BAD_REQUEST,
                 "media_fetch_failed",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DataUrl(
+                    "missing comma in data url".to_string(),
+                )),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::InvalidMaxLongSidePixel {
+                    value: 0,
+                    factor: 28,
+                }),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DisallowedAddress {
+                    host: "127.0.0.1".to_string(),
+                    address: std::net::IpAddr::from([127, 0, 0, 1]),
+                    class: "loopback",
+                }),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
                 "invalid_request_error",
             ),
             (
