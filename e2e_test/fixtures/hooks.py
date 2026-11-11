@@ -8,7 +8,8 @@ This module handles:
   evict-and-restart between consecutive classes that share a backend.
 - Session teardown: Stop all pooled workers on session finish.
 - Rerun record: name every case pytest-rerunfailures ran again (the terminal
-  summary, the run page's annotations, ``reruns.txt`` under ``E2E_LOG_DIR``).
+  summary, the run page's annotations and step summary, ``reruns.txt`` under
+  ``E2E_LOG_DIR``).
 """
 
 from __future__ import annotations
@@ -580,7 +581,9 @@ class _RerunReporter:
     ``e2e rerun:`` line per rerun in the terminal summary, a warning
     annotation per rerun on the run page under GitHub Actions, and
     ``reruns.txt`` under ``E2E_LOG_DIR``, the directory a row's worker logs
-    are uploaded from.
+    are uploaded from. The rows upload that directory on failure alone, so
+    the same lines go into the step summary (``GITHUB_STEP_SUMMARY``), the
+    record of a green row's reruns that outlives the runner.
     """
 
     def __init__(self) -> None:
@@ -611,11 +614,18 @@ class _RerunReporter:
         if os.environ.get("GITHUB_ACTIONS") == "true":
             for record in records:
                 terminalreporter.write_line(_annotation(record))
+        text = "\n".join(lines) + "\n"
         log_dir = os.environ.get("E2E_LOG_DIR")
         if lines and log_dir:
             os.makedirs(log_dir, exist_ok=True)
             with open(os.path.join(log_dir, "reruns.txt"), "w", encoding="utf-8") as file:
-                file.write("\n".join(lines) + "\n")
+                file.write(text)
+        step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if lines and step_summary:
+            # A line break first: the step's earlier summary may end without
+            # one, and a heading renders only at the start of a line.
+            with open(step_summary, "a", encoding="utf-8") as file:
+                file.write(f"\n### e2e reruns: {len(records)}\n\n```text\n{text}```\n")
 
 
 def pytest_collection_modifyitems(
