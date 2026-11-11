@@ -1163,7 +1163,7 @@ impl WorkerMonitor {
     /// the shared snapshot removal is queued so a removal wave costs one
     /// batched rebuild instead of one per worker (see
     /// [`Self::flush_pending_evictions`]).
-    fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
+    pub(crate) fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         // No load feed, no verdict: a flag left set would strand the worker
         // out of routing with nothing to ever clear it.

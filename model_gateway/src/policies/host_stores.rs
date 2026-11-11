@@ -549,6 +549,23 @@ fn engine_load_of(row: LoadRow, role: Role) -> EngineLoad {
     }
 }
 
+/// One rank's entry of a polled report, from the store's row.
+fn scheduler_entry_of(rank: u16, row: LoadRow, role: Role) -> SchedulerLoadSnapshot {
+    let mut entry = SchedulerLoadSnapshot::from(&engine_load_of(row, role));
+    entry.dp_rank = i32::from(rank);
+    entry
+}
+
+/// A polled report over `loads`, sampled when the poll began.
+fn polled_report_of(loads: Vec<SchedulerLoadSnapshot>, polled_at: Instant) -> WorkerLoadResponse {
+    WorkerLoadResponse {
+        dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
+        loads,
+        sampled_at: Some(polled_at),
+        ..WorkerLoadResponse::default()
+    }
+}
+
 // ---------------------------------------------------------------- workers
 
 /// Two of the trait's rules bend to the registry's shape until it gains an
@@ -767,13 +784,41 @@ impl LoadSink for HostStores {
         rank: u16,
         row: LoadRow,
         received_at: Instant,
-        _source: LoadSource,
+        source: LoadSource,
     ) {
         let (Some(monitor), Some(worker)) = (self.monitor(), self.resolve(id)) else {
             return;
         };
-        let record = engine_load_of(row, role_of(*worker.worker_type()));
-        monitor.apply_pushed_load(&worker, i32::from(rank), &record, received_at);
+        let role = role_of(*worker.worker_type());
+        match source {
+            LoadSource::Stream | LoadSource::Relay(_) => {
+                let record = engine_load_of(row, role);
+                monitor.apply_pushed_load(&worker, i32::from(rank), &record, received_at);
+            }
+            // The gateway's own read of one rank takes the poll's path, which
+            // writes no push receipt, over the worker's other published ranks.
+            LoadSource::Poll | LoadSource::Scrape => {
+                let read = scheduler_entry_of(rank, row, role);
+                let mut loads: Vec<SchedulerLoadSnapshot> = monitor
+                    .load_snapshot()
+                    .report(worker.url())
+                    .map(|(report, _)| {
+                        report
+                            .loads
+                            .iter()
+                            .filter(|entry| entry.dp_rank != read.dp_rank)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                loads.push(read);
+                monitor.ingest_polled_report(
+                    &worker,
+                    polled_report_of(loads, received_at),
+                    received_at,
+                );
+            }
+        }
     }
 
     /// A poll's rows take the poll loop's own path: merged over a pushed
@@ -792,19 +837,9 @@ impl LoadSink for HostStores {
         let role = role_of(*worker.worker_type());
         let loads: Vec<SchedulerLoadSnapshot> = rows
             .iter()
-            .map(|&(rank, row)| {
-                let mut entry = SchedulerLoadSnapshot::from(&engine_load_of(row, role));
-                entry.dp_rank = i32::from(rank);
-                entry
-            })
+            .map(|&(rank, row)| scheduler_entry_of(rank, row, role))
             .collect();
-        let report = WorkerLoadResponse {
-            dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
-            loads,
-            sampled_at: Some(polled_at),
-            ..WorkerLoadResponse::default()
-        };
-        monitor.ingest_polled_report(&worker, report, polled_at);
+        monitor.ingest_polled_report(&worker, polled_report_of(loads, polled_at), polled_at);
     }
 
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode {
@@ -856,9 +891,17 @@ impl LoadSink for HostStores {
             .map_or(0, |(report, _)| report.loads.len())
     }
 
-    /// The monitor evicts a worker on the registry's removal event, which
-    /// [`WorkersStore::remove`] emits through the registry.
-    fn evict(&self, _id: WorkerId) {}
+    /// The monitor's eviction, as the registry's removal event drives it for
+    /// a removed worker: the overload flag, the pushed state and the memo go
+    /// now, the snapshot entry in a rebuild flushed here, so a worker that
+    /// stays registered after its reports stopped reads empty at once.
+    fn evict(&self, id: WorkerId) {
+        let (Some(monitor), Some(worker)) = (self.monitor(), self.resolve(id)) else {
+            return;
+        };
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+    }
 }
 
 // -------------------------------------------------------------- KV events
@@ -1265,6 +1308,105 @@ mod tests {
         assert!(
             !host.completed_ok_since(GatewayId::LOCAL, id, now),
             "another gateway's dispatch does not count"
+        );
+    }
+
+    fn monitor_host() -> (
+        tokio::runtime::Runtime,
+        Arc<WorkerRegistry>,
+        Arc<WorkerMonitor>,
+        HostStores,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the monitor's publish task");
+        let registry = Arc::new(WorkerRegistry::new());
+        let monitor = {
+            let _enter = runtime.enter();
+            Arc::new(WorkerMonitor::new(
+                Arc::clone(&registry),
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                1,
+                false,
+                false,
+            ))
+        };
+        let host = HostStores::new(Arc::clone(&registry), Some(&monitor), None);
+        (runtime, registry, monitor, host)
+    }
+
+    /// The store contract's scrape rule through the host: a scrape record is
+    /// the gateway's own read, so it writes no push receipt and the poll
+    /// stays, while a stream record of the same worker suppresses it.
+    #[test]
+    fn a_scrape_record_writes_no_receipt_so_the_poll_stays_through_the_host() {
+        let (runtime, registry, _monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let row = LoadRow {
+            running: 4,
+            live_rate: 2_000,
+            ..LoadRow::default()
+        };
+        host.record(id, 0, row, t0, LoadSource::Scrape);
+        assert_eq!(
+            host.load(id, 0).map(|sample| sample.row.running),
+            Some(4),
+            "the row is held"
+        );
+        assert_eq!(
+            host.poll_mode(id, t0 + Duration::from_secs(1), interval),
+            PollMode::Poll,
+            "a scrape writes no receipt"
+        );
+        host.record(id, 0, row, t0 + Duration::from_secs(1), LoadSource::Stream);
+        assert_eq!(
+            host.poll_mode(id, t0 + Duration::from_secs(2), interval),
+            PollMode::Suppressed,
+            "the stream's receipt is the one read"
+        );
+    }
+
+    /// The store contract's eviction through the host: a worker that stays
+    /// registered after its reports stopped loses its samples, its rank
+    /// count and its push receipt on `evict`, and its poll resumes.
+    #[test]
+    fn evict_clears_a_registered_workers_loads_through_the_host() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let row = LoadRow {
+            running: 4,
+            live_rate: 2_000,
+            ..LoadRow::default()
+        };
+        host.record(id, 0, row, t0, LoadSource::Stream);
+        monitor.flush_pushed();
+        assert_eq!(host.ranks(id), 1);
+        assert_eq!(
+            host.poll_mode(id, t0 + Duration::from_secs(1), interval),
+            PollMode::Suppressed
+        );
+        host.evict(id);
+        assert_eq!(
+            host.load(id, 0).map(|sample| sample.row.running),
+            None,
+            "the samples are gone"
+        );
+        assert_eq!(host.ranks(id), 0, "the rank count is gone");
+        assert_eq!(
+            host.poll_mode(id, t0 + Duration::from_secs(2), interval),
+            PollMode::Poll,
+            "the receipt is gone, the poll resumes"
         );
     }
 
