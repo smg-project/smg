@@ -420,13 +420,21 @@ fn a_byte_without_a_token_leaves_its_pieces_to_the_model() {
     let mut state = 0xB17E_0000_0000_0001u64;
     let shape = &shapes()[0];
     let mut tokenizer = tokenizer_of(shape, &mut state);
-    // The vertical tab's token taken out: no pool text holds the byte, so
-    // no merge names it.
+    // The vertical tab's token taken out, with every merge that names it
+    // (a vocabulary without the byte's token has none).
     let gone = bytes_char()[0x0B].to_string();
     let mut model = serde_json::to_value(tokenizer.get_model()).expect("the model as JSON");
     let vocab = model["vocab"].as_object_mut().expect("the vocabulary");
     assert!(vocab.remove(&gone).is_some(), "the byte's token was there");
-    tokenizer.with_model(serde_json::from_value::<BPE>(model).expect("a model without it"));
+    let merges = model["merges"].as_array_mut().expect("the merges");
+    merges.retain(|merge| match merge {
+        Value::Array(pair) => pair.iter().all(|part| part.as_str() != Some(&gone)),
+        Value::String(line) => line.split(' ').all(|part| part != gone),
+        _ => true,
+    });
+    // Read back from text: the model's reader borrows its strings.
+    let model = serde_json::to_string(&model).expect("the model as text");
+    tokenizer.with_model(serde_json::from_str::<BPE>(&model).expect("a model without it"));
     let native = seeded(&tokenizer);
     assert!(native
         .merges
@@ -1384,7 +1392,7 @@ fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
     let mut vocab = Vocab::default();
     let mut alphabet: Vec<char> = table.to_vec();
     alphabet.sort_unstable();
-    for ch in alphabet.into_iter().filter(|&ch| ch != table[0]) {
+    for ch in alphabet {
         let id = vocab.len() as u32;
         vocab.insert(ch.to_string(), id);
     }
@@ -1397,8 +1405,11 @@ fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
         }
         merges.push((a.to_owned(), b.to_owned()));
     }
+    // A model that marks the end of a word: the table declines it, the
+    // model merges every piece.
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
+        .end_of_word_suffix("</w>".to_owned())
         .build()
         .expect("bpe");
     tokenizer.with_model(bpe);
