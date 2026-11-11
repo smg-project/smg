@@ -54,22 +54,7 @@ impl SglangSchedulerClient {
         "SGLang scheduler"
     );
 
-    /// Submit an embedding request
-    pub async fn embed(
-        &self,
-        req: proto::EmbedRequest,
-    ) -> Result<proto::EmbedResponse, tonic::Status> {
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        // Inject W3C trace context into gRPC metadata
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.embed(request).await?;
-        Ok(response.into_inner())
-    }
+    crate::impl_embed!(proto);
 
     /// Abort a request
     pub async fn abort_request(

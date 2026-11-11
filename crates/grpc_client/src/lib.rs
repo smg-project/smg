@@ -458,3 +458,91 @@ macro_rules! impl_abort_for_drop_with_reason {
     };
 }
 pub(crate) use impl_abort_for_drop_with_reason;
+
+/// The abort of a client whose wire carries request ids alone: the reason
+/// stays in the signature the abort-on-drop hook calls and is not sent.
+macro_rules! impl_abort_without_reason {
+    ($proto:ident) => {
+        /// Abort a request
+        pub async fn abort_request(
+            &self,
+            request_id: String,
+            _reason: String,
+        ) -> Result<(), tonic::Status> {
+            tracing::debug!("Sending abort request for {}", request_id);
+            let request = tonic::Request::new($proto::AbortRequest {
+                request_ids: vec![request_id.clone()],
+            });
+
+            let mut client = self.client.clone();
+            let _response = client.abort(request).await?;
+            tracing::debug!("Abort response received for {}", request_id);
+            Ok(())
+        }
+    };
+}
+pub(crate) use impl_abort_without_reason;
+
+/// The embedding RPC with the trace context injected into its metadata.
+macro_rules! impl_embed {
+    ($proto:ident) => {
+        /// Submit an embedding request
+        pub async fn embed(
+            &self,
+            req: $proto::EmbedRequest,
+        ) -> Result<$proto::EmbedResponse, tonic::Status> {
+            let mut client = self.client.clone();
+            let mut request = tonic::Request::new(req);
+
+            if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+
+            let response = client.embed(request).await?;
+            Ok(response.into_inner())
+        }
+    };
+}
+pub(crate) use impl_embed;
+
+/// The load conversions of a wire whose `SchedulerLoad` carries a rank's poll
+/// figures alone: field for field, the measured input capacity where the
+/// servicer reports one, every other canonical field absent.
+macro_rules! impl_rank_load_conversions {
+    ($proto:ident) => {
+        impl From<$proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
+            fn from(load: $proto::SchedulerLoad) -> Self {
+                Self {
+                    dp_rank: load.dp_rank,
+                    num_running_reqs: load.num_running_reqs,
+                    num_waiting_reqs: load.num_waiting_reqs,
+                    num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
+                    num_total_reqs: load.num_total_reqs,
+                    num_used_tokens: load.num_used_tokens,
+                    max_total_num_tokens: load.max_total_num_tokens,
+                    token_usage: load.token_usage,
+                    gen_throughput: load.gen_throughput,
+                    prefill_throughput: load.prefill_throughput,
+                    cache_hit_rate: load.cache_hit_rate,
+                    utilization: load.utilization,
+                    max_running_requests: load.max_running_requests,
+                    ..Default::default()
+                }
+            }
+        }
+
+        impl From<$proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
+            fn from(resp: $proto::GetLoadsResponse) -> Self {
+                Self {
+                    timestamp: resp.timestamp,
+                    version: resp.version,
+                    dp_rank_count: resp.dp_rank_count,
+                    loads: resp.loads.into_iter().map(Into::into).collect(),
+                    aggregate: None,
+                    sampled_at: None,
+                }
+            }
+        }
+    };
+}
+pub(crate) use impl_rank_load_conversions;
