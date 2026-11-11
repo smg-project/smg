@@ -656,7 +656,9 @@ impl LeastLoad {
         } else {
             nominal
         };
-        let k = r.active_kv().clamp(0.0, 0.999_999);
+        // The active share, at the legacy formula's clamp: a saturated row
+        // prices its barrier at 999 times the weight, not a million.
+        let k = r.active_kv().clamp(0.0, 0.999);
         (queued + running + credit_work) / drain + self.kv_pressure_weight * k / (1.0 - k)
     }
 
@@ -1771,6 +1773,36 @@ mod tests {
             scores[1] < 1.0,
             "the busy worker's held share is the pressure"
         );
+    }
+
+    #[test]
+    fn the_kv_barrier_reads_the_active_share_at_the_legacy_clamp() {
+        let scorer = LeastLoad::new(0.15, 1024, 2000.0);
+        let row = |active: u16, total: u16, queued: u32| LoadRow {
+            active_kv_permille: active,
+            kv_usage_permille: total,
+            queued,
+            live_rate: 2000,
+            ..LoadRow::default()
+        };
+        let facts = RequestFacts::default();
+        // A saturated row prices its barrier at 999 times the weight (150 s
+        // at 0.15), so a queue of 400 requests at the mean prefill (205 s)
+        // loses to it; at a clamp of 0.999999 the barrier would be 150,000 s
+        // and the queue would win.
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(row(1000, 1000, 0));
+        pool[1].load = Some(row(0, 0, 400));
+        let mut scores = [0.0f32; 2];
+        scorer.score(&facts, &pool, &kept(2), &mut scores);
+        assert!(scores[0] > scores[1], "{scores:?}");
+        // The barrier reads the active share: a cache full of evictable
+        // blocks (total 1.0, active 0.1) is lighter than one half held by
+        // running requests.
+        pool[0].load = Some(row(100, 1000, 0));
+        pool[1].load = Some(row(500, 500, 0));
+        scorer.score(&facts, &pool, &kept(2), &mut scores);
+        assert!(scores[0] > scores[1], "{scores:?}");
     }
 
     #[test]
