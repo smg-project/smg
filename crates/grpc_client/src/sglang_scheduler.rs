@@ -825,6 +825,24 @@ mod tests {
         assert!(params.logit_bias.is_empty());
     }
 
+    /// A completions `max_tokens` of zero reaches the proto as `Some(0)`, a
+    /// prefill-only turn (the prompt-scoring request, `echo` with `logprobs`),
+    /// not as an unset limit.
+    #[test]
+    fn completion_max_tokens_zero_reaches_the_proto_as_zero() {
+        let scoring: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "echo": true, "logprobs": 1, "max_tokens": 0
+        }))
+        .expect("a completion request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&scoring)
+            .expect("build sampling params");
+        assert_eq!(
+            params.max_new_tokens,
+            Some(0),
+            "an explicit zero is prefill only, not an unset limit"
+        );
+    }
+
     #[test]
     fn test_scheduler_load_maps_disagg_section() {
         let load = proto::SchedulerLoad {
