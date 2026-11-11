@@ -489,6 +489,52 @@ fn every_shape_gets_a_native_path() {
     }
 }
 
+/// A vocabulary without a token for one byte (some files lack one for a
+/// byte no text of theirs holds) keeps its merge table: the pieces that
+/// hold the byte are the model's, every other piece merges in the table.
+#[test]
+fn a_byte_without_a_token_leaves_its_pieces_to_the_model() {
+    let mut state = 0xB17E_0000_0000_0001u64;
+    let shape = &shapes()[0];
+    let mut tokenizer = tokenizer_of(shape, &mut state);
+    // The vertical tab's token taken out, with every merge that names it
+    // (a vocabulary without the byte's token has none).
+    let gone = bytes_char()[0x0B].to_string();
+    let mut model = serde_json::to_value(tokenizer.get_model()).expect("the model as JSON");
+    let vocab = model["vocab"].as_object_mut().expect("the vocabulary");
+    assert!(vocab.remove(&gone).is_some(), "the byte's token was there");
+    let merges = model["merges"].as_array_mut().expect("the merges");
+    merges.retain(|merge| match merge {
+        Value::Array(pair) => pair.iter().all(|part| part.as_str() != Some(&gone)),
+        Value::String(line) => line.split(' ').all(|part| part != gone),
+        _ => true,
+    });
+    // Read back from text: the model's reader borrows its strings.
+    let model = serde_json::to_string(&model).expect("the model as text");
+    tokenizer.with_model(serde_json::from_str::<BPE>(&model).expect("a model without it"));
+    let native = seeded(&tokenizer);
+    assert!(native
+        .merges
+        .as_ref()
+        .is_some_and(|table| table.lacks_a_token_for(b"\x0b")));
+    for text in [
+        "plain words here",
+        "a\u{b}b",
+        " \u{b} \u{b}\u{b}x",
+        "tabs\tand\u{b}more words",
+    ] {
+        let reference = tokenizer
+            .encode(text, false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        let ids = native
+            .encode(Some(tokenizer.get_model()), text, false)
+            .unwrap_or_else(|fallback| panic!("declined {text:?} as {fallback:?}"));
+        assert_eq!(ids, reference, "{text:?}");
+    }
+}
+
 #[test]
 fn shapes_outside_the_path_are_declined() {
     let mut state = 0x1234_5678_9ABC_DEF1u64;
@@ -1483,8 +1529,8 @@ fn every_shape_merges_its_misses_natively() {
 
 #[test]
 fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
-    // A vocabulary without the token of byte 0x00: the table declines the
-    // model, the path stays, and its misses take the model's own merge.
+    // A model that marks the end of a word: the table declines the model,
+    // the path stays, and its misses take the model's own merge.
     let mut state = 0x1212_3434_5656_7878u64;
     let shape = &shapes()[0];
     let mut tokenizer = tokenizer_of(shape, &mut state);
@@ -1492,9 +1538,13 @@ fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
     let mut vocab = Vocab::default();
     let mut alphabet: Vec<char> = table.to_vec();
     alphabet.sort_unstable();
-    for ch in alphabet.into_iter().filter(|&ch| ch != table[0]) {
-        let id = vocab.len() as u32;
-        vocab.insert(ch.to_string(), id);
+    for ch in alphabet {
+        // The word-final form too, so the model keeps a word's last
+        // character and the merges below fire inside the longer words.
+        for token in [ch.to_string(), format!("{ch}</w>")] {
+            let id = vocab.len() as u32;
+            vocab.insert(token, id);
+        }
     }
     let mut merges = Merges::new();
     for (a, b) in [("a", "b"), ("b", "c"), ("ab", "c"), ("a", "bc")] {
@@ -1505,8 +1555,11 @@ fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
         }
         merges.push((a.to_owned(), b.to_owned()));
     }
+    // A model that marks the end of a word: the table declines it, the
+    // model merges every piece.
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
+        .end_of_word_suffix("</w>".to_owned())
         .build()
         .expect("bpe");
     tokenizer.with_model(bpe);

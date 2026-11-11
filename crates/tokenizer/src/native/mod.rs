@@ -962,6 +962,7 @@ impl NativeEncoder {
                     merges = table.merges(),
                     bytes = table.bytes(),
                     preformed_characters = table.preformed_characters(),
+                    missing_bytes = table.missing_bytes(),
                     "the native encode path merges its piece-cache misses itself"
                 );
                 Some(table)
@@ -1336,8 +1337,9 @@ impl NativeEncoder {
     /// over (the model's ids by the table's contract, several for an entry
     /// the merges do not reach); through the model itself on a path without
     /// a table of its own. An entry with a character outside the alphabet is
-    /// no byte-level piece; one the model declines, or whose ids the table
-    /// cannot hold, is left to the miss path. A model with merge dropout
+    /// no byte-level piece; one the model declines, whose ids the table
+    /// cannot hold, or that holds a byte the table has no token for, is left
+    /// to the miss path. A model with merge dropout
     /// tokenizes at random and gets no seed. The entries are read by id, on
     /// the caller's rayon pool when the load runs on one, else on a pool of
     /// `SEED_THREADS` threads that is gone when the read is; without a copy
@@ -1394,7 +1396,12 @@ impl NativeEncoder {
             scratch.ids.clear();
             match (chars, merges) {
                 (Some(chars), _) => chars.merge(entry, &mut scratch.symbols, &mut scratch.ids),
-                (None, Some(table)) => table.merge(piece, &mut scratch.ids),
+                (None, Some(table)) => {
+                    if table.lacks_a_token_for(piece) {
+                        return None;
+                    }
+                    table.merge(piece, &mut scratch.ids);
+                }
                 (None, None) => {
                     for token in &model.tokenize(entry).ok()? {
                         ids.push(token.id)?;
@@ -1571,6 +1578,7 @@ impl NativeEncoder {
             merges = merges.merges(),
             bytes = merges.bytes(),
             preformed_characters = merges.preformed_characters(),
+            missing_bytes = merges.missing_bytes(),
             "the native encode path merges a tiktoken vocabulary's piece-cache misses itself"
         );
         let stages = vec![Stage {
@@ -2177,8 +2185,9 @@ impl NativeEncoder {
     /// Appends the ids of one piece: from the thread's cache, else from the
     /// encoder's seed, else merged over the model's merges (the whole piece
     /// looked up first under `ignore_merges`), else, for a model the merge
-    /// table declined, from the model itself over the piece's byte-level
-    /// alphabet form (a raw piece of the sentencepiece path never comes here:
+    /// table declined or a piece holding a byte the table has no token for,
+    /// from the model itself over the piece's byte-level alphabet form (a
+    /// raw piece of the sentencepiece path never comes here:
     /// it has [`Self::tokenize_raw_piece_slow`]);
     /// remembered in the thread's cache whichever answered;
     /// [`Fallback::PieceDeclined`] when the model declines the piece (or
@@ -2343,7 +2352,13 @@ impl NativeEncoder {
             "a sentencepiece piece takes tokenize_raw_piece_slow"
         );
         if !vacancy.is_some_and(|vacancy| self.seed.ids_into(vacancy.key(), ids)) {
-            if let Some(table) = &self.merges {
+            // A piece holding a byte the table has no token for is the
+            // model's (see `MergeTable::lacks_a_token_for`).
+            if let Some(table) = self
+                .merges
+                .as_ref()
+                .filter(|table| !table.lacks_a_token_for(bytes))
+            {
                 // Under `ignore_merges` a piece that is an entry is that entry:
                 // the model's map is asked when the piece can be one (the
                 // lookup is the piece mapped to the alphabet as a string, its
