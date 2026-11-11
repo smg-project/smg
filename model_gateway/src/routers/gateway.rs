@@ -481,13 +481,15 @@ impl Gateway {
 
     /// The router of a Messages request: in IGW mode an empty message (a
     /// `max_tokens` of 0) may go to a router that answers it without an
-    /// engine.
+    /// engine. Takes the request's `max_tokens`, not the request: a local
+    /// that was borrowed keeps its slot in the route's task across the awaits
+    /// that follow, a second copy of the request per plain request.
     fn select_messages_router(
         &self,
-        body: &CreateMessageRequest,
+        max_tokens: u32,
         model_id: &str,
     ) -> Option<Arc<dyn RouterTrait>> {
-        if self.enable_igw && body.max_tokens == 0 {
+        if self.enable_igw && max_tokens == 0 {
             self.select_router_for_empty_message(model_id)
         } else {
             self.select_router_for_request(Some(model_id))
@@ -512,7 +514,7 @@ impl Gateway {
             Ok(resolved) => resolved,
             Err(refused) => return refused,
         };
-        let response = match self.select_messages_router(&body, model_id) {
+        let response = match self.select_messages_router(body.max_tokens, model_id) {
             Some(router) => {
                 router
                     .route_messages(headers, tenant_meta, body, model_id)
@@ -636,12 +638,19 @@ impl RouterTrait for Gateway {
     ) -> Response {
         // A thread turn runs as its own boxed future: its locals (the chain
         // walk, the rebuild, the answer read back) would otherwise size every
-        // plain request's task.
-        if body.thread.is_some() {
+        // plain request's task. The request is read by value and moved, never
+        // borrowed, before the awaits: a borrowed local keeps a second copy of
+        // the request in every plain request's task (`is_some()` borrows it;
+        // the `matches!` reads the discriminant in place).
+        #[expect(
+            clippy::redundant_pattern_matching,
+            reason = "is_some() borrows the request; a borrowed local keeps its slot in the task"
+        )]
+        if matches!(body.thread, Some(_)) {
             return Box::pin(self.route_messages_thread(headers, tenant_meta, body, model_id))
                 .await;
         }
-        match self.select_messages_router(&body, model_id) {
+        match self.select_messages_router(body.max_tokens, model_id) {
             Some(router) => {
                 router
                     .route_messages(headers, tenant_meta, body, model_id)
