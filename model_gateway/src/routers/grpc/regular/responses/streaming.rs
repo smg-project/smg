@@ -213,10 +213,27 @@ fn frame_text(chunk: &[u8]) -> Cow<'_, str> {
 /// and a re-sliced stream every slice cut from one chunk. Read as one event,
 /// such a frame parses as nothing and everything after its first event is lost.
 fn sse_events(frame: &str) -> impl Iterator<Item = &str> {
-    frame
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|event| !event.is_empty())
+    // The blank line found by the SIMD two-byte search (`memchr`, a dependency
+    // of the gateway already): `str::split("\n\n")` runs the two-way substring
+    // searcher, which held 4.6 % of a Responses request's user instructions.
+    // A split at an ASCII pair is at a character boundary, so the slices are
+    // text.
+    let mut rest = Some(frame);
+    std::iter::from_fn(move || {
+        let text = rest?;
+        Some(match memchr::memmem::find(text.as_bytes(), b"\n\n") {
+            Some(end) => {
+                rest = Some(&text[end + 2..]);
+                &text[..end]
+            }
+            None => {
+                rest = None;
+                text
+            }
+        })
+    })
+    .map(str::trim)
+    .filter(|event| !event.is_empty())
 }
 
 /// One `data:` event of the chat stream's body, as the Responses conversions
@@ -2083,6 +2100,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(error["code"], "internal_error");
         assert_eq!(error["message"], "engine unavailable");
+    }
+
+    #[test]
+    fn the_events_of_a_frame_are_split_at_the_blank_line_as_before() {
+        let frame = "data: {\"a\":1}\n\ndata: {\"b\":2}\n\n\n\n: keep-alive\n\ndata: [DONE]\n\n";
+        let events: Vec<&str> = sse_events(frame).collect();
+        let split: Vec<&str> = frame
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|event| !event.is_empty())
+            .collect();
+        assert_eq!(events, split);
+        assert_eq!(
+            events,
+            [
+                "data: {\"a\":1}",
+                "data: {\"b\":2}",
+                ": keep-alive",
+                "data: [DONE]"
+            ]
+        );
+        assert_eq!(sse_events("").count(), 0);
+        assert_eq!(sse_events("\n\n").count(), 0);
+        assert_eq!(sse_events("data: x").collect::<Vec<_>>(), ["data: x"]);
     }
 
     #[test]
