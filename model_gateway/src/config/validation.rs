@@ -296,7 +296,78 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
             ));
         }
     }
+    // A tcp:// worker URL is what the ZMQ sockets bind, where a userinfo
+    // (`user:secret@`) has no meaning at all: refused, by the adapter's own
+    // reading (an `@` anywhere after the scheme), so that nothing the
+    // validator passes is refused at registration instead, whatever the
+    // `Endpoint` grammar makes of the rest of the string. (A gRPC worker
+    // URL's userinfo is accepted and named by [`unused_credentials_warning`],
+    // at start-up and at registration, where a log line is seen.)
+    if url
+        .strip_prefix("tcp://")
+        .is_some_and(|authority| authority.contains('@'))
+    {
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            Endpoint::redacted_str(url),
+            "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets at the \
+             host and port",
+        ));
+    }
     Ok(())
+}
+
+/// The warning for a `grpc://` worker URL that carries userinfo
+/// (`user:secret@`), `None` for every other URL. An HTTP worker's userinfo
+/// is sent as basic auth; a gRPC worker never receives it, since the channel
+/// names the host and port alone, so a credential written there is named
+/// once, masked, instead of dropped in silence. The URL stays accepted: it is
+/// otherwise valid and deployments may carry one. Pure, so that start-up can
+/// log it after the subscriber exists (the validator runs before) and the
+/// add-worker route can log it at registration.
+pub fn unused_credentials_warning(url: &str) -> Option<String> {
+    let endpoint = Endpoint::parse(url).ok()?;
+    (url.starts_with("grpc://") && endpoint.has_credentials()).then(|| {
+        format!(
+            "worker URL {} carries userinfo, which is not sent to a gRPC worker: the gateway's \
+             channel names the host and port alone",
+            endpoint.redacted()
+        )
+    })
+}
+
+/// [`unused_credentials_warning`] over every worker URL the configuration
+/// lists for a mode, in the order they are listed.
+pub fn unused_credentials_warnings(mode: &RoutingMode) -> Vec<String> {
+    let urls: Vec<&str> = match mode {
+        RoutingMode::Regular { worker_urls }
+        | RoutingMode::OpenAI { worker_urls }
+        | RoutingMode::Anthropic { worker_urls }
+        | RoutingMode::Gemini { worker_urls } => worker_urls.iter().map(String::as_str).collect(),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => prefill_urls
+            .iter()
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+        RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            ..
+        } => encode_urls
+            .iter()
+            .chain(prefill_urls.iter())
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+    };
+    urls.into_iter()
+        .filter_map(unused_credentials_warning)
+        .collect()
 }
 
 /// The encode side takes three policies. This is the one list: the mode walk
@@ -2415,6 +2486,7 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::worker::ConnectionMode;
 
@@ -3530,6 +3602,82 @@ mod tests {
             assert!(!text.contains("secret"), "{text}");
             assert!(text.contains("<unparsable address>"), "{text}");
         }
+    }
+
+    /// A userinfo is refused on a `tcp://` worker URL (the sockets bind the
+    /// host and port; nothing reads it), masked in the refusal.
+    #[test]
+    fn a_tcp_worker_url_with_userinfo_is_refused_masked() {
+        for url in [
+            "tcp://user:secret@10.0.0.5:31000",
+            "tcp://secret@10.0.0.5:31000",
+        ] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("tcp://***@10.0.0.5:31000"), "{text}");
+            assert!(text.contains("takes no userinfo"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+        }
+        assert!(validate_worker_url("tcp://10.0.0.5:31000").is_ok());
+    }
+
+    /// What the ZMQ adapter refuses for a userinfo, the validator refuses
+    /// first: a `tcp://` URL with an `@` that the endpoint grammar reads as
+    /// something else (a rank suffix after it, an empty userinfo) is refused
+    /// here, masked, instead of passing to a refusal at registration.
+    #[test]
+    fn a_tcp_worker_url_the_adapter_refuses_is_refused_by_the_validator() {
+        for url in ["tcp://user:secret@host:1@2", "tcp://@host:31000"] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("takes no userinfo"), "{url}: {text}");
+            assert!(!text.contains("secret"), "{url}: {text}");
+        }
+        let text = validate_worker_url("tcp://user:secret@host:1@2")
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("tcp://***@host:1@2"), "{text}");
+    }
+
+    /// A `grpc://` worker URL with userinfo stays accepted and earns the one
+    /// warning, which names the address masked and never the secret; an
+    /// `http://` URL's userinfo is basic auth and earns none, nor does a URL
+    /// without one. Over a mode, every listed URL is read once, in order.
+    #[test]
+    fn a_grpc_worker_url_with_userinfo_is_accepted_and_named_once_masked() {
+        validate_worker_url("grpc://user:secret@worker:50051").expect("accepted");
+        let warning = unused_credentials_warning("grpc://user:secret@worker:50051").unwrap();
+        assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
+        assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
+        assert!(!warning.contains("secret"), "{warning}");
+        for url in ["http://user:secret@worker:8000", "grpc://worker:50051"] {
+            assert_eq!(unused_credentials_warning(url), None, "{url}");
+        }
+
+        let mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![
+                ("grpc://user:secret@prefill:50051".to_string(), Some(8998)),
+                ("http://user:secret@prefill-http:8000".to_string(), None),
+            ],
+            decode_urls: vec![
+                "grpc://decode:50051".to_string(),
+                "grpc://token@decode-2:50051".to_string(),
+            ],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let warnings = unused_credentials_warnings(&mode);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("grpc://***@prefill:50051"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("grpc://***@decode-2:50051"),
+            "{warnings:?}"
+        );
+        assert!(unused_credentials_warnings(&RoutingMode::Regular {
+            worker_urls: vec!["http://user:secret@worker:8000".to_string()],
+        })
+        .is_empty());
     }
 
     #[test]
