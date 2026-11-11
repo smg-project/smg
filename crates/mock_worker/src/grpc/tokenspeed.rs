@@ -17,7 +17,7 @@ use ts::{
     token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
 };
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, TokenizerStream};
+use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
 use crate::{engine::KvEventStream, script::MatchedStop};
 
 pub(super) type Server = TokenSpeedSchedulerServer<MockScheduler>;
@@ -44,6 +44,14 @@ impl TokenSpeedScheduler for MockScheduler {
         }
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
+        let rendezvous = req
+            .kv_bootstrap_info
+            .as_ref()
+            .map_or(Rendezvous::None, |info| Rendezvous::Named {
+                host: info.bootstrap_host.clone(),
+                port: info.bootstrap_port,
+                room: info.bootstrap_room,
+            });
         let frames = self
             .generate_frames(GenerateInput {
                 request_id: req.request_id.clone(),
@@ -58,6 +66,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 // This proto carries no scores row for requested token ids.
                 score_ids: Vec::new(),
                 pin: req.data_parallel_rank,
+                rendezvous,
             })
             .await?;
         let request_id = req.request_id;

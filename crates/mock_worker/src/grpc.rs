@@ -380,7 +380,8 @@ impl MockScheduler {
 /// choices the request samples, its token limit, whether it streams, the
 /// logprobs it wants (the alternatives per token; `None` for none), the token
 /// ids it asks a score for (a prefill-only scoring request's; empty on the
-/// wires without the field) and the rank it is pinned to.
+/// wires without the field), the rank it is pinned to, and the KV
+/// rendezvous a disaggregated request carries ([`Rendezvous`]).
 pub(crate) struct GenerateInput {
     pub(crate) request_id: String,
     pub(crate) prompt_ids: Vec<u32>,
@@ -391,6 +392,25 @@ pub(crate) struct GenerateInput {
     pub(crate) logprobs: Option<usize>,
     pub(crate) score_ids: Vec<u32>,
     pub(crate) pin: Option<i32>,
+    pub(crate) rendezvous: Rendezvous,
+}
+
+/// The KV rendezvous a disaggregated request carries, read from each
+/// wire's own field ([`SchedulerWire::rendezvous_field`]): the prefill
+/// side's bootstrap server and the room both sides meet under on the
+/// TokenSpeed and SGLang wires, or the connector's parameters the vLLM
+/// wire carries, opaque to the mock. A request without one is a regular
+/// request, or a disaggregated one the gateway sent without its rendezvous.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Rendezvous {
+    #[default]
+    None,
+    Named {
+        host: String,
+        port: i32,
+        room: i64,
+    },
+    Opaque,
 }
 
 /// The logprobs of a frame's tokens: the sampled token's per position, the
@@ -487,6 +507,53 @@ impl MockScheduler {
         Ok(finish_error)
     }
 
+    /// A prefill or decode worker refuses a request without its KV rendezvous,
+    /// as the engines' disaggregated servers do and as the HTTP wire refuses a
+    /// request without its `bootstrap_room`: a request without one would pair
+    /// nowhere. The wire says which sides the gateway names it to: both on
+    /// TokenSpeed and SGLang, the decode side on vLLM, whose prefill request
+    /// carries the connector's parameters only when a connector relays them.
+    /// A named rendezvous needs a host and a port. Its room may be 0: the
+    /// gateway draws SGLang rooms from 0 and a TokenSpeed room residue can
+    /// land on 0, and the engines take it. A prefill worker that bound a
+    /// bootstrap port refuses one naming another port, where its decode
+    /// partner would come. A regular worker takes any request. The check
+    /// comes before the realistic engine's hooks: a request sent to the wrong
+    /// pool spends no armed fault.
+    fn check_rendezvous(&self, rendezvous: &Rendezvous) -> Result<(), Status> {
+        let role = match self.cfg.role {
+            Some(role @ (Role::Prefill | Role::Decode)) => role,
+            Some(Role::Encode) | None => return Ok(()),
+        };
+        let wire = self.cfg.grpc_wire;
+        let field = wire.rendezvous_field();
+        match rendezvous {
+            Rendezvous::None if role == Role::Prefill && !wire.prefill_takes_rendezvous() => Ok(()),
+            Rendezvous::None => Err(Status::invalid_argument(format!(
+                "mock-worker: a {} worker takes a disaggregated request with its {field}",
+                role.as_str()
+            ))),
+            Rendezvous::Named { host, port, room } => {
+                if host.is_empty() || *port <= 0 {
+                    return Err(Status::invalid_argument(format!(
+                        "mock-worker: {field} names no rendezvous (host {host:?}, port {port}, \
+                         room {room})"
+                    )));
+                }
+                match self.bootstrap_port {
+                    Some(own) if role == Role::Prefill && i32::from(own) != *port => {
+                        Err(Status::invalid_argument(format!(
+                            "mock-worker: {field} names bootstrap port {port}, this prefill \
+                             worker bound {own}"
+                        )))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            Rendezvous::Opaque => Ok(()),
+        }
+    }
+
     /// The generate stream of one request, as every wire's `Generate` answers
     /// it, in wire-neutral frames. In flight from here until the stream is
     /// done (or dropped by the gateway), so a shutdown knows what it waits
@@ -495,6 +562,7 @@ impl MockScheduler {
         &self,
         input: GenerateInput,
     ) -> Result<FrameStream, Status> {
+        self.check_rendezvous(&input.rendezvous)?;
         let in_flight = InFlight::enter_on(&self.in_flight);
 
         // A prefill worker's answer: the prompt side's completion alone,

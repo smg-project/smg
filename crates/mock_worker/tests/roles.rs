@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::StreamExt as _;
 use mock_worker::{
     admin,
     config::{Config, Role, SchedulerWire},
@@ -15,7 +16,10 @@ use mock_worker::{
     http, script,
 };
 use serde_json::{json, Value};
-use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm, TokenSpeedSchedulerClient};
+use smg_grpc_client::{
+    sglang_proto as sg, tokenspeed_proto as ts, vllm_proto as vllm, SglangSchedulerClient,
+    TokenSpeedSchedulerClient,
+};
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
@@ -72,6 +76,67 @@ fn request(id: &str, input_ids: &[u32], stream: bool) -> ts::GenerateRequest {
     }
 }
 
+/// The request with the rendezvous the gateway mints for a disaggregated
+/// pair on this wire: the prefill side's bootstrap server and a room.
+fn rendezvous(req: ts::GenerateRequest, port: i32) -> ts::GenerateRequest {
+    rendezvous_room(req, port, 7)
+}
+
+/// The request with a rendezvous naming `room` at the bootstrap `port`.
+fn rendezvous_room(mut req: ts::GenerateRequest, port: i32, room: i64) -> ts::GenerateRequest {
+    req.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+        bootstrap_host: "127.0.0.1".to_string(),
+        bootstrap_port: port,
+        bootstrap_room: room,
+    });
+    req
+}
+
+/// Serve one canned worker of `role` on the SGLang wire, on a free port:
+/// the gateway's client for that wire.
+async fn start_sglang(role: Role) -> SglangSchedulerClient {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a free port");
+    let port = listener.local_addr().expect("listener address").port();
+    let cfg = Config {
+        model_id: "roles-test".to_string(),
+        grpc_base_port: port,
+        grpc_count: 1,
+        output_tokens: 3,
+        role: Some(role),
+        grpc_wire: SchedulerWire::Sglang,
+        ..Config::default()
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server serves until the test process exits"
+    )]
+    let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
+    SglangSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("connect to the mock worker")
+}
+
+/// The SGLang wire's request with a rendezvous naming `room` at the
+/// bootstrap port the gateway would name.
+fn sglang_request(id: &str, room: i32) -> sg::GenerateRequest {
+    sg::GenerateRequest {
+        request_id: id.to_string(),
+        tokenized: Some(sg::TokenizedInput {
+            input_ids: vec![1, 2, 3],
+            original_text: String::new(),
+        }),
+        sampling_params: Some(sg::SamplingParams::default()),
+        disaggregated_params: Some(sg::DisaggregatedParams {
+            bootstrap_host: "127.0.0.1".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: room,
+        }),
+        ..Default::default()
+    }
+}
+
 /// A server-arg value as a string: what the gateway flattens into a label.
 fn server_arg(info: &ts::GetServerInfoResponse, key: &str) -> Option<String> {
     let value = info.server_args.as_ref()?.fields.get(key)?;
@@ -91,7 +156,11 @@ async fn a_prefill_worker_answers_the_prompt_side_alone_and_leaves_the_script_to
     script::enqueue(&name, vec![scripted]).expect("a known worker");
 
     for stream in [true, false] {
-        let frames = generate(&client, request("pd-1", &[1, 2, 3, 4, 5], stream)).await;
+        let frames = generate(
+            &client,
+            rendezvous(request("pd-1", &[1, 2, 3, 4, 5], stream), 8998),
+        )
+        .await;
         assert_eq!(
             frames.len(),
             1,
@@ -160,7 +229,7 @@ async fn a_prefill_worker_binds_its_bootstrap_port_and_advertises_its_role() {
 async fn a_decode_worker_generates_as_a_regular_worker_and_advertises_its_role() {
     let (client, _) = start(Role::Decode, None, Some("kv-v2")).await;
 
-    let frames = generate(&client, request("pd-2", &[1, 2, 3], true)).await;
+    let frames = generate(&client, rendezvous(request("pd-2", &[1, 2, 3], true), 8998)).await;
     let chunks = frames
         .iter()
         .filter(|frame| matches!(frame.response, Some(GenResp::Chunk(_))))
@@ -355,7 +424,7 @@ async fn a_realistic_prefill_worker_honors_an_armed_fault_before_it_answers() {
         .expect("arm the fault");
     assert_eq!(armed.status(), 200);
     let refused = client
-        .generate(request("pd-f1", &[1, 2, 3], false))
+        .generate(rendezvous(request("pd-f1", &[1, 2, 3], false), 8998))
         .await
         .err()
         .expect("the armed status, not a stream");
@@ -363,7 +432,11 @@ async fn a_realistic_prefill_worker_honors_an_armed_fault_before_it_answers() {
     assert_eq!(fault_counts(&http, &fault).await, (1, 0));
 
     // Spent: the next request is the prompt side's completion as before.
-    let frames = generate(&client, request("pd-f2", &[1, 2, 3], false)).await;
+    let frames = generate(
+        &client,
+        rendezvous(request("pd-f2", &[1, 2, 3], false), 8998),
+    )
+    .await;
     let Some(GenResp::Complete(complete)) = &frames[0].response else {
         panic!("a Complete, not {:?}", frames[0]);
     };
@@ -383,7 +456,11 @@ async fn a_realistic_prefill_worker_ends_the_prompt_side_with_error_on_an_armed_
         .await
         .expect("arm the fault");
     assert_eq!(armed.status(), 200);
-    let frames = generate(&client, request("pd-e1", &[1, 2, 3], false)).await;
+    let frames = generate(
+        &client,
+        rendezvous(request("pd-e1", &[1, 2, 3], false), 8998),
+    )
+    .await;
     let Some(GenResp::Complete(complete)) = &frames[0].response else {
         panic!("a Complete, not {:?}", frames[0]);
     };
@@ -399,7 +476,7 @@ async fn a_realistic_prefill_worker_ends_the_prompt_side_with_error_on_an_armed_
         .expect("arm the fault");
     assert_eq!(armed.status(), 200);
     let refused = client
-        .generate(request("pd-e2", &[1, 2, 3], false))
+        .generate(rendezvous(request("pd-e2", &[1, 2, 3], false), 8998))
         .await
         .err()
         .expect("the cut's status, not a stream");
@@ -944,4 +1021,127 @@ async fn a_canned_encode_worker_reports_its_held_request_as_running() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn a_disaggregated_worker_refuses_a_request_without_its_rendezvous() {
+    for role in [Role::Prefill, Role::Decode] {
+        let (client, _) = start(role, None, None).await;
+        // No rendezvous: the request would pair nowhere, as the engines'
+        // disaggregated servers answer, and the refusal names the field.
+        let refused = client
+            .generate(request("pd-r1", &[1, 2, 3], false))
+            .await
+            .err()
+            .expect("no rendezvous, not a stream");
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "{role:?}: {refused:?}"
+        );
+        assert!(
+            refused.message().contains("kv_bootstrap_info"),
+            "{refused:?}"
+        );
+        // A rendezvous with a port of 0 names none.
+        let empty = client
+            .generate(rendezvous(request("pd-r2", &[1, 2, 3], false), 0))
+            .await
+            .err()
+            .expect("a port of 0, not a stream");
+        assert_eq!(
+            empty.code(),
+            tonic::Code::InvalidArgument,
+            "{role:?}: {empty:?}"
+        );
+        // The rendezvous the gateway mints: answered as before.
+        let frames = generate(
+            &client,
+            rendezvous(request("pd-r3", &[1, 2, 3], false), 8998),
+        )
+        .await;
+        assert!(
+            matches!(
+                frames.last().and_then(|frame| frame.response.as_ref()),
+                Some(GenResp::Complete(_))
+            ),
+            "{role:?}: {frames:?}"
+        );
+        // A room of 0 is a room the gateway can mint: taken like any other.
+        let frames = generate(
+            &client,
+            rendezvous_room(request("pd-r4", &[1, 2, 3], false), 8998, 0),
+        )
+        .await;
+        assert!(
+            matches!(
+                frames.last().and_then(|frame| frame.response.as_ref()),
+                Some(GenResp::Complete(_))
+            ),
+            "{role:?}: {frames:?}"
+        );
+    }
+}
+
+/// On the SGLang wire the gateway draws a room from 0 up, so 0 is a room
+/// like any other: both disaggregated roles take it.
+#[tokio::test]
+async fn a_disaggregated_worker_takes_a_room_of_zero_on_the_sglang_wire() {
+    for role in [Role::Prefill, Role::Decode] {
+        let client = start_sglang(role).await;
+        let mut stream = client
+            .generate(sglang_request("pd-sg-0", 0))
+            .await
+            .expect("a room of 0 names a rendezvous");
+        let mut last = None;
+        while let Some(frame) = stream.next().await {
+            last = Some(frame.expect("a response frame"));
+        }
+        stream.mark_completed();
+        assert!(
+            matches!(
+                last.as_ref().and_then(|frame| frame.response.as_ref()),
+                Some(sg::generate_response::Response::Complete(_))
+            ),
+            "{role:?}: {last:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_prefill_worker_refuses_a_rendezvous_naming_another_port() {
+    let bootstrap_port = free_port();
+    let (client, _) = start(Role::Prefill, Some(bootstrap_port), None).await;
+    // Its decode partner would come to the named port for the handoff: a
+    // port other than the one this worker bound is refused with both named.
+    let elsewhere = client
+        .generate(rendezvous(
+            request("pd-p1", &[1, 2, 3], false),
+            i32::from(bootstrap_port) + 1,
+        ))
+        .await
+        .err()
+        .expect("another port, not a stream");
+    assert_eq!(
+        elsewhere.code(),
+        tonic::Code::InvalidArgument,
+        "{elsewhere:?}"
+    );
+    assert!(
+        elsewhere.message().contains(&bootstrap_port.to_string()),
+        "{elsewhere:?}"
+    );
+    let frames = generate(
+        &client,
+        rendezvous(
+            request("pd-p2", &[1, 2, 3], false),
+            i32::from(bootstrap_port),
+        ),
+    )
+    .await;
+    assert_eq!(
+        frames.len(),
+        1,
+        "the prompt side's completion on its own port: {frames:?}"
+    );
 }
