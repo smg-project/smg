@@ -365,13 +365,12 @@ pub fn parse_paths(text: &str) -> Result<Vec<PathSpec>> {
 }
 
 /// The paths of a run on `fleet`: the named ones, or the fleet's default list, each
-/// one the fleet serves (the HTTP fleet refuses the Messages and generate paths by name
-/// and reason).
+/// one the fleet serves (the HTTP fleet refuses the generate paths by name and reason).
 pub fn fleet_paths(fleet: Fleet, text: Option<&str>) -> Result<Vec<PathSpec>> {
     let paths = parse_paths(text.unwrap_or_else(|| fleet.default_paths()))?;
     if let Some(unserved) = paths.iter().find(|p| !fleet.serves(p.name)) {
         bail!(
-            "the {} path is not served on the {} fleet (the mock engine's HTTP wire has no Messages route and answers /generate in the chat shape); name --paths without it",
+            "the {} path is not served on the {} fleet (the mock engine's HTTP wire answers /generate in the chat shape); name --paths without it",
             unserved.name,
             fleet.as_str()
         );
@@ -575,18 +574,15 @@ mod tests {
         );
         assert_eq!(
             names(fleet_paths(Fleet::Http, None).unwrap()),
-            ["chat", "stream", "tools", "json"]
+            ["chat", "stream", "tools", "json", "messages"]
         );
         assert_eq!(
             names(fleet_paths(Fleet::PrefillDecode, Some("messages_stream")).unwrap()),
             ["messages_stream"]
         );
-        let err = fleet_paths(Fleet::Http, Some("chat,messages"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("messages path is not served on the http fleet"),
-            "{err}"
+        assert_eq!(
+            names(fleet_paths(Fleet::Http, Some("chat,messages")).unwrap()),
+            ["chat", "messages"]
         );
         let err = fleet_paths(Fleet::Http, Some("chat,generate_stream_spaced_long"))
             .unwrap_err()

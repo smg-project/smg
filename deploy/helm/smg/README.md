@@ -240,7 +240,7 @@ An older gateway image does not know `--api-key-file`; a chart of this version w
 
 #### Control Plane
 
-`router.adminPort` starts the admin listener (`--admin-port`): the control-plane routes (the admin routes, `/workers` and `/v1/rl`) are served on that container port, with the probes, and the data port answers 404 for them. The chart renders a second Service, `<fullname>-router-admin` (`router.adminService`, ClusterIP by default), so the control plane has a name of its own inside the cluster; the ingress never names it. `router.adminHost` binds the listener on another address.
+`router.adminPort` starts the admin listener (`--admin-port`): the control-plane routes (the admin routes, `/workers` and `/v1/rl`) are served on that container port, with the probes, and the data port answers 404 for them. The chart renders a second Service, `<fullname>-router-admin` (`router.adminService`, ClusterIP by default), so the control plane has a name of its own inside the cluster; the ingress never names it. `router.adminHost` binds the listener on another address. A loopback `router.adminHost` (`127.0.0.1`, `::1`) leaves the admin Service with nowhere to send traffic: Service traffic reaches the pod IP. A host without `router.adminPort`, or an admin port equal to another listener's, is refused at render.
 
 The control-plane API keys (`auth.controlPlane`) reach the gateway as a file, like the shared key: `auth.controlPlane.apiKeys` (one `id:name:role:key` entry per line, role `admin` or `user`) is written into a chart-managed Secret, or `auth.controlPlane.existingSecret` names one, mounted at `/etc/smg/control-plane` and read with `--control-plane-api-keys-file`. A rotated `auth.controlPlane.apiKeys` rolls the router pods (`checksum/control-plane`); a rotated existing Secret needs the rollout restart described above. [`examples/with-admin-plane.yaml`](examples/with-admin-plane.yaml) sets both.
 
@@ -254,7 +254,7 @@ helm install smg deploy/helm/smg \
 
 #### Admission Config
 
-`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a scheduler ConfigMap without the scheduler enabled.
+`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a rate-limit or scheduler ConfigMap without its feature enabled.
 
 ```bash
 kubectl create configmap smg-rate-limit --from-file=rate-limit.yaml=./rate-limit.yaml
@@ -262,6 +262,8 @@ helm install smg deploy/helm/smg \
   --set router.tenantRateLimit.enabled=true \
   --set router.tenantRateLimit.configMap.name=smg-rate-limit
 ```
+
+The gateway reads both files once at start. An edit of a ConfigMap reaches the mounted file through the kubelet's symlink swap, but it takes effect on the next `kubectl rollout restart` of the router Deployment; the mounts stay whole ConfigMaps for a later file watch.
 
 #### Store URLs
 

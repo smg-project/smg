@@ -2223,6 +2223,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn stream_adapter_measures_the_idle_flush_from_the_last_chunk() {
+        let window = policy().idle_flush;
+        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+        let mut out = Box::pin(rechunk_stream(
+            policy(),
+            ReceiverStream::new(rx),
+            NoopObserver,
+        ));
+        // Under the emit threshold and inside the window: held.
+        tx.send(Ok(chunk("abcde"))).await.unwrap();
+        assert!(tokio::time::timeout(window / 5, out.next()).await.is_err());
+        // A second delta late in the window starts a new one: nothing leaves
+        // until a whole window has passed since that delta, not since the
+        // stream began.
+        tokio::time::sleep(window * 3 / 5).await;
+        tx.send(Ok(chunk("fghij"))).await.unwrap();
+        assert!(
+            tokio::time::timeout(window * 4 / 5, out.next())
+                .await
+                .is_err(),
+            "held text left before a window had passed since the last delta"
+        );
+        // And it leaves once that window has passed: bounded from above too,
+        // so a window that grew would be noticed.
+        let frame = tokio::time::timeout(window / 2, out.next())
+            .await
+            .expect("the held text leaves once a window has passed since the last delta")
+            .unwrap()
+            .unwrap();
+        assert_eq!(contents(&[frame]), vec!["abcdefghij"]);
+        drop(tx);
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn stream_adapter_delivers_the_tail_before_an_upstream_error() {
         let upstream = stream::iter(vec![Ok(chunk("ab")), Err(io::Error::other("boom"))]);
         let mut out = Box::pin(rechunk_stream(policy(), upstream, NoopObserver));

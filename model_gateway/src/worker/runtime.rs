@@ -1033,6 +1033,13 @@ impl WorkerRuntime {
             self.note_busy_started();
         }
     }
+    /// [`Self::note_tracked_started`] at `now_ms`: the dispatch's instant,
+    /// read once by the caller and shared with its prefill booking.
+    pub fn note_tracked_started_at(&self, now_ms: u64) {
+        if self.tracked_in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.note_busy_started_at(now_ms);
+        }
+    }
     pub fn note_tracked_ended(&self) {
         let _ =
             self.tracked_in_flight
@@ -1063,8 +1070,11 @@ impl WorkerRuntime {
     }
     /// The load counter left zero: the wedged rule's clock starts now.
     fn note_busy_started(&self) {
-        self.busy_since_ms
-            .store(super::liveness::now_ms().max(1), Ordering::Relaxed);
+        self.note_busy_started_at(super::liveness::now_ms());
+    }
+    /// [`Self::note_busy_started`] at `now_ms`, a stamp the caller read.
+    fn note_busy_started_at(&self, now_ms: u64) {
+        self.busy_since_ms.store(now_ms.max(1), Ordering::Relaxed);
     }
 
     /// Saturating decrement. Returns `true` if the counter was decremented,
@@ -1492,6 +1502,20 @@ mod tests {
             Some(Duration::from_secs(2)),
             "the answer leaves the handoff alone"
         );
+    }
+
+    #[test]
+    fn a_tracked_run_started_at_a_stamp_starts_the_busy_clock_there() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_tracked_started_at(5_000);
+        assert_eq!(runtime.busy_since_ms.load(Ordering::Relaxed), 5_000);
+        // A run under way keeps its start.
+        runtime.note_tracked_started_at(6_000);
+        assert_eq!(runtime.busy_since_ms.load(Ordering::Relaxed), 5_000);
+        runtime.note_tracked_ended();
+        runtime.note_tracked_ended();
+        runtime.note_tracked_started_at(9_000);
+        assert_eq!(runtime.busy_since_ms.load(Ordering::Relaxed), 9_000);
     }
 
     #[test]

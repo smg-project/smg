@@ -6,6 +6,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
+  `ResponseFormat::StructuralTag` carries `Box<serde_json::Map<String, Value>>`. A format had
+  grown from 104 to 128 bytes when the schema kept its description and the structural tag
+  arrived, and the Gateway's chat route task, which holds a request's format three times over
+  its awaits, moved up one allocator size class on every chat request. Behind a pointer each, a
+  format is 16 bytes, a chat request 1,040 (1,152 before), and the task is back in its class;
+  the wire shape and the schema are unchanged, and a text or json_object format allocates
+  nothing.
 - Breaking: on `ChatMessage::Assistant`, `function_call` is `Option<Box<FunctionCallResponse>>`,
   and the provider extension's `tools` is `Option<Box<serde_json::Value>>`. The assistant turn is
   the enum's largest variant, so the two rarely-present values had grown every chat message to
@@ -49,6 +57,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
   choice it does not expect. A choice with log probabilities is written as before.
+- A completion request with `"echo": null` is served, as the public API allows. The crate refused
+  it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
+  and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
@@ -61,6 +72,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `text_tokens` in the completion details. A usage the gateway builds is written as before.
   Breaking: `PromptTokenUsageInfo` gains `text_tokens`, `image_tokens` and `cache_write_tokens`,
   and `CompletionTokensDetails` gains `text_tokens`, all `Option<u32>`.
+- `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
+  `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
+  gateway's `/generate` reads its body through the validated extractor and answers a negative
+  temperature, a `top_p` above one, an `n` of zero or an empty `input_ids` in the error envelope
+  (`400`, with `error.code` and `error.param`) where it sent them to the engine. The rule over the whole
+  request, live for the first time, refuses only a body with no prompt at all (none of `text`,
+  `input_ids`, `input_embeds`), as `missing_required_parameter`; a body with both `text` and
+  `input_ids` and an `input_embeds`-only body stay with the routers as today. The cross-field sampling rules (`min_new_tokens` above
+  `max_new_tokens`, more than one structured-output constraint) name their field in `error.param`.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a

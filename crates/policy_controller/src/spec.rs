@@ -118,7 +118,9 @@ pub struct Needs {
 }
 
 impl Needs {
-    fn or(self, other: Self) -> Self {
+    /// Both sides' needs: what a host feeding either of two stage sets must
+    /// feed.
+    pub(crate) fn or(self, other: Self) -> Self {
         Self {
             text: self.text || other.text,
             token_hashes: self.token_hashes || other.token_hashes,
@@ -2388,11 +2390,105 @@ mod tests {
             assert_eq!(engine.needs().loads, load_aware, "{name}");
             assert!(!engine.needs().events, "{name}");
             assert!(engine.profile_for("any", Phase::Single).is_some(), "{name}");
+            // One profile bound to every model and phase: the per-phase and
+            // per-binding reads are the summary.
+            for phase in [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode] {
+                assert_eq!(engine.needs_for_phase(phase), engine.needs(), "{name}");
+                assert_eq!(engine.needs_for("any", phase), engine.needs(), "{name}");
+            }
         }
         assert_eq!(
             PolicySpec::preset("cache_aware").err(),
             Some(SpecError::UnknownPreset("cache_aware".into()))
         );
+    }
+
+    /// The needs are read per binding and per phase: a pd-pair binding's
+    /// prefill side reads what the prefill profile's stages read, its decode
+    /// side the decode profile's, and a phase's fold spans every binding
+    /// that covers it.
+    #[test]
+    fn the_needs_are_read_per_binding_and_per_phase() {
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "default": { "filter": ["healthy"], "pick": "round-robin" },
+            "prefill": { "filter": ["healthy", "has-capacity"], "score": ["least-load"], "pick": "best" },
+            "decode": { "filter": ["healthy", "has-room"], "score": ["session-affinity"], "pick": "best" }
+          },
+          "bindings": [
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        let loads = Needs {
+            loads: true,
+            ..Needs::default()
+        };
+        let headers = Needs {
+            headers: true,
+            ..Needs::default()
+        };
+        assert_eq!(engine.needs(), loads.or(headers));
+        assert_eq!(engine.needs_for("pd/x", Phase::Prefill), loads);
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), headers);
+        // The pair binding covers neither phase; the catch-all's profile
+        // reads nothing.
+        assert_eq!(engine.needs_for("pd/x", Phase::Single), Needs::default());
+        assert_eq!(engine.needs_for("other", Phase::Prefill), Needs::default());
+        // Per phase: the pair binding and the catch-all, whose empty phase
+        // list covers every phase.
+        assert_eq!(engine.needs_for_phase(Phase::Prefill), loads);
+        assert_eq!(engine.needs_for_phase(Phase::Decode), headers);
+        assert_eq!(engine.needs_for_phase(Phase::Single), Needs::default());
+        assert_eq!(engine.needs_for_phase(Phase::Encode), Needs::default());
+
+        // The shape the gateway's configuration produces: every model's pair
+        // phases bound first, the catch-all behind it. The catch-all decides
+        // no pair request, so its stages add nothing to the pair phases.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "default": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "prefill": { "filter": ["healthy", "has-capacity"], "score": ["session-affinity"], "pick": "best" },
+            "decode": { "filter": ["healthy", "has-room"], "pick": "round-robin" }
+          },
+          "bindings": [
+            { "match": { "model": "*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(engine.needs_for_phase(Phase::Prefill), headers);
+        assert_eq!(engine.needs_for_phase(Phase::Decode), Needs::default());
+        assert_eq!(engine.needs_for_phase(Phase::Single), loads);
+        assert_eq!(engine.needs_for_phase(Phase::Encode), loads);
+
+        // A decode-phase binding before the pair binding decides the decode
+        // requests that come alone; a pair's decode side is decided by the
+        // binding its prefill lookup resolves to, with that pair's decode
+        // profile. The decode needs carry both.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "decode-only": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "prefill": { "filter": ["healthy"], "pick": "round-robin" },
+            "decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "default": { "filter": ["healthy"], "pick": "round-robin" }
+          },
+          "bindings": [
+            { "match": { "model": "*", "phase": ["decode"] }, "profile": "decode-only" },
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), loads.or(headers));
+        assert_eq!(engine.needs_for("other", Phase::Decode), loads);
+        assert_eq!(engine.needs_for("pd/x", Phase::Prefill), Needs::default());
+        assert_eq!(engine.needs_for_phase(Phase::Decode), loads.or(headers));
+        assert_eq!(engine.needs_for_phase(Phase::Prefill), Needs::default());
     }
 
     #[test]

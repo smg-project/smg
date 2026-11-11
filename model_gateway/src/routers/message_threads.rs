@@ -520,7 +520,10 @@ impl MessageThreads {
                 }
                 Written::Refused => ("unstored", bytes),
             },
-            Err(_) => ("unstored", bytes),
+            Err(error) => {
+                warn!(%error, "message thread: the answer is not JSON, the turn is not stored");
+                ("unstored", bytes)
+            }
         };
         Metrics::record_message_thread_turn(op, outcome);
         Response::from_parts(parts, Body::from(bytes))
@@ -537,6 +540,7 @@ impl MessageThreads {
             .filter(|id| !id.is_empty())
             .map(ResponseId::from)
         else {
+            warn!("message thread: the answer has no id, the turn is not stored");
             return Written::Refused;
         };
         let mut record = StoredResponse::new(turn.previous);
@@ -563,7 +567,13 @@ impl MessageThreads {
         };
         match self.store.store_response_if_absent(record) {
             Ok(()) => Written::Reissued(Bytes::from(bytes)),
-            Err(_) => Written::Refused,
+            Err(record) => {
+                warn!(
+                    id = %record.id.0,
+                    "message thread: the reissued write was refused, the turn is not stored"
+                );
+                Written::Refused
+            }
         }
     }
 }
@@ -575,6 +585,7 @@ mod tests {
     use axum::{body::Bytes, http::header, response::IntoResponse, Json};
     use futures::{stream, StreamExt};
     use tokio::time::timeout;
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -1389,5 +1400,51 @@ mod tests {
             answered.headers()["request-id"].to_str().unwrap(),
             "upstream-1"
         );
+    }
+
+    fn create_turn() -> CreateMessageRequest {
+        request(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "thread": {"type": "create"}
+        }))
+    }
+
+    /// A 200 answer that is not JSON goes to the client as it came; the turn
+    /// is left unstored and the log says why.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_non_json_answer_is_left_unstored_with_a_warning() {
+        let threads = MessageThreads::new();
+        let (_, turn) = accepted(threads.resolve(create_turn(), None).await);
+        let plain = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("not json"))
+            .expect("a response");
+        let answered = threads.stored(turn.expect("a turn"), plain).await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let bytes = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        assert_eq!(bytes.as_ref(), b"not json");
+        assert!(logs_contain("the answer is not JSON"));
+    }
+
+    /// A JSON answer without an id goes to the client as it came; the turn
+    /// is left unstored and the log says why.
+    #[tokio::test]
+    #[traced_test]
+    async fn an_answer_without_an_id_is_left_unstored_with_a_warning() {
+        let threads = MessageThreads::new();
+        let (_, turn) = accepted(threads.resolve(create_turn(), None).await);
+        let answered = threads
+            .stored(
+                turn.expect("a turn"),
+                answer("", json!([{"type": "text", "text": "x"}])),
+            )
+            .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        assert_eq!(body_of(answered).await["id"], "");
+        assert!(logs_contain("the answer has no id"));
     }
 }

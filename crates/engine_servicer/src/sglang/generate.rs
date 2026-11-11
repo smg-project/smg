@@ -8,7 +8,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use engine_zmq_adapter::{to_sglang_response, SglangGenerateStream};
 use futures::StreamExt;
-use smg_grpc_client::{sglang_proto as sg, vllm_proto as vllm};
+use smg_grpc_client::{
+    media_identity::{self as media, sglang as contract},
+    sglang_proto as sg, vllm_proto as vllm,
+};
 use tonic::Status;
 
 use super::{hidden_states_cap, HiddenStatesCap, SglangModelInfo, State};
@@ -83,25 +86,24 @@ pub(super) async fn generate(
                 state.mm_hasher.as_ref(),
                 req.mm_inputs.as_mut(),
             ) {
-                if smg_grpc_client::sglang_media_identity::reusable_request(&original) {
+                if contract::reusable_request(&original) {
                     tokio::select! {
                         biased;
                         _ = &mut cancel => return Err(Status::cancelled("media identity request aborted")),
                         result = hasher.precompute_proto(mm, &req.request_id) => result?,
                     };
+                    let batch: &sg::MultimodalInputs = mm;
                     identity = sg::MediaIdentity {
-                        version: smg_grpc_client::sglang_media_identity::VERSION,
+                        version: contract::VERSION,
                         processor_key: key.to_string(),
-                        request_digest: smg_grpc_client::sglang_media_identity::request_digest(
-                            &original,
-                        ),
+                        request_digest: contract::request_digest(&original),
                         input_ids: req
                             .tokenized
                             .as_ref()
                             .map_or_else(Vec::new, |t| t.input_ids.clone()),
-                        mm_inputs: Some(smg_grpc_client::sglang_media_identity::pixel_less(mm)),
+                        mm_inputs: media::identity(batch),
                     };
-                    if smg_grpc_client::sglang_media_identity::validate(&identity, &original, key) {
+                    if contract::validate(&identity, &original, key) {
                         state.shared.metrics.media_identity("prepared");
                     } else {
                         identity = sg::MediaIdentity::default();
@@ -123,7 +125,7 @@ pub(super) async fn generate(
         .sampling_params
         .as_ref()
         .map_or((None, 1), |params| (params.max_new_tokens, params.n));
-    // A language-side worker hands a request's image references to the
+    // A language-side worker hands a request's media references to the
     // encoders before the submit (the dispatcher the lifecycle owner
     // supplied); every other worker refuses such a request there.
     let subs = client

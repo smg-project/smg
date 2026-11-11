@@ -1974,6 +1974,21 @@ class TestAdminMaxConnections:
         with pytest.raises(SystemExit):
             parse_router_args(["--admin-max-connections", "-1"])
 
+    def test_the_help_names_the_port_and_the_probe_listener(self):
+        """The bound needs --admin-port and a probe on the admin port falls
+        under it: the help says both and sends probes to --health-check-port,
+        which no bound covers."""
+        # Wide enough that the formatter breaks no flag at its hyphens.
+        parser = argparse.ArgumentParser(
+            formatter_class=lambda prog: argparse.HelpFormatter(prog, width=10_000)
+        )
+        RouterArgs.add_cli_args(parser)
+        help_text = " ".join(parser.format_help().split())
+
+        assert "Needs --admin-port. Probes on the admin port fall under the bound" in help_text
+        assert "--health-check-port, which no bound covers" in help_text
+        assert "--admin-port, which it does not cover" not in help_text
+
 
 class TestPrometheusHostDefault:
     """--prometheus-host is unset by default: the router derives the metrics

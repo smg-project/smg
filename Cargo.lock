@@ -7978,12 +7978,15 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "parking_lot 0.13.0",
+ "prost-build",
+ "prost-types",
  "rustc-hash 2.1.3",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.21",
+ "wit-parser",
 ]
 
 [[package]]

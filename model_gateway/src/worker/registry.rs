@@ -26,6 +26,7 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
 use openai_protocol::worker::WorkerStatus;
+use rustc_hash::FxBuildHasher;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
@@ -262,10 +263,18 @@ struct GlobalRoutingSnapshot {
 /// Model index using immutable snapshots for lock-free reads.
 /// Updates create new snapshots (copy-on-write semantics); route projections
 /// are cached lazily inside each immutable snapshot.
-type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>>>;
+///
+/// The maps a request's model id or a worker's URL is looked up in hash with
+/// [`FxBuildHasher`]: the keys are the server's own (registration and
+/// configuration name them; a request's model string is looked up, never
+/// inserted), so the std hasher's flooding resistance buys nothing, and its
+/// SipHash-1-3 over a 20-40 byte key was 0.7-1.5 % of a request's user
+/// instructions with the map lookups on top. The kv index hashes its tenant
+/// and node maps the same way.
+type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>, FxBuildHasher>>;
 
 /// Model alias to canonical model ID.
-type ModelAliasIndex = Arc<DashMap<String, Arc<str>>>;
+type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -332,7 +341,7 @@ pub struct WorkerRegistry {
 
     /// Consistent hash rings per model for O(log n) routing.
     /// Rebuilt on worker add/remove (copy-on-write).
-    hash_rings: Arc<DashMap<String, Arc<HashRing>>>,
+    hash_rings: Arc<DashMap<String, Arc<HashRing>, FxBuildHasher>>,
 
     /// Orders snapshots and publication for both per-model and wildcard rings.
     /// Membership writers release their index guards before taking this lock;
@@ -353,7 +362,7 @@ pub struct WorkerRegistry {
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
 
     /// URL to worker ID mapping
-    url_to_id: Arc<DashMap<String, WorkerId>>,
+    url_to_id: Arc<DashMap<String, WorkerId, FxBuildHasher>>,
 
     /// Per-worker-ID locks for serializing replace() operations.
     /// Only held during the in-memory model index diff (no I/O, microseconds).
@@ -362,7 +371,7 @@ pub struct WorkerRegistry {
     /// Count of workers currently flagged overloaded, per model-index key.
     /// Moved only on flag transitions and on registry membership changes, so
     /// reading it costs one map probe and no worker walk.
-    model_overloaded: Arc<DashMap<String, AtomicUsize>>,
+    model_overloaded: Arc<DashMap<String, AtomicUsize, FxBuildHasher>>,
 
     /// `--worker-overload-shed`: refuse a request with a 503 when every
     /// candidate is overloaded instead of steering it to the least-loaded
@@ -381,7 +390,7 @@ pub struct WorkerRegistry {
     /// Updated when a worker with non-empty retry overrides registers.
     /// Cleaned up when the last worker for a model is removed.
     /// When retries are disabled, max_retries is set to 1.
-    model_retry_configs: Arc<DashMap<String, RetryConfig>>,
+    model_retry_configs: Arc<DashMap<String, RetryConfig, FxBuildHasher>>,
 
     /// Registration origin per worker (local vs mesh-imported). Written
     /// under the per-worker mutation lock before the `Registered` event,
@@ -428,7 +437,7 @@ impl WorkerRegistry {
         let (connect_signal_tx, connect_signal_rx) = mpsc::unbounded_channel();
         Self {
             workers: Arc::new(DashMap::new()),
-            model_index: Arc::new(DashMap::new()),
+            model_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
                 snapshot: Self::empty_routing_snapshot(),
@@ -436,8 +445,8 @@ impl WorkerRegistry {
             global_epoch: AtomicUsize::new(0),
             global_membership_order: parking_lot::RwLock::new(()),
             global_routing_update: parking_lot::Mutex::new(()),
-            model_alias_index: Arc::new(DashMap::new()),
-            hash_rings: Arc::new(DashMap::new()),
+            model_alias_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            hash_rings: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             hash_ring_update: parking_lot::Mutex::new(()),
             #[cfg(test)]
             hash_ring_test_hooks: parking_lot::Mutex::new(HashRingTestHooks::default()),
@@ -445,12 +454,12 @@ impl WorkerRegistry {
             transition_test_hooks: parking_lot::Mutex::new(TransitionTestHooks::default()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
-            url_to_id: Arc::new(DashMap::new()),
+            url_to_id: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             worker_mutation_locks: Arc::new(DashMap::new()),
-            model_overloaded: Arc::new(DashMap::new()),
+            model_overloaded: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
-            model_retry_configs: Arc::new(DashMap::new()),
+            model_retry_configs: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             worker_origins: Arc::new(DashMap::new()),
             import_records: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
@@ -1541,6 +1550,12 @@ impl WorkerRegistry {
             self.bump_global_routing_epoch();
         }
 
+        // The old instance stays alive in the handles that hold it (a load
+        // guard taken before the replacement) and writes under the URL until
+        // they go: the series store keeps its witness, so a later removal of
+        // the URL drops those writes until the old instance is gone too.
+        Metrics::worker_replaced(old_worker.url(), Arc::downgrade(&old_worker));
+
         // The replacement carries its own backend-client slot, so the old
         // instance's ZMQ handshake driver can now only hold its socket binds
         // against the new worker's connect.
@@ -1910,7 +1925,7 @@ impl WorkerRegistry {
             // Retire the URL's series while the URL still maps to this id: a
             // registration of the same URL cannot slip in between and have its
             // fresh series retired under it.
-            Metrics::remove_worker_metrics(worker.url());
+            Metrics::remove_worker_metrics(worker.url(), Arc::downgrade(&worker));
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);

@@ -22,11 +22,11 @@ use std::{
 use bytes::Bytes;
 use engine_servicer::{
     BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncodeRelease, EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor,
-    MediaRequest, ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher,
-    SglangMediaProcessor, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
-    TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, TrtllmModelInfo,
-    TrtllmServicerConfig, TrtllmServicerServer, VllmModelInfo, VllmServicerConfig,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, MediaError,
+    MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia, ServicerConfig, ServicerError,
+    SglangEncodeDispatcher, SglangMediaProcessor, SglangModelInfo, SglangServicerConfig,
+    SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer,
+    TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer, VllmModelInfo, VllmServicerConfig,
     VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
     DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
     PIXEL_MODALITIES,
@@ -1326,18 +1326,40 @@ fn dispatch_answer(py: Python<'_>, answer: &Bound<'_, PyAny>) -> PyResult<Dispat
 
 /// The encode dispatch of an SGLang language-side worker behind a Python
 /// object (see `smg_grpc_servicer.sglang.rust_encode.EncodeDispatchBridge`):
-/// `dispatch(rid, image_urls, on_error)` runs SGLang's own receiver for the
-/// request (the assignment across the encoders, the encode requests to them
-/// on the receiver's thread) and returns a [`DispatchAnswer`]; `on_error` is
-/// this side's [`DispatchError`], which the bridge calls with the receiver's
-/// failure once the release ran, so the notice reaches the scheduler rank
-/// holding the request. Calls into Python only from a blocking thread, as
-/// the media bridge does.
+/// `dispatch(rid, image_urls, video_urls, audio_urls, on_error)` runs
+/// SGLang's own receiver for the request (the assignment across the encoders,
+/// the encode requests to them on the receiver's thread) and returns a
+/// [`DispatchAnswer`]; `on_error` is this side's [`DispatchError`], which the
+/// bridge calls with the receiver's failure once the release ran, so the
+/// notice reaches the scheduler rank holding the request. The bridge's
+/// `transport_mode` (the engine's receiver mode, `http` or `grpc`) is read
+/// once, when the server is built: it decides what the dispatch is asked for
+/// (the gRPC encoder service takes images only). Calls into Python only from
+/// a blocking thread, as the media bridge does.
 struct PythonEncodeDispatcher {
     bridge: Arc<Py<PyAny>>,
+    transport: EncodeTransport,
+}
+
+/// The transport the bridge's receiver runs: its `transport_mode`, the
+/// engine's receiver mode; another value refuses the server by name.
+fn encode_transport(bridge: &Bound<'_, PyAny>) -> PyResult<EncodeTransport> {
+    let mode: String = bridge.getattr("transport_mode")?.extract()?;
+    match mode.as_str() {
+        "http" => Ok(EncodeTransport::Http),
+        "grpc" => Ok(EncodeTransport::Grpc),
+        other => Err(PyValueError::new_err(format!(
+            "the encode dispatcher's transport_mode is {other:?}; the engine's receiver modes \
+             are \"http\" and \"grpc\""
+        ))),
+    }
 }
 
 impl SglangEncodeDispatcher for PythonEncodeDispatcher {
+    fn transport(&self) -> EncodeTransport {
+        self.transport
+    }
+
     fn dispatch(
         &self,
         request: EncodeDispatchRequest,
@@ -1346,7 +1368,12 @@ impl SglangEncodeDispatcher for PythonEncodeDispatcher {
         Box::pin(async move {
             let EncodeDispatchRequest {
                 rid,
-                image_urls,
+                media:
+                    EncodeMediaRefs {
+                        image_urls,
+                        video_urls,
+                        audio_urls,
+                    },
                 on_error,
             } = request;
             // The release becomes its guard inside the blocking task: a
@@ -1363,8 +1390,11 @@ impl SglangEncodeDispatcher for PythonEncodeDispatcher {
                                 sink: on_error,
                             },
                         )?;
-                        let answer =
-                            bridge.call_method1(py, "dispatch", (rid, image_urls, on_error))?;
+                        let answer = bridge.call_method1(
+                            py,
+                            "dispatch",
+                            (rid, image_urls, video_urls, audio_urls, on_error),
+                        )?;
                         dispatch_answer(py, answer.bind(py))
                     })?;
                 let sent = release.map(|release| {
@@ -1741,11 +1771,15 @@ impl PySglangGrpcServer {
     ) -> PyResult<Self> {
         // The language side's encode dispatch, behind the launcher's bridge
         // object; absent on every other worker.
-        let encode_dispatcher = encode_dispatcher.map(|bridge| {
-            Arc::new(PythonEncodeDispatcher {
-                bridge: Arc::new(bridge.unbind()),
-            }) as Arc<dyn SglangEncodeDispatcher>
-        });
+        let encode_dispatcher = encode_dispatcher
+            .map(|bridge| -> PyResult<Arc<dyn SglangEncodeDispatcher>> {
+                let transport = encode_transport(&bridge)?;
+                Ok(Arc::new(PythonEncodeDispatcher {
+                    bridge: Arc::new(bridge.unbind()),
+                    transport,
+                }))
+            })
+            .transpose()?;
         let native = smg_media_processor
             .map(|options| {
                 native_media_options(

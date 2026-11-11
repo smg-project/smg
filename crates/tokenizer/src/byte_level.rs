@@ -28,7 +28,10 @@ use std::{
 use anyhow::{anyhow, Result};
 use tokenizers::{decoders::DecoderWrapper, Tokenizer as HfTokenizer};
 
-use crate::traits::{IncrementalDecoder, TokenIdType};
+use crate::{
+    traits::{IncrementalDecoder, TokenIdType},
+    word_cache::{token_of, Listing},
+};
 
 /// Highest code point in the byte-level alphabet plus one (the 68 bytes that
 /// are not printable Latin-1 map to U+0100..=U+0143).
@@ -235,7 +238,7 @@ pub(crate) fn decoder_kind(decoder: Option<&DecoderWrapper>) -> String {
 impl ByteLevelTable {
     /// `None` unless the tokenizer decodes with a plain `ByteLevel` decoder.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
-        Self::build_with_max_id(tokenizer, None)
+        Self::build_with_max_id(tokenizer, None, None)
     }
 
     /// [`Self::build`] with the model's largest id as the file's read saw
@@ -243,6 +246,7 @@ impl ByteLevelTable {
     pub(crate) fn build_with_max_id(
         tokenizer: &HfTokenizer,
         model_max_id: Option<u32>,
+        listing: Option<&Listing>,
     ) -> Option<Arc<Self>> {
         if !matches!(tokenizer.get_decoder(), Some(DecoderWrapper::ByteLevel(_))) {
             return None;
@@ -253,7 +257,7 @@ impl ByteLevelTable {
         let mut table = ByteLevelTableBuilder::with_capacity(count);
         let mut bytes = Vec::new();
         for id in 0..count {
-            match tokenizer.id_to_token(id as u32) {
+            match token_of(tokenizer, listing, id as u32) {
                 Some(token) => {
                     bytes.clear();
                     push_token_bytes(&token, &mut bytes);
@@ -601,6 +605,48 @@ pub(crate) mod tests {
 
     pub(crate) const SPECIAL: &str = "<|im_end|>";
     const ADDED: &str = "<tool>";
+
+    /// The lookup the decode tables take agrees with `id_to_token` on
+    /// every id, with the read's listing and without it: an added token
+    /// first, then the model's token; and the table built from the
+    /// listing is the table built from the model.
+    #[test]
+    fn the_token_lookup_and_the_table_agree_with_and_without_the_listing() {
+        use crate::word_cache::{token_of, Listing};
+        let mut tokenizer = byte_level_tokenizer();
+        tokenizer
+            .add_tokens([AddedToken::from(ADDED, false)])
+            .expect("add token");
+        let vocab: Vocab = tokenizer.get_vocab(false).into_iter().collect();
+        let listing = Listing::of(&vocab).expect("a dense vocabulary lists");
+        assert_eq!(listing.len() as usize, vocab.len());
+        let model_max_id = Some(listing.len() - 1);
+        let max_id = max_token_id(&tokenizer, model_max_id).expect("ids");
+        assert!(
+            max_id >= listing.len(),
+            "the added tokens sit past the model's ids"
+        );
+        for id in 0..=max_id + 1 {
+            let expected = tokenizer.id_to_token(id);
+            assert_eq!(
+                token_of(&tokenizer, Some(&listing), id).as_deref(),
+                expected.as_deref(),
+                "id {id} with the listing"
+            );
+            assert_eq!(
+                token_of(&tokenizer, None, id).as_deref(),
+                expected.as_deref(),
+                "id {id} without it"
+            );
+        }
+        let listed = ByteLevelTable::build_with_max_id(&tokenizer, model_max_id, Some(&listing))
+            .expect("a byte-level table");
+        let swept = ByteLevelTable::build_with_max_id(&tokenizer, model_max_id, None)
+            .expect("a byte-level table");
+        for id in 0..=max_id + 1 {
+            assert_eq!(listed.token_bytes(id), swept.token_bytes(id), "id {id}");
+        }
+    }
 
     fn alphabet() -> Vec<char> {
         let mut chars: Vec<(u8, char)> = CHAR_BYTES

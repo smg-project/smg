@@ -11,10 +11,11 @@ use tokenizers::{
     },
     normalizers::{
         unicode::{NFC, NFKC},
-        NormalizerWrapper, Replace,
+        NormalizerWrapper, Prepend, Replace, Sequence as NormalizerSequence,
     },
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
+        digits::Digits,
         metaspace::{Metaspace, PrependScheme},
         sequence::Sequence,
         split::{Split, SplitPattern},
@@ -32,7 +33,7 @@ use tokenizers::{
 use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
 use super::{
-    sentencepiece::{MERGE_SCRATCH_SYMBOLS, WORD_MARKER},
+    sentencepiece::{CharSymbols, MERGE_SCRATCH_SYMBOLS, WORD_MARKER},
     short_pieces::{ShortPieceKey, ShortPieceTable, MIN_SLOTS},
     *,
 };
@@ -48,6 +49,12 @@ const DIGITS: &str = r"\p{N}{1,3}";
 const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
 const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// The clitic group as a letter class with the apostrophe outside it, and
+/// possessive runs (`?+`, `++`).
+const POSSESSIVE_CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
+/// The same clitic class with greedy runs, a digit cap and a one-space
+/// last alternative.
+const CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s";
 /// The cased template without the clitic group and with one digit at a
 /// time.
 const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -327,6 +334,68 @@ fn shapes() -> Vec<Shape> {
             special: &["<|endoftext|>"],
             added: &[],
         },
+        Shape {
+            name: "possessive-clitic-class",
+            nfc: true,
+            pre_tokenizers: vec![
+                split(
+                    POSSESSIVE_CLITIC_CLASS,
+                    SplitDelimiterBehavior::Isolated,
+                    false,
+                ),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &[
+                "<|startoftext|>",
+                "<|endoftext|>",
+                "[gMASK]",
+                "<|role_end|>",
+            ],
+            added: &[("<tool_call>", false), ("<think>", false)],
+        },
+        Shape {
+            name: "clitic-class",
+            nfc: false,
+            pre_tokenizers: vec![
+                split(CLITIC_CLASS, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: true,
+            special: &[
+                "<|startoftext|>",
+                "<|endoftext|>",
+                "<|im_start|>",
+                "<|im_end|>",
+            ],
+            added: &[("<think>", false), ("<|tool_call_start|>", false)],
+        },
+        // `Digits` before the `ByteLevel` with its own regex: every numeric
+        // character its own piece, the rest cut by the byte-level pattern.
+        Shape {
+            name: "digits-then-byte-level-regex",
+            nfc: false,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
+        // `Digits` in runs before a split and the `ByteLevel`.
+        Shape {
+            name: "digit-runs",
+            nfc: false,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+        },
         // Added tokens with a space inside, matched after normalization
         // (the default of `add_tokens`): a cut at that space would turn
         // the token into pieces.
@@ -381,7 +450,7 @@ fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
 /// build it.
 fn seeded(tokenizer: &HfTokenizer) -> NativeEncoder {
     let mut native = NativeEncoder::from_tokenizer(tokenizer).expect("native path");
-    native.seed_vocabulary(tokenizer.get_model());
+    native.seed_vocabulary(tokenizer.get_model(), None);
     native
 }
 
@@ -400,9 +469,17 @@ fn every_shape_gets_a_native_path() {
         let expected_stages = shape
             .pre_tokenizers
             .iter()
-            .filter(|p| matches!(p, PreTokenizerWrapper::Split(_)))
+            .filter(|p| {
+                matches!(
+                    p,
+                    PreTokenizerWrapper::Split(_) | PreTokenizerWrapper::Digits(_)
+                )
+            })
             .count()
-            + usize::from(shape.name == "byte-level-regex");
+            + usize::from(matches!(
+                shape.pre_tokenizers.last(),
+                Some(PreTokenizerWrapper::ByteLevel(byte_level)) if byte_level.use_regex
+            ));
         assert_eq!(
             native.expect("native").stages.len(),
             expected_stages,
@@ -484,8 +561,77 @@ fn shapes_outside_the_path_are_declined() {
     tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
     assert_eq!(
         declined(&tokenizer),
-        "no pre-tokenizer (the path needs ByteLevel, after any Split stages)"
+        "no pre-tokenizer (the path needs ByteLevel, after any split stages)"
     );
+}
+
+/// The `Digits` stage holds exactly what `char::is_numeric` accepts, the
+/// reference's test, over every scalar value: the toolchain's numeric set,
+/// not the engine's `\p{N}` (another Unicode version); a toolchain bump that
+/// widens the set fails here, not in the ids.
+#[test]
+fn the_digits_stage_holds_what_is_numeric_accepts() {
+    let stage = NativeEncoder::split_stage(&serde_json::json!(
+        {"type": "Digits", "individual_digits": true}
+    ))
+    .expect("the digits stage");
+    let mut text = String::new();
+    for code in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(code) else {
+            continue;
+        };
+        text.clear();
+        text.push(c);
+        let native = stage.pattern.find_iter(&text).next() == Some((0, text.len()));
+        assert_eq!(native, c.is_numeric(), "U+{code:04X}");
+    }
+}
+
+/// Two numeric characters the regex engine's `\p{N}` table lacks (U+11DE0
+/// and U+11DE1, numeric to the toolchain), with a merge across their
+/// boundary in the vocabulary: the reference's `Digits` under
+/// `individual_digits` cuts between them, so the merge never applies, and
+/// the native stage cuts there too.
+#[test]
+fn digits_the_engine_table_lacks_are_cut_apart_before_a_merge_across_them() {
+    let mut state = 0xD161_7000_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "digits-then-byte-level-regex")
+        .expect("the shape");
+    let mut tokenizer = tokenizer_of(&shape, &mut state);
+    let table = bytes_char();
+    let mut vocab = Vocab::default();
+    let mut alphabet: Vec<char> = table.to_vec();
+    alphabet.sort_unstable();
+    for ch in alphabet {
+        let id = vocab.len() as u32;
+        vocab.insert(ch.to_string(), id);
+    }
+    // The last byte of U+11DE0 and the first byte of U+11DE1, merged.
+    let (a, b) = (table[0xA0].to_string(), table[0xF0].to_string());
+    let id = vocab.len() as u32;
+    vocab.insert(format!("{a}{b}"), id);
+    let merges: Merges = vec![(a, b)];
+    tokenizer.with_model(
+        BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .expect("bpe"),
+    );
+    let native = seeded(&tokenizer);
+    for text in [
+        "\u{11DE0}\u{11DE1}",
+        "x\u{11DE0}\u{11DE1}y",
+        "\u{11DE0} \u{11DE1}",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
 }
 
 #[test]
@@ -1569,6 +1715,43 @@ fn the_seed_holds_every_short_vocabulary_entry_with_the_models_ids() {
     }
 }
 
+/// The sentencepiece seed holds every short vocabulary entry with the ids
+/// the model gives it (the pass merges the entry's symbols over the
+/// character-symbol table instead of asking the model), and nothing else.
+#[test]
+fn the_sentencepiece_seed_holds_every_short_vocabulary_entry_with_the_models_ids() {
+    let mut state = 0x5EED_5EED_5EED_5EEDu64;
+    for shape in sentencepiece_shapes() {
+        let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        let mut seeded = 0;
+        for entry in tokenizer.get_vocab(false).keys() {
+            let Some(key) = CharSymbols::entry_key(entry) else {
+                continue;
+            };
+            let expected: Vec<u32> = model
+                .tokenize(entry)
+                .expect("the model tokenizes its own entry")
+                .iter()
+                .map(|token| token.id)
+                .collect();
+            let mut ids = Vec::new();
+            assert!(
+                native.seed.ids_into(key, &mut ids),
+                "{}: {entry:?} is not seeded",
+                shape.name
+            );
+            assert_eq!(ids, expected, "{}: {entry:?}", shape.name);
+            seeded += 1;
+        }
+        assert_eq!(native.seed.len(), seeded, "{}", shape.name);
+        // Every synthetic entry is space-free and at most 15 raw bytes, so
+        // the key takes them all: the seeded count is the vocabulary's.
+        assert_eq!(seeded, tokenizer.get_vocab_size(false), "{}", shape.name);
+    }
+}
+
 #[test]
 fn an_entry_the_merges_do_not_reach_is_seeded_as_the_model_tokenizes_it() {
     // The vocabulary has "xyz" but the merges make only "xy": the model
@@ -1876,8 +2059,9 @@ fn piece_caches_stay_within_their_bound_across_threads() {
 }
 
 /// A thread's packed table starts with the fewest slots, grows with the
-/// distinct pieces the thread meets up to its share, and is made anew for a
-/// smaller share (threads joined since it grew) when it is cleared.
+/// distinct pieces the thread meets up to its share, and is cut back to the
+/// slots of a smaller share (threads joined since it grew) when it is
+/// cleared.
 #[test]
 fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
     let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
@@ -1975,10 +2159,10 @@ fn a_thread_whose_share_fell_is_within_it_from_its_next_encode_on() {
 
 /// A thread's packed table grown for an earlier share keeps its slots
 /// through a clear at the bound; once the share fell below them (threads
-/// joined) the thread's next encode call makes the table anew for the
-/// share, entries within it or not.
+/// joined) the thread's next encode call cuts the table back to the slots
+/// of the share, entries within it or not.
 #[test]
-fn a_thread_whose_packed_table_outgrew_its_share_remakes_it_at_its_next_encode() {
+fn a_thread_whose_packed_table_outgrew_its_share_cuts_it_back_at_its_next_encode() {
     let mut state = 0xF00D_CAFE_DEAD_BEEFu64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
@@ -2846,6 +3030,8 @@ fn sentencepiece_model(state: &mut u64) -> BPE {
 struct SentencepieceShape {
     name: &'static str,
     replace: bool,
+    /// The `Replace` as the one step of a `Sequence`, as some files write it.
+    sequence: bool,
     split: bool,
     metaspace: Option<PrependScheme>,
     /// The post-processor frames the ids with `<s>`.
@@ -2857,6 +3043,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "replace-split",
             replace: true,
+            sequence: false,
             split: true,
             metaspace: None,
             bos: true,
@@ -2864,6 +3051,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "replace",
             replace: true,
+            sequence: false,
             split: false,
             metaspace: None,
             bos: false,
@@ -2871,6 +3059,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-first",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::First),
             bos: true,
@@ -2878,6 +3067,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-always",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Always),
             bos: false,
@@ -2885,9 +3075,18 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
         SentencepieceShape {
             name: "metaspace-never",
             replace: false,
+            sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Never),
             bos: false,
+        },
+        SentencepieceShape {
+            name: "replace-in-sequence",
+            replace: true,
+            sequence: true,
+            split: false,
+            metaspace: None,
+            bos: true,
         },
     ]
 }
@@ -2895,10 +3094,14 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
 fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTokenizer {
     let mut tokenizer = HfTokenizer::new(sentencepiece_model(state));
     if shape.replace {
+        let replace = Replace::new(" ", "\u{2581}").expect("a Replace normalizer");
+        let normalizer: NormalizerWrapper = if shape.sequence {
+            NormalizerSequence::new(vec![replace.into()]).into()
+        } else {
+            replace.into()
+        };
         tokenizer
-            .with_normalizer(Some(
-                Replace::new(" ", "\u{2581}").expect("a Replace normalizer"),
-            ))
+            .with_normalizer(Some(normalizer))
             .expect("normalizer");
     }
     if shape.split {
@@ -3439,6 +3642,25 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
     );
+    // The Replace in a Sequence with another step: the one-step sequence is
+    // the only sequence the path takes (a Prepend before the Replace is the
+    // legacy conversion's shape, which this path would read without the
+    // prepended marker).
+    let replace =
+        || NormalizerWrapper::from(Replace::new(" ", "\u{2581}").expect("a Replace normalizer"));
+    for steps in [
+        vec![Prepend::new("\u{2581}".to_owned()).into(), replace()],
+        vec![replace(), NormalizerWrapper::NFC(NFC)],
+    ] {
+        let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
+        tokenizer
+            .with_normalizer(Some(NormalizerSequence::new(steps)))
+            .expect("normalizer");
+        assert_eq!(
+            declined(&tokenizer),
+            "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
+        );
+    }
     // Neither the Replace nor a Metaspace.
     let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
     tokenizer

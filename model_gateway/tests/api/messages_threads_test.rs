@@ -20,16 +20,28 @@ use crate::common::{
     AppTestContext,
 };
 
+/// The beta the public API requires on every request of a thread.
+const THREADS_BETA: &str = "message-threads-2026-08-12";
+
 #[expect(
     clippy::unwrap_used,
     reason = "test helper: a malformed request or answer fails the test"
 )]
-async fn post(app: &Router, path: &str, payload: &Value) -> (StatusCode, Value) {
-    let req = Request::builder()
+async fn post_with(
+    app: &Router,
+    path: &str,
+    payload: &Value,
+    beta: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
         .method("POST")
         .uri(path)
         .header(CONTENT_TYPE, "application/json")
-        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-version", "2023-06-01");
+    if let Some(beta) = beta {
+        req = req.header("anthropic-beta", beta);
+    }
+    let req = req
         .body(Body::from(serde_json::to_string(payload).unwrap()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -38,6 +50,11 @@ async fn post(app: &Router, path: &str, payload: &Value) -> (StatusCode, Value) 
         .await
         .unwrap();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// A request as the public SDK sends a thread turn: with the threads beta.
+async fn post(app: &Router, path: &str, payload: &Value) -> (StatusCode, Value) {
+    post_with(app, path, payload, Some(THREADS_BETA)).await
 }
 
 /// A continue turn reaches the backend as the whole conversation: the create
@@ -153,5 +170,47 @@ async fn test_v1_messages_thread_continue_rebuilds_the_conversation_for_the_back
     );
 
     assert_eq!(recorder.bodies().len(), 2, "the refusals reach no backend");
+    ctx.shutdown().await;
+}
+
+/// A `thread` field without the message-threads beta header is refused with
+/// the public API's 400 before the backend; with the header the same turn is
+/// served. The header is what tells the gateway to parse the turn.
+#[tokio::test]
+async fn test_v1_messages_thread_without_the_beta_header_is_refused() {
+    let recorder = RequestRecorder::new();
+    set_request_recorder(18964, Arc::clone(&recorder));
+    let ctx = AppTestContext::new(vec![MockWorkerConfig {
+        port: 18964,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    }])
+    .await;
+    let app = ctx.create_app();
+    let payload = json!({
+        "model": "mock-model",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "first"}],
+        "thread": {"type": "create"}
+    });
+
+    let (status, refused) = post_with(&app, "/v1/messages", &payload, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["type"], "error");
+    assert_eq!(refused["error"]["type"], "invalid_request_error");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("message-threads-2026-08-12"), "{refused}");
+    assert_eq!(recorder.bodies().len(), 0, "the refusal reaches no backend");
+
+    let (status, created) = post(&app, "/v1/messages", &payload).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(
+        recorder.bodies().len(),
+        1,
+        "the turn with the header is served"
+    );
+
     ctx.shutdown().await;
 }

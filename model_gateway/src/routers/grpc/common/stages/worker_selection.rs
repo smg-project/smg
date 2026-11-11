@@ -826,7 +826,7 @@ impl WorkerSelectionStage {
 
     /// Keep known grid-bearing decode identities on vision-capable workers.
     /// EPD references are unresolved: prefer vision when available, but let
-    /// dispatch validate the resulting identity before using a stripped leg.
+    /// dispatch validate the resulting identity before using a stripped decode request.
     fn decode_side_needs_vision(
         &self,
         request: &RequestType,
@@ -1328,7 +1328,7 @@ impl WorkerSelectionStage {
     /// 404 of a model nobody serves.
     fn role_missing(model_id: &str, missing: &[&'static str]) -> Response {
         placement::no_available_workers(format!(
-            "No {} worker is registered for model '{model_id}' at the moment (its other leg \
+            "No {} worker is registered for model '{model_id}' at the moment (its other side \
              is): the pair is incomplete",
             missing.join(" or ")
         ))
@@ -1438,10 +1438,10 @@ impl WorkerSelectionStage {
         response
     }
 
-    /// Workers serve the model but none of the leg's workers processes media
+    /// Workers serve the model but none of the pool's workers processes media
     /// references. Preparation answers this verdict for the pool as
     /// registered (`multimodal::resolve_mm_processing`); here it is the
-    /// backstop for a pool that changed in between, or a disaggregated leg
+    /// backstop for a pool that changed in between, or a disaggregated side
     /// none of whose workers does. Terminal: capability cannot change within
     /// a retry window. Its one rate-limited line is written by
     /// [`Self::report_refusal`] at the stage's entry points, like the pool's
@@ -4218,7 +4218,7 @@ mod tests {
                                 None
                             )
                             .is_ok(),
-                        "unresolved refs may use a stripped decode leg when no vision D exists"
+                        "unresolved refs may use a stripped decode request when no vision D exists"
                     );
                 }
             }

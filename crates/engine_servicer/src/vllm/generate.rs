@@ -251,11 +251,11 @@ async fn submit(
             "This model does not support generation",
         ));
     }
-    // An encode-prefill-decode leg (the encoder's request with the consumer's
+    // An encode-prefill-decode request (the encoder's with the consumer's
     // destination, or the prefill side's with the encoder's handles) rides
     // the engine's encoder-cache connector, which the launcher reports off
     // `ec_transfer_config` and `GetServerInfo` advertises, so a Router selects
-    // an engine without one for neither side. A leg that arrives there all
+    // an engine without one for neither side. A request that arrives there all
     // the same is refused here, before the media stage or the engine sees it
     // (the engine would run it as a plain request and the caller would read
     // a completion without the handles), in the shape a media reference is
@@ -263,7 +263,7 @@ async fn submit(
     if !state.model.supports_ec_transfer && ec_transfer_params_sent(&req) {
         return Err(Status::invalid_argument(NO_ENCODER_CACHE));
     }
-    // On an engine with a connector, the leg's parameters (a JSON object; a
+    // On an engine with a connector, the request's parameters (a JSON object; a
     // malformed field is refused by the adapter's parse) are checked as the
     // Python servicer checks them: a consumer's pixel-less batches need a
     // usable handle per media item before the engine sees the request.
@@ -301,7 +301,7 @@ async fn submit(
         Some((media, identity)) => (Some(media), identity.map(Arc::new)),
         None => (None, None),
     };
-    // An encoder's leg with router-preprocessed batches gets its identity
+    // An encoder's request with router-preprocessed batches gets its identity
     // from the batches themselves (the media stage saw no reference).
     let media_identity = media_identity.or_else(|| {
         ec_producer_leg

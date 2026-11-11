@@ -21,6 +21,9 @@ fn current_timestamp() -> i64 {
 // Rerank API
 // ============================================================================
 
+/// A request to the rerank route: the query, the documents to rank against it,
+/// the model, how many of the best to return and whether to return the
+/// documents' text.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_rerank_request"))]
 pub struct RerankRequest {
@@ -49,7 +52,9 @@ pub struct RerankRequest {
     pub return_documents: bool,
 
     // Engine-specific extensions
-    /// Request ID for tracking
+    /// Request ID for tracking; absent from the body when unset, so the
+    /// forwarded bytes carry no `rid` key to strip.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<StringOrArray>,
 
     /// User identifier
@@ -371,5 +376,32 @@ impl From<V1RerankReqInput> for RerankRequest {
             rid: v1.rid,
             user: v1.user,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A request without a `rid` writes no `rid` key, so the proxy's strip
+    /// of the engine defaults finds nothing to drop and forwards the
+    /// serialized bytes as they are; a set `rid` is written.
+    #[test]
+    fn a_rerank_request_without_rid_writes_no_rid_key() {
+        let request: RerankRequest =
+            serde_json::from_value(json!({"model": "m", "query": "q", "documents": ["d"]}))
+                .expect("a well-formed request");
+        let body = serde_json::to_value(&request).expect("a body");
+        assert!(body.get("rid").is_none(), "{body}");
+        let with_rid: RerankRequest = serde_json::from_value(
+            json!({"model": "m", "query": "q", "documents": ["d"], "rid": "r-1"}),
+        )
+        .expect("a well-formed request");
+        assert_eq!(
+            serde_json::to_value(&with_rid).expect("a body")["rid"],
+            "r-1"
+        );
     }
 }

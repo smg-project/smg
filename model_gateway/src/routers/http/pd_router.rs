@@ -405,8 +405,7 @@ impl PDRouter {
                 }
             }
             Ok(res) => {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let status = res.status();
                 // Use the status code to determine which error function to use
                 match status {
                     StatusCode::BAD_REQUEST => error::bad_request(
@@ -681,11 +680,13 @@ impl PDRouter {
         // policy routes a completions batch on its first prompt alone
         // (`PdRoute::routing_inputs`), and the tenant is charged for them all.
         let (reservation, denial) = tenant_rate_limit::reserve(
-            self.rate_limit_manager.as_deref(),
-            tenant_meta,
-            &original_request,
+            tenant_rate_limit::estimate(
+                self.rate_limit_manager.as_deref(),
+                tenant_meta,
+                &original_request,
+                None,
+            ),
             model,
-            None,
         )
         .await;
 
@@ -1183,8 +1184,7 @@ impl PDRouter {
     /// status's body as the envelope, not as events. An error body that
     /// cannot be read says so in the detail.
     async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
-        let status = StatusCode::from_u16(response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = response.status();
         // Taken before the body read consumes the response.
         let retry_after = response.headers().get(RETRY_AFTER).cloned();
         let detail = match response.bytes().await {
@@ -1218,8 +1218,7 @@ impl PDRouter {
         dispatch_start: Instant,
     ) -> Response {
         events::RequestReceivedEvent {}.emit();
-        let status = StatusCode::from_u16(decode_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = decode_response.status();
         if !(context.is_stream && status.is_success()) {
             Self::record_sequential_side(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
         }
@@ -1489,8 +1488,7 @@ impl PDRouter {
         };
 
         // Process decode response
-        let status = StatusCode::from_u16(decode_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = decode_response.status();
         debug!("Decode response status: {}", status);
 
         // Honest PD TTFT: dispatch to the decode response head — the first
@@ -1725,8 +1723,7 @@ impl PDRouter {
                 Ok(response) => response,
                 Err(e) => return Self::prefill_transport_failed(prefill.as_ref(), &e),
             };
-            let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let prefill_status = prefill_response.status();
             if !prefill_status.is_success() {
                 error!(
                     "Prefill server returned error status prefill_url={} status={}",
@@ -1930,8 +1927,7 @@ impl PDRouter {
                 Ok(response) => response,
                 Err(e) => return Err(Self::prefill_transport_failed(prefill.as_ref(), &e)),
             };
-            let status = StatusCode::from_u16(response.status().as_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status = response.status();
             if !status.is_success() {
                 error!(
                     "Prefill server returned error status prefill_url={} status={}",
@@ -2124,10 +2120,29 @@ impl PDRouter {
         }
     }
 
+    /// Whether the body is read for the pair policies' sake: the registry's
+    /// static answer for the two pair sides.
     fn policies_need_request_text(&self) -> bool {
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-        prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+        self.policy_registry.pair_needs_request_text()
+    }
+
+    /// The count request as the prefill worker receives it (its model the
+    /// canonical one) and the text the placement policies read, if they read
+    /// any: both taken before the send, so the request itself does not ride
+    /// in the route's task across it.
+    fn count_tokens_wire(
+        mut body: CountMessageTokensRequest,
+        canonical_model: Option<&str>,
+        policies_need_text: bool,
+    ) -> (Option<String>, serde_json::Result<Bytes>) {
+        let request_text = policies_need_text.then(|| body.extract_text_for_routing());
+        if let Some(canonical_model) = canonical_model {
+            canonical_model.clone_into(&mut body.model);
+        }
+        (
+            request_text,
+            serialize_json_sized(&body, None).map(Bytes::from),
+        )
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
@@ -2381,8 +2396,7 @@ impl PDRouter {
         prefill_url: &str,
         return_logprob: bool,
     ) -> Result<(StatusCode, Option<Bytes>), Response> {
-        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let prefill_status = prefill_response.status();
 
         if !prefill_status.is_success() {
             error!(
@@ -2728,7 +2742,7 @@ impl RouterTrait for PDRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+        if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
         self.route_pd(headers, Some(tenant_meta), body, model_id)
@@ -2739,16 +2753,21 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        mut body: CountMessageTokensRequest,
+        body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
         // Counting generates nothing, so it takes one prefill worker (which
         // holds the tokenizer and prompt template) and no KV handoff.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let request_text = self
-            .policies_need_request_text()
-            .then(|| body.extract_text_for_routing());
+        // The request is serialized before the send and never borrowed here:
+        // a borrowed local keeps its slot in the task across the awaits that
+        // follow, a second copy of the request per count.
+        let (request_text, wire) = Self::count_tokens_wire(
+            body,
+            canonical_model.as_deref(),
+            self.policies_need_request_text(),
+        );
         let Some(worker) = placement::select_single(
             &self.worker_registry,
             &self.policy_registry,
@@ -2771,11 +2790,8 @@ impl RouterTrait for PDRouter {
             );
         };
 
-        if let Some(canonical_model) = canonical_model.as_deref() {
-            canonical_model.clone_into(&mut body.model);
-        }
-        let body = match serialize_json_sized(&body, None) {
-            Ok(bytes) => Bytes::from(bytes),
+        let body = match wire {
+            Ok(bytes) => bytes,
             Err(e) => return Self::handle_serialization_error(e),
         };
         if let Some(response) = overload::shed_if_worker_overloaded(
@@ -2831,8 +2847,7 @@ impl RouterTrait for PDRouter {
                 );
             }
         };
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
         let mut response_headers = header_utils::preserve_response_headers(res.headers());
         header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
         match res.bytes().await {
@@ -4032,6 +4047,32 @@ mod tests {
                 "head sent: {head_sent}: the timeout was not recorded against the worker"
             );
         }
+    }
+
+    #[test]
+    fn count_tokens_wire_reads_the_text_before_the_canonical_model_goes_on_the_wire() {
+        let body: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "alias",
+            "messages": [{"role": "user", "content": "count me"}],
+        }))
+        .unwrap();
+        let expected_text = body.extract_text_for_routing();
+
+        let (text, wire) = PDRouter::count_tokens_wire(body.clone(), Some("canonical"), true);
+        assert_eq!(text.as_deref(), Some(expected_text.as_str()));
+        let forwarded: Value = serde_json::from_slice(&wire.unwrap()).unwrap();
+        assert_eq!(forwarded["model"], "canonical");
+
+        let (text, wire) = PDRouter::count_tokens_wire(body, None, false);
+        assert!(
+            text.is_none(),
+            "no policy reads the text, so none is extracted"
+        );
+        let forwarded: Value = serde_json::from_slice(&wire.unwrap()).unwrap();
+        assert_eq!(
+            forwarded["model"], "alias",
+            "without a canonical model the request's own goes on the wire"
+        );
     }
 
     #[tokio::test]

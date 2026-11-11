@@ -106,7 +106,7 @@ def test_an_encode_worker_takes_the_vllm_wire_and_a_bootstrap_port():
     encode = _worker(ConnectionMode.GRPC, worker_type=WorkerType.ENCODE, bootstrap_port=31901)
     cmd = encode._build_cmd()
     assert _flag(cmd, "--worker-type") == "encode"
-    assert _last_flag(cmd, "--grpc-wire") == "vllm", "the encode role is the vLLM wire's"
+    assert _last_flag(cmd, "--grpc-wire") == "vllm", "the encode role's default wire"
     assert _flag(cmd, "--bootstrap-base-port") == "31901", "the port the gateway is told of"
     # A class's own wire comes after the role's, as for every pool: the mock
     # takes the last, and refuses the encode role on a wire without one.

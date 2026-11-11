@@ -3,14 +3,16 @@
 //! `SMG_MM_PIXEL_CACHE_MB` unset or 0).
 
 use std::{
+    collections::{hash_map::Entry, HashMap},
     io::{self, BufWriter, Write},
     mem::size_of,
+    num::NonZeroUsize,
     sync::{Arc, OnceLock},
 };
 
 use llm_multimodal::{ModelSpecificValue, PreprocessedEncoderInputs};
 use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use serde_json::Value;
 
 use crate::observability::metrics::Metrics;
@@ -43,7 +45,10 @@ fn preprocessed_heap_bytes(preprocessed: &PreprocessedEncoderInputs) -> usize {
         .iter()
         .map(|(key, value)| key.len() + model_specific_value_heap_bytes(value))
         .sum();
-    preprocessed.encoder_input.nbytes()
+    preprocessed
+        .encoder_input
+        .shared_allocation()
+        .map_or_else(|| preprocessed.encoder_input.nbytes(), |_| 0)
         + preprocessed.encoder_input.ndim() * size_of::<usize>()
         + preprocessed.feature_token_counts.len() * size_of::<usize>()
         + preprocessed.item_sizes.len() * size_of::<(u32, u32)>()
@@ -75,12 +80,43 @@ const PIXEL_CACHE_KEY_OVERHEAD: usize = 128;
 
 struct PixelCacheInner {
     map: LruCache<PixelCacheKey, Arc<CachedPreprocessedItem>>,
+    recent_large_misses: LruCache<PixelCacheKey, u64>,
+    large_fill_bytes: u64,
+    allocations: HashMap<usize, usize>,
     cur_bytes: usize,
-    max_bytes: usize,
+}
+
+impl PixelCacheInner {
+    /// Charge a shared wire allocation when its first slice enters the cache.
+    fn charge(&mut self, value: &CachedPreprocessedItem) {
+        self.cur_bytes += value.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        if let Some((id, capacity)) = value.preprocessed.encoder_input.shared_allocation() {
+            let count = self.allocations.entry(id).or_default();
+            if *count == 0 {
+                self.cur_bytes += capacity;
+            }
+            *count += 1;
+        }
+    }
+
+    /// Release a shared allocation's charge when its last slice leaves.
+    fn uncharge(&mut self, value: &CachedPreprocessedItem) {
+        self.cur_bytes -= value.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        if let Some((id, capacity)) = value.preprocessed.encoder_input.shared_allocation() {
+            if let Entry::Occupied(mut count) = self.allocations.entry(id) {
+                *count.get_mut() -= 1;
+                if *count.get() == 0 {
+                    count.remove();
+                    self.cur_bytes -= capacity;
+                }
+            }
+        }
+    }
 }
 
 /// Thread-safe, byte-budgeted LRU of per-image vision processor outputs.
 pub(crate) struct PixelCache {
+    max_bytes: usize,
     inner: Mutex<PixelCacheInner>,
 }
 
@@ -90,12 +126,22 @@ impl PixelCache {
         // zero, rather than appearing with the first image.
         Metrics::init_mm_pixel_cache_series();
         Self {
+            max_bytes,
             inner: Mutex::new(PixelCacheInner {
                 map: LruCache::unbounded(),
+                recent_large_misses: LruCache::sparse(
+                    NonZeroUsize::new(1024).unwrap_or(NonZeroUsize::MIN),
+                ),
+                large_fill_bytes: 0,
+                allocations: HashMap::new(),
                 cur_bytes: 0,
-                max_bytes,
             }),
         }
+    }
+
+    /// Upper bound for the total size of resident entries.
+    pub(super) fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     pub(crate) fn get(&self, key: &PixelCacheKey) -> Option<Arc<CachedPreprocessedItem>> {
@@ -103,35 +149,130 @@ impl PixelCache {
         inner.map.get(key).cloned()
     }
 
-    pub(crate) fn insert(&self, key: PixelCacheKey, value: Arc<CachedPreprocessedItem>) {
-        let entry_bytes = value.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+    /// Remember large cold fills without pinning their pixels. Admit when at
+    /// least half the images recurred within one cache budget of intervening fills.
+    pub(super) fn admit_repeated<'a>(
+        &self,
+        keys: impl ExactSizeIterator<Item = &'a PixelCacheKey>,
+        capacity: usize,
+    ) -> bool {
+        let required = keys.len().div_ceil(2);
         let mut inner = self.inner.lock();
-        if entry_bytes > inner.max_bytes {
-            return;
+        let start = inner.large_fill_bytes;
+        let end = start.wrapping_add(capacity as u64);
+        inner.large_fill_bytes = end;
+        keys.filter_map(|key| inner.recent_large_misses.put(key.clone(), end))
+            .filter(|previous| start.wrapping_sub(*previous) < self.max_bytes as u64)
+            .count()
+            >= required
+    }
+
+    pub(crate) fn insert(&self, key: PixelCacheKey, value: Arc<CachedPreprocessedItem>) {
+        self.insert_locked(self.inner.lock(), [(key, value)], true);
+    }
+
+    /// Insert the request's misses that are still absent under the cache lock.
+    pub(super) fn insert_batch(
+        &self,
+        entries: impl IntoIterator<Item = (PixelCacheKey, Arc<CachedPreprocessedItem>)>,
+    ) {
+        self.insert_locked(self.inner.lock(), entries, false);
+    }
+
+    /// Check capacity plus the separately allocated metadata of every slice.
+    pub(super) fn shared_batch_fits<'a>(
+        &self,
+        capacity: usize,
+        entries: impl Iterator<Item = &'a PreprocessedEncoderInputs>,
+    ) -> bool {
+        self.max_bytes
+            .checked_sub(capacity)
+            .is_some_and(|remaining| {
+                entries
+                    .map(|entry| preprocessed_heap_bytes(entry) + PIXEL_CACHE_KEY_OVERHEAD)
+                    .try_fold(remaining, usize::checked_sub)
+                    .is_some()
+            })
+    }
+
+    /// Install a whole shared allocation only if it fits and replacing its
+    /// images releases every older allocation touched by the replacement.
+    pub(super) fn insert_shared_batch(
+        &self,
+        entries: Vec<(PixelCacheKey, Arc<CachedPreprocessedItem>)>,
+        capacity: usize,
+    ) -> bool {
+        if !self.shared_batch_fits(
+            capacity,
+            entries.iter().map(|(_, entry)| &entry.preprocessed),
+        ) {
+            return false;
         }
-        let PixelCacheInner {
-            map,
-            cur_bytes,
-            max_bytes,
-        } = &mut *inner;
-        if let Some(previous) = map.put(key, value) {
-            *cur_bytes = cur_bytes.saturating_sub(previous.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD);
-        }
-        *cur_bytes += entry_bytes;
-        let mut evicted_entries = 0;
-        while *cur_bytes > *max_bytes {
-            match map.pop_lru() {
-                Some((_, evicted)) => {
-                    *cur_bytes =
-                        cur_bytes.saturating_sub(evicted.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD);
-                    evicted_entries += 1;
-                }
-                None => break,
+        let mut replaced = HashMap::new();
+        let inner = self.inner.lock();
+        for (key, _) in &entries {
+            if let Some((owner, _)) = inner
+                .map
+                .peek(key)
+                .and_then(|value| value.preprocessed.encoder_input.shared_allocation())
+            {
+                *replaced.entry(owner).or_insert(0) += 1;
             }
         }
-        let (bytes, entries) = (*cur_bytes, map.len());
+        if replaced
+            .iter()
+            .any(|(owner, count)| inner.allocations.get(owner) != Some(count))
+        {
+            return false;
+        }
+        self.insert_locked(inner, entries, true);
+        true
+    }
+
+    /// Keep replacement checks and insertion within the same cache lock.
+    fn insert_locked(
+        &self,
+        mut inner: MutexGuard<'_, PixelCacheInner>,
+        entries: impl IntoIterator<Item = (PixelCacheKey, Arc<CachedPreprocessedItem>)>,
+        replace: bool,
+    ) {
+        let mut released = Vec::new();
+        let mut evicted_entries = 0;
+        let mut inserted = false;
+        for (key, value) in entries {
+            if !replace && inner.map.contains(&key) {
+                continue;
+            }
+            let capacity = value
+                .preprocessed
+                .encoder_input
+                .shared_allocation()
+                .map_or(0, |(_, bytes)| bytes);
+            if value.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD + capacity > self.max_bytes {
+                continue;
+            }
+            inserted = true;
+            inner.charge(&value);
+            if let Some(previous) = inner.map.put(key, value) {
+                inner.uncharge(&previous);
+                released.push(previous);
+            }
+        }
+        while inner.cur_bytes > self.max_bytes {
+            if let Some((_, evicted)) = inner.map.pop_lru() {
+                inner.uncharge(&evicted);
+                released.push(evicted);
+                evicted_entries += 1;
+            } else {
+                break;
+            }
+        }
+        let (bytes, entries) = (inner.cur_bytes, inner.map.len());
         drop(inner);
-        Metrics::record_mm_pixel_cache_insert(evicted_entries, bytes, entries);
+        if inserted {
+            Metrics::record_mm_pixel_cache_insert(evicted_entries, bytes, entries);
+        }
+        drop(released);
     }
 
     #[cfg(test)]
@@ -373,6 +514,123 @@ mod tests {
         assert_eq!(got.preprocessed.feature_token_counts, vec![10]);
         assert!(Arc::ptr_eq(&got, &value));
         assert!(cache.get(&pixel_cache_key("missing")).is_none());
+    }
+
+    #[test]
+    fn cold_large_fills_require_reuse() {
+        let cache = PixelCache::new(400);
+        let a = ["a", "b", "c", "d"].map(pixel_cache_key);
+        let b = ["d", "e", "f", "g"].map(pixel_cache_key);
+        assert!(!cache.admit_repeated(a.iter(), 100));
+        assert!(!cache.admit_repeated(b.iter(), 100));
+        assert!(cache.admit_repeated(a.iter(), 100));
+        for _ in 0..4 {
+            cache.admit_repeated(b.iter(), 100);
+        }
+        assert!(!cache.admit_repeated(a.iter(), 100));
+        assert_eq!(cache.current_bytes(), 0);
+    }
+
+    #[test]
+    fn immediate_reuse_excludes_the_previous_fill_capacity() {
+        let keys = ["a", "b"].map(pixel_cache_key);
+        for capacity in [400, 800] {
+            let cache = PixelCache::new(400);
+            assert!(!cache.admit_repeated(keys.iter(), capacity));
+            assert!(cache.admit_repeated(keys.iter(), capacity));
+        }
+    }
+
+    fn shared_pixel_entries(keys: [&str; 2]) -> Vec<(PixelCacheKey, Arc<CachedPreprocessedItem>)> {
+        use llm_multimodal::{EncoderDtype, EncoderInput, PixelNorm};
+
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.resize(128, 0);
+        let mut wire = EncoderInput::wire(
+            bytes,
+            EncoderDtype::BFloat16,
+            vec![2, 32],
+            PixelNorm {
+                scale: 1.0,
+                offset: [0.0; 3],
+                divisor: [1.0; 3],
+                channel_block: 1,
+            },
+        )
+        .unwrap();
+        assert!(wire.share_wire(1024));
+        let parts = wire.split_axis0(&[1, 1]).unwrap();
+        keys.into_iter()
+            .zip(parts)
+            .map(|(key, encoder_input)| {
+                (
+                    pixel_cache_key(key),
+                    Arc::new(CachedPreprocessedItem {
+                        preprocessed: PreprocessedEncoderInputs::new(
+                            encoder_input,
+                            vec![1],
+                            vec![(1, 1)],
+                        ),
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    /// Partial eviction retains the whole charge until the final slice leaves.
+    #[test]
+    fn pixel_cache_accounts_for_shared_wire_capacity_once() {
+        let entries = shared_pixel_entries(["a", "b"]);
+        let (_, capacity) = entries[0]
+            .1
+            .preprocessed
+            .encoder_input
+            .shared_allocation()
+            .unwrap();
+        let meta = entries[0].1.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        let independent = pixel_cache_item(1, 8);
+        let other = independent.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        let cache = PixelCache::new(capacity + meta + other);
+        cache.insert_batch(entries);
+        assert_eq!(cache.current_bytes(), capacity + 2 * meta);
+        cache.insert(pixel_cache_key("c"), independent.clone());
+        assert!(cache.get(&pixel_cache_key("a")).is_none());
+        assert_eq!(cache.current_bytes(), capacity + meta + other);
+        cache.insert(pixel_cache_key("d"), independent);
+        assert!(cache.get(&pixel_cache_key("b")).is_none());
+        assert_eq!(cache.current_bytes(), 2 * other);
+    }
+
+    #[test]
+    fn shared_batch_replacement_keeps_complete_backings_and_metadata_budget() {
+        let entries = shared_pixel_entries(["a", "b"]);
+        let (owner, capacity) = entries[0]
+            .1
+            .preprocessed
+            .encoder_input
+            .shared_allocation()
+            .unwrap();
+        let entry_bytes = entries[0].1.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+
+        let too_small = PixelCache::new(capacity + entry_bytes);
+        assert!(!too_small.insert_shared_batch(entries.clone(), capacity));
+        assert_eq!(too_small.current_bytes(), 0);
+
+        let cache = PixelCache::new(4 * capacity);
+        assert!(cache.insert_shared_batch(entries, capacity));
+        assert!(!cache.insert_shared_batch(shared_pixel_entries(["a", "c"]), capacity));
+        assert_eq!(
+            cache
+                .get(&pixel_cache_key("a"))
+                .unwrap()
+                .preprocessed
+                .encoder_input
+                .shared_allocation(),
+            Some((owner, capacity))
+        );
+        assert!(cache.get(&pixel_cache_key("c")).is_none());
+        assert!(cache.insert_shared_batch(shared_pixel_entries(["a", "b"]), capacity));
+        assert_eq!(cache.current_bytes(), capacity + 2 * entry_bytes);
     }
 
     #[test]

@@ -54,22 +54,7 @@ impl SglangSchedulerClient {
         "SGLang scheduler"
     );
 
-    /// Submit an embedding request
-    pub async fn embed(
-        &self,
-        req: proto::EmbedRequest,
-    ) -> Result<proto::EmbedResponse, tonic::Status> {
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        // Inject W3C trace context into gRPC metadata
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.embed(request).await?;
-        Ok(response.into_inner())
-    }
+    crate::impl_embed!(proto);
 
     /// Abort a request
     pub async fn abort_request(
@@ -838,6 +823,24 @@ mod tests {
         let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&plain)
             .expect("build sampling params");
         assert!(params.logit_bias.is_empty());
+    }
+
+    /// A completions `max_tokens` of zero reaches the proto as `Some(0)`, a
+    /// prefill-only turn (the prompt-scoring request, `echo` with `logprobs`),
+    /// not as an unset limit.
+    #[test]
+    fn completion_max_tokens_zero_reaches_the_proto_as_zero() {
+        let scoring: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "echo": true, "logprobs": 1, "max_tokens": 0
+        }))
+        .expect("a completion request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&scoring)
+            .expect("build sampling params");
+        assert_eq!(
+            params.max_new_tokens,
+            Some(0),
+            "an explicit zero is prefill only, not an unset limit"
+        );
     }
 
     #[test]

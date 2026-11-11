@@ -276,8 +276,7 @@ impl Router {
 
                 match send_with_stale_conn_retry(request_builder).await {
                     Ok(res) => {
-                        let status = StatusCode::from_u16(res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let status = res.status();
 
                         // Preserve headers from backend
                         let response_headers =
@@ -444,14 +443,25 @@ impl Router {
     /// reserves its estimate once, before any dispatch, and the one answer the
     /// dispatch paths converge on resolves the reservation once
     /// (`tenant_rate_limit::resolve`).
-    pub(crate) async fn route_typed_request<T: TenantCharge + serde::Serialize>(
-        &self,
-        headers: Option<&HeaderMap>,
-        tenant_meta: Option<&TenantRequestMeta>,
+    ///
+    /// A plain fn around an async block, not an async fn: everything the
+    /// route reads from the request by reference (whether it streams, its
+    /// routing derivatives, the tenant's estimate) is read here, before the
+    /// request moves into the lease, and the block uses the lease in place.
+    /// An async fn re-binds its by-value argument and keeps that local once
+    /// it has been borrowed, two copies of the request in the task beside
+    /// the lease's; the block holds the lease alone.
+    pub(crate) fn route_typed_request<'a, T>(
+        &'a self,
+        headers: Option<&'a HeaderMap>,
+        tenant_meta: Option<&'a TenantRequestMeta>,
         typed_req: T,
         route: &'static str,
-        model_id: &str,
-    ) -> Response {
+        model_id: &'a str,
+    ) -> impl Future<Output = Response> + Send + 'a
+    where
+        T: TenantCharge + serde::Serialize + Send + 'a,
+    {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
@@ -460,53 +470,62 @@ impl Router {
         // understands aliases; retry configs, hash rings and policies do not,
         // and an alias would silently fall back to router defaults.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
-        let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let outcome = self.begin_route(route, model_id, is_stream);
-
+        let estimate = tenant_rate_limit::estimate(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            &typed_req,
+            routing.text.as_deref(),
+        );
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
-        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
-        let retry_config = per_model_retry_config
-            .as_ref()
-            .unwrap_or(&self.retry_config);
-
-        let (reservation, denial) = self
-            .reserve_tenant_estimate(tenant_meta, &typed_req, model_id, routing.text.as_deref())
-            .await;
-
+        let per_model_retry_config = self
+            .worker_registry
+            .get_retry_config(canonical_model.as_deref().unwrap_or(model_id));
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
             typed_req,
             routing,
-            ReleasePoint::from_retry_config(retry_config),
+            ReleasePoint::from_retry_config(
+                per_model_retry_config
+                    .as_ref()
+                    .unwrap_or(&self.retry_config),
+            ),
         );
-        // The state the attempts share; `TypedAttempt` names each piece.
-        let tried = parking_lot::Mutex::new(Vec::new());
-        let ledger = AttemptLedger::default();
-        let attempt = TypedAttempt {
-            headers,
-            lease: &lease,
-            route,
-            model_id,
-            canonical_model: canonical_model.as_deref(),
-            is_stream,
-            ledger: &ledger,
-            tried: &tried,
-        };
+        async move {
+            let model_id = canonical_model.as_deref().unwrap_or(model_id);
+            let retry_config = per_model_retry_config
+                .as_ref()
+                .unwrap_or(&self.retry_config);
+            let outcome = self.begin_route(route, model_id, is_stream);
+            let (reservation, denial) = tenant_rate_limit::reserve(estimate, model_id).await;
+            // The state the attempts share; `TypedAttempt` names each piece.
+            let tried = parking_lot::Mutex::new(Vec::new());
+            let ledger = AttemptLedger::default();
+            let attempt = TypedAttempt {
+                headers,
+                lease: &lease,
+                route,
+                model_id,
+                canonical_model: canonical_model.as_deref(),
+                is_stream,
+                ledger: &ledger,
+                tried: &tried,
+            };
 
-        let response = if let Some(denied) = denial {
-            denied
-        } else if lease.release_point() == ReleasePoint::AfterDispatch {
-            self.dispatch_once(&attempt, outcome.endpoint).await
-        } else {
-            self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
-                .await
-        };
-        let response = self
-            .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
-            .await;
-        outcome.answered_typed(&response, start);
-        response
+            let response = if let Some(denied) = denial {
+                denied
+            } else if lease.release_point() == ReleasePoint::AfterDispatch {
+                self.dispatch_once(&attempt, outcome.endpoint).await
+            } else {
+                self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
+                    .await
+            };
+            let response = self
+                .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
+                .await;
+            outcome.answered_typed(&response, start);
+            response
+        }
     }
 
     /// The routing inputs of a request, derived once (for a typed request,
@@ -570,28 +589,6 @@ impl Router {
             model_label: Cow::Borrowed(model_label),
             endpoint,
         }
-    }
-
-    /// Reserve the tenant's estimate once per logical request, before any
-    /// dispatch: every attempt dispatches under this one reservation. With
-    /// the rate limiter on and a tenant to charge, either the reservation or
-    /// the denial, which is the request's answer, never retried; `(None,
-    /// None)` for a request outside the limiter (`tenant_rate_limit::reserve`).
-    async fn reserve_tenant_estimate<T: TenantCharge>(
-        &self,
-        tenant_meta: Option<&TenantRequestMeta>,
-        typed_req: &T,
-        model_id: &str,
-        routing_text: Option<&str>,
-    ) -> (Option<TenantReservation>, Option<Response>) {
-        tenant_rate_limit::reserve(
-            self.rate_limit_manager.as_deref(),
-            tenant_meta,
-            typed_req,
-            model_id,
-            routing_text,
-        )
-        .await
     }
 
     /// The one dispatch of a request with retries disabled: the lease frees
@@ -1073,8 +1070,7 @@ impl Router {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let status = res.status();
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -1188,8 +1184,7 @@ impl Router {
             Err(response) => return response,
         };
 
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
 
         Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
 
@@ -1455,8 +1450,7 @@ impl Router {
         load_guard: WorkerLoadGuard,
     ) -> Response {
         let StreamRelayMode { is_stream, rechunk } = mode;
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
 
         if is_stream {
             // Preserve headers for streaming response
@@ -2230,6 +2224,7 @@ impl Router {
                     .any_model_retry_override_enables_retries(),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
             tenant_rate_limited: self.rate_limit_manager.is_some(),
+            message_thread: header_utils::anthropic_beta_named(headers, "message-threads"),
         })
     }
 
@@ -2597,7 +2592,7 @@ impl RouterTrait for Router {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+        if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
         self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
@@ -2896,8 +2891,9 @@ mod tests {
         policies::as_cache_aware,
         routers::common::{
             body_policy::{
-                REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
-                REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
+                REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
+                REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                REASON_WASM_REQUEST_HOOK,
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
             test_support::fast_retry_config,
@@ -4069,6 +4065,28 @@ mod tests {
             headers.insert(CONTENT_LENGTH, len.parse().unwrap());
         }
         headers
+    }
+
+    /// A request that names the message-threads beta buffers: the thread
+    /// layer rebuilds the turn from its body before the route.
+    #[test]
+    fn a_message_thread_turn_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        let mut headers = headers_with_content_length(Some("64"));
+        headers.insert(
+            "anthropic-beta",
+            "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_MESSAGE_THREAD)
+        );
     }
 
     #[test]
@@ -6537,6 +6555,81 @@ mod tests {
         let (status, _) = posted(app, request).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         drop(listener);
+    }
+
+    /// A worker that answers the chat route with `body` as one sized SSE
+    /// answer: hyper writes the `Content-Length` an upstream that knows its
+    /// length would.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_sized_sse_worker(body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                move || async move { ([(CONTENT_TYPE, "text/event-stream")], body) },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Re-slicing changes the body's length: a re-sliced stream reaches the
+    /// client without the upstream's `Content-Length` and with its text
+    /// whole, while a plain relay keeps the header with the bytes it copies.
+    #[tokio::test]
+    async fn a_re_sliced_stream_drops_the_upstreams_content_length() {
+        use openai_protocol::validated::Normalizable;
+
+        const BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: [DONE]\n\n";
+        let url = spawn_sized_sse_worker(BODY).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for (model, keeps_length) in [("MiniMax-M3", false), ("served-plain-relay-model", true)] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                response.headers().contains_key(CONTENT_LENGTH),
+                keeps_length,
+                "{model}: the Content-Length of a sized upstream answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let text: String = sse_events(std::str::from_utf8(&bytes).unwrap())
+                .iter()
+                .filter_map(|event| event.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .filter_map(|json| {
+                    json["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(text, "Hello", "{model}: the text is whole");
+        }
     }
 }
 

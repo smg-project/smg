@@ -196,7 +196,12 @@ impl Scanner {
         }
         let (digit, digit_cap) = match digits {
             Node::Class(class) => (*class, 1),
-            Node::ClassRepeat { class, min: 1, max } => (*class, *max),
+            Node::ClassRepeat {
+                class,
+                min: 1,
+                max,
+                possessive: false,
+            } => (*class, *max),
             _ => return None,
         };
         let [punct_prefix, punct_run, punct_break] = concat(punct)? else {

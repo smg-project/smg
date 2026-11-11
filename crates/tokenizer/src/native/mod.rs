@@ -97,13 +97,43 @@ use short_pieces::{ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTE
 
 use crate::{
     encode_path::{Declined, Fallback},
-    word_cache::{ModelView, TokenizerOf},
+    word_cache::{Listing, ModelView, TokenizerOf},
 };
 
 /// The split the `ByteLevel` pre-tokenizer applies itself when `use_regex`
 /// is on (GPT-2 and its descendants).
 const BYTE_LEVEL_PATTERN: &str =
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+
+/// A class of the code points of `ranges` as a pattern: one character a
+/// piece, or one run of them under `runs`. ASCII members other than letters
+/// and digits are escaped (the class syntax's own characters among them),
+/// the rest stand as the ranges they are.
+fn class_pattern(ranges: &[(char, char)], runs: bool) -> String {
+    let mut pattern = String::with_capacity(4 * ranges.len() + 4);
+    pattern.push('[');
+    for &(start, end) in ranges {
+        if start.is_ascii() {
+            for c in start..=end {
+                if !c.is_ascii_alphanumeric() {
+                    pattern.push('\\');
+                }
+                pattern.push(c);
+            }
+        } else {
+            pattern.push(start);
+            if end > start {
+                pattern.push('-');
+                pattern.push(end);
+            }
+        }
+    }
+    pattern.push(']');
+    if runs {
+        pattern.push('+');
+    }
+    pattern
+}
 
 /// Pieces up to this many bytes are cached per thread by their count (see
 /// `PIECE_CACHE_CAPACITY`): those of up to `SHORT_PIECE_MAX_BYTES` in a
@@ -172,29 +202,38 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// this divided by the number of threads that have encoded with the encoder
 /// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table starts
 /// at 64 slots (2 KiB) and grows as the thread meets pieces (by four up to
-/// 4,096 slots, by two above), up to the slots for its cap, and is made anew
-/// for a smaller cap when it is cleared, so a thread that encodes little holds
-/// little and the packed tables of one tokenizer stay under 352 MiB however
-/// many runtime and blocking threads encode with it (sixteen threads at the
-/// full bound hold 264 MiB; more threads share the total, each table rounded up
-/// to a power of two slots, at most eight thirds of the total in slots). The
-/// maps of the pieces of 16 to 64 bytes share the count at about 140 bytes a
-/// typical entry (430 at most, see `PIECE_CACHE_CAPACITY`), and a clear keeps
-/// the packed slots and the map's buckets (both made anew for a smaller share),
-/// so the count-bounded tiers of one tokenizer hold at most the sum of the two:
-/// about 820 MiB at sixteen threads with typical map entries (about 2.2 GiB,
-/// sixteen times the 140 MiB of a thread, were every map entry the worst case),
-/// toward 352 + 560 MiB with the rounding of more threads; the long pieces add
-/// `LONG_PIECE_BYTES_TOTAL` at most. A thread reads its share at the start of
-/// every encode call and keeps it for that call's misses (a call that was
-/// running when threads joined keeps its earlier share until it ends; the long
-/// tier reads the live share at every miss), so after threads join it is within
-/// the smaller share from its next call on, entries, packed slots and map
-/// buckets alike, and holds at most its earlier share until then, or until it
-/// exits if it never encodes again: right after a join the total is the earlier
-/// share times the threads that had it plus the new share times the rest, and
-/// settles as they encode. Before this bound the same ceilings were a sixteenth
-/// of these. All of it is freed with the encoder.
+/// 4,096 slots, by two above), up to the slots for its cap, and is cut back to
+/// the slots of a smaller cap when it is cleared (made anew only past its
+/// reservation), so a thread that encodes little holds little and the packed
+/// tables of one tokenizer stay under 352 MiB up to some 680 threads (sixteen
+/// threads at the full bound hold 264 MiB; more threads share the total, each
+/// table rounded up to a power of two slots, at most eight thirds of the total
+/// in slots) and under twice that however many more encode with it (a table cut
+/// back inside its reservation keeps the pages it touched, 528 KiB at most,
+/// while the later threads hold their share's slots: about 440 MiB in all at
+/// 1,024 threads). The maps of the pieces of 16 to 64 bytes share the count at
+/// about 140 bytes a typical entry (430 at most, see `PIECE_CACHE_CAPACITY`),
+/// and a clear keeps the packed slots and the map's buckets (the map made anew,
+/// the packed table cut back, for a smaller share), so the count-bounded tiers
+/// of one tokenizer hold at most the sum of the two: about 820 MiB at sixteen
+/// threads with typical map entries (about 2.2 GiB, sixteen times the 140 MiB
+/// of a thread, were every map entry the worst case), toward 352 + 560 MiB with
+/// the rounding of more threads (the packed part toward twice its 352 MiB past
+/// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
+/// most. A thread reads its share at the start of every encode call and keeps
+/// it for that call's misses (a call that was running when threads joined keeps
+/// its earlier share until it ends; the long tier reads the live share at every
+/// miss), so after threads join it is within the smaller share from its next
+/// call on, entries, packed slots and map buckets alike (the packed table's
+/// pages already touched inside its reservation stay resident,
+/// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
+/// thread: more than the share's slots only once those fall under the
+/// reservation, a share under 6,144 entries, some 680 threads on this total),
+/// and holds at most its earlier share until then, or until it exits if it
+/// never encodes again: right after a join the total is the earlier share times
+/// the threads that had it plus the new share times the rest, and settles as
+/// they encode. Before this bound the same ceilings were a sixteenth of these.
+/// All of it is freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
@@ -259,6 +298,16 @@ impl SeededIds {
     fn as_slice(&self) -> &[u32] {
         &self.ids[..usize::from(self.count)]
     }
+}
+
+/// A seed job's scratch: the ids an entry merges to and, on the
+/// sentencepiece path, its initial symbols; one per rayon job (a split of
+/// 2048 entries or more), reused across the entries it reads, so the pass
+/// allocates nothing per entry.
+#[derive(Default)]
+struct SeedScratch {
+    ids: Vec<u32>,
+    symbols: Vec<u32>,
 }
 
 /// One vocabulary entry as the pass over the vocabulary reads it: a short
@@ -332,10 +381,13 @@ impl PieceCache {
 
     /// Forgets the tiers bounded by count. The packed table keeps its slots
     /// and the map its buckets, unless `share` fell below what they were
-    /// grown for: the table is made anew when it has more slots than the
-    /// share takes, the map when its capacity is above twice the share (a
-    /// map that grew under the share stays under that, so the check never
-    /// fires at a steady share and a clear at the bound keeps the buckets).
+    /// grown for: the table is cut back to the slots the share takes when it
+    /// has more (inside its reservation the room stays, with the pages the
+    /// thread already touched, `THREAD_BACKING_SLOTS` slots at most; a table
+    /// that had moved past the reservation is made anew), the map is made
+    /// anew when its capacity is above twice the share (a map that grew under
+    /// the share stays under that, so the check never fires at a steady share
+    /// and a clear at the bound keeps the buckets).
     fn clear_short(&mut self, share: usize) {
         self.packed.clear(share);
         if self.short.capacity() > 2 * share {
@@ -1023,7 +1075,14 @@ impl NativeEncoder {
         let replace = serde_json::json!(
             {"type": "Replace", "pattern": {"String": " "}, "content": WORD_MARKER.to_string()}
         );
-        let replaces = *normalizer == replace;
+        // Alone, or as the one step of a `Sequence`, as some conversions
+        // write it.
+        let replaces = *normalizer == replace
+            || normalizer.get("type").and_then(Value::as_str) == Some("Sequence")
+                && normalizer
+                    .get("normalizers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|steps| matches!(steps.as_slice(), [step] if *step == replace));
         if !(normalizer.is_null() || replaces) {
             return Err(Declined::from(
                 "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) \
@@ -1271,11 +1330,13 @@ impl NativeEncoder {
     /// The vocabulary's own pieces with their ids, the table every thread
     /// reads before its own cache: each entry of the model's vocabulary whose
     /// spelling maps back from the byte-level alphabet to 1..=15 raw bytes,
-    /// with the ids the model gives that spelling, exactly what a cache miss
-    /// on the piece computes (its own id under `ignore_merges`, else the
-    /// merge result, which is several ids for an entry the merges do not
-    /// reach). An entry with a character outside the alphabet is no
-    /// byte-level piece; one the model declines, or whose ids the table
+    /// with the ids a cache miss on the piece computes: its own id under
+    /// `ignore_merges` (the whole-piece lookup finds an entry before any
+    /// merge), else the merge of its symbols over the table the misses merge
+    /// over (the model's ids by the table's contract, several for an entry
+    /// the merges do not reach); through the model itself on a path without
+    /// a table of its own. An entry with a character outside the alphabet is
+    /// no byte-level piece; one the model declines, or whose ids the table
     /// cannot hold, is left to the miss path. A model with merge dropout
     /// tokenizes at random and gets no seed. The entries are read by id, on
     /// the caller's rayon pool when the load runs on one, else on a pool of
@@ -1283,22 +1344,30 @@ impl NativeEncoder {
     /// of the vocabulary either way.
     ///
     /// Called once the model's word cache is bounded (see `word_cache`): the
-    /// words the seed merges would otherwise fill that cache on every thread
-    /// of the pool, and the crate never clears a thread's cache of a dropped
-    /// model.
-    pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper) {
-        (self.seed, self.seed_covers_short_entries, self.long_entries) =
-            Self::vocabulary_seed(model, &self.alphabet, self.chars.is_some());
+    /// words a seed read through the model merges would otherwise fill that
+    /// cache on every thread of the pool, and the crate never clears a
+    /// thread's cache of a dropped model.
+    pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper, listing: Option<&Listing>) {
+        (self.seed, self.seed_covers_short_entries, self.long_entries) = Self::vocabulary_seed(
+            model,
+            listing,
+            &self.alphabet,
+            self.merges.as_ref(),
+            self.chars.as_deref(),
+        );
     }
 
     /// The table [`Self::seed_vocabulary`] reads, and whether every id of
     /// `0..vocab_size` was an entry (so the table holds every short entry).
     /// On the sentencepiece path (`chars`) an entry's spelling is its own
-    /// text: its key is its raw form (`CharSymbols::entry_key`).
+    /// text: its key is its raw form (`CharSymbols::entry_key`). `merges` is
+    /// the byte-level path's own table, when it has one.
     fn vocabulary_seed(
         model: &ModelWrapper,
+        listing: Option<&Listing>,
         alphabet: &[char; 256],
-        chars: bool,
+        merges: Option<&MergeTable>,
+        chars: Option<&CharSymbols>,
     ) -> (ShortPieceTable, bool, Option<LongEntryFilter>) {
         let ModelWrapper::BPE(bpe) = model else {
             return (ShortPieceTable::for_entries(0), false, None);
@@ -1312,22 +1381,48 @@ impl NativeEncoder {
         for (byte, &c) in alphabet.iter().enumerate() {
             byte_of[c as usize] = Some(byte as u8);
         }
-        // One id's read: `None` for an id that is no entry, else the seeded
-        // piece, the bytes of a long byte-level piece, or `None` inside for
-        // an entry that is no byte-level piece.
-        let read = |id: u32| -> Option<Option<Seeded>> {
-            let entry = bpe.id_to_token(id)?;
-            let seeded = (|| {
-                let ids_of = |entry: &str| {
-                    let mut ids = SeededIds::default();
+        // The ids of one entry (`piece` its raw bytes on the byte-level
+        // path): what a miss on it computes, see above. The model is asked
+        // only where the path has no table: it allocates a word and a token
+        // list per call.
+        let ids_of = |id: u32, entry: &str, piece: &[u8], scratch: &mut SeedScratch| {
+            let mut ids = SeededIds::default();
+            if bpe.ignore_merges {
+                ids.push(id)?;
+                return Some(ids);
+            }
+            scratch.ids.clear();
+            match (chars, merges) {
+                (Some(chars), _) => chars.merge(entry, &mut scratch.symbols, &mut scratch.ids),
+                (None, Some(table)) => table.merge(piece, &mut scratch.ids),
+                (None, None) => {
                     for token in &model.tokenize(entry).ok()? {
                         ids.push(token.id)?;
                     }
-                    Some(ids)
-                };
-                if chars {
-                    let key = CharSymbols::entry_key(&entry)?;
-                    return Some(Seeded::Short(key, ids_of(entry.as_str())?));
+                    return Some(ids);
+                }
+            }
+            for &id in &scratch.ids {
+                ids.push(id)?;
+            }
+            Some(ids)
+        };
+        // One id's read: `None` for an id that is no entry, else the seeded
+        // piece, the bytes of a long byte-level piece, or `None` inside for
+        // an entry that is no byte-level piece.
+        let read = |id: u32, scratch: &mut SeedScratch| -> Option<Option<Seeded>> {
+            let owned;
+            let entry: &str = match listing {
+                Some(listing) => listing.get(id)?,
+                None => {
+                    owned = bpe.id_to_token(id)?;
+                    &owned
+                }
+            };
+            let seeded = (|| {
+                if chars.is_some() {
+                    let key = CharSymbols::entry_key(entry)?;
+                    return Some(Seeded::Short(key, ids_of(id, entry, &[], scratch)?));
                 }
                 let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
                 let mut len = 0;
@@ -1350,18 +1445,23 @@ impl NativeEncoder {
                     return Some(Seeded::Long(long.into_boxed_slice()));
                 }
                 let key = ShortPieceKey::of(&piece[..len])?;
-                Some(Seeded::Short(key, ids_of(entry.as_str())?))
+                Some(Seeded::Short(
+                    key,
+                    ids_of(id, entry, &piece[..len], scratch)?,
+                ))
             })();
             Some(seeded)
         };
         let ids = 0..bpe.get_vocab_size() as u32;
-        // One slot per id.
+        // One slot per id, written in place (the read keeps its index, so the
+        // collect is one list and no concatenation); one scratch per rayon job
+        // (2048 entries or more).
         let read_all = || {
             ids.clone()
                 .into_par_iter()
                 .with_min_len(2048)
-                .filter_map(&read)
-                .collect::<Vec<Option<Seeded>>>()
+                .map_init(SeedScratch::default, |scratch, id| read(id, scratch))
+                .collect::<Vec<Option<Option<Seeded>>>>()
         };
         // A caller that is a worker of a rayon pool already (the Python
         // binding loads on its own, sized by its host) reads on that pool,
@@ -1384,20 +1484,24 @@ impl NativeEncoder {
                         %error,
                         "could not build the vocabulary seed's pool; reading on the calling thread"
                     );
-                    (ids.filter_map(&read).collect::<Vec<_>>(), 1)
+                    let mut scratch = SeedScratch::default();
+                    (ids.map(|id| read(id, &mut scratch)).collect::<Vec<_>>(), 1)
                 }
             }
         };
-        let covers = entries.len() == bpe.get_vocab_size();
+        // An id that was an entry has a slot that is `Some`; the seeded pieces
+        // are the inner `Some`s.
+        let covers = entries.iter().filter(|read| read.is_some()).count() == bpe.get_vocab_size();
         let short = entries
             .iter()
             .flatten()
+            .flatten()
             .filter(|seeded| matches!(seeded, Seeded::Short(..)))
             .count();
-        let long = entries.iter().flatten().count() - short;
+        let long = entries.iter().flatten().flatten().count() - short;
         let mut table = ShortPieceTable::for_entries(short);
         let mut filter = LongEntryFilter::for_entries(long);
-        for seeded in entries.iter().flatten() {
+        for seeded in entries.iter().flatten().flatten() {
             match seeded {
                 Seeded::Short(key, ids) => {
                     table.insert(*key, ids.as_slice(), short);
@@ -1405,7 +1509,7 @@ impl NativeEncoder {
                 Seeded::Long(bytes) => filter.insert(bytes),
             }
         }
-        let filter = (covers && !chars).then_some(filter);
+        let filter = (covers && chars.is_none()).then_some(filter);
         tracing::debug!(
             entries = table.len(),
             slots = table.slots(),
@@ -1505,12 +1609,13 @@ impl NativeEncoder {
         table
     }
 
-    /// The `Split` stages of a pre-tokenizer that is zero or more `Split`s
-    /// followed by one `ByteLevel` without prefix space.
+    /// The stages of a pre-tokenizer that is zero or more `Split`s (or
+    /// `Digits`, a split on numeric characters) followed by one `ByteLevel`
+    /// without prefix space.
     fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
         if pre_tokenizer.is_null() {
             return Err(Declined::from(
-                "no pre-tokenizer (the path needs ByteLevel, after any Split stages)",
+                "no pre-tokenizer (the path needs ByteLevel, after any split stages)",
             ));
         }
         let items: Vec<&Value> = match type_of("pre-tokenizer", pre_tokenizer)? {
@@ -1547,13 +1652,32 @@ impl NativeEncoder {
     }
 
     /// One `Split` before the `ByteLevel` as a stage: a regex or a literal
-    /// the pattern engine takes, `Isolated`, or `Removed` inverted.
+    /// the pattern engine takes, `Isolated`, or `Removed` inverted. A
+    /// `Digits` is the `Isolated` split on numeric characters, each one a
+    /// piece under `individual_digits`, else each run: the reference splits
+    /// on `char::is_numeric`, the toolchain's numeric set
+    /// ([`unicode::STD_NUMERIC`]), which is not the engine's `\p{N}` (the
+    /// regex engine's Unicode version).
     fn split_stage(split: &Value) -> Result<Stage, Declined> {
         match type_of("pre-tokenizer stage", split)? {
             "Split" => {}
+            "Digits" => {
+                let each = split
+                    .get("individual_digits")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        Declined::from("a Digits without a boolean individual_digits")
+                    })?;
+                return Pattern::parse(&class_pattern(unicode::STD_NUMERIC, !each))
+                    .map(|pattern| Stage {
+                        pattern,
+                        keep_gaps: true,
+                    })
+                    .ok_or_else(|| Declined::from("the Digits split pattern"));
+            }
             other => {
                 return Err(Declined::from(format!(
-                    "pre-tokenizer {other} before the ByteLevel (only Split)"
+                    "pre-tokenizer {other} before the ByteLevel (only Split or Digits)"
                 )))
             }
         }
@@ -2439,8 +2563,10 @@ impl NativeEncoder {
     /// fell since it last read it (threads joined) clears its count-bounded
     /// tiers here, by their entries, by the slots of its packed table or by
     /// the capacity of its map (arrays grown for the earlier share keep
-    /// their size through a clear at the bound; here they are made anew for
-    /// the share), so every thread that still encodes is within the share
+    /// their size through a clear at the bound; here the map is made anew for
+    /// the share and the packed table is cut back to the share's slots inside
+    /// its reservation, see `ShortPieceTable::clear`), so every thread that
+    /// still encodes is within the share
     /// from its next call on (the share is read here once and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that

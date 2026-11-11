@@ -26,6 +26,9 @@ use crate::{
 // Chat Messages
 // ============================================================================
 
+/// One message of a chat conversation, tagged by its `role` (system, user,
+/// assistant, tool, function, developer or root), carrying the content and
+/// fields that role has.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "role")]
@@ -198,6 +201,8 @@ impl<'de> Deserialize<'de> for AssistantReasoning {
     }
 }
 
+/// A message's content as the wire carries it: one text string, or a list of
+/// typed parts (text, image, audio, video, refusal).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -279,6 +284,9 @@ impl MessageContent {
 // Chat Completion Request
 // ============================================================================
 
+/// A request to the chat completions route: the conversation so far, the model,
+/// and the sampling, tool, response-format and streaming parameters, validated
+/// together before dispatch.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Default, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_chat_cross_parameters"))]
@@ -1171,6 +1179,8 @@ impl GenerationRequest for ChatCompletionRequest {
 // Response Types
 // ============================================================================
 
+/// The complete (non-streamed) answer of the chat completions route, object
+/// `chat.completion`: the choices with their messages, and the usage.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionResponse {
@@ -1226,6 +1236,9 @@ pub struct ChatCompletionMessage {
     // Note: audio is not added yet
 }
 
+/// One generated alternative of a chat completion: its index, the assistant
+/// message, the log probabilities (`null` unless requested) and the reason
+/// generation stopped.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatChoice {
     pub index: u32,
@@ -1242,6 +1255,9 @@ pub struct ChatChoice {
     pub hidden_states: Option<Vec<f32>>,
 }
 
+/// One chunk of a streamed chat completion, object `chat.completion.chunk`: the
+/// choices' deltas and, when requested, the usage (on the last chunk, or the
+/// running usage on every chunk with `continuous_usage_stats`).
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionStreamResponse {
@@ -1277,6 +1293,9 @@ pub struct ChatMessageDelta {
     pub reasoning_content: Option<String>,
 }
 
+/// One alternative's part of a streamed chunk: its index, the delta since the
+/// previous chunk, the log probabilities when requested, and the finish reason
+/// once it stops.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatStreamChoice {
     pub index: u32,

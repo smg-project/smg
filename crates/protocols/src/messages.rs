@@ -1765,6 +1765,7 @@ pub struct ErrorEnvelope {
 }
 
 impl ErrorEnvelope {
+    /// Wraps an error with the id of the request it answers.
     pub fn new(error: ErrorResponse, request_id: impl Into<String>) -> Self {
         Self {
             envelope_type: "error".to_string(),

@@ -225,11 +225,15 @@ router:
   #    (the admin routes, the worker-registry routes /workers and the RL
   #    routes /v1/rl) are served on this container port, with the probes,
   #    and the data port answers 404 for them. A second Service,
-  #    <release>-router-admin, exposes it inside the cluster; the ingress
-  #    never names it. null keeps the control plane on the data port.
+  #    <fullname>-router-admin, exposes it inside the cluster; the ingress
+  #    never names it. null keeps the control plane on the data port. A port
+  #    equal to router.port, router.metrics.port or the mesh port is refused
+  #    at render: the gateway refuses two listeners on one port.
   adminPort: null
   # -- Bind host of the admin listener (--admin-host); null binds it as the
-  #    data listener is bound
+  #    data listener is bound. Needs adminPort (refused at render without it).
+  #    A loopback host (127.0.0.1, ::1) leaves the admin Service with nowhere
+  #    to send traffic: Service traffic reaches the pod IP.
   adminHost: null
   adminService:
     type: ClusterIP
@@ -239,7 +243,8 @@ router:
   #    and the limits YAML comes from a ConfigMap of yours, mounted whole at
   #    /etc/smg/rate-limit and read with --tenant-rate-limit-config (the key
   #    names the file). Enabled without a ConfigMap is refused at render: the
-  #    gateway requires the file with the flag.
+  #    gateway requires the file with the flag. A ConfigMap without enabled is
+  #    refused too: the gateway would ignore it with a warning at start-up.
   tenantRateLimit:
     enabled: false
     configMap:

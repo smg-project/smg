@@ -32,23 +32,6 @@ impl RouterConfigBuilder {
         Self::default()
     }
 
-    /// Takes ownership
-    pub fn from_config(config: RouterConfig) -> Self {
-        Self {
-            config,
-            client_cert_path: None,
-            client_key_path: None,
-            ca_cert_paths: Vec::new(),
-            server_cert_path: None,
-            server_key_path: None,
-            mcp_config_path: None,
-        }
-    }
-
-    pub fn from_config_ref(config: &RouterConfig) -> Self {
-        Self::from_config(config.clone())
-    }
-
     // ==================== Routing Mode ====================
 
     pub fn regular_mode(mut self, worker_urls: Vec<String>) -> Self {
@@ -1077,11 +1060,6 @@ impl RouterConfig {
     pub fn builder() -> RouterConfigBuilder {
         RouterConfigBuilder::new()
     }
-
-    /// Create a builder from this configuration
-    pub fn to_builder(&self) -> RouterConfigBuilder {
-        RouterConfigBuilder::from_config_ref(self)
-    }
 }
 
 #[cfg(test)]
@@ -1089,28 +1067,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-
-    /// Test that .to_builder() round-trip conversion works correctly
-    #[test]
-    fn test_builder_from_existing_config() {
-        let original = RouterConfigBuilder::new()
-            .regular_mode(vec!["http://worker1:8000".to_string()])
-            .port(3000)
-            .build()
-            .unwrap();
-
-        let modified = original
-            .to_builder()
-            .port(4000)
-            .enable_metrics("0.0.0.0", 29000)
-            .enable_trace("localhost:4317")
-            .build()
-            .unwrap();
-
-        assert_eq!(modified.port, 4000);
-        assert!(modified.metrics.is_some());
-        assert!(modified.trace_config.is_some());
-    }
 
     /// Test complex routing mode helper method
     #[test]

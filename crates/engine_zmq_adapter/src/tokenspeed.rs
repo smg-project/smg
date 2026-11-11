@@ -503,8 +503,8 @@ pub(crate) fn translate_request_tokenspeed_for(
     // handshake ships it) or a decode side's item (the KV comes from the
     // prefill, the item's metadata keeps the prompt the same on both
     // sides). The translator cannot tell the prefill side apart (the
-    // rendezvous rides on both legs), so a disaggregated request passes the
-    // item on either leg, as the Python servicer does; the gateway sends the
+    // rendezvous rides on both sides), so a disaggregated request passes the
+    // item on either side, as the Python servicer does; the gateway sends the
     // pixel-free clone to the decode side only. An aggregated request has
     // nowhere else to get it from.
     if let Some(mm) = multimodal_inputs.as_ref() {

@@ -87,21 +87,32 @@ pub(crate) trait TenantCharge: GenerationRequest {
     }
 }
 
-/// The arguments of the assistant's tool calls in the history.
+/// What the assistant's turns in the history carry beside their content and
+/// reasoning: a refusal, and the arguments of their tool calls and of a
+/// deprecated function call. A call's name is not counted.
 impl TenantCharge for ChatCompletionRequest {
     fn unrouted_words(&self) -> usize {
         self.messages
             .iter()
-            .filter_map(|message| match message {
+            .map(|message| match message {
                 ChatMessage::Assistant {
-                    tool_calls: Some(calls),
+                    refusal,
+                    tool_calls,
+                    function_call,
                     ..
-                } => Some(calls),
-                _ => None,
+                } => {
+                    let arguments: usize = tool_calls
+                        .iter()
+                        .flatten()
+                        .map(|call| &call.function)
+                        .chain(function_call.as_deref())
+                        .filter_map(|function| function.arguments.as_deref())
+                        .map(word_count)
+                        .sum();
+                    arguments + refusal.as_deref().map_or(0, word_count)
+                }
+                _ => 0,
             })
-            .flatten()
-            .filter_map(|call| call.function.arguments.as_deref())
-            .map(word_count)
             .sum()
     }
 }
@@ -309,31 +320,65 @@ pub(crate) struct TenantReservation {
     samples_per_prompt: u32,
 }
 
-/// Reserve `request`'s estimate for `tenant_meta` under `manager`, once per
-/// logical request and before any dispatch: every attempt dispatches under
-/// this one reservation. With a limiter and a tenant to charge, either the
-/// reservation or the denial, which is the request's answer, never retried;
-/// `(None, None)` for a request outside the limiter (no limiter configured,
-/// or a route that charges no tenant). `routing_text` is the request's
-/// routing text when routing already extracted it
-/// ([`TenantCharge::estimated_input_tokens`]).
-pub(crate) async fn reserve<T: TenantCharge>(
-    manager: Option<&RateLimitManager>,
-    tenant_meta: Option<&TenantRequestMeta>,
+/// What a tenant reservation charges for one request, with the limiter and
+/// the tenant it was gated on: the reserve-time estimate of the request's
+/// input tokens and the answers each prompt gets, read from the request
+/// before any dispatch ([`estimate`]), so the reservation itself borrows
+/// nothing of the request across its await and cannot be asked for with a
+/// limiter, a tenant and an estimate that were not gated together.
+#[derive(Clone, Copy)]
+pub(crate) struct TenantEstimate<'a> {
+    manager: &'a RateLimitManager,
+    tenant_meta: &'a TenantRequestMeta,
+    estimated_input_tokens: u32,
+    samples_per_prompt: u32,
+}
+
+/// The charge of `request` under the tenant rate limiter: `None` for a
+/// request outside it (no limiter configured, or a route that charges no
+/// tenant), so the estimate is read only when a reservation will use it.
+/// `routing_text` is the request's routing text when routing already
+/// extracted it ([`TenantCharge::estimated_input_tokens`]).
+pub(crate) fn estimate<'a, T: TenantCharge>(
+    manager: Option<&'a RateLimitManager>,
+    tenant_meta: Option<&'a TenantRequestMeta>,
     request: &T,
-    model_id: &str,
     routing_text: Option<&str>,
+) -> Option<TenantEstimate<'a>> {
+    Some(TenantEstimate {
+        manager: manager?,
+        tenant_meta: tenant_meta?,
+        estimated_input_tokens: request.estimated_input_tokens(routing_text),
+        samples_per_prompt: request.samples_per_prompt(),
+    })
+}
+
+/// Reserve `estimate` once per logical request, before any dispatch: every
+/// attempt dispatches under this one reservation. Either the reservation or
+/// the denial, which is the request's answer, never retried; `(None, None)`
+/// for a request outside the limiter (no estimate: no limiter configured, or
+/// a route that charges no tenant).
+pub(crate) async fn reserve(
+    estimate: Option<TenantEstimate<'_>>,
+    model_id: &str,
 ) -> (Option<TenantReservation>, Option<Response>) {
-    let (Some(manager), Some(tenant_meta)) = (manager, tenant_meta) else {
+    let Some(estimate) = estimate else {
         return (None, None);
     };
     let cell = RateLimitCell::new();
-    let estimate = request.estimated_input_tokens(routing_text);
-    match cell.reserve(manager, tenant_meta, model_id, estimate).await {
+    match cell
+        .reserve(
+            estimate.manager,
+            estimate.tenant_meta,
+            model_id,
+            estimate.estimated_input_tokens,
+        )
+        .await
+    {
         Ok(()) => (
             Some(TenantReservation {
                 cell,
-                samples_per_prompt: request.samples_per_prompt(),
+                samples_per_prompt: estimate.samples_per_prompt,
             }),
             None,
         ),
@@ -953,6 +998,27 @@ mod tests {
         // 3 words of text and 10 of arguments: ceil(13 * 1.3).
         assert_eq!(chat.estimated_input_tokens(None), 17);
         assert_eq!(chat.estimated_input_tokens(Some("weather in Paris")), 17);
+    }
+
+    /// A refused turn's refusal and the arguments of a deprecated function
+    /// call, which the upstream reads with the rest of the history.
+    #[test]
+    fn a_chat_history_reserves_its_refusals_and_function_call_arguments() {
+        let chat: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "refusal": TEN_WORDS},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "weather",
+                    "arguments": "{\"query\": \"one two three four five six seven eight nine\"}",
+                }},
+            ],
+        }));
+        assert_eq!(chat.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text, 10 of refusal and 10 of arguments: ceil(23 * 1.3).
+        assert_eq!(chat.estimated_input_tokens(None), 30);
+        assert_eq!(chat.estimated_input_tokens(Some("weather in Paris")), 30);
     }
 
     /// A tool result's text, a string or text blocks, and a tool use's input.

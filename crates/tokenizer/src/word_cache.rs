@@ -18,10 +18,14 @@
 //! applied as the model moves into the built tokenizer. One model, no copy.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use serde::{
@@ -99,6 +103,57 @@ pub(crate) struct ReadBpe {
     /// The ids are `0..n` with no gap and no id twice: the tables may
     /// walk the entries by id and find every one of them.
     pub(crate) dense: bool,
+    /// The vocabulary's text by id when the ids are dense (see
+    /// [`Listing`]), shared with the tables built after the model moved
+    /// into the built tokenizer.
+    pub(crate) tokens: Option<Arc<Listing>>,
+}
+
+/// The vocabulary's text, listed once by the read: every token's bytes in
+/// one buffer and, by id, where each token lies in it. The passes that walk
+/// the vocabulary (the seed, the preformed analysis, the character symbols,
+/// the decode tables) borrow their tokens from it instead of cloning each
+/// out of the model (`id_to_token`), one `String` per id per pass.
+pub(crate) struct Listing {
+    text: String,
+    spans: Vec<(u32, u32)>,
+}
+
+impl Listing {
+    /// The token of `id` (`None` past the end of the vocabulary).
+    pub(crate) fn get(&self, id: u32) -> Option<&str> {
+        let &(start, end) = self.spans.get(id as usize)?;
+        Some(&self.text[start as usize..end as usize])
+    }
+
+    /// How many ids the listing covers (`0..len`).
+    pub(crate) fn len(&self) -> u32 {
+        self.spans.len() as u32
+    }
+
+    /// The listing of a dense vocabulary (every id below its length, none
+    /// twice), or `None` for a sparse one (an id past the vocabulary's size,
+    /// two tokens on one id) or one too large for the spans' width.
+    pub(crate) fn of(vocab: &Vocab) -> Option<Self> {
+        let n = vocab.len();
+        let bytes = vocab.keys().map(String::len).sum::<usize>();
+        // Under the marker, so no span's start can read as an unwritten slot.
+        if bytes >= u32::MAX as usize || u32::try_from(n).is_err() {
+            return None;
+        }
+        let mut text = String::with_capacity(bytes);
+        let mut spans = vec![(u32::MAX, u32::MAX); n];
+        for (token, &id) in vocab {
+            let start = text.len() as u32;
+            text.push_str(token);
+            let slot = spans.get_mut(id as usize)?;
+            if slot.0 != u32::MAX {
+                return None;
+            }
+            *slot = (start, text.len() as u32);
+        }
+        Some(Self { text, spans })
+    }
 }
 
 impl ReadBpe {
@@ -115,6 +170,7 @@ impl ReadBpe {
                 fresh
             }
         });
+        let tokens = dense.then(|| Listing::of(vocab)).flatten().map(Arc::new);
         let mut token = String::new();
         let mut pairs = Vec::with_capacity(merges.len());
         for (left, right) in merges {
@@ -134,6 +190,7 @@ impl ReadBpe {
                         pairs: None,
                         max_id,
                         dense,
+                        tokens,
                     }
                 }
             }
@@ -142,25 +199,55 @@ impl ReadBpe {
             pairs: Some(pairs.into_boxed_slice()),
             max_id,
             dense,
+            tokens,
         }
     }
 }
 
-/// The model's vocabulary as `(id, token)` entries, one at a time. By id
-/// when the read says the ids are exactly the range `0..n` of the
+/// The token of `id` as the decode sees it: an added token first (its own
+/// map, as `id_to_token` looks), then the model's: borrowed from the read's
+/// listing when there is one, cloned out of the model otherwise.
+pub(crate) fn token_of<'a>(
+    tokenizer: &TokenizerOf<ModelWrapper>,
+    listing: Option<&'a Listing>,
+    id: u32,
+) -> Option<Cow<'a, str>> {
+    if let Some(added) = tokenizer.get_added_vocabulary().simple_id_to_token(id) {
+        return Some(Cow::Owned(added));
+    }
+    match listing {
+        Some(listing) if id < listing.len() => listing.get(id).map(Cow::Borrowed),
+        _ => tokenizer.id_to_token(id).map(Cow::Owned),
+    }
+}
+
+/// The model's vocabulary as `(id, token)` entries, one at a time: borrowed
+/// from the read's listing when it has one (a dense vocabulary, `Listing`);
+/// else by id when the read says the ids are exactly the range `0..n` of the
 /// vocabulary's `n` entries (one lookup per id, each token used and dropped
 /// before the next, no clone of the map); otherwise a walk of the map, as
 /// for a model without a read. A vocabulary numbered sparsely, or with two
-/// tokens on one id, never starts the walk by id.
+/// tokens on one id, is never listed and never starts the walk by id.
 pub(crate) fn entries_of<'a>(
     bpe: &'a BPE,
-    read: Option<&ReadBpe>,
-) -> Box<dyn Iterator<Item = (u32, String)> + 'a> {
+    read: Option<&'a ReadBpe>,
+) -> Box<dyn Iterator<Item = (u32, Cow<'a, str>)> + 'a> {
+    if let Some(tokens) = read.and_then(|read| read.tokens.as_deref()) {
+        return Box::new(
+            (0..tokens.len())
+                .filter_map(move |id| tokens.get(id).map(|token| (id, Cow::Borrowed(token)))),
+        );
+    }
     match read.filter(|read| read.dense).and_then(|read| read.max_id) {
         Some(max_id) => Box::new(
-            (0..=max_id).filter_map(move |id| bpe.id_to_token(id).map(|token| (id, token))),
+            (0..=max_id)
+                .filter_map(move |id| bpe.id_to_token(id).map(|token| (id, Cow::Owned(token)))),
         ),
-        None => Box::new(bpe.get_vocab().into_iter().map(|(token, id)| (id, token))),
+        None => Box::new(
+            bpe.get_vocab()
+                .into_iter()
+                .map(|(token, id)| (id, Cow::Owned(token))),
+        ),
     }
 }
 

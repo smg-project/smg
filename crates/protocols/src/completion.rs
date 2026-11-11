@@ -17,6 +17,9 @@ use crate::{common::invalid, validated::Normalizable};
 // Completions API (v1/completions) - DEPRECATED but still supported
 // ============================================================================
 
+/// A request to the completions route: the model, the prompt (a text, texts,
+/// token ids or lists of them) and the sampling and streaming parameters,
+/// validated together before dispatch.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_completion_cross_parameters"))]
@@ -33,8 +36,9 @@ pub struct CompletionRequest {
     #[validate(range(min = 0, max = 20))]
     pub best_of: Option<u32>,
 
-    /// Echo back the prompt in addition to the completion
-    #[serde(default)]
+    /// Echo back the prompt in addition to the completion. A `null` reads as
+    /// the default, as the public API allows.
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
     pub echo: bool,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
@@ -51,7 +55,12 @@ pub struct CompletionRequest {
     #[validate(range(min = 0, max = 20))]
     pub logprobs: Option<u32>,
 
-    /// The maximum number of tokens to generate
+    /// The maximum number of tokens to generate. A zero is a request in its
+    /// own right, not a value to refuse: with `echo` and `logprobs` it scores
+    /// the prompt and generates nothing (the loglikelihood shape evaluation
+    /// harnesses send), a prefill-only turn for the engines that take one.
+    /// The bound starts at zero for that reason, where the chat route's
+    /// starts at one.
     #[validate(range(min = 0))]
     pub max_tokens: Option<u32>,
 
@@ -123,16 +132,28 @@ pub struct CompletionRequest {
     pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub no_stop_trim: bool,
 
     /// Ignore end-of-sequence tokens during generation
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub ignore_eos: bool,
 
     /// Skip special tokens during detokenization. Serialized only when
     /// `false`: `true` is what the engine applies without the field.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
+    )]
     pub skip_special_tokens: bool,
 
     /// Path to LoRA adapter(s) for model customization
@@ -142,7 +163,11 @@ pub struct CompletionRequest {
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub return_hidden_states: bool,
 
     /// Sampling seed for deterministic outputs
@@ -421,6 +446,8 @@ impl<'de> Deserialize<'de> for CompletionPrompt {
 // Response Types
 // ============================================================================
 
+/// The complete (non-streamed) answer of the completions route, object
+/// `text_completion`: the choices with their texts, and the usage.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionResponse {
@@ -433,6 +460,9 @@ pub struct CompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
+/// One generated alternative of a completion: its text, its index, the log
+/// probabilities when requested, the reason generation stopped and the stop
+/// condition it matched.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionChoice {
     pub text: String,
@@ -446,6 +476,8 @@ pub struct CompletionChoice {
     pub matched_stop: Option<Value>, // Can be string or integer
 }
 
+/// One chunk of a streamed completion, object `text_completion`: the choices'
+/// text pieces and, on the last chunk when requested, the usage.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionStreamResponse {
     pub id: String,
@@ -459,6 +491,9 @@ pub struct CompletionStreamResponse {
     pub usage: Option<Usage>,
 }
 
+/// One alternative's part of a streamed completion chunk: the text since the
+/// previous chunk, its index, the log probabilities when requested, and the
+/// finish reason once it stops.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionStreamChoice {
     pub text: String,
@@ -565,6 +600,73 @@ mod tests {
         assert_eq!(body["error"]["param"], "logprobs");
     }
 
+    /// The public API allows `"echo": null`. It reads as the default and the
+    /// request is written back as one without the key is; a wrong type is
+    /// still refused.
+    #[test]
+    fn echo_null_reads_as_an_absent_echo_does() {
+        let nulled = req(serde_json::json!({"echo": null}));
+        assert!(!nulled.echo);
+        nulled.validate().expect("valid");
+        assert!(!nulled.other.contains_key("echo"));
+        assert_eq!(
+            serde_json::to_value(&nulled).expect("serialize"),
+            serde_json::to_value(req(serde_json::json!({}))).expect("serialize")
+        );
+        assert!(req(serde_json::json!({"echo": true})).echo);
+        assert!(serde_json::from_value::<CompletionRequest>(
+            serde_json::json!({"model": "m", "prompt": "hello", "echo": "yes"})
+        )
+        .is_err());
+    }
+
+    /// A client that writes an unset engine flag as `null` gets the request an
+    /// absent key gives, as the chat request does.
+    #[test]
+    fn engine_flags_read_null_as_their_default() {
+        let nulled = req(serde_json::json!({
+            "no_stop_trim": null,
+            "ignore_eos": null,
+            "skip_special_tokens": null,
+            "return_hidden_states": null
+        }));
+        assert!(!nulled.no_stop_trim);
+        assert!(!nulled.ignore_eos);
+        assert!(nulled.skip_special_tokens);
+        assert!(!nulled.return_hidden_states);
+        assert_eq!(
+            serde_json::to_value(&nulled).expect("serialize"),
+            serde_json::to_value(req(serde_json::json!({}))).expect("serialize")
+        );
+    }
+
+    /// Through the extractor every route uses, a body with `"echo": null` is
+    /// served, where it was a 400 `invalid_type`.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn an_echo_null_body_passes_the_extractor() {
+        use axum::{
+            body::Body,
+            extract::{FromRequest, Request},
+        };
+
+        use crate::validated::ValidatedJson;
+
+        let body = serde_json::json!({"model": "m", "prompt": "hello", "echo": null});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let Ok(ValidatedJson(request)) =
+            ValidatedJson::<CompletionRequest>::from_request(request, &()).await
+        else {
+            panic!("an echo of null must be accepted");
+        };
+        assert!(!request.echo);
+    }
+
     #[test]
     fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
         let value = serde_json::to_value(req(serde_json::json!({}))).expect("serialize");
@@ -603,6 +705,21 @@ mod tests {
         assert!(back.ignore_eos);
         assert!(back.return_hidden_states);
         assert!(!back.skip_special_tokens);
+    }
+
+    /// A `max_tokens` of zero is the prompt-scoring request (`echo` with
+    /// `logprobs`, nothing generated): it validates, and the zero stays a
+    /// zero on the request that goes to the wire, so the bound keeps
+    /// starting at zero where the chat route's starts at one.
+    #[test]
+    fn max_tokens_zero_is_the_prompt_scoring_request_and_validates() {
+        let scoring = req(serde_json::json!({"echo": true, "logprobs": 1, "max_tokens": 0}));
+        assert!(
+            scoring.validate().is_ok(),
+            "max_tokens 0 with echo and logprobs is a request, not a refused value"
+        );
+        assert_eq!(scoring.max_tokens, Some(0), "the zero is kept as written");
+        assert!(scoring.echo, "echo rides with it");
     }
 
     fn prompt(value: Value) -> Result<CompletionPrompt, String> {

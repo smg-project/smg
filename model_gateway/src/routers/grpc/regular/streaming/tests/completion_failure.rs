@@ -101,7 +101,7 @@ async fn two_prompt_reading(
     later_stream: ProtoStream,
     tokenizer: Arc<dyn Tokenizer>,
     tx: SseSender,
-) {
+) -> ReadingEnd {
     let processor = processor(false);
     let spec = completion_spec();
     let body_first_frame = AtomicBool::new(false);
@@ -131,6 +131,7 @@ async fn two_prompt_reading(
     ])
     .await;
     assert!(outcomes.is_ok(), "{:?}", outcomes.err());
+    ReadingEnd::Complete
 }
 
 /// Open the gate of [`later_prompt_stream`]'s prompt and read its hand-off on
@@ -209,6 +210,7 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
             )
             .await;
         assert!(result.is_ok(), "{:?}", result.err());
+        ReadingEnd::Complete
     };
     let mut body = DrivenBody::new(Box::pin(reading), rx);
     let first = body

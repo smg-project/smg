@@ -1,11 +1,7 @@
 use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use axum::{
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::{http::HeaderMap, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -52,7 +48,9 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
-    routers::{error, grpc::regular::symphony::template::Templates, RouterTrait},
+    routers::{
+        common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
+    },
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -534,7 +532,7 @@ impl GrpcRouter {
                 serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
             } else {
                 match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
-                    Ok(response) => Json(response).into_response(),
+                    Ok(response) => json_response(&response),
                     Err(error_response) => error_response,
                 }
             }
@@ -685,7 +683,7 @@ impl GrpcRouter {
                 }),
             );
         }
-        (StatusCode::OK, Json(queued)).into_response()
+        json_response(&queued)
     }
 
     /// Main route_embeddings implementation
@@ -801,27 +799,26 @@ impl GrpcRouter {
     /// tokenizer: the request is rendered through the model's chat template
     /// exactly as `/v1/messages` renders it and the prompt's token count is
     /// returned. No worker takes part, so every worker type is covered.
+    /// Takes the request by reference: an async fn that takes it by value
+    /// and borrows it across the await holds two copies of it in its task,
+    /// the captured argument and the re-bound local.
     async fn route_messages_count_tokens_impl(
         &self,
-        body: CountMessageTokensRequest,
+        body: &CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
         let model_id = self.resolve_canonical_model_id(model_id);
         match self
             .count_prompt_tokens(
                 &model_id,
-                message_utils::MessagesPrompt::from(&body),
+                message_utils::MessagesPrompt::from(body),
                 &body.chat_tools(),
                 body.tool_choice.as_ref(),
                 false,
             )
             .await
         {
-            Ok(input_tokens) => (
-                StatusCode::OK,
-                Json(CountMessageTokensResponse { input_tokens }),
-            )
-                .into_response(),
+            Ok(input_tokens) => json_response(&CountMessageTokensResponse { input_tokens }),
             Err(refused) => refused,
         }
     }
@@ -960,7 +957,7 @@ impl GrpcRouter {
             container: None,
         };
         if !stream {
-            return (StatusCode::OK, Json(message)).into_response();
+            return json_response(&message);
         }
 
         let events = [
@@ -1309,7 +1306,7 @@ impl RouterTrait for GrpcRouter {
         body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
-        self.route_messages_count_tokens_impl(body, model_id).await
+        self.route_messages_count_tokens_impl(&body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {

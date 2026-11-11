@@ -128,7 +128,10 @@ pub struct RouterConfig {
     /// counted in the same `smg_http_connections_rejected_total`. `0` is no
     /// bound. The bound is the admin listener's own, so the control plane
     /// stays reachable while the data plane is saturated, and a client that
-    /// reaches the admin listener cannot hold it open without limit.
+    /// reaches the admin listener cannot hold it open without limit. Needs
+    /// `admin_port` (the validator refuses the bound without it). Probes on
+    /// the admin port fall under the bound like any connection;
+    /// `health_check_port` is the listener no bound covers.
     #[serde(default)]
     pub admin_max_connections: usize,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
@@ -2365,19 +2368,6 @@ impl RouterConfig {
         self.discovery.is_some()
     }
 
-    /// Check if metrics are enabled
-    pub fn has_metrics(&self) -> bool {
-        self.metrics.is_some()
-    }
-
-    /// Check if tracing is enabled
-    pub fn has_tracing(&self) -> bool {
-        match &self.trace_config {
-            Some(trace_config) => trace_config.enable_trace,
-            None => false,
-        }
-    }
-
     pub fn effective_prefill_queue_size(&self) -> usize {
         self.prefill_queue_size
             .unwrap_or(DEFAULT_PREFILL_QUEUE_SIZE)
@@ -3764,28 +3754,6 @@ discovery:
     }
 
     #[test]
-    fn test_has_metrics() {
-        let config = RouterConfig::default();
-        assert!(!config.has_metrics());
-
-        let config = RouterConfig::builder()
-            .metrics_config(MetricsConfig::default())
-            .build_unchecked();
-        assert!(config.has_metrics());
-    }
-
-    #[test]
-    fn test_has_tracing() {
-        let config = RouterConfig::default();
-        assert!(!config.has_tracing());
-
-        let config = RouterConfig::builder()
-            .enable_trace("localhost:4317")
-            .build_unchecked();
-        assert!(config.has_tracing());
-    }
-
-    #[test]
     fn test_large_worker_lists() {
         let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{i}")).collect();
 
@@ -3881,8 +3849,11 @@ discovery:
         assert_eq!(config.mode.worker_count(), 4);
         assert_eq!(config.policy.name(), "power_of_two");
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
     }
 
     #[test]
@@ -3923,8 +3894,11 @@ discovery:
         assert_eq!(config.mode.worker_count(), 3);
         assert_eq!(config.policy.name(), "cache_aware");
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
     }
 
     #[test]
@@ -3969,8 +3943,11 @@ discovery:
             .build_unchecked();
 
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
         assert_eq!(config.mode_type(), "regular");
 
         let json = serde_json::to_string_pretty(&config).unwrap();

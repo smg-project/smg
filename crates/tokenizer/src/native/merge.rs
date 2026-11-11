@@ -363,10 +363,11 @@ impl MergeTable {
                     .map(|c| byte_of.get(c as usize).copied().flatten())
                     .collect()
             };
-            // The entries by id where the read says the ids are the range,
-            // else through a clone of the vocabulary map.
+            // The entries borrowed from the read's listing when it has one,
+            // by id where the read says the ids are the range, else through
+            // a clone of the vocabulary map.
             let raws = entries_of(bpe, read)
-                .filter_map(|(id, token)| raw_of(&token).map(|raw| (id, raw)))
+                .filter_map(|(id, token)| raw_of(token.as_ref()).map(|raw| (id, raw)))
                 .collect();
             table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         }

@@ -498,6 +498,18 @@ impl ConfigValidator {
         if config.policy_engine != PolicyEngineMode::Engine {
             return Ok(());
         }
+        // The decider binds the default, prefill and decode profiles; an
+        // encode side has none in this build, so an encode decision would
+        // run the default profile where the legacy path hashes content. The
+        // mode is refused by name until the encode step binds its profile.
+        if matches!(config.mode, RoutingMode::EncodePrefillDecode { .. }) {
+            return Err(ConfigError::invalid_value(
+                "policy_engine",
+                "encode-prefill-decode",
+                "the policy engine carries no encode profile in this build; \
+                 encode-prefill-decode runs under --policy-engine legacy",
+            ));
+        }
         let prefill = config.mode.get_prefill_policy(&config.policy);
         let decode = config.mode.get_decode_policy(&config.policy);
         for policy in [&config.policy, prefill, decode] {
@@ -1386,6 +1398,16 @@ impl ConfigValidator {
             if let Err(reason) = parse_bind_host(admin_host) {
                 return Err(ConfigError::invalid_value("admin_host", admin_host, reason));
             }
+        }
+        // The bound is the admin listener's own: without a port there is no
+        // listener for it to bound, and nothing would say so.
+        if config.admin_max_connections > 0 && config.admin_port.is_none() {
+            return Err(ConfigError::invalid_value(
+                "admin_max_connections",
+                config.admin_max_connections,
+                "--admin-max-connections needs --admin-port: the admin listener exists only \
+                 with a port",
+            ));
         }
 
         // Each listener needs its own port. Two of them on one port used to
@@ -2725,6 +2747,35 @@ mod tests {
             ConfigValidator::validate(&config),
             Err(ConfigError::InvalidValue { ref field, ref value, ref reason })
                 if field == "policy_engine" && value == "least_load" && reason.contains("default_throughput")
+        ));
+        let legacy = RouterConfig {
+            policy_engine: PolicyEngineMode::Legacy,
+            ..config
+        };
+        assert!(ConfigValidator::validate(&legacy).is_ok());
+    }
+
+    /// Under `engine` the encode-prefill-decode mode is refused at start by
+    /// name: the decider binds no encode profile in this build, so an encode
+    /// decision would run the default profile; the legacy path takes it.
+    #[test]
+    fn the_engine_switch_refuses_encode_prefill_decode_without_an_encode_profile() {
+        let config = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            mode: RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("http://encode:8000".to_string(), None)],
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref value, .. })
+                if field == "policy_engine" && value == "encode-prefill-decode"
         ));
         let legacy = RouterConfig {
             policy_engine: PolicyEngineMode::Legacy,
@@ -5422,6 +5473,7 @@ mod tests {
     fn an_admin_connection_limit_above_the_permit_maximum_is_rejected() {
         let config = |admin_max_connections: usize| RouterConfig {
             admin_max_connections,
+            admin_port: Some(30004),
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker:8000".to_string()],
             },
@@ -5440,6 +5492,38 @@ mod tests {
                 assert_eq!(field, "admin_max_connections");
                 assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
                 assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid admin_max_connections, got {other:?}"),
+        }
+    }
+
+    /// The bound is the admin listener's own: without `admin_port` there is
+    /// no listener to bound, so a bound without the port is refused by name
+    /// (as a host without the port is); with the port, or without a bound,
+    /// the settings pass.
+    #[test]
+    fn an_admin_connection_bound_without_an_admin_port_is_rejected() {
+        let config = |admin_max_connections: usize, admin_port: Option<u16>| RouterConfig {
+            admin_max_connections,
+            admin_port,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for (bound, port) in [(0, None), (16, Some(30004))] {
+            ConfigValidator::validate(&config(bound, port))
+                .unwrap_or_else(|e| panic!("bound {bound} with port {port:?}: {e}"));
+        }
+        match ConfigValidator::validate(&config(16, None)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "admin_max_connections");
+                assert_eq!(value, "16");
+                assert!(reason.contains("--admin-port"), "{reason}");
             }
             other => panic!("expected an invalid admin_max_connections, got {other:?}"),
         }

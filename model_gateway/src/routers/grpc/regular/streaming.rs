@@ -57,8 +57,8 @@ use crate::{
                     CompletionTokenTracker, TokenCounts,
                 },
                 responses::{
-                    body_guards, build_sse_response_driven, build_sse_response_from_stream,
-                    driven_channel, DrivenBody, Reading,
+                    body_guards, build_sse_response_driven, build_sse_response_driven_with,
+                    build_sse_response_from_stream, driven_channel, Reading, ReadingEnd,
                 },
             },
             context,
@@ -75,7 +75,7 @@ use crate::{
             wire::StreamShape,
         },
     },
-    worker::{GuardedStream, PrefillLoadGuard},
+    worker::PrefillLoadGuard,
 };
 
 mod completion;
@@ -88,6 +88,8 @@ use self::{
         CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
+#[cfg(test)]
+use crate::routers::grpc::common::responses::DrivenBody;
 
 /// Running usage is separate from settlement state: only Complete messages
 /// authorize settlement, even when intermediate chunks already report counts.
@@ -471,13 +473,14 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source)
+                    if let Err(failure) = &result {
+                        utils::send_stream_failure(&tx, failure, &source)
                             .instrument(span)
                             .await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::PrefillDecode {
@@ -508,13 +511,14 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source)
+                    if let Err(failure) = &result {
+                        utils::send_stream_failure(&tx, failure, &source)
                             .instrument(span)
                             .await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::Embedding { .. } => Box::pin(async move {
@@ -525,6 +529,7 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                ReadingEnd::Failed
             }),
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => Box::pin(async move {
@@ -535,20 +540,19 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                ReadingEnd::Failed
             }),
         };
 
         // Return SSE response; its body holds the guards for as long as it lives.
-        let stream = GuardedStream::new(DrivenBody::new(reading, rx), guards);
-        if let Some(policy) = rechunk {
-            build_sse_response_from_stream(sse_rechunk::rechunk_stream(
+        build_sse_response_driven_with(reading, rx, guards, |stream| match rechunk {
+            Some(policy) => build_sse_response_from_stream(sse_rechunk::rechunk_stream(
                 policy,
                 stream,
                 sse_rechunk::NoopObserver,
-            ))
-        } else {
-            build_sse_response_from_stream(stream)
-        }
+            )),
+            None => build_sse_response_from_stream(stream),
+        })
     }
 
     /// Process streaming chunks from a single stream (Regular mode)
@@ -756,11 +760,12 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
+                    if let Err(failure) = &result {
+                        utils::send_stream_failure(&tx, failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::PrefillDecode {
@@ -787,11 +792,12 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
+                    if let Err(failure) = &result {
+                        utils::send_stream_failure(&tx, failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::Embedding { .. } => Box::pin(async move {
@@ -802,6 +808,7 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                ReadingEnd::Failed
             }),
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => Box::pin(async move {
@@ -812,6 +819,7 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                ReadingEnd::Failed
             }),
         };
 
@@ -2360,8 +2368,8 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = result {
-                        span.in_scope(|| source.account(&failure));
+                    if let Err(failure) = &result {
+                        span.in_scope(|| source.account(failure));
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse::new(
                                 failure.messages_error_type(),
@@ -2372,6 +2380,7 @@ impl StreamingProcessor {
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                     // No data: [DONE] — Anthropic uses message_stop instead
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::PrefillDecode {
@@ -2402,12 +2411,12 @@ impl StreamingProcessor {
                         .await
                         .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = result {
+                    if let Err(failure) = &result {
                         // A decode side the engine failed without a reason is read against
                         // the pair's bootstrap port first, as the chat event is (see
                         // `StreamSource::explain`), so the event names a dead rendezvous.
-                        let explained = source.explain(&failure).await;
-                        let failure = explained.as_ref().unwrap_or(&failure);
+                        let explained = source.explain(failure).await;
+                        let failure = explained.as_ref().unwrap_or(failure);
                         span.in_scope(|| source.account(failure));
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse::new(
@@ -2418,6 +2427,7 @@ impl StreamingProcessor {
                         let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::Embedding { .. } => Box::pin(async move {
@@ -2429,6 +2439,7 @@ impl StreamingProcessor {
                 };
                 let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
+                ReadingEnd::Failed
             }),
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => Box::pin(async move {
@@ -2440,6 +2451,7 @@ impl StreamingProcessor {
                 };
                 let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
+                ReadingEnd::Failed
             }),
         };
 
@@ -2623,6 +2635,7 @@ impl StreamingProcessor {
                 let reading = async move {
                     utils::send_error_sse(&tx, message, "invalid_request_error").await;
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::Failed
                 };
                 return build_sse_response_driven(Box::pin(reading), rx, guards);
             }
@@ -2729,9 +2742,10 @@ impl StreamingProcessor {
             .await
             .unwrap_or_else(|panicked| Err(panicked.into()));
 
-            match outcomes {
+            let end = match outcomes {
                 Err(failure) => {
                     utils::send_stream_failure(&tx, &failure, &source).await;
+                    ReadingEnd::Failed
                 }
                 Ok(outcomes) => {
                     let mut total_prompt = 0u32;
@@ -2820,7 +2834,7 @@ impl StreamingProcessor {
                     // left and ended the read, which is no completed
                     // generation and gets no terminal router metric.
                     if tx.is_closed() {
-                        return;
+                        return ReadingEnd::Complete;
                     }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
@@ -2833,10 +2847,12 @@ impl StreamingProcessor {
                         cached_tokens: Some(u64::from(total_cached)),
                         output_tokens: total_completion as u64,
                     });
+                    ReadingEnd::Complete
                 }
-            }
+            };
 
             let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+            end
         };
 
         build_sse_response_driven(Box::pin(reading), rx, guards)
