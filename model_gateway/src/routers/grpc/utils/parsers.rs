@@ -11,7 +11,6 @@ use llm_tokenizer::{
 pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
-    model_card::ModelCard,
     profile::ProviderProfile,
     worker::ConstrainedDecoding,
 };
@@ -125,13 +124,15 @@ impl ParserResolver {
 
     /// Effective tool-parser name for `model`, if any.
     pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
-        self.card_parser(model, |card| card.tool_parser.as_ref())
+        self.card_names(model)
+            .tool
             .or_else(|| self.legacy_flags.tool.clone())
     }
 
     /// Effective reasoning-parser name for `model`, if any.
     pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
-        self.card_parser(model, |card| card.reasoning_parser.as_ref())
+        self.card_names(model)
+            .reasoning
             .or_else(|| self.legacy_flags.reasoning.clone())
     }
 
@@ -151,10 +152,28 @@ impl ParserResolver {
     /// them in that order with its registry between (`regular::symphony::names::reads`);
     /// the legacy parsers take each kind's first, from the flags only a name
     /// they read ([`Self::tool_parser`], [`Self::reasoning_parser`],
-    /// [`Self::legacy_tool`]).
+    /// [`Self::legacy_tool`]). The registry walk itself, for the tests: a
+    /// request's readers take the names its preparation resolved
+    /// ([`Self::names_for`]) or read them among the workers the stage holds
+    /// ([`Self::names_among`]).
+    #[cfg(test)]
     pub(crate) fn names(&self, model: &str) -> ModelNames<'_> {
         ModelNames {
             labels: self.card_names(model),
+            flags: &self.flags,
+        }
+    }
+
+    /// [`Self::names`] read among `workers`, the model's workers a stage
+    /// already holds: the cards come from that slice, with no registry walk
+    /// of this resolver's own.
+    pub(crate) fn names_among(&self, workers: &[Arc<dyn Worker>], model: &str) -> ModelNames<'_> {
+        ModelNames {
+            labels: if self.worker_registry.is_some() {
+                Self::card_names_among(workers, model)
+            } else {
+                Names::default()
+            },
             flags: &self.flags,
         }
     }
@@ -200,49 +219,72 @@ impl ParserResolver {
     /// The names `model`'s own cards set (worker labels), without the process-wide fallback:
     /// what the workers say of the model, each `None` when no card names one.
     fn card_names(&self, model: &str) -> Names {
+        self.worker_registry
+            .as_ref()
+            .map_or_else(Names::default, |registry| {
+                Self::card_names_among(&registry.get_by_model(model), model)
+            })
+    }
+
+    /// Both names `model`'s cards set among `workers`, in one walk. Cards
+    /// built by the label pipeline agree across the workers of one model; where
+    /// they do not (mixed labels, e.g. mid rolling-upgrade) each kind takes
+    /// the lexicographically smallest name, so the choice does not depend on
+    /// the registry's iteration order. Registration logs the conflict as a
+    /// warning; here it is debug (the per-request hot path).
+    fn card_names_among(workers: &[Arc<dyn Worker>], model: &str) -> Names {
+        let mut tool = CardPick::default();
+        let mut reasoning = CardPick::default();
+        for worker in workers {
+            let Some(card) = worker.metadata().spec.models.find(model) else {
+                continue;
+            };
+            tool.offer(card.tool_parser.as_ref());
+            reasoning.offer(card.reasoning_parser.as_ref());
+        }
         Names {
-            tool: self.card_parser(model, |card| card.tool_parser.as_ref()),
-            reasoning: self.card_parser(model, |card| card.reasoning_parser.as_ref()),
+            tool: tool.chosen(model, "tool"),
+            reasoning: reasoning.chosen(model, "reasoning"),
+        }
+    }
+}
+
+/// One parser kind's choice over a model's cards: the name the cards agree
+/// on, or the lexicographically smallest where they conflict.
+#[derive(Default)]
+struct CardPick<'a> {
+    chosen: Option<&'a String>,
+    conflict: bool,
+}
+
+impl<'a> CardPick<'a> {
+    fn offer(&mut self, name: Option<&'a String>) {
+        let Some(name) = name else {
+            return;
+        };
+        match self.chosen {
+            None => self.chosen = Some(name),
+            Some(existing) if existing != name => {
+                self.conflict = true;
+                if name < existing {
+                    self.chosen = Some(name);
+                }
+            }
+            Some(_) => {}
         }
     }
 
-    fn card_parser(
-        &self,
-        model: &str,
-        pick: impl Fn(&ModelCard) -> Option<&String>,
-    ) -> Option<String> {
-        let registry = self.worker_registry.as_ref()?;
-        // Cards built by the label pipeline agree across workers of one model;
-        // if they don't (mixed labels, e.g. mid rolling-upgrade), pick the
-        // lexicographically smallest so resolution is deterministic rather
-        // than registry-iteration-order dependent. Registration logs a
-        // warning for the conflict; here it's debug (per-request hot path).
-        let mut chosen: Option<String> = None;
-        let mut conflict = false;
-        for worker in registry.get_by_model(model).iter() {
-            let Some(name) = worker.metadata().spec.models.find(model).and_then(&pick) else {
-                continue;
-            };
-            match &chosen {
-                None => chosen = Some(name.clone()),
-                Some(existing) if existing != name => {
-                    conflict = true;
-                    if name < existing {
-                        chosen = Some(name.clone());
-                    }
-                }
-                Some(_) => {}
-            }
-        }
-        if conflict {
+    fn chosen(self, model: &str, kind: &'static str) -> Option<String> {
+        if self.conflict {
             tracing::debug!(
                 model,
-                chosen = chosen.as_deref(),
+                kind,
+                chosen = self.chosen.map(String::as_str),
                 "Workers for this model declare conflicting parser overrides; \
                  using the lexicographically smallest"
             );
         }
-        chosen
+        self.chosen.cloned()
     }
 }
 
@@ -2198,6 +2240,8 @@ mod tests {
 
 #[cfg(test)]
 mod parser_resolver_tests {
+    use openai_protocol::model_card::ModelCard;
+
     use super::*;
     use crate::worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType};
 
@@ -2300,6 +2344,64 @@ mod parser_resolver_tests {
         let resolver = ParserResolver::disabled();
         assert_eq!(resolver.tool_parser("m"), None);
         assert_eq!(resolver.reasoning_parser("m"), None);
+    }
+
+    /// The reading stage holds the model's workers already: the names read among them are the
+    /// names a registry walk resolves, each kind chosen on its own in the one pass (the smallest
+    /// where the cards disagree, a card for another model skipped), and a disabled resolver
+    /// reads none among them either.
+    #[test]
+    fn the_names_among_a_models_workers_are_the_registry_walks() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let cards = [
+            ModelCard::new("m")
+                .with_tool_parser("zebra")
+                .with_reasoning_parser("qwen3"),
+            ModelCard::new("m").with_tool_parser("alpha"),
+            ModelCard::new("other")
+                .with_tool_parser("aardvark")
+                .with_reasoning_parser("basic"),
+        ];
+        for (i, card) in cards.into_iter().enumerate() {
+            let worker = BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                .model(card)
+                .worker_type(WorkerType::Regular)
+                .build();
+            registry.register(Arc::new(worker));
+        }
+        let resolver =
+            ParserResolver::with_flags(Arc::clone(&registry), None, Some("flag".to_string()));
+        let workers = registry.get_by_model("m");
+        let among = resolver.names_among(&workers, "m");
+        assert_eq!(among, resolver.names("m"));
+        assert_eq!(
+            among.labels,
+            Names {
+                tool: Some("alpha".to_string()),
+                reasoning: Some("qwen3".to_string()),
+            }
+        );
+        assert_eq!(among.flags, &resolver.flags);
+        assert_eq!(
+            resolver.names_among(&workers, "other").labels,
+            Names::default()
+        );
+        assert_eq!(
+            ParserResolver::disabled().names_among(&workers, "m").labels,
+            Names::default()
+        );
+        // The slice is the stage's snapshot: a worker registered after it was
+        // taken moves a registry walk's names, not the names read among it.
+        let later = BasicWorkerBuilder::new("http://w3:8000")
+            .model(ModelCard::new("m").with_tool_parser("aardvark"))
+            .worker_type(WorkerType::Regular)
+            .build();
+        registry.register(Arc::new(later));
+        assert_eq!(
+            resolver.names_among(&workers, "m").labels.tool.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(resolver.names("m").labels.tool.as_deref(), Some("aardvark"));
     }
 
     #[test]
