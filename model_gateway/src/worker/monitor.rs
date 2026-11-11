@@ -392,11 +392,33 @@ pub struct WorkerMonitor {
     pending_pushed: Mutex<HashMap<String, Arc<dyn Worker>>>,
     pushed_notify: Arc<Notify>,
     pushed_flush_task: Mutex<Option<JoinHandle<()>>>,
+    /// Each worker's read-path record under its own lock: a read of one
+    /// rank on a worker without a stream holds the lock from the snapshot
+    /// read through the publish, so two reads of the worker never put an
+    /// older report back over a newer one, and the record carries the own
+    /// instant of every rank a read refreshed (see [`ReadInstants`]).
+    read_instants: Mutex<HashMap<String, Arc<Mutex<Option<ReadInstants>>>>>,
+    /// A test's hook, run under a worker's read lock just before the read's
+    /// report is published, so a test can see the lock held at that point.
+    #[cfg(test)]
+    pub(crate) before_read_publish: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// A worker's published copy of its pushed report, with the worker it came
 /// from for the publish fence.
 type PushedReport = (Arc<dyn Worker>, Arc<WorkerLoadResponse>);
+
+/// What the read path knows of a worker without a stream: the poll's sample
+/// instant for the rows no read refreshed, each read rank's own instant, and
+/// the instant of the report the path published last. A published report
+/// with another instant came from another publisher (the poll loop's tick,
+/// the host's poll) and supersedes the record: its rows are that poll's.
+#[derive(Debug)]
+pub(crate) struct ReadInstants {
+    polled: Instant,
+    ranks: BTreeMap<i32, Instant>,
+    published: Instant,
+}
 
 /// Where a worker's load comes from at a tick. An engine that reports its
 /// load on its KV-event stream is not asked for it again: in gRPC mode the
@@ -519,6 +541,9 @@ impl WorkerMonitor {
             pending_pushed: Mutex::new(HashMap::new()),
             pushed_notify: Arc::new(Notify::new()),
             pushed_flush_task: Mutex::new(None),
+            read_instants: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            before_read_publish: Mutex::new(None),
         }
     }
 
@@ -594,7 +619,9 @@ impl WorkerMonitor {
     /// once, with no report and no receipt made. The read is no stream: no
     /// push receipt, so the poll decision stays the poll's, no liveness
     /// cadence mark, and no one-way margin on its age; a report that mixes
-    /// the read with older rows takes the earlier instant.
+    /// the read with other rows takes the earliest of their own instants (a
+    /// read rank's its read's, the rest the poll's), built and published
+    /// under the worker's read lock.
     pub(crate) fn apply_read_load(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -618,8 +645,13 @@ impl WorkerMonitor {
         let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
         let mut read = SchedulerLoadSnapshot::from(record);
         read.dp_rank = dp_rank;
+        // The worker's read lock from the snapshot read through the publish:
+        // a second read of another rank waits for it, so neither publishes
+        // the other's rank from a snapshot the other has replaced.
+        let lock = self.read_lock_of(url);
+        let mut instants = lock.lock();
         let snapshot = self.load_state.snapshot();
-        let (mut loads, published_at) = match snapshot.report(url) {
+        let (mut loads, published) = match snapshot.report(url) {
             Some((report, at)) if report.ranks_are_dp_ranks() => (
                 report
                     .loads
@@ -631,20 +663,67 @@ impl WorkerMonitor {
             ),
             _ => (Vec::new(), None),
         };
-        let instant = if loads.is_empty() {
-            sampled_at
-        } else {
-            published_at.map_or(sampled_at, |at| at.min(sampled_at))
-        };
+        // The record stands while the published report is the one this path
+        // wrote last; any other report is a poll's, whose instant every one
+        // of its rows carries, and supersedes the record.
+        let polled = published.unwrap_or(sampled_at);
+        let current = instants
+            .as_ref()
+            .is_some_and(|record| published == Some(record.published));
+        if !current {
+            *instants = None;
+        }
+        let record = instants.get_or_insert_with(|| ReadInstants {
+            polled,
+            ranks: BTreeMap::new(),
+            published: polled,
+        });
+        record.ranks.insert(dp_rank, sampled_at);
         loads.push(read);
         loads.sort_by_key(|entry| entry.dp_rank);
+        // The report's instant is the earliest of its rows' own: a read
+        // rank's its read's, the rest the poll's, so repeated reads advance
+        // it as their ranks refresh.
+        let instant = loads
+            .iter()
+            .map(|entry| {
+                record
+                    .ranks
+                    .get(&entry.dp_rank)
+                    .copied()
+                    .unwrap_or(record.polled)
+            })
+            .min()
+            .unwrap_or(sampled_at);
+        record.published = instant;
         let load = WorkerLoadResponse {
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
             loads,
             sampled_at: Some(instant),
             ..WorkerLoadResponse::default()
         };
+        #[cfg(test)]
+        if let Some(hook) = self.before_read_publish.lock().as_ref() {
+            hook();
+        }
         self.ingest_polled_report(worker, load, received_at);
+        // The worker's read lock (`instants`) drops here, after the publish.
+    }
+
+    /// The read path's lock and record of one worker.
+    fn read_lock_of(&self, url: &str) -> Arc<Mutex<Option<ReadInstants>>> {
+        Arc::clone(
+            self.read_instants
+                .lock()
+                .entry(url.to_string())
+                .or_default(),
+        )
+    }
+
+    /// The read path's lock of one worker, for a test that holds it.
+    #[cfg(test)]
+    pub(crate) fn read_lock(&self, url: &str) -> Arc<Mutex<Option<ReadInstants>>> {
+        self.read_lock_of(url)
     }
 
     /// The in-place merge behind both: `pushed` marks a stream's record,
@@ -1266,6 +1345,7 @@ impl WorkerMonitor {
         // polled until its own stream pushes.
         self.pushed_reports.lock().remove(url);
         self.pushed_at.lock().remove(url);
+        self.read_instants.lock().remove(url);
         self.load_state.enqueue_eviction(Arc::clone(worker));
     }
 

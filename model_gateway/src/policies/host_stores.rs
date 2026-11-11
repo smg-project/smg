@@ -1146,7 +1146,7 @@ impl ReservationStore for HostStores {
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::{mpsc, Arc},
+        sync::{atomic::AtomicBool, mpsc, Arc},
         thread,
     };
 
@@ -1574,6 +1574,167 @@ mod tests {
         );
         assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(7));
         assert_eq!(host.ranks(id), 2);
+    }
+
+    /// Repeated reads of a worker's ranks advance the report's sample
+    /// instant: each row keeps its own read's instant, a row no read
+    /// refreshed the poll's, and the report takes the earliest of them, so
+    /// the scorer releases the dispatches every current row has seen.
+    #[test]
+    fn repeated_reads_of_two_ranks_advance_the_reports_sample_instant() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
+        let instant = |rank| host.load(id, rank).map(|sample| sample.sampled_at);
+        host.record(id, 0, row(5), at(1), LoadSource::Scrape);
+        assert_eq!(instant(0), Some(t0), "rank 1 is still the poll's row");
+        host.record(id, 1, row(6), at(2), LoadSource::Scrape);
+        assert_eq!(
+            instant(1),
+            Some(at(1)),
+            "both rows are reads: the earlier read's instant"
+        );
+        host.record(id, 0, row(7), at(3), LoadSource::Scrape);
+        assert_eq!(
+            instant(0),
+            Some(at(2)),
+            "rank 0 refreshed: rank 1's read is the earliest"
+        );
+        monitor.flush_pushed();
+        assert_eq!(host.load(id, 0).map(|sample| sample.row.running), Some(7));
+        assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(6));
+    }
+
+    /// A poll after reads supersedes their instants: its rows are the
+    /// poll's, so a later read of one rank takes the poll's instant for the
+    /// other rank, not the stale read's.
+    #[test]
+    fn a_poll_after_reads_supersedes_their_sample_instants() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
+        let instant = |rank| host.load(id, rank).map(|sample| sample.sampled_at);
+        host.record(id, 0, row(5), at(1), LoadSource::Scrape);
+        host.record(id, 1, row(6), at(2), LoadSource::Scrape);
+        assert_eq!(instant(1), Some(at(1)));
+        host.report(id, &[(0, row(8)), (1, row(9))], at(3), LoadSource::Poll);
+        assert_eq!(instant(0), Some(at(3)), "the poll's instant for both rows");
+        host.record(id, 0, row(10), at(4), LoadSource::Scrape);
+        assert_eq!(
+            instant(0),
+            Some(at(3)),
+            "rank 1 is the poll's row again, not the earlier read's"
+        );
+        monitor.flush_pushed();
+        assert_eq!(host.load(id, 0).map(|sample| sample.row.running), Some(10));
+        assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(9));
+    }
+
+    /// A read holds its worker's lock from the snapshot read through the
+    /// publish: a second read of the worker waits for it, so neither
+    /// publishes the other's rank from a snapshot the other has replaced.
+    #[test]
+    fn a_read_waits_for_the_lock_another_read_of_the_worker_holds() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let t0 = Instant::now();
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
+        let lock = monitor.read_lock(worker.url());
+        let held = lock.lock();
+        let handle = runtime.handle().clone();
+        let started = AtomicBool::new(false);
+        let (host, started) = (&host, &started);
+        thread::scope(move |scope| {
+            let reader = scope.spawn(move || {
+                let _enter = handle.enter();
+                started.store(true, Ordering::SeqCst);
+                host.record(
+                    id,
+                    1,
+                    row(7),
+                    t0 + Duration::from_secs(1),
+                    LoadSource::Scrape,
+                );
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                host.load(id, 1).map(|sample| sample.row.running),
+                Some(4),
+                "the read waits while the lock is held"
+            );
+            drop(held);
+            reader.join().expect("the reader thread");
+        });
+        monitor.flush_pushed();
+        assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(7));
+        assert_eq!(host.load(id, 0).map(|sample| sample.row.running), Some(3));
+    }
+
+    /// A read holds its worker's lock through the publish: at the instant
+    /// the report is published the lock is still taken, so no second read
+    /// can slip its snapshot read between this read's and its publish.
+    #[test]
+    fn a_read_holds_its_workers_lock_through_the_publish() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let t0 = Instant::now();
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
+        let lock = monitor.read_lock(worker.url());
+        let held_at_publish = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&held_at_publish);
+        *monitor.before_read_publish.lock() = Some(Box::new(move || {
+            seen.store(lock.try_lock().is_none(), Ordering::SeqCst);
+        }));
+        host.record(
+            id,
+            1,
+            row(7),
+            t0 + Duration::from_secs(1),
+            LoadSource::Scrape,
+        );
+        assert!(
+            held_at_publish.load(Ordering::SeqCst),
+            "the worker's read lock is held when the read publishes"
+        );
+        *monitor.before_read_publish.lock() = None;
+        monitor.flush_pushed();
+        assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(7));
     }
 
     /// The store contract's eviction through the host: a worker that stays
