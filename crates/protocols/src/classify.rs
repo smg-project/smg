@@ -12,6 +12,7 @@ use validator::Validate;
 
 use super::{
     common::{routing_text_of_input, GenerationRequest, UsageInfo},
+    embedding::validate_input,
     validated::Normalizable,
 };
 
@@ -20,9 +21,11 @@ use super::{
 // ============================================================================
 
 /// Classification request - compatible with the serving engine's /v1/classify API.
-/// It declares no validation rule: the validated extractor reads it for the
-/// gateway's error envelope on a body that does not parse or does not match
-/// the type.
+/// Its one rule is the public API's shape rule on `input` (`validate_input`; the
+/// embeddings route's array of objects is not among its shapes, as no engine
+/// takes one here):
+/// the validated extractor answers a body outside it in the gateway's error
+/// envelope before any worker sees it.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct ClassifyRequest {
@@ -33,6 +36,9 @@ pub struct ClassifyRequest {
     /// - Single string: "text to classify"
     /// - Array of strings: ["text1", "text2"]
     /// - Token IDs: [1, 2, 3] (advanced usage)
+    ///
+    /// Nothing empty: the public API's shape rule, shared with the embeddings route.
+    #[validate(custom(function = "validate_input"))]
     pub input: Value,
 
     /// Optional user identifier

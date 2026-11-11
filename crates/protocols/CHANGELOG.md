@@ -117,7 +117,18 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   answer the gateway's JSON error envelope (`400`, with `error.code` and `error.param`) where
   axum's own text/plain `422`, `415` and `400` answered before. `V1RerankReqInput` refuses an
   empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
-  its `top_n` keeps reading `0` as all documents. The four other types declare no rule.
+  its `top_n` keeps reading `0` as all documents. `TokenizeRequest` and `DetokenizeRequest`
+  declare no rule; the rules `EmbeddingRequest` and `ClassifyRequest` declare follow.
+- `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
+  an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
+  member of another kind than the first is refused by its index), and `EmbeddingRequest` the
+  API's bound on `dimensions` (at least one), so the gateway refuses the shapes the API refuses
+  in its error envelope with the field in `error.param` (`empty_array`, `empty_input`,
+  `invalid_type`, `integer_below_min_value`) before a worker sees them, on the gRPC path and the
+  HTTP relay alike. `validate_input` is the classify route's rule and the base of the embeddings
+  route's (`validate_embedding_input`), which also takes the serving engine's array of objects, a
+  structured member each, forwarded with no field of them read. The rule reads shape only: a
+  batch's length, the `encoding_format` and the objects' fields are the serving engine's to bound.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
