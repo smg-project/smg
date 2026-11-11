@@ -1249,7 +1249,11 @@ impl Router {
             .filter(|w| !w.is_dp_aware())
             .cloned()
             .collect();
-        if non_dp_workers.is_empty() {
+        // The engines' rows join when no plain worker is available, not only
+        // when none exists: an engine that was one plain row before its ranks
+        // were discovered stays reachable beside a plain worker whose breaker
+        // is open.
+        if !non_dp_workers.iter().any(|worker| worker.is_available()) {
             let mut rows: Vec<Arc<dyn Worker>> = all_workers.to_vec();
             rows.sort_by_key(|w| w.dp_rank());
             // One row per engine: its lowest available rank, its first rank
@@ -3380,6 +3384,55 @@ mod tests {
             worker.endpoint_url("/v1/audio/transcriptions"),
             "http://engine-a:8000/v1/audio/transcriptions"
         );
+    }
+
+    /// A mixed pool, one plain worker with its breaker open beside a healthy
+    /// engine of two ranks: the engine's row stands in, as the engine did
+    /// when it was one plain row, so the one unavailable worker does not
+    /// turn every transcription away.
+    #[test]
+    fn a_transcription_falls_back_to_an_engine_when_no_plain_worker_is_available() {
+        let router = create_test_regular_router();
+        router.worker_registry.remove_by_url("http://worker2:8080");
+        for rank in [0, 1] {
+            let row = BasicWorkerBuilder::new("http://engine-a:8000")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .dp_config(rank, 2)
+                .build();
+            router.worker_registry.register_or_replace(Arc::new(row));
+        }
+        let plain = router
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .find(|worker| !worker.is_dp_aware())
+            .expect("the plain worker");
+        for _ in 0..100 {
+            if !plain.is_available() {
+                break;
+            }
+            plain.record_outcome(500);
+        }
+        assert!(!plain.is_available(), "the plain worker's breaker is open");
+        let routing = RoutingDerivatives {
+            tokens: None,
+            text: None,
+            rid_key: None,
+            cache_namespace: None,
+        };
+        let worker = router
+            .select_transcription_worker(None, crate::worker::UNKNOWN_MODEL_ID, &routing)
+            .unwrap_or_else(|refusal| {
+                panic!("the engine stays reachable, got {}", refusal.status())
+            });
+        assert_eq!(
+            worker.base_url(),
+            "http://engine-a:8000",
+            "{}",
+            worker.url()
+        );
+        assert!(worker.is_available());
     }
 
     #[test]
