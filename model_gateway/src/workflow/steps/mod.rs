@@ -24,7 +24,9 @@ use local::{
     SubmitTokenizerJobStep,
 };
 use openai_protocol::worker::WorkerSpec;
-pub use shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep, WorkerList};
+pub use shared::{
+    registered_in, ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep, WorkerList,
+};
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use crate::{

@@ -5,7 +5,8 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{
-    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowData, WorkflowError,
+    WorkflowResult, WorkflowState,
 };
 
 use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
@@ -22,9 +23,22 @@ use crate::{
 /// Works with any workflow data type that implements `WorkerRegistrationData`.
 pub struct RegisterWorkersStep;
 
+/// The step's id in the registration DAGs.
+const REGISTER_WORKERS_STEP: &str = "register_workers";
+
+/// Whether the registry step of `state` completed: the registration's workers
+/// are in the registry, whatever the workflow did after it (a cancellation or
+/// a later step's failure leaves them there).
+pub fn registered_in<D: WorkflowData>(state: &WorkflowState<D>) -> bool {
+    state
+        .step_states
+        .get(&StepId::new(REGISTER_WORKERS_STEP))
+        .is_some_and(|step| step.status == StepStatus::Succeeded)
+}
+
 fn step_failed(message: String) -> WorkflowError {
     WorkflowError::StepFailed {
-        step_id: StepId::new("register_workers"),
+        step_id: StepId::new(REGISTER_WORKERS_STEP),
         message,
     }
 }
@@ -271,6 +285,70 @@ mod tests {
 
     fn worker(model_id: &str) -> Arc<dyn Worker> {
         worker_at("http://worker:8080", model_id)
+    }
+
+    /// A terminal state says whether its registry step landed: the step's
+    /// record reads `Succeeded` once the workers are in the registry, whatever
+    /// the workflow's own status became after it; no record, or a step that
+    /// did not run through, means nothing landed.
+    #[test]
+    fn a_terminal_state_says_whether_its_registry_step_landed() {
+        use openai_protocol::worker::WorkerSpec;
+        use wfaas::{StepState, WorkflowId, WorkflowInstanceId, WorkflowStatus};
+
+        use crate::{
+            app_context::testing::app_context_for_tests, config::RouterConfig,
+            worker::WorkerRegistry, workflow::steps::create_worker_workflow_data,
+        };
+        let data = create_worker_workflow_data(
+            WorkerSpec::new("http://worker:8080"),
+            WorkerRegistrationMode::CreateOnly,
+            app_context_for_tests(
+                RouterConfig::default(),
+                Arc::new(WorkerRegistry::new()),
+                None,
+            ),
+        );
+        let mut state = WorkflowState::new(
+            WorkflowInstanceId::new(),
+            WorkflowId::new("worker_registration"),
+            data,
+        );
+        state.status = WorkflowStatus::Cancelled;
+        assert!(
+            !registered_in(&state),
+            "no record of the step, nothing landed"
+        );
+        let step = StepId::new("register_workers");
+        for status in [
+            StepStatus::Pending,
+            StepStatus::Running,
+            StepStatus::Failed,
+            StepStatus::Skipped,
+        ] {
+            state.step_states.insert(
+                step.clone(),
+                StepState {
+                    status,
+                    ..StepState::default()
+                },
+            );
+            assert!(
+                !registered_in(&state),
+                "a {status:?} registry step landed nothing"
+            );
+        }
+        state.step_states.insert(
+            step,
+            StepState {
+                status: StepStatus::Succeeded,
+                ..StepState::default()
+            },
+        );
+        assert!(
+            registered_in(&state),
+            "a cancelled workflow whose registry step succeeded left its workers"
+        );
     }
 
     fn replace_by_id(worker_id: &WorkerId, expected_revision: u64) -> WorkerRegistrationMode {

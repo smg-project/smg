@@ -1358,11 +1358,26 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         label: &str,
         timeout_duration: Duration,
     ) -> Result<String, String> {
+        let state = self
+            .wait_for_terminal_state(instance_id, label, timeout_duration)
+            .await?;
+        completion_outcome(&state, label)
+    }
+
+    /// Waits for the workflow to reach a terminal status and returns that
+    /// state, its step states included, read before the terminal cleanup.
+    /// The timeout is an error and leaves a still-running workflow to the
+    /// periodic cleanup.
+    pub async fn wait_for_terminal_state(
+        &self,
+        instance_id: WorkflowInstanceId,
+        label: &str,
+        timeout_duration: Duration,
+    ) -> Result<WorkflowState<D>, String> {
         let start = std::time::Instant::now();
         let mut poll_interval = Duration::from_millis(100);
         let max_poll_interval = Duration::from_millis(2000);
         let poll_backoff = Duration::from_millis(200);
-
         loop {
             if start.elapsed() > timeout_duration {
                 // Only removes already-terminal state; a still-running
@@ -1375,37 +1390,20 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     label
                 ));
             }
-
             let state = self
                 .get_status(instance_id)
                 .await
                 .map_err(|e| format!("Failed to get workflow status: {e:?}"))?;
-
-            let result = match state.status {
-                WorkflowStatus::Completed => {
-                    Ok(format!("{label} completed successfully via workflow"))
+            match state.status {
+                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                    self.state_store.cleanup_if_terminal(instance_id).await;
+                    return Ok(state);
                 }
-                WorkflowStatus::Failed => {
-                    let current_step = state.current_step.as_ref();
-                    let step_name = current_step
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let error_msg = current_step
-                        .and_then(|step_id| state.step_states.get(step_id))
-                        .and_then(|s| s.last_error.as_deref())
-                        .unwrap_or("Unknown error");
-                    Err(format!("Workflow failed at step {step_name}: {error_msg}"))
-                }
-                WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {label}")),
                 WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
                     tokio::time::sleep(poll_interval).await;
                     poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
-                    continue;
                 }
-            };
-
-            self.state_store.cleanup_if_terminal(instance_id).await;
-            return result;
+            }
         }
     }
 
@@ -1480,6 +1478,32 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> std::fmt::Debug for WorkflowEn
         f.debug_struct("WorkflowEngine")
             .field("definitions_count", &self.definitions.read().len())
             .finish()
+    }
+}
+
+/// The outcome a terminal state reads as: the completion line, the
+/// failing step's error, or the cancellation.
+pub fn completion_outcome<D: WorkflowData>(
+    state: &WorkflowState<D>,
+    label: &str,
+) -> Result<String, String> {
+    match state.status {
+        WorkflowStatus::Completed => Ok(format!("{label} completed successfully via workflow")),
+        WorkflowStatus::Failed => {
+            let current_step = state.current_step.as_ref();
+            let step_name = current_step
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let error_msg = current_step
+                .and_then(|step_id| state.step_states.get(step_id))
+                .and_then(|s| s.last_error.as_deref())
+                .unwrap_or("Unknown error");
+            Err(format!("Workflow failed at step {step_name}: {error_msg}"))
+        }
+        WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {label}")),
+        WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+            Err(format!("Workflow still running for {label}"))
+        }
     }
 }
 

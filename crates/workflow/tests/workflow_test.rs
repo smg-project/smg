@@ -1624,3 +1624,57 @@ async fn a_retry_indefinitely_step_keeps_retrying_past_the_policy_s_attempts() {
     assert_eq!(step_state.attempt, 5);
     assert_eq!(counter.load(Ordering::SeqCst), 5);
 }
+
+/// The terminal state a waiter reads of a cancelled workflow still carries
+/// the steps that completed before the cancellation, and the outcome line
+/// reads the cancellation.
+#[tokio::test]
+async fn a_cancelled_workflow_s_terminal_state_keeps_its_completed_steps() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let first_attempt_running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let workflow = WorkflowDefinition::new("cancel_after_a_step_workflow", "Cancel After A Step")
+        .add_step(StepDefinition::new(
+            "done_step",
+            "Step that completes",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "held_step",
+                "Step held in its first attempt",
+                Arc::new(HeldFailingStep {
+                    attempts: Arc::clone(&attempts),
+                    first_attempt_running: Arc::clone(&first_attempt_running),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(30)),
+            })
+            .with_timeout(Duration::from_secs(5))
+            .depends_on(&["done_step"]),
+        );
+    let instance_id = started(&engine, workflow).await.unwrap();
+    timeout(Duration::from_secs(5), first_attempt_running.notified())
+        .await
+        .expect("the held step runs after the completed one");
+    engine.cancel_workflow(instance_id).await.unwrap();
+    release.notify_one();
+    let state = engine
+        .wait_for_terminal_state(instance_id, "cancel after a step", Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        state.step_states[&StepId::new("done_step")].status,
+        StepStatus::Succeeded,
+        "the completed step stays readable in the terminal state"
+    );
+    assert_eq!(
+        wfaas::completion_outcome(&state, "cancel after a step"),
+        Err("Workflow cancelled for cancel after a step".to_string())
+    );
+}

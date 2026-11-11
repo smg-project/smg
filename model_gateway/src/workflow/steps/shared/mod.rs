@@ -11,7 +11,7 @@ use std::{collections::HashSet, sync::Arc};
 
 pub use activate::ActivateWorkersStep;
 use openai_protocol::worker::{ConnectionMode, WorkerType};
-pub use register::RegisterWorkersStep;
+pub use register::{registered_in, RegisterWorkersStep};
 pub(crate) use update_policies::start_kv_stream;
 pub use update_policies::UpdatePoliciesStep;
 

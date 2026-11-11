@@ -30,7 +30,7 @@ use crate::{
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
+        registered_in, McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
         WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode,
     },
 };
@@ -948,6 +948,21 @@ impl JobQueue {
         }
     }
 
+    /// Queues the removal of the worker under `url`: the job a `DELETE` of a
+    /// live worker queues, drain and bookkeeping included.
+    async fn queue_removal(context: &Arc<AppContext>, url: &str) -> Result<(), String> {
+        let queue = context
+            .worker_job_queue
+            .get()
+            .ok_or_else(|| "Worker job queue not initialized".to_string())?;
+        queue
+            .submit(Job::RemoveWorker {
+                url: url.to_string(),
+                expected_revisions: None,
+            })
+            .await
+    }
+
     /// Takes the mark under `own_id`, if there is one: true when a `DELETE`
     /// ended this registration before its job had saved a workflow state.
     fn take_mark(marks: &DashSet<WorkerId>, own_id: Option<&WorkerId>) -> bool {
@@ -1012,10 +1027,33 @@ impl JobQueue {
                     instance_id
                 );
 
-                engines
+                let state = engines
                     .worker_registration
-                    .wait_for_completion(instance_id, &config.url, timeout_duration)
-                    .await
+                    .wait_for_terminal_state(instance_id, &config.url, timeout_duration)
+                    .await?;
+                let outcome = wfaas::completion_outcome(&state, &config.url);
+                // A POST's registration that put its worker in the registry
+                // and did not finish (a DELETE's cancel landing after the
+                // registry step, a later step's failure) leaves no worker
+                // behind: it goes out through the removal job, as a DELETE of
+                // a live worker sends it. A startup or discovery registration
+                // is its own pass's to reconcile.
+                let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
+                match outcome {
+                    Err(failure) if create_only && registered_in(&state) => {
+                        Err(match Self::queue_removal(context, &config.url).await {
+                            Ok(()) => format!(
+                                "{failure}; its worker was registered and leaves through a \
+                                queued removal"
+                            ),
+                            Err(submit) => format!(
+                                "{failure}; its worker was registered and its removal could \
+                                not be queued: {submit}"
+                            ),
+                        })
+                    }
+                    outcome => outcome,
+                }
             }
             Job::UpdateWorker { url, update } => {
                 let engines = context
