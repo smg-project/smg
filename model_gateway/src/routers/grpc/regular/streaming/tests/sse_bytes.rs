@@ -524,3 +524,129 @@ async fn ready_engine_chunks_share_a_frame_after_the_first_token_on_the_completi
         "{chunks:?}"
     );
 }
+
+/// The content deltas of the events in `frame`, in order; the opening
+/// chunk's empty content is no delta.
+fn contents_of(frame: &[u8]) -> Vec<String> {
+    std::str::from_utf8(frame)
+        .expect("UTF-8 SSE")
+        .split("\n\n")
+        .filter_map(|event| event.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .filter_map(|json| {
+            json["choices"][0]["delta"]["content"]
+                .as_str()
+                .filter(|content| !content.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The frames until `deltas` content deltas have arrived (the engine quiet
+/// behind them), then the gate opened and the frames after it: the two
+/// lists.
+async fn frames_until_the_deltas_then_the_rest(
+    mut rx: SseReceiver,
+    deltas: usize,
+    gate: oneshot::Sender<()>,
+) -> (Vec<Bytes>, Vec<Bytes>) {
+    let mut before = Vec::new();
+    let mut seen = 0;
+    while seen < deltas {
+        let frame = rx.recv().await.expect("a frame").expect("a write");
+        seen += contents_of(&frame).len();
+        before.push(frame);
+    }
+    gate.send(()).expect("the reader waits at the gate");
+    let mut after = Vec::new();
+    while let Some(frame) = rx.recv().await {
+        after.push(frame.expect("a write"));
+    }
+    (before, after)
+}
+
+/// The room one event may add past the bound: a chat chunk event of a
+/// one-character delta is under 200 bytes.
+const ONE_EVENT_ROOM: usize = 512;
+
+/// A burst of ready engine messages behind the first token leaves in frames
+/// bounded by `CHUNK_FLUSH_BYTES`: the frame being written goes out once it
+/// holds the bound, so a burst past it leaves as more than one frame, each
+/// at most the bound plus the event that crossed it, the deltas in order,
+/// before the engine's next message is read; the finish behind the gate is
+/// its own frame. `generate_frames` pins the same bound on the generate
+/// stream.
+#[tokio::test]
+async fn a_burst_past_the_flush_bound_leaves_in_bounded_frames_on_the_chat_stream() {
+    const BURST: usize = 200;
+    let (gate, gated) = oneshot::channel();
+    let burst: Vec<_> = (0..BURST).map(|_| chunk(0, "a")).collect();
+    let (stream, server) = staged_stream(
+        vec![(None, burst), (Some(gated), vec![complete(0, "stop")])],
+        "0",
+    )
+    .await;
+    let (tx, rx) = sse_channel();
+    let request: ChatCompletionRequest =
+        serde_json::from_value(request("fixture-model", json!({}))).expect("chat request");
+    let dispatch = context::DispatchMetadata {
+        request_id: "chatcmpl-fixture".to_string(),
+        model: request.model.clone(),
+        created: 1_700_000_000,
+        weight_version: None,
+    };
+    let processor = processor(false);
+    let reading = async {
+        let result = processor
+            .process_streaming_chunks(
+                stream,
+                dispatch,
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                ChatResponseSpec::from(&request),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        result
+    };
+    let (result, (burst_frames, rest)) = tokio::join!(
+        reading,
+        frames_until_the_deltas_then_the_rest(rx, BURST, gate)
+    );
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    let deltas: Vec<String> = burst_frames
+        .iter()
+        .flat_map(|frame| contents_of(frame))
+        .collect();
+    assert_eq!(deltas, vec!["a"; BURST], "the burst's deltas in order");
+    let sizes: Vec<usize> = burst_frames.iter().map(Bytes::len).collect();
+    let largest = sizes.iter().copied().max().expect("a frame");
+    assert!(
+        largest >= CHUNK_FLUSH_BYTES,
+        "a full frame left at the bound: {sizes:?}"
+    );
+    assert!(
+        largest < CHUNK_FLUSH_BYTES + ONE_EVENT_ROOM,
+        "no frame past the bound by more than the event that crossed it: {sizes:?}"
+    );
+    assert!(
+        sizes.len() > 2,
+        "the burst behind the first token's frame leaves in more than one frame: {sizes:?}"
+    );
+    let finish: Vec<String> = rest
+        .iter()
+        .map(|frame| String::from_utf8_lossy(frame).to_string())
+        .collect();
+    assert_eq!(
+        finish.len(),
+        1,
+        "the finish behind the gate is its own frame: {finish:?}"
+    );
+    assert!(
+        finish[0].contains(r#""finish_reason":"stop""#),
+        "{finish:?}"
+    );
+}
