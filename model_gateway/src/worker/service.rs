@@ -1428,6 +1428,52 @@ mod tests {
         );
     }
 
+    /// A deleted group's id is not the next registration's: the base
+    /// reservation behind the group id leaves with the last rank row, so a
+    /// POST of the same URL answers a new id, and the deleted Location does
+    /// not resolve to the replacement.
+    #[tokio::test]
+    async fn a_deleted_groups_id_is_not_reused_by_the_next_registration() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "http://10.0.0.15:8000";
+        let row = |rank: usize| {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .model(ModelCard::new("m"))
+                    .dp_config(rank, 2)
+                    .build(),
+            )
+        };
+        let group_id = registry.reserve_id_for_url(url);
+        let rows: Vec<WorkerId> = (0..2)
+            .map(|rank| registry.register(row(rank)).unwrap())
+            .collect();
+        assert!(service.get_worker(group_id.as_str()).is_ok());
+
+        // The DELETE of the group: every rank row leaves.
+        for id in &rows {
+            registry.remove(id);
+        }
+        // The POST of the same URL: a new group under a new id.
+        let next_id = registry.reserve_id_for_url(url);
+        assert_ne!(next_id, group_id, "the deleted group's id was reused");
+        registry.register(row(0)).unwrap();
+        assert!(matches!(
+            service.get_worker(group_id.as_str()),
+            Err(WorkerServiceError::NotFound { .. })
+        ));
+        assert!(service.get_worker(next_id.as_str()).is_ok());
+    }
+
     /// A worker over the cap through the labels discovered at registration
     /// still takes an update that adds no key through the endpoint: a rewrite
     /// of keys it has reaches the queue, a new key is refused by name.
