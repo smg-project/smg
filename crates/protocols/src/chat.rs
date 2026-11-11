@@ -795,9 +795,14 @@ fn validate_chat_cross_parameters(
             .map_err(|error| on_field(error, "response_format"))?;
     }
 
+    // The model's provider profile, selected once for the rules below (the
+    // tools a `tool_choice` is judged against include the dynamic tools the
+    // profile defines; step 10 applies the profile's own contract).
+    let provider = ProviderProfile::for_model(&req.model);
+
     // 7. A tool_choice against the tools the model will see
     if let Some(tool_choice) = &req.tool_choice {
-        validate_tool_choice(req, tool_choice)?;
+        validate_tool_choice(req, provider, tool_choice)?;
     }
 
     // 8. A function's `parameters`, when given, is a JSON Schema object (an
@@ -835,22 +840,23 @@ fn validate_chat_cross_parameters(
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
     //     OpenAI's own contract refuses the pair.
-    ProviderProfile::for_model(&req.model).validate_chat(req)?;
+    provider.validate_chat(req)?;
 
     Ok(())
 }
 
 /// A `tool_choice` against the tools the model will see: the request's tools
-/// plus the dynamic tools its system and developer messages declare. Only
-/// `none` and `auto` are allowed without tools; a named function must be
-/// declared; an allowed-tools choice names a mode and function tools only,
-/// each declared.
+/// plus the dynamic tools its system and developer messages declare under
+/// `provider`, the model's profile. Only `none` and `auto` are allowed without
+/// tools; a named function must be declared; an allowed-tools choice names a
+/// mode and function tools only, each declared.
 fn validate_tool_choice(
     req: &ChatCompletionRequest,
+    provider: ProviderProfile,
     tool_choice: &ToolChoice,
 ) -> Result<(), validator::ValidationError> {
     // Lazy on purpose: most tool traffic only needs the emptiness check.
-    let effective_tools = || req.effective_tools();
+    let effective_tools = || req.effective_tools_for(provider);
     let has_tools = effective_tools().next().is_some();
     let requires_tools = !matches!(
         tool_choice,
@@ -925,7 +931,16 @@ impl ChatCompletionRequest {
     /// request's provider profile defines them (Kimi K3 dynamic tools on
     /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
     pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
-        ProviderProfile::for_model(&self.model).dynamic_tools(self)
+        self.dynamic_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::dynamic_tools`] under the model's provider profile the caller
+    /// derived already (the gateway's preparation derives it once per request
+    /// and the stages after it read the kept value; every `_for` reader below
+    /// takes it the same way, so a request's tool set is read without
+    /// selecting the profile again on each reading).
+    pub fn dynamic_tools_for(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
+        provider.dynamic_tools(self)
     }
 
     /// Whether the request offers the model any tool: a request-level `tools`
@@ -940,7 +955,12 @@ impl ChatCompletionRequest {
     /// Whether a call can be forced is a question for the narrowed set,
     /// [`Self::callable_tools`].
     pub fn declares_tools(&self) -> bool {
-        self.tools.is_some() || self.dynamic_tools().next().is_some()
+        self.declares_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::declares_tools`] under the profile the caller derived already.
+    pub fn declares_tools_for(&self, provider: ProviderProfile) -> bool {
+        self.tools.is_some() || self.dynamic_tools_for(provider).next().is_some()
     }
 
     /// Every tool the model will see: the request-level `tools` followed by
@@ -948,11 +968,16 @@ impl ChatCompletionRequest {
     /// tool-call parsing first of all, must work from this set rather than
     /// from `tools` alone, or a call to a dynamic tool comes back as text.
     pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.effective_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tools`] under the profile the caller derived already.
+    pub fn effective_tools_for(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
         self.tools
             .as_deref()
             .into_iter()
             .flatten()
-            .chain(self.dynamic_tools())
+            .chain(self.dynamic_tools_for(provider))
     }
 
     /// [`Self::effective_tools`] as one list: the request's own `tools`,
@@ -961,7 +986,13 @@ impl ChatCompletionRequest {
     /// request (the constraint, the response spec, the table that reads the
     /// calls), so where nothing narrows it, nothing copies it.
     pub fn effective_tool_list(&self) -> Cow<'_, [Tool]> {
-        let mut dynamic = self.dynamic_tools().peekable();
+        self.effective_tool_list_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tool_list`] under the profile the caller derived
+    /// already.
+    pub fn effective_tool_list_for(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let mut dynamic = self.dynamic_tools_for(provider).peekable();
         if dynamic.peek().is_none() {
             return Cow::Borrowed(self.tools.as_deref().unwrap_or(&[]));
         }
@@ -982,7 +1013,12 @@ impl ChatCompletionRequest {
     /// shared, when no message declares a tool; a list that chains both
     /// otherwise; an empty list when the request declares none.
     pub fn shared_tool_list(&self) -> Arc<[Tool]> {
-        let mut dynamic = self.dynamic_tools().peekable();
+        self.shared_tool_list_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::shared_tool_list`] under the profile the caller derived already.
+    pub fn shared_tool_list_for(&self, provider: ProviderProfile) -> Arc<[Tool]> {
+        let mut dynamic = self.dynamic_tools_for(provider).peekable();
         match (&self.tools, dynamic.peek()) {
             (Some(tools), None) => Arc::clone(tools),
             (None, None) => Arc::default(),
@@ -1003,7 +1039,12 @@ impl ChatCompletionRequest {
     /// alone, a forced call could only ever land on a request-level tool. The
     /// list is borrowed from the request where the choice narrows nothing.
     pub fn callable_tools(&self) -> Cow<'_, [Tool]> {
-        let tools = self.effective_tool_list();
+        self.callable_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::callable_tools`] under the profile the caller derived already.
+    pub fn callable_tools_for(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let tools = self.effective_tool_list_for(provider);
         match self
             .tool_choice
             .as_ref()
@@ -1358,6 +1399,47 @@ mod tests {
         ThinkingParam, ThinkingType,
     };
     use crate::common::{FunctionCallDelta, ToolCallDelta};
+
+    /// The tool readers answer for the profile the caller hands them, the
+    /// profile the gateway's preparation derived once per request: under the
+    /// model's own profile they read what the no-argument readers read; under
+    /// another profile they read that profile's tools, not the model id's.
+    #[test]
+    fn the_tool_readers_take_the_profile_the_caller_derived() {
+        use super::ProviderProfile;
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [
+                    {"type": "function", "function": {"name": "get_weather"}}
+                ]},
+                {"role": "user", "content": "hi"}
+            ]
+        }))
+        .expect("request deserializes");
+        assert!(request.declares_tools_for(ProviderProfile::Kimi));
+        assert_eq!(
+            request.declares_tools_for(ProviderProfile::Kimi),
+            request.declares_tools()
+        );
+        assert_eq!(
+            request.effective_tools_for(ProviderProfile::Kimi).count(),
+            1
+        );
+        assert_eq!(
+            request.effective_tool_list_for(ProviderProfile::Kimi).len(),
+            1
+        );
+        assert_eq!(request.shared_tool_list_for(ProviderProfile::Kimi).len(), 1);
+        assert_eq!(request.callable_tools_for(ProviderProfile::Kimi).len(), 1);
+        assert!(!request.declares_tools_for(ProviderProfile::Generic));
+        assert!(request
+            .effective_tool_list_for(ProviderProfile::Generic)
+            .is_empty());
+        assert!(request
+            .shared_tool_list_for(ProviderProfile::Generic)
+            .is_empty());
+    }
 
     /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
     /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
@@ -2190,7 +2272,7 @@ mod request_contract_tests {
 mod tool_choice_tests {
     use serde_json::{json, Value};
 
-    use super::{validate_tool_choice, ChatCompletionRequest};
+    use super::{validate_tool_choice, ChatCompletionRequest, ProviderProfile};
 
     fn request(tools: Value, tool_choice: Value) -> ChatCompletionRequest {
         serde_json::from_value(json!({
@@ -2206,7 +2288,7 @@ mod tool_choice_tests {
     fn verdict(tools: Value, tool_choice: Value) -> Option<String> {
         let req = request(tools, tool_choice);
         let choice = req.tool_choice.as_ref().expect("a tool choice");
-        validate_tool_choice(&req, choice)
+        validate_tool_choice(&req, ProviderProfile::for_model(&req.model), choice)
             .err()
             .map(|e| e.code.into_owned())
     }
