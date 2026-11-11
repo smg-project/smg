@@ -2138,9 +2138,10 @@ impl PDRouter {
     }
 
     /// The count request as the prefill worker receives it (its model the
-    /// canonical one), serialized once a worker is selected, so a refusal
-    /// for want of a worker serializes nothing and the request still does not
-    /// ride in the route's task across the send.
+    /// canonical one), serialized once a worker is selected and admitted, so
+    /// a refusal for want of a worker or for the worker's overload serializes
+    /// nothing and the request still does not ride in the route's task across
+    /// the send.
     fn count_tokens_wire(
         mut body: CountMessageTokensRequest,
         canonical_model: Option<&str>,
@@ -2769,7 +2770,7 @@ impl RouterTrait for PDRouter {
         // The request is never borrowed here: a borrowed local keeps its slot
         // in the task across the awaits that follow, a second copy of the
         // request per count. It is moved out for its routing text, moved back,
-        // and serialized once a worker is selected.
+        // and serialized once a worker is selected and admitted.
         let (request_text, body) =
             Self::count_tokens_routing_text(body, self.policies_need_request_text());
         let Some(worker) = placement::select_single(
@@ -2794,10 +2795,6 @@ impl RouterTrait for PDRouter {
             );
         };
 
-        let body = match Self::count_tokens_wire(body, canonical_model.as_deref()) {
-            Ok(bytes) => bytes,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
         if let Some(response) = overload::shed_if_worker_overloaded(
             worker.as_ref(),
             model_id,
@@ -2805,6 +2802,10 @@ impl RouterTrait for PDRouter {
         ) {
             return response;
         }
+        let body = match Self::count_tokens_wire(body, canonical_model.as_deref()) {
+            Ok(bytes) => bytes,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
         let _load_guard = WorkerLoadGuard::with_key(
             worker.clone(),
             self.policy_registry.sticky_header_key(headers),
