@@ -1351,9 +1351,12 @@ impl Router {
     }
 
     /// Buffer a worker response body, capped at `limit` bytes; a larger body
-    /// is a misbehaving worker and yields a 502 before memory balloons. The
-    /// request's own timeout running out mid-body ends the request as it does
-    /// before the head (see [`convert_reqwest_error`]).
+    /// is a misbehaving worker and yields a 502 before memory balloons, and so
+    /// does a body the worker's connection cuts short (a close before the
+    /// announced length, a reset mid-body): the worker's transport failing
+    /// under the call, answered under its own code, never a fault of the
+    /// gateway's. The request's own timeout running out mid-body ends the
+    /// request as it does before the head (see [`convert_reqwest_error`]).
     async fn read_worker_body_capped<S>(mut stream: S, limit: usize) -> Result<Bytes, Response>
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
@@ -1369,7 +1372,7 @@ impl Router {
                     )));
                 }
                 Err(e) => {
-                    return Err(error::internal_error(
+                    return Err(error::bad_gateway(
                         "read_response_body_failed",
                         format!("Failed to get response body: {}", cause(&e)),
                     ));
@@ -3783,9 +3786,9 @@ mod tests {
 
     /// The buffered transcription answer's outcome names the reason from
     /// what the client sees: a body the gateway could not read whole (cut
-    /// under the read) is the gateway's own 500 under its code, counted as
-    /// the worker's connection failing (`transport_disconnect`), not as the
-    /// worker-style reason of a 500; a body that arrives whole is the
+    /// under the read) is a bad gateway under the gateway's own code, counted
+    /// as the worker's connection failing (`transport_disconnect`), not as
+    /// the worker-style reason of a 502; a body that arrives whole is the
     /// worker's answer, recorded by its status.
     #[tokio::test]
     async fn a_buffered_transcription_read_failure_names_the_gateways_reason() {
@@ -3805,7 +3808,7 @@ mod tests {
         let answer =
             buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
                 .await;
-        assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&answer),
             "read_response_body_failed"
@@ -3875,8 +3878,12 @@ mod tests {
         );
     }
 
+    /// A body the engine's stream ends with an error is the worker's
+    /// transport failing under the call: a bad gateway under the read's code,
+    /// the class the over-limit body takes and the one the metrics file the
+    /// code under (`transport_disconnect`), never a 500 of the gateway's own.
     #[tokio::test]
-    async fn read_worker_body_capped_maps_read_failure_to_500() {
+    async fn read_worker_body_capped_maps_a_read_failure_to_a_bad_gateway() {
         let url = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
 
         let response = Router::read_worker_body_capped(
@@ -3886,7 +3893,57 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "read_response_body_failed"
+        );
+    }
+
+    /// Loopback engine stub whose every answer is a 200 head announcing a
+    /// 1000-byte body, twelve bytes of it, and then the closed connection: an
+    /// engine that goes away mid-answer, as the client reads it ("end of file
+    /// before message length reached").
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn spawn_close_after_headers_stub() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 1000\r\n\r\n{\"partial\":",
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An engine that closes the connection after its head and a few bytes
+    /// of the body it announced is answered the same way: a bad gateway
+    /// under the read's code, with the client's reason in the message.
+    #[tokio::test]
+    async fn a_worker_that_closes_mid_body_is_a_bad_gateway() {
+        let url = spawn_close_after_headers_stub().await;
+
+        let response = Router::read_worker_body_capped(
+            worker_body(&crate::server::http_client(), &url).await,
+            1 << 20,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"

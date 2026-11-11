@@ -397,7 +397,7 @@ impl PDRouter {
                     }
                     Err(e) => {
                         error!("Failed to read response body: {}", e);
-                        error::internal_error(
+                        error::bad_gateway(
                             "read_response_body_failed",
                             format!("Failed to read response body: {}", cause(&e)),
                         )
@@ -3445,6 +3445,42 @@ mod tests {
             *seen.lock().unwrap(),
             vec![None, Some("Bearer callers-own-key".to_string())]
         );
+    }
+
+    /// A worker that closes the connection after its head, before the body
+    /// it announced, failed below HTTP: the proxied GET answers a bad gateway
+    /// under the read's code, as the typed routes' buffered reads do, not a
+    /// 500 of the gateway's own.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn a_worker_that_closes_mid_body_is_proxied_as_a_bad_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n{\"partial\":")
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+
+        let response = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = json_of(response).await;
+        assert_eq!(body["error"]["code"], "read_response_body_failed", "{body}");
     }
 
     #[tokio::test]
