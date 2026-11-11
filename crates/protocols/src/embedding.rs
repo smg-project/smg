@@ -27,6 +27,10 @@ pub struct EmbeddingRequest {
 
     /// Engine extension: request id for tracking
     pub rid: Option<String>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 impl GenerationRequest for EmbeddingRequest {

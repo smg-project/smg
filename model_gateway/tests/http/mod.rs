@@ -1,6 +1,7 @@
 //! HTTP application integration tests
 
 mod decisions_http_test;
+mod embeddings_relay_test;
 mod inflight_tracker_test;
 mod load_guard_raii_test;
 mod mock_engines_contract_test;

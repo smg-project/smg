@@ -92,3 +92,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
   message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
   `reasoning: AssistantReasoning`, whose `text` is that option.
+- `EmbeddingRequest` and `ClassifyRequest` keep the fields they do not model in a flattened
+  `other` map, as `ChatCompletionRequest` and `CompletionRequest` do, so the HTTP relay forwards an
+  embeddings or classify body as the client wrote it (`truncate_prompt_tokens`,
+  `add_special_tokens`, `normalize`, `priority`, `extra_body`, ...). The relay re-serializes the
+  typed body and dropped every key the types did not declare. Breaking: the two structs gain the
+  field `other: serde_json::Map<String, Value>`.
