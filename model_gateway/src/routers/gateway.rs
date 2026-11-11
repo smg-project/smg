@@ -1705,6 +1705,23 @@ mod tests {
         .unwrap()
     }
 
+    /// A plain Messages request's task holds the request once: a local
+    /// borrowed before the move keeps a second copy across the awaits (the
+    /// task read 1,072 bytes around a 488-byte request that way, 584 with
+    /// the request moved).
+    #[test]
+    fn a_plain_messages_task_holds_the_request_once() {
+        let gateway = test_gateway(true);
+        let meta = test_tenant_meta();
+        let task = gateway.route_messages(None, &meta, message_request(1), "m");
+        let task = size_of_val(&*task);
+        let request = size_of::<CreateMessageRequest>();
+        assert!(
+            task < 2 * request,
+            "the task is {task} bytes around a request of {request}"
+        );
+    }
+
     /// The name of the router that answered a Messages request for `m`.
     async fn messages_router(gateway: &Gateway, max_tokens: u32) -> String {
         let response = gateway
