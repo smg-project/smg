@@ -1098,7 +1098,9 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_worker_selection_total",
-        "Worker selection events by worker_type, connection_mode, model, policy"
+        "Worker selection events by worker_type, connection_mode, model and profile (the \
+         deciding policy or profile; the policy label carries the same value for one release \
+         while it is renamed to profile)"
     );
     describe_counter!(
         "smg_worker_errors_total",
@@ -2880,7 +2882,11 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record worker selection
+    /// Record a worker selection under the deciding policy's or profile's
+    /// name. The series carries that name under two labels for one release:
+    /// `profile`, the name of the policy controller's observability
+    /// contract, and `policy`, the label it renames, with the same value
+    /// until the next release drops it.
     pub fn record_worker_selection(
         worker_type: &'static str,
         connection_mode: &'static str,
@@ -2893,7 +2899,8 @@ impl Metrics {
                 "worker_type" => worker_type,
                 "connection_mode" => connection_mode,
                 "model" => model,
-                "policy" => policy
+                "policy" => policy,
+                "profile" => policy
             )
         };
         if !handles::keep_handles() {
