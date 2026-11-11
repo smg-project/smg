@@ -763,6 +763,7 @@ def source_name(repo: Repo, dependent: Component, dep: Component) -> str:
 COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
 USE_TREE = re.compile(r"\buse\s+(?:::)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*([^;]*?))?\s*;", re.S)
 NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+CONSTANT = re.compile(r"\s*(?:const|static)\b(?!\s+(?:fn|unsafe|async|extern)\b)")
 
 
 def use_leaves(tree: str, prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str | None]]:
@@ -818,17 +819,21 @@ def imported_names(text: str, ident: str) -> set[str] | None:
 def public_spans(text: str) -> list[str]:
     """The heads of a source's public items: from a bare ``pub`` (``pub(crate)`` and its kin are
     not public) or an ``impl`` to the ``{``, ``;``, ``,`` or ``}`` that ends the head outside
-    every bracket, across wrapped lines (``<<``, ``<=``, ``->``, ``=>`` and ``>=`` are operators,
-    not brackets). A ``pub enum`` or ``pub trait`` keeps its body, whose variants and methods are
-    public without the word; a trait ``impl`` keeps the ``type … = …;`` lines of its body."""
+    every bracket, across wrapped lines (``<=``, ``->``, ``=>`` and ``>=`` are operators, not
+    brackets, and ``<<`` is a shift when whitespace follows it, as rustfmt writes one, else two
+    brackets as in ``Vec<<T as Tr>::A>``). A ``const`` or ``static`` head ends at its ``=``: the
+    initializer is not API. A ``pub enum`` or ``pub trait`` keeps its body, whose variants and
+    methods are public without the word; a trait ``impl`` keeps the ``type … = …;`` lines of its
+    body."""
     spans: list[str] = []
     for match in re.finditer(r"\b(?:pub|impl)\b(?!\s*\()", text):
         start = i = match.end()
         depth = 0
+        constant = CONSTANT.match(text, start) is not None
         while i < len(text):
             char, before, after = text[i], text[i - 1 : i], text[i + 1 : i + 2]
             if char == "<":
-                if after in ("<", "="):
+                if after == "=" or (after == "<" and text[i + 2 : i + 3].isspace()):
                     i += 2
                     continue
                 depth += 1
@@ -841,7 +846,7 @@ def public_spans(text: str) -> list[str]:
                 depth += 1
             elif char in ")]":
                 depth = max(depth - 1, 0)
-            elif depth == 0 and char in "{;,}":
+            elif depth == 0 and (char in "{;,}" or (char == "=" and constant)):
                 break
             i += 1
         head = text[start:i]

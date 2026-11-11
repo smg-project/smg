@@ -361,7 +361,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "iota": "pub use kap;\n",
         "theta": "use kap::Ext as _;\n\npub fn f(e: &Event<'_>) -> u8 {\n    0\n}\n",
         "mu": "use kap::types::{self, Other};\n\npub fn f(x: types::Thing) -> u8 {\n    0\n}\n",
-        "pi": "use kap::Thing;\n\npub const SIZE: usize = 256 << 20;\n\nfn private(_thing: Thing) {}\n",
+        "pi": "use kap::Thing;\n\npub const SIZE: usize = kap::SIZE << 20;\n\nfn private(_thing: Thing) {}\n",
         "upsilon": (
             "use kap::Thing;\n\npub struct It;\n\nimpl Iterator for It {\n    type Item = Thing;\n\n"
             "    fn next(&mut self) -> Option<Thing> {\n        None\n    }\n}\n"
@@ -428,7 +428,14 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     assert [span.split()[0] for span in spans] == ["fn", "enum", "From<W>"]
     assert "Result<X, Y>" in spans[0] and "A(Z)" in spans[1]
     shift = "pub const SIZE: usize = 256 << 20;\nfn private(_t: Thing) {}\n"
-    assert mod.public_spans(shift) == [" const SIZE: usize = 256 << 20"]
+    assert mod.public_spans(shift) == [" const SIZE: usize "]
+    assert mod.public_spans("pub fn f(x: Vec<<T as Tr>::A>, y: kap::Thing) {}\n") == [
+        " fn f(x: Vec<<T as Tr>::A>, y: kap::Thing) "
+    ]
+    table = 'pub const TAGS: &[&str] = &["<a", "<b"];\nfn p(_t: Thing) {}\n'
+    assert mod.public_spans(table) == [" const TAGS: &[&str] "]
+    const_fn = "pub const fn f(x: kap::T) -> u8 {\n    1\n}\n"
+    assert mod.public_spans(const_fn) == [" const fn f(x: kap::T) -> u8 "]
     assert mod.public_spans("pub fn le(a: u8) -> bool {\n    a <= 2\n}\nfn p(_t: Thing) {}\n") == [
         " fn le(a: u8) -> bool "
     ]
