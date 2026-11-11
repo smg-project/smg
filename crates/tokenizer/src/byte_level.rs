@@ -128,6 +128,25 @@ fn span(start: usize, end: usize) -> (u32, u32) {
     (start as u32, end as u32)
 }
 
+/// The largest id of the vocabulary, added tokens included: the model's as
+/// the file's one-pass read saw it, against the added tokens' own; through
+/// the whole vocabulary (a clone of its map and every token) only where no
+/// read gave it, a model built in memory say.
+pub(crate) fn max_token_id(tokenizer: &HfTokenizer, model_max_id: Option<u32>) -> Option<u32> {
+    match model_max_id {
+        Some(model) => {
+            let added = tokenizer
+                .get_added_vocabulary()
+                .get_added_tokens_decoder()
+                .keys()
+                .copied()
+                .max();
+            Some(added.map_or(model, |added| added.max(model)))
+        }
+        None => tokenizer.get_vocab(true).values().copied().max(),
+    }
+}
+
 /// Builds a [`ByteLevelTable`] one id at a time, from 0 up.
 pub(crate) struct ByteLevelTableBuilder {
     spans: Vec<(u32, u32)>,
@@ -216,10 +235,19 @@ pub(crate) fn decoder_kind(decoder: Option<&DecoderWrapper>) -> String {
 impl ByteLevelTable {
     /// `None` unless the tokenizer decodes with a plain `ByteLevel` decoder.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
+        Self::build_with_max_id(tokenizer, None)
+    }
+
+    /// [`Self::build`] with the model's largest id as the file's read saw
+    /// it, when it did (see [`max_token_id`]).
+    pub(crate) fn build_with_max_id(
+        tokenizer: &HfTokenizer,
+        model_max_id: Option<u32>,
+    ) -> Option<Arc<Self>> {
         if !matches!(tokenizer.get_decoder(), Some(DecoderWrapper::ByteLevel(_))) {
             return None;
         }
-        let max_id = tokenizer.get_vocab(true).values().copied().max()?;
+        let max_id = max_token_id(tokenizer, model_max_id)?;
         let count = max_id as usize + 1;
         let added = tokenizer.get_added_vocabulary();
         let mut table = ByteLevelTableBuilder::with_capacity(count);
