@@ -679,8 +679,12 @@ impl Decider {
     }
 }
 
-/// How many retirements the commit remembers: a lease older than that many
-/// is past every dispatch deadline.
+/// How many retirements the commit remembers by handle. Past the cap the
+/// oldest entry leaves and its bound becomes the record's watermark: a lease
+/// decided before the oldest remembered retirement books nothing, whatever
+/// handle it names, since that handle may be one the record forgot. The
+/// dispatch itself still goes; only its accounting is skipped, and a lease
+/// that old is past every dispatch deadline.
 const RETIRED_KEPT: usize = 1024;
 
 /// The handles the membership retired (removed, or replaced at their URL),
@@ -688,28 +692,45 @@ const RETIRED_KEPT: usize = 1024;
 /// decided before that sequence books nothing on the handle, so the rows the
 /// retirement pruned do not come back through a late dispatch; a lease
 /// decided after it books as usual, as the id may be a new handle's (the
-/// allocator reuses addresses). The oldest entry leaves at the cap.
+/// allocator reuses addresses). The entries are kept in the order of their
+/// bounds; the oldest leaves at the cap, and its bound stays as the
+/// watermark every check reads first.
 #[derive(Debug, Default)]
 struct Retired {
     bound: HashMap<WorkerId, u64>,
     order: VecDeque<WorkerId>,
+    /// The bound of the newest entry the cap dropped: the order follows the
+    /// bounds, so a lease below it is older than every retirement the record
+    /// still names.
+    watermark: u64,
 }
 
 impl Retired {
     fn retire(&mut self, id: WorkerId, next_lease: u64) {
-        if self.bound.insert(id, next_lease).is_none() {
-            self.order.push_back(id);
-            if self.order.len() > RETIRED_KEPT {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.bound.remove(&oldest);
-                }
+        // A handle retired again (a successor at the same URL can carry the
+        // same id once the allocator reuses the address) moves to the back
+        // with its new bound, so the order stays the order of the bounds.
+        if self.bound.insert(id, next_lease).is_some() {
+            if let Some(at) = self.order.iter().position(|kept| *kept == id) {
+                self.order.remove(at);
+            }
+        }
+        self.order.push_back(id);
+        if self.order.len() > RETIRED_KEPT {
+            let dropped = self
+                .order
+                .pop_front()
+                .and_then(|oldest| self.bound.remove(&oldest));
+            if let Some(bound) = dropped {
+                self.watermark = self.watermark.max(bound);
             }
         }
     }
 
-    /// Whether `lease` was decided before `id`'s retirement.
+    /// Whether `lease` was decided before `id`'s retirement, or before the
+    /// oldest retirement the record still names.
     fn predates(&self, id: WorkerId, lease: LeaseId) -> bool {
-        self.bound.get(&id).is_some_and(|&bound| lease.0 < bound)
+        lease.0 < self.watermark || self.bound.get(&id).is_some_and(|&bound| lease.0 < bound)
     }
 }
 
@@ -1763,6 +1784,123 @@ mod tests {
                 "a lease decided after the retirement books as usual"
             );
         }
+    }
+    /// A commit under a lease older than the oldest retirement the record
+    /// still names books nothing either: the record forgets a handle past
+    /// its cap, and a lease that old may name one it forgot. The dispatch
+    /// itself still goes, and a lease decided after books as usual.
+    #[test]
+    fn a_commit_under_a_lease_older_than_the_oldest_remembered_retirement_books_nothing() {
+        let config = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = decider(&config);
+        let (workers, _reports) = fed_pair(&decider);
+        let request = HostRequest {
+            prompt_tokens: decider.prompt_tokens(None),
+            ..request()
+        };
+        let book = |position: u32| {
+            let (decision, lease) = decider.decide(&request, &workers, &[]);
+            decider
+                .commit(&lease, &decision, Side::Single, |t| t.position == position)
+                .expect("the wanted worker is booked");
+        };
+        let leader = || {
+            let (decision, _) = decider.decide(&request, &workers, &[]);
+            decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .iter()
+                .next()
+                .map(|t| t.position)
+        };
+        // Two leases decided while the found worker stands...
+        let stale = [
+            decider.decide(&request, &workers, &[]),
+            decider.decide(&request, &workers, &[]),
+        ];
+        // ...its retirement, then enough others' that its entry leaves the
+        // record (the handles stay alive, so no id is reused meanwhile)...
+        decider.on_worker_removed(workers[0].as_ref());
+        let churn = pool(RETIRED_KEPT);
+        for gone in &churn {
+            decider.on_worker_removed(gone.as_ref());
+        }
+        // ...and the stale commits after it: the dispatches go, nothing is booked.
+        for (decision, lease) in &stale {
+            decider
+                .commit(lease, decision, Side::Single, |t| t.position == 0)
+                .expect("the dispatch itself proceeds");
+        }
+        book(1);
+        assert_eq!(
+            leader(),
+            Some(0),
+            "the forgotten handle reads idle: the stale leases booked nothing"
+        );
+        // A lease decided after the churn books under the same id.
+        book(0);
+        book(0);
+        assert_eq!(
+            leader(),
+            Some(1),
+            "a lease decided after the oldest remembered retirement books as usual"
+        );
+    }
+    /// The record keeps the bound of the entry it drops at the cap as its
+    /// watermark: a lease below it predates whatever handle it names, a
+    /// lease at or above it is judged by the handle's own bound alone.
+    #[test]
+    fn the_retired_record_keeps_a_watermark_past_its_cap() {
+        let mut retired = Retired::default();
+        retired.retire(WorkerId(0), 5);
+        for id in 1..=u64::try_from(RETIRED_KEPT).expect("a small cap") {
+            retired.retire(WorkerId(id), 10);
+        }
+        assert!(
+            retired.predates(WorkerId(0), LeaseId(4)),
+            "below the watermark: older than every remembered retirement"
+        );
+        assert!(
+            !retired.predates(WorkerId(0), LeaseId(5)),
+            "at the watermark, the handle forgotten: books as a new handle's"
+        );
+        assert!(
+            retired.predates(WorkerId(1), LeaseId(9)),
+            "a remembered handle keeps its own bound"
+        );
+        assert!(!retired.predates(WorkerId(1), LeaseId(10)));
+    }
+    /// A handle retired again moves to the back of the order with its new
+    /// bound, so the entry the cap drops is always the oldest retirement
+    /// still named and the watermark never jumps past a remembered bound.
+    #[test]
+    fn a_handle_retired_again_moves_behind_the_entries_it_once_preceded() {
+        let mut retired = Retired::default();
+        retired.retire(WorkerId(0), 5);
+        retired.retire(WorkerId(1), 6);
+        retired.retire(WorkerId(0), 7);
+        // 1,023 more make 1,025: the cap drops one entry, the front, which
+        // is 1's since 0 moved behind it.
+        for id in 2..=u64::try_from(RETIRED_KEPT).expect("a small cap") {
+            retired.retire(WorkerId(id), 10);
+        }
+        // An id the record never saw is judged by the watermark alone.
+        let unknown = WorkerId(u64::MAX);
+        assert!(
+            !retired.predates(unknown, LeaseId(6)),
+            "the watermark is the dropped entry's bound of 6, not the re-retired handle's 7"
+        );
+        assert!(retired.predates(unknown, LeaseId(5)));
+        assert!(
+            retired.predates(WorkerId(0), LeaseId(6)),
+            "the re-retired handle is still named, under its new bound"
+        );
+        assert!(!retired.predates(WorkerId(0), LeaseId(7)));
     }
     /// A retirement that lands while a decision runs, after the view read
     /// the pool and before the engine decided, outdates that lease too: the
