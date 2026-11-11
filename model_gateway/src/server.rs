@@ -1128,6 +1128,35 @@ pub struct ServerConfig {
     pub secrets_auto_reload: bool,
 }
 
+impl ServerConfig {
+    /// A server with the listener `router_config` names and nothing else: no
+    /// log file, no discovery, no mesh, no metrics endpoint, no control-plane
+    /// authentication, no secret source, a five-second shutdown grace. A
+    /// library caller or a test starts from it and sets what it needs by a
+    /// struct update, so a field added here with its default breaks no
+    /// hand-built literal.
+    pub fn minimal(router_config: RouterConfig) -> Self {
+        Self {
+            router_config,
+            log_dir: None,
+            log_level: None,
+            log_json: false,
+            service_discovery_config: None,
+            mesh_discovery_config: None,
+            prometheus_config: None,
+            shutdown_grace_period_secs: 5,
+            shutdown_settle_secs: None,
+            control_plane_auth: None,
+            mesh_server_config: None,
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+            secret_sources: Default::default(),
+            secret_files: Default::default(),
+            secrets_auto_reload: false,
+        }
+    }
+}
+
 /// `Router::layer` for an application-wide layer a configuration may leave
 /// out.
 ///
@@ -4003,29 +4032,6 @@ mod tests {
         .expect("plain HTTP response test timed out");
     }
 
-    /// Build a test server config without discovery, mesh, or authentication;
-    /// the listener is the one `router_config` names.
-    fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
-        ServerConfig {
-            router_config,
-            log_dir: None,
-            log_level: None,
-            log_json: false,
-            service_discovery_config: None,
-            mesh_discovery_config: None,
-            prometheus_config: None,
-            shutdown_grace_period_secs: 5,
-            shutdown_settle_secs: None,
-            control_plane_auth: None,
-            mesh_server_config: None,
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-            secret_sources: Default::default(),
-            secret_files: Default::default(),
-            secrets_auto_reload: false,
-        }
-    }
-
     /// `startup` must reject an invalid config even when `RouterConfig` was
     /// built directly (struct literal or `Deserialize`), not via
     /// `RouterConfigBuilder::build()` — a Rust library caller can construct
@@ -4046,7 +4052,7 @@ mod tests {
 
         // The refusal named, not any error: a listener that failed to bind
         // would also be one.
-        let error = startup(minimal_server_config(router_config))
+        let error = startup(ServerConfig::minimal(router_config))
             .await
             .expect_err("startup must validate router_config even when constructed directly");
         assert!(
