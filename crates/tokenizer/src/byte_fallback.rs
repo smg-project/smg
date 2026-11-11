@@ -50,7 +50,7 @@ impl PieceTable {
     /// then `ByteFallback` and `Fuse`, then an optional `Strip(" ", 1, 0)`;
     /// any other chain keeps the `tokenizers` decode.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
-        Self::build_with_max_id(tokenizer, None)
+        Self::build_with_max_id(tokenizer, None, None)
     }
 
     /// [`Self::build`] with the model's largest id as the file's read saw
@@ -58,6 +58,7 @@ impl PieceTable {
     pub(crate) fn build_with_max_id(
         tokenizer: &HfTokenizer,
         model_max_id: Option<u32>,
+        listing: Option<&crate::word_cache::Listing>,
     ) -> Option<Arc<Self>> {
         let chain = serde_json::to_value(tokenizer.get_decoder()?).ok()?;
         let decoders = chain.get("decoders")?.as_array()?;
@@ -90,7 +91,7 @@ impl PieceTable {
         let mut text = Vec::with_capacity(ids * 4);
         let mut piece = Vec::with_capacity(ids);
         for id in 0..=max_id {
-            let kind = match tokenizer.id_to_token(id) {
+            let kind = match crate::word_cache::token_of(tokenizer, listing, id) {
                 None => Piece::Absent,
                 Some(token) => match byte_token(&token) {
                     Some(byte) => Piece::Byte(byte),

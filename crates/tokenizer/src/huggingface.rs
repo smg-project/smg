@@ -46,7 +46,7 @@ use crate::{
         Encoder, Encoding, IncrementalDecoder, PromptEncoding, SpecialTokens, TokenIdType,
         Tokenizer as TokenizerTrait,
     },
-    word_cache::{LateBoundModel, LoadingTokenizer, ModelView, TokenizerOf},
+    word_cache::{LateBoundModel, Listing, LoadingTokenizer, ModelView, TokenizerOf},
 };
 
 mod deepseek_v31;
@@ -316,9 +316,9 @@ impl DirectEncoders {
     /// Reads the vocabulary into the direct encoder's seed: an entry's ids
     /// from the path's own tables, the model asked only where the path has
     /// none (see `NativeEncoder::seed_vocabulary`).
-    fn seed_native(&mut self, model: &ModelWrapper) {
+    fn seed_native(&mut self, model: &ModelWrapper, listing: Option<&Listing>) {
         if let Some(native) = &mut self.native {
-            native.seed_vocabulary(model);
+            native.seed_vocabulary(model, listing);
         }
     }
 }
@@ -877,8 +877,12 @@ impl HuggingFaceTokenizer {
         // copy of the model (see `word_cache`).
         tokenizer.get_model().bound(encoders.bpe_words_cached());
         let model_max_id = tokenizer.get_model().read().and_then(|read| read.max_id);
+        let listing = tokenizer
+            .get_model()
+            .read()
+            .and_then(|read| read.tokens.clone());
         let tokenizer = HfTokenizer::from(tokenizer);
-        encoders.seed_native(tokenizer.get_model());
+        encoders.seed_native(tokenizer.get_model(), listing.as_deref());
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&tokenizer, has_byte_fallback);
         let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
@@ -902,9 +906,11 @@ impl HuggingFaceTokenizer {
             .and_then(deepseek_v31::Checkpoint::load);
         let tools_block =
             deepseek_v31.is_some() && deepseek_v31::Checkpoint::renders_tools_block(&chat_template);
-        let byte_level = ByteLevelTable::build_with_max_id(&tokenizer, model_max_id);
-        let pieces = PieceTable::build_with_max_id(&tokenizer, model_max_id);
-        let token_texts = TokenTextTable::build_with_max_id(&tokenizer, model_max_id);
+        let byte_level =
+            ByteLevelTable::build_with_max_id(&tokenizer, model_max_id, listing.as_deref());
+        let pieces = PieceTable::build_with_max_id(&tokenizer, model_max_id, listing.as_deref());
+        let token_texts =
+            TokenTextTable::build_with_max_id(&tokenizer, model_max_id, listing.as_deref());
         log_decode_path(
             &tokenizer,
             byte_level.is_some(),
@@ -1227,7 +1233,7 @@ impl HuggingFaceTokenizer {
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
         let mut encoders = DirectEncoders::choose(&tokenizer);
         Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
-        encoders.seed_native(tokenizer.get_model());
+        encoders.seed_native(tokenizer.get_model(), None);
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&tokenizer, has_byte_fallback);

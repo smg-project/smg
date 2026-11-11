@@ -1531,11 +1531,26 @@ fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
     let dense = model_with(&[("a", "b")], false);
     let late = read_of(&dense);
     assert!(late.read().is_some_and(|read| read.dense));
+    assert!(
+        late.read().is_some_and(|read| read.tokens.is_some()),
+        "a dense vocabulary is listed"
+    );
     assert_eq!(
-        sorted(entries_of(&dense, late.read()).collect()),
+        sorted(
+            entries_of(&dense, late.read())
+                .map(|(id, token)| (id, token.into_owned()))
+                .collect()
+        ),
         walk(&dense)
     );
-    assert_eq!(sorted(entries_of(&dense, None).collect()), walk(&dense));
+    assert_eq!(
+        sorted(
+            entries_of(&dense, None)
+                .map(|(id, token)| (id, token.into_owned()))
+                .collect()
+        ),
+        walk(&dense)
+    );
 
     let mut vocab = Vocab::default();
     vocab.insert("<unk>".to_owned(), 0);
@@ -1558,7 +1573,11 @@ fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
         Some((1 << 31) + 2)
     );
     assert_eq!(
-        sorted(entries_of(&sparse, late.read()).collect()),
+        sorted(
+            entries_of(&sparse, late.read())
+                .map(|(id, token)| (id, token.into_owned()))
+                .collect()
+        ),
         walk(&sparse)
     );
 
@@ -1577,7 +1596,46 @@ fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
         .expect("a BPE with two tokens on one id");
     assert_eq!(late.read().and_then(|read| read.max_id), Some(2));
     assert!(late.read().is_some_and(|read| !read.dense));
-    let entries = sorted(entries_of(&doubled, late.read()).collect());
+    let entries = sorted(
+        entries_of(&doubled, late.read())
+            .map(|(id, token)| (id, token.into_owned()))
+            .collect(),
+    );
     assert_eq!(entries.len(), 3, "both tokens of the shared id");
     assert_eq!(entries, walk(&doubled));
+    assert!(
+        late.read().is_some_and(|read| read.tokens.is_none()),
+        "two tokens on one id are walked, not listed"
+    );
+}
+
+/// The listing holds every token of a dense vocabulary under its id, in
+/// one buffer, and nothing past the end.
+#[test]
+fn the_listing_holds_every_token_under_its_id() {
+    use crate::word_cache::Listing;
+    let mut vocab = Vocab::default();
+    for (id, token) in ["a", "b", "ab", "\u{e9}", "a\u{e9}"]
+        .into_iter()
+        .enumerate()
+    {
+        vocab.insert(token.to_owned(), id as u32);
+    }
+    let listing = Listing::of(&vocab).expect("a dense vocabulary lists");
+    assert_eq!(listing.len(), 5);
+    for (token, &id) in &vocab {
+        assert_eq!(listing.get(id), Some(token.as_str()));
+    }
+    assert_eq!(listing.get(5), None, "past the end");
+    let mut sparse = Vocab::default();
+    sparse.insert("a".to_owned(), 0);
+    sparse.insert("b".to_owned(), 2);
+    assert!(Listing::of(&sparse).is_none(), "a gap: no listing");
+    let mut twice = Vocab::default();
+    twice.insert("a".to_owned(), 0);
+    twice.insert("b".to_owned(), 0);
+    assert!(
+        Listing::of(&twice).is_none(),
+        "two tokens on one id: no listing"
+    );
 }

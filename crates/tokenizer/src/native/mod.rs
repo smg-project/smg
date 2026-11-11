@@ -97,7 +97,7 @@ use short_pieces::{ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTE
 
 use crate::{
     encode_path::{Declined, Fallback},
-    word_cache::{ModelView, TokenizerOf},
+    word_cache::{Listing, ModelView, TokenizerOf},
 };
 
 /// The split the `ByteLevel` pre-tokenizer applies itself when `use_regex`
@@ -1310,9 +1310,10 @@ impl NativeEncoder {
     /// words a seed read through the model merges would otherwise fill that
     /// cache on every thread of the pool, and the crate never clears a
     /// thread's cache of a dropped model.
-    pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper) {
+    pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper, listing: Option<&Listing>) {
         (self.seed, self.seed_covers_short_entries, self.long_entries) = Self::vocabulary_seed(
             model,
+            listing,
             &self.alphabet,
             self.merges.as_ref(),
             self.chars.as_deref(),
@@ -1326,6 +1327,7 @@ impl NativeEncoder {
     /// the byte-level path's own table, when it has one.
     fn vocabulary_seed(
         model: &ModelWrapper,
+        listing: Option<&Listing>,
         alphabet: &[char; 256],
         merges: Option<&MergeTable>,
         chars: Option<&CharSymbols>,
@@ -1372,11 +1374,18 @@ impl NativeEncoder {
         // piece, the bytes of a long byte-level piece, or `None` inside for
         // an entry that is no byte-level piece.
         let read = |id: u32, scratch: &mut SeedScratch| -> Option<Option<Seeded>> {
-            let entry = bpe.id_to_token(id)?;
+            let owned;
+            let entry: &str = match listing {
+                Some(listing) => listing.get(id)?,
+                None => {
+                    owned = bpe.id_to_token(id)?;
+                    &owned
+                }
+            };
             let seeded = (|| {
                 if chars.is_some() {
-                    let key = CharSymbols::entry_key(&entry)?;
-                    return Some(Seeded::Short(key, ids_of(id, &entry, &[], scratch)?));
+                    let key = CharSymbols::entry_key(entry)?;
+                    return Some(Seeded::Short(key, ids_of(id, entry, &[], scratch)?));
                 }
                 let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
                 let mut len = 0;
@@ -1401,7 +1410,7 @@ impl NativeEncoder {
                 let key = ShortPieceKey::of(&piece[..len])?;
                 Some(Seeded::Short(
                     key,
-                    ids_of(id, &entry, &piece[..len], scratch)?,
+                    ids_of(id, entry, &piece[..len], scratch)?,
                 ))
             })();
             Some(seeded)
