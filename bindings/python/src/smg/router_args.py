@@ -315,7 +315,8 @@ class RouterArgs:
     # The admin listener (bind host and port) for the control-plane routes; None = the
     # control plane stays on the data listener
     admin_host: str | None = None
-    # Most client connections the admin listener holds open at once (0 = no bound)
+    # Most client connections the admin listener holds open at once (0 = no bound; needs
+    # admin_port; a probe on the admin port falls under it like any connection)
     admin_max_connections: int = 0
     admin_port: int | None = None
     api_key: str | None = None
@@ -2239,8 +2240,9 @@ class RouterArgs:
                 " a response: the client sees its connection end and should retry with"
                 " backoff; each is counted in smg_http_connections_rejected_total."
                 " Readiness is unaffected. Probes on the data port are subject to the"
-                " bound like any connection: point them at --health-check-port or"
-                " --admin-port, which it does not cover. 0 = no bound"
+                " bound like any connection: point them at --health-check-port, which no"
+                " bound covers. --admin-port is outside this bound and inside its own,"
+                " --admin-max-connections. 0 = no bound"
             ),
         )
         request_group.add_argument(
@@ -2254,7 +2256,9 @@ class RouterArgs:
                 " smg_http_connections_rejected_total. 0 = no bound. The bound is the admin"
                 " listener's own, so the control plane stays reachable while the data plane"
                 " is saturated, and a client that reaches the admin listener cannot hold it"
-                " open without limit"
+                " open without limit. Needs --admin-port. Probes on the admin port fall under"
+                " the bound like any connection: point them at --health-check-port, which no"
+                " bound covers"
             ),
         )
         request_group.add_argument(
