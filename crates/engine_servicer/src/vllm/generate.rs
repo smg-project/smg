@@ -277,7 +277,7 @@ async fn submit(
     if let Some(params) = ec_params.as_ref() {
         encoder_cache::check_consumer_handoff(&req, &state.model, params)?;
     }
-    let ec_producer_leg = ec_params.is_some() && encoder_cache::is_producer(&state.model);
+    let ec_producer_side = ec_params.is_some() && encoder_cache::is_producer(&state.model);
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
@@ -304,7 +304,7 @@ async fn submit(
     // An encoder's request with router-preprocessed batches gets its identity
     // from the batches themselves (the media stage saw no reference).
     let media_identity = media_identity.or_else(|| {
-        ec_producer_leg
+        ec_producer_side
             .then(|| encoder_cache::producer_identity(&req, &state.model))
             .flatten()
             .map(Arc::new)
@@ -404,7 +404,7 @@ async fn submit(
                 load,
                 VllmShape {
                     media_identity: media_identity.clone(),
-                    ec_producer_leg,
+                    ec_producer_side,
                 },
             ),
             decoder,
@@ -425,7 +425,7 @@ async fn submit(
 struct VllmShape {
     media_identity: Option<Arc<vllm::MediaIdentity>>,
     /// Whether this is the encoder side of an encoder-cache handoff.
-    ec_producer_leg: bool,
+    ec_producer_side: bool,
 }
 
 impl Shape for VllmShape {
@@ -452,7 +452,7 @@ impl Shape for VllmShape {
 
     fn completed(&self, state: &State, complete: &vllm::GenerateComplete) -> Result<(), Status> {
         match self.media_identity.as_deref() {
-            Some(identity) if self.ec_producer_leg => {
+            Some(identity) if self.ec_producer_side => {
                 encoder_cache::check_producer_handles(&state.model, identity, complete)
             }
             _ => Ok(()),
