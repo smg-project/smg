@@ -904,7 +904,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_connections_rejected_total",
-        "HTTP connections closed at accept for arriving beyond the connection limit (max_connections): nothing was read from or written to them"
+        "HTTP connections closed at accept for arriving beyond a listener's connection limit (max_connections on the data listener, admin_max_connections on the admin listener): nothing was read from or written to them"
     );
     describe_counter!(
         "smg_http_rate_limit_total",
