@@ -3,7 +3,10 @@
 
 For every component (a workspace crate or a Python package), since the given tag:
 whether its files changed, whether its version was bumped, and, for a crate, whether
-the workspace root's dependency entry agrees. A version is bumped when no release tag
+the workspace root's dependency entry agrees. A component's files include what the
+symlinks under its path point at: a package that ships another directory's files through
+a link (the proto package ships crates/grpc_client/proto that way) ships their changes
+too, so they move its version. A version is bumped when no release tag
 ``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
 code: the registries take a version once. Then the files that must mirror the gateway's
 version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
@@ -350,6 +353,26 @@ class Repo:
             position += size + 1
         return texts
 
+    def symlink_targets(self, path: str) -> list[str]:
+        """What the symlinks under ``path`` at HEAD point at, as repository paths. A link
+        into ``path`` itself, outside the repository or absolute is left out."""
+        entries = self.git("ls-tree", "-r", "-z", "HEAD", "--", path).split("\0")
+        inside = path.rstrip("/") + "/"
+        targets: list[str] = []
+        for entry in entries:
+            if not entry.startswith("120000 "):
+                continue
+            link = entry.split("\t", 1)[1]
+            pointee = (self.show("HEAD", link) or "").strip()
+            if not pointee or os.path.isabs(pointee):
+                continue
+            target = os.path.normpath(os.path.join(os.path.dirname(link), pointee))
+            if target.startswith("..") or target == path.rstrip("/") or target.startswith(inside):
+                continue
+            if target not in targets:
+                targets.append(target)
+        return targets
+
     def changed_since(self, tag: str, paths: Sequence[str]) -> list[str]:
         """``git diff --name-status`` lines since the tag, renames detected."""
         return self.git("diff", "--name-status", "-M", f"{tag}..HEAD", "--", *paths).splitlines()
@@ -404,13 +427,19 @@ def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
     return False
 
 
+def component_paths(repo: Repo, component: Component) -> list[str]:
+    """The paths whose changes are the component's: its directory (and the place a crate moved
+    under crates/ had before), then what the symlinks under it point at."""
+    return [f"{p}/" for p in with_legacy(component.path)] + repo.symlink_targets(component.path)
+
+
 def files_changed(repo: Repo, tag: str, component: Component) -> int:
-    """The component's files changed since the tag; pure renames and a version-only edit do not count."""
-    dirs = [f"{p}/" for p in with_legacy(component.path)]
+    """The component's files changed since the tag, the targets of its symlinks among them; pure
+    renames and a version-only edit do not count."""
     version_name = os.path.basename(component.version_file)
     count = sum(
         1
-        for line in repo.changed_since(tag, dirs)
+        for line in repo.changed_since(tag, component_paths(repo, component))
         if not line.startswith("R100") and not line.endswith(version_name)
     )
     if version_file_has_other_changes(repo, tag, component.version_file):
@@ -482,9 +511,7 @@ def check(
         return verdict
     verdict.unbumped = carrier is not None
     if verdict.unbumped:
-        verdict.level = bump_level(
-            repo.commits_since(tag, [f"{p}/" for p in with_legacy(component.path)])
-        )
+        verdict.level = bump_level(repo.commits_since(tag, component_paths(repo, component)))
     elif component.dep_key:
         pinned = workspace_dep_version(root_toml, component.dep_key)
         if pinned != verdict.version:

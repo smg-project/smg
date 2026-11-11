@@ -654,3 +654,70 @@ def test_a_component_whose_files_went_is_named_loudly(mod, repo):
     git(repo, "commit", "-q", "-m", "refactor: beta goes")
     with pytest.raises(mod.Fatal, match="crates/beta/Cargo.toml is gone: drop beta from the table"):
         run(mod, repo, tag="v1.0.0")
+
+
+# --- a component's symlinks -----------------------------------------------------
+
+
+def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
+    """A package that ships another directory's files through a link (the proto package ships
+    the .proto files that way) ships their changes: they count as the package's, with the
+    level of the commits that made them. A link into the package itself or out of the
+    repository adds nothing."""
+    import os
+
+    root = tmp_path / "linked"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    put(root, "Cargo.toml", root_manifest({}))
+    put(root, "model_gateway/Cargo.toml", manifest("smg", "1.0.0"))
+    put(root, "model_gateway/src/main.rs", "fn main() {}\n")
+    put(root, "pkg/pyproject.toml", '[project]\nname = "pkg"\nversion = "0.1.0"\n')
+    put(root, "pkg/pkg.py", "x = 1\n")
+    put(root, "shared/schema.proto", 'syntax = "proto3";\n')
+    put(root, "LICENSE", "license\n")
+    os.symlink("../shared", root / "pkg" / "schema")
+    os.symlink("pkg.py", root / "pkg" / "alias.py")
+    os.symlink("../../elsewhere", root / "pkg" / "outside")
+    os.symlink("/etc/hostname", root / "pkg" / "absolute")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore: initial")
+    git(root, "tag", "v1.0.0")
+    repo = mod.Repo(root)
+    assert repo.symlink_targets("pkg") == ["shared"]
+    assert repo.symlink_targets("pkg/") == ["shared"]
+    assert mod.component_paths(repo, mod.package("pkg", "pkg", "pkg/pyproject.toml")) == [
+        "pkg/",
+        "shared",
+    ]
+    assert repo.symlink_targets("model_gateway") == []
+
+    crates = (mod.crate("smg", "model_gateway"),)
+    packages = (mod.package("pkg", "pkg", "pkg/pyproject.toml"),)
+    stream = io.StringIO()
+    assert (
+        mod.run(
+            root,
+            "v1.0.0",
+            "check",
+            None,
+            mod.Out(stream),
+            crates=crates,
+            packages=packages,
+            mirrors=(),
+        )
+        == 0
+    )
+    assert "pkg" not in stream.getvalue(), "nothing changed since the tag"
+
+    put(root, "shared/schema.proto", 'syntax = "proto3";\nmessage M {}\n')
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "feat(shared): a message")
+    stream = io.StringIO()
+    code = mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    out = stream.getvalue()
+    assert code == 1
+    assert "  ! pkg (pkg/) — 1 file(s) changed but version not bumped (v0.1.0) [minor]" in out
+    assert "1 Python package(s) with changes, 0 unchanged" in out
