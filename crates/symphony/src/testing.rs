@@ -584,3 +584,46 @@ pub(crate) fn weather_declared() -> Declared {
         }}),
     )])
 }
+
+/// The events a test writes by hand: the tool-call events with the id and the
+/// empty source the adapters do not read, and the engine's finish with no
+/// reasoning tokens.
+pub(crate) mod events {
+    use crate::event::{Event, FinishReason, Text};
+
+    /// A call's start, `call_<index>` as its id.
+    pub(crate) fn call(index: u32, name: &str) -> Event<'static> {
+        Event::ToolCallStart {
+            index,
+            id: format!("call_{index}"),
+            name: name.into(),
+            source: Text::default(),
+        }
+    }
+
+    /// A fragment of a call's arguments.
+    pub(crate) fn arguments(index: u32, json: &str) -> Event<'static> {
+        Event::ToolCallArguments {
+            index,
+            json: json.to_owned().into(),
+            source: Text::default(),
+        }
+    }
+
+    /// A call's end.
+    pub(crate) fn end(index: u32) -> Event<'static> {
+        Event::ToolCallEnd {
+            index,
+            source: Text::default(),
+        }
+    }
+
+    /// The engine's finish with the calls counted and no reasoning tokens.
+    pub(crate) fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
+        Event::Finish {
+            reason,
+            tool_calls,
+            reasoning_tokens: 0,
+        }
+    }
+}
