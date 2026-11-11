@@ -667,9 +667,19 @@ impl RequestPipeline {
         let root_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref())
             .map(str::to_owned);
         Box::pin(cache_trace::scope(requested, async move {
-            let result = self.run_inner(ctx, metrics_endpoint, retry_config).await;
-            if let Err(response) = &result {
-                cache_trace::failure(root_id.as_deref(), response.status().as_u16());
+            let mut result = self.run_inner(ctx, metrics_endpoint, retry_config).await;
+            if let Err(response) = &mut result {
+                let status = response.status().as_u16();
+                cache_trace::failure(root_id.as_deref(), status);
+                // A refusal the request asked to see carries its decisions too:
+                // a shed's record is in the ring, and this header names its id.
+                if let Some(value) = cache_trace::refusal_header(root_id.as_deref(), status)
+                    .and_then(|header| http::HeaderValue::from_str(&header).ok())
+                {
+                    response
+                        .headers_mut()
+                        .insert(cache_trace::REQUEST_HEADER, value);
+                }
             }
             result
         }))

@@ -2358,6 +2358,63 @@ mod rerank_tests {
 }
 
 #[cfg(test)]
+mod policy_explain_tests {
+    use smg::config::PolicyEngineMode;
+
+    use super::*;
+    use crate::common::TestRouterConfig;
+
+    async fn explain(ctx: &AppTestContext, id: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/policy/explain/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.create_app().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Under the legacy policies no engine is hosted: there is no record to
+    /// explain, and the answer says which switch would host one.
+    #[tokio::test]
+    async fn under_the_legacy_policies_explain_has_no_engine() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let (status, body) = explain(&ctx, "1").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"]["code"], "policy_engine_not_hosted", "{body}");
+        ctx.shutdown().await;
+    }
+
+    /// Under the engine an id nothing traced is not found, and an id that is
+    /// not a number is refused.
+    #[tokio::test]
+    async fn under_the_engine_an_unknown_or_malformed_id_is_refused() {
+        let mut config = TestRouterConfig::round_robin(3947);
+        config.policy_engine = PolicyEngineMode::Engine;
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let (status, body) = explain(&ctx, "7").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"]["code"], "decision_not_found", "{body}");
+        let (status, body) = explain(&ctx, "seven").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_request", "{body}");
+        // A segment that is not valid UTF-8 is refused in the same envelope
+        // as a non-numeric id, not the framework's or another plane's.
+        let (status, body) = explain(&ctx, "%ff").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]["code"].is_string(),
+            "a malformed segment is refused in the route's own envelope: {body}"
+        );
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
 mod single_model_tests {
     use super::*;
 

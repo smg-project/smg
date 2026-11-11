@@ -79,6 +79,7 @@ use crate::{
         metrics::{self, PrometheusConfig},
         metrics_server, otel_trace, runtime_metrics,
     },
+    policies,
     routers::{
         common::{header_utils, realtime::ws::RealtimeQueryParams},
         error as route_error,
@@ -902,6 +903,15 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
     Json(state.context.inflight_tracker.snapshot()).into_response()
 }
 
+/// `GET /policy/explain/{id}`: the policy engine's record of the traced
+/// decision `id` (`policies::explain`).
+async fn policy_explain(
+    State(state): State<Arc<AppState>>,
+    ValidatedPath(id): ValidatedPath<String>,
+) -> Response {
+    policies::explain::respond(&state.context, &id)
+}
+
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
@@ -1506,6 +1516,9 @@ pub fn build_apps(
         .route("/heap_profile", post(dump_heap_profile))
         // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
+        // The policy engine's record of a traced decision, by the id the
+        // request's trace header names (`policies::explain`).
+        .route("/policy/explain/{id}", get(policy_explain))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
         .route("/wasm", post(add_wasm_module))
