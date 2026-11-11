@@ -2224,6 +2224,7 @@ impl Router {
                     .any_model_retry_override_enables_retries(),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
             tenant_rate_limited: self.rate_limit_manager.is_some(),
+            message_thread: header_utils::anthropic_beta_named(headers, "message-threads"),
         })
     }
 
@@ -2890,8 +2891,9 @@ mod tests {
         policies::as_cache_aware,
         routers::common::{
             body_policy::{
-                REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
-                REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
+                REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
+                REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                REASON_WASM_REQUEST_HOOK,
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
             test_support::fast_retry_config,
@@ -4063,6 +4065,28 @@ mod tests {
             headers.insert(CONTENT_LENGTH, len.parse().unwrap());
         }
         headers
+    }
+
+    /// A request that names the message-threads beta buffers: the thread
+    /// layer rebuilds the turn from its body before the route.
+    #[test]
+    fn a_message_thread_turn_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        let mut headers = headers_with_content_length(Some("64"));
+        headers.insert(
+            "anthropic-beta",
+            "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_MESSAGE_THREAD)
+        );
     }
 
     #[test]
