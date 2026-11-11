@@ -279,6 +279,9 @@ impl ZmqGenerateStream {
 pub(crate) struct StreamState {
     pub(crate) output_ids: Vec<u32>,
     pub(crate) completion_tokens: u32,
+    /// The prompt count the usage reports: the request's own where the
+    /// wire's module seeds it with the ids it sent, the engine's once an
+    /// output reports one.
     pub(crate) prompt_tokens: u32,
     pub(crate) cached_tokens: u32,
     /// Cumulative sampled-token logprobs across ticks. The proto contract is

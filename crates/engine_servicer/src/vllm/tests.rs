@@ -5237,7 +5237,7 @@ smg_servicer_metrics_scrape_seconds{model="served",wire="vllm"} <v>
 smg_servicer_metrics_scrapes_total{model="served",wire="vllm",code="200"} 0
 smg_servicer_metrics_scrapes_total{model="served",wire="vllm",code="500"} 0
 smg_servicer_prompt_tokens_cached_total{model="served",wire="vllm",rank="0"} 1
-smg_servicer_prompt_tokens_total{model="served",wire="vllm",rank="0"} 6
+smg_servicer_prompt_tokens_total{model="served",wire="vllm",rank="0"} 15
 smg_servicer_request_errors_total{model="served",wire="vllm",code="unavailable"} 1
 smg_servicer_request_generation_tokens_count{model="served",wire="vllm",rank="0"} 5
 smg_servicer_request_generation_tokens_sum{model="served",wire="vllm",rank="0"} 8
@@ -5296,7 +5296,9 @@ smg_servicer_media_requests_total{model="served",wire="vllm",outcome="unavailabl
 /// One streamed request (three chunks, the engine's stop), one non-streamed
 /// (the budget), one the caller aborts, one duplicate id refused, one a
 /// shutdown cuts: the scrape's families, types, label sets and values are
-/// exactly these.
+/// exactly these. Every request that produced an output counts a prompt:
+/// the engine's figure where its output reported one, the request's own
+/// three ids otherwise.
 #[tokio::test]
 async fn the_scrape_pins_the_families_after_a_scripted_sequence() {
     let mut h = metrics_harness(model_info(), None).await;

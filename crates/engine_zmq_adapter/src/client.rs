@@ -863,10 +863,11 @@ impl ZmqEngineClient {
             let top_logprobs = ranked_candidate_count(sampling.and_then(|sp| sp.logprobs));
             let prompt_top_logprobs =
                 ranked_candidate_count(sampling.and_then(|sp| sp.prompt_logprobs));
-            let first_prompt_token = request
-                .prompt_token_ids
-                .as_ref()
-                .and_then(|ids| ids.first().copied());
+            let prompt_token_ids = request.prompt_token_ids.as_deref().unwrap_or_default();
+            let first_prompt_token = prompt_token_ids.first().copied();
+            // The usage's prompt count until the engine's prefill stats
+            // report their own.
+            let prompt_tokens = u32::try_from(prompt_token_ids.len()).unwrap_or(u32::MAX);
             // Sub-streams submitted before a mid-loop failure are dropped with
             // the error, which auto-aborts their engine-side requests.
             let stream = client
@@ -879,6 +880,7 @@ impl ZmqEngineClient {
                 top_logprobs,
                 prompt_top_logprobs,
                 first_prompt_token,
+                prompt_tokens,
             ));
         }
         Ok(streams)
