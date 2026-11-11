@@ -45,6 +45,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `json_schema` response format keeps its `description` when the request is written back for an
+  upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
+  reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
+  `text.format` description into the Chat request it builds, but a gRPC engine still gets only the
+  format's schema, as before. Breaking: `JsonSchemaFormat` gains `description: Option<String>`.
 - A usage object whose `prompt_tokens_details` leaves out `cached_tokens` parses, with no tokens
   cached, as the public API defaults the key. The crate refused the whole usage, and the
   completion around it, with ``missing field `cached_tokens` ``. The newer counters an upstream
