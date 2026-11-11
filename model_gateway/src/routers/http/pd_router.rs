@@ -4055,6 +4055,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn count_tokens_wire_reads_the_text_before_the_canonical_model_goes_on_the_wire() {
+        let body: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "alias",
+            "messages": [{"role": "user", "content": "count me"}],
+        }))
+        .unwrap();
+        let expected_text = body.extract_text_for_routing();
+
+        let (text, wire) = PDRouter::count_tokens_wire(body.clone(), Some("canonical"), true);
+        assert_eq!(text.as_deref(), Some(expected_text.as_str()));
+        let forwarded: Value = serde_json::from_slice(&wire.unwrap()).unwrap();
+        assert_eq!(forwarded["model"], "canonical");
+
+        let (text, wire) = PDRouter::count_tokens_wire(body, None, false);
+        assert!(
+            text.is_none(),
+            "no policy reads the text, so none is extracted"
+        );
+        let forwarded: Value = serde_json::from_slice(&wire.unwrap()).unwrap();
+        assert_eq!(
+            forwarded["model"], "alias",
+            "without a canonical model the request's own goes on the wire"
+        );
+    }
+
     #[tokio::test]
     async fn messages_count_tokens_uses_one_prefill_worker_and_no_bootstrap() {
         let (prefill_url, prefill_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
