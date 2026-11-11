@@ -103,6 +103,31 @@ pub(crate) mod test_support {
         false
     }
 
+    /// Whether the TurboJPEG library loads and reads a call's warning
+    /// (`tjGetErrorCode`, TurboJPEG 2.0 and later), for a test of a frame
+    /// kept after a warning: a 1.x library decodes the same files and keeps
+    /// none, so where the reading is missing, a failure where
+    /// [`REQUIRE_TURBOJPEG`] is set, else a skip said on stderr.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skip says so; the harness shows it under --nocapture"
+    )]
+    pub(crate) fn warned_decode_or_skip(test: &str) -> bool {
+        if !turbojpeg_or_skip(test) {
+            return false;
+        }
+        if crate::jpeg_turbo::turbojpeg_reads_warnings() {
+            return true;
+        }
+        let required = std::env::var_os(REQUIRE_TURBOJPEG).is_some_and(|value| !value.is_empty());
+        assert!(
+            !required,
+            "libturbojpeg reads no warning (TurboJPEG 1.x), and {REQUIRE_TURBOJPEG} is set: {test}"
+        );
+        eprintln!("libturbojpeg reads no warning: skipping {test}");
+        false
+    }
+
     /// Reports that `missing` keeps a test or a case from running: a failure
     /// where [`REQUIRE_VIDEO_TOOLS`] is set, a skip said on stderr elsewhere.
     #[expect(

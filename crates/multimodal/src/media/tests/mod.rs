@@ -1,3 +1,4 @@
+mod cut_jpeg;
 mod decode_limit;
 mod exif_orientation;
 mod hop_budget;
