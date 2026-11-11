@@ -51,6 +51,11 @@ pub enum ChatMessage {
     /// reference and the deprecated function call are carried as the client
     /// sent them, for an upstream that reads them; the gRPC chat template
     /// never sees them, as the engines' own chat utils leave them out.
+    ///
+    /// The variant is the largest of the enum, so its room is every turn's:
+    /// the deprecated function call and the provider extension ride behind a
+    /// pointer each, which keeps a turn under 192 bytes (a history of four
+    /// turns in the allocator's 768-byte class, of eight in the 1,536 one).
     #[serde(rename = "assistant")]
     Assistant {
         content: Option<MessageContent>,
@@ -58,7 +63,7 @@ pub enum ChatMessage {
         name: Option<String>,
         audio: Option<ChatAssistantAudio>,
         tool_calls: Option<Vec<ToolCall>>,
-        function_call: Option<FunctionCallResponse>,
+        function_call: Option<Box<FunctionCallResponse>>,
         /// Reasoning content for O1-style models (an engine extension), read
         /// from `reasoning_content` or `reasoning`; see [`AssistantReasoning`].
         #[serde(flatten)]
@@ -1342,7 +1347,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessageDelta,
+        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, ChatMessageDelta,
         ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
         ThinkingParam, ThinkingType,
     };
@@ -1981,6 +1986,35 @@ mod tests {
             {"role": "assistant", "content": null, "tool_calls": [call("c3")]}
         ]);
         assert_eq!(request(history).history_tool_calls_count(), 3);
+    }
+
+    /// The deprecated function call and the provider extension of an
+    /// assistant turn ride behind a pointer each. The variant is the enum's
+    /// largest, so its room is every chat message's: 176 bytes on 64-bit
+    /// targets before the refusal, the audio reference and the function call
+    /// were kept, 272 with the two inline, and the history of four turns the
+    /// reader grows a vector to had left the allocator's 768-byte class for
+    /// the 1,280 one (eight turns the 1,536 for the 2,560) on every chat
+    /// request. Under 192 bytes a turn, both histories are back in their
+    /// class. A field that grows the turn past it needs its own read.
+    #[test]
+    fn an_assistant_turns_function_call_and_provider_extension_ride_behind_a_pointer_each() {
+        let message: ChatMessage =
+            serde_json::from_value(json!({"role": "assistant", "content": "Hello."}))
+                .expect("a plain assistant turn");
+        let ChatMessage::Assistant {
+            function_call, ext, ..
+        } = &message
+        else {
+            panic!("not an assistant turn");
+        };
+        assert_eq!(size_of_val(function_call), size_of::<usize>());
+        assert_eq!(size_of_val(&ext.tools), size_of::<usize>());
+        assert!(
+            size_of::<ChatMessage>() <= 192,
+            "a chat message is {} bytes",
+            size_of::<ChatMessage>()
+        );
     }
 }
 
