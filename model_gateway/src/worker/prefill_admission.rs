@@ -215,8 +215,13 @@ where
 }
 
 /// How many times a newcomer with nobody waiting decides and commits
-/// before it queues: the proposal and one re-decision after a commit miss.
-const NEWCOMER_ATTEMPTS: usize = 2;
+/// before it queues: the proposal and two re-decisions after commit misses.
+/// Deciders that read one load picture converge on one worker, so a miss is
+/// followed by another more often than chance, and a newcomer that queues
+/// makes every later arrival queue behind it. Under the decider bench's
+/// worst arrival shape (eight thread-hogging loops over a binding window)
+/// two attempts queued in 26 of 36 runs and three in 0 of 12.
+const NEWCOMER_ATTEMPTS: usize = 3;
 
 /// The per-worker capacity window as a decision reads it outside the
 /// admission lock: an atomic read of the worker's load against the limit.
@@ -527,7 +532,7 @@ impl PrefillAdmission {
     /// The invariant stays "only the queue head, or a newcomer with nobody
     /// waiting, selects": that request reads the capacity window with no lock
     /// held, decides, then takes the lock to re-validate and reserve. A
-    /// newcomer whose proposal the commit refuses decides once more (its
+    /// newcomer whose proposal the commit refuses decides up to twice more (its
     /// closures know the miss) and then joins the queue; a newcomer that
     /// finds others waiting asks `available` once (the caller's cheap check,
     /// as [`Self::admit`] hides capacity from a request that may not select)
@@ -563,8 +568,8 @@ impl PrefillAdmission {
         if newcomer_allowed {
             // A newcomer's proposal can lose its slot to another newcomer
             // that committed first, the one commit miss of this path; it
-            // decides once more before it queues, so two requests that read
-            // the same window do not turn one free slot into a queue.
+            // decides up to twice more before it queues, so requests that
+            // read the same window do not turn one free slot into a queue.
             for _ in 0..NEWCOMER_ATTEMPTS {
                 match decide(&window) {
                     PrefillProposal::Unavailable => {
@@ -1496,15 +1501,15 @@ mod tests {
         let first = admission.admit(None, select_worker(&worker)).await.unwrap();
 
         // The decision proposes the full worker (a stale read would); the
-        // commit's re-validation refuses it twice (the proposal and its one
-        // re-decision), and the request waits as the head instead of taking
-        // a second slot; nothing was released since its read, so the entry
-        // owes no first pass.
+        // commit's re-validation refuses it three times (the proposal and
+        // its two re-decisions), and the request waits as the head instead
+        // of taking a second slot; nothing was released since its read, so
+        // the entry owes no first pass.
         let decisions = Arc::new(AtomicUsize::new(0));
         let waiter = decided_attempt(&admission, &worker, &decisions);
         wait_for_queued(&admission, 1).await;
         assert_eq!(worker.load(), 1);
-        assert_eq!(decisions.load(Ordering::Relaxed), 2);
+        assert_eq!(decisions.load(Ordering::Relaxed), 3);
 
         drop(first);
         let admitted = waiter.await.unwrap().unwrap();
@@ -1528,9 +1533,10 @@ mod tests {
         wait_for_queued(&admission, 2).await;
 
         // The second request found a waiter, so it checked availability and
-        // never decided; the head decided twice on arrival (the proposal and
-        // its re-decision) and decides again only when it is woken.
-        assert_eq!(head_decisions.load(Ordering::Relaxed), 2);
+        // never decided; the head decided three times on arrival (the
+        // proposal and its two re-decisions) and decides again only when it
+        // is woken.
+        assert_eq!(head_decisions.load(Ordering::Relaxed), 3);
         assert_eq!(second_decisions.load(Ordering::Relaxed), 0);
         assert_eq!(worker.load(), 1);
 
@@ -1736,12 +1742,13 @@ mod tests {
         let worker = worker("http://prefill-decided-head-refused");
         let first = admission.admit(None, select_worker(&worker)).await.unwrap();
 
-        // The head's decisions in order: at arrival two proposals the full
-        // worker's commit refuses (the second is the newcomer's re-decision);
-        // at the release's wake a decision that reads no capacity; at the
-        // next wake a proposal the commit refuses (the slot went elsewhere);
-        // at the next a proposal that commits. Through all of them the head
-        // keeps its place and the waiter behind it never decides.
+        // The head's decisions in order: at arrival three proposals the full
+        // worker's commit refuses (the second and third are the newcomer's
+        // re-decisions); at the release's wake a decision that reads no
+        // capacity; at the next wake a proposal the commit refuses (the slot
+        // went elsewhere); at the next a proposal that commits. Through all
+        // of them the head keeps its place and the waiter behind it never
+        // decides.
         let decisions = Arc::new(AtomicUsize::new(0));
         #[expect(
             clippy::disallowed_methods,
@@ -1758,14 +1765,14 @@ mod tests {
                         || true,
                         |_window| {
                             let decision = decisions.fetch_add(1, Ordering::Relaxed);
-                            if decision == 2 {
+                            if decision == 3 {
                                 PrefillProposal::AtCapacity
                             } else {
                                 PrefillProposal::Proposed(decision)
                             }
                         },
                         |capacity, decision| {
-                            if decision == 3 {
+                            if decision == 4 {
                                 PrefillAdmissionAttempt::AtCapacity
                             } else {
                                 capacity.select(Arc::clone(&worker), decision)
@@ -1781,12 +1788,12 @@ mod tests {
         wait_for_queued(&admission, 2).await;
         assert_eq!(
             decisions.load(Ordering::Relaxed),
-            2,
-            "the arrival's two decisions"
+            3,
+            "the arrival's three decisions"
         );
 
         drop(first);
-        wait_for_count(&decisions, 3).await;
+        wait_for_count(&decisions, 4).await;
         assert_eq!(
             admission.queued_requests(),
             2,
@@ -1795,7 +1802,7 @@ mod tests {
         assert_eq!(worker.load(), 0);
 
         admission.notify_capacity_changed();
-        wait_for_count(&decisions, 4).await;
+        wait_for_count(&decisions, 5).await;
         assert_eq!(
             admission.queued_requests(),
             2,
@@ -1806,7 +1813,7 @@ mod tests {
 
         admission.notify_capacity_changed();
         let admitted = head.await.unwrap().unwrap();
-        assert_eq!(admitted.selected, 4, "the fifth decision committed");
+        assert_eq!(admitted.selected, 5, "the sixth decision committed");
         assert_eq!(worker.load(), 1);
         assert_eq!(admission.queued_requests(), 1);
         drop(admitted);
@@ -1915,13 +1922,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_decided_newcomer_with_no_queue_is_refused_after_its_two_decisions() {
+    async fn a_decided_newcomer_with_no_queue_is_refused_after_its_three_decisions() {
         let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
         let worker = worker("http://prefill-decided-no-queue");
         let first = admission.admit(None, select_worker(&worker)).await.unwrap();
 
-        // Nobody waits, so the newcomer decides; the full worker refuses
-        // both commits, and with no queue to join it is refused.
+        // Nobody waits, so the newcomer decides; the full worker refuses all
+        // three commits, and with no queue to join it is refused. The count
+        // is pinned as a number: three is the retry rule's value.
         let decisions = AtomicUsize::new(0);
         let commits = AtomicUsize::new(0);
         let result = admission
@@ -1939,8 +1947,8 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(PrefillAdmissionRejection::QueueFull)));
-        assert_eq!(decisions.load(Ordering::Relaxed), NEWCOMER_ATTEMPTS);
-        assert_eq!(commits.load(Ordering::Relaxed), NEWCOMER_ATTEMPTS);
+        assert_eq!(decisions.load(Ordering::Relaxed), 3);
+        assert_eq!(commits.load(Ordering::Relaxed), 3);
         assert_eq!(admission.queued_requests(), 0);
         drop(first);
     }

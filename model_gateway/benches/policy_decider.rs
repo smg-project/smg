@@ -14,9 +14,14 @@
 //! the lock hold alone) and `window` (a binding window: queueing and
 //! commit misses). The pair and decode-room sections arrive with the pair seam.
 //! Fleets from `PD_FLEETS` (default 8,64,512), `PD_TASKS` tasks (64) on eight
-//! runtime threads, `PD_PER_TASK` admissions each (2000). Output: TSV rows on
-//! stdout: `section  shape  policy  workers  p50_ns  p99_ns  per_s  misses
-//! rejects`.
+//! runtime threads, `PD_PER_TASK` admissions each (2000). The tasks start from
+//! one barrier and each yields after every admission, the shape of a request
+//! handler between awaits. `PD_PACE=hog` keeps a task on its thread between
+//! admissions instead: eight thread-hogging loops, a stress arm named `+hog`
+//! in the section column and never a gate (under it the decided window cell
+//! is bimodal by run, a queue that forms in the first wave and never drains).
+//! Output: TSV rows on stdout: `section  shape  policy  workers  p50_ns
+//! p99_ns  per_s  misses  rejects`.
 #![expect(
     clippy::unwrap_used,
     clippy::print_stdout,
@@ -48,6 +53,7 @@ use smg::{
     },
 };
 use smg_policy_controller::{Decision, Lease, Phase, Side, Target, WorkerId};
+use tokio::{sync::Barrier, task::yield_now};
 
 fn env_list(name: &str, default: &str) -> Vec<String> {
     std::env::var(name)
@@ -131,9 +137,14 @@ fn summarize(mut lat: Vec<u64>, total: Duration) -> Row {
     }
 }
 
+fn hog_pace() -> bool {
+    std::env::var("PD_PACE").is_ok_and(|v| v == "hog")
+}
+
 fn print_row(section: &str, shape: &str, policy: &str, workers: usize, row: &Row, c: &Counters) {
+    let pace = if hog_pace() { "+hog" } else { "" };
     println!(
-        "{section}\t{shape}\t{policy}\t{workers}\t{}\t{}\t{:.0}\t{}\t{}",
+        "{section}{pace}\t{shape}\t{policy}\t{workers}\t{}\t{}\t{:.0}\t{}\t{}",
         row.p50,
         row.p99,
         row.per_s,
@@ -159,17 +170,29 @@ where
         .build()
         .unwrap();
     let op = Arc::new(op);
+    // One barrier start, then a yield after every admission: a task that
+    // never yields holds its runtime thread, so the tasks run eight at a
+    // time and a queued one hands its thread to a new arrival that must
+    // queue behind it. That is the stress shape (`PD_PACE=hog`), kept by
+    // name and never a gate.
+    let hog = hog_pace();
+    let barrier = Arc::new(Barrier::new(tasks));
     runtime.block_on(async {
         let start = Instant::now();
         let handles: Vec<_> = (0..tasks)
             .map(|t| {
                 let op = Arc::clone(&op);
+                let barrier = Arc::clone(&barrier);
                 tokio::spawn(async move {
+                    barrier.wait().await;
                     let mut lat = Vec::with_capacity(per_task);
                     for k in 0..per_task {
                         let t0 = Instant::now();
                         op(t * per_task + k).await;
                         lat.push(t0.elapsed().as_nanos() as u64);
+                        if !hog {
+                            yield_now().await;
+                        }
                     }
                     lat
                 })
