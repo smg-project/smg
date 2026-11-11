@@ -105,6 +105,11 @@ fn class_capacity(len: usize) -> Option<usize> {
         .then(|| len.next_power_of_two())
 }
 
+/// The capacity a buffer of `len` bytes will retain.
+pub fn allocation_capacity(len: usize) -> usize {
+    class_capacity(len).unwrap_or(len)
+}
+
 /// The class of a buffer, by its capacity: `None` unless the capacity is a
 /// class's.
 fn class_index(capacity: usize) -> Option<usize> {

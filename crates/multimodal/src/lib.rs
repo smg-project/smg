@@ -21,6 +21,7 @@ pub mod types;
 mod video_seek;
 pub mod vision;
 pub mod webp_native;
+mod wire_bytes;
 
 pub use audio::AudioPreProcessor;
 pub use encoder_inputs::{
@@ -55,6 +56,7 @@ pub use vision::{
     DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig, VideoClipOptions,
     VisionPreProcessor, VisionPreprocessingContext,
 };
+pub use wire_bytes::WireBytes;
 
 /// Support for this crate's unit tests.
 #[cfg(test)]

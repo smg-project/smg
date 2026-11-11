@@ -518,6 +518,7 @@ fn returned(inputs: PreprocessedEncoderInputs) {
             buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
         }
         EncoderInput::Wire { bytes, .. } => buffer_pool::recycle(bytes),
+        EncoderInput::SharedWire { bytes, .. } => bytes.recycle(),
         EncoderInput::F32(_) => {}
     }
 }

@@ -2623,7 +2623,7 @@ mod tests {
                 extra_batches: Vec::new(),
                 modality: "video".to_string(),
                 image_data: Vec::new(),
-                pixel_values: vec![0; 8],
+                pixel_values: vec![0; 8].into(),
                 pixel_values_shape: vec![2],
                 pixel_values_dtype: "float32".to_string(),
                 model_specific_tensors: HashMap::from([(
@@ -2639,7 +2639,7 @@ mod tests {
             }],
             modality: "image".to_string(),
             image_data: vec![vec![0; 2]],
-            pixel_values: vec![0; 16],
+            pixel_values: vec![0; 16].into(),
             pixel_values_shape: vec![4, 4],
             pixel_values_dtype: "float32".to_string(),
             model_specific_tensors: HashMap::from([(
@@ -2915,7 +2915,7 @@ mod tests {
     fn vllm_mm_data(modality: common::Modality) -> VllmMultimodalData {
         let is_video = modality == common::Modality::Video;
         VllmMultimodalData {
-            pixel_values: vec![0u8; 16],
+            pixel_values: vec![0u8; 16].into(),
             pixel_values_shape: vec![1, 4],
             pixel_values_dtype: "float32".to_string(),
             model_specific_tensors: HashMap::new(),
