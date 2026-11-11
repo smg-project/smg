@@ -45,7 +45,8 @@ use crate::{
         next_batch, servicer_config, Bounded,
     },
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncodeRelease, EncoderDispatchErrorReq, ServicerError, SglangEncodeDispatcher,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, ServicerError,
+    SglangEncodeDispatcher,
 };
 
 fn model_info() -> SglangModelInfo {
@@ -1699,8 +1700,9 @@ const IMAGE_REFERENCE: &str = "data:image/png;base64,iVBORw0KGgo=";
 
 /// How a scripted dispatcher answers every call.
 enum DispatchAnswer {
-    /// Two encoders registered, the one image assigned to the first: the
-    /// engine's frontend with encoders behind it.
+    /// Two encoders registered, every item assigned to the first, keyed by
+    /// the engine's modality value (image 1, video 2, audio 3): the engine's
+    /// frontend with encoders behind it.
     Encoders,
     /// No encoder registered: the frontend leaves the request alone.
     NoEncoder,
@@ -1709,25 +1711,32 @@ enum DispatchAnswer {
 }
 
 /// The lifecycle owner's dispatcher, scripted: records every call and the
-/// sink it was handed, counts its releases.
+/// sink it was handed, counts its releases; over the HTTP transport unless
+/// built [`Self::on`] another.
 struct ScriptedDispatcher {
     answer: DispatchAnswer,
-    calls: Mutex<Vec<(String, Vec<String>)>>,
+    transport: EncodeTransport,
+    calls: Mutex<Vec<(String, EncodeMediaRefs)>>,
     sinks: Mutex<Vec<EncodeDispatchErrorSink>>,
     released: Arc<AtomicUsize>,
 }
 
 impl ScriptedDispatcher {
     fn new(answer: DispatchAnswer) -> Arc<Self> {
+        Self::on(answer, EncodeTransport::Http)
+    }
+
+    fn on(answer: DispatchAnswer, transport: EncodeTransport) -> Arc<Self> {
         Arc::new(Self {
             answer,
+            transport,
             calls: Mutex::default(),
             sinks: Mutex::default(),
             released: Arc::default(),
         })
     }
 
-    fn calls(&self) -> Vec<(String, Vec<String>)> {
+    fn calls(&self) -> Vec<(String, EncodeMediaRefs)> {
         self.calls.lock().unwrap().clone()
     }
 
@@ -1756,14 +1765,29 @@ impl ScriptedDispatcher {
 }
 
 impl SglangEncodeDispatcher for ScriptedDispatcher {
+    fn transport(&self) -> EncodeTransport {
+        self.transport
+    }
+
     fn dispatch(
         &self,
         request: EncodeDispatchRequest,
     ) -> EncodeFuture<Result<EncodeDispatchOutcome, String>> {
+        // The engine's own assignment shape: every named modality, keyed by
+        // the engine's enum value, its items on the first of two encoders.
+        let assigned: BTreeMap<u32, Vec<u32>> = [
+            (1, &request.media.image_urls),
+            (2, &request.media.video_urls),
+            (3, &request.media.audio_urls),
+        ]
+        .into_iter()
+        .filter(|(_, urls)| !urls.is_empty())
+        .map(|(modality, urls)| (modality, vec![u32::try_from(urls.len()).unwrap(), 0]))
+        .collect();
         self.calls
             .lock()
             .unwrap()
-            .push((request.rid, request.image_urls));
+            .push((request.rid, request.media));
         self.sinks.lock().unwrap().push(request.on_error);
         let released = Arc::clone(&self.released);
         // Built only where the dispatch answers: the guard runs on drop, and a
@@ -1782,7 +1806,7 @@ impl SglangEncodeDispatcher for ScriptedDispatcher {
             DispatchAnswer::Failure(message) => Err((*message).to_string()),
             DispatchAnswer::Encoders => Ok(EncodeDispatchOutcome {
                 need_wait_for_mm_inputs: true,
-                num_items_assigned: Some(BTreeMap::from([(1, vec![1, 0])])),
+                num_items_assigned: Some(assigned),
                 encoder_urls: Some(ENCODERS.iter().map(ToString::to_string).collect()),
                 sent: Some(sent()),
             }),
@@ -1820,6 +1844,145 @@ fn media_reference_request(id: &str, n: u32) -> sg::GenerateRequest {
         ..Default::default()
     }));
     request
+}
+
+const VIDEO_REFERENCE: &str = "https://example.test/clip.mp4";
+const AUDIO_REFERENCE: &str = "https://example.test/voice.wav";
+const EVERY_MODALITY_PROMPT: &str = "<|vision_start|><|image_pad|><|vision_end|>\
+<|vision_start|><|video_pad|><|vision_end|><|audio_start|><|audio_pad|><|audio_end|>Describe all three.";
+
+/// The image reference as the dispatcher sees it: one list of one.
+fn image_reference_media() -> EncodeMediaRefs {
+    EncodeMediaRefs {
+        image_urls: vec![IMAGE_REFERENCE.to_string()],
+        ..Default::default()
+    }
+}
+
+/// A request naming one image, one video and one audio by reference beside
+/// its unexpanded prompt, one choice.
+fn every_modality_reference_request(id: &str) -> sg::GenerateRequest {
+    let mut request = generate_request(id, false, Vec::new());
+    request.tokenized = Some(sg::TokenizedInput {
+        original_text: EVERY_MODALITY_PROMPT.to_string(),
+        input_ids: vec![1, 7, 8, 9, 2],
+    });
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        modalities: ["image", "video", "audio"].map(str::to_string).to_vec(),
+        image_urls: vec![IMAGE_REFERENCE.to_string()],
+        video_urls: vec![VIDEO_REFERENCE.to_string()],
+        audio_urls: vec![AUDIO_REFERENCE.to_string()],
+        ..Default::default()
+    }));
+    request
+}
+
+/// Video and audio references are the encoders' input as images are: over
+/// the HTTP transport the dispatch carries every modality in its own list and
+/// the scheduler's request carries the per-modality assignment the dispatch
+/// set (keyed by the engine's modality value) beside the unexpanded prompt.
+/// On the gRPC transport, which takes images only, such a request is refused
+/// by name before the dispatch (no call, the scheduler idle, the id free
+/// again) while an image-only request still dispatches.
+#[tokio::test]
+async fn video_and_audio_references_reach_the_encoders_over_http_and_are_refused_over_grpc() {
+    let dispatcher = ScriptedDispatcher::new(DispatchAnswer::Encoders);
+    let mut h = harness_with(vision_model(1), dispatcher.configure(1)).await;
+    let mut stream = h
+        .client
+        .generate(every_modality_reference_request("trio"))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(add.rid, "trio");
+    assert_eq!(add.need_wait_for_mm_inputs, Some(true));
+    assert_eq!(
+        add.num_items_assigned,
+        Some(BTreeMap::from([
+            (1, vec![1, 0]),
+            (2, vec![1, 0]),
+            (3, vec![1, 0])
+        ]))
+    );
+    assert_eq!(
+        add.encoder_urls,
+        Some(ENCODERS.iter().map(ToString::to_string).collect())
+    );
+    assert_eq!(add.input_text.as_deref(), Some(EVERY_MODALITY_PROMPT));
+    assert!(
+        add.mm_inputs.is_none(),
+        "no processor output on the language side"
+    );
+    assert_eq!(
+        dispatcher.calls(),
+        vec![(
+            "trio".to_string(),
+            EncodeMediaRefs {
+                image_urls: vec![IMAGE_REFERENCE.to_string()],
+                video_urls: vec![VIDEO_REFERENCE.to_string()],
+                audio_urls: vec![AUDIO_REFERENCE.to_string()],
+            }
+        )]
+    );
+    wait_until(|| dispatcher.released() == 1).await;
+    send(
+        &mut h.engine_out,
+        &batch("trio", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let dispatcher = ScriptedDispatcher::on(DispatchAnswer::Encoders, EncodeTransport::Grpc);
+    let mut h = harness_with(vision_model(1), dispatcher.configure(1)).await;
+    let status = h
+        .client
+        .generate(every_modality_reference_request("trio"))
+        .await
+        .expect_err("the gRPC transport takes images only");
+    assert_eq!(status.code(), Code::InvalidArgument, "{}", status.message());
+    assert!(
+        status
+            .message()
+            .contains("gRPC transport takes image references only"),
+        "{}",
+        status.message()
+    );
+    assert!(dispatcher.calls().is_empty(), "refused before the dispatch");
+    assert_scheduler_idle(&mut h.engine_in).await;
+    // The id is free again, and images still dispatch on this transport.
+    let mut stream = h
+        .client
+        .generate(media_reference_request("trio", 1))
+        .await
+        .expect("images dispatch over gRPC")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.need_wait_for_mm_inputs),
+        ("trio", Some(true))
+    );
+    assert_eq!(
+        dispatcher.calls(),
+        vec![("trio".to_string(), image_reference_media())]
+    );
+    wait_until(|| dispatcher.released() == 1).await;
+    send(
+        &mut h.engine_out,
+        &batch("trio", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// On a language-side worker a request's image references go to the
@@ -1867,9 +2030,9 @@ async fn a_language_side_request_is_dispatched_to_the_encoders_before_its_rank()
     assert_eq!(rids, ["epd-0", "epd-1"]);
     let calls = dispatcher.calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
-    for (rid, urls) in &calls {
+    for (rid, media) in &calls {
         assert!(rids.contains(rid), "{rid}");
-        assert_eq!(urls, &[IMAGE_REFERENCE.to_string()]);
+        assert_eq!(media, &image_reference_media());
     }
     // Released once each request was on the wire.
     wait_until(|| dispatcher.released() == 2).await;
@@ -1911,31 +2074,38 @@ async fn a_language_side_request_is_dispatched_to_the_encoders_before_its_rank()
 
 /// Media references a worker cannot have encoded are refused before the
 /// scheduler, by name: on a worker with no encode dispatch (not a
-/// language-side worker), on a language-side worker whose dispatch finds no
-/// encoder registered (the dispatcher is released even so), and when the
-/// dispatch itself fails; a failure reported for a request that never went
-/// out reaches no rank. The refused id is free again: a text request under
-/// it reaches the scheduler.
+/// language-side worker), whatever the modality named, on a language-side
+/// worker whose dispatch finds no encoder registered (the dispatcher is
+/// released even so), and when the dispatch itself fails; a failure reported
+/// for a request that never went out reaches no rank. The refused id is free
+/// again: a text request under it reaches the scheduler.
 #[tokio::test]
 async fn media_references_a_worker_cannot_encode_are_refused_before_the_scheduler() {
     let mut h = harness(vision_model(1)).await;
-    let status = h
-        .client
-        .generate(media_reference_request("refs", 1))
-        .await
-        .expect_err("no encode dispatch on this worker");
-    assert_eq!(
-        status.code(),
-        Code::FailedPrecondition,
-        "{}",
-        status.message()
-    );
-    assert!(
-        status.message().contains("runs no encode dispatch"),
-        "{}",
-        status.message()
-    );
-    assert_scheduler_idle(&mut h.engine_in).await;
+    for request in [
+        media_reference_request("refs", 1),
+        // Video and audio references get the same answer here: the
+        // translation no longer refuses them by name, this worker does.
+        every_modality_reference_request("refs-every"),
+    ] {
+        let status = h
+            .client
+            .generate(request)
+            .await
+            .expect_err("no encode dispatch on this worker");
+        assert_eq!(
+            status.code(),
+            Code::FailedPrecondition,
+            "{}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("runs no encode dispatch"),
+            "{}",
+            status.message()
+        );
+        assert_scheduler_idle(&mut h.engine_in).await;
+    }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
     for (answer, code, needle) in [
@@ -1962,7 +2132,7 @@ async fn media_references_a_worker_cannot_encode_are_refused_before_the_schedule
         assert!(status.message().contains(needle), "{}", status.message());
         assert_eq!(
             dispatcher.calls(),
-            vec![("refs".to_string(), vec![IMAGE_REFERENCE.to_string()])]
+            vec![("refs".to_string(), image_reference_media())]
         );
         assert_eq!(dispatcher.released(), releases);
         // A failure reported now is for a request no rank holds: dropped.

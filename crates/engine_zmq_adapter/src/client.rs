@@ -1126,7 +1126,7 @@ impl ZmqEngineClient {
 
     /// [`generate_sglang_streams_with_trace`](Self::generate_sglang_streams_with_trace)
     /// on a language-side worker of an encode/prefill-disaggregated
-    /// deployment: a choice naming image references (and carrying no
+    /// deployment: a choice naming media references (and carrying no
     /// preprocessed tensors) is handed to `dispatcher` before its submit, as
     /// the engine's own frontend hands the media to the encoders, and the
     /// scheduler's request carries what the dispatch set
@@ -1134,7 +1134,10 @@ impl ZmqEngineClient {
     /// refused: this worker runs no encode dispatch. A dispatch that finds no
     /// encoder registered leaves the request without embeddings, which this
     /// worker cannot make itself: refused as well, rather than answered as
-    /// text.
+    /// text. Video and audio references on a dispatcher whose transport takes
+    /// images only (the encoders' gRPC service) are refused by name before
+    /// the dispatch: the engine's own receiver would fail them on its
+    /// dispatch thread, after the request went out.
     pub async fn generate_sglang_streams_dispatching(
         &self,
         req: sglang_proto::GenerateRequest,
@@ -1190,13 +1193,7 @@ impl ZmqEngineClient {
         // Fan-out clones share identical media; cache only within this request.
         let mut shared_hashes = None;
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
-            let image_refs = sub
-                .mm_inputs
-                .as_deref()
-                .map(encode_media_refs)
-                .transpose()
-                .map_err(tonic::Status::invalid_argument)?
-                .flatten();
+            let media_refs = sub.mm_inputs.as_deref().and_then(encode_media_refs);
             let mut request = translate_request_sglang(
                 sub,
                 max_model_len,
@@ -1211,7 +1208,7 @@ impl ZmqEngineClient {
                     .precompute_shared(mm, &request.rid, &mut shared_hashes)
                     .await?;
             }
-            let dispatched = match (image_refs, dispatcher) {
+            let dispatched = match (media_refs, dispatcher) {
                 (None, _) => None,
                 (Some(_), None) => {
                     return Err(tonic::Status::failed_precondition(
@@ -1220,12 +1217,19 @@ impl ZmqEngineClient {
                          worker of an encode/prefill-disaggregated deployment)",
                     ));
                 }
-                (Some(image_urls), Some(dispatcher)) => {
+                (Some(media), Some(dispatcher)) => {
+                    if !dispatcher.transport().takes(&media) {
+                        return Err(tonic::Status::invalid_argument(
+                            "multimodal payload names video or audio references; the encoders' \
+                             gRPC transport takes image references only (the engine's HTTP \
+                             encoders take video and audio)",
+                        ));
+                    }
                     let notice = EncodeNotice::new(Arc::clone(client));
                     let outcome = dispatcher
                         .dispatch(EncodeDispatchRequest {
                             rid: request.rid.clone(),
-                            image_urls,
+                            media,
                             on_error: notice.sink(),
                         })
                         .await
