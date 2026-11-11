@@ -190,12 +190,19 @@ fn tcp_socket_addresses(
 /// masked whole (`tcp://***@host:port`), since the text reaches the start-up
 /// log and the add-worker route's answer, and a userinfo may be a secret.
 fn masked(url: &str) -> String {
-    // The first `://` is the scheme separator only when what precedes it can
-    // be a scheme: a schemeless string may carry `://` later (in its path, or
-    // in a malformed userinfo), and that one must not move the split past
-    // the userinfo.
+    // The first `://` is the scheme separator only when what precedes it is
+    // made of scheme characters alone (letters, digits, `+`, `-`, `.`): a
+    // schemeless string may carry `://` later, in its path or inside its
+    // userinfo, and that one must not move the split past the userinfo.
     let (prefix, authority) = match url.split_once("://") {
-        Some((scheme, rest)) if !scheme.contains(['@', '/', '?', '#']) => (scheme, rest),
+        Some((scheme, rest))
+            if !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            (scheme, rest)
+        }
         _ => ("", url),
     };
     match authority.rsplit_once('@') {
@@ -569,12 +576,18 @@ mod tests {
         assert!(err.contains("without userinfo"), "{err}");
     }
 
-    /// A schemeless override that carries `://` later in the string (its
-    /// path) is still masked at its userinfo: the later separator does not
-    /// move the split, so the refusal never writes the secret.
+    /// A schemeless override that carries `://` later in the string (in its
+    /// path, or inside its userinfo) is still masked at its userinfo: the
+    /// later separator does not move the split, so the refusal never writes
+    /// the secret.
     #[test]
     fn a_schemeless_override_with_a_later_separator_is_masked() {
         assert_eq!(masked("user:secret@host/x://y"), "***@host/x://y");
+        assert_eq!(masked("user:abc://def@host:30500"), "***@host:30500");
+        let err =
+            zmq_handshake_address("ipc:///tmp/w", Some("user:abc://def@host:30500")).unwrap_err();
+        assert!(err.contains("***@host:30500"), "{err}");
+        assert!(!err.contains("abc") && !err.contains("def"), "{err}");
         let err =
             zmq_handshake_address("ipc:///tmp/w", Some("user:secret@host/x://y")).unwrap_err();
         assert!(err.contains("***@host/x://y"), "{err}");
