@@ -33,8 +33,10 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        as_consistent_hashing, engine_host::HostRequest, policy_filters_unavailable_workers,
-        CacheNamespace, Decider, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        as_consistent_hashing,
+        engine_host::{HostRequest, PairPartners},
+        policy_filters_unavailable_workers, CacheNamespace, Decider, LoadBalancingPolicy,
+        PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
@@ -1557,12 +1559,16 @@ pub(crate) enum PairProposal {
 pub(crate) struct PairDecision {
     decision: Decision,
     lease: Lease,
+    /// The decode side's booking of a request of unknown size: the decode
+    /// policy's own estimate, where the lease carries the prefill's.
+    decode_tokens: u32,
     /// The open prefills the decision's targets index by position.
     prefills: Vec<Arc<dyn Worker>>,
     /// The decode rows the targets' pair sides index by position.
     decodes: Vec<Arc<dyn Worker>>,
     pair_runtime: Option<RuntimeType>,
     prefill_over: bool,
+    lift_prefill: bool,
     lift_decode: bool,
 }
 
@@ -1617,13 +1623,12 @@ pub(crate) fn decide_pair(
         .iter()
         .map(|&i| Arc::clone(&pairs.prefill[i]))
         .collect();
-    let partners = |i: usize| {
-        pairs.partners[open[i]]
-            .iter()
-            .filter(|d| live.partner_open(d, pair_runtime))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    // Each open prefill's partner list as the index shares it between the
+    // prefills of one pairing descriptor, and the live filter over a list,
+    // which reads the decode and the pair's runtime alone: the engine keys
+    // one pair class per list and builds its rows once.
+    let list = |i: usize| &pairs.partners[open[i]];
+    let partner_open = |d: &Arc<dyn Worker>| live.partner_open(d, pair_runtime);
     let request = HostRequest {
         model: model_id,
         prompt_tokens: decider.prefill_prompt_tokens(inputs.tokens),
@@ -1640,8 +1645,11 @@ pub(crate) fn decide_pair(
         &request,
         &prefills,
         has_capacity,
-        &partners,
-        live.lift_decode,
+        PairPartners {
+            list: &list,
+            open: &partner_open,
+            lift_decode: live.lift_decode,
+        },
         excluded,
     );
     if let Decision::Shed(shed) = &decision {
@@ -1668,10 +1676,12 @@ pub(crate) fn decide_pair(
     Ok(PairProposal::Decided(PairDecision {
         decision,
         lease,
+        decode_tokens: decider.decode_prompt_tokens(inputs.tokens),
         prefills,
         decodes,
         pair_runtime,
         prefill_over: live.prefill_over,
+        lift_prefill: live.lift_prefill,
         lift_decode: live.lift_decode,
     }))
 }
@@ -1717,8 +1727,9 @@ fn pair_shed(
 /// [`select_pair`] through the policy engine, the commit half, as
 /// `acquire_prefill_decided`'s `commit` under the admission lock:
 /// `has_capacity` is the window as the lock reads it. The first target whose
-/// prefill has capacity and whose decode partner is still open is the pair,
-/// booked on both sides; when every target misses, the missed ids go to
+/// prefill has capacity and is still open and whose decode partner is still
+/// open is the pair, booked on both sides, the decode at its own estimate;
+/// when every target misses, the missed ids go to
 /// `missed` for the one re-decision and the request waits for a slot. The
 /// room itself is claimed at dispatch (`pd_admission::admit_decode`), as
 /// under the legacy path.
@@ -1741,11 +1752,17 @@ pub(crate) fn commit_pair(
             .pair
             .map(|pair| &pd.decodes[pair.decode_position as usize])
     };
+    // Both sides are re-read under the lock, as the single seam re-reads
+    // availability: the prefill open under its pool's lift beside its
+    // window, the decode partner live.
     let accept = |target: &Target| {
-        has_capacity(&pd.prefills[target.position as usize])
+        let prefill = &pd.prefills[target.position as usize];
+        has_capacity(prefill)
+            && open_under(prefill, pd.lift_prefill)
             && decode_of(target).is_some_and(|d| partner_live(d, pd.lift_decode, pd.pair_runtime))
     };
-    let Some(target) = decider.commit(&pd.lease, &pd.decision, Side::Prefill, accept) else {
+    let Some(target) = decider.commit_pair(&pd.lease, pd.decode_tokens, &pd.decision, accept)
+    else {
         if let Some(pick) = pd.decision.pick() {
             for target in pick.targets.iter() {
                 missed.push(target.id);
@@ -1780,12 +1797,16 @@ pub(crate) fn commit_pair(
         model_id,
         policies.get_prefill_policy().name(),
     );
-    Metrics::record_worker_selection(
-        metrics_labels::WORKER_DECODE,
-        decode.connection_mode().as_metric_label(),
-        model_id,
-        policies.get_decode_policy().name(),
-    );
+    // A decode paired by load under the lift is the veto fallback's pick,
+    // counted above, not a selection of the decode policy.
+    if !pd.lift_decode {
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            decode.connection_mode().as_metric_label(),
+            model_id,
+            policies.get_decode_policy().name(),
+        );
+    }
     debug!(
         prefill = %prefill.redacted_url(),
         decode = %decode.redacted_url(),
@@ -2246,6 +2267,227 @@ mod tests {
             ..PlacementInputs::default()
         };
         assert!(pair_decider(&policies, &keyed).is_none());
+    }
+
+    /// The engine's proposal of one pair, decided with an open window and
+    /// nothing excluded, for a test that reads the decision itself.
+    fn proposed_pair(registry: &WorkerRegistry, policies: &PolicyRegistry) -> PairDecision {
+        let decider = pair_decider(policies, &PlacementInputs::default())
+            .expect("the engine serves the pair");
+        let pairs = pairs_of(registry, policies);
+        let proposal = decide_pair(
+            registry,
+            policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &|_| true,
+            PlacementInputs::default(),
+            &[],
+        )
+        .expect("a pair is open");
+        match proposal {
+            PairProposal::Decided(pd) => pd,
+            PairProposal::Settled(_) => panic!("the engine decides the pair"),
+        }
+    }
+
+    /// The decode of a proposal's first target.
+    fn proposed_decode(pd: &PairDecision) -> Arc<dyn Worker> {
+        let target = pd
+            .decision
+            .pick()
+            .expect("a pair")
+            .targets
+            .first()
+            .copied()
+            .expect("a target");
+        Arc::clone(&pd.decodes[target.pair.expect("the decode side").decode_position as usize])
+    }
+
+    /// Prefills of one pairing descriptor share one partner list, so the
+    /// decision builds one set of decode rows for all of them (P + D rows,
+    /// never P x D) and still rotates both pools in full.
+    #[test]
+    fn with_the_engine_switch_prefills_sharing_a_partner_list_share_one_pair_class() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:3", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let pairs = pairs_of(&registry, &policies);
+        assert!(
+            pairs
+                .partners
+                .iter()
+                .all(|list| Arc::ptr_eq(list, &pairs.partners[0])),
+            "one descriptor, one shared list"
+        );
+        let pd = proposed_pair(&registry, &policies);
+        assert_eq!(pd.prefills.len(), 3);
+        assert_eq!(
+            pd.decodes.len(),
+            2,
+            "one row per decode, not one per (prefill, decode)"
+        );
+        let picks = decided_hits(&registry, &policies, 12);
+        for prefill in ["grpc://p:1", "grpc://p:2", "grpc://p:3"] {
+            assert_eq!(picks[prefill], 4, "{picks:?}");
+        }
+        for decode in ["grpc://d:1", "grpc://d:2"] {
+            assert_eq!(picks[decode], 6, "{picks:?}");
+        }
+    }
+
+    /// The commit re-checks the prefill's availability under the lock as it
+    /// does the decode partner's: a prefill that went unavailable between
+    /// the decision and the commit refuses its targets, the miss is recorded
+    /// for the one re-decision, and the re-decision pairs the other prefill.
+    #[test]
+    fn the_pair_commit_re_checks_the_prefill_as_it_does_the_decode() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pd = proposed_pair(&registry, &policies);
+        let chosen = Arc::clone(
+            &pd.prefills[pd
+                .decision
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .expect("a target")
+                .position as usize],
+        );
+        chosen.set_status(WorkerStatus::NotReady);
+        let mut missed = Vec::new();
+        let refused = commit_pair(
+            &policies,
+            decider,
+            MODEL,
+            PairProposal::Decided(pd),
+            &|_| true,
+            &mut missed,
+        )
+        .err()
+        .expect("the prefill went unavailable under the lock");
+        assert_eq!(refused.role, WorkerRole::Prefill);
+        assert!(matches!(
+            refused.verdict,
+            PlacementFailure::PrefillAtCapacity
+        ));
+        assert_eq!(missed.len(), 2, "the prefill and its decode: {missed:?}");
+        let pair = decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+            .expect("the re-decision pairs the other prefill");
+        assert_ne!(pair.prefill.url(), chosen.url());
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+        assert_eq!(decider.decisions(), 2, "one re-decision");
+    }
+
+    /// A round-robin prefill beside a least-load decode, no token count: the
+    /// decode side is booked at its own policy's mean, so the booked decode
+    /// carries the credit and every next decision takes the other decode
+    /// (booked at the prefill's estimate of nothing, the two would tie).
+    #[test]
+    fn a_mixed_policy_pair_books_the_decode_at_the_decode_policies_estimate() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let round_robin = PolicyConfig::RoundRobin;
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &round_robin,
+            &least_load,
+        );
+        let decider = policies.decider().expect("hosted");
+        let feed = TestFeed::attached_to(policies.get_decode_policy().as_ref());
+        let idle = || one_rank_load(0, 0.1, 2000.0);
+        feed.publish(&HashMap::from([
+            ("grpc://p:1".to_string(), idle()),
+            ("grpc://d:1".to_string(), idle()),
+            ("grpc://d:2".to_string(), idle()),
+        ]));
+        decider.set_load_receiver(Some(feed.receiver()));
+        assert_eq!(
+            decider.prefill_prompt_tokens(None),
+            0,
+            "round robin prices no tokens"
+        );
+        assert_eq!(decider.decode_prompt_tokens(None), 100);
+        let mut missed = Vec::new();
+        let booked = decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+            .expect("a pair is open")
+            .decode;
+        for _ in 0..20 {
+            let next = proposed_decode(&proposed_pair(&registry, &policies));
+            assert_ne!(
+                next.url(),
+                booked.url(),
+                "the booked decode carries its own credit"
+            );
+        }
+    }
+
+    /// Both decode partners over the thresholds with shedding off, one of
+    /// them busier: under the switch every placement takes the least-loaded
+    /// partner, counted as the veto fallback and not as a selection of the
+    /// decode policy, as the legacy path pairs such a pool.
+    #[test]
+    fn with_the_engine_switch_an_all_overloaded_decode_pool_pairs_the_least_loaded_partner() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let busier = registry.get_by_url("grpc://d:1").expect("registered");
+        for _ in 0..3 {
+            busier.increment_load();
+        }
+        for url in ["grpc://d:1", "grpc://d:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut missed = Vec::new();
+        let pair = metrics::with_local_recorder(&recorder, || {
+            decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+        })
+        .expect("a pair is open");
+        assert_eq!(pair.decode.url(), "grpc://d:2", "the least-loaded partner");
+        let rendered = handle.render();
+        assert_one_overload_fallback(&rendered);
+        assert!(
+            !rendered.lines().any(|line| {
+                line.starts_with("smg_worker_selection_total{")
+                    && line.contains("worker_type=\"decode\"")
+            }),
+            "the fallback's decode is not a selection of the decode policy:\n{rendered}"
+        );
+        let picks = decided_hits(&registry, &policies, 4);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        assert_eq!(picks["grpc://d:2"], 4, "{picks:?}");
     }
 
     /// A decode partner whose window is full, or whose free room a place

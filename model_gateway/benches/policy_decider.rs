@@ -10,14 +10,17 @@
 //! - `engine_decided`: the decision outside the lock, the commit under it
 //!   (`PrefillAdmission::admit_decided`).
 //!
-//! Sections (`PD_SECTIONS`, default all four): `fifo` (a window that never
+//! Sections (`PD_SECTIONS`, default all five): `fifo` (a window that never
 //! binds: the lock hold alone), `window` (a binding window: queueing and
 //! commit misses), `rooms` (the decode room claim with no shared lock: the
 //! room pre-filter and the atomic claim against the engine's room bit and the
-//! claim as the commit) and `pair` (the pair plan under the FIFO: the prefill
+//! claim as the commit), `pair` (the pair plan under the FIFO: the prefill
 //! selection and its partner's room under the lock against the engine's pair
-//! decision under it and outside it). Fleets from `PD_FLEETS` (default
-//! 8,64,512; the pair section runs a quarter as many prefills, two at least),
+//! decision under it and outside it, prefill `i` partnered with the decodes
+//! `j` where `j % prefills == i`) and `pair_all` (the same with every prefill
+//! partnered with every decode through one shared list, the homogeneous
+//! fleet's shape). Fleets from `PD_FLEETS` (default 8,64,512; the pair
+//! sections run a quarter as many prefills, two at least),
 //! `PD_TASKS` tasks (64) on eight runtime threads, `PD_PER_TASK` admissions
 //! each (2000), `PD_ROOMS` rooms per decode (4). Output: TSV rows on stdout:
 //! `section  shape  policy  workers  p50_ns  p99_ns  per_s  misses  rejects`.
@@ -41,8 +44,9 @@ use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
     config::{PolicyConfig, RoutingKeyOverrideConfig},
     policies::{
-        engine_host::HostRequest, Decider, LeastLoadPolicy, LoadBalancingPolicy, RoundRobinPolicy,
-        SelectWorkerInfo, WorkerRole,
+        engine_host::{HostRequest, PairPartners},
+        Decider, LeastLoadPolicy, LoadBalancingPolicy, RoundRobinPolicy, SelectWorkerInfo,
+        WorkerRole,
     },
     worker::{
         acquire_prefill, acquire_prefill_decided,
@@ -578,8 +582,51 @@ type PairArms = (Arc<dyn Worker>, Arc<dyn Worker>);
 /// and the decode rows the targets' pair sides index.
 type PairPlan = (Decision, Lease, Vec<Arc<dyn Worker>>);
 
-/// Prefill `i`'s partners.
-type Partners = Arc<Vec<Vec<Arc<dyn Worker>>>>;
+/// Prefill `i`'s partner list; prefills of one pairing descriptor share one
+/// list, as the gateway's pair index shares it.
+type Partners = Arc<Vec<Arc<[Arc<dyn Worker>]>>>;
+
+/// The counted prompt every pair request carries; both sides book it.
+const PROMPT_TOKENS: u32 = 1024;
+
+/// How the pair sections partner the prefills with the decodes.
+#[derive(Clone, Copy)]
+enum Topology {
+    /// Prefill `i` with the decodes `j` where `j % prefills == i`: distinct
+    /// lists, the engine's best case.
+    Partitioned,
+    /// Every prefill with every decode through one shared list: the
+    /// homogeneous fleet.
+    AllToAll,
+}
+
+impl Topology {
+    fn section(self) -> &'static str {
+        match self {
+            Self::Partitioned => "pair",
+            Self::AllToAll => "pair_all",
+        }
+    }
+
+    fn partners(self, prefills: usize, decodes: &[Arc<dyn Worker>]) -> Partners {
+        Arc::new(match self {
+            Self::Partitioned => (0..prefills)
+                .map(|i| {
+                    decodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| j % prefills == i)
+                        .map(|(_, d)| Arc::clone(d))
+                        .collect()
+                })
+                .collect(),
+            Self::AllToAll => {
+                let all: Arc<[Arc<dyn Worker>]> = decodes.iter().cloned().collect();
+                vec![all; prefills]
+            }
+        })
+    }
+}
 
 /// Today's pair selection at the queue head: the capacity pre-filter, the
 /// prefill policy over the open prefills, the room pre-filter over its
@@ -587,7 +634,7 @@ type Partners = Arc<Vec<Vec<Arc<dyn Worker>>>>;
 fn legacy_pair(
     policy: &dyn LoadBalancingPolicy,
     prefills: &[Arc<dyn Worker>],
-    partners_of: &[Vec<Arc<dyn Worker>>],
+    partners_of: &[Arc<[Arc<dyn Worker>]>],
     capacity: Option<&PrefillSelectionContext<'_>>,
 ) -> Result<PairArms, Verdict> {
     let open: Vec<usize> = (0..prefills.len())
@@ -605,13 +652,13 @@ fn legacy_pair(
     let pi = policy
         .select_worker(&open_workers, &info)
         .ok_or(Verdict::Unavailable)?;
-    let partners = &partners_of[open[pi]];
+    let partners: &[Arc<dyn Worker>] = &partners_of[open[pi]];
     let with_room: Vec<Arc<dyn Worker>> = partners
         .iter()
         .filter(|d| has_free_room(d.as_ref()))
         .cloned()
         .collect();
-    let decodes = if with_room.is_empty() {
+    let decodes: &[Arc<dyn Worker>] = if with_room.is_empty() {
         partners
     } else {
         &with_room
@@ -632,15 +679,20 @@ fn engine_pair_decision(
     has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
     excluded: &[WorkerId],
 ) -> Result<PairPlan, Verdict> {
-    let partners = |i: usize| partners_of[i].clone();
+    let list = |i: usize| &partners_of[i];
     let request = HostRequest {
         model: "m",
-        prompt_tokens: 1024,
+        prompt_tokens: PROMPT_TOKENS,
         phase: Phase::Prefill,
         ..HostRequest::default()
     };
+    let partners = PairPartners {
+        list: &list,
+        open: &|_| true,
+        lift_decode: false,
+    };
     let (decision, lease, decodes) =
-        decider.decide_pair(&request, prefills, has_capacity, &partners, false, excluded);
+        decider.decide_pair(&request, prefills, has_capacity, partners, excluded);
     match decision {
         Decision::Pick(_) => Ok((decision, lease, decodes)),
         Decision::Shed(shed) if shed.emptied_by == "has-capacity" => Err(Verdict::AtCapacity),
@@ -659,7 +711,7 @@ fn engine_pair_commit(
     counters: &Counters,
     missed: &std::sync::Mutex<Vec<WorkerId>>,
 ) -> Result<PairArms, Verdict> {
-    let committed = decider.commit(&lease, &decision, Side::Prefill, |t: &Target| {
+    let committed = decider.commit_pair(&lease, PROMPT_TOKENS, &decision, |t: &Target| {
         capacity.is_none_or(|c| c.has_capacity(&prefills[t.position as usize])) && t.pair.is_some()
     });
     match committed {
@@ -688,25 +740,21 @@ fn engine_pair_commit(
 }
 
 /// The pair plan under the FIFO: a quarter as many prefills as decodes (two
-/// at least), prefill `i` partnered with the decodes `j` where `j % prefills
-/// == i`, the window never binding (the lock hold and the view build alone).
-fn section_pair(fleets: &[usize], tasks: usize, per_task: usize, window: usize, names: &[String]) {
+/// at least), partnered by `topology`, the window never binding (the lock
+/// hold and the view build alone).
+fn section_pair(
+    topology: Topology,
+    fleets: &[usize],
+    tasks: usize,
+    per_task: usize,
+    window: usize,
+    names: &[String],
+) {
     for &n in fleets {
         let prefill_count = (n / 4).max(2);
         let prefills = pool(prefill_count, WorkerType::Prefill, "prefill");
         let decodes = decode_pool(n, 4_096);
-        let partners_of: Partners = Arc::new(
-            (0..prefill_count)
-                .map(|i| {
-                    decodes
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, _)| j % prefill_count == i)
-                        .map(|(_, d)| Arc::clone(d))
-                        .collect()
-                })
-                .collect(),
-        );
+        let partners_of = topology.partners(prefill_count, &decodes);
         for name in names {
             let p = Arc::new(policies(name, &[&prefills, &decodes]));
             for shape in ["legacy_under_lock", "engine_under_lock", "engine_decided"] {
@@ -830,7 +878,7 @@ fn section_pair(fleets: &[usize], tasks: usize, per_task: usize, window: usize, 
                         }
                     }),
                 };
-                print_row("pair", shape, policy_name, n, &row, &counters);
+                print_row(topology.section(), shape, policy_name, n, &row, &counters);
             }
         }
     }
@@ -841,7 +889,7 @@ fn main() {
         .iter()
         .map(|s| s.parse().unwrap())
         .collect();
-    let sections = env_list("PD_SECTIONS", "fifo,window,rooms,pair");
+    let sections = env_list("PD_SECTIONS", "fifo,window,rooms,pair,pair_all");
     let names = env_list("PD_POLICIES", "round_robin,least_load");
     let tasks: usize = env_num("PD_TASKS", 64);
     let per_task: usize = env_num("PD_PER_TASK", 2_000);
@@ -854,7 +902,17 @@ fn main() {
             "fifo" => section_prefill("fifo", &fleets, tasks, per_task, window, &names),
             "window" => section_prefill("window", &fleets, tasks, per_task, binding, &names),
             "rooms" => section_rooms(&fleets, tasks, per_task, rooms, &names),
-            "pair" => section_pair(&fleets, tasks, per_task, window, &names),
+            "pair" => section_pair(
+                Topology::Partitioned,
+                &fleets,
+                tasks,
+                per_task,
+                window,
+                &names,
+            ),
+            "pair_all" => {
+                section_pair(Topology::AllToAll, &fleets, tasks, per_task, window, &names);
+            }
             other => eprintln!("unknown section {other}"),
         }
     }
