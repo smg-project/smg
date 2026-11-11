@@ -254,7 +254,7 @@ helm install smg deploy/helm/smg \
 
 #### Admission Config
 
-`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a scheduler ConfigMap without the scheduler enabled.
+`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a rate-limit or scheduler ConfigMap without its feature enabled.
 
 ```bash
 kubectl create configmap smg-rate-limit --from-file=rate-limit.yaml=./rate-limit.yaml

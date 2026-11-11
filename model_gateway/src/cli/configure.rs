@@ -830,6 +830,14 @@ impl CliArgs {
                     "without --priority-scheduler-enabled",
                 ),
             ),
+            (
+                self.serving.tenant_rate_limit_config.is_some()
+                    && !self.serving.tenant_rate_limit_enabled,
+                ignored(
+                    "--tenant-rate-limit-config",
+                    "without --tenant-rate-limit-enabled",
+                ),
+            ),
         ];
         warnings
             .into_iter()
