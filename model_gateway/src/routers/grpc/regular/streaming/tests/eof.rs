@@ -2857,6 +2857,14 @@ fn delta_tool_calls(events: &[Value]) -> Vec<&Value> {
 /// `lookup` tool under `tool_choice`: the SSE events of the stream, which
 /// must end without an error.
 async fn prefilled_reasoning_tool_events(tool_choice: Value, output: &str) -> Vec<Value> {
+    reasoning_tool_events(tool_choice, output, CharacterTokenizer::default()).await
+}
+
+async fn reasoning_tool_events(
+    tool_choice: Value,
+    output: &str,
+    tokenizer: CharacterTokenizer,
+) -> Vec<Value> {
     let request = serde_json::from_value(serde_json::json!({
         "model":"test-model", "messages":[], "separate_reasoning":true,
         "tool_choice":tool_choice,
@@ -2879,7 +2887,7 @@ async fn prefilled_reasoning_tool_events(tool_choice: Value, output: &str) -> Ve
         .process_streaming_chunks(
             stream,
             dispatch(),
-            Arc::new(CharacterTokenizer::default()),
+            Arc::new(tokenizer),
             (None, None, false, false, false),
             spec,
             &tx,
@@ -2891,6 +2899,18 @@ async fn prefilled_reasoning_tool_events(tool_choice: Value, output: &str) -> Ve
     server.abort();
     assert!(result.is_ok(), "{result:?}");
     events
+}
+
+#[tokio::test]
+async fn qwen3_stream_strips_generated_think_tag_when_template_has_closed_block() {
+    let events = reasoning_tool_events(
+        serde_json::json!("auto"),
+        "<think>plan</think>answer",
+        CharacterTokenizer::with_closed_prefill_think_block(),
+    )
+    .await;
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    assert_eq!(chat_text(&events, 0, "content"), "answer");
 }
 
 #[tokio::test]
