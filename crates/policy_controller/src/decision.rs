@@ -106,12 +106,16 @@ pub enum ShedReason {
 
 /// The decision's trace: what the trace header and an explain call print.
 /// This is the first step's subset of the record; per-filter drops,
-/// per-scorer contributions, the plan, the picker and the shadow pick join it
-/// with the observability contract.
+/// per-scorer contributions, the plan and the shadow pick join it later.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Trace {
-    /// The profile that decided.
+    /// The profile that decided, as its position among the engine's
+    /// profiles; [`Trace::NO_PROFILE`] when no profile ran.
     pub profile: u16,
+    /// The stage that settled the decision: the picker that chose for a
+    /// pick (the prefill side's for a pair), the filter or picker that left
+    /// nothing for a shed, `binding` when no profile matched the request.
+    pub stage: &'static str,
     /// Candidates after the filters.
     pub survivors: u32,
     /// The top candidates and their combined scores, best first.
@@ -119,6 +123,11 @@ pub struct Trace {
     pub top_len: u8,
     pub seed: u64,
     pub generation: u64,
+}
+
+impl Trace {
+    /// The `profile` of a decision no profile ran: a binding miss.
+    pub const NO_PROFILE: u16 = u16::MAX;
 }
 
 /// A pick: ordered targets and the trace.

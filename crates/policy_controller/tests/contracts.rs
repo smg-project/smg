@@ -261,7 +261,8 @@ fn trace_record() -> &'static [&'static str] {
             top,
             top_len,
             seed,
-            generation
+            generation,
+            stage
         }
     )
 }
@@ -687,7 +688,9 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Trace",
             record: trace_record(),
-            host_only: &["top_len"],
+            // `stage` is the host's name of the settling stage; the wire
+            // carries it as the `plan` and `picker` positions.
+            host_only: &["top_len", "stage"],
             wire_only: &[
                 "plan",
                 "drops",
