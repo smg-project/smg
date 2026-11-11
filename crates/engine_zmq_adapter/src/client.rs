@@ -125,6 +125,38 @@ pub(crate) enum ZmqBackend {
     Trtllm(Arc<TrtllmClient>),
 }
 
+impl ZmqBackend {
+    /// The engine's name as the adapter's refusals say it.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Vllm(_) => "vLLM",
+            Self::TokenSpeed(_) => "TokenSpeed",
+            Self::Sglang(_) => "SGLang",
+            Self::Trtllm(_) => "TensorRT-LLM",
+        }
+    }
+}
+
+/// The refusal of a call made before an engine is connected.
+pub(crate) fn no_engine() -> tonic::Status {
+    tonic::Status::unavailable("no connected ZMQ engine")
+}
+
+/// The refusal of an operation asked of a backend that does not serve it;
+/// `backend` names the backends that do, article included.
+fn only_on(operation: &str, backend: &str) -> tonic::Status {
+    tonic::Status::unimplemented(format!("{operation} is only available on {backend}"))
+}
+
+/// The refusal of a request whose wire is another engine's: the connected
+/// backend's name and the wire the request came on.
+fn wrong_wire(backend: &ZmqBackend, wire: &str, request: &str) -> tonic::Status {
+    let name = backend.name();
+    tonic::Status::internal(format!(
+        "{name} ZMQ backend cannot serve a {wire} {request} request"
+    ))
+}
+
 /// Per-connection constants of a [`ZmqEngineClient`], fixed at connect time.
 pub(crate) struct ZmqConnectionMeta {
     /// Model id advertised for metadata (the engine does not report it on the
@@ -528,7 +560,7 @@ impl ZmqEngineClient {
             .engines()
             .first()
             .map(|engine| engine.engine_id.clone())
-            .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
+            .ok_or_else(no_engine)?;
         self.meta
             .supported_tasks
             .get_or_try_init(|| async {
@@ -605,9 +637,7 @@ impl ZmqEngineClient {
         match &self.backend {
             ZmqBackend::Vllm(client) => Ok(client),
             ZmqBackend::TokenSpeed(_) | ZmqBackend::Sglang(_) | ZmqBackend::Trtllm(_) => {
-                Err(tonic::Status::unimplemented(format!(
-                    "{operation} is only available on a vLLM ZMQ backend"
-                )))
+                Err(only_on(operation, "a vLLM ZMQ backend"))
             }
         }
     }
@@ -619,9 +649,7 @@ impl ZmqEngineClient {
         match &self.backend {
             ZmqBackend::Sglang(client) => Ok(client),
             ZmqBackend::Vllm(_) | ZmqBackend::TokenSpeed(_) | ZmqBackend::Trtllm(_) => {
-                Err(tonic::Status::unimplemented(format!(
-                    "{operation} is only available on an SGLang ZMQ backend"
-                )))
+                Err(only_on(operation, "an SGLang ZMQ backend"))
             }
         }
     }
@@ -705,7 +733,7 @@ impl ZmqEngineClient {
         self.engines()
             .first()
             .map(|engine| engine.ready_response.max_model_len)
-            .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))
+            .ok_or_else(no_engine)
     }
 
     /// Capture identities from every connected replica, or none if any replica
@@ -752,9 +780,7 @@ impl ZmqEngineClient {
         trace_headers: Option<BTreeMap<String, String>>,
     ) -> Result<Vec<VllmGenerateStream>, tonic::Status> {
         let ZmqBackend::Vllm(client) = &self.backend else {
-            return Err(tonic::Status::internal(
-                "per-choice generate streams are only available on a vLLM ZMQ backend",
-            ));
+            return Err(wrong_wire(&self.backend, "vLLM", "generate"));
         };
         // EngineCore needs a concrete `max_tokens`; vLLM's OpenAI frontend
         // (which the ZMQ path bypasses) defaults an unset value to
@@ -764,7 +790,7 @@ impl ZmqEngineClient {
             .engines()
             .first()
             .map(|e| (e.ready_response.max_model_len, e.ready_response.dtype))
-            .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
+            .ok_or_else(no_engine)?;
         // Media is translated once for all choices (an SHM payload is read,
         // and unlinked, a single time) and off the runtime: `/dev/shm` reads
         // and the dtype casts of multi-megabyte tensors would otherwise hold a
@@ -911,9 +937,7 @@ impl ZmqEngineClient {
         req: vllm::GenerateRequest,
     ) -> Result<ZmqGenerateStream, tonic::Status> {
         if !matches!(self.backend, ZmqBackend::Vllm(_)) {
-            return Err(tonic::Status::internal(
-                "TokenSpeed ZMQ backend expects a TokenSpeed generate request",
-            ));
+            return Err(wrong_wire(&self.backend, "vLLM", "generate"));
         }
         // The deadline counts from the dispatch: before the submits.
         let deadline = self.request_deadline();
@@ -961,9 +985,7 @@ impl ZmqEngineClient {
         grid_tensors: GridTensors,
     ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
         let ZmqBackend::TokenSpeed(client) = &self.backend else {
-            return Err(tonic::Status::internal(
-                "vLLM ZMQ backend expects a vLLM generate request",
-            ));
+            return Err(wrong_wire(&self.backend, "TokenSpeed", "generate"));
         };
         // A disaggregated encode worker lists `encode` alone: it runs no
         // language model, so the gRPC servicer's words for its Generate.
@@ -1026,9 +1048,7 @@ impl ZmqEngineClient {
         rendezvous: &EncodeRendezvous,
     ) -> Result<(), tonic::Status> {
         let ZmqBackend::TokenSpeed(client) = &self.backend else {
-            return Err(tonic::Status::internal(
-                "vLLM ZMQ backend expects a vLLM encode request",
-            ));
+            return Err(wrong_wire(&self.backend, "TokenSpeed", "encode"));
         };
         let encoders: Vec<&ConnectedEngine> = client
             .engines()
@@ -1391,9 +1411,9 @@ impl ZmqEngineClient {
                 }
                 control_on_every_rank(client, method, args, wait).await
             }
-            ZmqBackend::Vllm(_) | ZmqBackend::Trtllm(_) => Err(tonic::Status::unimplemented(
-                format!("{rpc} is only available on an SGLang or TokenSpeed ZMQ backend"),
-            )),
+            ZmqBackend::Vllm(_) | ZmqBackend::Trtllm(_) => {
+                Err(only_on(rpc, "an SGLang or TokenSpeed ZMQ backend"))
+            }
         }
     }
 
@@ -1507,9 +1527,7 @@ impl ZmqEngineClient {
     /// RPC on the ZMQ wire.
     pub async fn reset_prefix_cache(&self, timeout: Duration) -> Result<bool, tonic::Status> {
         let ZmqBackend::Vllm(client) = &self.backend else {
-            return Err(tonic::Status::unimplemented(
-                "FlushCache is only available on a vLLM ZMQ backend",
-            ));
+            return Err(only_on("FlushCache", "a vLLM ZMQ backend"));
         };
         let args = vec![OpaqueValue::from(false), OpaqueValue::from(false)];
         let calls = client.engines().iter().map(|engine| {
@@ -1540,9 +1558,12 @@ impl ZmqEngineClient {
         timeout: Duration,
     ) -> Result<(), tonic::Status> {
         let ZmqBackend::Vllm(client) = &self.backend else {
-            return Err(tonic::Status::unimplemented(
-                "StartProfile and StopProfile are only available on a vLLM ZMQ backend",
-            ));
+            let rpc = if is_start {
+                "StartProfile"
+            } else {
+                "StopProfile"
+            };
+            return Err(only_on(rpc, "a vLLM ZMQ backend"));
         };
         let args = vec![OpaqueValue::from(is_start)];
         let calls = client
@@ -3128,5 +3149,102 @@ mod tests {
             .await
             .expect_err("tokenspeed");
         assert_eq!(status.code(), Code::Unimplemented);
+    }
+
+    /// The three refusal families carry their status code and their words:
+    /// a call before any engine is connected is UNAVAILABLE; an operation
+    /// another backend serves is UNIMPLEMENTED and names the backends that
+    /// serve it, for every operation string this file passes.
+    #[test]
+    fn refusals_carry_their_code_and_their_words() {
+        let status = no_engine();
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "no connected ZMQ engine");
+
+        for (operation, backend) in [
+            ("Embed", "a vLLM ZMQ backend"),
+            ("get_supported_tasks", "a vLLM ZMQ backend"),
+            ("FlushCache", "a vLLM ZMQ backend"),
+            ("StartProfile", "a vLLM ZMQ backend"),
+            ("StopProfile", "a vLLM ZMQ backend"),
+            ("Embed", "an SGLang ZMQ backend"),
+            ("FlushCache", "an SGLang or TokenSpeed ZMQ backend"),
+            ("StartProfile", "an SGLang or TokenSpeed ZMQ backend"),
+            ("StopProfile", "an SGLang or TokenSpeed ZMQ backend"),
+        ] {
+            let status = only_on(operation, backend);
+            assert_eq!(status.code(), Code::Unimplemented, "{operation}");
+            assert_eq!(
+                status.message(),
+                format!("{operation} is only available on {backend}")
+            );
+        }
+    }
+
+    /// A request on another engine's wire is refused through the methods
+    /// that carry it, naming the connected backend and the wire the request
+    /// came on, whichever of the four engines is connected: a vLLM generate
+    /// request, whole and per-choice, on each of the other three backends;
+    /// a TokenSpeed generate or encode request on each of its other three.
+    #[tokio::test]
+    async fn a_wrong_wire_refusal_names_the_connected_backend() {
+        let wires = [
+            (RuntimeType::Vllm, "vLLM"),
+            (RuntimeType::TokenSpeed, "TokenSpeed"),
+            (RuntimeType::Trtllm, "TensorRT-LLM"),
+            (RuntimeType::Sglang, "SGLang"),
+        ];
+        for (runtime, name) in wires {
+            let (client, _engine, _dir) = connected_pair(runtime).await;
+            assert_eq!(client.backend.name(), name);
+            let mut refusals = Vec::new();
+            if name != "vLLM" {
+                let Err(status) = client.generate_vllm(vllm::GenerateRequest::default()).await
+                else {
+                    panic!("a vLLM generate request on the {name} wire was not refused");
+                };
+                refusals.push(("vLLM", "generate", status));
+                let Err(status) = client
+                    .generate_vllm_streams(vllm::GenerateRequest::default())
+                    .await
+                else {
+                    panic!("a per-choice vLLM generate on the {name} wire was not refused");
+                };
+                refusals.push(("vLLM", "generate", status));
+            }
+            if name != "TokenSpeed" {
+                let Err(status) = client
+                    .generate_tokenspeed_streams_for_model(
+                        tokenspeed_proto::GenerateRequest::default(),
+                        GridTensors::Positions,
+                    )
+                    .await
+                else {
+                    panic!("a TokenSpeed generate request on the {name} wire was not refused");
+                };
+                refusals.push(("TokenSpeed", "generate", status));
+                let rendezvous = EncodeRendezvous {
+                    bootstrap_host: String::new(),
+                    bootstrap_port: 0,
+                };
+                let Err(status) = client
+                    .encode_tokenspeed(
+                        smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest::default(),
+                        &rendezvous,
+                    )
+                    .await
+                else {
+                    panic!("a TokenSpeed encode request on the {name} wire was not refused");
+                };
+                refusals.push(("TokenSpeed", "encode", status));
+            }
+            for (wire, request, status) in refusals {
+                assert_eq!(status.code(), Code::Internal, "{name} {wire} {request}");
+                assert_eq!(
+                    status.message(),
+                    format!("{name} ZMQ backend cannot serve a {wire} {request} request")
+                );
+            }
+        }
     }
 }
