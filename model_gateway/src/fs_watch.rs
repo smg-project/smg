@@ -290,6 +290,58 @@ mod tests {
         );
     }
 
+    /// A wake that arrives while a burst settles is drained into that
+    /// burst: with two named files, a write inside the settle window leaves
+    /// no wake behind the settle, and the watch still wakes for the next
+    /// change. Each file's burst is taken and settled first, so the channel
+    /// is empty when the window opens and the second file is known to wake
+    /// on its own. One file's burst cannot pin this: its writes all land
+    /// before the first wake is taken, so the channel's one slot drops all
+    /// but one wake and the settle finds nothing to drain.
+    #[tokio::test]
+    async fn a_wake_during_the_settle_is_drained_into_the_burst() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("workers.json");
+        let second = dir.path().join("tenants.json");
+        let (tx, mut rx) = mpsc::channel(1);
+        let _watch =
+            DirectoryWatch::start(dir.path(), names(&["workers.json", "tenants.json"]), tx)
+                .unwrap();
+
+        std::fs::write(&first, "{}").unwrap();
+        assert!(
+            woken(&mut rx, Duration::from_secs(10)).await,
+            "the first file's write not seen"
+        );
+        settle(&mut rx).await;
+        // A distinct event, never coalesced with the first file's, and the
+        // channel is empty: this wake is the second file's own.
+        std::fs::write(&second, "{}").unwrap();
+        assert!(
+            woken(&mut rx, Duration::from_secs(10)).await,
+            "the second file's write not seen"
+        );
+        settle(&mut rx).await;
+
+        // The write lands early in the settle window, its event well before
+        // the window ends: the settle drains the wake it sends.
+        let write_in_the_window = async {
+            time::sleep(SETTLE / 10).await;
+            std::fs::write(&second, "{}").unwrap();
+        };
+        tokio::join!(settle(&mut rx), write_in_the_window);
+        assert!(
+            rx.try_recv().is_err(),
+            "the wake inside the settle window was not drained into the burst"
+        );
+
+        std::fs::write(&first, "{}").unwrap();
+        assert!(
+            woken(&mut rx, Duration::from_secs(10)).await,
+            "the watch did not wake after the settle"
+        );
+    }
+
     /// Only an event about the watched directory itself, removed or moved
     /// away, marks the watch lost; events about files inside it do not.
     #[test]
