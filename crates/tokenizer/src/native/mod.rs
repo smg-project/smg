@@ -172,15 +172,17 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// this divided by the number of threads that have encoded with the encoder
 /// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table starts
 /// at 64 slots (2 KiB) and grows as the thread meets pieces (by four up to
-/// 4,096 slots, by two above), up to the slots for its cap, and is made anew
-/// for a smaller cap when it is cleared, so a thread that encodes little holds
-/// little and the packed tables of one tokenizer stay under 352 MiB however
+/// 4,096 slots, by two above), up to the slots for its cap, and is cut back to
+/// the slots of a smaller cap when it is cleared (made anew only past its
+/// reservation), so a thread that encodes little holds little and the packed
+/// tables of one tokenizer stay under 352 MiB however
 /// many runtime and blocking threads encode with it (sixteen threads at the
 /// full bound hold 264 MiB; more threads share the total, each table rounded up
 /// to a power of two slots, at most eight thirds of the total in slots). The
 /// maps of the pieces of 16 to 64 bytes share the count at about 140 bytes a
 /// typical entry (430 at most, see `PIECE_CACHE_CAPACITY`), and a clear keeps
-/// the packed slots and the map's buckets (both made anew for a smaller share),
+/// the packed slots and the map's buckets (the map made anew, the packed table
+/// cut back, for a smaller share),
 /// so the count-bounded tiers of one tokenizer hold at most the sum of the two:
 /// about 820 MiB at sixteen threads with typical map entries (about 2.2 GiB,
 /// sixteen times the 140 MiB of a thread, were every map entry the worst case),
@@ -195,11 +197,10 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// each, about 528 KiB per thread: more than the share's slots only once
 /// those fall under the reservation, a share under 6,144 entries, some 680
 /// threads on this total), and holds at most its earlier share until then, or
-/// until it
-/// exits if it never encodes again: right after a join the total is the earlier
-/// share times the threads that had it plus the new share times the rest, and
-/// settles as they encode. Before this bound the same ceilings were a sixteenth
-/// of these. All of it is freed with the encoder.
+/// until it exits if it never encodes again: right after a join the total is
+/// the earlier share times the threads that had it plus the new share times the
+/// rest, and settles as they encode. Before this bound the same ceilings were a
+/// sixteenth of these. All of it is freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
