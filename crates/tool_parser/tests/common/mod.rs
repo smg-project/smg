@@ -107,6 +107,24 @@ pub mod streaming_helpers {
     }
 }
 
+/// A function tool of this name and description that takes no parameters.
+#[allow(
+    dead_code,
+    reason = "shared test utility not used by all test binaries"
+)]
+pub fn tool(name: &str, description: &str) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            parameters: Some(json!({})),
+            strict: None,
+            extra: Default::default(),
+        },
+    }
+}
+
 /// Create a comprehensive set of test tools covering all parser test scenarios
 #[allow(
     dead_code,
