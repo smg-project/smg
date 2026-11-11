@@ -448,7 +448,7 @@ mod tests {
     use crate::{
         app_context::testing::app_context_for_tests,
         config::RouterConfig,
-        worker::{BasicWorkerBuilder, ModelCard},
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard},
     };
 
     /// The removal workflow as a whole, its steps run in the definition's
@@ -468,6 +468,7 @@ mod tests {
                 BasicWorkerBuilder::new(url)
                     .model(ModelCard::new("m"))
                     .label("tokenizer_path", "/tok/m")
+                    .connection_mode(ConnectionMode::Grpc)
                     .build(),
             );
             app_context.worker_registry.register(worker);

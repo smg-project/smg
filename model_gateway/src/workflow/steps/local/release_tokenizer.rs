@@ -8,7 +8,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::submit_tokenizer_job::tokenizer_source;
 use crate::{
-    worker::{basic::merge_labels, Worker, WorkerRegistry},
+    worker::{basic::merge_labels, Worker},
     workflow::data::WorkerRemovalWorkflowData,
 };
 
@@ -18,14 +18,20 @@ use crate::{
 /// (`SubmitTokenizerJobStep`) and nothing unloaded it: every retired model
 /// id kept its tokenizer resident, tens of megabytes each, so model-id churn
 /// grew the registry and the process without bound. Once the removed workers
-/// have left the worker registry, every model they were registered with or
-/// listed is asked after, as the policy step asks: a model no worker serves
-/// any more loses the tokenizer registered under its id, with the multimodal
-/// config that came with it, when that tokenizer's source is the one a
-/// removed worker of the model loads it from (its labels and the router's
-/// flags, as at registration), so an operator's registration of another
-/// source under the same name stays. The model's next registration loads
-/// the tokenizer again.
+/// have left the worker registry, the primary model of every removed worker
+/// on the gRPC pipeline is asked after, as the registration step loads under
+/// the primary alone and for that pipeline alone (an HTTP or external
+/// worker's registration loaded none; with autoload off the gateway manages
+/// none and the step skips): a model no worker serves any more loses the
+/// tokenizer registered under its id, with the multimodal config that came
+/// with it, when that tokenizer's source is the one a removed worker of the
+/// model loads it from (its labels and the router's flags, as at
+/// registration), so an operator's registration of another source under the
+/// same name stays. The model's next registration loads the tokenizer again.
+/// A model a removed worker only lists keeps its entry: the operator's
+/// registration of a listed model stays, and so does a same-source entry a
+/// worker whose primary it was loaded earlier, until a worker whose primary
+/// it is leaves.
 pub struct ReleaseTokenizerStep;
 
 #[async_trait]
@@ -48,72 +54,82 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
             .flatten()
             .chain(&context.data.removed_workers)
             .collect();
+        // The gateway manages no tokenizer when autoload is off: every entry
+        // is the operator's, as the registration step leaves them.
+        if app_context.router_config.disable_tokenizer_autoload {
+            return Ok(StepResult::Skip);
+        }
         let router = &app_context.router_config;
         let mut asked: HashSet<String> = HashSet::new();
         let mut released = 0usize;
         for worker in &removed {
-            for model_id in WorkerRegistry::policy_model_ids(worker) {
-                if !asked.insert(model_id.clone())
-                    || app_context.worker_registry.contains_model(&model_id)
-                {
-                    continue;
-                }
-                let Some(entry) = app_context.tokenizer_registry.get_by_name(&model_id) else {
-                    continue;
-                };
-                let loaded_by_a_worker = removed.iter().any(|worker| {
-                    WorkerRegistry::policy_model_ids(worker).contains(&model_id) && {
-                        let labels = merge_labels(
-                            &worker.metadata().discovered_labels,
-                            &worker.metadata().spec.labels,
-                        );
-                        tokenizer_source(
-                            &labels,
-                            router.tokenizer_path.as_deref(),
-                            router.model_path.as_deref(),
-                        ) == Some(entry.source.as_str())
-                    }
-                });
-                if !loaded_by_a_worker {
-                    debug!(
-                        model = %model_id,
-                        source = %entry.source,
-                        "Tokenizer of a model no worker serves kept: not the source its workers load from"
-                    );
-                    continue;
-                }
-                let Some(entry) = app_context.tokenizer_registry.remove(&model_id) else {
-                    continue;
-                };
-                // A worker of the model whose registration landed between the
-                // read above and this remove serves the model again: the entry
-                // goes back as it was (its registration job reads it as
-                // already loaded), the multimodal config untouched.
-                if app_context.worker_registry.contains_model(&model_id) {
-                    let tokenizer = Arc::clone(&entry.tokenizer);
-                    if let Err(error) = app_context
-                        .tokenizer_registry
-                        .load(&entry.id, &entry.name, &entry.source, || async {
-                            Ok(tokenizer)
-                        })
-                        .await
-                    {
-                        warn!(
-                            model = %model_id,
-                            "A model registered again under the release of its tokenizer could not take it back: {error}"
-                        );
-                    }
-                    continue;
-                }
-                app_context.multimodal_config_registry.remove(&entry.id);
-                released += 1;
-                info!(
-                    model = %model_id,
-                    tokenizer_id = %entry.id,
-                    source = %entry.source,
-                    "Released the tokenizer of a model no worker serves"
-                );
+            // The registration step loads a tokenizer for a worker on the gRPC
+            // pipeline alone, under its primary model id; a worker of another
+            // shape loaded none, so nothing of its leaves.
+            if !worker.connection_mode().uses_grpc_pipeline() {
+                continue;
             }
+            let model_id = worker.model_id().to_string();
+            if !asked.insert(model_id.clone())
+                || app_context.worker_registry.contains_model(&model_id)
+            {
+                continue;
+            }
+            let Some(entry) = app_context.tokenizer_registry.get_by_name(&model_id) else {
+                continue;
+            };
+            let loaded_by_a_worker = removed.iter().any(|worker| {
+                worker.connection_mode().uses_grpc_pipeline() && worker.model_id() == model_id && {
+                    let labels = merge_labels(
+                        &worker.metadata().discovered_labels,
+                        &worker.metadata().spec.labels,
+                    );
+                    tokenizer_source(
+                        &labels,
+                        router.tokenizer_path.as_deref(),
+                        router.model_path.as_deref(),
+                    ) == Some(entry.source.as_str())
+                }
+            });
+            if !loaded_by_a_worker {
+                debug!(
+                    model = %model_id,
+                    source = %entry.source,
+                    "Tokenizer of a model no worker serves kept: not the source its workers load from"
+                );
+                continue;
+            }
+            let Some(entry) = app_context.tokenizer_registry.remove(&model_id) else {
+                continue;
+            };
+            // A worker of the model whose registration landed between the
+            // read above and this remove serves the model again: the entry
+            // goes back as it was (its registration job reads it as already
+            // loaded), the multimodal config untouched.
+            if app_context.worker_registry.contains_model(&model_id) {
+                let tokenizer = Arc::clone(&entry.tokenizer);
+                if let Err(error) = app_context
+                    .tokenizer_registry
+                    .load(&entry.id, &entry.name, &entry.source, || async {
+                        Ok(tokenizer)
+                    })
+                    .await
+                {
+                    warn!(
+                        model = %model_id,
+                        "A model registered again under the release of its tokenizer could not take it back: {error}"
+                    );
+                }
+                continue;
+            }
+            app_context.multimodal_config_registry.remove(&entry.id);
+            released += 1;
+            info!(
+                model = %model_id,
+                tokenizer_id = %entry.id,
+                source = %entry.source,
+                "Released the tokenizer of a model no worker serves"
+            );
         }
         debug!(
             "Released {} tokenizer(s) of the removed workers' models",
@@ -139,7 +155,7 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
-        worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerRegistry},
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry},
         workflow::steps::local::{
             create_worker_removal_workflow_data, RemoveFromPolicyRegistryStep,
             RemoveFromWorkerRegistryStep,
@@ -156,13 +172,15 @@ mod tests {
         )
     }
 
-    /// A registered worker of `model` whose `tokenizer_path` label names
-    /// `source`, as a worker whose registration loaded the model's tokenizer.
+    /// A registered worker of `model` on the gRPC pipeline whose
+    /// `tokenizer_path` label names `source`, as a worker whose registration
+    /// loaded the model's tokenizer.
     fn worker(app_context: &AppContext, url: &str, model: &str, source: &str) -> Arc<dyn Worker> {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(url)
                 .model(ModelCard::new(model))
                 .label("tokenizer_path", source)
+                .connection_mode(ConnectionMode::Grpc)
                 .build(),
         );
         app_context.worker_registry.register(Arc::clone(&worker));
@@ -233,30 +251,76 @@ mod tests {
         );
     }
 
+    /// The registration step loads under a worker's primary model alone, so
+    /// the release asks after the primary alone: an endpoint that lists a
+    /// second model takes its primary's tokenizer with it and leaves the
+    /// listed model's entry.
     #[tokio::test]
-    async fn every_model_the_worker_listed_is_asked_after() {
+    async fn a_model_a_worker_only_lists_keeps_its_entry() {
         let app_context = app_context();
         let endpoint: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://e:8000")
                 .models(vec![ModelCard::new("a"), ModelCard::new("b")])
                 .label("tokenizer_path", "/tok/shared")
+                .connection_mode(ConnectionMode::Grpc)
                 .build(),
         );
         app_context.worker_registry.register(Arc::clone(&endpoint));
-        let other = worker(&app_context, "http://w2:8000", "b", "/tok/shared");
         tokenizer(&app_context, "a", "/tok/shared").await;
         tokenizer(&app_context, "b", "/tok/shared").await;
 
         remove(&app_context, endpoint).await;
         assert!(
             !app_context.tokenizer_registry.contains("a"),
-            "no worker serves a any more"
+            "no worker serves the primary any more"
         );
         assert!(
             app_context.tokenizer_registry.contains("b"),
-            "the other worker serves b"
+            "a listed model's entry is not the endpoint's to release"
         );
-        remove(&app_context, other).await;
-        assert!(app_context.tokenizer_registry.is_empty());
+    }
+
+    /// With autoload off the gateway manages no tokenizer: every entry is the
+    /// operator's and the step skips.
+    #[tokio::test]
+    async fn autoload_disabled_keeps_the_entry() {
+        let app_context = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .disable_tokenizer_autoload(true)
+                .build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
+        );
+        let only = worker(&app_context, "http://w1:8000", "m", "/tok/m");
+        tokenizer(&app_context, "m", "/tok/m").await;
+
+        remove(&app_context, only).await;
+        assert!(
+            app_context.tokenizer_registry.contains("m"),
+            "the gateway manages no tokenizer with autoload off"
+        );
+    }
+
+    /// An HTTP worker's registration loaded no tokenizer, so none of its
+    /// leaves: the startup tokenizer of the router's model stays.
+    #[tokio::test]
+    async fn an_http_last_worker_keeps_the_entry() {
+        let app_context = app_context();
+        let only: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .model(ModelCard::new("m"))
+                .label("tokenizer_path", "/tok/m")
+                .connection_mode(ConnectionMode::Http)
+                .build(),
+        );
+        app_context.worker_registry.register(Arc::clone(&only));
+        tokenizer(&app_context, "m", "/tok/m").await;
+
+        remove(&app_context, only).await;
+        assert!(
+            app_context.tokenizer_registry.contains("m"),
+            "an HTTP worker's registration loaded no tokenizer"
+        );
     }
 }
