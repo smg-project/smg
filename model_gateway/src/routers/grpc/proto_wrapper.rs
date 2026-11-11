@@ -1132,26 +1132,22 @@ impl DispatchBooking {
 
     /// [`Self::book`] for a request dispatched at `dispatched_at`: the one
     /// instant the dispatch read, which its deadline runs from too, stamps
-    /// the prefill booking.
+    /// the prefill booking and the start of the worker's tracked run.
     pub(crate) fn book_at(
         worker: &Arc<dyn Worker>,
         prompt_tokens: u64,
         streaming: bool,
         dispatched_at: Instant,
     ) -> Self {
+        let now_ms = liveness::ms_at(dispatched_at);
         let progress = streaming.then(|| {
-            worker.note_tracked_started();
+            worker.note_tracked_started_at(now_ms);
             ProgressTicket {
                 worker: Arc::clone(worker),
             }
         });
         Self {
-            prefill: PrefillTicket::book_as_at(
-                worker,
-                prompt_tokens,
-                streaming,
-                liveness::ms_at(dispatched_at),
-            ),
+            prefill: PrefillTicket::book_as_at(worker, prompt_tokens, streaming, now_ms),
             progress,
         }
     }
