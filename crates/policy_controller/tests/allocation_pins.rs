@@ -133,7 +133,7 @@ fn a_decision_after_a_soft_filter_fallback_allocates_nothing() {
 #[test]
 fn a_round_robin_decision_over_a_changing_survivor_set_allocates_nothing() {
     // One tried exclusion rotating through the pool makes every survivor set
-    // new to the rotation table: its slot-claim path must not allocate.
+    // new to the rotation table: its claim path must not allocate.
     let engine = engine_of("round_robin");
     for n in [64u32, 512] {
         let view = fleet(n);

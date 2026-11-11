@@ -243,10 +243,9 @@ struct SinceReport {
     /// The held token-work in the high bits and the held requests in the low
     /// [`REQUEST_BITS`]: one word, so a reader never sees a torn pair.
     held: AtomicU64,
-    /// The instant of the oldest held dispatch over every lane; `u64::MAX`
-    /// when none. A dispatch lowers it under its lane's lock; a release
-    /// recomputes it under every lane's lock, so it never reads above a held
-    /// dispatch.
+    /// The lowest of the lanes' front instants; `u64::MAX` when none. A
+    /// dispatch lowers it under its lane's lock; a release recomputes it
+    /// under every lane's lock, so it never reads above any lane's front.
     oldest_micros: AtomicU64,
     lanes: [DispatchLane; DISPATCH_LANES],
 }
@@ -260,7 +259,7 @@ type Dispatches = VecDeque<(u64, u32)>;
 #[repr(align(64))]
 struct DispatchLane {
     dispatches: Mutex<Dispatches>,
-    /// The instant of this lane's oldest dispatch; `u64::MAX` when none.
+    /// The instant at this lane's front; `u64::MAX` when none.
     oldest_micros: AtomicU64,
 }
 
@@ -294,6 +293,12 @@ fn lane_of_this_thread() -> usize {
             drawn
         })
     })
+}
+
+/// Pins this thread's lane, so a test owns one lane per thread.
+#[cfg(test)]
+fn take_lane(lane: usize) {
+    LANE.with(|drawn| drawn.set(Some(lane)));
 }
 
 impl Default for DispatchLane {
@@ -1037,28 +1042,40 @@ impl Picker for PowerOfTwoCountFirst {
 
 /// A rotation per survivor set, keyed by the set's rows (id and DP rank) in
 /// order; a set seen first starts from a shared advancing position. The
-/// rotations live in a fixed table of 4,096 words the key indexes, each
-/// holding a tag of the key and the set's next position: a
-/// decision over a known set advances its word, a set seen first claims its
-/// slot in place, and a set whose slot another set holds takes it over, so
-/// the other starts from the shared position when seen again (the
-/// forgetting a full table had, per slot). No path takes a lock or
-/// allocates; two sets racing for one slot may take one position from each
+/// rotations live in a fixed table of 512 buckets the key picks one of, each
+/// one cache line of eight words, each word holding a tag of its key and the
+/// set's next position: a decision over a known set advances its word, a set
+/// seen first claims an empty word of its bucket in place, and only a set
+/// whose bucket is full takes a word, the one the shared position names, so
+/// that word's set starts from the shared position when seen again (the
+/// forgetting a full table had, per bucket). No path takes a lock or
+/// allocates; two sets racing for one word may take one position from each
 /// other's rotation.
 #[derive(Debug)]
 pub struct RoundRobin {
-    slots: Box<[AtomicU64]>,
+    buckets: Box<[Bucket]>,
     next_start: AtomicU64,
 }
 
-/// Words of the rotation table: the top [`SLOT_BITS`] of the mixed key pick
-/// one, and the 31 bits below them are the word's tag.
-const SLOT_BITS: u32 = 12;
-const ROTATION_SLOTS: usize = 1 << SLOT_BITS;
+/// One cache line of rotation words: a set lives in whichever word of its
+/// bucket holds its tag.
+#[derive(Debug)]
+#[repr(align(64))]
+struct Bucket {
+    ways: [AtomicU64; WAYS],
+}
 
-/// The odd multiplier that mixes a key before it is split into a slot and a
-/// tag, so two sets that differ in one row's rank (the key's top bits) take
-/// different slots.
+/// Words per bucket: one cache line of them.
+const WAYS: usize = 8;
+
+/// Buckets of the rotation table: the top [`BUCKET_BITS`] of the mixed key
+/// pick one, and the 31 bits below them are the word's tag.
+const BUCKET_BITS: u32 = 9;
+const ROTATION_BUCKETS: usize = 1 << BUCKET_BITS;
+
+/// The odd multiplier that mixes a key before it is split into a bucket and
+/// a tag, so two sets that differ in one row's rank (the key's top bits)
+/// take different buckets.
 const KEY_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// A word no set has claimed: its tag has bit 31 set, which no key's tag has.
@@ -1070,6 +1087,14 @@ const EMPTY_SLOT: u64 = u64::MAX;
 const POSITION_BITS: u32 = 32;
 const POSITION_MASK: u64 = (1 << POSITION_BITS) - 1;
 
+impl Default for Bucket {
+    fn default() -> Self {
+        Self {
+            ways: [const { AtomicU64::new(EMPTY_SLOT) }; WAYS],
+        }
+    }
+}
+
 impl Default for RoundRobin {
     fn default() -> Self {
         Self::new()
@@ -1079,9 +1104,7 @@ impl Default for RoundRobin {
 impl RoundRobin {
     pub fn new() -> Self {
         Self {
-            slots: (0..ROTATION_SLOTS)
-                .map(|_| AtomicU64::new(EMPTY_SLOT))
-                .collect(),
+            buckets: (0..ROTATION_BUCKETS).map(|_| Bucket::default()).collect(),
             next_start: AtomicU64::new(0),
         }
     }
@@ -1100,35 +1123,48 @@ impl RoundRobin {
         h
     }
 
-    /// The key's slot and its tag in place: the mixed key's top bits and the
-    /// 31 below them, so every bit of the key reaches both.
-    fn slot_of(key: u64) -> (usize, u64) {
+    /// The key's bucket and its tag in place: the mixed key's top bits and
+    /// the 31 below them, so every bit of the key reaches both.
+    fn bucket_of(key: u64) -> (usize, u64) {
         let mixed = key.wrapping_mul(KEY_MIX);
-        let slot = (mixed >> (64 - SLOT_BITS)) as usize;
-        let tag = (mixed >> (64 - SLOT_BITS - 31)) & 0x7FFF_FFFF;
-        (slot, tag << POSITION_BITS)
+        let bucket = (mixed >> (64 - BUCKET_BITS)) as usize;
+        let tag = (mixed >> (64 - BUCKET_BITS - 31)) & 0x7FFF_FFFF;
+        (bucket, tag << POSITION_BITS)
     }
 
     fn advance(&self, key: u64) -> u64 {
-        let (index, tag) = Self::slot_of(key);
-        let slot = &self.slots[index];
-        let mut word = slot.load(Ordering::Relaxed);
+        let (index, tag) = Self::bucket_of(key);
+        let ways = &self.buckets[index].ways;
         loop {
-            if word & !POSITION_MASK == tag {
-                return slot.fetch_add(1, Ordering::Relaxed) & POSITION_MASK;
+            let mut empty = None;
+            for way in ways {
+                let word = way.load(Ordering::Relaxed);
+                if word & !POSITION_MASK == tag {
+                    return way.fetch_add(1, Ordering::Relaxed) & POSITION_MASK;
+                }
+                if word == EMPTY_SLOT && empty.is_none() {
+                    empty = Some((way, word));
+                }
             }
-            // A set seen first, or one whose slot another set holds: it takes
-            // the slot from the shared position. Another decision may have
-            // claimed the slot meanwhile: its word is read again.
+            // A set seen first claims an empty word from the shared position;
+            // one whose bucket is full takes the word the position names, and
+            // that word's set starts again when seen. Another decision may
+            // have changed the word meanwhile: the bucket is read again.
             let start = self.next_start.fetch_add(1, Ordering::Relaxed) & POSITION_MASK;
-            match slot.compare_exchange(
-                word,
-                tag | ((start + 1) & POSITION_MASK),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return start,
-                Err(now) => word = now,
+            let (way, word) = empty.unwrap_or_else(|| {
+                let way = &ways[(start as usize) % WAYS];
+                (way, way.load(Ordering::Relaxed))
+            });
+            if way
+                .compare_exchange(
+                    word,
+                    tag | ((start + 1) & POSITION_MASK),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return start;
             }
         }
     }
@@ -1216,23 +1252,44 @@ mod tests {
     }
 
     #[test]
-    fn a_set_whose_slot_another_set_takes_starts_again_from_the_shared_position() {
-        // Keys a and b share a slot under different tags; c takes another
-        // slot. A fresh table's shared position runs 0, 1, 2, ... per claim.
+    fn two_sets_of_one_bucket_keep_their_own_rotations() {
+        // Keys a and b share a bucket under different tags. A fresh table's
+        // shared position runs 0, 1, 2, ... per claim: a claims at 0, b at
+        // 1, and seen in turn for a thousand rounds each walks on by one,
+        // neither taking the other's word.
         let rr = RoundRobin::new();
         let a = 0x0123_4567_89ab_cdefu64;
-        let (slot_a, tag_a) = RoundRobin::slot_of(a);
+        let (bucket_a, tag_a) = RoundRobin::bucket_of(a);
         let b = (1u64..)
-            .find(|&k| k != a && RoundRobin::slot_of(k).0 == slot_a)
-            .expect("a key sharing a's slot");
-        assert_ne!(RoundRobin::slot_of(b).1, tag_a, "b's tag differs");
-        let c = (1u64..)
-            .find(|&k| RoundRobin::slot_of(k).0 != slot_a)
-            .expect("a key in another slot");
-        assert_eq!([rr.advance(a), rr.advance(a), rr.advance(a)], [0, 1, 2]);
-        assert_eq!([rr.advance(b), rr.advance(b)], [1, 2], "b takes the slot");
-        assert_eq!([rr.advance(a), rr.advance(a)], [2, 3], "a starts again");
-        assert_eq!([rr.advance(c), rr.advance(c)], [3, 4], "c's own slot");
+            .find(|&k| k != a && RoundRobin::bucket_of(k).0 == bucket_a)
+            .expect("a key sharing a's bucket");
+        assert_ne!(RoundRobin::bucket_of(b).1, tag_a, "b's tag differs");
+        assert_eq!([rr.advance(a), rr.advance(b)], [0, 1]);
+        for n in 1..1_000 {
+            assert_eq!([rr.advance(a), rr.advance(b)], [n, n + 1], "round {n}");
+        }
+    }
+
+    #[test]
+    fn a_ninth_set_of_a_full_bucket_takes_the_word_the_shared_position_names() {
+        // Nine keys share a bucket of eight words. The ninth, claiming at
+        // the shared position 8, takes word 0 from the first set; the first,
+        // seen again, claims at 9 and takes word 1 from the second; a set
+        // whose word nobody took walks on.
+        let rr = RoundRobin::new();
+        let bucket = RoundRobin::bucket_of(0x0123_4567_89ab_cdef).0;
+        let keys: Vec<u64> = (1u64..)
+            .filter(|&k| RoundRobin::bucket_of(k).0 == bucket)
+            .take(9)
+            .collect();
+        for (n, &k) in keys[..8].iter().enumerate() {
+            assert_eq!(rr.advance(k), n as u64, "each claims a word of its own");
+        }
+        assert_eq!(rr.advance(keys[8]), 8, "the ninth takes word 0");
+        assert_eq!(rr.advance(keys[2]), 3, "the third walks on");
+        assert_eq!(rr.advance(keys[0]), 9, "the first starts again, at word 1");
+        assert_eq!(rr.advance(keys[8]), 9, "the ninth walks on");
+        assert_eq!(rr.advance(keys[1]), 10, "the second starts again");
     }
 
     #[test]
@@ -1889,12 +1946,14 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_dispatches_and_decisions_keep_the_tally_exact() {
-        // Eight threads each book 500 dispatches on their own rank and on
-        // one shared rank while deciding in between; the count held per
-        // rank is exact at the end, both in the lanes and in the held word a
-        // decision reads, and a report sampled after every dispatch
-        // releases them all.
+    fn concurrent_dispatches_and_releases_keep_the_tally_exact() {
+        // Eight threads, one per lane, each book 500 dispatches at rising
+        // instants on their own rank and on one shared rank, and every
+        // fifty score over a pool sampled at a midpoint that moves forward,
+        // so releases run while other lanes add. A sample at the midpoint
+        // then leaves the later half of every lane, exact in the lanes and
+        // in the held word a decision reads, and a sample past every
+        // dispatch releases them all.
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
         let mut pool: Vec<Candidate> = (0..9).map(|i| candidate(i, 0)).collect();
         for c in &mut pool {
@@ -1902,44 +1961,52 @@ mod tests {
             c.load_sampled_at_micros = 1_000;
         }
         let kept: Vec<u32> = (0..9).collect();
+        let sampled_at = |pool: &[Candidate], at: u64| -> Vec<Candidate> {
+            let mut sampled = pool.to_vec();
+            for c in &mut sampled {
+                c.load_sampled_at_micros = at;
+            }
+            sampled
+        };
         std::thread::scope(|s| {
             for t in 0..8u32 {
-                let (ll, pool, kept) = (&ll, &pool, &kept);
+                let (ll, pool, kept, sampled_at) = (&ll, &pool, &kept, &sampled_at);
                 s.spawn(move || {
-                    let lease = Lease {
-                        issued_micros: 2_000,
-                        tokens: 7,
-                        ..Lease::default()
-                    };
+                    take_lane(t as usize);
                     let mut scores = vec![0.0f32; 9];
-                    for n in 0..500 {
+                    for n in 0..500u64 {
+                        let lease = Lease {
+                            issued_micros: 2_000 + n,
+                            tokens: 7,
+                            ..Lease::default()
+                        };
                         ll.on_dispatched(&lease, &target_of(&pool[t as usize]), Side::Single, 0);
                         ll.on_dispatched(&lease, &target_of(&pool[8]), Side::Single, 0);
                         if n % 50 == 0 {
-                            ll.score(&RequestFacts::default(), pool, kept, &mut scores);
+                            let midpoint = sampled_at(pool, 2_000 + n / 2);
+                            ll.score(&RequestFacts::default(), &midpoint, kept, &mut scores);
                         }
                     }
                 });
             }
         });
+        let mut scores = vec![0.0f32; 9];
+        let midpoint = sampled_at(&pool, 2_250);
+        ll.score(&RequestFacts::default(), &midpoint, &kept, &mut scores);
         for c in &pool[..8] {
-            assert_eq!(ll.held(c.id), 500, "{:?}", c.id);
-            assert_eq!(ll.held_word_at(c.id, 0), (3_500, 500), "{:?}", c.id);
+            assert_eq!(ll.held(c.id), 249, "{:?}", c.id);
+            assert_eq!(ll.held_word_at(c.id, 0), (249 * 7, 249), "{:?}", c.id);
         }
-        assert_eq!(ll.held(pool[8].id), 4_000, "the shared rank");
+        assert_eq!(ll.held(pool[8].id), 8 * 249, "the shared rank");
         assert_eq!(
             ll.held_word_at(pool[8].id, 0),
-            (28_000, 4_000),
+            (8 * 249 * 7, 8 * 249),
             "the shared rank's word"
         );
-        let mut sampled = pool.clone();
-        for c in &mut sampled {
-            c.load_sampled_at_micros = 3_000;
-        }
-        let mut scores = vec![0.0f32; 9];
-        ll.score(&RequestFacts::default(), &sampled, &kept, &mut scores);
-        assert!(sampled.iter().all(|c| ll.held(c.id) == 0));
-        assert!(sampled.iter().all(|c| ll.held_word_at(c.id, 0) == (0, 0)));
+        let past = sampled_at(&pool, 3_000);
+        ll.score(&RequestFacts::default(), &past, &kept, &mut scores);
+        assert!(past.iter().all(|c| ll.held(c.id) == 0));
+        assert!(past.iter().all(|c| ll.held_word_at(c.id, 0) == (0, 0)));
     }
 
     #[test]

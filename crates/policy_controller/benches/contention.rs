@@ -33,7 +33,7 @@ use smg_policy_controller::{
 /// The presets with a stateful stage (the credit tally, the rotation table)
 /// and the stateless control; `round_robin_churn` decides over a survivor
 /// set that differs per decision (one tried exclusion rotating through the
-/// pool), the rotation table's slot-claim path.
+/// pool), the rotation table's claim path.
 const PRESETS: [&str; 4] = [
     "least_load",
     "round_robin",
