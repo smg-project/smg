@@ -3857,6 +3857,94 @@ fn the_corpus_replay_reads_a_v3_2_set_recorded_in_chat_mode_without_the_reasonin
     }
 }
 
+/// The witness rule's second exception, which the sampled corpus run does not reach (the set
+/// [`LIBRARY_DEFECTS`] records lies outside the pinned sample): a one-case set under the recorded
+/// slug, written here with the recorded id and a witness of the recorded library, replayed twice.
+/// With the library reading the call's parameter under another name the case stays bitwise
+/// against the reference, nothing fails, and the report carries the recorded reason beside the
+/// library's actual reading; with the library reading the case as the parser does the run fails
+/// naming the stale entry. The prompt is stated as opening the thought when asked, so the
+/// family's expected list holds no probe and the one-case set is whole.
+#[test]
+fn a_recorded_library_defect_is_reported_and_fails_once_the_library_reads_as_the_parser() {
+    let defect = &LIBRARY_DEFECTS[0];
+    let (slug, _) = defect
+        .id
+        .split_once('/')
+        .expect("the recorded id carries its slug");
+    assert!(
+        MODELS.iter().any(|(recorded, _)| *recorded == slug),
+        "{slug}: not among the recorded models"
+    );
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("library-defect-replay-{}", std::process::id()));
+    let dir = root.join(slug).join("parse");
+    fs::create_dir_all(&dir).expect("the set's directory");
+    let block = concat!(
+        "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n",
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    );
+    let message = |arguments: &str| {
+        serde_json::json!({
+            "content": "Checking now.",
+            "tool_calls": [{"function": {"name": "get_weather", "arguments": arguments}}]
+        })
+    };
+    let replay = |witness_arguments: &str| {
+        let case = serde_json::json!({
+            "id": defect.id,
+            "request": {"chat_template_kwargs": {"enable_thinking": false}},
+            "reference": {
+                "text": format!("Checking now.\n\n{block}"),
+                "message": message("{\"city\": \"Paris\"}"),
+                "finish_reason": "tool_calls",
+            },
+            "witnesses": {
+                defect.library: {
+                    "message": message(witness_arguments),
+                    "finish_reason": "tool_calls",
+                }
+            },
+        });
+        fs::write(dir.join("common.jsonl"), case.to_string() + "\n").expect("the set");
+        match replay_model(&root, slug, GenerationPrompt::OpensTheThoughtWhenAsked) {
+            Replayed::Compared {
+                report, failures, ..
+            } => (report, failures),
+            Replayed::Skipped(why) => (why, vec!["the slug was skipped".to_string()]),
+        }
+    };
+    let (report, failures) = replay("{\"cit\": \"Paris\"}");
+    let (stale_report, stale_failures) = replay("{\"city\": \"Paris\"}");
+    fs::remove_dir_all(&root).expect("the tree removed");
+    assert!(
+        failures.is_empty(),
+        "the recorded wrong reading failed the run: {failures:#?}\n{report}"
+    );
+    let verdict = report
+        .lines()
+        .find(|line| line.ends_with(defect.id))
+        .map_or("not in the report", str::trim_start);
+    assert!(verdict.starts_with("bitwise"), "{verdict}\n{report}");
+    let recorded = format!(
+        "{} reads it wrongly, as recorded: {}; it read: ",
+        defect.library, defect.reason
+    );
+    assert!(
+        report.contains(&recorded) && report.contains("\\\"cit\\\""),
+        "the recorded line with the library's reading is not in the report:\n{report}"
+    );
+    let stale = format!(
+        "{}: recorded as a wrong reading of {} but read as the parser now",
+        defect.id, defect.library
+    );
+    assert!(
+        stale_failures.len() == 1 && stale_failures[0].starts_with(&stale),
+        "{stale_failures:#?}\n{stale_report}"
+    );
+}
+
 /// Spins until `ready` holds, for at most ten seconds, so that a test waiting on another thread's
 /// progress fails with `never` rather than hangs.
 fn wait_until(ready: impl Fn() -> bool, never: &str) {
