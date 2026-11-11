@@ -1062,7 +1062,7 @@ mod tests {
                 "model": "m", "max_tokens": 8,
                 "messages": [
                     {"role": "user", "content": "hi"},
-                    {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "m1", "name": "echo", "server_name": "s", "input": {}}]}
+                    {"role": "user", "content": [{"type": "container_upload", "file_id": "file_1"}]}
                 ]
             })
             .to_string(),
@@ -1076,7 +1076,7 @@ mod tests {
         let message = json["error"]["message"].as_str().unwrap_or_default();
         assert!(
             message.starts_with(
-                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages[1].content[0].type: unknown variant `mcp_tool_use`, expected one of `text`, `image`"
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages[1].content[0].type: unknown variant `container_upload`, expected one of `text`, `image`"
             ),
             "{message}"
         );
