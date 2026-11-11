@@ -3883,11 +3883,13 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     # main's floor quotes an older floor in its comment and has an entry after it
     floor = '    "smg-grpc-proto>=0.4.0",  # up from "smg-grpc-proto>=0.3.0"\n'
     extra = 'mlx = ["smg-grpc-proto>=0.4.0", "mlx>=0.22.0"]\n'
+    # an extra whose first entry is a literal string with a URL fragment: its hash opens no comment
+    frag = "cu = ['wheel @ https://example.org/w.whl#sha256=abc', \"smg-grpc-proto>=0.4.0\"]\n"
     repo.commit_main(
         "chore(servicer): the floors",
         "grpc_servicer/pyproject.toml",
         '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n'
-        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}',
+        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}{frag}',
     )
     repo.cut()
     # the branch's bump raised the floors with what it published (by hand, as a cut's review does):
@@ -3899,7 +3901,8 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
         "grpc_servicer/pyproject.toml",
         repo.read("grpc_servicer/pyproject.toml")
         .replace(floor + '    "grpcio>=1.60",\n', '    "grpcio>=1.70",\n' + raised)
-        .replace(extra, 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.23.0"]\n'),
+        .replace(extra, 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.23.0"]\n')
+        .replace(frag, frag.replace("0.4.0", "0.5.0")),
     )
     repo.git("add", "-A")
     repo.git("commit", "--quiet", "-m", "chore(release): the servicer's floors")
@@ -3917,15 +3920,16 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     # the branch's requirement and comment, main's comma (an entry follows on main): one line
     followed = '    "smg-grpc-proto>=0.5.0",  # 0.5.0 adds the fields the servicer reads\n'
     assert followed in text, text
-    assert text.count("smg-grpc-proto>=0.5.0") == 2 and "0.3.0" not in text, text
+    assert text.count("smg-grpc-proto>=0.5.0") == 3 and "0.3.0" not in text, text
     assert 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.22.0"]\n' in text, text
+    assert frag.replace("0.4.0", "0.5.0") in text, text
     assert tomllib.loads(text)["project"]["dependencies"] == [
         "smg-grpc-proto>=0.5.0",
         "grpcio>=1.60",
     ]
     assert '"grpcio>=1.60"' in text, "a floor on a package that is not ours is the maintainer's"
-    assert done.stdout.count("grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0") == 2
-    assert "0.4.0 -> 0.5.0 (requirement 2)" in done.stdout, done.stdout
+    assert done.stdout.count("grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0") == 3
+    assert "0.4.0 -> 0.5.0 (requirement 3)" in done.stdout, done.stdout
     again = subprocess.run(
         [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
         cwd=repo.work,
@@ -3947,6 +3951,54 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     )
     assert kept.returncode == 0 and "already follows" in kept.stdout, kept.stdout
     assert repo.read("grpc_servicer/pyproject.toml") == higher
+
+
+def test_sync_versions_refuses_a_floor_it_cannot_pair_by_position(repo: Sandbox) -> None:
+    """A name that occurs a different number of times in main's file and the release's (an extra
+    added on one side since the cut, placed before an older one) cannot be paired by position: the
+    sync names the file, the name and the counts, moves nothing for that name and fails, so the
+    release flow stops for a move by hand rather than writing a floor onto the wrong entry."""
+    floor = '    "smg-grpc-proto>=0.4.0",\n'
+    extra = 'mlx = ["smg-grpc-proto>=0.4.0", "mlx>=0.22.0"]\n'
+    repo.commit_main(
+        "chore(servicer): the floors",
+        "grpc_servicer/pyproject.toml",
+        '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n'
+        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}',
+    )
+    repo.cut()
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml").replace("0.4.0", "0.5.0"),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(release): the servicer's floors")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    # main added an extra with its own requirement on the proto package, before the mlx extra
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml").replace(
+            extra, 'tpu = ["smg-grpc-proto>=0.4.0"]\n' + extra
+        ),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "feat(servicer): a tpu extra")
+    done = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert (
+        "sync_versions: grpc_servicer/pyproject.toml: smg-grpc-proto>= occurs 3 time(s) here and 2"
+        " in origin/release/1.14: the pairing is ambiguous, not moved (move it by hand)"
+    ) in done.stderr, done.stderr
+    text = repo.read("grpc_servicer/pyproject.toml")
+    assert "0.5.0" not in text and text.count("smg-grpc-proto>=0.4.0") == 3, text
 
 
 def test_sync_versions_usage_and_version_order() -> None:

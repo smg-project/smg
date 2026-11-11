@@ -73,12 +73,13 @@ def line_of(text: str, start: int, end: int) -> tuple[int, int]:
 
 def in_comment(text: str, start: int) -> bool:
     """Whether ``text[start]`` sits in a TOML comment: a ``#`` outside quotes earlier on its line
-    (a comment that quotes a floor names no requirement)."""
-    quoted = False
+    (a comment that quotes a floor names no requirement; a ``#`` inside a basic or a literal
+    string, a URL's fragment, opens no comment)."""
+    quote = ""
     for char in text[text.rfind("\n", 0, start) + 1 : start]:
-        if char == '"':
-            quoted = not quoted
-        elif char == "#" and not quoted:
+        if char in "\"'" and quote in ("", char):
+            quote = "" if quote else char  # a basic or a literal string opens and closes
+        elif char == "#" and not quote:
             return True
     return False
 
@@ -183,12 +184,29 @@ def main(argv: list[str] | None = None) -> int:
             continue
         theirs = floors(theirs_text, names)
         text = repo.read(component.version_file)
+        mine = floors(text, names)
+        # a name that occurs a different number of times in the two files cannot be paired by
+        # position (an extra added on one side since the cut may sit before an older one): the
+        # name is refused with its counts, for a move by hand, and the run reports the failure
+        ambiguous = {
+            name
+            for name in mine.keys() | theirs.keys()
+            if len(mine.get(name, [])) != len(theirs.get(name, []))
+        }
+        for name in sorted(ambiguous):
+            print(
+                f"sync_versions: {component.version_file}: {name}>= occurs"
+                f" {len(mine.get(name, []))} time(s) here and {len(theirs.get(name, []))} in {ref}:"
+                " the pairing is ambiguous, not moved (move it by hand)",
+                file=sys.stderr,
+            )
+            failed += 1
         seen: dict[str, int] = {}
         pieces: list[str] = []
         end = 0
         for match in FLOOR.finditer(text):
             name, floor = match[1], match[2]
-            if name not in names or in_comment(text, match.start()):
+            if name not in names or name in ambiguous or in_comment(text, match.start()):
                 continue
             k = seen.get(name, 0)
             seen[name] = k + 1
