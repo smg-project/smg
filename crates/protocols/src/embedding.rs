@@ -7,6 +7,8 @@ use super::common::{GenerationRequest, UsageInfo};
 // Embedding API
 // ============================================================================
 
+/// A request to the embeddings route: the model, the input (a text, texts,
+/// token ids or a batch of them) and the encoding format of the vectors.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct EmbeddingRequest {
@@ -57,6 +59,8 @@ impl GenerationRequest for EmbeddingRequest {
     }
 }
 
+/// One embedding of the answer, object `embedding`: the vector and the index of
+/// the input it embeds.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EmbeddingObject {
     pub object: String, // "embedding"
@@ -64,6 +68,8 @@ pub struct EmbeddingObject {
     pub index: u32,
 }
 
+/// The answer of the embeddings route, object `list`: one embedding per input,
+/// the model and the usage.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EmbeddingResponse {
     pub object: String, // "list"

@@ -17,6 +17,9 @@ use crate::{common::invalid, validated::Normalizable};
 // Completions API (v1/completions) - DEPRECATED but still supported
 // ============================================================================
 
+/// A request to the completions route: the model, the prompt (a text, texts,
+/// token ids or lists of them) and the sampling and streaming parameters,
+/// validated together before dispatch.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_completion_cross_parameters"))]
@@ -421,6 +424,8 @@ impl<'de> Deserialize<'de> for CompletionPrompt {
 // Response Types
 // ============================================================================
 
+/// The complete (non-streamed) answer of the completions route, object
+/// `text_completion`: the choices with their texts, and the usage.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionResponse {
@@ -433,6 +438,9 @@ pub struct CompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
+/// One generated alternative of a completion: its text, its index, the log
+/// probabilities when requested, the reason generation stopped and the stop
+/// condition it matched.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionChoice {
     pub text: String,
@@ -445,6 +453,8 @@ pub struct CompletionChoice {
     pub matched_stop: Option<Value>, // Can be string or integer
 }
 
+/// One chunk of a streamed completion, object `text_completion`: the choices'
+/// text pieces and, on the last chunk when requested, the usage.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionStreamResponse {
     pub id: String,
@@ -458,6 +468,9 @@ pub struct CompletionStreamResponse {
     pub usage: Option<Usage>,
 }
 
+/// One alternative's part of a streamed completion chunk: the text since the
+/// previous chunk, its index, the log probabilities when requested, and the
+/// finish reason once it stops.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionStreamChoice {
     pub text: String,
