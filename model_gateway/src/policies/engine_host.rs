@@ -380,6 +380,12 @@ pub struct HostRequest<'a> {
     /// The prefill capacity window as the host reads it, when the decision
     /// is a prefill side's; every candidate has capacity otherwise.
     pub has_capacity: Option<CapacityCheck<'a>>,
+    /// The request's lease sequence when the router drew it before it
+    /// captured its candidates ([`Decider::begin`]): the decision and the
+    /// one re-decision over the same candidates run under it, so a handle
+    /// retired after the draw is booked by neither commit. `None` numbers
+    /// the lease when its view is built.
+    pub sequence: Option<LeaseId>,
 }
 
 /// What the encode items of one request share, as the host holds it: the
@@ -583,16 +589,28 @@ impl Decider {
     }
 
     /// Record `id`'s retirement at the next lease to be issued. A lease is
-    /// numbered before its view is built, so every decision that began
-    /// before this call carries a lower sequence.
+    /// numbered at the router's capture (`begin`) or before its view is
+    /// built, so every decision that began before this call carries a lower
+    /// sequence.
     fn retire(&self, id: WorkerId) {
         self.retired
             .lock()
             .retire(id, self.seq.load(Ordering::Relaxed));
     }
 
-    /// Decisions taken so far, each `decide` or `decide_pair` call one; for
-    /// tests and dumps.
+    /// Draw a request's lease sequence before its candidates are captured.
+    /// A router that reads the pool after this call books nothing on a
+    /// handle retired from then on, however the retirement interleaves with
+    /// its capture and its decision: [`HostRequest::sequence`] carries the
+    /// draw into [`Decider::decide`], and the one re-decision over the same
+    /// candidates reuses it. A request without one is numbered when its
+    /// view is built.
+    pub fn begin(&self) -> LeaseId {
+        LeaseId(self.seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Lease sequences drawn so far: each `begin`, and each `decide` or
+    /// `decide_pair` call without a drawn one; for tests and dumps.
     pub fn decisions(&self) -> u64 {
         self.seq.load(Ordering::Relaxed).saturating_sub(1)
     }
@@ -734,9 +752,10 @@ impl Decider {
         excluded: &[WorkerId],
     ) -> (Decision, Lease) {
         let now = Instant::now();
-        // Numbered before the view is built: a retirement that lands during
-        // the decision outdates this lease (see `Retired`).
-        let id = LeaseId(self.seq.fetch_add(1, Ordering::Relaxed));
+        // Under the sequence the router drew at its capture, or one drawn
+        // here before the view is built: a retirement that lands after the
+        // draw outdates this lease (see `Retired`).
+        let id = request.sequence.unwrap_or_else(|| self.begin());
         let snapshot = self.snapshot();
         let session_key = request.session_key.map_or(Identity::NONE, |key| {
             Identity::scoped(key, session_scope(request.model, request.phase))
@@ -891,9 +910,10 @@ impl Decider {
         excluded: &[WorkerId],
     ) -> (Decision, Lease, Vec<Arc<dyn Worker>>) {
         let now = Instant::now();
-        // Numbered before the view is built: a retirement that lands during
-        // the decision outdates this lease (see `Retired`).
-        let id = LeaseId(self.seq.fetch_add(1, Ordering::Relaxed));
+        // Under the sequence the router drew at its capture, or one drawn
+        // here before the view is built: a retirement that lands after the
+        // draw outdates this lease (see `Retired`).
+        let id = request.sequence.unwrap_or_else(|| self.begin());
         let snapshot = self.snapshot();
         let session_key = request.session_key.map_or(Identity::NONE, Identity::plain);
         let build = ViewBuild {
@@ -2453,6 +2473,77 @@ mod tests {
             "the retired handle reads idle: a lease numbered before the view booked nothing"
         );
     }
+    /// A retirement that lands between a router's capture of its candidates
+    /// and its decision outdates the lease when the router drew the request's
+    /// sequence first: the captured slice still holds the retired handle, the
+    /// decision and the one re-decision over that slice run under the drawn
+    /// sequence, and neither commit books on it.
+    #[test]
+    fn a_commit_under_a_sequence_drawn_before_the_retirement_books_nothing() {
+        let config = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = decider(&config);
+        let (workers, _reports) = fed_pair(&decider);
+        let leader = || {
+            let (decision, _) = decider.decide(&request(), &workers, &[]);
+            decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .iter()
+                .next()
+                .map(|t| t.position)
+        };
+        // The router's order: the sequence, then the candidate slice (both
+        // handles), then the first worker's retirement lands, then the
+        // decision over the stale slice.
+        let sequence = decider.begin();
+        let captured = workers.clone();
+        decider.on_worker_removed(workers[0].as_ref());
+        let under_sequence = HostRequest {
+            prompt_tokens: decider.prompt_tokens(None),
+            sequence: Some(sequence),
+            ..request()
+        };
+        let (decision, lease) = decider.decide(&under_sequence, &captured, &[]);
+        assert_eq!(
+            lease.id, sequence,
+            "the decision runs under the drawn sequence"
+        );
+        decider
+            .commit(&lease, &decision, Side::Single, |t| t.position == 0)
+            .expect("the dispatch itself proceeds");
+        // The one re-decision over the same slice, the live worker excluded
+        // as a commit miss would exclude it, keeps the sequence.
+        let live = worker_id(workers[1].as_ref());
+        let (again, lease) = decider.decide(&under_sequence, &captured, &[live]);
+        assert_eq!(
+            lease.id, sequence,
+            "the re-decision keeps the drawn sequence"
+        );
+        decider
+            .commit(&lease, &again, Side::Single, |t| t.position == 0)
+            .expect("the re-decision's dispatch proceeds too");
+        // One small booking on the other worker: the retired handle, idle,
+        // still leads; either stale booking at the mean size would have lost it.
+        let small = HostRequest {
+            prompt_tokens: 1,
+            ..request()
+        };
+        let (decision, lease) = decider.decide(&small, &workers, &[]);
+        decider
+            .commit(&lease, &decision, Side::Single, |t| t.position == 1)
+            .expect("the other worker is booked");
+        assert_eq!(
+            leader(),
+            Some(0),
+            "the retired handle reads idle: no commit under the drawn sequence booked on it"
+        );
+    }
+
     /// A retirement that lands while a commit runs, after its check and
     /// before its booking, waits for the booking: the check and the booking
     /// hold the retirement record's lock together, so the row the booking
