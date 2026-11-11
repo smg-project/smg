@@ -1225,6 +1225,22 @@ def services(documents: list[dict]) -> dict[str, dict]:
 
 
 @needs_helm
+@pytest.mark.parametrize(
+    "settings, words",
+    [
+        (("router.adminHost=0.0.0.0",), "router.adminPort"),
+        (("router.adminPort=30000",), "router.port"),
+        (("router.adminPort=29000", "router.metrics.port=29000"), "router.metrics.port"),
+        (("router.mesh.enabled=true", "router.adminPort=39527"), "router.mesh.port"),
+    ],
+)
+def test_an_admin_listener_the_gateway_would_refuse_is_refused_at_render(settings, words):
+    """A host without the port, or a port another listener holds, fails at the
+    gateway's start; the chart refuses both where the values are written."""
+    assert words in render_error(*settings)
+
+
+@needs_helm
 def test_the_admin_listener_renders_its_port_and_service_only_when_set():
     """Without ``router.adminPort`` nothing names the admin listener; with it
     the pod passes the flags and carries the port, and a Service of its own
@@ -1237,7 +1253,7 @@ def test_the_admin_listener_renders_its_port_and_service_only_when_set():
 
     _, documents = render(
         "router.adminPort=9001",
-        "router.adminHost=127.0.0.1",
+        "router.adminHost=0.0.0.0",
         "router.ingress.enabled=true",
         "router.ingress.hosts[0].host=smg.example.com",
         "router.ingress.hosts[0].paths[0].path=/",
@@ -1246,7 +1262,7 @@ def test_the_admin_listener_renders_its_port_and_service_only_when_set():
     pod = router_pod(documents)
     args = pod["spec"]["containers"][0]["args"]
     assert args[args.index("--admin-port") + 1] == "9001"
-    assert args[args.index("--admin-host") + 1] == "127.0.0.1"
+    assert args[args.index("--admin-host") + 1] == "0.0.0.0"
     ports = {p["name"]: p["containerPort"] for p in pod["spec"]["containers"][0]["ports"]}
     assert ports["admin"] == 9001
     admin = services(documents)["smg-router-admin"]
