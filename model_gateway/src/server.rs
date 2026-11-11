@@ -127,14 +127,14 @@ pub struct AppState {
 
 async fn parse_function_call(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ParseFunctionCallRequest>,
+    AdminJson(req): AdminJson<ParseFunctionCallRequest>,
 ) -> Response {
     parse::parse_function_call(&state.context, &req).await
 }
 
 async fn parse_reasoning(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SeparateReasoningRequest>,
+    AdminJson(req): AdminJson<SeparateReasoningRequest>,
 ) -> Response {
     parse::parse_reasoning(&state.context, &req).await
 }
@@ -836,9 +836,9 @@ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Respo
 
 async fn start_profile(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<StartProfileRequest>>,
+    body: Option<AdminJson<StartProfileRequest>>,
 ) -> Response {
-    let body = body.map_or_else(StartProfileRequest::default, |Json(body)| body);
+    let body = body.map_or_else(StartProfileRequest::default, |AdminJson(body)| body);
     WorkerManager::start_profile_all(
         &state.context.worker_registry,
         &body.options,
@@ -850,9 +850,9 @@ async fn start_profile(
 
 async fn stop_profile(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<StopProfileRequest>>,
+    body: Option<AdminJson<StopProfileRequest>>,
 ) -> Response {
-    let body = body.map_or_else(StopProfileRequest::default, |Json(body)| body);
+    let body = body.map_or_else(StopProfileRequest::default, |AdminJson(body)| body);
     WorkerManager::stop_profile_all(&state.context.worker_registry, body.url.as_deref())
         .await
         .into_response()
