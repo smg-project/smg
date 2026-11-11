@@ -308,6 +308,13 @@ fn items(body: &Value) -> Vec<(u64, Vec<f32>)> {
         .collect()
 }
 
+/// `values` in their natural order: the calls of a batch are in flight
+/// together, so a stub records them in arrival order, not the inputs' order.
+fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+    values.sort();
+    values
+}
+
 #[tokio::test]
 async fn a_batch_of_texts_is_one_call_per_text_answered_in_order() {
     let bed = Bed::new(Endpoint::Embeddings).await;
@@ -330,8 +337,19 @@ async fn a_batch_of_texts_is_one_call_per_text_answered_in_order() {
     let total: usize = expected_ids.iter().map(Vec::len).sum();
     assert_eq!(body["usage"]["prompt_tokens"], json!(total), "{body}");
     assert_eq!(body["usage"]["total_tokens"], json!(total), "{body}");
-    assert_eq!(bed.seen_ids(), expected_ids, "one call per input, in order");
-    assert_eq!(bed.seen_texts(), texts, "each call carries its own text");
+    // The calls are in flight together, so the stub's arrival order is not
+    // the inputs' order: the calls are read as a set (the response's order is
+    // asserted above).
+    assert_eq!(
+        sorted(bed.seen_ids()),
+        sorted(expected_ids),
+        "one call per input"
+    );
+    assert_eq!(
+        sorted(bed.seen_texts()),
+        sorted(texts.iter().map(|text| text.to_string()).collect()),
+        "each call carries its own text"
+    );
 }
 
 #[tokio::test]
@@ -367,7 +385,11 @@ async fn token_id_inputs_reach_the_engine_as_given() {
         "{body}"
     );
     assert_eq!(body["usage"]["prompt_tokens"], json!(3), "{body}");
-    assert_eq!(bed.seen_ids(), vec![vec![1, 2], vec![3]], "the ids as sent");
+    assert_eq!(
+        sorted(bed.seen_ids()),
+        vec![vec![1, 2], vec![3]],
+        "the ids as sent"
+    );
     assert_eq!(bed.seen_texts(), ["", ""], "no text beside the ids");
 
     let (status, body) = bed.embed(json!({"model": MODEL, "input": [4, 2, 1]})).await;
@@ -434,7 +456,11 @@ async fn a_classify_batch_is_one_result_per_input() {
     }
     let total: usize = expected_ids.iter().map(Vec::len).sum();
     assert_eq!(body["usage"]["prompt_tokens"], json!(total), "{body}");
-    assert_eq!(bed.seen_ids(), expected_ids, "one call per input, in order");
+    assert_eq!(
+        sorted(bed.seen_ids()),
+        sorted(expected_ids),
+        "one call per input"
+    );
 }
 
 #[tokio::test]

@@ -1178,8 +1178,9 @@ pub(crate) fn start_failure_response(
 /// worker and answered in the inputs' order (the wire takes one input per
 /// call). The first failure fails the request as a failed single call does,
 /// once every call has answered: a sibling in flight is never dropped
-/// mid-way, so the worker's own account of the calls it admitted stays whole;
-/// the worker is charged once, for the request.
+/// mid-way, so the worker's own account of the calls it admitted stays whole.
+/// The worker's request count takes one per call, as the batched completions
+/// route counts its sub-requests.
 async fn execute_embed(
     requests: Vec<ProtoEmbedRequest>,
     clients: &mut ClientSelection,
@@ -1188,10 +1189,14 @@ async fn execute_embed(
 ) -> Result<ExecutionResult, Response> {
     let client = &*clients.single_or_mismatch("execute_embed")?;
 
-    if let Some(worker) = workers.single() {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
-    }
-    let answers = join_all(requests.into_iter().map(|request| client.embed(request))).await;
+    let worker = workers.single();
+    let answers = join_all(requests.into_iter().map(|request| {
+        if let Some(worker) = worker {
+            Metrics::record_worker_request(worker.url(), worker.model_id());
+        }
+        client.embed(request)
+    }))
+    .await;
     let result: Result<Vec<_>, _> = answers.into_iter().collect();
     if let Some(status) = result.breaker_status() {
         workers.record_outcome(ledger, status);
