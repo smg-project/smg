@@ -40,6 +40,7 @@ use super::{
 pub(super) struct Class {
     negated: bool,
     categories: u16,
+    /// Code point ranges, sorted and disjoint once [`Class::finish`] has run.
     ranges: Vec<(u32, u32)>,
     /// Categories taken out of the class before any negation: the engine's
     /// intersection with a negated property class, `[...&&[^\p{Han}]]`.
@@ -210,8 +211,6 @@ fn folded_letters(class: Class) -> Option<Class> {
         let letter = char::from_u32(low).filter(char::is_ascii_alphabetic)?;
         fold_letter(&mut folded, letter);
     }
-    folded.ranges.sort_unstable();
-    folded.ranges.dedup();
     Some(folded)
 }
 
@@ -245,6 +244,19 @@ fn in_categories(categories: u16, code: u32) -> bool {
 
 impl Class {
     fn finish(mut self) -> Self {
+        // `in_ranges` binary-searches on the ends in start order: a range
+        // inside another breaks that, so the ranges are sorted here, once
+        // for every way a class is built, and the overlapping ones become
+        // one.
+        self.ranges.sort_unstable();
+        self.ranges.dedup_by(|next, kept| {
+            if next.0 <= kept.1 {
+                kept.1 = kept.1.max(next.1);
+                true
+            } else {
+                false
+            }
+        });
         let mut ascii = AsciiSet::default();
         for code in 0u32..128 {
             if self.contains_slow(code) {
@@ -1622,7 +1634,6 @@ impl Parser<'_> {
             class.categories |= member.categories;
             class.ranges.extend_from_slice(&member.ranges);
         }
-        class.ranges.sort_unstable();
         self.classes.truncate(first);
         Node::Class(self.add_class(class))
     }
@@ -1633,7 +1644,6 @@ impl Parser<'_> {
         let mut class = Class::default();
         if self.case_insensitive && c.is_ascii_alphabetic() {
             fold_letter(&mut class, c);
-            class.ranges.sort_unstable();
         } else {
             class.ranges.push((u32::from(c), u32::from(c)));
         }
@@ -1802,7 +1812,6 @@ impl Parser<'_> {
                 class.ranges.push((u32::from(item), u32::from(item)));
             }
         }
-        class.ranges.sort_unstable();
         Some(class)
     }
 }
@@ -2145,6 +2154,9 @@ mod tests {
             ),
             (r" ?(?:a|b|\u00E9)+|\p{N}", r" ?[ab\u00E9]+|\p{N}"),
             (r"(?:\p{N}|[,.])+\p{L}?", r"[\p{N},.]+\p{L}?"),
+            // A range inside another: the union's ranges merge in
+            // `Class::finish`, or `d`..`z` would be read as absent.
+            (r"(?:[a-z]|c)+", r"[a-zc]+"),
         ];
         let mut texts: Vec<String> = code_points_swept()
             .filter_map(char::from_u32)
@@ -2198,7 +2210,7 @@ mod tests {
             r"(?:ab|c)+",
             r"(?:[^a]|b)+",
             r"(?:\p{L}|\p{M}+)+",
-            r"(?i:a|b)+",
+            r"(?i:(?:a|b)+)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
@@ -2686,7 +2698,7 @@ mod tests {
         // subset.
         for pattern in [
             r"(?:ab)++",
-            r"(?:a|b)?+",
+            r"(?:ab|c)?+",
             r"(?:'s)*+",
             r"a{2}+",
             r"a{1,3}+",
