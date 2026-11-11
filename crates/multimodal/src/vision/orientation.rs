@@ -397,11 +397,7 @@ mod neon {
         };
         for j in 0..16 {
             let x = x0 + j;
-            let row = if layout.reverse_rows {
-                out_h - 1 - x
-            } else {
-                x
-            };
+            let row = layout.row_of(out_h, x);
             // The destination run, a 48-byte slice as above.
             let start = (row * out_w + col0) * 3;
             let run = &mut out[start..start + 48];
@@ -675,11 +671,7 @@ mod avx2 {
             };
             for (c, words) in (0..4).map(row_words).enumerate() {
                 let x = x0 + 4 * q + c;
-                let row = if layout.reverse_rows {
-                    out_h - 1 - x
-                } else {
-                    x
-                };
+                let row = layout.row_of(out_h, x);
                 let start = (row * out_w + col0) * 3;
                 out[start..start + 48].copy_from_slice(&words);
             }
