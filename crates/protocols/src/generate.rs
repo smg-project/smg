@@ -219,6 +219,23 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
         ));
     }
 
+    // A negative id is no token. Refused here, both wires answer it the same
+    // way at the boundary: the HTTP routers key the routing tokens with a
+    // cast that would wrap it, and an engine refuses it in its own words one
+    // hop later; the gRPC stage's own check becomes a second line.
+    let negative = match &req.input_ids {
+        Some(InputIds::Single(ids)) => ids.iter().copied().find(|&id| id < 0),
+        Some(InputIds::Batch(sequences)) => sequences.iter().flatten().copied().find(|&id| id < 0),
+        None => None,
+    };
+    if let Some(id) = negative {
+        return Err(invalid_at(
+            "input_ids",
+            "integer_below_min_value",
+            format!("Invalid 'input_ids': a token id must be non-negative, but got {id} instead."),
+        ));
+    }
+
     Ok(())
 }
 
