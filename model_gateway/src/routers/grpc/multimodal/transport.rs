@@ -365,6 +365,20 @@ fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn Worker>>
     }
 }
 
+/// SGLang's declared floating encoder dtype, with float32 for older workers.
+pub(super) fn mm_sglang_encoder_input_dtype(workers: Option<&WorkerSelection>) -> EncoderDtype {
+    sglang_wire_dtype(mm_encoder_input_dtype_from_worker(workers).as_deref())
+}
+
+/// Accept only floating encoder inputs; unknown labels retain the legacy wire.
+fn sglang_wire_dtype(label: Option<&str>) -> EncoderDtype {
+    match label {
+        Some("bfloat16") => EncoderDtype::BFloat16,
+        Some("float16") => EncoderDtype::Float16,
+        _ => EncoderDtype::Float32,
+    }
+}
+
 /// The wire dtype for the vLLM encoder input.
 ///
 /// Defaults to float32 rather than to the narrower width the TokenSpeed path
@@ -570,8 +584,7 @@ fn image_wire_dtype(
     overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
     let dtype = match runtime {
-        // Pinned on that wire, as its assembly pins it.
-        RuntimeType::Sglang => EncoderDtype::Float32,
+        RuntimeType::Sglang => sglang_wire_dtype(label.as_deref()),
         RuntimeType::Vllm if device_normalizes => return None,
         RuntimeType::Vllm => wire_dtype(
             &resolve_mm_vllm_encoder_input_dtype(overrides.vllm.clone(), label),
@@ -720,13 +733,14 @@ mod tests {
         Arc::new(builder.build())
     }
 
+    /// Pool planning agrees with assembly, including SGLang worker labels.
     #[test]
     fn a_worker_image_wire_dtype_is_what_its_assembly_writes() {
         let plain = DtypeOverrides::default();
         let bf16 = || Some("bfloat16".to_string());
         assert_eq!(
             image_wire_dtype(RuntimeType::Sglang, bf16(), false, &plain),
-            Some(EncoderDtype::Float32)
+            Some(EncoderDtype::BFloat16)
         );
         assert_eq!(
             image_wire_dtype(RuntimeType::Vllm, None, false, &plain),
@@ -778,7 +792,7 @@ mod tests {
         );
         assert_eq!(
             image_wire_dtype(RuntimeType::Sglang, bf16(), false, &overridden),
-            Some(EncoderDtype::Float32)
+            Some(EncoderDtype::BFloat16)
         );
     }
 
@@ -841,6 +855,23 @@ mod tests {
             shared_image_wire_dtype(&[worker("http://f", RuntimeType::Sglang, &[])], &plain),
             Some(EncoderDtype::Float32)
         );
+    }
+
+    /// Disagreeing SGLang workers must defer the wire write until selection.
+    #[test]
+    fn sglang_mixed_precision_fleet_defers_the_wire_write() {
+        let narrow = worker(
+            "http://half",
+            RuntimeType::Sglang,
+            &[("multimodal_encoder_dtype", "float16")],
+        );
+        let legacy = worker("http://legacy", RuntimeType::Sglang, &[]);
+        let policy = DtypeOverrides::default();
+        assert_eq!(
+            shared_image_wire_dtype(std::slice::from_ref(&narrow), &policy),
+            Some(EncoderDtype::Float16)
+        );
+        assert_eq!(shared_image_wire_dtype(&[narrow, legacy], &policy), None);
     }
 
     /// The stages see the fleet's wire dtype by default: the one-pass wire

@@ -209,7 +209,7 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
     }
 
 
-def server_facts(server_args: Any) -> dict[str, Any]:
+def server_facts(server_args: Any, model_config: Any | None = None) -> dict[str, Any]:
     """``SglangGrpcServer`` keyword arguments for ``GetServerInfo`` and
     ``GetLoads``: the server args as the Router's label source (with the
     operator's pairing protocol, as the Python servicer adds it), the
@@ -229,6 +229,10 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     else:
         args_dict = dict(getattr(server_args, "__dict__", {}))
     args_dict = _json_safe(args_dict)
+    if model_config is not None:
+        from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
+
+        args_dict["multimodal_encoder_dtype"] = encoder_dtype(None, lambda: model_config.dtype)
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
@@ -550,7 +554,9 @@ class SglangLauncher(RustLauncher):
         return default_kv_events_config(args)
 
     def facts(self, args: Any) -> dict[str, Any]:
-        return {**model_facts(args), **server_facts(args)}
+        """Share the resolved model config between model facts and the wire dtype label."""
+        model_config = _model_config(args)
+        return {**model_facts(args, model_config), **server_facts(args, model_config)}
 
     def tokenizer_dir(self, args: Any) -> str | None:
         return tokenizer_dir_for(args)
