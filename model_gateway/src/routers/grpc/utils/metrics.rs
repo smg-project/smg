@@ -386,14 +386,14 @@ mod tests {
                 REASON_DEADLINE,
             ),
             (
-                error::internal_error("call_upstream_connection_failed", "refused"),
+                error::bad_gateway("call_upstream_connection_failed", "refused"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             // The client files a reset or a close before the head as a
             // request fault, and a body cut short as a body fault: both are
             // the worker's connection failing under the call.
             (
-                error::internal_error("call_upstream_request_error", "reset"),
+                error::bad_gateway("call_upstream_request_error", "reset"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             (
