@@ -9,7 +9,13 @@
 //! as the start read it, and a reload rebuilds the serving map from that
 //! fixed part and the files'.
 
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -27,7 +33,7 @@ use crate::{
         validation::ConfigValidator,
         ConfigError, TenantApiKeyEntry,
     },
-    fs_watch::{settle, DirectoryWatch},
+    fs_watch::{directory_of, settle, DirectoryWatch},
     middleware::AuthConfig,
     server::posture::{SecretSource, SecretSources},
 };
@@ -75,12 +81,10 @@ impl SecretFiles {
     fn by_directory(&self) -> BTreeMap<PathBuf, Vec<OsString>> {
         let mut dirs: BTreeMap<PathBuf, Vec<OsString>> = BTreeMap::new();
         for path in self.paths() {
-            let dir = match path.parent() {
-                Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-                _ => PathBuf::from("."),
-            };
             if let Some(name) = path.file_name() {
-                dirs.entry(dir).or_default().push(name.to_os_string());
+                dirs.entry(directory_of(path).to_path_buf())
+                    .or_default()
+                    .push(name.to_os_string());
             }
         }
         dirs
@@ -217,7 +221,10 @@ impl SecretReloader {
     /// Read every file, check the serving set that would be in force by the
     /// start's rules, then put the sets in force: a file that cannot be used
     /// stops the reload before any swap. A request in flight finishes under
-    /// the set it took.
+    /// the set it took. The sets are the keys the gateway accepts: the shared
+    /// key it sends upstream to its workers is the start's until a restart,
+    /// so a secret the gateway and its workers share is rotated with a
+    /// restart of the gateway.
     pub fn reload(&self) -> Result<ReloadReport, BadFile> {
         let _turn = self.turn.lock();
         let mut report = ReloadReport::default();
@@ -346,15 +353,19 @@ pub async fn reload_logged(
 
 /// `--secrets-auto-reload`: the directories of the key files the start read
 /// are watched (`DirectoryWatch`), and a change runs the reload the route
-/// runs, once a burst of changes has settled. A directory that cannot be
-/// watched refuses the start. A directory removed or moved away is said so
-/// once and watched again once it exists, with one reload then. The task runs
-/// for the lifetime of the server.
+/// runs, once a burst of changes has settled. The files are read once more
+/// as the watch starts: a file rotated between the start's read and the
+/// watch raises no event, and would stay out of force until its next
+/// rotation. A directory that cannot be watched refuses the start. A
+/// directory removed or moved away is said so once and watched again once it
+/// exists, with one reload then. The task runs for the lifetime of the
+/// server.
 pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::JoinHandle<()>> {
     let (wake, woken) = mpsc::channel(1);
     let mut watches = Vec::new();
     for (dir, names) in reloader.files.by_directory() {
-        let watch = DirectoryWatch::start(&dir, names.clone(), wake.clone())?;
+        let watch = DirectoryWatch::start(&dir, names.clone(), wake.clone())
+            .map_err(|error| watch_refused(&dir, error))?;
         watches.push(Watched {
             dir,
             names,
@@ -366,12 +377,27 @@ pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::
         directories = watches.len(),
         "watching the key files; a change reloads the keys"
     );
+    // What changed between the start's read of the files and the watch is
+    // read now, as after a lost directory returns: no event reports it.
+    let _ = wake.try_send(());
     #[expect(
         clippy::disallowed_methods,
         reason = "the key-file watch runs for the lifetime of the server"
     )]
     let handle = task::spawn(watch_loop(reloader, wake, woken, watches));
     Ok(handle)
+}
+
+/// The start's refusal for a key directory that cannot be watched. The watch
+/// crate's own error names no path for the likely causes, the inotify
+/// limits, so this one names the flag and the directory.
+fn watch_refused(dir: &Path, error: notify::Error) -> notify::Error {
+    // The kind alone: a path the error carries is the directory itself.
+    let cause = notify::Error::new(error.kind);
+    notify::Error::generic(&format!(
+        "--secrets-auto-reload: cannot watch {}: {cause}",
+        dir.display()
+    ))
 }
 
 /// One watched directory of key files; `watch` is `None` while the directory
@@ -424,8 +450,6 @@ async fn watch_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use smg_auth::{ApiKeyEntry, Role};
 
     use super::*;
@@ -830,6 +854,45 @@ mod tests {
         handle.abort();
     }
 
+    /// A key rotated between the start's read of its file and the watch's
+    /// start raises no event: the watch reads the files once as it starts,
+    /// and the rotated key is in force without a further change.
+    #[tokio::test]
+    async fn a_rotation_before_the_watch_starts_is_in_force_once_it_starts() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = write(dir.path(), "key", "k-one\n");
+        let serving = AuthConfig::new(Some("k-one".into()));
+        let reloader = Arc::new(
+            SecretReloader::new(
+                SecretFiles {
+                    api_key: Some(file.clone()),
+                    ..SecretFiles::default()
+                },
+                &sources(SecretSource::File, None),
+                Some("k-one"),
+                &[],
+                serving.clone(),
+                None,
+            )
+            .expect("a file source"),
+        );
+
+        // Rotated before the watch exists: no event will ever report it.
+        let staged = write(dir.path(), "key.staged", "k-two\n");
+        std::fs::rename(&staged, &file).expect("renamed over the key file");
+        let handle = start_auto_reload(Arc::clone(&reloader)).expect("the directory is watched");
+        let deadline = time::Instant::now() + Duration::from_secs(10);
+        while !serving.contains_token("k-two") {
+            assert!(
+                time::Instant::now() < deadline,
+                "the rotation before the watch was not read"
+            );
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!serving.contains_token("k-one"), "the old key is out");
+        handle.abort();
+    }
+
     /// The key files' directory removed and recreated with a rotated key:
     /// every key stands while it is gone, and the rotated key is in force
     /// within the re-watch's second without a call. The key is written in
@@ -925,6 +988,42 @@ mod tests {
             time::sleep(Duration::from_millis(50)).await;
         }
         handle.abort();
+    }
+
+    /// A key directory that cannot be watched refuses the start by the
+    /// flag and the directory, named once, never by a bare OS error.
+    #[tokio::test]
+    async fn a_directory_that_cannot_be_watched_is_refused_by_flag_and_directory() {
+        let dir = tempfile::tempdir().expect("a directory");
+        // A regular file where the key's directory should be.
+        let blocker = write(dir.path(), "a-file", "");
+        let reloader = Arc::new(
+            SecretReloader::new(
+                SecretFiles {
+                    api_key: Some(blocker.join("key")),
+                    ..SecretFiles::default()
+                },
+                &sources(SecretSource::File, None),
+                Some("k-one"),
+                &[],
+                AuthConfig::new(Some("k-one".into())),
+                None,
+            )
+            .expect("a file source"),
+        );
+        let error = start_auto_reload(reloader).expect_err("a file is no directory to watch");
+        let text = error.to_string();
+        let directory = blocker.display().to_string();
+        assert!(
+            text.starts_with("--secrets-auto-reload: cannot watch "),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches(&directory).count(),
+            1,
+            "the directory once: {text}"
+        );
+        assert!(text.ends_with("not a directory"), "{text}");
     }
 
     #[test]

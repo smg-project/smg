@@ -24,10 +24,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    http,
-    response::{IntoResponse, Response},
-};
+use axum::{http, response::Response};
 use openai_protocol::responses::{ResponsesRequest, ResponsesResponse};
 use tracing::debug;
 use uuid::Uuid;
@@ -36,6 +33,7 @@ use super::{common::ResponsesCallContext, conversions, non_streaming, streaming}
 use crate::{
     middleware::TenantRequestMeta,
     routers::{
+        common::json_response,
         error,
         grpc::common::responses::{
             ensure_mcp_connection, load_history, naming_parser, BackgroundStream, ResponsesContext,
@@ -130,7 +128,7 @@ async fn route_responses_sync(
 ) -> Response {
     match non_streaming::route_responses_internal(ctx, request, params).await {
         Ok((responses_response, parser)) => naming_parser(
-            axum::Json(responses_response).into_response(),
+            json_response(&responses_response),
             parser.map(|parser| http::HeaderValue::from_static(parser.name())),
         ),
         Err(response) => response, // Already a Response with proper status code

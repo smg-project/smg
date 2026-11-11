@@ -381,8 +381,8 @@ impl SglangSchedulerClient {
         let mut constraints = Vec::new();
 
         let format = body_format(request, set_aside)?;
-        if let Some(schema) = format.schema {
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema));
+        if let Some(constraint) = Self::constraint_of(format.format) {
+            constraints.push(constraint);
         }
 
         if let Some(ebnf) = format.ebnf {
@@ -652,6 +652,9 @@ impl SglangSchedulerClient {
             ConstraintKind::JsonSchema => proto::sampling_params::Constraint::JsonSchema(value),
             ConstraintKind::Regex => proto::sampling_params::Constraint::Regex(value),
             ConstraintKind::Ebnf => proto::sampling_params::Constraint::EbnfGrammar(value),
+            ConstraintKind::StructuralTag => {
+                proto::sampling_params::Constraint::StructuralTag(value)
+            }
         })
     }
 
@@ -1251,6 +1254,10 @@ mod tests {
             (
                 ConstraintKind::Ebnf,
                 proto::sampling_params::Constraint::EbnfGrammar("v".to_string()),
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                proto::sampling_params::Constraint::StructuralTag("v".to_string()),
             ),
         ] {
             assert_eq!(

@@ -290,8 +290,7 @@ pub(super) async fn route_chat(
                     }
                 };
 
-                let status = StatusCode::from_u16(resp.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let status = resp.status();
 
                 // Record CB outcome based on HTTP status.
                 // For streaming: status is known upfront (200 = success).

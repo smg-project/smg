@@ -526,11 +526,24 @@ impl KvEventMonitor {
                 // stop retrying — this RPC will never succeed.
                 if e.code() == tonic::Code::Unimplemented {
                     match sub.role {
+                        // The one line an operator gets for a worker whose
+                        // cache the cache-aware policy cannot see: it names
+                        // the model and carries the servicer's own reason
+                        // (the publisher is off, or the engine cannot serve
+                        // this model's cache groups). The model itself stays
+                        // on its event index while any other worker of it
+                        // publishes; only when none does is it routed on the
+                        // approximate prefix tree.
                         Role::Index { .. } => warn!(
                             worker_url = %Endpoint::redacted_str(worker_url),
+                            model_id = sub.model_id,
+                            reason = e.message(),
                             "Backend does not implement SubscribeKvEvents, \
                              disabling KV event subscription for this worker; \
-                             cache-aware routing sees nothing of its cache"
+                             cache-aware routing sees nothing of this worker's \
+                             cache, and the model falls back to the approximate \
+                             prefix tree only when no worker of it publishes \
+                             events"
                         ),
                         Role::Loads => info!(
                             worker_url = %Endpoint::redacted_str(worker_url),
@@ -793,7 +806,10 @@ mod tests {
 
     use futures::Stream;
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
-    use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
+    };
     use smg_grpc_client::{
         common_proto as common,
         tokenspeed_scheduler::tokenspeed_proto::{
@@ -802,6 +818,7 @@ mod tests {
         },
     };
     use tonic::{transport::Server, Request, Response, Status};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
@@ -1717,8 +1734,11 @@ mod tests {
     }
 
     /// A backend that serves no KV events (an engine whose publisher is off)
-    /// left one WARN line as the only trace of a cache-aware router routing
-    /// blind: the worker carries a gauge from the answer until it leaves.
+    /// leaves one WARN line, which names the model, carries the servicer's
+    /// own reason and says that the model reaches the approximate tree only
+    /// when no worker of it publishes; the worker carries a gauge from the
+    /// answer until it leaves.
+    #[traced_test]
     #[test]
     fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
         use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -1745,7 +1765,18 @@ mod tests {
             rt.block_on(async {
                 let (addr, server) = serve(Subscribe::Unimplemented).await;
 
-                let worker = grpc_worker(addr);
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://{addr}"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .model(ModelCard::new("hybrid-m"))
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                );
                 let monitor = KvEventMonitor::new();
                 monitor
                     .on_worker_added(&worker, SubscriptionKind::Events)
@@ -1761,6 +1792,27 @@ mod tests {
                     Some(1.0),
                     "the answer raises the gauge"
                 );
+                // The WARN line itself names the model, carries the servicer's
+                // reason and says when the model reaches the tree; the
+                // subscription's start line names the model too, so the
+                // checks are scoped to the refusal's line.
+                logs_assert(|lines: &[&str]| {
+                    let line = lines
+                        .iter()
+                        .find(|line| line.contains("does not implement SubscribeKvEvents"))
+                        .ok_or_else(|| "no refusal line was logged".to_string())?;
+                    for wanted in [
+                        "WARN",
+                        "hybrid-m",
+                        "KV cache events not enabled",
+                        "approximate prefix tree only when no worker of it publishes events",
+                    ] {
+                        if !line.contains(wanted) {
+                            return Err(format!("the refusal line lacks {wanted:?}: {line}"));
+                        }
+                    }
+                    Ok(())
+                });
 
                 monitor.on_worker_removed(worker.url()).await;
                 assert_eq!(

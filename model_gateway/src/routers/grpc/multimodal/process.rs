@@ -30,6 +30,9 @@ use super::{
 };
 use crate::observability::metrics::Metrics;
 
+#[path = "batch_image_cache.rs"]
+mod batch_image_cache;
+
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
     media: MediaBatch,
@@ -324,7 +327,7 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
         .with_video_frame_sampling(frame_sampling)
         .with_image_transparency(ctx.transparency)
         .with_minimax_sglang_resize(
-            ctx.spec.name() == "minimax_m3"
+            ctx.spec.resizes_source_images()
                 && ctx
                     .model_config
                     .preprocessor_config
@@ -332,7 +335,7 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
                     .unwrap_or(false),
         )
         .with_minimax_image_resize(
-            ctx.spec.name() == "minimax_m3"
+            ctx.spec.resizes_source_images()
                 && !ctx
                     .model_config
                     .preprocessor_config
@@ -544,9 +547,8 @@ fn intermediate_of(
         .with_encoder_input_format(spec.encoder_input_format()))
 }
 
-/// Preprocess one modality's batch: a small image batch through the pixel
-/// cache, image by image, when the cache is on and the processor allows it;
-/// every other batch whole, on the blocking pool. An image the engine can
+/// Preprocess one modality's batch, using the pixel cache for eligible images.
+/// An image the engine can
 /// never place is refused first, on the size its header gave and the
 /// processor's own size-to-count rule, before any of the batch is decoded
 /// or any tensor built; the counts the preprocessing produces are held to
@@ -566,11 +568,8 @@ async fn preprocess_modality(
     preprocess_batch(media, ctx).await
 }
 
-/// The per-image path through the pixel cache for an image batch the cache
-/// takes: one image, or fewer than 32 of a processor that preprocesses each
-/// image independently (retaining individual tensors plus their concatenation
-/// is costly for large requests, which keep their whole-batch allocation
-/// path). `None` sends the batch down the whole-batch path.
+/// Batch misses for processors that support slicing the result into cache
+/// entries. Use the per-image path for other eligible requests.
 async fn cached_images(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
@@ -582,20 +581,20 @@ async fn cached_images(
         return Ok(None);
     };
     let processor = ctx.vision_processors.image();
-    if !(images.len() == 1
-        || (images.len() < 32 && processor.is_ok_and(|p| p.supports_per_image_preprocessing())))
-    {
+    let independent = processor
+        .as_ref()
+        .is_ok_and(|processor| processor.supports_per_image_preprocessing());
+    let batch_cache = ctx.image_wire_dtype == Some(EncoderDtype::BFloat16)
+        && !images.is_empty()
+        && processor.is_ok_and(|processor| processor.supports_bf16_batch_cache());
+    let per_image_cache = images.len() == 1 || (images.len() < 32 && independent);
+    if batch_cache {
+        return batch_image_cache::preprocess(images, cache, ctx, !per_image_cache).await;
+    }
+    if !per_image_cache {
         return Ok(None);
     }
-    let config = serde_json::json!({
-        "model_id": ctx.model_id,
-        "model_type": ctx.model_type,
-        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
-        // A one-pass result is only right for its own wire.
-        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
-        "transparency": ctx.transparency,
-    });
-    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config, &ctx.model_config.config)?;
+    let fingerprint = image_cache_fingerprint(ctx)?;
     // Deduplicate within the request even if the result cannot fit
     // in the cache. Record every position before scheduling work.
     let mut unique = HashMap::new();
@@ -667,6 +666,23 @@ async fn cached_images(
     .context("Image batch assembly task panicked")?
     .context("Image batch assembly failed")
     .map(Some)
+}
+
+/// Identify the model, wire format and image policy in the pixel cache.
+fn image_cache_fingerprint(ctx: &PlanContext<'_>) -> Result<u64> {
+    let config = serde_json::json!({
+        "model_id": ctx.model_id,
+        "model_type": ctx.model_type,
+        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
+        // A one-pass result is only right for its own wire.
+        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
+        "transparency": ctx.transparency,
+    });
+    Ok(config_fingerprint(
+        ctx.tokenizer_id,
+        &config,
+        &ctx.model_config.config,
+    )?)
 }
 
 /// `work` on the blocking pool, with the time its task waited in the pool's
@@ -743,20 +759,7 @@ async fn preprocess_batch(
 
     on_pool(ctx.model_id, move || match media_for_preprocess {
         MediaBatch::Images(images) => {
-            // Decode every frame first, in parallel on the preprocessing
-            // pool, rather than one photo after another on this thread.
-            ImageFrame::decode_all(&images)
-                .map_err(llm_multimodal::MultiModalError::Media)?;
-            let processor = vision_processors.image()?;
-            // The frames' own pixels, borrowed from the cells `decode_all`
-            // just filled: no processor owns, consumes or mutates its input,
-            // so the batch costs one pointer per image instead of a deep copy
-            // of every decoded image.
-            let decoded: Vec<&image::DynamicImage> = images
-                .iter()
-                .map(|frame| frame.image().map_err(llm_multimodal::MultiModalError::Media))
-                .collect::<Result<_, _>>()?;
-            preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
+            preprocess_image_frames(&images, &vision_processors, image_wire_dtype)
         }
         MediaBatch::Videos(videos) => {
             let processor = vision_processors.video()?;
@@ -918,6 +921,31 @@ async fn preprocess_image_batch(
     })
     .await
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
+}
+
+/// Decode a batch in parallel and borrow its frames for the vision processor.
+fn preprocess_image_frames(
+    images: &[Arc<ImageFrame>],
+    vision_processors: &VisionProcessors,
+    image_wire_dtype: Option<EncoderDtype>,
+) -> Result<PreprocessedEncoderInputs> {
+    // Decode every frame first, in parallel on the preprocessing
+    // pool, rather than one photo after another on this thread.
+    ImageFrame::decode_all(images).map_err(llm_multimodal::MultiModalError::Media)?;
+    let processor = vision_processors.image()?;
+    // The frames' own pixels, borrowed from the cells `decode_all`
+    // just filled: no processor owns, consumes or mutates its input,
+    // so the batch costs one pointer per image instead of a deep copy
+    // of every decoded image.
+    let decoded: Vec<&image::DynamicImage> = images
+        .iter()
+        .map(|frame| {
+            frame
+                .image()
+                .map_err(llm_multimodal::MultiModalError::Media)
+        })
+        .collect::<Result<_, _>>()?;
+    preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
 }
 
 /// The images preprocessed: laid out in `wire_dtype` in one pass when the
@@ -1147,7 +1175,10 @@ mod tests {
 
     /// The queue wait is measured on the pool thread before the work and
     /// recorded there: a task behind the one held thread records at least
-    /// the time from its queueing to the hold's release, a task whose
+    /// the time from its queueing to the hold's release and at most the time
+    /// from just before its queueing to the drain's end, once every record is
+    /// in (the test's own instants bracket each wait from both sides, so a
+    /// wait measured from an instant taken too early fails too), a task whose
     /// awaiting future was dropped while it queued records its wait all the
     /// same, and the record is taken before the work runs.
     #[test]
@@ -1190,6 +1221,8 @@ mod tests {
                     let _ = dropped_tx.send(("dropped", waited, false));
                 },
             ));
+            // Stamped before the poll, so the task's own clock starts after it.
+            let dropped_before = Instant::now();
             std::future::poll_fn(|cx| {
                 let _ = dropped.as_mut().poll(cx);
                 Poll::Ready(())
@@ -1218,6 +1251,7 @@ mod tests {
                     ));
                 },
             ));
+            let awaited_before = Instant::now();
             std::future::poll_fn(|cx| {
                 let _ = awaited.as_mut().poll(cx);
                 Poll::Ready(())
@@ -1237,7 +1271,13 @@ mod tests {
             while let Some((who, waited, worked_first)) = rx.recv().await {
                 seen.insert(who, (waited, worked_first));
             }
-            for (who, queued) in [("dropped", dropped_queued), ("awaited", awaited_queued)] {
+            // Stamped once every sender is gone: each record was sent before
+            // its sender dropped, whatever order the pool ran the tasks in.
+            let done = Instant::now();
+            for (who, before, queued) in [
+                ("dropped", dropped_before, dropped_queued),
+                ("awaited", awaited_before, awaited_queued),
+            ] {
                 let (waited, _) = seen
                     .get(who)
                     .unwrap_or_else(|| panic!("{who}: no wait recorded"));
@@ -1245,6 +1285,11 @@ mod tests {
                 assert!(
                     *waited >= held,
                     "{who}: waited {waited} s, queued {held} s before the release"
+                );
+                let bracket = done.duration_since(before).as_secs_f64();
+                assert!(
+                    *waited <= bracket,
+                    "{who}: waited {waited} s, but {bracket} s passed from before its queueing to the drain's end"
                 );
             }
             let (_, worked_first) = seen["awaited"];

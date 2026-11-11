@@ -793,3 +793,336 @@ async fn the_policy_is_part_of_the_pixel_cache_key() {
         "the same image under another policy misses the cache; the first policy hits it again"
     );
 }
+
+/// Fill and reuse a 32-image batch, including the path that waits for a replay.
+#[tokio::test]
+async fn bf16_batch_cache_reuses_large_batches_for_qwen_and_gemma() {
+    let frame = |id| {
+        Arc::new(ImageFrame::new(
+            image::RgbImage::from_pixel(112, 112, image::Rgb([id, 21, 203])).into(),
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            id.to_string(),
+        ))
+    };
+    let cold = (0..32).map(frame).collect::<Vec<_>>();
+    let appended = frame(32);
+    for model_type in ["qwen3_vl", "gemma4"] {
+        let config = MultimodalModelConfig::new(
+            serde_json::json!({"model_type": model_type, "image_token_id": 100}),
+            PreProcessorConfig::default(),
+            None,
+        );
+        let mut components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .unwrap();
+        components.pixel_cache = Some(Arc::new(PixelCache::new(512 * 1024 * 1024)));
+        let spec = components
+            .model_registry
+            .lookup(&ModelMetadata {
+                model_id: model_type,
+                tokenizer: &NoTokenizer,
+                config: &config.config,
+            })
+            .unwrap();
+        let ctx = PlanContext {
+            components: &components,
+            model_id: model_type,
+            model_type: Some(model_type),
+            spec,
+            tokenizer_id: model_type,
+            model_config: &config,
+            vision_processors: config.vision_processors(spec),
+            image_wire_dtype: Some(EncoderDtype::BFloat16),
+            transparency: TransparencyPolicy::KeepAlpha,
+            encoder_budget: None,
+        };
+        let first = MediaBatch::Images(cold.clone());
+        let uncached = preprocess_batch(&first, &ctx).await.unwrap();
+        // A newly cacheable pooled batch can defer filling until it recurs.
+        for _ in 0..2 {
+            let result = preprocess_modality(&first, &ctx).await.unwrap();
+            assert_eq!(result.encoder_input.shape(), uncached.encoder_input.shape());
+            assert_eq!(
+                result.encoder_input.write_as(EncoderDtype::BFloat16),
+                uncached.encoder_input.write_as(EncoderDtype::BFloat16),
+            );
+        }
+
+        // Invalid encoded bytes make an accidental cache miss visible.
+        let mut cached = cold
+            .iter()
+            .rev()
+            .map(|image| {
+                Arc::new(ImageFrame::encoded(
+                    bytes::Bytes::from_static(b"not an image"),
+                    ImageDetail::Auto,
+                    ImageSource::InlineBytes,
+                    image.hash.clone(),
+                    ImageSize::new(112, 112),
+                    None,
+                ))
+            })
+            .collect::<Vec<_>>();
+        cached.push(Arc::clone(&appended));
+        let expected = cold
+            .iter()
+            .rev()
+            .chain(std::iter::once(&appended))
+            .cloned()
+            .collect();
+        let result = preprocess_modality(&MediaBatch::Images(cached), &ctx)
+            .await
+            .unwrap();
+        let expected = preprocess_batch(&MediaBatch::Images(expected), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result.encoder_input.shape(), expected.encoder_input.shape());
+        assert_eq!(
+            result.encoder_input.write_as(EncoderDtype::BFloat16),
+            expected.encoder_input.write_as(EncoderDtype::BFloat16),
+        );
+        assert_eq!(result.feature_token_counts, expected.feature_token_counts);
+        assert_eq!(result.item_sizes, expected.item_sizes);
+        assert_eq!(result.model_specific.len(), expected.model_specific.len());
+        for (key, value) in expected.model_specific {
+            assert_eq!(
+                format!("{:?}", result.model_specific[&key]),
+                format!("{value:?}")
+            );
+        }
+    }
+}
+
+/// Keep newly computed images when an overlapping request cannot replace its old backing.
+#[tokio::test]
+async fn bf16_recompute_caches_misses_without_replacing_a_partial_backing() {
+    let (mut components, _, _) = setup(true, false);
+    let cache = Arc::new(PixelCache::new(512 * 1024 * 1024));
+    components.pixel_cache = Some(cache.clone());
+    let model = "qwen3_vl";
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": model, "image_token_id": 100}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let spec = components
+        .model_registry
+        .lookup(&ModelMetadata {
+            model_id: model,
+            tokenizer: &NoTokenizer,
+            config: &config.config,
+        })
+        .unwrap();
+    let ctx = context(
+        &components,
+        &config,
+        spec,
+        model,
+        model,
+        Some(EncoderDtype::BFloat16),
+        None,
+    );
+    let fingerprint = image_cache_fingerprint(&ctx).unwrap();
+    let key = |id: u8| PixelCacheKey {
+        image_hash: id.to_string(),
+        config_fingerprint: fingerprint,
+    };
+    let batch = |ids: [u8; 3]| {
+        MediaBatch::Images(
+            ids.into_iter()
+                .map(|id| {
+                    Arc::new(ImageFrame::new(
+                        image::RgbImage::from_pixel(640, 640, image::Rgb([id, 21, 203])).into(),
+                        Default::default(),
+                        Default::default(),
+                        ImageSource::InlineBytes,
+                        id.to_string(),
+                    ))
+                })
+                .collect(),
+        )
+    };
+    preprocess_modality(&batch([0, 1, 2]), &ctx).await.unwrap();
+    let prefix = cache.get(&key(0)).unwrap();
+    assert!(prefix
+        .preprocessed
+        .encoder_input
+        .shared_allocation()
+        .is_some());
+
+    // One hit and two misses above the recompute threshold. The other
+    // session still owns two slices of the original allocation.
+    preprocess_modality(&batch([0, 3, 4]), &ctx).await.unwrap();
+    assert!(Arc::ptr_eq(&prefix, &cache.get(&key(0)).unwrap()));
+    for id in [3, 4] {
+        let entry = cache.get(&key(id)).expect("recomputed miss must be cached");
+        assert!(entry
+            .preprocessed
+            .encoder_input
+            .shared_allocation()
+            .is_none());
+    }
+}
+
+/// Reuse previously cached images across turns and preserve wire bytes and order.
+#[tokio::test]
+async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": "minimax_m3_vl"}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let image = |id, width, height| {
+        Arc::new(ImageFrame::new(
+            image::RgbImage::from_pixel(width, height, image::Rgb([id, 21, 203])).into(),
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            id.to_string(),
+        ))
+    };
+    let cached_only = |image: &ImageFrame| {
+        // This frame can only succeed if preprocessing does not decode it.
+        Arc::new(ImageFrame::encoded(
+            bytes::Bytes::from_static(b"not an image"),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            image.hash.clone(),
+            ImageSize::new(112, 112),
+            None,
+        ))
+    };
+    let first = image(1, 112, 112);
+    let second = image(2, 140, 112);
+    let third = image(3, 112, 168);
+    let first_hit = cached_only(&first);
+    let second_hit = cached_only(&second);
+    let third_hit = cached_only(&third);
+    let fourth = image(4, 168, 140);
+    let fifth = image(5, 140, 168);
+    let sixth = image(6, 168, 112);
+    let seventh = image(7, 112, 140);
+    let sixth_hit = cached_only(&sixth);
+    let seventh_hit = cached_only(&seventh);
+
+    let mut components = MultimodalComponents::new(
+        Arc::new(MultimodalConfigRegistry::new()),
+        None,
+        None,
+        &MultimodalSettings::default(),
+    )
+    .unwrap();
+    components.pixel_cache = Some(Arc::new(PixelCache::new(16 * 1024 * 1024)));
+    let spec = components
+        .model_registry
+        .lookup(&ModelMetadata {
+            model_id: "MiniMax-M3",
+            tokenizer: &NoTokenizer,
+            config: &config.config,
+        })
+        .unwrap();
+    let ctx = PlanContext {
+        components: &components,
+        model_id: "MiniMax-M3",
+        model_type: Some("minimax_m3_vl"),
+        spec,
+        tokenizer_id: "m3",
+        model_config: &config,
+        vision_processors: config.vision_processors(spec),
+        image_wire_dtype: Some(EncoderDtype::BFloat16),
+        transparency: TransparencyPolicy::KeepAlpha,
+        encoder_budget: None,
+    };
+    let batch = |images: &[&Arc<ImageFrame>]| {
+        MediaBatch::Images(images.iter().map(|image| Arc::clone(image)).collect())
+    };
+    let turns = [
+        (vec![&first, &fifth], vec![&first, &fifth]),
+        (
+            vec![&first_hit, &sixth, &seventh],
+            vec![&first, &sixth, &seventh],
+        ),
+        (vec![&sixth_hit, &seventh_hit], vec![&sixth, &seventh]),
+        (
+            vec![&second, &first_hit, &second],
+            vec![&second, &first, &second],
+        ),
+        (
+            vec![&third, &second_hit, &fourth, &first_hit],
+            vec![&third, &second, &fourth, &first],
+        ),
+        (vec![&third_hit, &first_hit], vec![&third, &first]),
+    ];
+    for (request, reference) in turns {
+        let expected = preprocess_batch(&batch(&reference), &ctx).await.unwrap();
+        let actual = preprocess_modality(&batch(&request), &ctx).await.unwrap();
+        assert_eq!(actual.encoder_input_shape(), expected.encoder_input_shape());
+        assert_eq!(
+            actual.encoder_input.write_as(EncoderDtype::BFloat16),
+            expected.encoder_input.write_as(EncoderDtype::BFloat16)
+        );
+        assert_eq!(actual.feature_token_counts, expected.feature_token_counts);
+        assert_eq!(actual.item_sizes, expected.item_sizes);
+        assert_eq!(actual.model_specific.len(), expected.model_specific.len());
+        for (key, value) in expected.model_specific {
+            assert_eq!(
+                format!("{:?}", actual.model_specific[&key]),
+                format!("{value:?}")
+            );
+        }
+    }
+
+    let mut small_components = MultimodalComponents::new(
+        Arc::new(MultimodalConfigRegistry::new()),
+        None,
+        None,
+        &MultimodalSettings::default(),
+    )
+    .unwrap();
+    small_components.pixel_cache = Some(Arc::new(PixelCache::new(200 * 1024)));
+    let small = PlanContext {
+        components: &small_components,
+        ..ctx
+    };
+    preprocess_modality(&batch(&[&first]), &small)
+        .await
+        .unwrap();
+    // A single image fits and is cached. The distinct three-image
+    // working set exceeds the budget.
+    preprocess_modality(&batch(&[&first_hit]), &small)
+        .await
+        .unwrap();
+    assert!(
+        preprocess_modality(&batch(&[&first_hit, &second, &third]), &small)
+            .await
+            .is_err()
+    );
+    let oversized = batch(&[&first, &second, &third]);
+    let expected = preprocess_batch(&oversized, &small).await.unwrap();
+    let actual = preprocess_modality(&oversized, &small).await.unwrap();
+    assert_eq!(
+        actual.encoder_input.write_as(EncoderDtype::BFloat16),
+        expected.encoder_input.write_as(EncoderDtype::BFloat16)
+    );
+
+    // Repeated images still share request-local work when the unique
+    // working set is too large to admit new entries.
+    let request = batch(&[&first_hit, &third, &second, &third]);
+    let reference = batch(&[&first, &third, &second, &third]);
+    let expected = preprocess_batch(&reference, &small).await.unwrap();
+    let actual = preprocess_modality(&request, &small).await.unwrap();
+    assert_eq!(actual.feature_token_counts, expected.feature_token_counts);
+    assert_eq!(
+        actual.encoder_input.write_as(EncoderDtype::BFloat16),
+        expected.encoder_input.write_as(EncoderDtype::BFloat16)
+    );
+    assert!(preprocess_modality(&batch(&[&second_hit]), &small)
+        .await
+        .is_err());
+}

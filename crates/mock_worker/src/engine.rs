@@ -1290,6 +1290,15 @@ impl Engine {
             .collect()
     }
 
+    /// The number of cached blocks, read without copying the keys.
+    pub fn cache_len(&self) -> usize {
+        self.shared
+            .cache_mirror
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
     /// Block keys of a prompt, exactly as the engine computes them.
     pub fn block_keys(prompt_token_ids: &[u32], block_size: usize) -> Vec<u64> {
         prompt_blocks(prompt_token_ids, block_size).0

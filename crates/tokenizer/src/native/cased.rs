@@ -48,14 +48,14 @@ use super::{
     pattern::{
         clitic_match, concat, each_match, plain_class, previous_boundary, repeat, Class, Node,
     },
-    scan::{Bits, Roles},
+    scan::{Bits, Roles, WordScan},
 };
 
 /// A part of the template that one class fills: its bit in a character's
 /// role bits.
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
-enum Role {
+pub(super) enum Role {
     /// The optional lead-in of the first letter alternative.
     Lead1,
     /// The upper run of the first letter alternative (`*`).
@@ -110,7 +110,7 @@ const ROLES: [Role; 15] = [
 
 impl Role {
     #[inline(always)]
-    const fn bit(self) -> Bits {
+    pub(super) const fn bit(self) -> Bits {
         1 << (self as u32)
     }
 }
@@ -259,6 +259,12 @@ impl Scanner {
         self.digit_cap
     }
 
+    /// The role tables; for the tests that pin the templates' scans.
+    #[cfg(test)]
+    pub(super) fn roles(&self) -> &Roles {
+        &self.roles
+    }
+
     /// The number of clitic alternatives of a letter alternative.
     #[cfg(test)]
     pub(super) fn clitics(&self) -> usize {
@@ -296,7 +302,7 @@ impl Scanner {
     /// lower run that must follow it (the upper run giving back to its last
     /// character of the lower class when none follows), then the clitic.
     #[inline(always)]
-    fn lower_body(
+    fn lower_body<const WORDS: bool>(
         &self,
         classes: &[Class],
         text: &str,
@@ -308,7 +314,9 @@ impl Scanner {
         let (p, last_lower_end) = self.roles.run_end_marked(text, q, upper.bit(), lower.bit());
         if let Some((bits, len)) = self.roles.at(text, p) {
             if bits & lower.bit() != 0 {
-                let end = self.roles.run_end(text, p + len, lower.bit());
+                let end =
+                    self.roles
+                        .run_end_as::<{ WordScan::LOWER }, WORDS>(text, p + len, lower.bit());
                 return Some(self.clitic_end(classes, text, end, clitics));
             }
         }
@@ -318,7 +326,7 @@ impl Scanner {
     /// The body of the second letter alternative at `q`: the upper run of at
     /// least one character, the lower run after it, then the clitic.
     #[inline(always)]
-    fn upper_body(
+    fn upper_body<const WORDS: bool>(
         &self,
         classes: &[Class],
         text: &str,
@@ -331,8 +339,12 @@ impl Scanner {
         if bits & upper.bit() == 0 {
             return None;
         }
-        let end = self.roles.run_end(text, q + len, upper.bit());
-        let end = self.roles.run_end(text, end, lower.bit());
+        let end = self
+            .roles
+            .run_end_as::<{ WordScan::UPPER }, WORDS>(text, q + len, upper.bit());
+        let end = self
+            .roles
+            .run_end_as::<{ WordScan::LOWER }, WORDS>(text, end, lower.bit());
         Some(self.clitic_end(classes, text, end, clitics))
     }
 
@@ -341,12 +353,17 @@ impl Scanner {
     /// Compiled into its callers' loops: out of line it was a call per
     /// piece, and every value the loop keeps across a call is a spill.
     #[inline(always)]
-    pub(super) fn match_at(&self, classes: &[Class], text: &str, pos: usize) -> Option<usize> {
+    pub(super) fn match_at<const WORDS: bool>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        pos: usize,
+    ) -> Option<usize> {
         let (c, len) = self.roles.at(text, pos)?;
         let after = pos + len;
         // 1. The first letter alternative: with the lead-in, then without it.
         if c & Role::Lead1.bit() != 0 {
-            if let Some(end) = self.lower_body(
+            if let Some(end) = self.lower_body::<WORDS>(
                 classes,
                 text,
                 after,
@@ -358,7 +375,7 @@ impl Scanner {
             }
         }
         if c & (Role::Upper1.bit() | Role::Lower1.bit()) != 0 {
-            if let Some(end) = self.lower_body(
+            if let Some(end) = self.lower_body::<WORDS>(
                 classes,
                 text,
                 pos,
@@ -371,7 +388,7 @@ impl Scanner {
         }
         // 2. The second letter alternative, the same way.
         if c & Role::Lead2.bit() != 0 {
-            if let Some(end) = self.upper_body(
+            if let Some(end) = self.upper_body::<WORDS>(
                 classes,
                 text,
                 after,
@@ -383,7 +400,7 @@ impl Scanner {
             }
         }
         if c & Role::Upper2.bit() != 0 {
-            return self.upper_body(
+            return self.upper_body::<WORDS>(
                 classes,
                 text,
                 pos,
@@ -447,7 +464,11 @@ impl Scanner {
         // 6. Whitespace before a non-space: the greedy run gives back its last
         //    character while a non-space follows it, down to one.
         if c & Role::TrailSpace.bit() != 0 {
-            let mut end = self.roles.run_end(text, after, Role::TrailSpace.bit());
+            let mut end = self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+                text,
+                after,
+                Role::TrailSpace.bit(),
+            );
             loop {
                 match self.roles.at(text, end) {
                     Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
@@ -462,7 +483,11 @@ impl Scanner {
         }
         // 7. The whitespace run.
         if c & Role::Space.bit() != 0 {
-            return Some(self.roles.run_end(text, after, Role::Space.bit()));
+            return Some(self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+                text,
+                after,
+                Role::Space.bit(),
+            ));
         }
         None
     }
@@ -471,12 +496,20 @@ impl Scanner {
     /// `Pattern::for_each_match`): a position no alternative matches at is
     /// passed over by one character, as the iterator does.
     #[inline(always)]
-    pub(super) fn for_each_match<F: FnMut(usize, usize)>(
+    pub(super) fn for_each_match<const WORDS: bool, F: FnMut(usize, usize)>(
         &self,
         classes: &[Class],
         text: &str,
         f: &mut F,
     ) {
-        each_match(text, |pos| self.match_at(classes, text, pos), f);
+        // The closure stays inside the encoder's loop (the compiler's budget
+        // would leave it out of line with the word scans compiled into
+        // `match_at`, and the call per piece would be back).
+        each_match(
+            text,
+            #[inline(always)]
+            |pos| self.match_at::<WORDS>(classes, text, pos),
+            f,
+        );
     }
 }

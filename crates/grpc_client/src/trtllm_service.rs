@@ -344,10 +344,7 @@ impl TrtllmServiceClient {
     ) -> Result<Option<proto::GuidedDecodingParams>, String> {
         // Collect non-tool constraint (response_format, ebnf, regex)
         let format = body_format(request, set_aside)?;
-        let mut guided = format.schema.map(|schema| proto::GuidedDecodingParams {
-            guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-            guide: schema,
-        });
+        let mut guided = Self::guide_of(format.format);
 
         if guided.is_none() {
             if let Some(ebnf) = format.ebnf {
@@ -603,6 +600,9 @@ impl TrtllmServiceClient {
                 ConstraintKind::JsonSchema => proto::guided_decoding_params::GuideType::JsonSchema,
                 ConstraintKind::Regex => proto::guided_decoding_params::GuideType::Regex,
                 ConstraintKind::Ebnf => proto::guided_decoding_params::GuideType::EbnfGrammar,
+                ConstraintKind::StructuralTag => {
+                    proto::guided_decoding_params::GuideType::StructuralTag
+                }
             };
             proto::GuidedDecodingParams {
                 guide_type: guide_type as i32,
@@ -1153,6 +1153,10 @@ mod tests {
             (
                 ConstraintKind::Ebnf,
                 proto::guided_decoding_params::GuideType::EbnfGrammar,
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                proto::guided_decoding_params::GuideType::StructuralTag,
             ),
         ] {
             assert_eq!(

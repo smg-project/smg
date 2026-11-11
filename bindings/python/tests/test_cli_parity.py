@@ -65,7 +65,8 @@ class RustCli:
 
 
 # Where a named CLI default is declared when the CLI sources do not declare it
-# themselves: the config types module main.rs imports its constants from.
+# themselves: the config types module main.rs imports its constants from. The
+# ``rust`` fixture hands their texts to the reader; a synthetic source hands its own.
 CONST_SOURCES = (MAIN_RS.parent / "config" / "types.rs",)
 
 
@@ -78,11 +79,11 @@ class UnreadDefault:
     raw: str
 
 
-def named_constant(name: str) -> str | None:
-    """The literal of ``pub const <name>: T = <literal>;`` in the CLI sources or the
-    config types module, or None when no such constant is declared."""
+def named_constant(name: str, *sources: str) -> str | None:
+    """The literal of ``pub const <name>: T = <literal>;`` in the first of ``sources``
+    that declares it, or None when none does."""
     pattern = re.compile(rf"\bconst\s+{re.escape(name)}\s*:[^=;]+=\s*([^;]+);")
-    for text in (cli_source(), *(path.read_text() for path in CONST_SOURCES)):
+    for text in sources:
         declared = pattern.search(text)
         if declared:
             return declared.group(1).strip()
@@ -106,9 +107,9 @@ def literal_value(raw: str) -> object:
         return None
 
 
-def literal_default(attribute: str) -> object:
+def literal_default(attribute: str, *sources: str) -> object:
     """The clap default as a Python value: None when the attribute carries none, the
-    value of a literal or of the constant a name stands for, and an
+    value of a literal or of the constant a name stands for in ``sources``, and an
     ``UnreadDefault`` for an expression the reader cannot compare."""
     quoted = re.search(r'\bdefault_value\s*=\s*"([^"]*)"', attribute)
     if quoted:
@@ -119,7 +120,7 @@ def literal_default(attribute: str) -> object:
     if not typed:
         return None
     raw = typed.group(1).strip()
-    declared = named_constant(raw) if re.fullmatch(r"[A-Z][A-Z0-9_]*", raw) else None
+    declared = named_constant(raw, *sources) if re.fullmatch(r"[A-Z][A-Z0-9_]*", raw) else None
     value = literal_value(raw if declared is None else declared)
     return UnreadDefault(raw) if value is None else value
 
@@ -129,13 +130,16 @@ def arg_attributes(text: str) -> int:
     return len(re.findall(r"^\s*#\[arg\(", text, re.MULTILINE))
 
 
-def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
+def parse_rust_cli(
+    text: str, struct_name: str = "CliArgs", constant_sources: tuple[str, ...] = ()
+) -> RustCli:
     """The flags of ``struct CliArgs``: each ``#[arg(...)]`` attribute and the field
     it annotates, recursively including ``#[command(flatten)]`` argument groups.
     The long flag is the explicit ``long = ".."`` or the field
     name with dashes, the second spellings its ``alias``/``visible_alias``.
-    ``attributes`` counts every attribute read, so held against
-    ``arg_attributes(text)`` it shows a group the reader did not reach."""
+    A default naming a constant is read from ``text`` and then from
+    ``constant_sources``. ``attributes`` counts every attribute read, so held
+    against ``arg_attributes(text)`` it shows a group the reader did not reach."""
     lines = text.splitlines()
     header = re.compile(rf"^(\s*)(?:pub(?:\([^)]*\))?\s+)?struct\s+{struct_name}\s*\{{\s*$")
     starts = [(n, m.group(1)) for n, line in enumerate(lines) if (m := header.match(line))]
@@ -167,7 +171,7 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
         )
         assert declared is not None, f"no field after the attribute ending at line {i}"
         if flattened:
-            group = parse_rust_cli(text, declared.group(2))
+            group = parse_rust_cli(text, declared.group(2), constant_sources)
             cli.flags.update(group.flags)
             cli.aliases.update(group.aliases)
             cli.attributes += group.attributes
@@ -182,7 +186,7 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
         name = declared.group(1)
         explicit = re.search(r'\blong\s*=\s*"([^"]+)"', attribute)
         flag = "--" + (explicit.group(1) if explicit else name.replace("_", "-"))
-        cli.flags[flag] = literal_default(attribute)
+        cli.flags[flag] = literal_default(attribute, text, *constant_sources)
         for alias in re.findall(r'\b(?:visible_)?alias\s*=\s*"([^"]+)"', attribute):
             cli.aliases["--" + alias] = flag
         i += 1
@@ -288,6 +292,40 @@ def test_parse_rust_cli_names_a_group_it_cannot_find():
         parse_rust_cli(source)
 
 
+def test_parse_rust_cli_reads_a_named_default_from_the_text_it_was_given():
+    """A ``default_value_t`` naming a constant reads the constant's literal from the
+    source under the reader, not from the checkout."""
+    source = """
+pub const RETRIES: usize = 3;
+struct CliArgs {
+    #[arg(long, default_value_t = RETRIES)]
+    retries: usize,
+}
+"""
+    assert parse_rust_cli(source).flags == {"--retries": 3}
+
+
+def test_parse_rust_cli_reads_a_named_default_from_a_constant_source():
+    """A constant another module declares is read from the sources handed in, and
+    reported by name when none declares it."""
+    source = (
+        "struct CliArgs {\n    #[arg(long, default_value_t = RETRIES)]\n    retries: usize,\n}\n"
+    )
+    types = "pub const RETRIES: usize = 3;\n"
+    assert parse_rust_cli(source, constant_sources=(types,)).flags == {"--retries": 3}
+    assert parse_rust_cli(source).flags == {"--retries": UnreadDefault("RETRIES")}
+
+
+def test_parse_rust_cli_reports_an_expression_default_as_unread():
+    source = """
+struct CliArgs {
+    #[arg(long, default_value_t = Policy::RoundRobin)]
+    policy: Policy,
+}
+"""
+    assert parse_rust_cli(source).flags == {"--policy": UnreadDefault("Policy::RoundRobin")}
+
+
 def launcher_options(use_router_prefix: bool = False) -> dict[str, argparse.Action]:
     parser = argparse.ArgumentParser(allow_abbrev=False, add_help=False)
     RouterArgs.add_cli_args(parser, use_router_prefix=use_router_prefix)
@@ -303,7 +341,7 @@ def rust() -> RustCli:
     if not MAIN_RS.exists():
         pytest.skip("the Rust CLI's source is not in this checkout")
     text = cli_source()
-    cli = parse_rust_cli(text)
+    cli = parse_rust_cli(text, constant_sources=tuple(p.read_text() for p in CONST_SOURCES))
     assert cli.attributes == arg_attributes(text), (
         f"{MAIN_RS} and {CLI_DIR}: {arg_attributes(text)} #[arg] attributes, {cli.attributes} reached from"
         " struct CliArgs; a group it flattens is declared in a shape parse_rust_cli does not"
@@ -358,12 +396,12 @@ def test_shared_flags_share_their_literal_defaults(rust, launcher):
     for flag, cli_default in rust.flags.items():
         if cli_default is None or flag not in launcher:
             continue
-        if isinstance(cli_default, UnreadDefault):
-            unread.append(f"{flag} = {cli_default.raw}")  # a CLI default the reader skipped
-            continue
         launcher_default = launcher[flag].default
         if launcher_default is None or isinstance(launcher_default, list):
             continue  # resolved later (a tri-state, the dataclass, the Rust core)
+        if isinstance(cli_default, UnreadDefault):
+            unread.append(f"{flag} = {cli_default.raw}")  # a CLI default the reader skipped
+            continue
         if isinstance(cli_default, bool) or isinstance(launcher_default, bool):
             same = cli_default is launcher_default
         elif isinstance(cli_default, (int, float)) and isinstance(launcher_default, (int, float)):

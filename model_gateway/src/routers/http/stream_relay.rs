@@ -5,9 +5,12 @@
 //! error after a successful head is accounted to its source and, when the
 //! head was SSE, ended with the typed error event on its own frame; the load
 //! guard rides in the body's own stream; a client that leaves ends the
-//! upstream read. The regular relay re-chunks SSE deltas when the provider
-//! profile asks; the decode relay reads each chunk through a hook (the
-//! prefill log-probability merge and the `[DONE]` cut).
+//! upstream read. The regular relay re-chunks SSE deltas when the wire of
+//! the model the client asked for asks, by the wire's numbers; the decode
+//! relay reads each chunk through a hook (the prefill log-probability merge
+//! and the `[DONE]` cut).
+
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -26,7 +29,7 @@ use super::stream_failure::{
 use crate::{
     routers::common::{
         sse::SSE_CHANNEL_BUFFER,
-        sse_rechunk::{NoopObserver, SseRechunker, IDLE_FLUSH},
+        sse_rechunk::{NoopObserver, SseRechunker},
     },
     worker::{GuardedStream, WorkerLoadGuard},
 };
@@ -39,7 +42,7 @@ pub(crate) struct ChunkStep {
 }
 
 /// How the relay reads each upstream chunk: as it is; through the SSE
-/// re-chunker the regular router's provider profile asks for; or through
+/// re-chunker the regular router's wire asks for; or through
 /// the decode side's hook (the prefill log-probability merge and the
 /// `[DONE]` cut). One of the three, so a re-chunker's held text can never be
 /// cut short by a hook that ends the relay.
@@ -59,6 +62,14 @@ impl ChunkMode {
     /// Whether the re-chunker holds text an idle flush should release.
     fn has_pending(&self) -> bool {
         matches!(self, Self::Rechunk(rechunker) if rechunker.has_pending())
+    }
+
+    /// The re-chunker's idle flush; the timer is never armed without one.
+    fn idle_flush(&self) -> Duration {
+        match self {
+            Self::Rechunk(rechunker) => rechunker.policy().idle_flush,
+            Self::Plain | Self::Hook(_) => Duration::ZERO,
+        }
     }
 
     /// The re-chunker's tail at the stream's end, or nothing.
@@ -135,7 +146,8 @@ where
             let mut relayed: u64 = 0;
             let mut sent_tail = SentTail::default();
             // One timer, reset per chunk, instead of a fresh sleep per token.
-            let idle = tokio::time::sleep(IDLE_FLUSH);
+            let idle_flush = mode.idle_flush();
+            let idle = tokio::time::sleep(idle_flush);
             tokio::pin!(idle);
             // One wait for the client's leaving, kept across the chunks: a
             // `closed()` built per `select!` round registers a waiter on the
@@ -146,7 +158,7 @@ where
                 tokio::select! {
                     chunk = stream.next() => {
                         if let ChunkMode::Rechunk(_) = mode {
-                            idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                            idle.as_mut().reset(tokio::time::Instant::now() + idle_flush);
                         }
                         match chunk {
                             // An empty upstream chunk must not become an empty
@@ -222,7 +234,7 @@ where
                         }
                     },
                     () = &mut idle, if mode.has_pending() => {
-                        idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                        idle.as_mut().reset(tokio::time::Instant::now() + idle_flush);
                         if let ChunkMode::Rechunk(rechunker) = &mut mode {
                             let tail = rechunker.flush_pending();
                             if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
@@ -259,30 +271,37 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::{
+        http::{HeaderMap, StatusCode},
+        response::Response,
+    };
     use bytes::Bytes;
-    use futures_util::stream;
+    use futures_util::{stream, Stream};
     use http_body_util::BodyExt;
 
     use super::{relay_streaming_body, ChunkMode, ChunkStep, Relay};
     use crate::{
-        routers::http::stream_failure::RelaySource,
+        routers::{common::sse::SSE_CHANNEL_BUFFER, http::stream_failure::RelaySource},
         worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
     };
 
-    /// The frames the client gets when the upstream yields `chunks` through
-    /// the relay in `mode`.
-    async fn frames_through(chunks: Vec<&'static [u8]>, mode: ChunkMode) -> Vec<Bytes> {
+    /// The relay of `upstream` in `mode`: a successful SSE head from a worker
+    /// at a port nobody listens on.
+    fn relay_of<S>(upstream: S, mode: ChunkMode) -> Response
+    where
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    {
         let worker: Arc<dyn Worker> =
             Arc::new(BasicWorkerBuilder::new("http://127.0.0.1:1").build());
-        let upstream = stream::iter(
-            chunks
-                .into_iter()
-                .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
-        );
-        let response = relay_streaming_body(
+        relay_streaming_body(
             upstream,
             Relay {
                 status: StatusCode::OK,
@@ -292,8 +311,18 @@ mod tests {
                 headers: HeaderMap::new(),
                 mode,
             },
+        )
+    }
+
+    /// The frames the client gets when the upstream yields `chunks` through
+    /// the relay in `mode`.
+    async fn frames_through(chunks: Vec<&'static [u8]>, mode: ChunkMode) -> Vec<Bytes> {
+        let upstream = stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
         );
-        let mut body = response.into_body();
+        let mut body = relay_of(upstream, mode).into_body();
         let mut frames = Vec::new();
         while let Some(frame) = body.frame().await {
             if let Ok(data) = frame.expect("a relayed frame").into_data() {
@@ -344,6 +373,41 @@ mod tests {
                 Bytes::from_static(b"data: a\n\n"),
                 Bytes::from_static(b"data: [DONE]\n\n")
             ]
+        );
+    }
+
+    /// A client that stops reading stops the upstream read: the relay holds
+    /// at most `SSE_CHANNEL_BUFFER` chunks for it, plus the one its parked
+    /// `send` carries, and never the rest of the stream. One frame the client
+    /// reads frees one slot.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_bounds_the_upstream_read_at_the_relays_buffer() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&pulled);
+        let upstream = stream::repeat_with(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, reqwest::Error>(Bytes::from_static(b"data: x\n\n"))
+        });
+        let mut body = relay_of(upstream, ChunkMode::Plain).into_body();
+
+        // The relay fills its channel and parks on the next send.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let unread = pulled.load(Ordering::SeqCst);
+        assert!(
+            (SSE_CHANNEL_BUFFER..=SSE_CHANNEL_BUFFER + 1).contains(&unread),
+            "the relay pulled {unread} chunks for a client that read none"
+        );
+
+        // One frame read frees one slot: one more chunk, not the stream.
+        body.frame()
+            .await
+            .expect("a frame")
+            .expect("a relayed frame");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_one = pulled.load(Ordering::SeqCst);
+        assert!(
+            (unread + 1..=unread + 2).contains(&after_one),
+            "the relay pulled {after_one} chunks after one frame was read, {unread} before"
         );
     }
 }

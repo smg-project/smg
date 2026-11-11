@@ -1002,7 +1002,7 @@ mod tests {
     use super::*;
     use crate::{
         json::PartialJson,
-        testing::{arguments, bytes, content, malformed_texts, tool},
+        testing::{arguments, bytes, content, indexed_calls as calls, malformed_texts, tool},
     };
 
     fn ids() -> CallIds {
@@ -1350,24 +1350,6 @@ mod tests {
         }
         assembler.finish(&mut out);
         out.drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(u32, String, String)> {
-        let mut calls: Vec<(u32, String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { index, name, .. } => {
-                    calls.push((*index, name.clone(), String::new()));
-                }
-                Event::ToolCallArguments { json, .. } => {
-                    if let Some(last) = calls.last_mut() {
-                        last.2.push_str(json);
-                    }
-                }
-                _ => {}
-            }
-        }
-        calls
     }
 
     /// The malformed text, whole: the events that carry it depend on the cuts, the text does not.

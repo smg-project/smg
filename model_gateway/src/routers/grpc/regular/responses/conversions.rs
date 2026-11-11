@@ -647,14 +647,15 @@ fn map_text_to_response_format(text: Option<&TextConfig>) -> Option<ResponseForm
         TextFormat::JsonSchema {
             name,
             schema,
-            description: _,
+            description,
             strict,
         } => Some(ResponseFormat::JsonSchema {
-            json_schema: JsonSchemaFormat {
+            json_schema: Box::new(JsonSchemaFormat {
+                description: description.clone(),
                 name: name.clone(),
                 schema: schema.clone(),
                 strict: *strict,
-            },
+            }),
         }),
     }
 }
@@ -1473,6 +1474,34 @@ mod tests {
             "{:?}",
             chat_req.messages
         );
+    }
+
+    /// A Responses request's `json_schema` text format keeps its description in
+    /// the Chat request the gRPC path builds from it.
+    #[test]
+    fn a_json_schema_text_format_keeps_its_description() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Name a city.",
+            "text": {"format": {
+                "type": "json_schema", "name": "city",
+                "description": "A city and its country.",
+                "schema": {"type": "object"}, "strict": true
+            }}
+        }))
+        .unwrap();
+        let chat_req = responses_to_chat(&req).unwrap();
+        let Some(ResponseFormat::JsonSchema { json_schema }) = &chat_req.response_format else {
+            panic!(
+                "expected a json_schema format, got {:?}",
+                chat_req.response_format
+            );
+        };
+        assert_eq!(
+            json_schema.description.as_deref(),
+            Some("A city and its country.")
+        );
+        assert_eq!(json_schema.name, "city");
     }
 
     #[test]

@@ -37,4 +37,10 @@ impl RdmaExporter {
     pub fn export(&self, _slot_key: i64, bytes: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
         Err(bytes)
     }
+
+    /// No-op: there is no arena in a build without NIXL.
+    #[expect(clippy::unused_self, reason = "match the NIXL exporter")]
+    pub fn export_slice(&self, _slot_key: i64, _bytes: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
 }

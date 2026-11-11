@@ -1267,6 +1267,18 @@ mod tests {
                 "ebnf",
                 "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
             ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"regex":"a+","response_format":{"type":"structural_tag","structures":[],"triggers":[]}}"#,
+                "regex_conflicts_with_json",
+                "regex",
+                "cannot use regex constraint with a JSON or structural_tag response format",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"ebnf":"root ::= \"a\"","response_format":{"type":"structural_tag","structures":[],"triggers":[]}}"#,
+                "ebnf_conflicts_with_json",
+                "ebnf",
+                "cannot use EBNF constraint with a JSON or structural_tag response format",
+            ),
         ] {
             let (status, json) = rejected::<ChatCompletionRequest>(body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");

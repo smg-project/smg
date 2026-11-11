@@ -286,6 +286,15 @@ pub trait ModelProcessorSpec: Send + Sync {
         EncoderInputFormat::Reference
     }
 
+    /// Whether the family sizes its source images itself before the processor
+    /// runs (the long-side rule of [`crate::minimax_resize`]): the gateway
+    /// then plans the geometry when it fetches and marks the frame as sized
+    /// for the processor. `false` for a family whose processor takes the
+    /// source as decoded.
+    fn resizes_source_images(&self) -> bool {
+        false
+    }
+
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId>;
     fn placeholder_token_for(

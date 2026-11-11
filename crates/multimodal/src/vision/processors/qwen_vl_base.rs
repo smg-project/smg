@@ -502,6 +502,15 @@ impl QwenVLProcessorBase {
         self.config.temporal_patch_size
     }
 
+    /// Number of elements in the resized RGB patch rows of one image.
+    pub(super) fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        let (height, width) = self.smart_resize(height as usize, width as usize).ok()?;
+        height
+            .checked_mul(width)?
+            .checked_mul(3)?
+            .checked_mul(self.temporal_patch_size())
+    }
+
     /// Divide a clip's temporal patch size by `timing`'s rate for its
     /// `video_second_per_grid`, rather than by the rate it was sampled at.
     pub fn with_video_timing(mut self, timing: QwenVideoTiming) -> Self {

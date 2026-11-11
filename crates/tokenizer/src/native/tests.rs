@@ -32,7 +32,7 @@ use tokenizers::{
 use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
 use super::{
-    sentencepiece::{MERGE_SCRATCH_SYMBOLS, WORD_MARKER},
+    sentencepiece::{CharSymbols, MERGE_SCRATCH_SYMBOLS, WORD_MARKER},
     short_pieces::{ShortPieceKey, ShortPieceTable, MIN_SLOTS},
     *,
 };
@@ -381,7 +381,7 @@ fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
 /// build it.
 fn seeded(tokenizer: &HfTokenizer) -> NativeEncoder {
     let mut native = NativeEncoder::from_tokenizer(tokenizer).expect("native path");
-    native.seed_vocabulary(tokenizer.get_model());
+    native.seed_vocabulary(tokenizer.get_model(), None);
     native
 }
 
@@ -843,7 +843,7 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
         let mut text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
         if shape.nfc {
-            text = nfc(&text).into_owned();
+            text = nfc(&text, None).into_owned();
         }
         let whole: Vec<String> = {
             let mut out = Vec::new();
@@ -1253,12 +1253,19 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
             library_is_nfc(&text),
             "{text:?} (quick)"
         );
-        let normalized = nfc(&text);
+        let normalized = nfc(&text, None);
         assert_eq!(normalized.as_ref(), expected, "{text:?}");
         assert_eq!(
             matches!(normalized, Cow::Borrowed(_)),
             text == expected,
             "{text:?}: borrowed only when nothing changed"
+        );
+        let with_quick = nfc(&text, Some(&quick));
+        assert_eq!(with_quick.as_ref(), expected, "{text:?} (quick)");
+        assert_eq!(
+            matches!(with_quick, Cow::Borrowed(_)),
+            text == expected,
+            "{text:?}: borrowed only when nothing changed (quick)"
         );
         changed += usize::from(text != expected);
     }
@@ -1302,7 +1309,12 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
     ] {
         assert_eq!(is_nfc(text), in_nfc, "{text:?}");
         assert_eq!(quick.is_nfc(text), in_nfc, "{text:?} (quick)");
-        assert_eq!(nfc(text).as_ref(), library_nfc(text), "{text:?}");
+        assert_eq!(nfc(text, None).as_ref(), library_nfc(text), "{text:?}");
+        assert_eq!(
+            nfc(text, Some(&quick)).as_ref(),
+            library_nfc(text),
+            "{text:?} (quick)"
+        );
     }
 }
 
@@ -1554,6 +1566,43 @@ fn the_seed_holds_every_short_vocabulary_entry_with_the_models_ids() {
         }
         assert_eq!(native.seed.len(), seeded, "{}", shape.name);
         assert!(seeded > 256, "{}: {seeded}", shape.name);
+    }
+}
+
+/// The sentencepiece seed holds every short vocabulary entry with the ids
+/// the model gives it (the pass merges the entry's symbols over the
+/// character-symbol table instead of asking the model), and nothing else.
+#[test]
+fn the_sentencepiece_seed_holds_every_short_vocabulary_entry_with_the_models_ids() {
+    let mut state = 0x5EED_5EED_5EED_5EEDu64;
+    for shape in sentencepiece_shapes() {
+        let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        let mut seeded = 0;
+        for entry in tokenizer.get_vocab(false).keys() {
+            let Some(key) = CharSymbols::entry_key(entry) else {
+                continue;
+            };
+            let expected: Vec<u32> = model
+                .tokenize(entry)
+                .expect("the model tokenizes its own entry")
+                .iter()
+                .map(|token| token.id)
+                .collect();
+            let mut ids = Vec::new();
+            assert!(
+                native.seed.ids_into(key, &mut ids),
+                "{}: {entry:?} is not seeded",
+                shape.name
+            );
+            assert_eq!(ids, expected, "{}: {entry:?}", shape.name);
+            seeded += 1;
+        }
+        assert_eq!(native.seed.len(), seeded, "{}", shape.name);
+        // Every synthetic entry is space-free and at most 15 raw bytes, so
+        // the key takes them all: the seeded count is the vocabulary's.
+        assert_eq!(seeded, tokenizer.get_vocab_size(false), "{}", shape.name);
     }
 }
 
@@ -1864,8 +1913,9 @@ fn piece_caches_stay_within_their_bound_across_threads() {
 }
 
 /// A thread's packed table starts with the fewest slots, grows with the
-/// distinct pieces the thread meets up to its share, and is made anew for a
-/// smaller share (threads joined since it grew) when it is cleared.
+/// distinct pieces the thread meets up to its share, and is cut back to the
+/// slots of a smaller share (threads joined since it grew) when it is
+/// cleared.
 #[test]
 fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
     let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
@@ -1963,10 +2013,10 @@ fn a_thread_whose_share_fell_is_within_it_from_its_next_encode_on() {
 
 /// A thread's packed table grown for an earlier share keeps its slots
 /// through a clear at the bound; once the share fell below them (threads
-/// joined) the thread's next encode call makes the table anew for the
-/// share, entries within it or not.
+/// joined) the thread's next encode call cuts the table back to the slots
+/// of the share, entries within it or not.
 #[test]
-fn a_thread_whose_packed_table_outgrew_its_share_remakes_it_at_its_next_encode() {
+fn a_thread_whose_packed_table_outgrew_its_share_cuts_it_back_at_its_next_encode() {
     let mut state = 0xF00D_CAFE_DEAD_BEEFu64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
@@ -2627,7 +2677,7 @@ fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
     }
     assert_eq!(at, line.len());
     assert!(is_nfc(&line));
-    assert!(matches!(nfc(&line), Cow::Borrowed(_)));
+    assert!(matches!(nfc(&line, None), Cow::Borrowed(_)));
     // The checked run ends at an ideograph, at an ASCII byte, or at the end.
     assert_eq!(checked_run("，漢".as_bytes()), 3);
     assert_eq!(checked_run("，。、漢字".as_bytes()), 9);
@@ -3348,12 +3398,14 @@ fn scanner_differential(patterns: &[&str]) {
                 expected,
                 "pattern {pattern:?} text {text:?}"
             );
-            let mut each = Vec::new();
-            parsed.for_each_match(text, |start, end| each.push((start, end)));
-            assert_eq!(
-                each, expected,
-                "for_each_match: pattern {pattern:?} text {text:?}"
-            );
+            for words in [false, true] {
+                let mut each = Vec::new();
+                parsed.for_each_match(text, words, |start, end| each.push((start, end)));
+                assert_eq!(
+                    each, expected,
+                    "for_each_match words={words}: pattern {pattern:?} text {text:?}"
+                );
+            }
         };
         for text in &fixtures {
             check(text);

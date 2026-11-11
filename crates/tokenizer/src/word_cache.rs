@@ -18,10 +18,14 @@
 //! applied as the model moves into the built tokenizer. One model, no copy.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use serde::{
@@ -58,6 +62,12 @@ pub(crate) type LoadingTokenizer = TokenizerOf<LateBoundModel>;
 /// The `tokenizers` model behind a tokenizer's model type, built or loading.
 pub(crate) trait ModelView {
     fn wrapper(&self) -> &ModelWrapper;
+
+    /// What the one-pass read of the file saw of a BPE section, while the
+    /// model is loading; nothing once it is built.
+    fn read(&self) -> Option<&ReadBpe> {
+        None
+    }
 }
 
 impl ModelView for ModelWrapper {
@@ -76,6 +86,169 @@ pub(crate) struct LateBoundModel {
     /// Words the BPE model caches per thread once built: the general bound
     /// until the load decides otherwise.
     words: AtomicUsize,
+    /// What the one-pass read of a BPE section saw, for the loader's own
+    /// tables; `None` for a model built in memory or read by the crate.
+    read: Option<ReadBpe>,
+}
+
+/// What the one-pass read of a BPE section saw that the loader's own tables
+/// are built from, so none of it is read back from the built model: the
+/// merges as ids (left, right, product; the rank is the index), when every
+/// merge names tokens of the vocabulary, the vocabulary's largest id, and
+/// whether its ids are exactly the range `0..n` of its `n` entries.
+/// Dropped with the loading model when it moves into the built tokenizer.
+pub(crate) struct ReadBpe {
+    pub(crate) pairs: Option<Box<[[u32; 3]]>>,
+    pub(crate) max_id: Option<u32>,
+    /// The ids are `0..n` with no gap and no id twice: the tables may
+    /// walk the entries by id and find every one of them.
+    pub(crate) dense: bool,
+    /// The vocabulary's text by id when the ids are dense (see
+    /// [`Listing`]), shared with the tables built after the model moved
+    /// into the built tokenizer.
+    pub(crate) tokens: Option<Arc<Listing>>,
+}
+
+/// The vocabulary's text, listed once by the read: every token's bytes in
+/// one buffer and, by id, where each token lies in it. The passes that walk
+/// the vocabulary (the seed, the preformed analysis, the character symbols,
+/// the decode tables) borrow their tokens from it instead of cloning each
+/// out of the model (`id_to_token`), one `String` per id per pass.
+pub(crate) struct Listing {
+    text: String,
+    spans: Vec<(u32, u32)>,
+}
+
+impl Listing {
+    /// The token of `id` (`None` past the end of the vocabulary).
+    pub(crate) fn get(&self, id: u32) -> Option<&str> {
+        let &(start, end) = self.spans.get(id as usize)?;
+        Some(&self.text[start as usize..end as usize])
+    }
+
+    /// How many ids the listing covers (`0..len`).
+    pub(crate) fn len(&self) -> u32 {
+        self.spans.len() as u32
+    }
+
+    /// The listing of a dense vocabulary (every id below its length, none
+    /// twice), or `None` for a sparse one (an id past the vocabulary's size,
+    /// two tokens on one id) or one too large for the spans' width.
+    pub(crate) fn of(vocab: &Vocab) -> Option<Self> {
+        let n = vocab.len();
+        let bytes = vocab.keys().map(String::len).sum::<usize>();
+        // Under the marker, so no span's start can read as an unwritten slot.
+        if bytes >= u32::MAX as usize || u32::try_from(n).is_err() {
+            return None;
+        }
+        let mut text = String::with_capacity(bytes);
+        let mut spans = vec![(u32::MAX, u32::MAX); n];
+        for (token, &id) in vocab {
+            let start = text.len() as u32;
+            text.push_str(token);
+            let slot = spans.get_mut(id as usize)?;
+            if slot.0 != u32::MAX {
+                return None;
+            }
+            *slot = (start, text.len() as u32);
+        }
+        Some(Self { text, spans })
+    }
+}
+
+impl ReadBpe {
+    fn of(vocab: &Vocab, merges: &[(String, String)]) -> Self {
+        let max_id = vocab.values().copied().max();
+        let n = vocab.len();
+        let mut seen = vec![0u64; n.div_ceil(64)];
+        let dense = vocab.values().all(|&id| {
+            let id = id as usize;
+            id < n && {
+                let (word, bit) = (id / 64, 1u64 << (id % 64));
+                let fresh = seen[word] & bit == 0;
+                seen[word] |= bit;
+                fresh
+            }
+        });
+        let tokens = dense.then(|| Listing::of(vocab)).flatten().map(Arc::new);
+        let mut token = String::new();
+        let mut pairs = Vec::with_capacity(merges.len());
+        for (left, right) in merges {
+            token.clear();
+            token.push_str(left);
+            token.push_str(right);
+            match (
+                vocab.get(left.as_str()),
+                vocab.get(right.as_str()),
+                vocab.get(token.as_str()),
+            ) {
+                (Some(&a), Some(&b), Some(&product)) => pairs.push([a, b, product]),
+                // A merge naming a token outside the vocabulary: the table
+                // built from the model declines it with the reason.
+                _ => {
+                    return Self {
+                        pairs: None,
+                        max_id,
+                        dense,
+                        tokens,
+                    }
+                }
+            }
+        }
+        Self {
+            pairs: Some(pairs.into_boxed_slice()),
+            max_id,
+            dense,
+            tokens,
+        }
+    }
+}
+
+/// The token of `id` as the decode sees it: an added token first (its own
+/// map, as `id_to_token` looks), then the model's: borrowed from the read's
+/// listing when there is one, cloned out of the model otherwise.
+pub(crate) fn token_of<'a>(
+    tokenizer: &TokenizerOf<ModelWrapper>,
+    listing: Option<&'a Listing>,
+    id: u32,
+) -> Option<Cow<'a, str>> {
+    if let Some(added) = tokenizer.get_added_vocabulary().simple_id_to_token(id) {
+        return Some(Cow::Owned(added));
+    }
+    match listing {
+        Some(listing) if id < listing.len() => listing.get(id).map(Cow::Borrowed),
+        _ => tokenizer.id_to_token(id).map(Cow::Owned),
+    }
+}
+
+/// The model's vocabulary as `(id, token)` entries, one at a time: borrowed
+/// from the read's listing when it has one (a dense vocabulary, `Listing`);
+/// else by id when the read says the ids are exactly the range `0..n` of the
+/// vocabulary's `n` entries (one lookup per id, each token used and dropped
+/// before the next, no clone of the map); otherwise a walk of the map, as
+/// for a model without a read. A vocabulary numbered sparsely, or with two
+/// tokens on one id, is never listed and never starts the walk by id.
+pub(crate) fn entries_of<'a>(
+    bpe: &'a BPE,
+    read: Option<&'a ReadBpe>,
+) -> Box<dyn Iterator<Item = (u32, Cow<'a, str>)> + 'a> {
+    if let Some(tokens) = read.and_then(|read| read.tokens.as_deref()) {
+        return Box::new(
+            (0..tokens.len())
+                .filter_map(move |id| tokens.get(id).map(|token| (id, Cow::Borrowed(token)))),
+        );
+    }
+    match read.filter(|read| read.dense).and_then(|read| read.max_id) {
+        Some(max_id) => Box::new(
+            (0..=max_id)
+                .filter_map(move |id| bpe.id_to_token(id).map(|token| (id, Cow::Owned(token)))),
+        ),
+        None => Box::new(
+            bpe.get_vocab()
+                .into_iter()
+                .map(|(token, id)| (id, Cow::Owned(token))),
+        ),
+    }
 }
 
 impl LateBoundModel {
@@ -90,6 +263,10 @@ impl ModelView for LateBoundModel {
     fn wrapper(&self) -> &ModelWrapper {
         &self.model
     }
+
+    fn read(&self) -> Option<&ReadBpe> {
+        self.read.as_ref()
+    }
 }
 
 impl From<ModelWrapper> for LateBoundModel {
@@ -97,6 +274,7 @@ impl From<ModelWrapper> for LateBoundModel {
         Self {
             model,
             words: AtomicUsize::new(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD),
+            read: None,
         }
     }
 }
@@ -104,7 +282,11 @@ impl From<ModelWrapper> for LateBoundModel {
 impl From<LateBoundModel> for ModelWrapper {
     /// The model moves into the built tokenizer with its bound applied.
     fn from(late: LateBoundModel) -> Self {
-        let LateBoundModel { mut model, words } = late;
+        let LateBoundModel {
+            mut model,
+            words,
+            read: _,
+        } = late;
         if let ModelWrapper::BPE(bpe) = &mut model {
             bpe.resize_cache(words.into_inner());
         }
@@ -115,7 +297,7 @@ impl From<LateBoundModel> for ModelWrapper {
 impl<'de> Deserialize<'de> for LateBoundModel {
     /// The file's model section, read in one pass (see [`ModelSection`]).
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(ModelSection).map(Self::from)
+        deserializer.deserialize_map(ModelSection)
     }
 }
 
@@ -142,13 +324,13 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
-    type Value = ModelWrapper;
+    type Value = LateBoundModel;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a tokenizer model section")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<ModelWrapper, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<LateBoundModel, A::Error> {
         let mut replay = Replay {
             key: None,
             value: None,
@@ -158,7 +340,7 @@ impl<'de> Visitor<'de> for ModelSection {
             let value = if key == "type" {
                 let kind: String = replay.rest.next_value()?;
                 if kind == "BPE" {
-                    return bpe_section(replay.rest).map(ModelWrapper::BPE);
+                    return bpe_section(replay.rest);
                 }
                 Value::String(kind)
             } else {
@@ -168,6 +350,7 @@ impl<'de> Visitor<'de> for ModelSection {
             replay.value = Some(value);
         }
         ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(replay))
+            .map(LateBoundModel::from)
     }
 }
 
@@ -204,8 +387,10 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for Replay<A> {
 
 /// The rest of a BPE section after its `type`, fed to the crate's builder
 /// field by field: the fields, their defaults and the skipping of unknown
-/// ones are the crate's own (`tokenizers::models::bpe::serialization`).
-fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<BPE, A::Error> {
+/// ones are the crate's own (`tokenizers::models::bpe::serialization`). What
+/// the loader's own tables need of the section rides on the loading model
+/// (`ReadBpe`), read here once.
+fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<LateBoundModel, A::Error> {
     let mut builder = BPE::builder();
     let mut vocab: Option<Vocab> = None;
     let mut merges: Option<Vec<(String, String)>> = None;
@@ -267,10 +452,16 @@ fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<BPE, A::Error> {
     let (Some(vocab), Some(merges)) = (vocab, merges) else {
         return Err(A::Error::custom("Missing vocab/merges"));
     };
-    builder
+    let read = ReadBpe::of(&vocab, &merges);
+    let model = builder
         .vocab_and_merges(vocab, merges)
         .build()
-        .map_err(A::Error::custom)
+        .map_err(A::Error::custom)?;
+    Ok(LateBoundModel {
+        model: ModelWrapper::BPE(model),
+        words: AtomicUsize::new(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD),
+        read: Some(read),
+    })
 }
 
 /// The merge list of a BPE section: each merge a pair `["a", "b"]`, or in

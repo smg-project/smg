@@ -4,6 +4,24 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ## Unreleased
 
+### Changed
+
+- Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
+  `ResponseFormat::StructuralTag` carries `Box<serde_json::Map<String, Value>>`. A format had
+  grown from 104 to 128 bytes when the schema kept its description and the structural tag
+  arrived, and the Gateway's chat route task, which holds a request's format three times over
+  its awaits, moved up one allocator size class on every chat request. Behind a pointer each, a
+  format is 16 bytes, a chat request 1,040 (1,152 before), and the task is back in its class;
+  the wire shape and the schema are unchanged, and a text or json_object format allocates
+  nothing.
+- Breaking: on `ChatMessage::Assistant`, `function_call` is `Option<Box<FunctionCallResponse>>`,
+  and the provider extension's `tools` is `Option<Box<serde_json::Value>>`. The assistant turn is
+  the enum's largest variant, so the two rarely-present values had grown every chat message to
+  272 bytes (176 before the refusal, the audio reference and the function call were kept), and
+  a history of four or eight turns moved up one allocator size class on every chat request.
+  Behind a pointer each, a message is 168 bytes and the history is back in its class; the wire
+  shape and the schema are unchanged.
+
 ### Removed
 
 - Breaking: the fifty-two builder constructors nothing in this repository uses are removed, with
@@ -35,6 +53,18 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `json_schema` response format keeps its `description` when the request is written back for an
+  upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
+  reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
+  `text.format` description into the Chat request it builds, but a gRPC engine still gets only the
+  format's schema, as before. Breaking: `JsonSchemaFormat` gains `description: Option<String>`.
+- A usage object whose `prompt_tokens_details` leaves out `cached_tokens` parses, with no tokens
+  cached, as the public API defaults the key. The crate refused the whole usage, and the
+  completion around it, with ``missing field `cached_tokens` ``. The newer counters an upstream
+  reports are kept: `text_tokens`, `image_tokens` and `cache_write_tokens` in the prompt details,
+  `text_tokens` in the completion details. A usage the gateway builds is written as before.
+  Breaking: `PromptTokenUsageInfo` gains `text_tokens`, `image_tokens` and `cache_write_tokens`,
+  and `CompletionTokensDetails` gains `text_tokens`, all `Option<u32>`.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a

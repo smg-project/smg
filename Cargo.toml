@@ -65,12 +65,14 @@ http = "1.4.2"
 lru = "0.18.0"
 memchr = "2"
 num-traits = "0.2"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 rand = "0.10.1"
 reqwest = { version = "0.13.4", default-features = false }
 serde = { version = "1.0" }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_with = { version = "3", features = ["macros"] }
+# serde_yaml is archived upstream (0.9 is its last line); every YAML reader inherits this one pin.
+serde_yaml = "0.9"
 subtle = "2.6"
 thiserror = "2.0.18"
 tokio = { version = "1.54.1" }

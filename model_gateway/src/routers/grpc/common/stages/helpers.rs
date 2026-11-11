@@ -9,6 +9,7 @@ use std::{
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
 use llm_tokenizer::traits::Tokenizer;
+use openai_protocol::common::ResponseFormat;
 use rand::RngExt;
 use smg_grpc_client::{
     mlx_proto,
@@ -487,18 +488,30 @@ impl ToolConstraintStamp {
     /// Capture the stamp for a built request that carries the forced call's
     /// structural tag. Nothing is captured for a JSON-schema constraint (no
     /// shape to follow) or when the backend's builder let the request's
-    /// `response_format` outrank the tool constraint (the request then
-    /// carries a schema, grammar or regex, never a structural tag).
-    /// `first_token` says the table built the tag for an engine that starts
-    /// the grammar at the first token.
+    /// `response_format` outrank the tool constraint: the request then
+    /// carries the body's own constraint, a schema, a grammar, a regex, or
+    /// the body's own structural tag, told from the forced call's by
+    /// `own_format`, the `response_format` as the builder read it (`None`
+    /// where the constraint set it aside). `first_token` says the table
+    /// built the tag for an engine that starts the grammar at the first
+    /// token.
     pub(crate) fn capture(
         unshaped: Option<(String, String)>,
         parser: Option<&str>,
         first_token: bool,
         request: &ProtoGenerateRequest,
+        own_format: Option<&ResponseFormat>,
     ) -> Option<Self> {
         let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
-        request.structural_tag()?;
+        let carried = request.structural_tag()?;
+        // The body's own tag rides as its builder wrote it
+        // (`response_format_constraint`): a request that carries it keeps it
+        // on every retry.
+        if let Some(own @ ResponseFormat::StructuralTag { .. }) = own_format {
+            if serde_json::to_string(own).is_ok_and(|tag| tag == carried) {
+                return None;
+            }
+        }
         Some(Self::Registry {
             constraint,
             parser: parser.map(str::to_string),

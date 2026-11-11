@@ -52,7 +52,9 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
-    routers::{error, grpc::regular::symphony::template::Templates, RouterTrait},
+    routers::{
+        common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
+    },
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -534,7 +536,7 @@ impl GrpcRouter {
                 serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
             } else {
                 match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
-                    Ok(response) => Json(response).into_response(),
+                    Ok(response) => json_response(&response),
                     Err(error_response) => error_response,
                 }
             }
@@ -685,7 +687,7 @@ impl GrpcRouter {
                 }),
             );
         }
-        (StatusCode::OK, Json(queued)).into_response()
+        json_response(&queued)
     }
 
     /// Main route_embeddings implementation
@@ -724,14 +726,17 @@ impl GrpcRouter {
         .await
     }
 
-    /// Main route_messages implementation
-    async fn route_messages_impl(
+    /// The Messages request as the pipeline takes it: its `model` field
+    /// canonical, in the `Arc` the request context holds, with the canonical
+    /// model id. Done before the async hops of [`Self::route_messages_impl`],
+    /// as [`Self::chat_request_for_pipeline`] does for chat, so that only the
+    /// handle travels through their state machines, not a copy of the request
+    /// per hop.
+    fn messages_request_for_pipeline(
         &self,
-        headers: Option<&HeaderMap>,
-        tenant_meta: &TenantRequestMeta,
         body: CreateMessageRequest,
         model_id: &str,
-    ) -> Response {
+    ) -> (Arc<CreateMessageRequest>, String) {
         debug!("Processing messages request for model: {}", model_id);
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
@@ -739,9 +744,19 @@ impl GrpcRouter {
         // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
-        canonical_body.model = model_id_cloned.clone();
-        let canonical_body = Arc::new(canonical_body);
+        canonical_body.model.clone_from(&model_id_cloned);
+        (Arc::new(canonical_body), model_id_cloned)
+    }
 
+    /// Main route_messages implementation, over the request
+    /// [`Self::messages_request_for_pipeline`] prepared.
+    async fn route_messages_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        canonical_body: Arc<CreateMessageRequest>,
+        model_id_cloned: String,
+    ) -> Response {
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
         // No worker takes part, so the answer carries no rate-limit
@@ -788,16 +803,19 @@ impl GrpcRouter {
     /// tokenizer: the request is rendered through the model's chat template
     /// exactly as `/v1/messages` renders it and the prompt's token count is
     /// returned. No worker takes part, so every worker type is covered.
+    /// Takes the request by reference: an async fn that takes it by value
+    /// and borrows it across the await holds two copies of it in its task,
+    /// the captured argument and the re-bound local.
     async fn route_messages_count_tokens_impl(
         &self,
-        body: CountMessageTokensRequest,
+        body: &CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
         let model_id = self.resolve_canonical_model_id(model_id);
         match self
             .count_prompt_tokens(
                 &model_id,
-                message_utils::MessagesPrompt::from(&body),
+                message_utils::MessagesPrompt::from(body),
                 &body.chat_tools(),
                 body.tool_choice.as_ref(),
                 false,
@@ -947,7 +965,7 @@ impl GrpcRouter {
             container: None,
         };
         if !stream {
-            return (StatusCode::OK, Json(message)).into_response();
+            return json_response(&message);
         }
 
         let events = [
@@ -1284,6 +1302,7 @@ impl RouterTrait for GrpcRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
+        let (body, model_id) = self.messages_request_for_pipeline(body, model_id);
         self.route_messages_impl(headers, tenant_meta, body, model_id)
             .await
     }
@@ -1295,7 +1314,7 @@ impl RouterTrait for GrpcRouter {
         body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
-        self.route_messages_count_tokens_impl(body, model_id).await
+        self.route_messages_count_tokens_impl(&body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {

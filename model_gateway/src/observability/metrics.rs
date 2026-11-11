@@ -733,8 +733,11 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 
 /// Jemalloc's run-time options for a long-running gateway, for every final
 /// artifact (the `smg` executable, the Python extension, the Go FFI library)
-/// to export as
-/// `_rjem_malloc_conf` next to its `#[global_allocator]`. With the stock
+/// to export as `_rjem_malloc_conf` next to its `#[global_allocator]`. The
+/// multimodal crate's baseline harness (`crates/multimodal/examples/mm_baseline.rs`)
+/// sits below this crate and repeats the bytes by hand; the test
+/// `the_multimodal_harness_repeats_the_malloc_conf` keeps that copy equal. With
+/// the stock
 /// settings a thread's freed pages decay back to the OS only when that thread
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
@@ -1507,6 +1510,10 @@ pub(crate) fn init_metrics() {
         "Pixel cache lookups that had to preprocess the image, by model"
     );
     describe_counter!(
+        "smg_mm_pixel_cache_budget_bypasses_total",
+        "Image requests that bypassed the pixel cache because their working set exceeds its byte budget, by model"
+    );
+    describe_counter!(
         "smg_mm_pixel_cache_evictions_total",
         "Entries the pixel cache dropped to stay within its byte budget"
     );
@@ -2249,6 +2256,15 @@ impl Metrics {
         counter!("smg_mm_pixel_cache_hits_total", "model" => model.clone())
             .increment(u64::from(hit));
         counter!("smg_mm_pixel_cache_misses_total", "model" => model).increment(u64::from(!hit));
+    }
+
+    /// A request bypassed pixel cache lookup because its working set is too large.
+    pub fn record_mm_pixel_cache_budget_bypass(model_id: &str) {
+        counter!(
+            "smg_mm_pixel_cache_budget_bypasses_total",
+            "model" => intern_model_label(model_id)
+        )
+        .increment(1);
     }
 
     /// The pixel cache after an insert: the entries it dropped to stay within

@@ -1770,3 +1770,19 @@ fn a_duration_bucket_list_is_refused_unless_finite_positive_and_strictly_ascendi
             .expect("an empty or strictly ascending list is accepted");
     }
 }
+
+#[test]
+fn the_multimodal_harness_repeats_the_malloc_conf() {
+    // The harness sits below this crate and cannot import the constant: it
+    // repeats the bytes by hand, and this is what keeps that copy equal.
+    let harness = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/multimodal/examples/mm_baseline.rs"
+    ));
+    let conf = std::str::from_utf8(&SERVER_MALLOC_CONF[..SERVER_MALLOC_CONF.len() - 1])
+        .expect("the malloc conf is ASCII");
+    assert!(
+        harness.contains(conf),
+        "crates/multimodal/examples/mm_baseline.rs no longer carries SERVER_MALLOC_CONF ({conf})"
+    );
+}

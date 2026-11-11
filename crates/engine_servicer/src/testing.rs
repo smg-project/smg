@@ -19,6 +19,14 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{kv_events::KvEventRelay, ServicerConfig};
 
+/// The handshake endpoint of one test: an IPC socket under its own
+/// directory. A probed TCP port is not reserved, so two tests running in
+/// parallel could pick the same one and a mock engine would handshake with
+/// the other test's servicer and wait forever for its INIT.
+pub(crate) fn handshake_address(dir: &Path) -> String {
+    format!("ipc://{}", dir.join("handshake").display())
+}
+
 /// The servicer configuration every servicer test starts from: an ephemeral
 /// port, the engine's data-plane sockets under the test's own directory,
 /// one engine, no tokenizer directory, a ten-second silence bound on the

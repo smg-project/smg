@@ -8,7 +8,11 @@
 //! size of the pools they would select from, so traffic can migrate between
 //! HTTP and gRPC and between regular and disaggregated fleets gradually.
 
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
@@ -101,13 +105,35 @@ const ROUTER_FAMILIES: [RouterFamily; 5] = [
     },
 ];
 
+/// The default router, resolved when it is set or mounted and read per
+/// request as it is: a single-router gateway reached its one router through
+/// a hash of the id and a probe of the map on every request (about 0.5 % of
+/// a chat request's user instructions on the mock bed). `router` is `None`
+/// while the id names a router that is not mounted, which the lookup read as
+/// no router before.
+struct DefaultRouter {
+    id: RouterId,
+    router: Option<Arc<dyn RouterTrait>>,
+}
+
 pub struct Gateway {
     worker_registry: Arc<WorkerRegistry>,
     /// Copy-on-write: routers are registered at startup and only read per
     /// request, so a wait-free `load()` replaces a `DashMap` shard lock (and a
     /// `RwLock` for the default) that every request would contend on.
     routers: ArcSwap<HashMap<RouterId, Arc<dyn RouterTrait>>>,
-    default_router: ArcSwapOption<RouterId>,
+    /// The mounted router of every family in [`ROUTER_FAMILIES`] order, read
+    /// by the weighted pick per request: the pick and the weights hashed every
+    /// family's id against the map, twice, on every request (a dozen SipHash
+    /// runs for five families); the array is resolved once, at the mount.
+    family_routers: ArcSwap<[Option<Arc<dyn RouterTrait>>; ROUTER_FAMILIES.len()]>,
+    default_router: ArcSwapOption<DefaultRouter>,
+    /// The mount path's lock: `register_router` and `set_default_router`
+    /// each read one swapped value and store another (the map, then the
+    /// default), and two of them interleaving could leave the default
+    /// without a router that is mounted; serialized, a mount and a default
+    /// named for it converge in either order. Requests never take it.
+    mounts: Mutex<()>,
     enable_igw: bool,
     /// The message threads of the Messages route: resolved before the
     /// family routers see a request, stored after one answers.
@@ -125,7 +151,9 @@ impl Gateway {
         Self {
             worker_registry,
             routers: ArcSwap::from_pointee(HashMap::new()),
+            family_routers: ArcSwap::from_pointee(std::array::from_fn(|_| None)),
             default_router: ArcSwapOption::empty(),
+            mounts: Mutex::new(()),
             enable_igw: false,
             threads: MessageThreads::new(),
         }
@@ -217,20 +245,44 @@ impl Gateway {
     }
 
     pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
+        let _mount = self.mounts.lock().unwrap_or_else(PoisonError::into_inner);
         self.routers.rcu(|routers| {
             let mut next: HashMap<_, _> = (**routers).clone();
             next.insert(id.clone(), Arc::clone(&router));
             next
         });
+        if let Some(index) = ROUTER_FAMILIES
+            .iter()
+            .position(|family| family.router == id)
+        {
+            self.family_routers.rcu(|families| {
+                let mut next = (**families).clone();
+                next[index] = Some(Arc::clone(&router));
+                next
+            });
+        }
 
-        if self.default_router.load().is_none() {
-            self.default_router.store(Some(Arc::new(id.clone())));
-            info!("Set default router to {}", id.as_str());
+        match &*self.default_router.load() {
+            None => {
+                info!("Set default router to {}", id.as_str());
+                self.store_default_router(id, Some(router));
+            }
+            // The default named before its router was mounted, or mounted
+            // again under its id: the default reads the router just mounted.
+            Some(default) if default.id == id => self.store_default_router(id, Some(router)),
+            Some(_) => {}
         }
     }
 
     pub fn set_default_router(&self, id: RouterId) {
-        self.default_router.store(Some(Arc::new(id)));
+        let _mount = self.mounts.lock().unwrap_or_else(PoisonError::into_inner);
+        let router = self.routers.load().get(&id).cloned();
+        self.store_default_router(id, router);
+    }
+
+    fn store_default_router(&self, id: RouterId, router: Option<Arc<dyn RouterTrait>>) {
+        self.default_router
+            .store(Some(Arc::new(DefaultRouter { id, router })));
     }
 
     pub fn router_count(&self) -> usize {
@@ -245,19 +297,20 @@ impl Gateway {
         &self,
         size: impl Fn(RoutingPool) -> usize,
     ) -> [usize; ROUTER_FAMILIES.len()] {
-        let routers = self.routers.load();
+        let mounted = self.family_routers.load();
         // A family has weight when its router is mounted and every pool has workers.
-        let has_weight = |family: &RouterFamily| {
-            routers.contains_key(&family.router) && family.pools.iter().all(|pool| size(*pool) > 0)
+        let has_weight = |i: usize, family: &RouterFamily| {
+            mounted[i].is_some() && family.pools.iter().all(|pool| size(*pool) > 0)
         };
         let mut weights = [0usize; ROUTER_FAMILIES.len()];
         for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
             let shadowed = family.shadowed_by.as_ref().is_some_and(|shadow| {
                 ROUTER_FAMILIES
                     .iter()
-                    .any(|other| other.router == *shadow && has_weight(other))
+                    .enumerate()
+                    .any(|(j, other)| other.router == *shadow && has_weight(j, other))
             });
-            if !shadowed && has_weight(family) {
+            if !shadowed && has_weight(i, family) {
                 weights[i] = family.pools.iter().map(|pool| size(*pool)).sum();
             }
         }
@@ -273,12 +326,11 @@ impl Gateway {
         &self,
         weights: &[usize; ROUTER_FAMILIES.len()],
     ) -> Option<Arc<dyn RouterTrait>> {
-        let routers = self.routers.load();
-        let mounted = |family: &RouterFamily| routers.contains_key(&family.router);
-        let total: usize = ROUTER_FAMILIES
+        let mounted = self.family_routers.load();
+        let total: usize = mounted
             .iter()
             .zip(weights)
-            .filter(|(family, weight)| **weight > 0 && mounted(family))
+            .filter(|(router, weight)| **weight > 0 && router.is_some())
             .map(|(_, weight)| *weight)
             .sum();
         if total == 0 {
@@ -286,13 +338,14 @@ impl Gateway {
         }
         let pick = ((rand::random::<f64>() * total as f64) as usize).min(total - 1);
         let mut cum = 0usize;
-        for (family, weight) in ROUTER_FAMILIES.iter().zip(weights) {
-            if *weight == 0 || !mounted(family) {
+        for (router, weight) in mounted.iter().zip(weights) {
+            let Some(router) = router else { continue };
+            if *weight == 0 {
                 continue;
             }
             cum += weight;
             if pick < cum {
-                return routers.get(&family.router).cloned();
+                return Some(Arc::clone(router));
             }
         }
         None
@@ -433,13 +486,13 @@ impl Gateway {
     ) -> Option<Arc<dyn RouterTrait>> {
         // In single-router mode (enable_igw=false), always use the default router
         if !self.enable_igw {
-            if let Some(default_id) = &*self.default_router.load() {
+            if let Some(default) = &*self.default_router.load() {
                 debug!(
                     "Single-router mode: using default router {} for model {:?}",
-                    default_id.as_str(),
+                    default.id.as_str(),
                     model_id
                 );
-                return self.routers.load().get(&**default_id).cloned();
+                return default.router.clone();
             }
         }
 
@@ -456,7 +509,7 @@ impl Gateway {
             self.default_router
                 .load()
                 .as_ref()
-                .and_then(|id| self.routers.load().get(&**id).cloned())
+                .and_then(|default| default.router.clone())
         })
     }
 
@@ -481,13 +534,15 @@ impl Gateway {
 
     /// The router of a Messages request: in IGW mode an empty message (a
     /// `max_tokens` of 0) may go to a router that answers it without an
-    /// engine.
+    /// engine. Takes the request's `max_tokens`, not the request: a local
+    /// that was borrowed keeps its slot in the route's task across the awaits
+    /// that follow, a second copy of the request per plain request.
     fn select_messages_router(
         &self,
-        body: &CreateMessageRequest,
+        max_tokens: u32,
         model_id: &str,
     ) -> Option<Arc<dyn RouterTrait>> {
-        if self.enable_igw && body.max_tokens == 0 {
+        if self.enable_igw && max_tokens == 0 {
             self.select_router_for_empty_message(model_id)
         } else {
             self.select_router_for_request(Some(model_id))
@@ -512,7 +567,7 @@ impl Gateway {
             Ok(resolved) => resolved,
             Err(refused) => return refused,
         };
-        let response = match self.select_messages_router(&body, model_id) {
+        let response = match self.select_messages_router(body.max_tokens, model_id) {
             Some(router) => {
                 router
                     .route_messages(headers, tenant_meta, body, model_id)
@@ -565,10 +620,9 @@ impl RouterTrait for Gateway {
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
         // Model info is fleet-wide: the default router answers, else any.
-        let routers = self.routers.load();
         let router = match self.default_router.load_full() {
-            Some(id) => routers.get(&*id).cloned(),
-            None => routers.values().next().cloned(),
+            Some(default) => default.router.clone(),
+            None => self.routers.load().values().next().cloned(),
         };
         match router {
             Some(router) => router.get_model_info(req).await,
@@ -636,12 +690,19 @@ impl RouterTrait for Gateway {
     ) -> Response {
         // A thread turn runs as its own boxed future: its locals (the chain
         // walk, the rebuild, the answer read back) would otherwise size every
-        // plain request's task.
-        if body.thread.is_some() {
+        // plain request's task. The request is read by value and moved, never
+        // borrowed, before the awaits: a borrowed local keeps a second copy of
+        // the request in every plain request's task (`is_some()` borrows it;
+        // the `matches!` reads the discriminant in place).
+        #[expect(
+            clippy::redundant_pattern_matching,
+            reason = "is_some() borrows the request; a borrowed local keeps its slot in the task"
+        )]
+        if matches!(body.thread, Some(_)) {
             return Box::pin(self.route_messages_thread(headers, tenant_meta, body, model_id))
                 .await;
         }
-        match self.select_messages_router(&body, model_id) {
+        match self.select_messages_router(body.max_tokens, model_id) {
             Some(router) => {
                 router
                     .route_messages(headers, tenant_meta, body, model_id)
@@ -1118,6 +1179,34 @@ mod tests {
         let manager = Arc::new(manager);
         manager.register_router(router_ids::HTTP_REGULAR, Arc::new(StubRouter));
         manager
+    }
+
+    /// The default router is whatever is mounted under its id, whenever it
+    /// is mounted: named before its router, it is no router until the mount;
+    /// mounted again under its id, it reads the new router; another router
+    /// mounted beside it does not move it.
+    #[test]
+    fn the_default_router_follows_the_router_mounted_under_its_id() {
+        let gateway = test_gateway(false);
+        gateway.set_default_router(router_ids::HTTP_PD);
+        assert!(gateway.select_router_for_request(None).is_none());
+
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        let mounted = gateway
+            .select_router_for_request(None)
+            .expect("the default, once mounted");
+
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        let remounted = gateway
+            .select_router_for_request(None)
+            .expect("the default, mounted again");
+        assert!(!Arc::ptr_eq(&mounted, &remounted));
+
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
+        let still = gateway
+            .select_router_for_request(Some("any-model"))
+            .expect("the default, with another router beside it");
+        assert!(Arc::ptr_eq(&remounted, &still));
     }
 
     /// A lone router speaks for itself — a forward-capable one keeps
@@ -1694,6 +1783,23 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    /// A plain Messages request's task holds the request once: a local
+    /// borrowed before the move keeps a second copy across the awaits (the
+    /// task read 1,072 bytes around a 488-byte request that way, 584 with
+    /// the request moved).
+    #[test]
+    fn a_plain_messages_task_holds_the_request_once() {
+        let gateway = test_gateway(true);
+        let meta = test_tenant_meta();
+        let task = gateway.route_messages(None, &meta, message_request(1), "m");
+        let task = size_of_val(&*task);
+        let request = size_of::<CreateMessageRequest>();
+        assert!(
+            task < 2 * request,
+            "the task is {task} bytes around a request of {request}"
+        );
     }
 
     /// The name of the router that answered a Messages request for `m`.

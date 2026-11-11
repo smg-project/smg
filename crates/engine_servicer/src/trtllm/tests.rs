@@ -35,7 +35,7 @@ use tonic::{transport::Channel, Code};
 use super::*;
 use crate::{
     kv_events,
-    testing::{servicer_config, Bounded},
+    testing::{handshake_address, servicer_config, Bounded},
 };
 
 fn model_info() -> TrtllmModelInfo {
@@ -64,12 +64,6 @@ fn config(dir: &std::path::Path, handshake: &str, model: TrtllmModelInfo) -> Trt
         servicer: servicer_config(dir, handshake),
         model,
     }
-}
-
-/// The handshake endpoint of one test: an IPC socket under its own
-/// directory, so two tests running in parallel never share one.
-fn handshake_address(dir: &std::path::Path) -> String {
-    format!("ipc://{}", dir.join("handshake").display())
 }
 
 /// The layouts the shim declares at its handshake: the field order of the

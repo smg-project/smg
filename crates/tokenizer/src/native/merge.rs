@@ -49,9 +49,16 @@ use std::{borrow::Cow, cmp::Reverse, collections::BinaryHeap};
 
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
-use tokenizers::{models::ModelWrapper, Model};
+use tokenizers::{
+    models::{bpe::BPE, ModelWrapper},
+    Model,
+};
 
-use crate::{encode_path::Declined, tiktoken::MAX_BYTE_LEVEL_TABLE_IDS};
+use crate::{
+    encode_path::Declined,
+    tiktoken::MAX_BYTE_LEVEL_TABLE_IDS,
+    word_cache::{entries_of, ReadBpe},
+};
 
 mod preformed;
 mod serialized;
@@ -264,7 +271,15 @@ impl MergeTable {
     /// The table of `model`'s merges, with `tokens` as the spelling of its
     /// byte tokens, or why the model's own merge stays in place for the
     /// path's misses.
-    pub(super) fn from_model(model: &ModelWrapper, tokens: ByteTokens) -> Result<Self, Declined> {
+    ///
+    /// `read` is what the file's one-pass read saw of the model (its merges
+    /// as ids, its largest id), so that neither is read back from the built
+    /// model; `None` for a model built in memory.
+    pub(super) fn from_model(
+        model: &ModelWrapper,
+        tokens: ByteTokens,
+        read: Option<&ReadBpe>,
+    ) -> Result<Self, Declined> {
         let ModelWrapper::BPE(bpe) = model else {
             return Err(Declined::from("the model is not BPE"));
         };
@@ -289,13 +304,17 @@ impl MergeTable {
                 .token_to_id(&spelling)
                 .ok_or_else(|| Declined::from(format!("byte {byte:#04x} has no token")))?;
         }
-        // The merges alone, through the model's `Serialize` (see `serialized`):
-        // its vocabulary is never serialized, so a vocabulary with gaps in its
-        // ids does not have the library warn about them at every load.
-        let serialized = serialized::merges_json(bpe)
-            .map_err(|e| Declined::from(format!("the model does not serialize: {e}")))?;
-        let SerializedMerges(merges) = serde_json::from_str(&serialized)
-            .map_err(|e| Declined::from(format!("the model's merges do not read back: {e}")))?;
+        // The merges as ids: what the file's one-pass read resolved, else
+        // read back from the model (a model built in memory, a vocabulary and
+        // merges pair, a merge the read could not resolve).
+        let from_model;
+        let merges: &[[u32; 3]] = match read.and_then(|read| read.pairs.as_deref()) {
+            Some(pairs) => pairs,
+            None => {
+                from_model = Self::merges_of(model, bpe)?;
+                &from_model
+            }
+        };
         if merges.len() >= MAX_RANKS {
             return Err(Declined::from(
                 "more merges than a short merge's keys carry",
@@ -310,25 +329,12 @@ impl MergeTable {
         if tokens == ByteTokens::Alphabet {
             table.hot_base = u64::from(byte_ids.iter().copied().min().unwrap_or(0));
         }
-        let mut token = String::new();
         let mut pairs = Vec::with_capacity(merges.len());
-        for (rank, (left, right)) in merges.iter().enumerate() {
+        for (rank, &[a, b, new_id]) in merges.iter().enumerate() {
             let rank = u32::try_from(rank)
                 .ok()
                 .filter(|&rank| rank != NO_RANK)
                 .ok_or_else(|| Declined::from("more merges than the table ranks"))?;
-            token.clear();
-            token.push_str(left);
-            token.push_str(right);
-            let (Some(a), Some(b), Some(new_id)) = (
-                model.token_to_id(left),
-                model.token_to_id(right),
-                model.token_to_id(&token),
-            ) else {
-                return Err(Declined::from(format!(
-                    "merge {left:?} + {right:?} names a token outside the vocabulary"
-                )));
-            };
             table.insert(a, b, Merge::new(rank, new_id));
             pairs.push((rank, a, b));
         }
@@ -357,14 +363,45 @@ impl MergeTable {
                     .map(|c| byte_of.get(c as usize).copied().flatten())
                     .collect()
             };
-            let raws = bpe
-                .get_vocab()
-                .into_iter()
-                .filter_map(|(token, id)| raw_of(&token).map(|raw| (id, raw)))
+            // The entries borrowed from the read's listing when it has one,
+            // by id where the read says the ids are the range, else through
+            // a clone of the vocabulary map.
+            let raws = entries_of(bpe, read)
+                .filter_map(|(id, token)| raw_of(token.as_ref()).map(|raw| (id, raw)))
                 .collect();
             table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         }
         Ok(table)
+    }
+
+    /// The model's merges as ids (left, right, product; the rank is the
+    /// index), read back through the model's `Serialize` (see `serialized`:
+    /// the merges alone, so a vocabulary with gaps in its ids does not have
+    /// the library warn about them at every load) and resolved in its
+    /// vocabulary; or why they cannot be.
+    fn merges_of(model: &ModelWrapper, bpe: &BPE) -> Result<Vec<[u32; 3]>, Declined> {
+        let serialized = serialized::merges_json(bpe)
+            .map_err(|e| Declined::from(format!("the model does not serialize: {e}")))?;
+        let SerializedMerges(merges) = serde_json::from_str(&serialized)
+            .map_err(|e| Declined::from(format!("the model's merges do not read back: {e}")))?;
+        let mut token = String::new();
+        let mut out = Vec::with_capacity(merges.len());
+        for (left, right) in &merges {
+            token.clear();
+            token.push_str(left);
+            token.push_str(right);
+            let (Some(a), Some(b), Some(new_id)) = (
+                model.token_to_id(left),
+                model.token_to_id(right),
+                model.token_to_id(&token),
+            ) else {
+                return Err(Declined::from(format!(
+                    "merge {left:?} + {right:?} names a token outside the vocabulary"
+                )));
+            };
+            out.push([a, b, new_id]);
+        }
+        Ok(out)
     }
 
     /// The table of a tiktoken vocabulary's merges (see the module
