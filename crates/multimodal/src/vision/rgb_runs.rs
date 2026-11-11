@@ -171,6 +171,8 @@ pub(crate) mod avx2 {
     /// Sixteen pixels span three words; eight pixels span a word and a half,
     /// the rest of the plane zero.
     const fn plane_masks<const WORDS: usize>(channel: usize, pixels: usize) -> [[u8; 16]; WORDS] {
+        // The words hold the three channel bytes of every pixel.
+        assert!(3 * pixels <= 16 * WORDS);
         let mut masks = [[0x80; 16]; WORDS];
         let mut word = 0;
         while word < WORDS {

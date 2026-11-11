@@ -526,6 +526,8 @@ mod avx2 {
     /// `3 (4 q + i / 4) + i % 4` for a channel and zero for the pad, gathered
     /// from the `WORDS` source words from `first` on.
     const fn widen_masks<const WORDS: usize>(q: usize, first: usize) -> [[u8; 16]; WORDS] {
+        // The words from `first` hold all twelve channel bytes of the four pixels.
+        assert!(16 * first <= 12 * q && 12 * q + 12 <= 16 * (first + WORDS));
         let mut masks = [[0x80; 16]; WORDS];
         let mut word = 0;
         while word < WORDS {
