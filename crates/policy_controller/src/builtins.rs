@@ -1041,16 +1041,18 @@ impl Picker for PowerOfTwoCountFirst {
 }
 
 /// A rotation per survivor set, keyed by the set's rows (id and DP rank) in
-/// order; a set seen first starts from a shared advancing position. The
+/// order; a set seen first starts from a row drawn from a shared counter. The
 /// rotations live in a fixed table of 512 buckets the key picks one of, each
 /// one cache line of eight words, each word holding a tag of its key and the
 /// set's next position: a decision over a known set advances its word, a set
 /// seen first claims an empty word of its bucket in place, and only a set
-/// whose bucket is full takes a word, the one the shared position names, so
-/// that word's set starts from the shared position when seen again (the
-/// forgetting a full table had, per bucket). No path takes a lock or
-/// allocates; two sets racing for one word may take one position from each
-/// other's rotation.
+/// whose bucket is full takes a word, the one the counter names, so that
+/// word's set draws anew when seen again (the forgetting a full table had,
+/// per bucket: more than eight live sets of one bucket visited in a cycle
+/// draw anew on every visit, a fresh row each rather than the next, which
+/// under one table in a thousand sees at 500 live sets). No path takes a
+/// lock or allocates; two sets racing for one word may take one position
+/// from each other's rotation.
 #[derive(Debug)]
 pub struct RoundRobin {
     buckets: Box<[Bucket]>,
@@ -1083,7 +1085,7 @@ const EMPTY_SLOT: u64 = u64::MAX;
 
 /// The low bits of a rotation word that hold the set's next position; the
 /// tag sits above them. A position that wraps changes the tag, and the set
-/// starts again from the shared position.
+/// draws its start anew.
 const POSITION_BITS: u32 = 32;
 const POSITION_MASK: u64 = (1 << POSITION_BITS) - 1;
 
@@ -1132,6 +1134,14 @@ impl RoundRobin {
         (bucket, tag << POSITION_BITS)
     }
 
+    /// The position a claim starts from: the shared counter's value mixed,
+    /// so sets seen first spread over the rows, and a set a full bucket
+    /// forgets takes a fresh row at each claim rather than the row its
+    /// cycle's length would fix.
+    fn start_of(claim: u64) -> u64 {
+        claim.wrapping_mul(KEY_MIX) >> 32
+    }
+
     fn advance(&self, key: u64) -> u64 {
         let (index, tag) = Self::bucket_of(key);
         let ways = &self.buckets[index].ways;
@@ -1146,13 +1156,14 @@ impl RoundRobin {
                     empty = Some((way, word));
                 }
             }
-            // A set seen first claims an empty word from the shared position;
-            // one whose bucket is full takes the word the position names, and
-            // that word's set starts again when seen. Another decision may
-            // have changed the word meanwhile: the bucket is read again.
-            let start = self.next_start.fetch_add(1, Ordering::Relaxed) & POSITION_MASK;
+            // A set seen first claims an empty word at a drawn start; one
+            // whose bucket is full takes the word the counter names, and that
+            // word's set draws anew when seen. Another decision may have
+            // changed the word meanwhile: the bucket is read again.
+            let claim = self.next_start.fetch_add(1, Ordering::Relaxed);
+            let start = Self::start_of(claim);
             let (way, word) = empty.unwrap_or_else(|| {
-                let way = &ways[(start as usize) % WAYS];
+                let way = &ways[(claim as usize) % WAYS];
                 (way, way.load(Ordering::Relaxed))
             });
             if way
@@ -1254,9 +1265,9 @@ mod tests {
     #[test]
     fn two_sets_of_one_bucket_keep_their_own_rotations() {
         // Keys a and b share a bucket under different tags. A fresh table's
-        // shared position runs 0, 1, 2, ... per claim: a claims at 0, b at
-        // 1, and seen in turn for a thousand rounds each walks on by one,
-        // neither taking the other's word.
+        // counter runs 0, 1, 2, ... per claim: a starts at the row drawn from
+        // 0 and b from 1, and seen in turn for a thousand rounds each walks
+        // on by one, neither taking the other's word.
         let rr = RoundRobin::new();
         let a = 0x0123_4567_89ab_cdefu64;
         let (bucket_a, tag_a) = RoundRobin::bucket_of(a);
@@ -1264,32 +1275,85 @@ mod tests {
             .find(|&k| k != a && RoundRobin::bucket_of(k).0 == bucket_a)
             .expect("a key sharing a's bucket");
         assert_ne!(RoundRobin::bucket_of(b).1, tag_a, "b's tag differs");
-        assert_eq!([rr.advance(a), rr.advance(b)], [0, 1]);
-        for n in 1..1_000 {
-            assert_eq!([rr.advance(a), rr.advance(b)], [n, n + 1], "round {n}");
+        let (start_a, start_b) = (RoundRobin::start_of(0), RoundRobin::start_of(1));
+        for n in 0..1_000 {
+            assert_eq!(
+                [rr.advance(a), rr.advance(b)],
+                [start_a + n, start_b + n],
+                "round {n}"
+            );
         }
     }
 
     #[test]
-    fn a_ninth_set_of_a_full_bucket_takes_the_word_the_shared_position_names() {
-        // Nine keys share a bucket of eight words. The ninth, claiming at
-        // the shared position 8, takes word 0 from the first set; the first,
-        // seen again, claims at 9 and takes word 1 from the second; a set
-        // whose word nobody took walks on.
+    fn a_ninth_set_of_a_full_bucket_takes_the_word_the_counter_names() {
+        // Nine keys share a bucket of eight words. The ninth, claim 8, takes
+        // word 0 from the first set; the first, seen again, claims at 9 and
+        // takes word 1 from the second; a set whose word nobody took walks
+        // on. Each claim starts at the row drawn from its counter value.
         let rr = RoundRobin::new();
         let bucket = RoundRobin::bucket_of(0x0123_4567_89ab_cdef).0;
         let keys: Vec<u64> = (1u64..)
             .filter(|&k| RoundRobin::bucket_of(k).0 == bucket)
             .take(9)
             .collect();
+        let start = RoundRobin::start_of;
         for (n, &k) in keys[..8].iter().enumerate() {
-            assert_eq!(rr.advance(k), n as u64, "each claims a word of its own");
+            assert_eq!(
+                rr.advance(k),
+                start(n as u64),
+                "each claims a word of its own"
+            );
         }
-        assert_eq!(rr.advance(keys[8]), 8, "the ninth takes word 0");
-        assert_eq!(rr.advance(keys[2]), 3, "the third walks on");
-        assert_eq!(rr.advance(keys[0]), 9, "the first starts again, at word 1");
-        assert_eq!(rr.advance(keys[8]), 9, "the ninth walks on");
-        assert_eq!(rr.advance(keys[1]), 10, "the second starts again");
+        assert_eq!(rr.advance(keys[8]), start(8), "the ninth takes word 0");
+        assert_eq!(rr.advance(keys[2]), start(2) + 1, "the third walks on");
+        assert_eq!(
+            rr.advance(keys[0]),
+            start(9),
+            "the first draws anew, at word 1"
+        );
+        assert_eq!(rr.advance(keys[8]), start(8) + 1, "the ninth walks on");
+        assert_eq!(rr.advance(keys[1]), start(10), "the second draws anew");
+    }
+
+    #[test]
+    fn nine_sets_cycling_one_bucket_take_every_row() {
+        // Nine keys of one bucket visited in a fixed cycle: eight words cannot
+        // hold them, so every visit past the first eight draws anew, at the
+        // row its counter value draws. Reduced to two, three or four rows,
+        // every set still takes every row over the rounds, where a start that
+        // advanced by the cycle's length would have fixed one.
+        let rr = RoundRobin::new();
+        let bucket = RoundRobin::bucket_of(0x0123_4567_89ab_cdef).0;
+        let keys: Vec<u64> = (1u64..)
+            .filter(|&k| RoundRobin::bucket_of(k).0 == bucket)
+            .take(9)
+            .collect();
+        let rounds = 300u64;
+        let mut taken = vec![[[0u64; 4]; 3]; 9];
+        for round in 0..rounds {
+            for (n, &k) in keys.iter().enumerate() {
+                let position = rr.advance(k);
+                assert_eq!(
+                    position,
+                    RoundRobin::start_of(9 * round + n as u64),
+                    "round {round}, set {n}"
+                );
+                for (r, rows) in [2u64, 3, 4].into_iter().enumerate() {
+                    taken[n][r][(position % rows) as usize] += 1;
+                }
+            }
+        }
+        for (n, set) in taken.iter().enumerate() {
+            for (r, rows) in [2usize, 3, 4].into_iter().enumerate() {
+                for (row, &count) in set[r][..rows].iter().enumerate() {
+                    assert!(
+                        count * 5 >= rounds,
+                        "set {n} over {rows} rows: row {row} taken {count} of {rounds}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
