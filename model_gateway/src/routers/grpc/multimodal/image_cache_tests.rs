@@ -796,7 +796,7 @@ async fn the_policy_is_part_of_the_pixel_cache_key() {
 
 /// Fill and reuse a 32-image batch, including the path that waits for a replay.
 #[tokio::test]
-async fn bf16_batch_cache_reuses_large_batches_for_qwen_and_gemma() {
+async fn bf16_batch_cache_reuses_large_batches_across_image_families() {
     let frame = |id| {
         Arc::new(ImageFrame::new(
             image::RgbImage::from_pixel(112, 112, image::Rgb([id, 21, 203])).into(),
@@ -808,7 +808,14 @@ async fn bf16_batch_cache_reuses_large_batches_for_qwen_and_gemma() {
     };
     let cold = (0..32).map(frame).collect::<Vec<_>>();
     let appended = frame(32);
-    for model_type in ["qwen3_vl", "gemma4"] {
+    for model_type in [
+        "qwen3_vl",
+        "gemma4",
+        "glm53_flash",
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "muse_spark",
+    ] {
         let config = MultimodalModelConfig::new(
             serde_json::json!({"model_type": model_type, "image_token_id": 100}),
             PreProcessorConfig::default(),
@@ -902,71 +909,78 @@ async fn bf16_batch_cache_reuses_large_batches_for_qwen_and_gemma() {
 /// Keep newly computed images when an overlapping request cannot replace its old backing.
 #[tokio::test]
 async fn bf16_recompute_caches_misses_without_replacing_a_partial_backing() {
-    let (mut components, _, _) = setup(true, false);
-    let cache = Arc::new(PixelCache::new(512 * 1024 * 1024));
-    components.pixel_cache = Some(cache.clone());
-    let model = "qwen3_vl";
-    let config = MultimodalModelConfig::new(
-        serde_json::json!({"model_type": model, "image_token_id": 100}),
-        PreProcessorConfig::default(),
-        None,
-    );
-    let spec = components
-        .model_registry
-        .lookup(&ModelMetadata {
-            model_id: model,
-            tokenizer: &NoTokenizer,
-            config: &config.config,
-        })
-        .unwrap();
-    let ctx = context(
-        &components,
-        &config,
-        spec,
-        model,
-        model,
-        Some(EncoderDtype::BFloat16),
-        None,
-    );
-    let fingerprint = image_cache_fingerprint(&ctx).unwrap();
-    let key = |id: u8| PixelCacheKey {
-        image_hash: id.to_string(),
-        config_fingerprint: fingerprint,
-    };
-    let batch = |ids: [u8; 3]| {
-        MediaBatch::Images(
-            ids.into_iter()
-                .map(|id| {
-                    Arc::new(ImageFrame::new(
-                        image::RgbImage::from_pixel(640, 640, image::Rgb([id, 21, 203])).into(),
-                        Default::default(),
-                        Default::default(),
-                        ImageSource::InlineBytes,
-                        id.to_string(),
-                    ))
-                })
-                .collect(),
-        )
-    };
-    preprocess_modality(&batch([0, 1, 2]), &ctx).await.unwrap();
-    let prefix = cache.get(&key(0)).unwrap();
-    assert!(prefix
-        .preprocessed
-        .encoder_input
-        .shared_allocation()
-        .is_some());
-
-    // One hit and two misses above the recompute threshold. The other
-    // session still owns two slices of the original allocation.
-    preprocess_modality(&batch([0, 3, 4]), &ctx).await.unwrap();
-    assert!(Arc::ptr_eq(&prefix, &cache.get(&key(0)).unwrap()));
-    for id in [3, 4] {
-        let entry = cache.get(&key(id)).expect("recomputed miss must be cached");
-        assert!(entry
+    for model in [
+        "qwen3_vl",
+        "glm53_flash",
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "muse_spark",
+    ] {
+        let (mut components, _, _) = setup(true, false);
+        let cache = Arc::new(PixelCache::new(512 * 1024 * 1024));
+        components.pixel_cache = Some(cache.clone());
+        let config = MultimodalModelConfig::new(
+            serde_json::json!({"model_type": model, "image_token_id": 100}),
+            PreProcessorConfig::default(),
+            None,
+        );
+        let spec = components
+            .model_registry
+            .lookup(&ModelMetadata {
+                model_id: model,
+                tokenizer: &NoTokenizer,
+                config: &config.config,
+            })
+            .unwrap();
+        let ctx = context(
+            &components,
+            &config,
+            spec,
+            model,
+            model,
+            Some(EncoderDtype::BFloat16),
+            None,
+        );
+        let fingerprint = image_cache_fingerprint(&ctx).unwrap();
+        let key = |id: u8| PixelCacheKey {
+            image_hash: id.to_string(),
+            config_fingerprint: fingerprint,
+        };
+        let batch = |ids: [u8; 3]| {
+            MediaBatch::Images(
+                ids.into_iter()
+                    .map(|id| {
+                        Arc::new(ImageFrame::new(
+                            image::RgbImage::from_pixel(640, 640, image::Rgb([id, 21, 203])).into(),
+                            Default::default(),
+                            Default::default(),
+                            ImageSource::InlineBytes,
+                            id.to_string(),
+                        ))
+                    })
+                    .collect(),
+            )
+        };
+        preprocess_modality(&batch([0, 1, 2]), &ctx).await.unwrap();
+        let prefix = cache.get(&key(0)).unwrap();
+        assert!(prefix
             .preprocessed
             .encoder_input
             .shared_allocation()
-            .is_none());
+            .is_some());
+
+        // One hit and two misses above the recompute threshold. The other
+        // session still owns two slices of the original allocation.
+        preprocess_modality(&batch([0, 3, 4]), &ctx).await.unwrap();
+        assert!(Arc::ptr_eq(&prefix, &cache.get(&key(0)).unwrap()));
+        for id in [3, 4] {
+            let entry = cache.get(&key(id)).expect("recomputed miss must be cached");
+            assert!(entry
+                .preprocessed
+                .encoder_input
+                .shared_allocation()
+                .is_none());
+        }
     }
 }
 
@@ -1125,4 +1139,113 @@ async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {
     assert!(preprocess_modality(&batch(&[&second_hit]), &small)
         .await
         .is_err());
+}
+
+/// Mixed hits, reordered duplicates and concurrent misses match an uncached batch.
+/// Tiny budgets bypass storage without changing the result.
+#[tokio::test]
+async fn independent_bf16_images_match_uncached_with_mixed_hits_and_budget_bypass() {
+    let frames: Vec<_> = [(112, 56), (84, 280), (56, 112), (224, 112)]
+        .into_iter()
+        .enumerate()
+        .map(|(id, (w, h))| {
+            Arc::new(ImageFrame::new(
+                image::RgbImage::from_fn(w, h, |x, y| {
+                    image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+                })
+                .into(),
+                Default::default(),
+                Default::default(),
+                ImageSource::InlineBytes,
+                id.to_string(),
+            ))
+        })
+        .collect();
+    for model_type in ["glm53_flash", "qwen2_vl", "qwen2_5_vl", "muse_spark"] {
+        let config = MultimodalModelConfig::new(
+            serde_json::json!({"model_type":model_type, "image_token_id":100}),
+            PreProcessorConfig::default(),
+            None,
+        );
+        for budget in [512 * 1024 * 1024, 4 * 1024 * 1024, 1, 0] {
+            let mut components = MultimodalComponents::new(
+                Arc::new(MultimodalConfigRegistry::new()),
+                None,
+                None,
+                &MultimodalSettings::default(),
+            )
+            .unwrap();
+            components.pixel_cache = (budget > 0).then(|| Arc::new(PixelCache::new(budget)));
+            let spec = components
+                .model_registry
+                .lookup(&ModelMetadata {
+                    model_id: model_type,
+                    tokenizer: &NoTokenizer,
+                    config: &config.config,
+                })
+                .unwrap();
+            let ctx = PlanContext {
+                components: &components,
+                model_id: model_type,
+                model_type: Some(model_type),
+                spec,
+                tokenizer_id: "glm-cache",
+                model_config: &config,
+                vision_processors: config.vision_processors(spec),
+                image_wire_dtype: Some(EncoderDtype::BFloat16),
+                transparency: TransparencyPolicy::KeepAlpha,
+                encoder_budget: None,
+            };
+            preprocess_modality(&MediaBatch::Images(frames[..3].to_vec()), &ctx)
+                .await
+                .unwrap();
+            let order = [2, 0, 1, 2, 3];
+            let expected = preprocess_batch(
+                &MediaBatch::Images(order.iter().map(|&i| frames[i].clone()).collect()),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let media = MediaBatch::Images(
+                order
+                    .iter()
+                    .map(|&i| {
+                        if i == 3 || budget < 512 * 1024 * 1024 {
+                            return frames[i].clone();
+                        }
+                        let size = frames[i].size();
+                        Arc::new(ImageFrame::encoded(
+                            bytes::Bytes::from_static(b"cached image must not be decoded"),
+                            ImageDetail::Auto,
+                            ImageSource::InlineBytes,
+                            frames[i].hash.clone(),
+                            size,
+                            None,
+                        ))
+                    })
+                    .collect(),
+            );
+            let (a, b) = tokio::join!(
+                preprocess_modality(&media, &ctx),
+                preprocess_modality(&media, &ctx)
+            );
+            for result in [a, b] {
+                let actual = result
+                    .unwrap_or_else(|error| panic!("{model_type}, cache budget {budget}: {error}"));
+                assert_eq!(actual.encoder_input.shape(), expected.encoder_input.shape());
+                assert_eq!(
+                    actual.encoder_input.write_as(EncoderDtype::BFloat16),
+                    expected.encoder_input.write_as(EncoderDtype::BFloat16)
+                );
+                assert_eq!(actual.feature_token_counts, expected.feature_token_counts);
+                assert_eq!(actual.item_sizes, expected.item_sizes);
+                for (key, value) in &expected.model_specific {
+                    assert_eq!(
+                        format!("{:?}", actual.model_specific[key]),
+                        format!("{value:?}")
+                    );
+                }
+            }
+        }
+    }
 }
