@@ -45,15 +45,21 @@ and SGLang wires, with `disaggregation_transfer_backend` mooncake, and
 `kv_role` behind `kv_connector` MooncakeConnector on the vLLM one, whose info
 is a struct of named fields the admin API's info patch sets by name: the mock
 moves no KV cache and names Mooncake as its transport on every wire). The
-encode role (`--worker-type encode`) is the vLLM wire's alone: the worker
-advertises `ec_role` ec_producer behind `ec_connector` ECCPUConnector (a prefill
-worker on that wire advertises the consumer side), reads as vision-capable with
-a worker-side media processor (`mm_processor` mock, so the gateway forwards
-media references to it), and answers every `Generate` that carries
-`ec_transfer_params_json` with the encoder's token-less completion, the media
-identity (the prompt ids as sent, one hash per media item) and one pull handle
-per hash naming its own address; the TokenSpeed encoder is a separate service
-the mock does not serve, and the SGLang wire has no encode role.
+encode role (`--worker-type encode`) is the two wires' with an encoder. On the
+vLLM wire the worker advertises `ec_role` ec_producer behind `ec_connector`
+ECCPUConnector (a prefill worker on that wire advertises the consumer side),
+reads as vision-capable with a worker-side media processor (`mm_processor`
+mock, so the gateway forwards media references to it), and answers every
+`Generate` that carries `ec_transfer_params_json` with the encoder's token-less
+completion, the media identity (the prompt ids as sent, one hash per media
+item) and one pull handle per hash naming its own address. On the TokenSpeed
+wire the worker mounts the engine's encoder service beside the scheduler's:
+its `Encode` takes a request's media with one rendezvous room per item
+(refused without), runs the realistic engine's admission hooks, counts in the
+admin API's `encodes` and answers accepted; its `Generate` is refused as the
+wrong pool, and a prefill worker on that wire refuses a request whose
+`encode_bootstrap_info` does not name a rendezvous for each media item once.
+The SGLang wire has no encode role.
 `--capture` records the TokenSpeed wire's requests only. Beside the scheduler
 service the server hosts the standard `grpc.health.v1` service (`Check`,
 `Watch`): the empty name and the served scheduler service are SERVING exactly
@@ -370,7 +376,7 @@ own code path), and the client reads the decode side's output.
 No KV moves between the two: the decode side has the prompt. ZMQ workers
 take no role, and one process gives the role to one wire's workers (worker
 `i` of either wire would bind the same bootstrap port); the encode role is
-the vLLM gRPC wire's alone.
+the vLLM and the TokenSpeed gRPC wires'.
 
 Every gRPC worker advertises the pairing protocol its environment names
 (`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:

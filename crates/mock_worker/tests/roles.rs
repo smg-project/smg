@@ -17,8 +17,8 @@ use mock_worker::{
 };
 use serde_json::{json, Value};
 use smg_grpc_client::{
-    sglang_proto as sg, tokenspeed_proto as ts, vllm_proto as vllm, SglangSchedulerClient,
-    TokenSpeedSchedulerClient,
+    sglang_proto as sg, tokenspeed_encoder_proto as enc, tokenspeed_proto as ts,
+    vllm_proto as vllm, SglangSchedulerClient, TokenSpeedSchedulerClient,
 };
 use tokio::{
     io::AsyncReadExt,
@@ -1144,4 +1144,258 @@ async fn a_prefill_worker_refuses_a_rendezvous_naming_another_port() {
         1,
         "the prompt side's completion on its own port: {frames:?}"
     );
+}
+/// An encode worker on the TokenSpeed wire, canned or realistic, worker 0 of
+/// its process with a bootstrap port, and the admin API beside it: the
+/// scheduler client, the encoder client, the HTTP client, the fault route and
+/// the worker's name.
+async fn start_tokenspeed_encoder(
+    realistic: bool,
+) -> (
+    TokenSpeedSchedulerClient,
+    enc::token_speed_encoder_client::TokenSpeedEncoderClient<Channel>,
+    reqwest::Client,
+    String,
+    String,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a free port");
+    let port = listener.local_addr().expect("listener address").port();
+    let cfg = Config {
+        model_id: "roles-test".to_string(),
+        grpc_base_port: port,
+        grpc_count: 1,
+        grpc_wire: SchedulerWire::TokenSpeed,
+        realistic,
+        role: Some(Role::Encode),
+        bootstrap_base_port: Some(free_port()),
+        ..Config::default()
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server serves until the test process exits"
+    )]
+    let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let scheduler = TokenSpeedSchedulerClient::connect(&endpoint)
+        .await
+        .expect("connect to the mock worker");
+    let channel = Channel::from_shared(endpoint)
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect to the encoder");
+    let (http, fault) = fault_route(port).await;
+    (
+        scheduler,
+        enc::token_speed_encoder_client::TokenSpeedEncoderClient::new(channel),
+        http,
+        fault,
+        format!("grpc:{port}"),
+    )
+}
+
+/// What the gateway sends a TokenSpeed encoder: the request's media items
+/// and one rendezvous room per item.
+fn tokenspeed_encode_request(id: &str, items: usize, rooms: &[i64]) -> enc::EncodeRequest {
+    enc::EncodeRequest {
+        request_id: id.to_string(),
+        mm_inputs: Some(ts::MultimodalInputs {
+            items: vec![ts::MultimodalItem::default(); items],
+        }),
+        items: rooms
+            .iter()
+            .map(|&bootstrap_room| enc::EncodeItemAssignment { bootstrap_room })
+            .collect(),
+    }
+}
+
+/// The worker's `encodes` count off the admin API's ops status, as a bed
+/// reads it.
+async fn encodes_served(http: &reqwest::Client, fault: &str, name: &str) -> u64 {
+    let base = fault.split("/admin/fault/").next().expect("the admin base");
+    let status: Value = http
+        .get(format!("{base}/admin/ops/all"))
+        .send()
+        .await
+        .expect("the ops status")
+        .json()
+        .await
+        .expect("json");
+    status["workers"]
+        .as_array()
+        .expect("workers")
+        .iter()
+        .find(|worker| worker["worker"] == name)
+        .map_or(0, |worker| worker["encodes"].as_u64().unwrap_or(0))
+}
+
+async fn arm(http: &reqwest::Client, fault: &str, query: &str) {
+    let armed = http
+        .post(format!("{fault}/fail?{query}"))
+        .send()
+        .await
+        .expect("arm the fault");
+    assert_eq!(armed.status(), 200);
+}
+
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refuses_generate() {
+    let (scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+
+    // One media item in one room: accepted and counted.
+    let before = encodes_served(&http, &fault, &name).await;
+    let answer = encoder
+        .encode(tokenspeed_encode_request("ts-e1", 1, &[42]))
+        .await
+        .expect("the encoder's answer")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    // Rooms that do not match the items, no item at all, or a room of 0:
+    // refused as malformed and not counted.
+    for (items, rooms) in [(2usize, &[7i64][..]), (0, &[][..]), (1, &[0][..])] {
+        let refused = encoder
+            .encode(tokenspeed_encode_request("ts-e2", items, rooms))
+            .await
+            .expect_err("a malformed encode request");
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "{items} item(s), rooms {rooms:?}: {refused:?}"
+        );
+    }
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    // A `Generate` went to the wrong pool: this worker takes `Encode`.
+    let wrong_pool = scheduler
+        .generate(request("ts-g1", &[1, 2, 3], false))
+        .await
+        .err()
+        .expect("the wrong pool, not a stream");
+    assert_eq!(
+        wrong_pool.code(),
+        tonic::Code::FailedPrecondition,
+        "{wrong_pool:?}"
+    );
+
+    // It advertises its role and the bootstrap port it bound, where the
+    // prefill side's engine would come for the embedding.
+    let info = scheduler.get_server_info().await.expect("server info");
+    assert_eq!(
+        server_arg(&info, "disaggregation_mode").as_deref(),
+        Some("encode")
+    );
+    assert!(
+        server_arg(&info, "disaggregation_bootstrap_port").is_some(),
+        "{info:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_realistic_tokenspeed_encode_worker_takes_the_fault_hooks() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(true).await;
+
+    // One 503 armed: refused before the answer, as the prompt side of a
+    // prefill worker is, and the failure is counted.
+    arm(&http, &fault, "status=503&count=1").await;
+    let refused = encoder
+        .encode(tokenspeed_encode_request("ts-f1", 1, &[1]))
+        .await
+        .expect_err("the armed status, not an answer");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert_eq!(fault_counts(&http, &fault).await, (1, 0));
+
+    // An armed cut: the request is not accepted, the cut is counted, and the
+    // side still ran for the bed that counts it.
+    arm(&http, &fault, "finish=error&status=503&count=1").await;
+    let before = encodes_served(&http, &fault, &name).await;
+    let answer = encoder
+        .encode(tokenspeed_encode_request("ts-f2", 1, &[2]))
+        .await
+        .expect("an answer")
+        .into_inner();
+    assert!(!answer.accepted, "the armed cut is the engine's refusal");
+    assert_eq!(fault_counts(&http, &fault).await, (1, 1));
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    // A malformed request spends no armed fault: the fault waits for the
+    // next well-formed one.
+    arm(&http, &fault, "status=503&count=1").await;
+    let malformed = encoder
+        .encode(tokenspeed_encode_request("ts-f3", 2, &[3]))
+        .await
+        .expect_err("a malformed encode request");
+    assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+    assert_eq!(fault_counts(&http, &fault).await, (1, 1));
+    let refused = encoder
+        .encode(tokenspeed_encode_request("ts-f4", 1, &[4]))
+        .await
+        .expect_err("the armed status, not an answer");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert_eq!(fault_counts(&http, &fault).await, (2, 1));
+}
+
+#[tokio::test]
+async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
+    let (client, _name) = start(Role::Prefill, None, None).await;
+    let room = |item_index: u32, bootstrap_room: i64| ts::EncodeItemBootstrapInfo {
+        item_index,
+        bootstrap_host: "127.0.0.1".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room,
+    };
+    // The prefill side's own rendezvous rides every request, as on the
+    // gateway's wire: the rooms are read at the top of generate, the
+    // rendezvous as the frames start, and a request without one ends there.
+    let with_media = |id: &str, rooms: Option<Vec<ts::EncodeItemBootstrapInfo>>| {
+        let mut req = rendezvous(request(id, &[1, 2, 3], false), 8998);
+        req.mm_inputs = Some(ts::MultimodalInputs {
+            items: vec![ts::MultimodalItem::default(); 2],
+        });
+        req.encode_bootstrap_info = rooms.map(|items| ts::EncodeBootstrapInfo { items });
+        req
+    };
+
+    // A room for each item: the prompt side's completion, as for any request.
+    let frames = generate(
+        &client,
+        with_media("ts-p1", Some(vec![room(0, 11), room(1, 12)])),
+    )
+    .await;
+    let Some(GenResp::Complete(complete)) = &frames[0].response else {
+        panic!("a Complete, not {:?}", frames[0]);
+    };
+    assert!(complete.output_ids.is_empty(), "no output: {complete:?}");
+    assert_eq!(complete.finish_reason, "stop");
+
+    // An item without a room, a room of 0, an item named twice, an index off
+    // the end: refused, as the engine's prefill would wait on that room and
+    // fail.
+    for rooms in [
+        vec![room(0, 11)],
+        vec![room(0, 11), room(1, 0)],
+        vec![room(0, 11), room(0, 12)],
+        vec![room(0, 11), room(2, 12)],
+    ] {
+        let refused = client
+            .generate(with_media("ts-p2", Some(rooms.clone())))
+            .await
+            .err()
+            .expect("a refused handoff, not a stream");
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "rooms {rooms:?}: {refused:?}"
+        );
+    }
+
+    // No rooms at all: a request without an encoder, served as before.
+    let frames = generate(&client, with_media("ts-p3", None)).await;
+    let Some(GenResp::Complete(complete)) = &frames[0].response else {
+        panic!("a Complete, not {:?}", frames[0]);
+    };
+    assert_eq!(complete.finish_reason, "stop");
 }
