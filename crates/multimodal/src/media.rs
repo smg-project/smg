@@ -1344,8 +1344,9 @@ fn decode_video_with_opencv_bytes_logged(
 }
 
 /// What keeps this process from decoding video, if anything, probed once:
-/// without the `opencv-video` feature a clip is decoded by the `ffmpeg` and
-/// `ffprobe` executables on PATH, and `SMG_VIDEO_DECODE_BACKEND` may name a
+/// without the `opencv-video` feature a clip is decoded by the `ffmpeg`
+/// executable on PATH (`ffprobe` is optional: the metadata and duration
+/// probes fall back to `ffmpeg`), and `SMG_VIDEO_DECODE_BACKEND` may name a
 /// backend this build does not have. `None` when video decodes here. A
 /// gateway reads it at start-up (one log line) and refuses a video part up
 /// front, the request's own answer, instead of failing the request's decode
@@ -1353,11 +1354,13 @@ fn decode_video_with_opencv_bytes_logged(
 /// same way. The binaries on PATH do not change underneath a process.
 pub fn missing_video_decoder() -> Option<&'static str> {
     VIDEO_DECODER_GAP
-        .get_or_init(probe_video_decoder_gap)
+        .get_or_init(|| probe_video_decoder_gap(executable_starts))
         .as_deref()
 }
 
-fn probe_video_decoder_gap() -> Option<String> {
+/// The probe behind [`missing_video_decoder`], with the "does this program
+/// start" question injected so a test can answer it without a PATH.
+fn probe_video_decoder_gap(starts: impl Fn(&str) -> std::io::Result<()>) -> Option<String> {
     match video_decode_backend_override() {
         Some("opencv") => {
             if cfg!(feature = "opencv-video") {
@@ -1379,39 +1382,33 @@ fn probe_video_decoder_gap() -> Option<String> {
             }
         }
     }
-    let mut gaps = Vec::new();
-    let mut not_found = false;
-    for program in ["ffmpeg", "ffprobe"] {
-        match executable_starts(program) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                not_found = true;
-                gaps.push(format!("{program} executable not found"));
-            }
-            Err(e) => gaps.push(format!("{program} could not be started: {e}")),
-        }
+    // ffmpeg alone decodes a clip; ffprobe is never required.
+    match starts("ffmpeg") {
+        Ok(()) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(
+            "ffmpeg executable not found; install ffmpeg to decode video_url inputs".to_string(),
+        ),
+        Err(e) => Some(format!("ffmpeg could not be started: {e}")),
     }
-    if gaps.is_empty() {
-        return None;
-    }
-    let mut why = gaps.join("; ");
-    if not_found {
-        why.push_str("; install ffmpeg to decode video_url inputs");
-    }
-    Some(why)
 }
 
-/// Whether `program -version` can be started from PATH (a blocking probe,
-/// run once at start-up); the error says why not, split as the decode
-/// path's own spawn is: `NotFound` apart from a binary that cannot run.
+/// Whether `program -version` starts from PATH and exits successfully (a
+/// blocking probe, run once at start-up); the error says why not, split as
+/// the decode path's own spawn is: `NotFound` apart from a binary that is
+/// there but cannot run, a non-zero exit (a missing shared library, for
+/// one) among the latter.
 fn executable_starts(program: &str) -> std::io::Result<()> {
-    std::process::Command::new(program)
+    let status = std::process::Command::new(program)
         .arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map(|_| ())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("exited with {status}")))
+    }
 }
 
 fn video_decode_backend_override() -> Option<&'static str> {
