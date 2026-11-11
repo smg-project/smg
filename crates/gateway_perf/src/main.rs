@@ -123,7 +123,7 @@ struct BedArgs {
 /// The cell flags (`cpu`, `alloc`).
 #[derive(Args, Clone, Debug)]
 struct CellArgs {
-    /// Comma-separated paths [the fleet's default: chat,stream,tools,json,messages; the HTTP fleet without messages]
+    /// Comma-separated paths [every fleet's default: chat,stream,tools,json,messages]
     #[arg(long)]
     paths: Option<String>,
     /// Requests per cell

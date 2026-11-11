@@ -574,7 +574,7 @@ mod tests {
         );
         assert_eq!(
             names(fleet_paths(Fleet::Http, None).unwrap()),
-            ["chat", "stream", "tools", "json"]
+            ["chat", "stream", "tools", "json", "messages"]
         );
         assert_eq!(
             names(fleet_paths(Fleet::PrefillDecode, Some("messages_stream")).unwrap()),
