@@ -16,13 +16,15 @@ use std::{
 };
 
 use llm_multimodal::{EncoderDtype, Modality};
-use openai_protocol::worker::{RuntimeType, TransportMode};
+use openai_protocol::worker::{ConnectionMode, RuntimeType, TransportMode};
 use smg_mm_rdma::{RdmaConfig, RdmaExporter};
 use tracing::{error, info, warn};
 
 use super::{serialize::wire_dtype, settings::mm_settings};
 use crate::{
-    routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable},
+    routers::grpc::{
+        backend_client::BackendClient, context::WorkerSelection, proto_wrapper::mm_shm_dev_writable,
+    },
     worker::{RoutingPool, Worker, WorkerRegistry},
 };
 
@@ -481,15 +483,25 @@ fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Opti
     encoder_dtype_label(primary_worker(workers)?.as_ref())
 }
 
-/// The `multimodal_encoder_dtype` label a worker advertises, when it does.
+/// An explicit encoder dtype label wins; a direct SGLang worker otherwise
+/// reads the current connection's declaration, including after reconnects.
 fn encoder_dtype_label(worker: &dyn Worker) -> Option<String> {
-    worker
-        .metadata()
-        .spec
+    let spec = &worker.metadata().spec;
+    if let Some(dtype) = spec
         .labels
         .get("multimodal_encoder_dtype")
         .filter(|dtype| !dtype.is_empty())
-        .cloned()
+    {
+        return Some(dtype.clone());
+    }
+    if spec.runtime_type != RuntimeType::Sglang {
+        return None;
+    }
+    let backend = worker.backend_client_if_initialized()?;
+    let BackendClient::Zmq(client) = backend.as_ref() else {
+        return None;
+    };
+    client.ready_response()?.multimodal_encoder_dtype.clone()
 }
 
 /// The router's own encoder dtype overrides, read once from the environment.
@@ -554,15 +566,27 @@ fn shared_image_wire_dtype_over(
     shared_image_wire_dtype(&workers, overrides)
 }
 
+/// Defer one-pass writes until every destination has a known, matching dtype.
 fn shared_image_wire_dtype(
     workers: &[Arc<dyn Worker>],
     overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
     let mut shared = None;
     for worker in workers {
+        let label = encoder_dtype_label(worker.as_ref());
+        let spec = &worker.metadata().spec;
+        // A handshake still in flight may announce a narrower dtype before
+        // assembly. Keep the convertible layout until that fact is known.
+        if spec.runtime_type == RuntimeType::Sglang
+            && spec.connection_mode == ConnectionMode::Zmq
+            && label.is_none()
+            && worker.backend_client_if_initialized().is_none()
+        {
+            return None;
+        }
         let dtype = image_wire_dtype(
             worker.metadata().spec.runtime_type,
-            encoder_dtype_label(worker.as_ref()),
+            label,
             device_normalizes(worker.as_ref()),
             overrides,
         )?;
@@ -872,6 +896,73 @@ mod tests {
             Some(EncoderDtype::Float16)
         );
         assert_eq!(shared_image_wire_dtype(&[narrow, legacy], &policy), None);
+    }
+
+    /// A real ZMQ handshake supplies SGLang's dtype without an explicit label;
+    /// overrides win and old schedulers retain float32. Before the handshake,
+    /// the one-pass planner must not freeze a layout in the legacy precision.
+    #[tokio::test]
+    async fn sglang_zmq_dtype_comes_from_the_handshake_unless_overridden() {
+        use engine_zmq_client::{
+            mock_engine::{connect_to_frontend, default_ready_response},
+            protocol::handshake::EngineCoreReadyResponse,
+            EngineId,
+        };
+
+        use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+        let pending: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///pending")
+                .runtime_type(RuntimeType::Sglang)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let policy = DtypeOverrides::default();
+        assert_eq!(shared_image_wire_dtype(&[pending], &policy), None);
+
+        for (advertised, explicit, expected) in [
+            (Some("bfloat16"), None, EncoderDtype::BFloat16),
+            (Some("float16"), None, EncoderDtype::Float16),
+            (Some("bfloat16"), Some("float32"), EncoderDtype::Float32),
+            (None, None, EncoderDtype::Float32),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+            let (handshake, input, output) = (ep("hs"), ep("in"), ep("out"));
+            let ready = EngineCoreReadyResponse {
+                multimodal_encoder_dtype: advertised.map(str::to_string),
+                ..default_ready_response()
+            };
+            let (client, engine) = tokio::join!(
+                ZmqEngineClient::connect(
+                    &handshake,
+                    &input,
+                    &output,
+                    1,
+                    "m".to_string(),
+                    EosTokenIds::default(),
+                    RuntimeType::Sglang,
+                    Duration::from_secs(10)
+                ),
+                connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
+            );
+            let _engine = engine.unwrap();
+            let mut builder = BasicWorkerBuilder::new(ep("worker"))
+                .runtime_type(RuntimeType::Sglang)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .backend_client(BackendClient::Zmq(client.unwrap()));
+            if let Some(dtype) = explicit {
+                builder = builder.label("multimodal_encoder_dtype", dtype);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            let workers = WorkerSelection::Single {
+                worker: Arc::clone(&worker),
+            };
+            assert_eq!(mm_sglang_encoder_input_dtype(Some(&workers)), expected);
+            assert_eq!(shared_image_wire_dtype(&[worker], &policy), Some(expected));
+        }
     }
 
     /// The stages see the fleet's wire dtype by default: the one-pass wire
