@@ -570,6 +570,24 @@ def _annotation(record: str) -> str:
     return f"::warning title=e2e rerun::{message}"
 
 
+# The run page shows ten warning annotations per step and drops the rest
+# without a word; the reporter is the only annotator of the test step.
+_ANNOTATIONS_PER_STEP = 10
+
+
+def _annotations(records: list[str]) -> list[str]:
+    """The warning commands for the run page: every record when they fit the
+    step's ten, else the first nine and one carrying the count of the rest, so
+    the page always shows how many reruns there were."""
+    if len(records) <= _ANNOTATIONS_PER_STEP:
+        return [_annotation(record) for record in records]
+    shown = records[: _ANNOTATIONS_PER_STEP - 1]
+    rest = len(records) - len(shown)
+    return [_annotation(record) for record in shown] + [
+        _annotation(f"{rest} more reruns, see the step summary")
+    ]
+
+
 class _RerunReporter:
     """Record the reruns of a session.
 
@@ -579,7 +597,8 @@ class _RerunReporter:
     keeps every rerun (the case, the attempt, the first line of its failure)
     and puts it where a green row is read: an ``e2e reruns: N`` count and one
     ``e2e rerun:`` line per rerun in the terminal summary, a warning
-    annotation per rerun on the run page under GitHub Actions, and
+    annotation per rerun on the run page under GitHub Actions (ten at most,
+    the last one counting the rest), and
     ``reruns.txt`` under ``E2E_LOG_DIR``, the directory a row's worker logs
     are uploaded from. The rows upload that directory on failure alone, so
     the same lines go into the step summary (``GITHUB_STEP_SUMMARY``), the
@@ -612,8 +631,8 @@ class _RerunReporter:
         for line in lines:
             terminalreporter.write_line(line)
         if os.environ.get("GITHUB_ACTIONS") == "true":
-            for record in records:
-                terminalreporter.write_line(_annotation(record))
+            for command in _annotations(records):
+                terminalreporter.write_line(command)
         text = "\n".join(lines) + "\n"
         log_dir = os.environ.get("E2E_LOG_DIR")
         if lines and log_dir:

@@ -1,4 +1,4 @@
-"""Unit tests for the rerun record (no GPU): the summary lines, the annotation,
+"""Unit tests for the rerun record (no GPU): the summary lines, the annotations,
 the file under ``E2E_LOG_DIR``, the step summary, and a real session whose case
 fails once under ``--reruns 1``.
 """
@@ -141,6 +141,31 @@ def test_a_session_without_reruns_leaves_the_step_summary_alone(monkeypatch, tmp
     reporter.pytest_runtest_logreport(_report("t.py::test_a", "passed", attempt=1))
     assert _summary(reporter) == ["e2e reruns: 0"]
     assert not summary.exists()
+
+
+def test_the_annotations_stop_at_the_run_pages_ten_with_the_rest_counted(monkeypatch):
+    """Twelve reruns give nine record annotations and one that counts the
+    other three; ten give ten and no count."""
+    monkeypatch.delenv("E2E_LOG_DIR", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    reporter = hooks._RerunReporter()
+    for n in range(12):
+        reporter.pytest_runtest_logreport(
+            _report(f"t.py::test_{n}", "rerun", attempt=1, message="E")
+        )
+    warnings = [line for line in _summary(reporter) if line.startswith("::warning")]
+    assert len(warnings) == 10
+    assert warnings[:9] == [
+        f"::warning title=e2e rerun::t.py::test_{n} attempt 1 failed: E" for n in range(9)
+    ]
+    assert warnings[9] == "::warning title=e2e rerun::3 more reruns, see the step summary"
+    ten = hooks._RerunReporter()
+    for n in range(10):
+        ten.pytest_runtest_logreport(_report(f"t.py::test_{n}", "rerun", attempt=1, message="E"))
+    warnings = [line for line in _summary(ten) if line.startswith("::warning")]
+    assert len(warnings) == 10
+    assert not any("more reruns" in line for line in warnings)
 
 
 def test_a_failure_without_a_crash_line_falls_back_to_its_text():
