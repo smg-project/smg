@@ -9,6 +9,7 @@ mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod find_workers_to_remove;
 mod rediscover_labels;
+mod release_tokenizer;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod submit_tokenizer_job;
@@ -31,6 +32,7 @@ pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
 use openai_protocol::worker::WorkerUpdateRequest;
 pub use rediscover_labels::RediscoverLabelsStep;
+pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
@@ -97,6 +99,8 @@ pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<A
 ///     remove_from_worker_registry
 ///              │
 ///     remove_from_policy_registry
+///              │
+///       release_tokenizer
 /// ```
 /// Cache cleanup removes only departed tenants, so surviving workers do not
 /// need the previous full-policy reinitialization pass.
@@ -159,6 +163,19 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
             })
             .depends_on(&["remove_from_worker_registry"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "release_tokenizer",
+                "Release the tokenizers of the models no worker serves any more",
+                Arc::new(ReleaseTokenizerStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
+            })
+            .depends_on(&["remove_from_policy_registry"]),
         )
 }
 

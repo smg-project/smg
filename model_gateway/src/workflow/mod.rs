@@ -56,6 +56,7 @@ pub use steps::{
     ModelInfo,
     ModelsResponse,
     RegisterWorkersStep,
+    ReleaseTokenizerStep,
     RemoveFromPolicyRegistryStep,
     RemoveFromWorkerRegistryStep,
     UpdatePoliciesForWorkerStep,

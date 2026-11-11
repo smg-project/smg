@@ -168,7 +168,7 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
 /// worker's own bundle (`fetch_tokenizer_from_worker`); a ZMQ worker's id has
 /// to be a path or hub id the gateway itself can load. Coming last, the id
 /// never displaces an operator's flag.
-fn tokenizer_source<'a>(
+pub(super) fn tokenizer_source<'a>(
     labels: &'a HashMap<String, String>,
     router_tokenizer_path: Option<&'a str>,
     router_model_path: Option<&'a str>,
