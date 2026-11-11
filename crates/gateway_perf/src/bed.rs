@@ -55,12 +55,12 @@ impl Fleet {
     }
 
     /// Whether the fleet's mock engines answer a path in the shape it measures: the
-    /// HTTP wire has no Messages route and answers `/generate` in the chat shape, so the
-    /// Messages and generate paths read a gRPC fleet only.
+    /// HTTP wire answers `/generate` in the chat shape, so the generate paths read a
+    /// gRPC fleet only.
     pub fn serves(self, path: &str) -> bool {
         match self {
             Self::Grpc | Self::PrefillDecode => true,
-            Self::Http => !(path.starts_with("messages") || path.starts_with("generate")),
+            Self::Http => !path.starts_with("generate"),
         }
     }
 
@@ -830,12 +830,7 @@ mod tests {
             "4 scripted mock engines on the HTTP wire"
         );
         assert_eq!((Fleet::Http.as_str(), Fleet::Http.wire()), ("http", "http"));
-        for path in [
-            "messages",
-            "messages_stream_spaced",
-            "generate_stream",
-            "generate_stream_spaced_long",
-        ] {
+        for path in ["generate_stream", "generate_stream_spaced_long"] {
             assert!(!Fleet::Http.serves(path), "{path}");
             assert!(Fleet::PrefillDecode.serves(path), "{path}");
         }
@@ -846,12 +841,15 @@ mod tests {
             "json",
             "completion_stream",
             "stream_logprobs",
+            "messages",
+            "messages_stream",
+            "messages_stream_spaced",
         ] {
             assert!(Fleet::Http.serves(path), "{path}");
         }
         assert_eq!(Fleet::PrefillDecode.wire(), "grpc");
         assert!(Fleet::Http.serves("chat") && Fleet::Http.serves("completion_stream"));
-        assert!(!Fleet::Http.serves("messages") && !Fleet::Http.serves("messages_stream_spaced"));
+        assert!(Fleet::Http.serves("messages") && !Fleet::Http.serves("generate_stream_spaced"));
         assert!(Fleet::Grpc.serves("messages") && Fleet::PrefillDecode.serves("messages_stream"));
         assert_eq!(Fleet::Http.default_paths(), "chat,stream,tools,json");
         assert_eq!(Fleet::Grpc.default_paths(), crate::paths::DEFAULT_PATHS);

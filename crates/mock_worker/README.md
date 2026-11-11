@@ -21,6 +21,8 @@ Two modes:
 - `GET /v1/models` → one model, `owned_by: sglang` (backend/model detection)
 - `POST /v1/chat/completions` · `/v1/completions` · `/generate` — non-stream JSON
   or SSE (`data: {chunk}\n\n … data: [DONE]\n\n`)
+- `POST /v1/messages` — the same answers in the Messages shape: one JSON
+  message, or the `message_start` … `message_stop` event stream (no `[DONE]`)
 - `GET /v1/loads?include=core` → `WorkerLoadResponse` (load-aware policies)
 - `POST /flush_cache` · `/start_profile` · `/stop_profile` — the gateway's admin
   fan-out: the flush clears the engine's cache (a canned worker has none) and
@@ -374,7 +376,8 @@ admission (`fail?status=S`, counted under `failed_total`), the admission
 delay and rate (`pause` freezes the passes, which the prompt side never
 takes). With no output to cut after, an armed cut (`after_tokens=K`) fires
 as its status at once, and `finish=error` ends the prompt side with `error`
-whatever the status; both count under `cut_total`, as on any worker. The
+whatever the status (a 500 on `/v1/messages`, which has no `error` stop
+reason); both count under `cut_total`, as on any worker. The
 engine itself never runs the prompt: nothing is admitted and no record is
 left.
 
@@ -450,10 +453,14 @@ the `Complete` (`output_ids`, `finish_reason`, `matched_stop`,
 `cached_tokens`, `output_logprobs` when `return_logprob` is set); a ZMQ rank
 pushes one `EngineCoreOutputs` batch per frame, the prompt's prefill stats
 on the first, the finish reason and `stop_reason` on the last; an HTTP worker
-answers `/v1/chat/completions`, `/v1/completions` and `/generate` with the
+answers `/v1/chat/completions`, `/v1/completions`, `/generate` and `/v1/messages` with the
 `output_text` pieces (one SSE frame per `chunk_tokens` pieces, the finish
 frame with `matched_stop`, under `stream_options.include_usage` a usage
-chunk of its own, then `[DONE]`; or one JSON body) and keys its prompt on its synthetic ids, one
+chunk of its own, then `[DONE]`; or one JSON body; on `/v1/messages` the pieces are
+`content_block_delta` events between `message_start` and `message_stop`, the
+`message_delta` carrying the stop reason, a text stop as `stop_sequence` (a
+token-id stop is none) and the output usage, with no usage chunk and no
+`[DONE]`) and keys its prompt on its synthetic ids, one
 per whitespace word of the prompt text (`http::synth_token_ids`). An answer
 without `output_ids` is encoded on the token wires with the worker's
 `--tokenizer`, which must then name local tokenizer files (a directory with

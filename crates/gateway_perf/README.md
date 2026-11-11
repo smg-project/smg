@@ -127,8 +127,8 @@ log level `warn`, as `grpc_stress/bed.sh` sets it up; 4 mock engines (`--workers
 ## The fleets
 
 Every path above runs on any fleet (`--fleet`, a bed flag of every mode), except on the HTTP
-fleet the Messages paths (the mock engine's HTTP wire has no Messages route) and the generate
-paths (that wire answers `/generate` in the chat shape): the driver refuses them there, and each
+fleet the generate paths (that wire answers `/generate` in the chat shape): the driver refuses
+them there, and each
 fleet has a default path list (`chat,stream,tools,json` on HTTP). A run is one fleet, named in its
 setup line, and the ids of `results.json` are the same on every fleet, so a gate file reads a
 prefill-decode or an HTTP run as it reads a regular one. On the HTTP wire the scripted
