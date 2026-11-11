@@ -98,7 +98,7 @@ fn ec_cpu_model_info(role: &str) -> VllmModelInfo {
     }
 }
 
-/// A pixel-less batch naming its media by hash alone: a consumer's leg.
+/// A pixel-less batch naming its media by hash alone: a consumer's request.
 fn pixel_less_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
     vllm::MultimodalInputs {
         mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
@@ -1305,7 +1305,7 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// An encode-prefill-decode leg carries encoder-cache transfer parameters:
+/// An encode-prefill-decode request carries encoder-cache transfer parameters:
 /// the encoder's request (a pull connector's empty object, or a push
 /// connector's consumer destination and transfer ids), or the prefill side's
 /// with the encoder's handles. This servicer runs no encoder-cache connector
@@ -1337,7 +1337,7 @@ async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
             "ec-prefill",
             r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
         ),
-        // The encoder leg of a pull connector: an empty object, the payload
+        // The encoder's request of a pull connector: an empty object, the payload
         // the Router sends most often, is parameters all the same.
         ("ec-encode-pull", "{}"),
     ] {
@@ -1367,7 +1367,7 @@ async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
 }
 
 /// With an encoder-cache connector in the engine, the four info fields are
-/// advertised as the launcher reports them, a leg's transfer parameters go
+/// advertised as the launcher reports them, a request's transfer parameters go
 /// to the engine as the connector's extra argument (a pull connector's empty
 /// object included, beside no KV params) and the connector's answer comes
 /// back on the `Complete`, as the Python servicer carries them.
@@ -1435,9 +1435,9 @@ async fn encoder_cache_transfer_parameters_pass_through_both_ways() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A consumer's leg (the prefill side of an encode-prefill-decode fleet)
+/// A consumer's request (the prefill side of an encode-prefill-decode fleet)
 /// brings pixel-less batches: the engine fetches their encodings by the
-/// handles in the transfer parameters, so a leg whose handles do not cover
+/// handles in the transfer parameters, so a request whose handles do not cover
 /// every item is refused before the engine, in the Python servicer's words
 /// (an empty object, a CPU handle without an address, a Mooncake transfer
 /// id short of one occurrence); one whose handles cover them goes through.
@@ -1486,7 +1486,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
     assert_eq!(engine_request.request_id, "ec-c-ok");
     assert!(
         engine_request.mm_features.is_none(),
-        "a pixel-less leg carries no features"
+        "a pixel-less request carries no features"
     );
 
     // The prefill side's realistic payload, grid tensors and hashes without
@@ -1509,7 +1509,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
         .client
         .generate(request)
         .await
-        .expect("a grid-only batch on an encoder-cache leg goes through")
+        .expect("a grid-only batch on an encoder-cache request goes through")
         .into_inner();
     let engine_request = recv_add(&mut h.engine_in).await;
     assert_eq!(engine_request.request_id, "ec-c-grid");
@@ -1547,7 +1547,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// An encoder's leg with router-preprocessed pixels: its `Complete` carries
+/// An encoder's request with router-preprocessed pixels: its `Complete` carries
 /// the media identity (the prompt's ids, the batch without its pixels) beside
 /// the connector's handles, and on a CPU connector a completion short of a
 /// handle for one of the items is refused instead of becoming a handoff.
@@ -1600,7 +1600,7 @@ async fn encoder_cache_producer_completion_carries_the_identity_and_the_cpu_hand
             .client
             .generate(request)
             .await
-            .expect("an encoder's leg is admitted")
+            .expect("an encoder's request is admitted")
             .into_inner();
         let engine_request = recv_add(&mut h.engine_in).await;
         assert_eq!(engine_request.request_id, id);
@@ -4759,7 +4759,7 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// Expanded media must be refused before normal engine admission; a PD leg
+/// Expanded media must be refused before normal engine admission; a PD request
 /// still releases its remote prefill through the abort-only notice.
 #[tokio::test]
 async fn expanded_context_rejection_preserves_pd_cleanup() {

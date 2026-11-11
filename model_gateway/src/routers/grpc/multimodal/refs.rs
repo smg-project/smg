@@ -442,7 +442,7 @@ fn router_serves(plan: &MediaPlan, placeholders: &PlaceholderTokens) -> bool {
 /// between). Every registered worker counts, healthy or not, as under `auto`:
 /// the capability is configuration, not health. A model with no worker at all
 /// is left to selection, which answers for it (the 404 of a model nobody
-/// serves, or the disaggregated leg that is missing). So is a pool with an
+/// serves, or the disaggregated side that is missing). So is a pool with an
 /// encode worker, the encode-prefill-decode pipeline: media references never
 /// travel on it whatever its workers advertise, and selection refuses them
 /// with the request's own 400 (`EncodeNotSupported`), which names the fix
@@ -1240,7 +1240,7 @@ mod tests {
             worker_of("text", "grpc://127.0.0.1:9904", &text_only),
             worker_of("legacy", "grpc://127.0.0.1:9905", &[]),
             // An encode-prefill-decode pool: references never travel on it,
-            // so its vision legs without a processor are not what readiness
+            // so its vision sides without a processor are not what readiness
             // waits on.
             typed_worker_of(
                 "vl-epd",
@@ -1261,7 +1261,7 @@ mod tests {
             vec!["vl-b".to_string()]
         );
         // The registration warning follows the same line: vl-b's worker is
-        // said, the encode-prefill-decode pool's vision leg is not, and a
+        // said, the encode-prefill-decode pool's vision side is not, and a
         // capable worker beside a plain one is not either; the plain one
         // beside it is said, with the pool serving the media (the line's
         // consequence reads the pool, `pool_processes_media_refs`).

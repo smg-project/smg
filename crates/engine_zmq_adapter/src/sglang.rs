@@ -1714,7 +1714,7 @@ mod tests {
         assert_eq!(
             place(RoomResidue, Some(0), Some(3), 4),
             Ok(Some(0)),
-            "room 0 (a lone leg's stand-in) is a room"
+            "room 0 (a lone side's stand-in) is a room"
         );
         assert_eq!(
             place(RoomResidue, Some(7), Some(1), 1),

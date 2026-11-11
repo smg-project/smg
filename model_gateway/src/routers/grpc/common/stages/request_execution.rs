@@ -1625,7 +1625,7 @@ pub(crate) fn retire_pd_side(
 /// The message a prefill side's silence verdict starts with (see
 /// [`prefill_side_silent`]); it tells the verdict from an engine's own
 /// `DEADLINE_EXCEEDED`.
-const PREFILL_SILENCE_MESSAGE: &str = "prefill leg produced nothing within";
+const PREFILL_SILENCE_MESSAGE: &str = "prefill side produced nothing within";
 
 /// The message of the verdict that puts a prefill side's silence on its
 /// stalled decode partner (see [`decode_partner_silent`]).
@@ -1827,8 +1827,8 @@ fn decode_partner_silent(
         metrics_labels::ERROR_TIMEOUT,
     );
     tonic::Status::deadline_exceeded(format!(
-        "{DECODE_SILENCE_MESSAGE} {bound:.1?} of the prefill leg's dispatch ({phase}): the prefill \
-         leg waited on it (decode silent for {silence:.1?})"
+        "{DECODE_SILENCE_MESSAGE} {bound:.1?} of the prefill side's dispatch ({phase}): the prefill \
+         side waited on it (decode silent for {silence:.1?})"
     ))
 }
 
@@ -2204,7 +2204,7 @@ pub(crate) mod tests {
             ("key", "other", false),
             ("key", "key", true),
         ] {
-            let leg = |role, key: &str| -> Arc<dyn Worker> {
+            let side_worker = |role, key: &str| -> Arc<dyn Worker> {
                 Arc::new(
                     BasicWorkerBuilder::new("grpc://worker:30000")
                         .worker_type(role)
@@ -2216,8 +2216,8 @@ pub(crate) mod tests {
             };
             let workers = WorkerSelection::Disaggregated {
                 encode_assignments: None,
-                prefill: leg(WorkerType::Prefill, pk),
-                decode: leg(WorkerType::Decode, dk),
+                prefill: side_worker(WorkerType::Prefill, pk),
+                decode: side_worker(WorkerType::Decode, dk),
                 runtime_type: RuntimeType::Sglang,
             };
             assert_eq!(
@@ -3483,7 +3483,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    /// Preserve vLLM reference requests when constructing the pixel-free Decode leg.
+    /// Preserve vLLM reference requests when constructing the pixel-free decode request.
     fn clone_without_mm_pixels_keeps_vllm_media_refs() {
         // The clone keeps the references; on the sequential path they are
         // replaced by the prefill side's identity before decode is sent.

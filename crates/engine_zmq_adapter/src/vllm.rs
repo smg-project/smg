@@ -628,7 +628,7 @@ fn translate_batches_for(
     if batches.is_empty() {
         return Ok(TranslatedMedia::default());
     }
-    // A pixel-less batch is a remote leg's: a PD decode side's (remote KV) or
+    // A pixel-less batch is a remote side's: a PD decode side's (remote KV) or
     // an encoder-cache consumer's (the encoder's handles).
     let has_remote_transfer =
         kv_transfer_params(req)?.is_some() || ec_transfer_params(req)?.is_some();
@@ -850,8 +850,8 @@ pub(crate) fn ec_transfer_params(
 }
 
 /// The connector params as `SamplingParams.extra_args`, where vLLM's own
-/// frontend puts them: a PD leg's KV-transfer params, an encode-prefill-decode
-/// leg's encoder-cache params, either or both; `None` without any.
+/// frontend puts them: a PD request's KV-transfer params, an encode-prefill-decode
+/// request's encoder-cache params, either or both; `None` without any.
 fn connector_extra_args(
     kv_transfer_params: Option<serde_json::Value>,
     ec_transfer_params: Option<serde_json::Value>,
