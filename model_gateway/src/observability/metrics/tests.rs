@@ -1664,6 +1664,34 @@ fn time_per_router_record_contended() {
     time("handles kept per worker", true);
 }
 
+/// The selection series names the deciding policy under both labels of
+/// the rename window, `policy` and `profile`, with one value: a dashboard
+/// keyed on either reads the same count.
+#[test]
+fn the_selection_series_carries_the_profile_label_beside_policy_for_one_release() {
+    let rendered = render_with_recorder(|| {
+        init_metrics();
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_GRPC,
+            "m-rename",
+            "round_robin",
+        );
+    });
+    let line = rendered
+        .lines()
+        .find(|line| line.starts_with("smg_worker_selection_total{") && line.contains("m-rename"))
+        .expect("the selection series is on the scrape");
+    assert_eq!(
+        line,
+        "smg_worker_selection_total{worker_type=\"regular\",connection_mode=\"grpc\",model=\"m-rename\",policy=\"round_robin\",profile=\"round_robin\"} 1"
+    );
+    assert!(
+        rendered.contains("# HELP smg_worker_selection_total "),
+        "the renamed label is announced in the help text:\n{rendered}"
+    );
+}
+
 /// The chat path's remaining per-request records (the selection, the
 /// cache-aware decision, the routing-key source, the admission gauges,
 /// the body path, the early release) render the same through kept
@@ -1720,8 +1748,8 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
     });
     assert_eq!(sorted_series(&kept), sorted_series(&built));
     for expected in [
-        "smg_worker_selection_total{worker_type=\"regular\",connection_mode=\"grpc\",model=\"m1\",policy=\"cache_aware\"} 2",
-        "smg_worker_selection_total{worker_type=\"prefill\",connection_mode=\"grpc\",model=\"m2\",policy=\"random\"} 1",
+        "smg_worker_selection_total{worker_type=\"regular\",connection_mode=\"grpc\",model=\"m1\",policy=\"cache_aware\",profile=\"cache_aware\"} 2",
+        "smg_worker_selection_total{worker_type=\"prefill\",connection_mode=\"grpc\",model=\"m2\",policy=\"random\",profile=\"random\"} 1",
         "smg_cache_aware_policy_branch_total{branch=\"tree_match\"} 2",
         "smg_cache_aware_policy_branch_total{branch=\"spill\"} 1",
         "smg_manual_policy_branch_total{branch=\"occupied_hit\"} 2",
