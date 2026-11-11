@@ -1,6 +1,6 @@
 """Unit tests for the rerun record (no GPU): the summary lines, the annotation,
-the file under ``E2E_LOG_DIR``, and a real session whose case fails once under
-``--reruns 1``.
+the file under ``E2E_LOG_DIR``, the step summary, and a real session whose case
+fails once under ``--reruns 1``.
 """
 
 from __future__ import annotations
@@ -10,9 +10,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fixtures import hooks
 
 pytest_plugins = ["pytester"]
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_step_summary(monkeypatch):
+    """These tests run under the runner too, where the step summary file is
+    set: an inherited one would take their synthetic reruns as the job's own."""
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
 
 
 class _Terminal:
@@ -94,6 +102,47 @@ def test_annotations_are_written_under_github_actions_only(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    "earlier", ["earlier\n", "earlier"], ids=["final-newline", "no-final-newline"]
+)
+def test_the_step_summary_keeps_the_lines_of_a_session_with_reruns(monkeypatch, tmp_path, earlier):
+    """The step summary file the runner names gets the count and the lines of
+    ``reruns.txt`` after what the step wrote before, on lines of their own
+    whether or not that content ended with a newline; it is the record a
+    green row keeps."""
+    summary = tmp_path / "summary.md"
+    summary.write_text(earlier, encoding="utf-8")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.delenv("E2E_LOG_DIR", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    reporter = hooks._RerunReporter()
+    reporter.pytest_runtest_logreport(
+        _report("t.py::test_a", "rerun", attempt=1, message="AssertionError: boom")
+    )
+    reporter.pytest_runtest_logreport(
+        _report("t.py::test_b", "rerun", attempt=1, message="OSError: late")
+    )
+    _summary(reporter)
+    assert summary.read_text(encoding="utf-8") == earlier + (
+        "\n### e2e reruns: 2\n"
+        "\n"
+        "```text\n"
+        "e2e rerun: t.py::test_a attempt 1 failed: AssertionError: boom\n"
+        "e2e rerun: t.py::test_b attempt 1 failed: OSError: late\n"
+        "```\n"
+    )
+
+
+def test_a_session_without_reruns_leaves_the_step_summary_alone(monkeypatch, tmp_path):
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.delenv("E2E_LOG_DIR", raising=False)
+    reporter = hooks._RerunReporter()
+    reporter.pytest_runtest_logreport(_report("t.py::test_a", "passed", attempt=1))
+    assert _summary(reporter) == ["e2e reruns: 0"]
+    assert not summary.exists()
+
+
 def test_a_failure_without_a_crash_line_falls_back_to_its_text():
     report = SimpleNamespace(longrepr="worker died\nexit 137", longreprtext="worker died\nexit 137")
     assert hooks._first_failure_line(report) == "worker died"  # type: ignore[arg-type]
@@ -110,7 +159,8 @@ def test_a_long_first_line_is_cut_to_the_record_length():
 
 def _isolated_session(pytester, monkeypatch, log_dir: Path):
     """A pytester session that loads only ``fixtures.hooks`` and the rerun
-    plugin, with the record directed at ``log_dir``."""
+    plugin, with the record directed at ``log_dir`` and the step summary at
+    a file beside it."""
     for key in list(os.environ):
         if key.startswith(("PYTEST_", "E2E_")):
             monkeypatch.delenv(key)
@@ -120,13 +170,15 @@ def _isolated_session(pytester, monkeypatch, log_dir: Path):
     monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     monkeypatch.setenv("E2E_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(log_dir.parent / "step-summary.md"))
     pytester.makeconftest('pytest_plugins = ["fixtures.hooks"]\n')
     return pytester.makeini("[pytest]\n")
 
 
 def test_a_real_session_records_the_case_that_passed_on_its_rerun(pytester, monkeypatch, tmp_path):
     """A case that fails on its first attempt and passes on the rerun ends
-    the session green with the rerun named in the summary and the record."""
+    the session green with the rerun named in the summary, the record and
+    the step summary."""
     log_dir = tmp_path / "logs"
     config = _isolated_session(pytester, monkeypatch, log_dir)
     case = pytester.makepyfile(
@@ -169,3 +221,5 @@ def test_a_real_session_records_the_case_that_passed_on_its_rerun(pytester, monk
     assert "e2e reruns: 1" in output.splitlines(), output
     assert rerun_line in output.splitlines(), output
     assert (log_dir / "reruns.txt").read_text(encoding="utf-8") == rerun_line + "\n"
+    step_summary = (log_dir.parent / "step-summary.md").read_text(encoding="utf-8")
+    assert step_summary == f"\n### e2e reruns: 1\n\n```text\n{rerun_line}\n```\n"
