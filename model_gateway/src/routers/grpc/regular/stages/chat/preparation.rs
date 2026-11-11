@@ -246,9 +246,10 @@ pub(crate) async fn prepare_chat_like(
 /// the request says; a JSON-schema constraint forces the call's JSON, so there
 /// are no markers to keep and the request's own setting stands; a request that
 /// offers tools the model may call (declared at the request level or on a
-/// message, see `ChatCompletionRequest::declares_tools`, the calls not switched
-/// off by `tool_choice: none`) keeps them for the tool parser's markers; any
-/// other request keeps its own setting.
+/// message that `provider`, the profile the preparation derived, reads; see
+/// `ChatCompletionRequest::declares_tools_for`; the calls not switched off by
+/// `tool_choice: none`) keeps them for the tool parser's markers; any other
+/// request keeps its own setting.
 fn skips_special_tokens(
     request: &ChatCompletionRequest,
     provider: ProviderProfile,
