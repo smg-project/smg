@@ -795,8 +795,9 @@ impl LoadSink for HostStores {
                 monitor.apply_pushed_load(&worker, i32::from(rank), &record, received_at);
             }
             // The gateway's own read of one rank merges where the stream's
-            // records land, with no push receipt: the poll stays, and a rank
-            // whose pushed record waits for the window keeps it.
+            // records land when the worker has them, and takes the poll's
+            // path over its published rows when not; no push receipt either
+            // way, so the poll stays.
             LoadSource::Poll | LoadSource::Scrape => {
                 monitor.apply_read_load(&worker, i32::from(rank), &record, received_at);
             }
@@ -1487,6 +1488,92 @@ mod tests {
             "a record for the other rank is dropped"
         );
         assert_eq!(host.ranks(id), 1);
+    }
+
+    /// An authoritative empty poll retracts a read's rows as it retracts the
+    /// pre-poll pushed ones: a worker whose rows came from scrapes alone
+    /// keeps none of them past it, and a later scrape of one rank brings no
+    /// other rank back.
+    #[test]
+    fn an_empty_poll_retracts_scraped_rows_without_a_receipt() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let t0 = Instant::now();
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        host.record(id, 0, row(4), t0, LoadSource::Scrape);
+        host.record(id, 1, row(5), t0, LoadSource::Scrape);
+        monitor.flush_pushed();
+        assert_eq!(host.ranks(id), 2);
+        host.record(
+            id,
+            1,
+            row(7),
+            t0 + Duration::from_millis(500),
+            LoadSource::Scrape,
+        );
+        host.report(id, &[], t0 + Duration::from_secs(1), LoadSource::Poll);
+        assert_eq!(host.ranks(id), 0, "the empty poll retracts the read rows");
+        monitor.flush_pushed();
+        assert_eq!(
+            host.ranks(id),
+            0,
+            "a flush after the empty poll publishes nothing"
+        );
+        host.record(
+            id,
+            0,
+            row(6),
+            t0 + Duration::from_secs(2),
+            LoadSource::Scrape,
+        );
+        monitor.flush_pushed();
+        assert_eq!(host.load(id, 0).map(|sample| sample.row.running), Some(6));
+        assert!(
+            host.load(id, 1).is_none(),
+            "the retracted rank does not come back with the next read"
+        );
+        assert_eq!(host.ranks(id), 1);
+    }
+
+    /// A read of one rank on a worker without a stream keeps the ranks a
+    /// poll learned: the read is laid over the published rows and published
+    /// at once, with no report of its own for the window to publish over
+    /// them.
+    #[test]
+    fn a_scrape_of_one_rank_keeps_the_polls_other_ranks() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let t0 = Instant::now();
+        let row = |running| LoadRow {
+            running,
+            ..LoadRow::default()
+        };
+        host.report(id, &[(0, row(3)), (1, row(4))], t0, LoadSource::Poll);
+        assert_eq!(host.ranks(id), 2);
+        host.record(
+            id,
+            1,
+            row(7),
+            t0 + Duration::from_secs(1),
+            LoadSource::Scrape,
+        );
+        monitor.flush_pushed();
+        assert_eq!(
+            host.load(id, 0).map(|sample| sample.row.running),
+            Some(3),
+            "the poll's other rank stays published"
+        );
+        assert_eq!(host.load(id, 1).map(|sample| sample.row.running), Some(7));
+        assert_eq!(host.ranks(id), 2);
     }
 
     /// The store contract's eviction through the host: a worker that stays

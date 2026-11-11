@@ -586,13 +586,15 @@ impl WorkerMonitor {
     }
 
     /// One rank's record from the gateway's own read of the worker (a poll
-    /// of one rank, a scrape), received at `received_at`: merged over the
-    /// worker's report in place as a pushed record is, so a rank whose
-    /// pushed record waits for the window keeps it, and published at the
-    /// window. The read is no stream: it writes no push receipt, so the
-    /// poll decision stays the poll's, and it leaves the liveness cadence
-    /// alone. Its sample instant is the receipt less the record's age with
-    /// no one-way margin: the reader aged it.
+    /// of one rank, a scrape), received at `received_at`. A worker with a
+    /// report on file, its stream's, takes it in place as a pushed record,
+    /// so a rank whose pushed record waits for the window keeps it; a worker
+    /// without one takes the poll's path over its published rows, so the
+    /// ranks a poll learned stay published and the read is published at
+    /// once, with no report and no receipt made. The read is no stream: no
+    /// push receipt, so the poll decision stays the poll's, no liveness
+    /// cadence mark, and no one-way margin on its age; a report that mixes
+    /// the read with older rows takes the earlier instant.
     pub(crate) fn apply_read_load(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -600,7 +602,49 @@ impl WorkerMonitor {
         record: &EngineLoad,
         received_at: Instant,
     ) {
-        self.merge_rank_record(worker, dp_rank, record, received_at, false);
+        if dp_rank < 0
+            || worker
+                .dp_rank()
+                .is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank))
+        {
+            return;
+        }
+        let url = worker.url();
+        if self.pushed_reports.lock().contains_key(url) {
+            self.merge_rank_record(worker, dp_rank, record, received_at, false);
+            return;
+        }
+        let age = Duration::from_millis(u64::from(record.age_ms));
+        let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
+        let mut read = SchedulerLoadSnapshot::from(record);
+        read.dp_rank = dp_rank;
+        let snapshot = self.load_state.snapshot();
+        let (mut loads, published_at) = match snapshot.report(url) {
+            Some((report, at)) if report.ranks_are_dp_ranks() => (
+                report
+                    .loads
+                    .iter()
+                    .filter(|entry| entry.dp_rank != dp_rank)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                Some(at),
+            ),
+            _ => (Vec::new(), None),
+        };
+        let instant = if loads.is_empty() {
+            sampled_at
+        } else {
+            published_at.map_or(sampled_at, |at| at.min(sampled_at))
+        };
+        loads.push(read);
+        loads.sort_by_key(|entry| entry.dp_rank);
+        let load = WorkerLoadResponse {
+            dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
+            loads,
+            sampled_at: Some(instant),
+            ..WorkerLoadResponse::default()
+        };
+        self.ingest_polled_report(worker, load, received_at);
     }
 
     /// The in-place merge behind both: `pushed` marks a stream's record,
@@ -851,7 +895,9 @@ impl WorkerMonitor {
                 .publish_group(std::slice::from_ref(&url), Vec::new());
             return;
         }
-        let now = Instant::now();
+        // A report that names its sample instant keeps it (the host's paths
+        // do); one that does not is stamped now.
+        let now = load.sampled_at.unwrap_or_else(Instant::now);
         let (newer, stream_sampled_at) = self.apply_polled_load(&url, &load, polled_at);
         // One sample instant per report, the earlier of the two: the carried
         // rows keep their stream's, so the scorer releases no dispatch they
@@ -891,20 +937,23 @@ impl WorkerMonitor {
 
     /// Retract pre-poll pushed ranks after an authoritative empty response.
     /// Records received since the poll began remain available for the next
-    /// push; a report left without ranks publishes nothing.
+    /// push; a read's rows, which carry no receipt, go with the pre-poll
+    /// ones; a report left without ranks publishes nothing.
     fn retract_pushed_load(&self, url: &str, rank: Option<usize>, polled_at: Instant) {
         let mut reports = self.pushed_reports.lock();
         let mut receipts = self.pushed_at.lock();
-        let Some(times) = receipts.get_mut(url) else {
-            return;
-        };
-        times.retain(|&dp_rank, at| {
-            rank.is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank)) || *at >= polled_at
-        });
+        if let Some(times) = receipts.get_mut(url) {
+            times.retain(|&dp_rank, at| {
+                rank.is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank)) || *at >= polled_at
+            });
+        }
+        // A worker with no receipt at all keeps nothing: every row on file
+        // is a read's.
+        let times = receipts.get(url);
         if let Some(report) = reports.get_mut(url) {
             report
                 .loads
-                .retain(|load| times.contains_key(&load.dp_rank));
+                .retain(|load| times.is_some_and(|times| times.contains_key(&load.dp_rank)));
             report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
         }
     }
