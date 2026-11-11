@@ -24,6 +24,15 @@ use tokio::{sync::mpsc, time};
 /// as a handful of events within a few milliseconds.
 pub(crate) const SETTLE: Duration = Duration::from_millis(200);
 
+/// The directory a file is watched in: its parent, or the working directory
+/// for a bare name, which has none.
+pub(crate) fn directory_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
 /// A watch on a directory for the named files in it. Dropping it stops the
 /// watch.
 pub(crate) struct DirectoryWatch {
@@ -37,16 +46,12 @@ pub(crate) struct DirectoryWatch {
 impl DirectoryWatch {
     /// The watch for one file: its directory, for its name.
     pub(crate) fn of_file(path: &Path, wake: mpsc::Sender<()>) -> notify::Result<Self> {
-        let dir = match path.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir,
-            _ => Path::new("."),
-        };
         let names = path
             .file_name()
             .map(OsStr::to_os_string)
             .into_iter()
             .collect();
-        Self::start(dir, names, wake)
+        Self::start(directory_of(path), names, wake)
     }
 
     /// Watch `dir` and send on `wake` whenever one of the `names` in it may
@@ -148,6 +153,18 @@ mod tests {
 
     fn names(names: &[&str]) -> Vec<OsString> {
         names.iter().map(OsString::from).collect()
+    }
+
+    /// A file is watched in its directory; a bare name has none, so it is
+    /// watched in the working directory.
+    #[test]
+    fn a_file_is_watched_in_its_directory_or_the_working_one() {
+        assert_eq!(
+            directory_of(Path::new("/etc/smg/api_key")),
+            Path::new("/etc/smg")
+        );
+        assert_eq!(directory_of(Path::new("keys/api_key")), Path::new("keys"));
+        assert_eq!(directory_of(Path::new("api_key")), Path::new("."));
     }
 
     /// Which events in the directory cause a reread.
