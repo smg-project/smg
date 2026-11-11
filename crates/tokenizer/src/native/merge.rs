@@ -366,7 +366,6 @@ impl MergeTable {
             // The entries by id where the read says the ids are the range,
             // else through a clone of the vocabulary map.
             let raws = entries_of(bpe, read)
-                .into_iter()
                 .filter_map(|(id, token)| raw_of(&token).map(|raw| (id, raw)))
                 .collect();
             table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));

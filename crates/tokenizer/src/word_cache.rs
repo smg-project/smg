@@ -90,16 +90,31 @@ pub(crate) struct LateBoundModel {
 /// What the one-pass read of a BPE section saw that the loader's own tables
 /// are built from, so none of it is read back from the built model: the
 /// merges as ids (left, right, product; the rank is the index), when every
-/// merge names tokens of the vocabulary, and the vocabulary's largest id.
+/// merge names tokens of the vocabulary, the vocabulary's largest id, and
+/// whether its ids are exactly the range `0..n` of its `n` entries.
 /// Dropped with the loading model when it moves into the built tokenizer.
 pub(crate) struct ReadBpe {
     pub(crate) pairs: Option<Box<[[u32; 3]]>>,
     pub(crate) max_id: Option<u32>,
+    /// The ids are `0..n` with no gap and no id twice: the tables may
+    /// walk the entries by id and find every one of them.
+    pub(crate) dense: bool,
 }
 
 impl ReadBpe {
     fn of(vocab: &Vocab, merges: &[(String, String)]) -> Self {
         let max_id = vocab.values().copied().max();
+        let n = vocab.len();
+        let mut seen = vec![0u64; n.div_ceil(64)];
+        let dense = vocab.values().all(|&id| {
+            let id = id as usize;
+            id < n && {
+                let (word, bit) = (id / 64, 1u64 << (id % 64));
+                let fresh = seen[word] & bit == 0;
+                seen[word] |= bit;
+                fresh
+            }
+        });
         let mut token = String::new();
         let mut pairs = Vec::with_capacity(merges.len());
         for (left, right) in merges {
@@ -118,6 +133,7 @@ impl ReadBpe {
                     return Self {
                         pairs: None,
                         max_id,
+                        dense,
                     }
                 }
             }
@@ -125,32 +141,27 @@ impl ReadBpe {
         Self {
             pairs: Some(pairs.into_boxed_slice()),
             max_id,
+            dense,
         }
     }
 }
 
-/// The model's vocabulary as `(id, token)` entries. By id when the read's
-/// largest id says the ids are the range `0..n` for the vocabulary's `n`
-/// entries (one lookup per id, no clone of the map) and that walk finds all
-/// `n` of them (two tokens on one id would hide one); otherwise a walk of
-/// the map, as for a model without a read. A vocabulary numbered sparsely
-/// never pays a walk of its id range.
-pub(crate) fn entries_of(bpe: &BPE, read: Option<&ReadBpe>) -> Vec<(u32, String)> {
-    let n = bpe.get_vocab_size();
-    if let Some(max_id) = read.and_then(|read| read.max_id) {
-        if max_id as usize + 1 == n {
-            let by_id: Vec<(u32, String)> = (0..=max_id)
-                .filter_map(|id| bpe.id_to_token(id).map(|token| (id, token)))
-                .collect();
-            if by_id.len() == n {
-                return by_id;
-            }
-        }
+/// The model's vocabulary as `(id, token)` entries, one at a time. By id
+/// when the read says the ids are exactly the range `0..n` of the
+/// vocabulary's `n` entries (one lookup per id, each token used and dropped
+/// before the next, no clone of the map); otherwise a walk of the map, as
+/// for a model without a read. A vocabulary numbered sparsely, or with two
+/// tokens on one id, never starts the walk by id.
+pub(crate) fn entries_of<'a>(
+    bpe: &'a BPE,
+    read: Option<&ReadBpe>,
+) -> Box<dyn Iterator<Item = (u32, String)> + 'a> {
+    match read.filter(|read| read.dense).and_then(|read| read.max_id) {
+        Some(max_id) => Box::new(
+            (0..=max_id).filter_map(move |id| bpe.id_to_token(id).map(|token| (id, token))),
+        ),
+        None => Box::new(bpe.get_vocab().into_iter().map(|(token, id)| (id, token))),
     }
-    bpe.get_vocab()
-        .into_iter()
-        .map(|(token, id)| (id, token))
-        .collect()
 }
 
 impl LateBoundModel {

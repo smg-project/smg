@@ -84,9 +84,10 @@ impl CharSymbols {
     /// could then cross a cut).
     ///
     /// `read` is what the file's one-pass read saw of the model: the merge
-    /// table takes the merges from it and the entries are read by id,
-    /// nothing through a clone of the vocabulary; `None` for a model built
-    /// in memory.
+    /// table takes the merges from it, and the entries are read by id when
+    /// it says the ids are the range of the vocabulary (else through the
+    /// vocabulary map, as without a read); `None` for a model built in
+    /// memory.
     pub(super) fn from_model(
         model: &ModelWrapper,
         marker: Marker,

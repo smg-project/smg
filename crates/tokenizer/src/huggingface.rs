@@ -904,7 +904,7 @@ impl HuggingFaceTokenizer {
             deepseek_v31.is_some() && deepseek_v31::Checkpoint::renders_tools_block(&chat_template);
         let byte_level = ByteLevelTable::build_with_max_id(&tokenizer, model_max_id);
         let pieces = PieceTable::build_with_max_id(&tokenizer, model_max_id);
-        let token_texts = TokenTextTable::build(&tokenizer);
+        let token_texts = TokenTextTable::build_with_max_id(&tokenizer, model_max_id);
         log_decode_path(
             &tokenizer,
             byte_level.is_some(),

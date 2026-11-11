@@ -1429,6 +1429,28 @@ fn read_of(bpe: &BPE) -> crate::word_cache::LateBoundModel {
     serde_json::from_str(&json).expect("the loading model reads its section")
 }
 
+/// The model's section as JSON text, read into the loading model without
+/// the built model's serializer, which walks every id up to the largest
+/// (a vocabulary numbered at 2^31 would stall there).
+fn section_of(
+    vocab: &Vocab,
+    merges: &[(&str, &str)],
+    byte_fallback: bool,
+) -> crate::word_cache::LateBoundModel {
+    let vocab: std::collections::BTreeMap<&str, u32> = vocab
+        .iter()
+        .map(|(token, &id)| (token.as_str(), id))
+        .collect();
+    let section = serde_json::json!({
+        "type": "BPE",
+        "unk_token": "<unk>",
+        "byte_fallback": byte_fallback,
+        "vocab": vocab,
+        "merges": merges,
+    });
+    serde_json::from_value(section).expect("the loading model reads its section")
+}
+
 /// The one-pass read of a model section holds the merges as the ids the
 /// built model resolves them to and the vocabulary's largest id, and the
 /// table built from it is the table built from the model; a merge whose
@@ -1507,8 +1529,12 @@ fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
 
     let dense = model_with(&[("a", "b")], false);
     let late = read_of(&dense);
-    assert_eq!(sorted(entries_of(&dense, late.read())), walk(&dense));
-    assert_eq!(sorted(entries_of(&dense, None)), walk(&dense));
+    assert!(late.read().is_some_and(|read| read.dense));
+    assert_eq!(
+        sorted(entries_of(&dense, late.read()).collect()),
+        walk(&dense)
+    );
+    assert_eq!(sorted(entries_of(&dense, None).collect()), walk(&dense));
 
     let mut vocab = Vocab::default();
     vocab.insert("<unk>".to_owned(), 0);
@@ -1518,18 +1544,22 @@ fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
     vocab.insert("a".to_owned(), 1 << 31);
     vocab.insert("b".to_owned(), (1 << 31) + 1);
     vocab.insert("ab".to_owned(), (1 << 31) + 2);
+    let late = section_of(&vocab, &[("a", "b")], true);
     let sparse = BPE::builder()
         .vocab_and_merges(vocab, vec![("a".to_owned(), "b".to_owned())])
         .byte_fallback(true)
         .unk_token("<unk>".to_owned())
         .build()
         .expect("a byte-fallback BPE numbered at 2^31");
-    let late = read_of(&sparse);
+    assert!(late.read().is_some_and(|read| !read.dense));
     assert_eq!(
         late.read().and_then(|read| read.max_id),
         Some((1 << 31) + 2)
     );
-    assert_eq!(sorted(entries_of(&sparse, late.read())), walk(&sparse));
+    assert_eq!(
+        sorted(entries_of(&sparse, late.read()).collect()),
+        walk(&sparse)
+    );
 
     let mut vocab = Vocab::default();
     for (token, id) in [("a", 0), ("b", 0), ("c", 2)] {
@@ -1541,7 +1571,8 @@ fn the_entries_by_id_are_the_vocabulary_walk_or_the_walk_itself() {
         .expect("a BPE with two tokens on one id");
     let late = read_of(&doubled);
     assert_eq!(late.read().and_then(|read| read.max_id), Some(2));
-    let entries = sorted(entries_of(&doubled, late.read()));
+    assert!(late.read().is_some_and(|read| !read.dense));
+    let entries = sorted(entries_of(&doubled, late.read()).collect());
     assert_eq!(entries.len(), 3, "both tokens of the shared id");
     assert_eq!(entries, walk(&doubled));
 }
