@@ -353,7 +353,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     put(root, "crates/lambda/src/lib.rs", "// lambda\n")
     deps = "\n[dependencies]\nkappa = { workspace = true }\n"
     sources = {
-        "omega": "fn uses(_thing: kap::Thing) {}\n",
+        "omega": "pub(crate) fn uses(_thing: impl Fn(&kap::Thing)) {}\n",
         "sigma": "pub use kap::Thing;\n",
         "phi": "use kap::Thing;\n\npub struct Holder {\n    pub thing: Thing,\n}\n",
         "chi": "use kap::Thing;\n\npub fn make(\n    first: u8,\n    _thing: Thing,\n) -> u8 {\n    first\n}\n",
@@ -436,6 +436,20 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     assert mod.public_spans(table) == [" const TAGS: &[&str] "]
     const_fn = "pub const fn f(x: kap::T) -> u8 {\n    1\n}\n"
     assert mod.public_spans(const_fn) == [" const fn f(x: kap::T) -> u8 "]
+    assert mod.public_spans("use kap::Thing;\npub(crate) fn f(x: impl Fn(&Thing)) {}\n") == []
+    assert (
+        mod.public_spans("fn g() -> impl Iterator<Item = kap::T> {\n    [].into_iter()\n}\n") == []
+    )
+    assert mod.public_spans("pub fn h(x: impl Into<kap::T>) {}\n") == [
+        " fn h(x: impl Into<kap::T>) "
+    ]
+    nested = (
+        "mod m {\n    unsafe impl Send for It {}\n    impl Iterator for It {\n"
+        "        type Item = Thing;\n    }\n}\n"
+    )
+    spans = mod.public_spans(nested)
+    assert [span.split()[0] for span in spans] == ["Send", "Iterator"]
+    assert "type Item = Thing;" in spans[1]
     assert mod.public_spans("pub fn le(a: u8) -> bool {\n    a <= 2\n}\nfn p(_t: Thing) {}\n") == [
         " fn le(a: u8) -> bool "
     ]

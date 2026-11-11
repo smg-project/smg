@@ -818,7 +818,9 @@ def imported_names(text: str, ident: str) -> set[str] | None:
 
 def public_spans(text: str) -> list[str]:
     """The heads of a source's public items: from a bare ``pub`` (``pub(crate)`` and its kin are
-    not public) or an ``impl`` to the ``{``, ``;``, ``,`` or ``}`` that ends the head outside
+    not public) or an ``impl`` that begins an item (an ``impl Trait`` inside a signature opens no
+    head of its own: in a public one it lies inside the ``pub`` span, in a private one it is no
+    API) to the ``{``, ``;``, ``,`` or ``}`` that ends the head outside
     every bracket, across wrapped lines (``<=``, ``->``, ``=>`` and ``>=`` are operators, not
     brackets, and ``<<`` is a shift when whitespace follows it, as rustfmt writes one, else two
     brackets as in ``Vec<<T as Tr>::A>``). A ``const`` or ``static`` head ends at its ``=``: the
@@ -826,7 +828,7 @@ def public_spans(text: str) -> list[str]:
     methods are public without the word; a trait ``impl`` keeps the ``type … = …;`` lines of its
     body."""
     spans: list[str] = []
-    for match in re.finditer(r"\b(?:pub|impl)\b(?!\s*\()", text):
+    for match in re.finditer(r"\bpub\b(?!\s*\()|^[ \t]*(?:unsafe[ \t]+)?(impl)\b", text, re.M):
         start = i = match.end()
         depth = 0
         constant = CONSTANT.match(text, start) is not None
@@ -859,7 +861,7 @@ def public_spans(text: str) -> list[str]:
                     break
             if re.match(r"\s*(enum|trait)\b", head):
                 head = text[start:end]
-            elif match[0] == "impl" and re.search(r"\bfor\b", head):
+            elif match[1] and re.search(r"\bfor\b", head):
                 head += " ".join(re.findall(r"\btype\s+[^;]*;", text[i:end]))
         spans.append(head)
     return spans
