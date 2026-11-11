@@ -1356,7 +1356,7 @@ mod tracked_tests {
     fn a_prefill_side_books_its_prompt_timed_and_joins_no_pile() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_prefill_side(Arc::clone(&worker), 4_096);
+            .tracked_prefill_side_booked(Arc::clone(&worker), PrefillTicket::book(&worker, 4_096));
         assert_eq!(worker.tracked_load(), 0, "a side is never part of a pile");
         assert_eq!(
             worker.prefill_backlog(),
@@ -1384,7 +1384,7 @@ mod tracked_tests {
         // the reader sees it once more, then the stream as it is.
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_prefill_side(Arc::clone(&worker), 16);
+            .tracked_prefill_side_booked(Arc::clone(&worker), PrefillTicket::book(&worker, 16));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         assert_eq!(
             stream.first_response_within(deadline).await.ok(),
@@ -1602,22 +1602,14 @@ impl ProtoStream {
     }
 
     /// Track this stream as the prefill side of a disaggregated dispatch to
-    /// `worker`: its `prompt_tokens` are pending prefill there until its
-    /// first response, which times the prompt's prefill for the worker's
-    /// rate (the side's first response is the end of its prefill, on either
-    /// dispatch shape), and every response is progress for the worker. The
-    /// side joins no pile: the gateway bounds its silence per request (see
-    /// [`crate::worker::liveness::prefill_side_bound`]) instead of judging the
-    /// worker by sides it cannot see progress on.
-    #[must_use]
-    pub fn tracked_prefill_side(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {
-        let prefill = PrefillTicket::book(&worker, prompt_tokens);
-        self.tracked_prefill_side_booked(worker, prefill)
-    }
-
-    /// [`Self::tracked_prefill_side`] for a side booked at its dispatch (see
-    /// [`PrefillTicket::book`]): the stream takes over the ticket, so the
-    /// first response ends the span that began before the call was polled.
+    /// `worker`, its prompt booked at the dispatch (see [`PrefillTicket::book`]):
+    /// the stream takes over the ticket, so the first response ends the span
+    /// that began before the call was polled and times the prompt's prefill
+    /// for the worker's rate (the side's first response is the end of its
+    /// prefill, on either dispatch shape), and every response is progress for
+    /// the worker. The side joins no pile: the gateway bounds its silence per
+    /// request (see [`crate::worker::liveness::prefill_side_bound`]) instead
+    /// of judging the worker by sides it cannot see progress on.
     #[must_use]
     pub(crate) fn tracked_prefill_side_booked(
         self,
@@ -2162,7 +2154,8 @@ impl<C: FanoutChild> FanoutStream<C> {
     }
 
     /// Children that have not ended yet.
-    pub fn open_children(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn open_children(&self) -> usize {
         self.children.iter().flatten().count()
     }
 

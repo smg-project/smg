@@ -2784,7 +2784,7 @@ pub(crate) mod tests {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
-            .tracked_prefill_side(Arc::clone(&prefill), 256);
+            .tracked_prefill_side_booked(Arc::clone(&prefill), PrefillTicket::book(&prefill, 256));
         let first = first_prefill_response_within(
             &mut stream,
             Some(three_second_bound()),
