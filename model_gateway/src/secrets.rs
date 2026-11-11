@@ -27,7 +27,7 @@ use crate::{
         validation::ConfigValidator,
         ConfigError, TenantApiKeyEntry,
     },
-    fs_watch::{settle, DirectoryWatch},
+    fs_watch::{directory_of, settle, DirectoryWatch},
     middleware::AuthConfig,
     server::posture::{SecretSource, SecretSources},
 };
@@ -75,12 +75,10 @@ impl SecretFiles {
     fn by_directory(&self) -> BTreeMap<PathBuf, Vec<OsString>> {
         let mut dirs: BTreeMap<PathBuf, Vec<OsString>> = BTreeMap::new();
         for path in self.paths() {
-            let dir = match path.parent() {
-                Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-                _ => PathBuf::from("."),
-            };
             if let Some(name) = path.file_name() {
-                dirs.entry(dir).or_default().push(name.to_os_string());
+                dirs.entry(directory_of(path).to_path_buf())
+                    .or_default()
+                    .push(name.to_os_string());
             }
         }
         dirs
