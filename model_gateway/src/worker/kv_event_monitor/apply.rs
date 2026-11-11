@@ -154,7 +154,7 @@ impl KvEventMonitor {
                 warn!(
                     worker_id,
                     indexed,
-                    "KV cache group view created after the worker's main blocks were indexed; its rule stays off until the worker's next clear"
+                    "KV cache group view created after the worker's main blocks were indexed; its rule stays off until the worker's next clear or a restart leaves the view complete"
                 );
             }
             worker_blocks.view(indexer, worker_id).created_over(indexed);
@@ -430,7 +430,7 @@ impl KvEventMonitor {
                     worker_blocks.counters.group_view_late += 1;
                     warn!(
                         worker_id,
-                        indexed = signal.len(),
+                        main_signal_dropped = signal.len(),
                         groups = groups.len(),
                         "KV cache group view restarted over the blocks of more than one main-signal group, or of one the rule cannot read; its rule stays off until the worker's next clear"
                     );
@@ -610,8 +610,11 @@ pub(crate) struct WorkerIndexCounters {
     /// name under a parent it did not know (the view's own counts, copied).
     pub(crate) group_dropped: u64,
     pub(crate) group_unnamed: u64,
-    /// Views created after the worker's main blocks were indexed: their rule
-    /// stays off until the worker's next clear.
+    /// Views whose rule went off when they were made or restarted: created
+    /// after the worker's main blocks were indexed (off until the worker's
+    /// next clear, or until a restart leaves the view complete), or
+    /// restarted over the blocks of more than one main-signal group (or of
+    /// one the rule cannot read), off until the worker's next clear.
     pub(crate) group_view_late: u64,
     /// Main stores with a block that carried no tokens: nothing to index under.
     pub(crate) tokenless_stores: u64,
