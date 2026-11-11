@@ -1625,7 +1625,7 @@ impl NativeEncoder {
     fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
         if pre_tokenizer.is_null() {
             return Err(Declined::from(
-                "no pre-tokenizer (the path needs ByteLevel, after any split stages)",
+                "no pre-tokenizer (the path needs a ByteLevel without a prefix space)",
             ));
         }
         let items: Vec<&Value> = match type_of("pre-tokenizer", pre_tokenizer)? {
@@ -1642,7 +1642,7 @@ impl NativeEncoder {
             .position(|item| item.get("type").and_then(Value::as_str) == Some("ByteLevel"))
             .filter(|&at| items[at].get("add_prefix_space").and_then(Value::as_bool) == Some(false))
             .ok_or_else(|| {
-                Declined::from("the pre-tokenizer does not end in ByteLevel without a prefix space")
+                Declined::from("the pre-tokenizer has no ByteLevel without a prefix space")
             })?;
         let mut stages = Vec::with_capacity(items.len());
         for split in &items[..at] {
@@ -1701,8 +1701,9 @@ impl NativeEncoder {
                     .ok_or_else(|| Declined::from("the Digits split pattern"));
             }
             "Punctuation" => {
+                // The reference reads a missing `behavior` as `Isolated`.
                 let runs = match split.get("behavior").and_then(Value::as_str) {
-                    Some("Isolated") => false,
+                    None | Some("Isolated") => false,
                     Some("Contiguous") => true,
                     behavior => {
                         return Err(Declined::from(format!(

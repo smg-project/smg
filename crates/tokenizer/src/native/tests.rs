@@ -127,6 +127,15 @@ const POOL: &[char] = &[
     ')',
     '€',
     '→',
+    // Punctuation beyond ASCII, for the `Punctuation` shapes: two code
+    // points where the reference's set and the engine's category differ
+    // (U+2E43 only in the category, U+166D only in the set).
+    '¿',
+    '«',
+    '…',
+    '、',
+    '\u{2E43}',
+    '\u{166D}',
     '\u{301}',
     '\u{93E}',
     '\u{E31}',
@@ -599,7 +608,7 @@ fn shapes_outside_the_path_are_declined() {
     ]))));
     assert_eq!(
         declined(&tokenizer),
-        "the pre-tokenizer does not end in ByteLevel without a prefix space"
+        "the pre-tokenizer has no ByteLevel without a prefix space"
     );
     // A normalizer other than NFC.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -675,7 +684,7 @@ fn shapes_outside_the_path_are_declined() {
     tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
     assert_eq!(
         declined(&tokenizer),
-        "no pre-tokenizer (the path needs ByteLevel, after any split stages)"
+        "no pre-tokenizer (the path needs a ByteLevel without a prefix space)"
     );
 }
 
