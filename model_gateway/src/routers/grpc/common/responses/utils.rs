@@ -324,6 +324,14 @@ pub(crate) fn decode_reasoning_content(blob: &str) -> Option<String> {
     String::from_utf8(BASE64_STANDARD.decode(payload).ok()?).ok()
 }
 
+/// Whether `name` is `namespace` and `member` joined by a dot, read at the
+/// dot without building the joined text.
+fn is_namespaced(name: &str, namespace: &str, member: &str) -> bool {
+    name.strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|rest| rest == member)
+}
+
 /// Recover structured identity only for a declared namespace member.
 /// Literal top-level names (including dots) take precedence over namespace matches.
 pub(crate) fn resolve_function_identity(
@@ -339,7 +347,7 @@ pub(crate) fn resolve_function_identity(
             if let ResponseTool::Namespace(namespace) = tool {
                 for member in &namespace.tools {
                     if let NamespaceTool::Function(ft) = member {
-                        if name == format!("{}.{}", namespace.name, ft.function.name) {
+                        if is_namespaced(name, &namespace.name, &ft.function.name) {
                             return (ft.function.name.clone(), Some(namespace.name.clone()));
                         }
                     }
@@ -1176,6 +1184,20 @@ mod tests {
             resolve_function_identity(request.tools.as_deref(), "weather.lookup"),
             ("weather.lookup".into(), None)
         );
+    }
+
+    #[test]
+    fn a_namespaced_name_is_read_at_the_dot() {
+        assert!(is_namespaced("weather.lookup", "weather", "lookup"));
+        for (name, namespace, member) in [
+            ("weatherx.lookup", "weather", "lookup"),
+            ("weather.lookups", "weather", "lookup"),
+            ("weather.lookup.now", "weather", "lookup"),
+            ("weather", "weather", ""),
+            ("lookup", "", "lookup"),
+        ] {
+            assert!(!is_namespaced(name, namespace, member), "{name}");
+        }
     }
 
     #[test]
