@@ -405,9 +405,11 @@ def test_real_slow_http_cannot_overrun_the_whole_probe_budget(tmp_path, phase, m
     assert rows[0]["readiness"]["error"] in ("TimeoutError", "URLError")
     assert not probe.ready(rows[0]["readiness"])
     # No further I/O once the shared caller budget is spent: the server saw at most
-    # one request. None when the budget was spent before the probe's first connect
-    # (a slow runner spends the 10 ms budget before the socket opens), one when the
-    # trickle was cut; never two. The count is not a clock.
+    # one connection (the handler counts connections, not requests). None when the
+    # budget was spent before the probe's first connect (a slow runner spends the
+    # 10 ms budget before the socket opens); one when the probe connected and gave
+    # up before sending or while the response trickled; never two. The count is
+    # not a clock.
     assert len(calls) <= 1
     assert "PRIVATE" not in json.dumps(rows)
 
