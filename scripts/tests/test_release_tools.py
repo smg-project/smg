@@ -3999,6 +3999,35 @@ def test_sync_versions_refuses_a_floor_it_cannot_pair_by_position(repo: Sandbox)
     ) in done.stderr, done.stderr
     text = repo.read("grpc_servicer/pyproject.toml")
     assert "0.5.0" not in text and text.count("smg-grpc-proto>=0.4.0") == 3, text
+    # the move by hand the message asks for: main carries the release's floors, the counts still
+    # differ (the release never takes main's new extra), nothing is pending, and the rerun passes
+    repo.put("grpc_servicer/pyproject.toml", text.replace("0.4.0", "0.5.0"))
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(servicer): the floors by hand")
+    again = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "ambiguous" not in again.stderr and "already follows" in again.stdout, again.stdout
+    # main dropping an extra is the same case the other way (one occurrence against two)
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml").replace(extra.replace("0.4.0", "0.5.0"), ""),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(servicer): the mlx extra dropped")
+    dropped = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert dropped.returncode == 0 and "ambiguous" not in dropped.stderr, dropped.stderr
 
 
 def test_sync_versions_usage_and_version_order() -> None:

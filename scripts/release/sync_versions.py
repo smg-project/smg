@@ -21,7 +21,8 @@ Usage:
                       above everything the branch will release: 1.15.0-dev once release/1.14 exists)
 
 Exit code 0 = the files follow the release (a report of what moved is printed), 1 = a rewrite
-did not take.
+did not take, or a floor could not be paired between the two files (named on stderr, with the
+counts, to move by hand; a rerun passes once main carries the release's floors).
 """
 
 from __future__ import annotations
@@ -186,12 +187,17 @@ def main(argv: list[str] | None = None) -> int:
         text = repo.read(component.version_file)
         mine = floors(text, names)
         # a name that occurs a different number of times in the two files cannot be paired by
-        # position (an extra added on one side since the cut may sit before an older one): the
-        # name is refused with its counts, for a move by hand, and the run reports the failure
+        # position (an extra added on one side since the cut may sit before an older one): while
+        # one of main's floors is below the release's highest, a move is pending under some
+        # pairing, so the name is refused with its counts, for a move by hand, and the run
+        # reports the failure; once main carries the release's floors there is nothing to pair
+        # and the name passes, so the recovery the message asks for clears the refusal
         ambiguous = {
             name
-            for name in mine.keys() | theirs.keys()
-            if len(mine.get(name, [])) != len(theirs.get(name, []))
+            for name in mine.keys() & theirs.keys()
+            if len(mine[name]) != len(theirs[name])
+            and min(version_key(floor) for _, floor, _ in mine[name])
+            < max(version_key(floor) for _, floor, _ in theirs[name])
         }
         for name in sorted(ambiguous):
             print(
