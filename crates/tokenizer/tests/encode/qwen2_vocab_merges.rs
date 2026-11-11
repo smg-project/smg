@@ -120,6 +120,27 @@ fn qwen2_loader_rejects_unrepresentable_added_token_ids() -> Result<()> {
 }
 
 #[test]
+fn qwen2_loader_refuses_an_entry_that_does_not_read() -> Result<()> {
+    let dir = TempDir::new()?;
+    write_qwen2_files(dir.path(), false, 9)?;
+    let config_path = dir.path().join("tokenizer_config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)?;
+    config["added_tokens_decoder"]["notanumber"] = json!({"content": "<x>", "special": true});
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+
+    let error = match create_tokenizer(dir.path().to_string_lossy().as_ref()) {
+        Ok(_) => panic!("an added token id that is not a number must fail the vocab.json path"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("key 'notanumber' is not a token id"),
+        "unexpected error: {message}"
+    );
+    Ok(())
+}
+
+#[test]
 fn mixed_non_qwen_directory_falls_back_to_tiktoken() -> Result<()> {
     let dir = TempDir::new()?;
     write_qwen2_files(dir.path(), false, 9)?;

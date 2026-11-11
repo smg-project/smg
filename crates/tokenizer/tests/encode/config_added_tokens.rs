@@ -239,6 +239,49 @@ fn an_entry_without_text_takes_no_id() {
 }
 
 #[test]
+fn an_entry_that_does_not_read_refuses_the_load() {
+    let well_formed = || config(&[(2, "<|im_start|>"), (3, "<|audio_start|>")]);
+
+    // A key that is not an id: the load is refused, the error names the
+    // file, the key and the rule.
+    let dir = TempDir::new().expect("a temp dir");
+    let mut config = well_formed();
+    config["added_tokens_decoder"]["notanumber"] = json!({"content": "<x>", "special": true});
+    let error = load(&dir, &tokenizer_json(&[], &FILE_TOKENS), config)
+        .err()
+        .expect("a key that is not an id refuses the load");
+    let message = error.to_string();
+    assert!(
+        message.contains("tokenizer_config.json"),
+        "the file: {message}"
+    );
+    assert!(message.contains("'notanumber'"), "the key: {message}");
+    assert!(
+        message.contains("the id of the token it describes"),
+        "the rule: {message}"
+    );
+
+    // The same configuration without that key: the well-placed neighbour
+    // loads on its id.
+    let dir = TempDir::new().expect("a temp dir");
+    let tokenizer = load(&dir, &tokenizer_json(&[], &FILE_TOKENS), well_formed())
+        .expect("the well-formed configuration loads");
+    assert_eq!(tokenizer.token_to_id("<|audio_start|>"), Some(3));
+
+    // An entry whose content is not text refuses the load too.
+    let dir = TempDir::new().expect("a temp dir");
+    let mut config = well_formed();
+    config["added_tokens_decoder"]["4"] = json!({"content": 4, "special": true});
+    let error = load(&dir, &tokenizer_json(&[], &FILE_TOKENS), config)
+        .err()
+        .expect("an entry that does not read refuses the load");
+    assert!(
+        error.to_string().contains("entry 4 does not read"),
+        "the entry: {error}"
+    );
+}
+
+#[test]
 fn a_configuration_without_the_block_changes_nothing() {
     let dir = TempDir::new().expect("a temp dir");
     let tokenizer = load(

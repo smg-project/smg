@@ -686,7 +686,10 @@ impl HuggingFaceTokenizer {
     /// The added tokens `tokenizer_config.json` declares (`added_tokens_decoder`:
     /// the id, the content and the matching flags of each), sorted by id. The
     /// file names a token's normalization or leaves it to the `transformers`
-    /// default (a special token raw, any other normalized).
+    /// default (a special token raw, any other normalized). A key that is not
+    /// an id, or an entry that does not read, refuses the load on both paths:
+    /// the file is wrong, the reference stack refuses it too, and a quiet
+    /// skip would load a vocabulary other than the one the files declare.
     fn config_added_tokens(
         config: &serde_json::Value,
         config_path: &Path,
@@ -699,14 +702,14 @@ impl HuggingFaceTokenizer {
             for (raw_id, raw_token) in decoder {
                 let id = raw_id.parse::<u32>().map_err(|error| {
                     Error::msg(format!(
-                        "Invalid added token ID '{raw_id}' in {}: {error}",
+                        "{}: added_tokens_decoder key '{raw_id}' is not a token id ({error}); every key of that block is the id of the token it describes",
                         config_path.display()
                     ))
                 })?;
                 let entry: AddedTokenConfig =
                     serde_json::from_value(raw_token.clone()).map_err(|error| {
                         Error::msg(format!(
-                            "Invalid added token {raw_id} in {}: {error}",
+                            "{}: added_tokens_decoder entry {raw_id} does not read ({error}); an entry holds the token's content and its flags",
                             config_path.display()
                         ))
                     })?;
@@ -936,7 +939,7 @@ impl HuggingFaceTokenizer {
         tokenizer.with_padding(None);
 
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
-        let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
+        let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy())?;
         // The class the configuration names decides the pipeline of a
         // Llama-class checkpoint (the rule is on `llama_class_pipeline`).
         Self::llama_class_pipeline(&mut tokenizer, tokenizer_path.parent(), &config_result);
@@ -1477,8 +1480,11 @@ impl HuggingFaceTokenizer {
 
     /// Load chat template, special token settings, and token strings from tokenizer_config.json.
     /// Reads the file once and extracts everything needed by the tokenizer constructor.
-    fn load_chat_template_and_config(tokenizer_path: &str) -> TokenizerConfigResult {
-        (|| {
+    /// Absent, or not JSON, the configuration is the default; an
+    /// `added_tokens_decoder` entry that does not read refuses the load (the
+    /// rule is on `config_added_tokens`).
+    fn load_chat_template_and_config(tokenizer_path: &str) -> Result<TokenizerConfigResult> {
+        (|| -> Option<Result<TokenizerConfigResult>> {
             let path = Path::new(tokenizer_path);
             let config_path = path.parent()?.join("tokenizer_config.json");
 
@@ -1509,15 +1515,12 @@ impl HuggingFaceTokenizer {
                 unk_token: ConfigToken::read(&config, "unk_token"),
                 pad_token: ConfigToken::read(&config, "pad_token"),
             };
-            // A block that does not read leaves the file's own added tokens
-            // standing, as before; the rest of the configuration is kept.
-            let added_tokens =
-                Self::config_added_tokens(&config, &config_path).unwrap_or_else(|error| {
-                    warn!(%error, "tokenizer_config.json's added_tokens_decoder was not read");
-                    Vec::new()
-                });
+            let added_tokens = match Self::config_added_tokens(&config, &config_path) {
+                Ok(added_tokens) => added_tokens,
+                Err(error) => return Some(Err(error)),
+            };
 
-            Some(TokenizerConfigResult {
+            Some(Ok(TokenizerConfigResult {
                 chat_template: templates.default,
                 tool_use_chat_template: templates.tool_use,
                 response_template,
@@ -1528,9 +1531,10 @@ impl HuggingFaceTokenizer {
                 add_prefix_space,
                 config_tokens,
                 added_tokens,
-            })
+            }))
         })()
-        .unwrap_or_default()
+        .transpose()
+        .map(Option::unwrap_or_default)
     }
 
     /// The Jinja renderer, with this tokenizer's special tokens unless the
