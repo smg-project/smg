@@ -377,6 +377,9 @@ impl EncoderInput {
                     // on the way; the tensor they hand out comes back here,
                     // so the next image's take on this thread is warm
                     // instead of a fresh allocation faulted in page by page.
+                    // On a thread that never takes (one that only writes
+                    // tensors made elsewhere) the pool keeps nothing, so the
+                    // give costs that thread no residency.
                     Self::F32(array) => scratch::give_f32(array.into_raw_vec_and_offset().0),
                     Self::SharedWire { .. } => {}
                 }
