@@ -689,22 +689,27 @@ def move_level(old: str, new: str) -> str:
     return "minor" if after[1] != before[1] else "patch"
 
 
+def manifest_at(repo: Repo, ref: str, component: Component) -> dict:
+    """The component's manifest at the ref, parsed; empty when it is not there or not TOML."""
+    text = next(
+        (text for path in with_legacy(component.version_file) if (text := repo.show(ref, path))),
+        None,
+    )
+    if text is None:
+        return {}
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return {}
+
+
 def published_requirements(
     repo: Repo, tag: str, component: Component, crates: Sequence[Component]
 ) -> dict[str, str]:
     """A crate's requirements on the workspace crates as its copy at the tag carries them, per
     crate name: the root's pin for a ``workspace = true`` entry, the entry's own version
     otherwise. Dev-dependencies are not published requirements."""
-    manifest = next(
-        (text for path in with_legacy(component.version_file) if (text := repo.show(tag, path))),
-        None,
-    )
-    if manifest is None:
-        return {}
-    try:
-        parsed = tomllib.loads(manifest)
-    except tomllib.TOMLDecodeError:
-        return {}
+    parsed = manifest_at(repo, tag, component)
     root = repo.show(tag, "Cargo.toml") or ""
     by_key = {c.dep_key or c.name: c.name for c in crates}
     requirements: dict[str, str] = {}
@@ -723,11 +728,29 @@ def published_requirements(
     return requirements
 
 
-def carries_in_public_api(repo: Repo, component: Component, dep: str) -> bool:
+def source_name(repo: Repo, dependent: Component, dep: Component) -> str:
+    """The name the dependent's sources use for the dependency: the key it declares the
+    dependency under when that key renames the package (its own ``package =``, or the
+    workspace entry's), else the dependency's library name (``[lib] name``, by default the
+    package name). Both manifests are read at HEAD, with the sources."""
+    key = dep.dep_key or dep.name
+    manifest = manifest_at(repo, "HEAD", dependent)
+    for section in ("dependencies", "build-dependencies"):
+        for own_key, spec in manifest.get(section, {}).items():
+            package = spec.get("package") if isinstance(spec, dict) else None
+            if package == dep.name or (package is None and own_key == key):
+                key = own_key
+    if key != dep.name:
+        return key.replace("-", "_")
+    lib = manifest_at(repo, "HEAD", dep).get("lib", {})
+    return lib.get("name") or dep.name.replace("-", "_")
+
+
+def carries_in_public_api(repo: Repo, component: Component, dep: Component) -> bool:
     """Whether the crate's sources at HEAD name the dependency in a public item (a ``pub use``
-    of it, or its path in a ``pub`` signature): a read of the text, the step then follows the
-    dependency's."""
-    ident = dep.replace("-", "_")
+    of it, or its path in a ``pub`` signature), under the name the sources use for it
+    (``source_name``): a read of the text, the step then follows the dependency's."""
+    ident = source_name(repo, component, dep)
     pattern = (
         rf"^[[:space:]]*pub[[:space:]]+(use[[:space:]]+{ident}(::|;|[[:space:]])"
         rf"|[^;]*[^A-Za-z0-9_]{ident}::)"
@@ -764,7 +787,7 @@ def dependency_moves(
                 new = plan.new_version(target) if target.unbumped else target.version
                 if caret_accepts(requirement, new):
                     continue
-                carried = carries_in_public_api(repo, verdict.component, dep)
+                carried = carries_in_public_api(repo, verdict.component, target.component)
                 verdict.unbumped = True
                 verdict.level = move_level(requirement, new) if carried else "patch"
                 verdict.dependency = f"{dep} ^{requirement} does not accept v{new}" + (

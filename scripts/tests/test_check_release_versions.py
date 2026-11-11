@@ -314,28 +314,39 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     a workspace dependency at the version the root pinned at the tag (a caret), and the cut moves
     that dependency past it. The plan moves such a crate at a patch step, or at the dependency's
     step when the crate's public API carries the dependency; a patch move of a dependency, and
-    a dev-dependency, move nothing."""
+    a dev-dependency, move nothing. The sources name a dependency by its library name (``kap``
+    for the package ``kappa`` here), or by the key of a rename (``kap_alias``)."""
     root = tmp_path / "deps"
     root.mkdir()
     git(root, "init", "-q", "-b", "main")
-    pins = {"kappa": "0.2.0", "lambda": "1.0.0", "omega": "0.3.0", "sigma": "0.1.0", "rho": "1.0.0"}
+    pins = {
+        "kappa": "0.2.0",
+        "lambda": "1.0.0",
+        "omega": "0.3.0",
+        "sigma": "0.1.0",
+        "rho": "1.0.0",
+        "tau": "0.1.0",
+    }
     put(root, "Cargo.toml", root_manifest(pins))
-    put(root, "crates/kappa/Cargo.toml", manifest("kappa", "0.2.0"))
+    put(root, "crates/kappa/Cargo.toml", manifest("kappa", "0.2.0") + '\n[lib]\nname = "kap"\n')
     put(root, "crates/kappa/src/lib.rs", "pub struct Thing;\n")
     put(root, "crates/lambda/Cargo.toml", manifest("lambda", "1.0.0"))
     put(root, "crates/lambda/src/lib.rs", "// lambda\n")
     deps = "\n[dependencies]\nkappa = { workspace = true }\n"
     put(root, "crates/omega/Cargo.toml", manifest("omega", "0.3.0") + deps)
-    put(root, "crates/omega/src/lib.rs", "fn uses(_thing: kappa::Thing) {}\n")
+    put(root, "crates/omega/src/lib.rs", "fn uses(_thing: kap::Thing) {}\n")
     put(root, "crates/sigma/Cargo.toml", manifest("sigma", "0.1.0") + deps)
-    put(root, "crates/sigma/src/lib.rs", "pub use kappa::Thing;\n")
+    put(root, "crates/sigma/src/lib.rs", "pub use kap::Thing;\n")
+    renamed = '\n[dependencies]\nkap_alias = { package = "kappa", path = "../kappa", version = "0.2.0" }\n'
+    put(root, "crates/tau/Cargo.toml", manifest("tau", "0.1.0") + renamed)
+    put(root, "crates/tau/src/lib.rs", "pub use kap_alias::Thing;\n")
     put(
         root,
         "crates/rho/Cargo.toml",
         manifest("rho", "1.0.0")
         + "\n[dependencies]\nlambda = { workspace = true }\n\n[dev-dependencies]\nkappa = { workspace = true }\n",
     )
-    put(root, "crates/rho/src/lib.rs", "pub use kappa::Thing;\n")
+    put(root, "crates/rho/src/lib.rs", "pub use kap::Thing;\n")
     put(root, "model_gateway/Cargo.toml", manifest("smg", "1.0.0"))
     put(root, "model_gateway/src/main.rs", "fn main() {}\n")
     git(root, "add", "-A")
@@ -363,10 +374,15 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         mod.crate("omega", "crates/omega", "omega"),
         mod.crate("sigma", "crates/sigma", "sigma"),
         mod.crate("rho", "crates/rho", "rho"),
+        mod.crate("tau", "crates/tau", "tau"),
     )
     repo = mod.Repo(root)
     assert mod.published_requirements(repo, "v1.0.0", crates[3], crates) == {"kappa": "0.2.0"}
     assert mod.published_requirements(repo, "v1.0.0", crates[5], crates) == {"lambda": "1.0.0"}
+    assert mod.published_requirements(repo, "v1.0.0", crates[6], crates) == {"kappa": "0.2.0"}
+    assert mod.source_name(repo, crates[4], crates[1]) == "kap"
+    assert mod.source_name(repo, crates[6], crates[1]) == "kap_alias"
+    assert mod.source_name(repo, crates[5], crates[2]) == "lambda"
 
     def check(mode="check"):
         stream = io.StringIO()
@@ -389,16 +405,21 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "  ! sigma (crates/sigma/) — unchanged, but its published requirement kappa ^0.2.0"
         " does not accept v0.3.0; its public API carries the dependency [minor]" in out
     )
+    assert (
+        "  ! tau (crates/tau/) — unchanged, but its published requirement kappa ^0.2.0"
+        " does not accept v0.3.0; its public API carries the dependency [minor]" in out
+    )
     assert "rho" not in out, (
         "lambda 1.0.1 sits inside ^1.0.0, and a dev-dependency is not published"
     )
-    assert "Summary: 4 crate(s) with changes, 2 unchanged" in out
-    assert "4 issue(s) found." in out
+    assert "Summary: 5 crate(s) with changes, 2 unchanged" in out
+    assert "5 issue(s) found." in out
 
     code, out = check("plan")
     assert code == 0
     assert "  patch omega v0.3.0 → v0.3.1 (crates/omega/Cargo.toml)" in out
     assert "  minor sigma v0.1.0 → v0.2.0 (crates/sigma/Cargo.toml)" in out
+    assert "  minor tau v0.1.0 → v0.2.0 (crates/tau/Cargo.toml)" in out
     assert "  minor kappa v0.2.0 → v0.3.0 (crates/kappa/Cargo.toml)" in out
 
     code, out = check("fix")
@@ -409,6 +430,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         ("lambda", "1.0.1"),
         ("omega", "0.3.1"),
         ("sigma", "0.2.0"),
+        ("tau", "0.2.0"),
     ):
         assert (
             mod.read_version("cargo", (root / f"crates/{name}/Cargo.toml").read_text(), "")
