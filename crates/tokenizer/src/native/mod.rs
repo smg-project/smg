@@ -172,29 +172,38 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// this divided by the number of threads that have encoded with the encoder
 /// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table starts
 /// at 64 slots (2 KiB) and grows as the thread meets pieces (by four up to
-/// 4,096 slots, by two above), up to the slots for its cap, and is made anew
-/// for a smaller cap when it is cleared, so a thread that encodes little holds
-/// little and the packed tables of one tokenizer stay under 352 MiB however
-/// many runtime and blocking threads encode with it (sixteen threads at the
-/// full bound hold 264 MiB; more threads share the total, each table rounded up
-/// to a power of two slots, at most eight thirds of the total in slots). The
-/// maps of the pieces of 16 to 64 bytes share the count at about 140 bytes a
-/// typical entry (430 at most, see `PIECE_CACHE_CAPACITY`), and a clear keeps
-/// the packed slots and the map's buckets (both made anew for a smaller share),
-/// so the count-bounded tiers of one tokenizer hold at most the sum of the two:
-/// about 820 MiB at sixteen threads with typical map entries (about 2.2 GiB,
-/// sixteen times the 140 MiB of a thread, were every map entry the worst case),
-/// toward 352 + 560 MiB with the rounding of more threads; the long pieces add
-/// `LONG_PIECE_BYTES_TOTAL` at most. A thread reads its share at the start of
-/// every encode call and keeps it for that call's misses (a call that was
-/// running when threads joined keeps its earlier share until it ends; the long
-/// tier reads the live share at every miss), so after threads join it is within
-/// the smaller share from its next call on, entries, packed slots and map
-/// buckets alike, and holds at most its earlier share until then, or until it
-/// exits if it never encodes again: right after a join the total is the earlier
-/// share times the threads that had it plus the new share times the rest, and
-/// settles as they encode. Before this bound the same ceilings were a sixteenth
-/// of these. All of it is freed with the encoder.
+/// 4,096 slots, by two above), up to the slots for its cap, and is cut back to
+/// the slots of a smaller cap when it is cleared (made anew only past its
+/// reservation), so a thread that encodes little holds little and the packed
+/// tables of one tokenizer stay under 352 MiB up to some 680 threads (sixteen
+/// threads at the full bound hold 264 MiB; more threads share the total, each
+/// table rounded up to a power of two slots, at most eight thirds of the total
+/// in slots) and under twice that however many more encode with it (a table cut
+/// back inside its reservation keeps the pages it touched, 528 KiB at most,
+/// while the later threads hold their share's slots: about 440 MiB in all at
+/// 1,024 threads). The maps of the pieces of 16 to 64 bytes share the count at
+/// about 140 bytes a typical entry (430 at most, see `PIECE_CACHE_CAPACITY`),
+/// and a clear keeps the packed slots and the map's buckets (the map made anew,
+/// the packed table cut back, for a smaller share), so the count-bounded tiers
+/// of one tokenizer hold at most the sum of the two: about 820 MiB at sixteen
+/// threads with typical map entries (about 2.2 GiB, sixteen times the 140 MiB
+/// of a thread, were every map entry the worst case), toward 352 + 560 MiB with
+/// the rounding of more threads (the packed part toward twice its 352 MiB past
+/// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
+/// most. A thread reads its share at the start of every encode call and keeps
+/// it for that call's misses (a call that was running when threads joined keeps
+/// its earlier share until it ends; the long tier reads the live share at every
+/// miss), so after threads join it is within the smaller share from its next
+/// call on, entries, packed slots and map buckets alike (the packed table's
+/// pages already touched inside its reservation stay resident,
+/// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
+/// thread: more than the share's slots only once those fall under the
+/// reservation, a share under 6,144 entries, some 680 threads on this total),
+/// and holds at most its earlier share until then, or until it exits if it
+/// never encodes again: right after a join the total is the earlier share times
+/// the threads that had it plus the new share times the rest, and settles as
+/// they encode. Before this bound the same ceilings were a sixteenth of these.
+/// All of it is freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
@@ -342,10 +351,13 @@ impl PieceCache {
 
     /// Forgets the tiers bounded by count. The packed table keeps its slots
     /// and the map its buckets, unless `share` fell below what they were
-    /// grown for: the table is made anew when it has more slots than the
-    /// share takes, the map when its capacity is above twice the share (a
-    /// map that grew under the share stays under that, so the check never
-    /// fires at a steady share and a clear at the bound keeps the buckets).
+    /// grown for: the table is cut back to the slots the share takes when it
+    /// has more (inside its reservation the room stays, with the pages the
+    /// thread already touched, `THREAD_BACKING_SLOTS` slots at most; a table
+    /// that had moved past the reservation is made anew), the map is made
+    /// anew when its capacity is above twice the share (a map that grew under
+    /// the share stays under that, so the check never fires at a steady share
+    /// and a clear at the bound keeps the buckets).
     fn clear_short(&mut self, share: usize) {
         self.packed.clear(share);
         if self.short.capacity() > 2 * share {
@@ -2485,8 +2497,10 @@ impl NativeEncoder {
     /// fell since it last read it (threads joined) clears its count-bounded
     /// tiers here, by their entries, by the slots of its packed table or by
     /// the capacity of its map (arrays grown for the earlier share keep
-    /// their size through a clear at the bound; here they are made anew for
-    /// the share), so every thread that still encodes is within the share
+    /// their size through a clear at the bound; here the map is made anew for
+    /// the share and the packed table is cut back to the share's slots inside
+    /// its reservation, see `ShortPieceTable::clear`), so every thread that
+    /// still encodes is within the share
     /// from its next call on (the share is read here once and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
