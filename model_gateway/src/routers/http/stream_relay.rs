@@ -284,13 +284,22 @@ mod tests {
         response::Response,
     };
     use bytes::Bytes;
-    use futures_util::{stream, Stream};
+    use futures_util::{stream, Stream, StreamExt};
     use http_body_util::BodyExt;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     use super::{relay_streaming_body, ChunkMode, ChunkStep, Relay};
     use crate::{
-        routers::{common::sse::SSE_CHANNEL_BUFFER, http::stream_failure::RelaySource},
-        worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
+        routers::{
+            common::{
+                sse::SSE_CHANNEL_BUFFER,
+                sse_rechunk::{RechunkPolicy, SseRechunker},
+            },
+            grpc::wire::Wire,
+            http::stream_failure::RelaySource,
+        },
+        worker::{test_support::RefusedAddress, BasicWorkerBuilder, Worker, WorkerLoadGuard},
     };
 
     /// The relay of `upstream` in `mode`: a successful SSE head from a worker
@@ -314,14 +323,12 @@ mod tests {
         )
     }
 
-    /// The frames the client gets when the upstream yields `chunks` through
-    /// the relay in `mode`.
-    async fn frames_through(chunks: Vec<&'static [u8]>, mode: ChunkMode) -> Vec<Bytes> {
-        let upstream = stream::iter(
-            chunks
-                .into_iter()
-                .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
-        );
+    /// The frames the client gets when `upstream` runs through the relay in
+    /// `mode`, read to the body's end.
+    async fn frames_from<S>(upstream: S, mode: ChunkMode) -> Vec<Bytes>
+    where
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    {
         let mut body = relay_of(upstream, mode).into_body();
         let mut frames = Vec::new();
         while let Some(frame) = body.frame().await {
@@ -330,6 +337,151 @@ mod tests {
             }
         }
         frames
+    }
+
+    /// The frames the client gets when the upstream yields `chunks` through
+    /// the relay in `mode`.
+    async fn frames_through(chunks: Vec<&'static [u8]>, mode: ChunkMode) -> Vec<Bytes> {
+        let upstream = stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
+        );
+        frames_from(upstream, mode).await
+    }
+
+    /// The one re-slicing policy in the tree.
+    fn re_slicing_policy() -> RechunkPolicy {
+        Wire::Minimax
+            .rechunk_policy()
+            .expect("the wire re-slices its streams")
+    }
+
+    /// A relay through the re-chunker of that policy.
+    fn re_sliced() -> ChunkMode {
+        ChunkMode::Rechunk(Box::new(SseRechunker::new(re_slicing_policy())))
+    }
+
+    /// One chat chunk frame carrying `text` as its content delta.
+    fn content_event(text: &str) -> Bytes {
+        Bytes::from(format!(
+            "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
+            serde_json::to_string(text).unwrap()
+        ))
+    }
+
+    /// Two content deltas the re-chunker holds: together under the emit
+    /// threshold, and at least the minimum tail an idle flush emits.
+    const HELD: [&str; 2] = ["abc", "def"];
+    /// The text of [`HELD`] once it reaches the client.
+    const HELD_TEXT: &str = "abcdef";
+
+    /// [`HELD`] as chat chunk frames, the policy's bounds checked once.
+    fn held_deltas() -> Vec<Bytes> {
+        let policy = re_slicing_policy();
+        let chars = HELD_TEXT.chars().count();
+        assert!(
+            policy.min_tail_chars <= chars && chars < policy.emit_threshold,
+            "the held text must reach the minimum tail and stay under the emit threshold"
+        );
+        HELD.iter().map(|text| content_event(text)).collect()
+    }
+
+    /// The content text of every chat chunk event in `frames`, each with the
+    /// index of the frame it came in.
+    fn content_of(frames: &[Bytes]) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            let text = String::from_utf8_lossy(frame);
+            for data in text
+                .split("\n\n")
+                .filter_map(|f| f.trim_start().strip_prefix("data: "))
+                .filter(|d| *d != "[DONE]")
+            {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(content) = value["choices"][0]["delta"]["content"].as_str() {
+                        out.push((index, content.to_string()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A transport error from a connect refused at an address nobody
+    /// listens at, as `reqwest` reports it.
+    async fn refused_call() -> reqwest::Error {
+        let refused = RefusedAddress::reserve();
+        crate::server::http_client_builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{}/v1/chat/completions", refused.addr()))
+            .send()
+            .await
+            .unwrap_err()
+    }
+
+    /// An upstream that closes its body without a closing frame still
+    /// delivers the text the re-chunker held under its emit threshold: the
+    /// relay writes the re-chunker's tail at the clean end.
+    #[tokio::test]
+    async fn a_clean_upstream_end_delivers_the_re_chunkers_held_text() {
+        let upstream = stream::iter(held_deltas().into_iter().map(Ok::<_, reqwest::Error>));
+        let frames = frames_from(upstream, re_sliced()).await;
+        let text: String = content_of(&frames).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(text, HELD_TEXT);
+    }
+
+    /// An upstream cut by a transport error delivers the held text before
+    /// the typed error event that ends the body.
+    #[tokio::test]
+    async fn a_cut_writes_the_held_text_before_the_error_event() {
+        let error = refused_call().await;
+        let upstream = stream::iter(held_deltas().into_iter().map(Ok))
+            .chain(stream::once(async move { Err(error) }));
+        let frames = frames_from(upstream, re_sliced()).await;
+        let content = content_of(&frames);
+        let text: String = content.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(text, HELD_TEXT);
+        let last = frames.len() - 1;
+        let event = String::from_utf8_lossy(&frames[last]);
+        assert!(
+            event.contains("error"),
+            "the body ends with the error event: {event}"
+        );
+        assert!(
+            content.iter().all(|(index, _)| *index < last),
+            "the held text goes out before the event"
+        );
+    }
+
+    /// The idle flush waits for the policy's silence since the last chunk,
+    /// not since the relay started: a second delta half a window in moves
+    /// the flush by half a window.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_flush_waits_for_silence_since_the_last_chunk() {
+        let idle_flush = re_slicing_policy().idle_flush;
+        let (tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(4);
+        let mut body = relay_of(ReceiverStream::new(rx), re_sliced()).into_body();
+        let started = tokio::time::Instant::now();
+        tx.send(Ok(content_event(HELD[0]))).await.unwrap();
+        tokio::time::sleep(idle_flush / 2).await;
+        tx.send(Ok(content_event(HELD[1]))).await.unwrap();
+        let frame = body
+            .frame()
+            .await
+            .expect("a frame")
+            .expect("a relayed frame")
+            .into_data()
+            .expect("data");
+        let text: String = content_of(&[frame]).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(text, HELD_TEXT);
+        assert_eq!(
+            started.elapsed(),
+            idle_flush / 2 + idle_flush,
+            "the flush runs one window after the last chunk"
+        );
+        drop(tx);
     }
 
     /// An empty upstream chunk becomes no frame at all, on the plain path and
@@ -380,7 +532,7 @@ mod tests {
     /// at most `SSE_CHANNEL_BUFFER` chunks for it, plus the one its parked
     /// `send` carries, and never the rest of the stream. One frame the client
     /// reads frees one slot.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_client_that_stops_reading_bounds_the_upstream_read_at_the_relays_buffer() {
         let pulled = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&pulled);
