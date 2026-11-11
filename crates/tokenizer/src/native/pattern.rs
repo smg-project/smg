@@ -3,8 +3,9 @@
 //! The patterns in use (GPT-2, Qwen, GLM, DeepSeek, MiniMax and their kin)
 //! draw on a small regex subset: alternation, concatenation, character
 //! classes built from Unicode categories, `\s`, ranges and literals, greedy
-//! `?` `*` `+` `{m,n}`, a case-insensitive group of literal alternatives for
-//! the English clitics, and the lookahead `(?!\S)`. This module parses that
+//! `?` `*` `+` `{m,n}` and the possessive `?+` `*+` `++` on a class, a
+//! case-insensitive group of literal alternatives (or a class of letters)
+//! for the English clitics, and the lookahead `(?!\S)`. This module parses that
 //! subset and matches it the way the engine behind `tokenizers`' `Split`
 //! does: leftmost-first alternation, greedy quantifiers that back off one
 //! repetition at a time. The engine also yields empty matches, and `Split`
@@ -174,6 +175,44 @@ const CAT_HAN: u16 = 1 << 11;
 const MULTI_CHARACTER_FOLDS: [[char; 2]; 5] =
     [['s', 's'], ['s', 't'], ['f', 'f'], ['f', 'i'], ['f', 'l']];
 
+/// Adds to `class` the ASCII letter `c` in both cases and the characters
+/// beyond ASCII the engine folds together with it under `(?i:...)`.
+fn fold_letter(class: &mut Class, c: char) {
+    let lower = c.to_ascii_lowercase();
+    let upper = c.to_ascii_uppercase();
+    class.ranges.push((u32::from(lower), u32::from(lower)));
+    class.ranges.push((u32::from(upper), u32::from(upper)));
+    if let Some((_, extra)) = unicode::FOLD_EXTRA
+        .iter()
+        .find(|(letter, _)| *letter == lower as u8)
+    {
+        for &e in *extra {
+            class.ranges.push((u32::from(e), u32::from(e)));
+        }
+    }
+}
+
+/// A bracket class under `(?i:...)`: accepted when every member is an ASCII
+/// letter, each folded the way a literal letter is (the engine folds a
+/// class's members too); a range, a property, a negation or a non-ASCII
+/// member would match differently and is declined.
+fn folded_letters(class: Class) -> Option<Class> {
+    if class.negated || class.categories != 0 || class.without != 0 {
+        return None;
+    }
+    let mut folded = Class::default();
+    for &(low, high) in &class.ranges {
+        if low != high {
+            return None;
+        }
+        let letter = char::from_u32(low).filter(char::is_ascii_alphabetic)?;
+        fold_letter(&mut folded, letter);
+    }
+    folded.ranges.sort_unstable();
+    folded.ranges.dedup();
+    Some(folded)
+}
+
 const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
     (CAT_LETTER, unicode::LETTER),
     (CAT_MARK, unicode::MARK),
@@ -282,11 +321,15 @@ impl Class {
 pub(super) enum Node {
     /// One character of the class.
     Class(usize),
-    /// Greedy repetition of one class character, `min..=max` times.
+    /// Greedy repetition of one class character, `min..=max` times. A
+    /// `possessive` run (`?+`, `*+`, `++`) never gives a character back once
+    /// taken: when what follows fails, the match backs off to a choice made
+    /// before the run, if there is one.
     ClassRepeat {
         class: usize,
         min: u32,
         max: u32,
+        possessive: bool,
     },
     /// Greedy repetition of a group, `min..=max` times; `first` is what the
     /// group's body can begin with ([`first_sets`] fills it).
@@ -392,8 +435,14 @@ enum Op {
     /// One character of the class.
     Char(usize),
     /// A greedy run of `min..=max` characters of the class; when what follows
-    /// fails it gives back one character at a time, down to `min`.
-    Run { class: usize, min: u32, max: u32 },
+    /// fails it gives back one character at a time, down to `min`, unless it
+    /// is `possessive`: such a run leaves no choice to come back to.
+    Run {
+        class: usize,
+        min: u32,
+        max: u32,
+        possessive: bool,
+    },
     /// Succeeds when the next character is not in the class.
     NotAhead(usize),
     /// A choice: the ops that follow are tried first; `next` is where to go
@@ -562,7 +611,12 @@ impl Pattern {
                     }
                     _ => true,
                 },
-                Op::Run { class, min, max } => {
+                Op::Run {
+                    class,
+                    min,
+                    max,
+                    possessive,
+                } => {
                     let class = &self.classes[class];
                     let mut count = 0u32;
                     let mut p = pos;
@@ -578,8 +632,10 @@ impl Pattern {
                     if count < min {
                         true
                     } else {
-                        choices[depth] = Choice { pc, pos: p, count };
-                        depth += 1;
+                        if !possessive {
+                            choices[depth] = Choice { pc, pos: p, count };
+                            depth += 1;
+                        }
                         pos = p;
                         pc += 1;
                         false
@@ -782,7 +838,12 @@ impl Scanner {
         };
         let (digit, digit_cap) = match digits {
             Node::Class(class) => (*class, 1),
-            Node::ClassRepeat { class, min: 1, max } => (*class, *max),
+            Node::ClassRepeat {
+                class,
+                min: 1,
+                max,
+                possessive: false,
+            } => (*class, *max),
             _ => return None,
         };
         let [punct_prefix, punct_run, punct_break] = concat(punct)? else {
@@ -1020,6 +1081,7 @@ pub(super) fn repeat(node: &Node, min: u32, max: u32) -> Option<usize> {
             class,
             min: node_min,
             max: node_max,
+            possessive: false,
         } if *node_min == min && *node_max == max => Some(*class),
         _ => None,
     }
@@ -1050,10 +1112,16 @@ pub(super) fn previous_boundary(text: &str, pos: usize) -> usize {
 fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
     match node {
         Node::Class(class) => program.push(Op::Char(*class)),
-        Node::ClassRepeat { class, min, max } => program.push(Op::Run {
+        Node::ClassRepeat {
+            class,
+            min,
+            max,
+            possessive,
+        } => program.push(Op::Run {
             class: *class,
             min: *min,
             max: *max,
+            possessive: *possessive,
         }),
         Node::Repeat {
             node,
@@ -1133,7 +1201,7 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
 fn choices(node: &Node) -> usize {
     match node {
         Node::Class(_) | Node::NotAhead(_) => 0,
-        Node::ClassRepeat { .. } => 1,
+        Node::ClassRepeat { possessive, .. } => usize::from(!*possessive),
         Node::Repeat { node, max, .. } => {
             if *max == 0 {
                 0
@@ -1300,6 +1368,14 @@ impl Parser<'_> {
         self.classes.len() - 1
     }
 
+    /// The ASCII letters a class holds, in lower case, once each.
+    fn ascii_letters(&self, class: usize) -> Vec<char> {
+        let class = &self.classes[class];
+        ('a'..='z')
+            .filter(|&letter| class.contains(letter) || class.contains(letter.to_ascii_uppercase()))
+            .collect()
+    }
+
     fn parse_alternation(&mut self) -> Option<Node> {
         let mut alternatives = vec![self.parse_concat()?];
         while self.chars.peek() == Some(&'|') {
@@ -1318,7 +1394,7 @@ impl Parser<'_> {
 
     fn parse_concat(&mut self) -> Option<Node> {
         let mut nodes = Vec::new();
-        let mut previous_letter = None;
+        let mut previous_letters: Vec<char> = Vec::new();
         while let Some(&c) = self.chars.peek() {
             if c == '|' || c == ')' {
                 break;
@@ -1327,17 +1403,21 @@ impl Parser<'_> {
             // Under `(?i:)` the engine also matches a run of letters against
             // the one character whose full case folding is that run (ß and ẞ
             // for "ss", ﬁ for "fi", ﬆ for "st", ...), which a matcher that
-            // folds letter by letter cannot do: such runs are declined.
-            let letter = (self.case_insensitive
-                && c.is_ascii_alphabetic()
-                && matches!(nodes.last(), Some(Node::Class(_))))
-            .then(|| c.to_ascii_lowercase());
-            if let (Some(first), Some(second)) = (previous_letter, letter) {
-                if MULTI_CHARACTER_FOLDS.contains(&[first, second]) {
-                    return None;
-                }
+            // folds letter by letter cannot do: such runs are declined, a
+            // letter class standing for each letter it holds.
+            let letters = match nodes.last() {
+                Some(Node::Class(class)) if self.case_insensitive => self.ascii_letters(*class),
+                _ => Vec::new(),
+            };
+            let folds_as_one = previous_letters.iter().any(|&first| {
+                letters
+                    .iter()
+                    .any(|&second| MULTI_CHARACTER_FOLDS.contains(&[first, second]))
+            });
+            if folds_as_one {
+                return None;
             }
-            previous_letter = letter;
+            previous_letters = letters;
         }
         Some(if nodes.len() == 1 {
             nodes.pop()?
@@ -1372,22 +1452,40 @@ impl Parser<'_> {
                 if min > max {
                     return None;
                 }
-                return self.quantified(atom, min, max);
+                return self.quantified(atom, min, max, true);
             }
             _ => return Some(atom),
         };
         self.chars.next();
-        self.quantified(atom, min, max)
+        self.quantified(atom, min, max, false)
     }
 
-    fn quantified(&mut self, atom: Node, min: u32, max: u32) -> Option<Node> {
-        // Lazy (`??`, `*?`) and possessive (`?+`, `*+`) forms are not supported.
-        if matches!(self.chars.peek(), Some('?' | '+')) {
-            return None;
-        }
+    fn quantified(&mut self, atom: Node, min: u32, max: u32, interval: bool) -> Option<Node> {
+        // The lazy forms (`??`, `*?`, `+?`) are not supported. The possessive
+        // ones (`?+`, `*+`, `++`) are, on a class: the run is taken whole and
+        // never gives a character back, as the engine takes it. After an
+        // interval the engine reads a `+` as a second quantifier (a repeat of
+        // the interval), not as the possessive mark: declined.
+        let possessive = match self.chars.peek() {
+            Some('?') => return None,
+            Some('+') if interval => return None,
+            Some('+') => {
+                self.chars.next();
+                true
+            }
+            _ => false,
+        };
         Some(match atom {
-            Node::Class(class) => Node::ClassRepeat { class, min, max },
+            Node::Class(class) => Node::ClassRepeat {
+                class,
+                min,
+                max,
+                possessive,
+            },
             Node::NotAhead(_) => return None,
+            // A possessive group would need the engine's rule for the choices
+            // inside it (an atomic group): declined.
+            _ if possessive => return None,
             // A group that repeats would need the engine's rule for an empty
             // iteration and an unbounded choice stack: only the optional form
             // is accepted, longer runs stay with `tokenizers`.
@@ -1417,17 +1515,24 @@ impl Parser<'_> {
     fn parse_atom(&mut self) -> Option<Node> {
         let c = self.chars.next()?;
         // Under `(?i:...)` only ASCII letters and plain ASCII literals are
-        // folded the way the engine folds them, letter by letter; a class, an
-        // escape or a non-ASCII literal there would match differently, so it
-        // is declined (so are lookaheads and the letter runs the engine folds
-        // as one character; see `parse_group` and `parse_concat`).
-        if self.case_insensitive && (c == '[' || c == '\\' || !c.is_ascii()) {
+        // folded the way the engine folds them, letter by letter, and a class
+        // whose members are ASCII letters the same way (`folded_letters`); an
+        // escape, a non-ASCII literal or any other class there would match
+        // differently, so it is declined (so are lookaheads and the letter
+        // runs the engine folds as one character; see `parse_group` and
+        // `parse_concat`).
+        if self.case_insensitive && (c == '\\' || !c.is_ascii()) {
             return None;
         }
         match c {
             '(' => self.parse_group(),
             '[' => {
                 let class = self.parse_class_body()?;
+                let class = if self.case_insensitive {
+                    folded_letters(class)?
+                } else {
+                    class
+                };
                 Some(Node::Class(self.add_class(class)))
             }
             '\\' => {
@@ -1484,18 +1589,7 @@ impl Parser<'_> {
     fn literal_class(&mut self, c: char) -> usize {
         let mut class = Class::default();
         if self.case_insensitive && c.is_ascii_alphabetic() {
-            let lower = c.to_ascii_lowercase();
-            let upper = c.to_ascii_uppercase();
-            class.ranges.push((u32::from(lower), u32::from(lower)));
-            class.ranges.push((u32::from(upper), u32::from(upper)));
-            if let Some((_, extra)) = unicode::FOLD_EXTRA
-                .iter()
-                .find(|(letter, _)| *letter == lower as u8)
-            {
-                for &e in *extra {
-                    class.ranges.push((u32::from(e), u32::from(e)));
-                }
-            }
+            fold_letter(&mut class, c);
             class.ranges.sort_unstable();
         } else {
             class.ranges.push((u32::from(c), u32::from(c)));
@@ -1699,7 +1793,13 @@ mod tests {
     /// without the ideographs, the rest as cl100k's.
     const KIMI: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 13] = [
+    /// The clitic group as a letter class with the apostrophe outside it,
+    /// and possessive runs; the same with greedy runs, a digit cap and a
+    /// one-space last alternative.
+    const POSSESSIVE_CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
+    const CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s";
+
+    const PATTERNS: [&str; 15] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -1713,6 +1813,8 @@ mod tests {
         TEKKEN,
         CASED_ONE_DIGIT,
         KIMI,
+        POSSESSIVE_CLITIC_CLASS,
+        CLITIC_CLASS,
     ];
 
     /// Characters that exercise every class the patterns use: ASCII of all
@@ -1926,7 +2028,10 @@ mod tests {
             r"a$",
             r"(a)",
             r"a*?",
-            r"a++",
+            r"a+?",
+            r"(?:ab)?+",
+            r"(?:a|b)++",
+            r"a{1,3}+",
             r"[[:alpha:]]",
             r"[a&&b]",
             r"[\p{L}&&\p{Han}]",
@@ -1944,7 +2049,7 @@ mod tests {
             r"(?:ab)+",
             r"(?: ?\p{L})*",
             r"(?:ab){2}",
-            r"(?i:[sdmt]|ll|ve|re)",
+            r"(?i:[a-z]|ll)",
             r"(?i:\p{Ll})",
             r"(?i:é)",
             r"\p{N}*",
@@ -2404,6 +2509,105 @@ mod tests {
     }
 
     #[test]
+    fn possessive_runs_never_give_back() {
+        // `a++a` cannot match "aaa": the run takes every a and gives none
+        // back, so the alternative fails where the greedy `a+a` matches.
+        assert_eq!(oracle_matches(r"a++a", "aaa"), Vec::<(usize, usize)>::new());
+        assert_eq!(oracle_matches(r"a+a", "aaa"), vec![(0, 3)]);
+        for (pattern, text) in [
+            (r"a++a|a", "aaa b"),
+            (r"a*+a|a", "aaa"),
+            (r"a?+a|x", "aa x a"),
+            (r"[^x]?+x|x", "ax xx x"),
+            (r"\p{L}++\p{N}|\p{L}", "ab1 ab a"),
+            (r" ?[^\s\p{L}\p{N}]++[\r\n]*|\s", " !!\n ?\r\n x"),
+            (
+                POSSESSIVE_CLITIC_CLASS,
+                "it's 'S don't 'LL x'veY  a1 2,3 \n\n  x \r\n 'ſ",
+            ),
+            (
+                CLITIC_CLASS,
+                "it's 'S don't 'LL x'veY  a1234 2,3 \n\n  x \r\n 'ſ",
+            ),
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert_eq!(
+                parsed.find_iter(text).collect::<Vec<_>>(),
+                oracle_matches(pattern, text),
+                "pattern {pattern:?} text {text:?}"
+            );
+        }
+        // A possessive run holds no choice: the stack a pattern needs is
+        // counted without it.
+        let mut parser = Parser {
+            chars: "a++b+".chars().peekable(),
+            classes: Vec::new(),
+            case_insensitive: false,
+        };
+        let root = parser.parse_alternation().expect("parses");
+        assert_eq!(choices(&root), 1);
+        // The engine's possessive mark on a group, and a `+` after an
+        // interval (a second quantifier to the engine), stay outside the
+        // subset.
+        for pattern in [
+            r"(?:ab)++",
+            r"(?:a|b)?+",
+            r"(?:'s)*+",
+            r"a{2}+",
+            r"a{1,3}+",
+            r"a{2,}+",
+        ] {
+            assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn case_insensitive_letter_classes_fold_each_letter() {
+        // The engine folds a class's members like literals: `[sdmt]` under
+        // `(?i:)` takes S, D, M, T and the long s, and nothing of ß.
+        for pattern in [
+            r"'(?i:[sdmt]|ll|ve|re)",
+            r"(?i:[sdmt])",
+            r"(?i:[kK]|x)",
+            r"(?i:[tT]|a[sd])",
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            for text in ["'S 'd 'LL 'ſ 'ß 'K '\u{212A}", "x K \u{212A} k t as AD aß"] {
+                assert_eq!(
+                    parsed.find_iter(text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, text),
+                    "pattern {pattern:?} text {text:?}"
+                );
+            }
+            let mut state = 0x5EED_0000_1234_5678u64;
+            for round in 0..500 {
+                let text = random_text(&mut state, 1 + round % 24);
+                assert_eq!(
+                    parsed.find_iter(&text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, &text),
+                    "pattern {pattern:?} text {text:?}"
+                );
+            }
+        }
+        // A class with anything but ASCII letters stays declined, and so does
+        // a letter class beside a literal letter the engine folds with one of
+        // its letters as one character.
+        for pattern in [
+            r"(?i:[a-z])",
+            r"(?i:[s\p{L}])",
+            r"(?i:[^s])",
+            r"(?i:[sé])",
+            r"(?i:[s1])",
+            r"(?i:[s\s])",
+            r"(?i:[st]s)",
+            r"(?i:f[fil])",
+            r"(?i:[sx][st])",
+        ] {
+            assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    #[test]
     fn case_insensitive_groups_decline_classes_and_non_ascii_literals() {
         // Under `(?i:)` the engine folds classes, properties and non-ASCII
         // literals as well; this matcher folds ASCII letters only, so a
@@ -2416,7 +2620,7 @@ mod tests {
         assert_eq!(oracle_matches(r"(?i:é)", "É"), vec![(0, 2)]);
         for (pattern, text) in [
             (r"(?i:[a-z]+)", "ABC \u{17F} \u{212A}"),
-            (r"(?i:[sdmt]|ll|ve|re)", "'S 'LL"),
+            (r"(?i:[s\p{Ll}]|ll)", "'S 'LL"),
             (r"(?i:\p{Ll})", "A"),
             (r"(?i:é)", "É"),
             (r"(?i:'[a-z])", "'S"),
