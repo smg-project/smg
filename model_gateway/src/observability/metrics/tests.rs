@@ -4,6 +4,20 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
 use super::{test_support::render_with_recorder, *};
+use crate::worker::{BasicWorkerBuilder, Worker};
+
+/// A removed worker nothing holds any more: a dead witness for `retire`.
+fn gone(url: &str) -> Weak<dyn Worker> {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    Arc::downgrade(&worker)
+}
+
+/// A removed worker a handle still holds: the worker and its witness.
+fn held(url: &str) -> (Arc<dyn Worker>, Weak<dyn Worker>) {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    let witness = Arc::downgrade(&worker);
+    (worker, witness)
+}
 
 #[test]
 fn tokenizer_activity_registers_both_layers_on_scrape() {
@@ -114,7 +128,7 @@ fn prefill_worker_removal_releases_its_admission_series() {
     metrics::with_local_recorder(&recorder, || {
         Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 7);
         Metrics::set_pd_prefill_admission_inflight("http://kept-prefill", 3);
-        workers.retire("http://removed-prefill");
+        workers.retire("http://removed-prefill", gone("http://removed-prefill"));
         // A release racing the removal must not bring the series back.
         Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 6);
     });
@@ -1334,7 +1348,7 @@ fn kept_worker_counters_follow_the_workers_registrations() {
         Metrics::record_worker_request("http://w2", "m");
         assert_eq!(counts(), [Some("2".to_owned()), Some("1".to_owned())]);
 
-        workers.retire("http://w1");
+        workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
         // A send racing the removal: its write is dropped, not kept.
         Metrics::record_worker_request("http://w1", "m");
@@ -1400,7 +1414,7 @@ fn kept_worker_gauges_set_the_recorders_series() {
             Some("4")
         );
 
-        workers.retire("http://w1");
+        workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
         Metrics::set_worker_requests_active("http://w1", 9);
         assert_eq!(value("smg_worker_requests_active", "http://w1"), None);
@@ -1416,6 +1430,76 @@ fn kept_worker_gauges_set_the_recorders_series() {
     handles::reset();
 }
 
+/// The upkeep forgets a retired address once nothing holds the removed
+/// worker: the set is bounded by the removed workers still referenced, not
+/// by the process's history of removals.
+#[test]
+fn upkeep_forgets_the_retired_addresses_whose_workers_are_gone() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    for n in 0..3 {
+        let url = format!("http://gone-{n}");
+        workers.retire(&url, gone(&url));
+    }
+    let (held_worker, witness) = held("http://held");
+    workers.retire("http://held", witness);
+    assert_eq!(workers.retired_len(), 4);
+    workers.run_upkeep();
+    assert_eq!(workers.retired_len(), 1, "the held worker's address stays");
+    drop(held_worker);
+    workers.run_upkeep();
+    assert_eq!(workers.retired_len(), 0);
+}
+
+/// A removed worker a handle still holds keeps its address retired through
+/// the upkeep, so its late write lands nowhere; the address is forgotten
+/// once the handle is gone.
+#[test]
+fn a_held_removed_worker_keeps_its_address_retired_through_upkeep() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    let listed = || {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered.lines().any(|line| {
+            line.starts_with("smg_worker_requests_total{") && line.contains("worker=\"http://w1\"")
+        })
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_worker_request("http://w1", "m");
+        assert!(listed());
+        let (worker, witness) = held("http://w1");
+        workers.retire("http://w1", witness);
+        handles::worker_set_changed();
+        workers.run_upkeep();
+        // A write from a handle that still holds the removed worker lands nowhere.
+        Metrics::record_worker_request("http://w1", "m");
+        assert!(!listed());
+        assert_eq!(workers.retired_len(), 1);
+        drop(worker);
+        workers.run_upkeep();
+        assert_eq!(workers.retired_len(), 0);
+    });
+    handles::reset();
+}
+
 /// The registry's registration and removal hooks are what move the
 /// worker-set generation the kept counters are checked against.
 #[test]
@@ -1423,7 +1507,7 @@ fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
     let mut kept = handles::WorkerRequests::default();
     kept.for_worker("http://w")
         .insert(Arc::from("m"), metrics::Counter::noop());
-    Metrics::remove_worker_metrics("http://gone");
+    Metrics::remove_worker_metrics("http://gone", gone("http://gone"));
     assert!(kept.for_worker("http://w").is_empty(), "a removal");
     kept.for_worker("http://w")
         .insert(Arc::from("m"), metrics::Counter::noop());
@@ -1699,7 +1783,7 @@ fn kept_worker_outcome_counters_follow_the_workers_registrations() {
         assert_eq!(value("http://w1", "success").as_deref(), Some("2"));
         assert_eq!(value("http://w1", "failure").as_deref(), Some("1"));
 
-        workers.retire("http://w1");
+        workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
         Metrics::record_worker_cb_outcome("http://w1", "success");
         assert_eq!(value("http://w1", "success"), None);

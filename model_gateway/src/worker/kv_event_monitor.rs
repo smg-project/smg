@@ -331,7 +331,6 @@ impl KvEventMonitor {
         let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         let load_sink = self.load_sink.get().cloned();
         let loop_model_id = model_id.clone();
-        let task_url = url.clone();
         let task_model_id = model_id.clone();
         let slots = Arc::clone(&self.worker_handles);
         let indexers = Arc::clone(&self.indexers);
@@ -343,6 +342,13 @@ impl KvEventMonitor {
                       handle is stored and graceful shutdown is sent on removal"
         )]
         let handle = tokio::spawn(async move {
+            // The task writes for the worker after the loop has returned it
+            // (the panic counter, the gauge `complete_removal` lowers). It
+            // keeps a handle on the worker through those writes: the series
+            // store forgets a removed address once no handle on its workers
+            // is left, and a write for the address by name alone after that
+            // would recreate its series.
+            let writer = Arc::clone(&worker);
             // Catch panics here so they surface when they happen — a bare
             // JoinError would only be observed at worker removal, leaving the
             // index silently frozen for this worker until then.
@@ -365,24 +371,26 @@ impl KvEventMonitor {
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "(non-string panic)".into());
                 error!(
-                    worker_url = %Endpoint::redacted_str(&task_url),
+                    worker_url = %Endpoint::redacted_str(writer.url()),
                     panic.message = %msg,
                     ?kind,
                     "KV event subscription task panicked; this worker's stream \
                      no longer feeds routing"
                 );
-                Metrics::record_kv_event_subscription_failure(&task_url, "panic");
+                Metrics::record_kv_event_subscription_failure(writer.url(), "panic");
             }
             Self::complete_removal(
                 &slots,
                 &indexers,
                 &model_block_sizes,
-                &task_url,
+                &writer,
                 id,
                 &task_model_id,
                 kind,
             )
             .await;
+            // The task's last write is made: the worker may go.
+            drop(writer);
             // Closes `done` last: an add waiting on it finds the slot free.
             drop(done_tx);
         });
@@ -408,16 +416,19 @@ impl KvEventMonitor {
     /// The task does this rather than `on_worker_removed`,
     /// whose future a caller may drop before the task has ended; a slot that
     /// is `Active` (the task ended on its own, or `stop` took the
-    /// subscription) is left as it is.
+    /// subscription) is left as it is. `worker` is the removed worker itself,
+    /// which the task holds through the write made here (see the task in
+    /// [`Self::on_worker_added`]).
     async fn complete_removal(
         slots: &Mutex<HashMap<String, Slot>>,
         indexers: &DashMap<String, Arc<KvIndex>>,
         block_sizes: &DashMap<String, KvBlockSize>,
-        worker_url: &str,
+        worker: &Arc<dyn Worker>,
         id: u64,
         model_id: &str,
         kind: SubscriptionKind,
     ) {
+        let worker_url = worker.url();
         let mut handles = slots.lock().await;
         if !matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
             return;
@@ -453,7 +464,10 @@ impl KvEventMonitor {
     /// Sends a graceful shutdown signal. The subscription task takes the
     /// worker's blocks out of the index from its own per-worker map; that
     /// CPU-bound cleanup runs on the bounded blocking pool rather than a Tokio
-    /// runtime worker.
+    /// runtime worker. A write made here once the task is gone (the join
+    /// error, the gauge of a task that ended before the removal) is made
+    /// under the caller's handle on the removed worker, which the removal
+    /// step holds through this call.
     pub async fn on_worker_removed(&self, worker_url: &str) {
         let subscription = {
             let mut handles = self.worker_handles.lock().await;
@@ -686,11 +700,17 @@ mod tests {
         panic!("timed out waiting until {what}");
     }
 
-    /// A gRPC worker at a port that refuses connections at once: its task
-    /// loops on reconnects and answers shutdown, with no engine involved.
+    /// The late-write test's worker address: a closed port, so its task loops
+    /// on reconnects and answers shutdown with no engine involved, and one no
+    /// other test of this binary registers. The series store is the
+    /// process's, and a registration of the same address by a test on another
+    /// thread would clear its retirement under this test's assertions.
+    const REFUSING_URL: &str = "grpc://127.0.0.1:2";
+
+    /// A gRPC worker at [`REFUSING_URL`].
     fn refusing_grpc_worker() -> Arc<dyn Worker> {
         Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+            BasicWorkerBuilder::new(REFUSING_URL)
                 .worker_type(WorkerType::Regular)
                 .connection_mode(ConnectionMode::Grpc)
                 .runtime_type(RuntimeType::TokenSpeed)
@@ -700,6 +720,101 @@ mod tests {
                 })
                 .build(),
         )
+    }
+
+    /// The subscription task writes for its worker after the loop has
+    /// returned it (the gauge `complete_removal` lowers), and it keeps a
+    /// handle on the worker through that write: the series store forgets a
+    /// removed address once no handle on its workers is left, so a late write
+    /// by name alone would recreate the address's series for good.
+    #[test]
+    fn a_removals_late_write_recreates_no_series_for_the_address() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::observability::worker_metrics::{self, WorkerSeriesRecorder};
+
+        let series = worker_metrics::installed_or_default();
+        let recorder = WorkerSeriesRecorder::new(
+            PrometheusBuilder::new().build_recorder(),
+            Arc::clone(series),
+        );
+        let listed = || {
+            let mut rendered = String::new();
+            series.render_into(&mut rendered);
+            rendered
+                .lines()
+                .any(|line| line.contains(&format!("worker=\"{REFUSING_URL}\"")))
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The spawned task runs on this thread, under the local recorder.
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let monitor = KvEventMonitor::new();
+                let worker = refusing_grpc_worker();
+                let url = worker.url().to_string();
+                let witness = Arc::downgrade(&worker);
+                monitor
+                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .await;
+                // The task starts at this thread's first yield. From then on it
+                // holds the worker twice, in its loop and in the handle it keeps
+                // for the removal writes: three strong counts with this test's.
+                wait_until("the task holds the worker", || witness.strong_count() >= 3).await;
+                assert!(listed(), "the subscription publishes the worker's series");
+
+                // The registry's removal retires the address with the worker's
+                // witness; from here the task alone holds the worker.
+                Metrics::remove_worker_metrics(&url, Arc::downgrade(&worker));
+                drop(worker);
+                // The removal up to its shutdown signal, as `on_worker_removed`
+                // does it, under a slot lock this test keeps: the task's
+                // cleanup waits at that lock once its loop has returned.
+                let mut handles = monitor.worker_handles.lock().await;
+                let Some(Slot::Active(sub)) = handles.remove(&url) else {
+                    panic!("an active subscription");
+                };
+                let mut done = sub.done.clone();
+                handles.insert(
+                    url.clone(),
+                    Slot::Removing(Reservation {
+                        id: sub.id,
+                        done: sub.done.clone(),
+                    }),
+                );
+                let _ = sub.shutdown_tx.send(());
+                wait_until("the loop has returned its worker", || {
+                    witness.strong_count() <= 1
+                })
+                .await;
+                assert_eq!(
+                    witness.strong_count(),
+                    1,
+                    "the task holds the worker through its removal writes"
+                );
+                series.run_upkeep();
+                assert!(
+                    series.is_retired(&url),
+                    "the address stays retired while the task can still write"
+                );
+
+                drop(handles);
+                let _ = done.changed().await;
+                assert_eq!(
+                    witness.strong_count(),
+                    0,
+                    "the task is gone with its handle"
+                );
+                series.run_upkeep();
+                assert!(
+                    !series.is_retired(&url),
+                    "the address is forgotten once the task is gone"
+                );
+                assert!(!listed(), "the removal's late write recreated no series");
+            });
+        });
     }
 
     /// A worker removed and added again under the same URL while the old
