@@ -1091,6 +1091,49 @@ enum WidthPass {
     Avx512(GroupTaps),
 }
 
+/// The vector width kernels' per-row scratch (the AVX2 arm's spread rows,
+/// the AVX-512 arm's row tails and 32-bit sums), owned by the pass's caller:
+/// a band loop sizes it once and every band reuses it, where a buffer per
+/// band was a zeroed allocation per band (and, past the sizes the allocator
+/// keeps cached pages for, one faulted in page by page: about 280 of them per
+/// 8k-class image). The kernels write only the bytes their rows cover and
+/// read zeros past them, so a buffer of the size a pass asked for keeps its
+/// zeros across the pass's bands; a size change zeroes it again.
+#[derive(Default)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    expect(dead_code, reason = "the portable width kernel keeps no scratch")
+)]
+struct BandScratch {
+    bytes: Vec<u8>,
+    sums: Vec<i32>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BandScratch {
+    /// `len` bytes, zeroed when the length is new to this scratch.
+    fn bytes(&mut self, len: usize) -> &mut [u8] {
+        Self::sized(&mut self.bytes, len)
+    }
+
+    /// `bytes` bytes and `sums` 32-bit lanes, each zeroed when its length is
+    /// new to this scratch.
+    fn parts(&mut self, bytes: usize, sums: usize) -> (&mut [u8], &mut [i32]) {
+        (
+            Self::sized(&mut self.bytes, bytes),
+            Self::sized(&mut self.sums, sums),
+        )
+    }
+
+    fn sized<T: Clone + Default>(buf: &mut Vec<T>, len: usize) -> &mut [T] {
+        if buf.len() != len {
+            buf.clear();
+            buf.resize(len, T::default());
+        }
+        buf
+    }
+}
+
 impl WidthPass {
     #[cfg(target_arch = "x86_64")]
     fn new<const C: usize>(kernel: &FixedKernel) -> Self {
@@ -1113,13 +1156,18 @@ impl WidthPass {
 
     /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass;
     /// a vector arm detects its features and calls in one place, as the
-    /// crate's NEON kernels and the FMA pass keep them.
+    /// crate's NEON kernels and the FMA pass keep them, and works in the
+    /// caller's `scratch` (one per band loop, reused band after band).
     #[cfg_attr(
         target_arch = "x86_64",
         expect(
             unsafe_code,
             reason = "the target-feature function runs only after this function detected its features"
         )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
     )]
     fn rows<const C: usize>(
         &self,
@@ -1129,6 +1177,14 @@ impl WidthPass {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        #[cfg_attr(
+            not(target_arch = "x86_64"),
+            expect(
+                unused_variables,
+                reason = "the portable width kernel keeps no scratch"
+            )
+        )]
+        scratch: &mut BandScratch,
     ) {
         match self {
             Self::Portable => pil_h_band::<C>(src, kernel, in_w, out_w, y0, band),
@@ -1140,7 +1196,7 @@ impl WidthPass {
                 // SAFETY: `is_x86_feature_detected!("avx2")` answered true just
                 // above, the only requirement of a `target_feature(enable =
                 // "avx2")` function.
-                unsafe { avx2::h_band::<C>(src, kernel, split, in_w, out_w, y0, band) }
+                unsafe { avx2::h_band::<C>(src, kernel, split, in_w, out_w, y0, band, scratch) }
             }
             #[cfg(target_arch = "x86_64")]
             Self::Avx512(groups) => {
@@ -1150,7 +1206,7 @@ impl WidthPass {
                 // SAFETY: `avx512::detected()` answered true just above: the
                 // processor reports every feature the `target_feature`
                 // function enables, its only requirement.
-                unsafe { avx512::h_band::<C>(src, kernel, groups, in_w, out_w, y0, band) }
+                unsafe { avx512::h_band::<C>(src, kernel, groups, in_w, out_w, y0, band, scratch) }
             }
         }
     }
@@ -1504,7 +1560,7 @@ mod avx2 {
         _mm_cvtsi32_si128, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
     };
 
-    use super::{FixedKernel, SplitTaps, SPLIT_LOW_BITS};
+    use super::{BandScratch, FixedKernel, SplitTaps, SPLIT_LOW_BITS};
 
     /// Pixels a scratch row carries past the source row: a window padded to
     /// a multiple of four taps reads at most three pixels past its last tap.
@@ -1520,6 +1576,10 @@ mod avx2 {
     /// lane, the high and the low halves of the taps into accumulators of
     /// their own. A band's odd last row runs alone in both halves.
     #[target_feature(enable = "avx2")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
+    )]
     pub(super) fn h_band<const C: usize>(
         src: &[u8],
         kernel: &FixedKernel,
@@ -1528,11 +1588,12 @@ mod avx2 {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        scratch: &mut BandScratch,
     ) {
         let row_in = in_w * C;
         let row_out = out_w * C;
         let scratch_len = (in_w + PADDING_PIXELS) * 4;
-        let mut scratch = vec![0_u8; 2 * scratch_len];
+        let scratch = scratch.bytes(2 * scratch_len);
         let (first, second) = scratch.split_at_mut(scratch_len);
         let mut pairs = band.chunks_exact_mut(2 * row_out);
         let mut y = y0;
@@ -1830,7 +1891,7 @@ mod avx512 {
         _mm512_unpacklo_epi16, _mm512_unpacklo_epi8, _mm_cvtsi32_si128,
     };
 
-    use super::{ChunkTaps, FixedKernel, GroupTaps, CHUNK_BITS};
+    use super::{BandScratch, ChunkTaps, FixedKernel, GroupTaps, CHUNK_BITS};
 
     /// The processor reports every feature the arms enable.
     pub(super) fn detected() -> bool {
@@ -1849,6 +1910,10 @@ mod avx512 {
     /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass,
     /// [`ROWS`] rows at a time by [`h_rows`] and the last rows one by one.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
+    )]
     pub(super) fn h_band<const C: usize>(
         src: &[u8],
         kernel: &FixedKernel,
@@ -1857,24 +1922,25 @@ mod avx512 {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        scratch: &mut BandScratch,
     ) {
         let row_in = in_w * C;
         let row_out = out_w * C;
         let tail_len = groups.tail.min(row_in);
-        let mut tails = vec![0_u8; ROWS * (tail_len + GroupTaps::WINDOW)];
         // A group's sixteen lanes land whole; the last group's lanes past the
         // row and the narrowing's last loads stay inside a row's scratch.
-        let mut sums = vec![0_i32; ROWS * (row_out.next_multiple_of(64) + 16)];
+        let (tails, sums) = scratch.parts(
+            ROWS * (tail_len + GroupTaps::WINDOW),
+            ROWS * (row_out.next_multiple_of(64) + 16),
+        );
         let mut blocks = band.chunks_exact_mut(ROWS * row_out);
         let mut y = y0;
         for block in blocks.by_ref() {
-            h_rows::<C, ROWS>(src, kernel, groups, row_in, y, block, &mut tails, &mut sums);
+            h_rows::<C, ROWS>(src, kernel, groups, row_in, y, block, tails, sums);
             y += ROWS;
         }
         for out_row in blocks.into_remainder().chunks_exact_mut(row_out) {
-            h_rows::<C, 1>(
-                src, kernel, groups, row_in, y, out_row, &mut tails, &mut sums,
-            );
+            h_rows::<C, 1>(src, kernel, groups, row_in, y, out_row, tails, sums);
             y += 1;
         }
     }
@@ -2195,7 +2261,15 @@ fn pil_resample_horizontal<const C: usize>(
     let pass = &WidthPass::new::<C>(kernel);
     let tasks = par_threads(out.len(), rows);
     if tasks <= 1 {
-        pass.rows::<C>(src, kernel, in_w, out_w, 0, &mut out);
+        pass.rows::<C>(
+            src,
+            kernel,
+            in_w,
+            out_w,
+            0,
+            &mut out,
+            &mut BandScratch::default(),
+        );
         return out;
     }
     let band_rows = rows.div_ceil(tasks);
@@ -2207,7 +2281,17 @@ fn pil_resample_horizontal<const C: usize>(
             let (band, tail) = rest.split_at_mut(n * row_out);
             rest = tail;
             let start = y0;
-            scope.spawn(move |_| pass.rows::<C>(src, kernel, in_w, out_w, start, band));
+            scope.spawn(move |_| {
+                pass.rows::<C>(
+                    src,
+                    kernel,
+                    in_w,
+                    out_w,
+                    start,
+                    band,
+                    &mut BandScratch::default(),
+                );
+            });
             y0 += n;
         }
     });
@@ -2283,6 +2367,7 @@ impl<const C: usize> BandedPasses<'_, C> {
         let row_len = self.out_w * C;
         // The width-pass rows `mid` holds: source rows `[mid_start, mid_end)`.
         let mut mid = Vec::new();
+        let mut scratch = BandScratch::default();
         let (mut mid_start, mut mid_end) = (0, 0);
         let mut y = y0;
         let end = y0 + out.len() / row_len;
@@ -2322,6 +2407,7 @@ impl<const C: usize> BandedPasses<'_, C> {
                     self.out_w,
                     kept,
                     &mut mid[(kept - start) * row_len..],
+                    &mut scratch,
                 );
             }
             (mid_start, mid_end) = (start, stop);
@@ -4512,7 +4598,15 @@ mod tests {
         ) {
             let kernel = FixedKernel::new(in_w, out_w, filter, quantization);
             let mut portable = vec![0_u8; in_h * out_w * C];
-            WidthPass::Portable.rows::<C>(data, &kernel, in_w, out_w, 0, &mut portable);
+            WidthPass::Portable.rows::<C>(
+                data,
+                &kernel,
+                in_w,
+                out_w,
+                0,
+                &mut portable,
+                &mut BandScratch::default(),
+            );
             #[cfg_attr(
                 not(target_arch = "x86_64"),
                 expect(unused_mut, reason = "only the x86-64 arms are pushed")
@@ -4532,7 +4626,15 @@ mod tests {
             }
             for (name, arm) in &arms {
                 let mut detected = vec![0_u8; in_h * out_w * C];
-                arm.rows::<C>(data, &kernel, in_w, out_w, 0, &mut detected);
+                arm.rows::<C>(
+                    data,
+                    &kernel,
+                    in_w,
+                    out_w,
+                    0,
+                    &mut detected,
+                    &mut BandScratch::default(),
+                );
                 assert_same_bytes(
                     &detected,
                     &portable,
