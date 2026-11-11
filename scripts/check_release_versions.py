@@ -357,7 +357,8 @@ class Repo:
         """``path`` at HEAD with every symlink along it resolved, one component at a time: a
         prefix that is a link has its pointee spliced in where it sits, ``..`` is collapsed only
         once the component before it is resolved, and the links crossed come back beside the
-        result. None when the path leaves the repository, reaches an absolute pointee or loops."""
+        result. None when the path leaves the repository, reaches an absolute pointee or crosses
+        more links than the OS follows (a loop; a link crossed twice on one path is not one)."""
         resolved: list[str] = []
         crossed: list[str] = []
         remaining = path.split("/")
@@ -374,7 +375,7 @@ class Repo:
             if not self.git("ls-tree", "HEAD", "--", candidate).startswith("120000 "):
                 resolved.append(part)
                 continue
-            if candidate in crossed:
+            if len(crossed) >= 40:
                 return None, crossed
             crossed.append(candidate)
             pointee = (self.show("HEAD", candidate) or "").strip()
@@ -386,9 +387,11 @@ class Repo:
     def symlink_targets(self, path: str) -> list[str]:
         """What the symlinks under ``path`` at HEAD point at, as repository paths, followed to
         the end of every chain: a target that is a link, a directory holding one, or a path
-        running through a directory link adds what that points at, with the links crossed on
-        the way, each read once. A link into ``path`` itself, outside the repository or
-        absolute is left out."""
+        running through a directory link adds what that points at, each read once. The links
+        crossed on the way count as targets too (a retarget changes what ships) but are not
+        read further: what lies behind a directory link beyond the path through it is not the
+        component's. A link into ``path`` itself, outside the repository or absolute is left
+        out."""
         here, inside = path.rstrip("/"), path.rstrip("/") + "/"
         targets: list[str] = []
         pending = [path]
@@ -407,7 +410,8 @@ class Repo:
                         continue
                     if found not in targets:
                         targets.append(found)
-                        pending.append(found)
+                        if found == target:
+                            pending.append(found)
         return targets
 
     def changed_since(self, tag: str, paths: Sequence[str]) -> list[str]:
