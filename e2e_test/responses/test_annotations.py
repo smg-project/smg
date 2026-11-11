@@ -226,7 +226,10 @@ def openai_direct_client():
 # deadline of its own, and the lane that runs this suite has a 30-minute cap with about
 # 20 minutes of setup and other tests inside it. A file still indexing at the deadline
 # skips the class with the reason in the log, instead of running a required job into its
-# cap with every test that ran green.
+# cap with every test that ran green. The bounded poll's keyword exists on the SDK from openai
+# 3.14; the harness lists the package with no floor, since its project installs into the engine
+# venvs and the engines pin their own SDK versions, and an older SDK fails loudly here, at the
+# fixture's setup, with an unexpected keyword.
 _VECTOR_STORE_INDEX_DEADLINE_S = 300
 _VECTOR_STORE_POLL_REQUEST_TIMEOUT_S = 30.0
 

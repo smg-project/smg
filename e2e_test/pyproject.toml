@@ -13,8 +13,7 @@ dependencies = [
   "jinja2",
   "mcp>=1.24,<3",
   "numpy",
-  # the responses fixture bounds its vector-store wait: create_and_poll(max_wait_seconds=...)
-  "openai>=3.14",
+  "openai",
   "pandas",
   "pillow",
   "pytest",
