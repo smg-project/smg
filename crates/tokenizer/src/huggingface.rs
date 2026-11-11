@@ -710,6 +710,15 @@ impl HuggingFaceTokenizer {
                             config_path.display()
                         ))
                     })?;
+                if entry.content.is_empty() {
+                    // No text is no token: the pipeline's add ignores it, and so
+                    // does the placement below.
+                    warn!(
+                        config_id = id,
+                        "tokenizer_config.json declares an added token without text; ignored"
+                    );
+                    continue;
+                }
                 let normalized = entry.normalized.unwrap_or(!entry.special);
                 let token = AddedToken::from(entry.content, entry.special)
                     .single_word(entry.single_word)
@@ -761,6 +770,10 @@ impl HuggingFaceTokenizer {
             .max()
             .map_or(table, |max| if *max >= table { max + 1 } else { table });
         let mut missing: Vec<(u32, AddedToken)> = Vec::new();
+        // The contents queued for the add so far, on the ids they will take: the
+        // pipeline's add reads its own map token by token, so a content declared
+        // twice is held on the first id by the time the second is added.
+        let mut queued: HashMap<&str, u32> = HashMap::new();
         for (id, token) in config_tokens {
             match added.get_vocab().get(&token.content) {
                 Some(held) if held == id => {}
@@ -773,9 +786,12 @@ impl HuggingFaceTokenizer {
                     );
                 }
                 None => {
-                    // A piece the table holds keeps the table's id; a new token takes the next one.
+                    // A piece the table holds keeps the table's id, a content queued
+                    // earlier keeps the id it was queued under, a new token takes
+                    // the next one.
                     let table_id = tokenizer.token_to_id(&token.content);
-                    let lands_on = table_id.unwrap_or(next_id);
+                    let queued_id = queued.get(token.content.as_str()).copied();
+                    let lands_on = queued_id.or(table_id).unwrap_or(next_id);
                     if lands_on != *id {
                         match misplaced {
                             MisplacedToken::RefusesTheLoad => {
@@ -795,9 +811,10 @@ impl HuggingFaceTokenizer {
                             }
                         }
                     }
-                    if table_id.is_none() {
+                    if table_id.is_none() && queued_id.is_none() {
                         next_id += 1;
                     }
+                    queued.insert(token.content.as_str(), lands_on);
                     missing.push((*id, token.clone()));
                 }
             }

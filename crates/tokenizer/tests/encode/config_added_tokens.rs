@@ -201,6 +201,42 @@ fn a_declared_id_the_pipeline_cannot_place_leaves_that_token_out() {
 }
 
 #[test]
+fn a_content_declared_on_two_ids_is_held_on_the_first() {
+    let dir = TempDir::new().expect("a temp dir");
+    // The pipeline's add gives the second declaration the first one's id, so
+    // the second is a declared id the pipeline cannot place: left out here.
+    let tokenizer = load(
+        &dir,
+        &tokenizer_json(&[], &FILE_TOKENS),
+        config(&[
+            (2, "<|im_start|>"),
+            (3, "<|audio_start|>"),
+            (4, "<|audio_start|>"),
+        ]),
+    )
+    .expect("the checkpoint loads");
+
+    assert_eq!(tokenizer.token_to_id("<|audio_start|>"), Some(3));
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 4);
+}
+
+#[test]
+fn an_entry_without_text_takes_no_id() {
+    let dir = TempDir::new().expect("a temp dir");
+    // The empty entry is no token and uses no id: `<|audio_end|>` on 3 is the
+    // next token and lands there.
+    let tokenizer = load(
+        &dir,
+        &tokenizer_json(&[], &FILE_TOKENS),
+        config(&[(0, ""), (2, "<|im_start|>"), (3, "<|audio_end|>")]),
+    )
+    .expect("the checkpoint loads");
+
+    assert_eq!(tokenizer.token_to_id("<|audio_end|>"), Some(3));
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 4);
+}
+
+#[test]
 fn a_configuration_without_the_block_changes_nothing() {
     let dir = TempDir::new().expect("a temp dir");
     let tokenizer = load(
