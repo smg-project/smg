@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
@@ -84,6 +84,7 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
+            json_response,
             placement::{self, Candidates, WireConstraint},
             retry::{is_retryable_response, BackoffCalculator},
         },
@@ -1164,7 +1165,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_chat",
@@ -1225,7 +1226,7 @@ impl RequestPipeline {
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     let body = generate_response_body(single_prompt, n, response);
-                    Self::routed_response(&dctx, axum::Json(body).into_response())
+                    Self::routed_response(&dctx, json_response(&body))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -1269,7 +1270,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_completion",
@@ -1316,7 +1317,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_messages",
@@ -1363,7 +1364,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_decisions",
@@ -1407,7 +1408,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_embeddings",
@@ -1508,7 +1509,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_classify",

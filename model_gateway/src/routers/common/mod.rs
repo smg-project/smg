@@ -94,6 +94,48 @@ pub(crate) fn serialize_json_sized<T: serde::Serialize>(
     Ok(buf)
 }
 
+/// The first allocation of a typed JSON answer's body: a chat completion,
+/// a Messages answer or a JSON-schema answer of a few hundred bytes fits it
+/// whole, a larger one grows from here instead of from 128 bytes.
+const JSON_ANSWER_CAPACITY: usize = 1024;
+
+/// A typed answer as a JSON response: serialized once into a `Vec<u8>`
+/// (serde's own sink, one `extend_from_slice` per write) that starts at
+/// [`JSON_ANSWER_CAPACITY`], handed to the body by refcount, with the
+/// `application/json` content type. `axum::Json` writes the same bytes
+/// through `BytesMut::with_capacity(128).writer()`: the `bytes` writer
+/// adapter slices every write to the buffer's remaining room before it
+/// appends, which prices the one-byte JSON tokens (2.5 % of a chat
+/// request's user instructions on the mock bed), and the 128-byte start
+/// reallocates and copies a 700-byte body three times. A value that does
+/// not serialize answers as axum does: a 500 with the error's text.
+pub(crate) fn json_response<T: serde::Serialize>(value: &T) -> axum::response::Response {
+    use axum::{
+        http::{header, HeaderValue, StatusCode},
+        response::IntoResponse,
+    };
+    let mut buf = Vec::with_capacity(JSON_ANSWER_CAPACITY);
+    match serde_json::to_writer(&mut buf, value) {
+        Ok(()) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            bytes::Bytes::from(buf),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            error.to_string(),
+        )
+            .into_response(),
+    }
+}
+
 /// A typed request as a `Value`, for the forwarding paths that edit it:
 /// `openai_protocol::common::to_value_exact` with the buffer pre-sized from
 /// the raw request length. Every typed `f32` goes out as the client wrote
@@ -167,6 +209,39 @@ mod tests {
         assert_eq!(body.len(), raw.len());
         assert_eq!(body.capacity(), serialized_capacity(raw.len()));
         assert!(body.capacity() <= body.len() + body.len() / 8 + 1024);
+    }
+
+    #[test]
+    fn a_json_answer_is_the_serializer_bytes_under_the_json_content_type() {
+        use axum::http::{header, StatusCode};
+        let value = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "x".repeat(600)}}],
+        });
+        let response = json_response(&value);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+        assert_eq!(body, serde_json::to_vec(&value).unwrap());
+    }
+
+    #[test]
+    fn a_json_answer_that_does_not_serialize_is_a_plain_text_500() {
+        use axum::http::{header, StatusCode};
+        // A map keyed by a tuple has no JSON key: the serializer refuses it.
+        let value: std::collections::BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+        let response = json_response(&value);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
     }
 
     #[test]
