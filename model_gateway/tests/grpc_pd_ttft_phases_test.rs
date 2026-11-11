@@ -474,8 +474,10 @@ fn the_completions_route_anchors_at_the_prefill_dispatch_under_held_headers() {
 
 /// A collected (non-streaming) chat answer on the sequential pair: its one
 /// record, the generation duration, is anchored at the prefill dispatch, so it
-/// carries both workers' delays. A clock read when the answer is collected
-/// would carry neither.
+/// carries both workers' delays. A clock read where the anchor is derived
+/// would carry the decode worker's delay alone, since the sequential pair
+/// drains the prefill stream before the answer path reads its anchor; the
+/// case then falls short of its floor by the prefill delay.
 #[test]
 fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
