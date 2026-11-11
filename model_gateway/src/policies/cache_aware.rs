@@ -3466,10 +3466,11 @@ impl CacheAwarePolicy {
 /// What the policy engine's view reads from this policy's indexes for one
 /// request, when the engine serves `cache_aware` (the ingestion stays here
 /// until the controller's store): per worker position the request's prefix
-/// in blocks by the event index (`overlap_blocks`) or by the approximate
-/// tree (`predicted_blocks`, a match above the threshold) and the warm-up
-/// facts, the request's block hashes with their kind, and the namespace
-/// seed. One buffer per deciding thread, reused.
+/// in blocks by the event index or by the approximate tree (both as
+/// `overlap_blocks`, the tree's only when its match clears the threshold)
+/// and the warm-up facts, the request's block hashes with their kind and
+/// the block size they were counted with, and the namespace seed. One
+/// buffer per deciding thread, reused.
 #[derive(Debug, Default)]
 pub(crate) struct AffinityRows {
     /// The request's blocks: the event index's content hashes for a
@@ -3478,6 +3479,9 @@ pub(crate) struct AffinityRows {
     /// request on the approximate token tree (its size is its token count).
     pub hashes: Vec<u64>,
     pub hash_kind: HashKind,
+    /// The size in tokens of one of the request's blocks as counted here:
+    /// the event index's learned block size, else the configured one.
+    pub block_size: u32,
     /// The cache namespace's hash seed; `0` unpartitioned.
     pub namespace_seed: u64,
     /// One row per worker position.
@@ -3487,7 +3491,10 @@ pub(crate) struct AffinityRows {
 /// One worker's affinity facts for the view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AffinityRow {
+    /// Blocks of the request the worker holds, by the policy's index: the
+    /// event index's overlap, or the approximate tree's match.
     pub overlap_blocks: u32,
+    /// A predictor's estimate; no source writes it in this build.
     pub predicted_blocks: u32,
     /// Milliseconds since the worker was admitted; `u32::MAX` (never young)
     /// while the pool has no warming worker, so the engine's slice costs a
@@ -3515,6 +3522,7 @@ impl AffinityRows {
         self.hashes.clear();
         self.rows.clear();
         self.hash_kind = HashKind::Token;
+        self.block_size = 0;
         self.namespace_seed = 0;
     }
 }
@@ -3549,10 +3557,11 @@ impl CacheAwarePolicy {
     /// index's overlap per holder (capped by the holder's cache groups) and
     /// the warm-up facts when the pool table has a warming worker; else the
     /// approximate tree's match above the threshold, placed on its tenants
-    /// and rounded up to whole blocks, so the share the engine compares
-    /// against the threshold never falls under the ratio this read cleared;
-    /// the request's block hashes beside them. Nothing is inserted: the
-    /// route is recorded at the commit ([`Self::record_route`]).
+    /// and rounded up to whole blocks, so a match the policy routes by stays
+    /// a hit for the engine's index source (a sub-block match prices under
+    /// the margin's floor either way); the request's block hashes and the
+    /// block size they were counted with beside them. Nothing is inserted:
+    /// the route is recorded at the commit ([`Self::record_route`]).
     pub(crate) fn fill_affinity(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -3561,6 +3570,7 @@ impl CacheAwarePolicy {
     ) {
         out.clear();
         out.rows.resize(workers.len(), AffinityRow::default());
+        out.block_size = narrow_usize(self.config.block_size.max(1));
         out.namespace_seed = info.cache_namespace.map_or(0, CacheNamespace::event_seed);
         let Some(first) = workers.first() else {
             return;
@@ -3614,6 +3624,7 @@ impl CacheAwarePolicy {
         out: &mut AffinityRows,
     ) {
         let hashes = Self::event_content_hashes(info, tokens, index.block_size);
+        out.block_size = narrow_usize(index.block_size.max(1));
         out.hashes.extend(hashes.iter().map(|hash| hash.0));
         let table = self.pool_table(workers, &index.indexer, liveness::now_ms());
         if !hashes.is_empty() {

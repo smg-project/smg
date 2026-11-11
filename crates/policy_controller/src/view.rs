@@ -380,6 +380,10 @@ pub struct RequestFacts<'a> {
     /// Prefix block hashes, capped by the host.
     pub block_hashes: &'a [u64],
     pub hash_kind: HashKind,
+    /// The size in tokens of one of the request's blocks as the host
+    /// counted them: an index's learned block size on an event-fed request,
+    /// the configured one on a tree-fed request; `0` reads the view's.
+    pub block_size: u32,
     /// The routing key as the host derives it, lineage-stripped.
     pub session_key: Identity<'a>,
     pub phase: Phase,

@@ -163,20 +163,31 @@ impl Gates {
         load > avg * self.rel && load > avg + self.margin(avg, held_tokens)
     }
 
+    /// The size of one of the request's blocks: the facts' own when the
+    /// host counted with one (an index's learned size), else the view's.
+    fn block_size_of(&self, facts: &RequestFacts<'_>) -> u32 {
+        if facts.block_size > 0 {
+            facts.block_size
+        } else {
+            self.block_size
+        }
+    }
+
     /// The request's size in blocks: its block hashes when the host sent
     /// them, else its token count over the block size, never under one.
     fn request_blocks(&self, facts: &RequestFacts<'_>) -> u32 {
         if facts.block_hashes.is_empty() {
-            (facts.prompt_tokens / self.block_size).max(1)
+            (facts.prompt_tokens / self.block_size_of(facts)).max(1)
         } else {
             u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX)
         }
     }
 
-    /// `blocks` of the request in tokens, for the held prefix's price.
-    fn tokens_of(&self, blocks: u32, kind: HashKind) -> f32 {
-        let units = blocks as f32 * self.block_size as f32;
-        match kind {
+    /// `blocks` of the request in tokens, for the held prefix's price: at
+    /// the block size the request was counted with.
+    fn tokens_of(&self, blocks: u32, facts: &RequestFacts<'_>) -> f32 {
+        let units = blocks as f32 * self.block_size_of(facts) as f32;
+        match facts.hash_kind {
             HashKind::Token => units,
             HashKind::Text => units / CHARS_PER_TOKEN as f32,
         }
@@ -315,7 +326,7 @@ impl Scorer for PrefixAffinity {
         // priced.
         let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
         let held = if priced {
-            self.gates.tokens_of(best, facts.hash_kind)
+            self.gates.tokens_of(best, facts)
         } else {
             0.0
         };
@@ -737,6 +748,20 @@ mod tests {
             ..SpillParams::default()
         }));
         assert_eq!(scores(&priced, &facts(16), &pool), vec![1.0, 0.5]);
+        // The price reads the block size the request was counted with: at
+        // one token a block the eight blocks are one request, the margin
+        // falls back to the swing and the holder spills; at 128 a block
+        // they are 128 requests, capped at the absolute 64, and it stays.
+        let narrow = RequestFacts {
+            block_size: 1,
+            ..facts(16)
+        };
+        assert_eq!(scores(&priced, &narrow, &pool), vec![0.0, 0.5]);
+        let wide = RequestFacts {
+            block_size: 128,
+            ..facts(16)
+        };
+        assert_eq!(scores(&priced, &wide, &pool), vec![1.0, 0.5]);
         // A decode decision prices nothing.
         let decode = RequestFacts {
             phase: Phase::Decode,
@@ -991,7 +1016,20 @@ mod tests {
         assert!(tuned.kv_configured());
         // Eight blocks of 32 tokens at 16 a request price at 16 requests,
         // capped at the configured 8.
-        assert_eq!(tuned.margin(0.0, tuned.tokens_of(8, HashKind::Token)), 8.0);
-        assert_eq!(tuned.tokens_of(8, HashKind::Text), 64.0);
+        let tokens = RequestFacts::default();
+        assert_eq!(tuned.margin(0.0, tuned.tokens_of(8, &tokens)), 8.0);
+        let text = RequestFacts {
+            hash_kind: HashKind::Text,
+            ..RequestFacts::default()
+        };
+        assert_eq!(tuned.tokens_of(8, &text), 64.0);
+        // The block size the host counted with (an index's learned 128)
+        // overrides the view's: eight blocks are 1024 tokens.
+        let learned = RequestFacts {
+            block_size: 128,
+            ..RequestFacts::default()
+        };
+        assert_eq!(tuned.tokens_of(8, &learned), 1024.0);
+        assert_eq!(tuned.request_blocks(&learned), 1);
     }
 }

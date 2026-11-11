@@ -615,6 +615,11 @@ impl AppContextBuilder {
                 .iter()
                 .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
         );
+        // The policy engine's warm-up stage is tuned from the liveness budgets
+        // when the policy registry is built below, so the configuration's
+        // budgets take effect first (the first call wins; `build` keeps its
+        // call for a context assembled without this constructor).
+        liveness::configure_from(&router_config);
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)

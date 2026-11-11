@@ -1020,6 +1020,7 @@ impl Decider {
                 prompt_tokens: request.prompt_tokens,
                 block_hashes: &affinity.hashes,
                 hash_kind: affinity.hash_kind,
+                block_size: affinity.block_size,
                 session_key,
                 phase: request.phase,
                 attempt: u8::try_from(request.tried.len()).unwrap_or(u8::MAX),
@@ -3906,6 +3907,10 @@ mod tests {
         assert_eq!(overlap[holder as usize], 5, "74 characters at 16 a block");
         assert_eq!(overlap[1 - holder as usize], 0, "the route alone holds it");
         assert_eq!(rows.hashes.len(), 4, "the whole windows of the text");
+        assert_eq!(
+            rows.block_size, 16,
+            "the tree path counts at the configured size"
+        );
         for _ in 0..20 {
             assert_eq!(
                 leader(&decider, &request, &workers),
