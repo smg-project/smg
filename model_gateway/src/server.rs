@@ -88,7 +88,7 @@ use crate::{
         RouterTrait,
     },
     server::{
-        connection_limit::ConnectionLimitAcceptor,
+        connection_limit::{BoundedListener, ConnectionLimitAcceptor},
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     },
     service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
@@ -2119,6 +2119,7 @@ fn serve_listeners(
                         .map(|acceptor| {
                             ConnectionLimitAcceptor::new(
                                 tls_acceptor(acceptor, connection_timeouts),
+                                BoundedListener::Admin,
                                 admin_max_connections,
                             )
                         })
@@ -2129,6 +2130,7 @@ fn serve_listeners(
                     axum_server::from_tcp(admin_listener)?
                         .acceptor(ConnectionLimitAcceptor::new(
                             http_acceptor(connection_timeouts),
+                            BoundedListener::Admin,
                             admin_max_connections,
                         ))
                         .handle(admin_handle)
@@ -2147,6 +2149,7 @@ fn serve_listeners(
                 .map(|acceptor| {
                     ConnectionLimitAcceptor::new(
                         tls_acceptor(acceptor, connection_timeouts),
+                        BoundedListener::Data,
                         max_connections,
                     )
                 })
@@ -2158,6 +2161,7 @@ fn serve_listeners(
             axum_server::from_tcp(listener)?
                 .acceptor(ConnectionLimitAcceptor::new(
                     http_acceptor(connection_timeouts),
+                    BoundedListener::Data,
                     max_connections,
                 ))
                 .handle(handle)
