@@ -545,8 +545,11 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     assert "rho" not in out, (
         "lambda 1.0.1 sits inside ^1.0.0, and a dev-dependency is not published"
     )
+    # tau's own requirement on kappa (a version beside the path) is what cargo reads: an issue until it holds
+    assert "crates/tau/Cargo.toml has kap_alias v0.2.0, expected v0.3.0" in out
+    assert "crates/rho/Cargo.toml has" not in out, "lambda 1.0.1 sits inside rho's ^1.0.0"
     assert "Summary: 16 crate(s) with changes, 2 unchanged" in out
-    assert "16 issue(s) found." in out
+    assert "17 issue(s) found." in out
 
     code, out = check("plan")
     assert code == 0
@@ -566,6 +569,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "  minor upsilon v0.6.0 → v0.7.0 (crates/upsilon/Cargo.toml)",
         "  minor zeta v0.2.0 → v0.3.0 (crates/zeta/Cargo.toml)",
         "  minor kappa v0.2.0 → v0.3.0 (crates/kappa/Cargo.toml)",
+        "  sync crates/tau/Cargo.toml kap_alias v0.2.0 → v0.3.0",
     ):
         assert line in out, line
     assert out.count("sync workspace Cargo.toml eta") == 1, out
@@ -597,6 +601,13 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         ), name
         assert mod.workspace_dep_version(root_toml, name) == version, name
     assert mod.read_version("cargo", (root / "crates/rho/Cargo.toml").read_text(), "") == "1.0.0"
+    # the fix moved tau's requirement with kappa, so cargo's read of the tree holds; the check behind it is clean
+    tau = (root / "crates/tau/Cargo.toml").read_text()
+    assert 'kap_alias = { package = "kappa", path = "../kappa", version = "0.3.0" }' in tau, tau
+    assert mod.write_dep_version(tau, "kap_alias", "0.3.0", "0.4.0") == tau.replace(
+        "0.3.0", "0.4.0"
+    )
+    assert mod.write_dep_version(tau, "kappa", "0.3.0", "0.4.0") is None
     code, out = check()
     assert code == 0, out
     assert "All versions consistent." in out
@@ -805,6 +816,42 @@ def test_the_plan_lists_a_gateway_already_at_the_cuts_version_among_the_bumped(m
         "Nothing to bump against v1.0.0: every crate and package changed since it is bumped already"
         " (smg v2.1.0-rc.1, alpha v1.1.0, beta v1.0.1, delta v0.2.0 (new), pkg v0.2.0); the mirrors agree."
     )
+
+
+def test_a_candidate_steps_a_carried_dependency_as_its_line_does(mod, repo):
+    """The gateway at a candidate, a dependency it carries in its public API crossing its caret: the
+    dependency rule steps the candidate as a final of its line (major from 1.0 on) instead of refusing
+    the suffix, so a plan to the next candidate (the version the cut writes) completes."""
+    assert (
+        mod.breaking_level("1.1.0-rc.1") == "major" and mod.breaking_level("0.4.0-rc.2") == "minor"
+    )
+    put(
+        repo,
+        "model_gateway/Cargo.toml",
+        manifest("smg", "1.1.0-rc.1") + "\n[dependencies]\nalpha = { workspace = true }\n",
+    )
+    put(repo, "model_gateway/src/main.rs", "pub fn uses(_x: alpha::Thing) {}\nfn main() {}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "chore: the first candidate")
+    git(repo, "tag", "v1.1.0-rc.1")
+    put(repo, "crates/alpha/src/lib.rs", "pub struct Thing;\npub struct More;\n")
+    put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "2.0.0"))
+    root = (
+        (repo / "Cargo.toml")
+        .read_text()
+        .replace('alpha = { version = "1.1.0"', 'alpha = { version = "2.0.0"')
+    )
+    put(repo, "Cargo.toml", root)
+    put(
+        repo,
+        "model_gateway/src/main.rs",
+        "pub fn uses(_x: alpha::Thing) {}\nfn main() {\n    println!();\n}\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "feat(alpha)!: more")
+    code, out = run(mod, repo, mode="plan", tag="v1.1.0-rc.1", override="1.1.0-rc.2")
+    assert code == 0, out
+    assert "  set smg v1.1.0-rc.1 → v1.1.0-rc.2 (model_gateway/Cargo.toml)" in out
 
 
 def test_the_plan_compares_against_the_highest_final_tag_by_default(mod, repo):

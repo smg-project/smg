@@ -457,6 +457,9 @@ class Verdict:
     workspace_version: str | None = None  # the root's entry when it disagrees
     # why a held crate moves: the published requirement a dependency's new version leaves
     dependency: str | None = None
+    # the manifest's own requirements on path dependencies that the versions written leave (cargo
+    # refuses the tree over them): the entry's key, its requirement, the version to write
+    requirements: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
@@ -620,6 +623,7 @@ class Plan:
         return (
             sum(1 for v in self.verdicts if v.unbumped)
             + sum(1 for v in self.verdicts if v.workspace_version is not None)
+            + sum(len(v.requirements) for v in self.verdicts)
             + len(self.mirrors)
         )
 
@@ -667,6 +671,8 @@ def report(verdict: Verdict, out: Out) -> None:
         out.line(
             f"    {bad} workspace Cargo.toml has {c.dep_key} v{verdict.workspace_version}, expected v{verdict.version}"
         )
+    for key, requirement, new in verdict.requirements:
+        out.line(f"    {bad} {c.version_file} has {key} v{requirement}, expected v{new}")
 
 
 def caret_accepts(requirement: str, version: str) -> bool:
@@ -687,10 +693,14 @@ LEVELS = ("patch", "minor", "major")
 
 
 def breaking_level(version: str) -> str:
-    """The step that leaves a version's own caret: major from 1.0 on, minor at 0.y, patch at 0.0.z."""
-    if not SEMVER.match(version):
-        raise Fatal(f"the dependency rule only steps X.Y.Z versions, got: {version}")
-    major, minor, _ = (int(part) for part in version.split("."))
+    """The step that leaves a version's own caret: major from 1.0 on, minor at 0.y, patch at 0.0.z.
+    A candidate steps as its line does (the suffix carries no level), so a plan from one candidate
+    to the next reads a carried dependency crossing its caret as a final would."""
+    if not CUT_VERSION.match(version):
+        raise Fatal(
+            f"the dependency rule only steps X.Y.Z versions and their candidates, got: {version}"
+        )
+    major, minor, _ = (int(part) for part in version.split("-")[0].split("."))
     return "major" if major else "minor" if minor else "patch"
 
 
@@ -742,6 +752,43 @@ def published_requirements(
         if isinstance(pinned, str) and SEMVER.match(pinned):
             requirements[name] = pinned
     return requirements
+
+
+def direct_requirements(
+    repo: Repo, component: Component, crates: Sequence[Component]
+) -> list[tuple[str, str, str]]:
+    """The requirements the component's manifest writes itself on the workspace crates it reaches
+    by path (a ``version`` beside the ``path``; the root pins a ``workspace = true`` entry), in
+    every dependency table cargo resolves, dev-dependencies too: the entry's key, the crate's name,
+    the requirement. Read from the working tree, as cargo reads it and as the fix leaves it."""
+    try:
+        manifest = tomllib.loads(repo.read(component.version_file))
+    except FileNotFoundError:
+        return []
+    except tomllib.TOMLDecodeError as error:
+        raise Fatal(f"{component.version_file} is not TOML: {error}") from None
+    by_key = {c.dep_key or c.name: c.name for c in crates}
+    tables = [manifest, *(t for t in manifest.get("target", {}).values() if isinstance(t, dict))]
+    found: list[tuple[str, str, str]] = []
+    for table in tables:
+        for section in ("dependencies", "build-dependencies", "dev-dependencies"):
+            for key, spec in table.get(section, {}).items():
+                if not isinstance(spec, dict) or spec.get("workspace") or not spec.get("path"):
+                    continue
+                name, requirement = by_key.get(spec.get("package", key)), spec.get("version")
+                if name is None or name == component.name:
+                    continue
+                if isinstance(requirement, str) and SEMVER.match(requirement):
+                    found.append((key, name, requirement))
+    return found
+
+
+def write_dep_version(manifest: str, key: str, old: str, new: str) -> str | None:
+    """The member manifest with the inline entry ``key``'s version moved from ``old`` to ``new``;
+    None when no such line is there (an entry written as its own table is left to the operator)."""
+    line = rf'^(\s*{re.escape(key)}\s*=\s*\{{[^\n]*?\bversion\s*=\s*"){re.escape(old)}(")'
+    text, moved = re.subn(line, rf"\g<1>{new}\g<2>", manifest, count=1, flags=re.M)
+    return text if moved else None
 
 
 def source_name(repo: Repo, dependent: Component, dep: Component) -> str:
@@ -953,6 +1000,23 @@ def dependency_moves(repo: Repo, tag: str, plan: Plan, crates: Sequence[Componen
                 changed = True
 
 
+def requirement_moves(repo: Repo, plan: Plan, crates: Sequence[Component]) -> None:
+    """The requirements the fix carries along: a member manifest's own ``version`` on a path
+    dependency, when the version the plan writes for that crate (or the one it has) leaves the
+    requirement's caret. Cargo refuses the tree over such an entry, which a read of the versions
+    alone passes; the entry is an issue until it holds, and the fix writes the new version to it
+    as it writes the root's pin."""
+    by_name = {v.component.name: v for v in plan.verdicts if v.component.kind == "crate"}
+    for verdict in by_name.values():
+        for key, name, requirement in direct_requirements(repo, verdict.component, crates):
+            target = by_name.get(name)
+            if target is None:
+                continue
+            new = plan.new_version(target) if target.unbumped else target.version
+            if not caret_accepts(requirement, new):
+                verdict.requirements.append((key, requirement, new))
+
+
 def examine(
     repo: Repo,
     tag: str,
@@ -982,8 +1046,11 @@ def examine(
     )
     plan = Plan(verdicts, [], target, override, gateway_version=target, cut_version=cut_version)
     dependency_moves(repo, tag, plan, crates)
+    requirement_moves(repo, plan, crates)
     for verdict in verdicts:
         if verdict.files_changed or verdict.workspace_version is not None or verdict.dependency:
+            report(verdict, out)
+        elif verdict.requirements:
             report(verdict, out)
     if cut_version is not None:
         plan.gateway_target = cut_version
@@ -1008,7 +1075,10 @@ def examine(
             1
             for v in verdicts
             if v.component.kind == kind
-            and bool(v.files_changed or v.workspace_version is not None or v.dependency) == changed
+            and bool(
+                v.files_changed or v.workspace_version is not None or v.dependency or v.requirements
+            )
+            == changed
         )
 
     out.line()
@@ -1039,6 +1109,9 @@ def propose(plan: Plan, out: Out, title: str = "Proposed fixes:") -> None:
             out.line(
                 f"  {sync} workspace Cargo.toml {v.component.dep_key} v{v.workspace_version} → v{v.version}"
             )
+    for v in plan.verdicts:
+        for key, requirement, new in v.requirements:
+            out.line(f"  {sync} {v.component.version_file} {key} v{requirement} → v{new}")
     for v in plan.verdicts:
         c = v.component
         if v.unbumped and c.kind == "package":
@@ -1158,6 +1231,16 @@ def apply(plan: Plan, repo: Repo, out: Out) -> int:
     for v in plan.verdicts:
         if v.workspace_version is not None:
             failed += not pin(v.component.dep_key or "", v.version)
+    for v in plan.verdicts:
+        for key, old, new in v.requirements:
+            path = v.component.version_file
+            text = write_dep_version(repo.read(path), key, old, new)
+            if text is None:
+                out.line(f"    {out.paint('red', f'FAILED to update {key} in {path} to v{new}')}")
+                failed += 1
+                continue
+            repo.write(path, text)
+            out.line(f"  {ok} {path} {key} → v{new}")
     for mirror, carried in plan.mirrors:
         failed += not rewrite(mirror.file, mirror.kind, carried, plan.gateway_target)
     return failed
