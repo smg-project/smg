@@ -849,8 +849,10 @@ fn validate_tool_choice(
     req: &ChatCompletionRequest,
     tool_choice: &ToolChoice,
 ) -> Result<(), validator::ValidationError> {
-    // Lazy on purpose: most tool traffic only needs the emptiness check.
-    let effective_tools = || req.effective_tools();
+    // Lazy on purpose: most tool traffic only needs the emptiness check; the
+    // profile is derived once for every read.
+    let provider = ProviderProfile::for_model(&req.model);
+    let effective_tools = || req.effective_tools_under(provider);
     let has_tools = effective_tools().next().is_some();
     let requires_tools = !matches!(
         tool_choice,
@@ -925,7 +927,14 @@ impl ChatCompletionRequest {
     /// request's provider profile defines them (Kimi K3 dynamic tools on
     /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
     pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
-        ProviderProfile::for_model(&self.model).dynamic_tools(self)
+        self.dynamic_tools_under(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::dynamic_tools`] under `provider`, the request's profile as a
+    /// caller derived it once: the serving path reads the tools several times
+    /// per request and derives the profile for none of them.
+    pub fn dynamic_tools_under(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
+        provider.dynamic_tools(self)
     }
 
     /// Whether the request offers the model any tool: a request-level `tools`
@@ -940,7 +949,12 @@ impl ChatCompletionRequest {
     /// Whether a call can be forced is a question for the narrowed set,
     /// [`Self::callable_tools`].
     pub fn declares_tools(&self) -> bool {
-        self.tools.is_some() || self.dynamic_tools().next().is_some()
+        self.declares_tools_under(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::declares_tools`] under a profile already derived.
+    pub fn declares_tools_under(&self, provider: ProviderProfile) -> bool {
+        self.tools.is_some() || self.dynamic_tools_under(provider).next().is_some()
     }
 
     /// Every tool the model will see: the request-level `tools` followed by
@@ -948,11 +962,16 @@ impl ChatCompletionRequest {
     /// tool-call parsing first of all, must work from this set rather than
     /// from `tools` alone, or a call to a dynamic tool comes back as text.
     pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.effective_tools_under(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tools`] under a profile already derived.
+    pub fn effective_tools_under(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
         self.tools
             .as_deref()
             .into_iter()
             .flatten()
-            .chain(self.dynamic_tools())
+            .chain(self.dynamic_tools_under(provider))
     }
 
     /// [`Self::effective_tools`] as one list: the request's own `tools`,
@@ -961,7 +980,12 @@ impl ChatCompletionRequest {
     /// request (the constraint, the response spec, the table that reads the
     /// calls), so where nothing narrows it, nothing copies it.
     pub fn effective_tool_list(&self) -> Cow<'_, [Tool]> {
-        let mut dynamic = self.dynamic_tools().peekable();
+        self.effective_tool_list_under(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tool_list`] under a profile already derived.
+    pub fn effective_tool_list_under(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let mut dynamic = self.dynamic_tools_under(provider).peekable();
         if dynamic.peek().is_none() {
             return Cow::Borrowed(self.tools.as_deref().unwrap_or(&[]));
         }

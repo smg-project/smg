@@ -127,7 +127,7 @@ pub(crate) fn scans_for_tool_calls_for(
     request: &ChatCompletionRequest,
     provider: ProviderProfile,
 ) -> bool {
-    request.declares_tools() || provider.parses_tool_calls_without_tools()
+    request.declares_tools_under(provider) || provider.parses_tool_calls_without_tools()
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {

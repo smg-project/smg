@@ -295,6 +295,9 @@ impl ProviderProfile {
 
     /// The vendor a model id names in one of its `/`-separated segments.
     fn from_model_segments(model: &str) -> Self {
+        // One walk over the segments: a vendor segment decides at once; the
+        // OpenAI reading needs them all (a `gpt-oss` anywhere is self-hosted).
+        let (mut openai, mut gpt_oss) = (false, false);
         for segment in model.split('/') {
             if deepseek::matches_model(segment) {
                 return ProviderProfile::DeepSeek;
@@ -315,11 +318,14 @@ impl ProviderProfile {
             {
                 return ProviderProfile::Zai;
             }
+            gpt_oss |= starts_with_ignore_ascii_case(segment, "gpt-oss");
+            openai |= is_openai_segment(segment);
         }
-        if is_openai_vendor_model(model) {
-            return ProviderProfile::OpenAi;
+        if openai && !gpt_oss {
+            ProviderProfile::OpenAi
+        } else {
+            ProviderProfile::Generic
         }
-        ProviderProfile::Generic
     }
 
     /// Shape the request for dispatch under this profile: the provider's own
@@ -501,6 +507,21 @@ fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut S
 /// requests through to the engine, whose grammar compiler decides what it can
 /// constrain, so the gateway does not refuse ahead of it.
 pub fn is_openai_vendor_model(model: &str) -> bool {
+    let mut openai = false;
+    for segment in model.split('/') {
+        // The open-weight gpt-oss models are served locally whatever route
+        // segment precedes them: never the vendor's hosted contract.
+        if starts_with_ignore_ascii_case(segment, "gpt-oss") {
+            return false;
+        }
+        openai |= is_openai_segment(segment);
+    }
+    openai
+}
+
+/// Whether one `/`-separated segment names the vendor's hosted models: the
+/// `openai` route segment, a model family's prefix or the reasoning series.
+fn is_openai_segment(segment: &str) -> bool {
     const PREFIXES: [&str; 6] = [
         "gpt-",
         "chatgpt-",
@@ -509,21 +530,11 @@ pub fn is_openai_vendor_model(model: &str) -> bool {
         "text-embedding-",
         "omni-moderation",
     ];
-    // The open-weight gpt-oss models are served locally whatever route
-    // segment precedes them: never the vendor's hosted contract.
-    if model
-        .split('/')
-        .any(|segment| starts_with_ignore_ascii_case(segment, "gpt-oss"))
-    {
-        return false;
-    }
-    model.split('/').any(|segment| {
-        segment.eq_ignore_ascii_case("openai")
-            || PREFIXES
-                .iter()
-                .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
-            || is_openai_reasoning_series(segment)
-    })
+    segment.eq_ignore_ascii_case("openai")
+        || PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
+        || is_openai_reasoning_series(segment)
 }
 
 /// `o1`, `o3`, `o4-mini`, `o3-pro-2025-06-10`: an `o`, the series digit, then
