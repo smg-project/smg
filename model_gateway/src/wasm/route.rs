@@ -163,6 +163,7 @@ fn job_refusal_parts(error: &JobOutcomeError) -> (StatusCode, &'static str) {
         JobOutcomeError::NotQueued(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
         JobOutcomeError::TimedOut(_) => (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
         JobOutcomeError::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_SERVER_ERROR"),
+        JobOutcomeError::InFlight(_) => (StatusCode::CONFLICT, "CONFLICT"),
     }
 }
 
@@ -226,6 +227,11 @@ mod tests {
                 JobOutcomeError::Failed("the job failed".into()),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_SERVER_ERROR",
+            ),
+            (
+                JobOutcomeError::InFlight("0f1e2d3c".into()),
+                StatusCode::CONFLICT,
+                "CONFLICT",
             ),
         ];
         for (error, status, code) in cases {
