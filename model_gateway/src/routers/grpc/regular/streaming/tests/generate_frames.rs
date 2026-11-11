@@ -101,6 +101,7 @@ fn driven_body_of(
             StreamingProcessor::process_generate_streaming(tokenizer, stream, ctx, &tx, None).await
         };
         failure_flag.store(result.is_err(), Ordering::SeqCst);
+        ReadingEnd::of(&result)
     };
     (DrivenBody::new(Box::pin(reading), rx), failed, server)
 }

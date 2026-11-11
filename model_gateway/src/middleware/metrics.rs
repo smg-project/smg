@@ -21,7 +21,14 @@
 //! A body that failed after its head went out (the relay's upstream stream
 //! broke mid-body) keeps the head's status, told apart by the `error_code`
 //! [`BODY_FAILED_CODE`]: counted as its head alone, a truncated answer was a
-//! complete one.
+//! complete one. So does a body whose producer told the client of a failure
+//! in the body itself and then ended it as planned (the error event a
+//! stream ends with, then `[DONE]`), whatever the failure's cause: a worker
+//! that cut the stream, a constraint the engine could not keep, a fault of
+//! the request found after the first frame, a failure in the gateway's own
+//! reading. Its producer's word reaches the edge as `BodyFailure`, and the
+//! response counts as a body that failed, as the client read it; the event's
+//! own type names the cause to the client.
 //!
 //! A body has gone out in full at its last frame, or once its data frames
 //! add up to the length the response declared (`Content-Length`): an
@@ -35,7 +42,10 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{ready, Context, Poll},
     time::Instant,
 };
@@ -94,6 +104,32 @@ pub const CLIENT_CLOSED_REQUEST_CODE: &str = "client_closed_request";
 /// The type the SSE error event gives a stream the worker failed, shared with
 /// it so the two names cannot drift apart.
 pub const BODY_FAILED_CODE: &str = STREAM_ERROR_TYPE;
+
+/// The word of a streamed body's producer that the body told the client of a
+/// failure on its way out: the error event a stream the worker failed ends
+/// with, before its `[DONE]`. Such a body ends with its own last frame, so
+/// the frames alone say it went out in full; counted by them, a stream the
+/// engine cut was a plain 200. Handed to the edge's body wrapper with the
+/// body's duties ([`BodyDuties::failure`]) and read once the body has ended:
+/// the response then counts as its head's status with [`BODY_FAILED_CODE`],
+/// what the client read. One shared flag per streamed response; a body with
+/// no producer's word is counted by its frames alone.
+///
+/// [`BodyDuties::failure`]: super::edge_body::BodyDuties::failure
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BodyFailure(Arc<AtomicBool>);
+
+impl BodyFailure {
+    /// The producer's word: the body ended with the client told of a failure.
+    pub(crate) fn tell(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the producer told of a failure.
+    pub(crate) fn told(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 /// The length a response declares for its body: its `Content-Length`, or
 /// else what the body itself knows exactly. An HTTP/1.1 server writes that
@@ -1111,6 +1147,74 @@ mod client_closed_tests {
             sample("200", "stream_error"),
             "{rendered}"
         );
+    }
+
+    /// A router whose `/stream` handler hands out `body` once with the
+    /// producer's word `failure` on it, under the metrics layer.
+    fn told_stream_app(body: Body, failure: BodyFailure) -> Router {
+        let slot = Arc::new(Mutex::new(Some(body)));
+        Router::new()
+            .route(
+                "/stream",
+                get(move || {
+                    let body = slot
+                        .lock()
+                        .expect("slot")
+                        .take()
+                        .expect("handler called once");
+                    let failure = failure.clone();
+                    async move {
+                        let mut response = Response::new(body);
+                        BodyDuties::hand(&mut response, |duties| duties.failure = Some(failure));
+                        response
+                    }
+                }),
+            )
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
+    }
+
+    /// A streamed body whose producer told the client of a failure in the
+    /// body and then ended it as planned (the error event, then `[DONE]`)
+    /// counts as a body that failed, what the client read; one whose
+    /// producer told of nothing counts as it went out.
+    #[test]
+    fn a_body_whose_producer_told_of_a_failure_counts_as_a_failed_body() {
+        for (told, error_code) in [(true, "stream_error"), (false, "")] {
+            let rendered = render(|handle| async move {
+                let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+                let failure = BodyFailure::default();
+                let app =
+                    told_stream_app(Body::from_stream(ReceiverStream::new(rx)), failure.clone());
+                let response = app.oneshot(request("/stream")).await.expect("response");
+                let mut body = response.into_body();
+                tx.send(Ok(Bytes::from_static(b"data: {}\n\n")))
+                    .await
+                    .expect("send");
+                assert!(body.frame().await.expect("a frame").is_ok());
+                if told {
+                    failure.tell();
+                }
+                tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+                    .await
+                    .expect("send");
+                drop(tx);
+                assert!(body.frame().await.expect("a frame").is_ok());
+                assert!(body.frame().await.is_none(), "the body ends as planned");
+                // Counted at the end, once: the head's status, the failure
+                // named when the producer told of one.
+                assert_eq!(
+                    responses(&handle.render(), "/stream"),
+                    sample("200", error_code),
+                    "told: {told}"
+                );
+                drop(body);
+            });
+            assert_eq!(
+                responses(&rendered, "/stream"),
+                sample("200", error_code),
+                "told: {told}: {rendered}"
+            );
+        }
     }
 
     #[test]
