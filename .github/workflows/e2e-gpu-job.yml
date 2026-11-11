@@ -139,6 +139,11 @@ on:
         required: false
         type: string
         default: ""
+      gpu_lease:
+        description: "Use a pre-admitted shared AMD runner; requires the operator-installed container hook"
+        required: false
+        type: boolean
+        default: false
       enabled:
         description: "Whether this row runs: false skips the job before it takes a runner (a caller's matrix row the changed paths do not reach)"
         required: false
@@ -149,7 +154,7 @@ jobs:
   run:
     if: ${{ inputs.enabled }}
     runs-on: ${{ inputs.runner }}
-    container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+    container: ${{ inputs.gpu_lease && fromJSON(format('{{"image":{0}}}', toJSON(inputs.container_image))) || (inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE) }}
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
@@ -157,6 +162,7 @@ jobs:
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
+      AMD_CI_GPU_COUNT: ${{ inputs.gpu_lease && inputs.gpu_tier || '' }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
       E2E_VLLM_MORIIO_MODE: ${{ inputs.vllm_moriio_mode }}
       E2E_VLLM_MORIIO_BACKEND: ${{ inputs.vllm_moriio_backend }}
@@ -175,6 +181,15 @@ jobs:
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
+      - name: Verify shared GPU admission
+        if: inputs.gpu_lease
+        env:
+          GPU_VENDOR: ${{ inputs.gpu_vendor }}
+        run: |
+          test "$GPU_VENDOR" = amd
+          : "${AMD_CI_GPU_LEASE_ID:?shared GPU admission hook is missing}"
+          python3 -c 'import os, torch; assert torch.cuda.device_count() == int(os.environ["AMD_CI_GPU_COUNT"])'
+
       - name: Checkout code
         uses: actions/checkout@v7
 

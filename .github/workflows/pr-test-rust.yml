@@ -1467,7 +1467,8 @@ jobs:
     with:
       engine: vllm
       gpu_tier: "1"
-      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      runner: ${{ vars.SMG_AMD_SHARED_GPUS == 'true' && (vars.SMG_RUNNER_AMD_SHARED_GPU_1 || '1-gpu-mi300x-shared') || vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      gpu_lease: ${{ vars.SMG_AMD_SHARED_GPUS == 'true' }}
       # Measured on the AMD runner: the suite's eight vLLM workers took 18:52
       # to come up and the step 21:58 end to end before the servicers'
       # planned warm-up; with it (the default level, up to 300 s per worker)

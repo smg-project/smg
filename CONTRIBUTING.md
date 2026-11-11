@@ -204,6 +204,26 @@ image **by digest** (`repo/image@sha256:...`) rather than by tag: the value is
 read at job start, so a mutable tag silently changes the CI environment with no
 workflow change to review.
 
+### Optional shared AMD functional runner
+
+`SMG_AMD_SHARED_GPUS=true` routes only the AMD one-GPU chat row to
+`SMG_RUNNER_AMD_SHARED_GPU_1` (fallback `1-gpu-mi300x-shared`). Existing AMD
+enablement gates still apply. The flag defaults off; benchmarks, PD and NVIDIA
+jobs retain their existing paths.
+
+Enable only after deploying and qualifying shared admission from
+[vllm-router-ci](https://github.com/andyluo7/vllm-router-ci). The dedicated runner
+must acquire its GPU lease **before accepting the job**, then use the installed
+Actions container hook to supply render devices, CPU/RAM limits and `/models`.
+The reusable job supplies an image without legacy Docker options and checks the
+lease marker and visible GPU count. Do not attach this label to a legacy runner
+or allocate devices in a workflow step: the job container already exists then.
+
+The shared container has private PID, IPC and network namespaces. Before enabling,
+run concurrent jobs and cancel one to verify the other's resources are unaffected.
+CPU workflow checks do not establish that live-runtime result. Roll back by
+disabling the flag, then draining the dedicated shared runners.
+
 ### Benchmark workflows
 
 The `benchmark-*` workflows are gated so a fork does not silently burn its
