@@ -101,12 +101,31 @@ const ROUTER_FAMILIES: [RouterFamily; 5] = [
     },
 ];
 
+/// The mounted routers as one swapped value: by id for the readers that name
+/// a router, and per family for the weighted pick, which reads a family's
+/// slot instead of hashing its id (about twenty lookups a request across the
+/// families and their shadows). Rebuilt at every registration; routers are
+/// registered at startup and only read per request.
+#[derive(Default)]
+struct RouterTable {
+    by_id: HashMap<RouterId, Arc<dyn RouterTrait>>,
+    /// Each family's router when mounted, in [`ROUTER_FAMILIES`] order.
+    families: [Option<Arc<dyn RouterTrait>>; ROUTER_FAMILIES.len()],
+}
+
+impl RouterTable {
+    fn with(by_id: HashMap<RouterId, Arc<dyn RouterTrait>>) -> Self {
+        let families = std::array::from_fn(|i| by_id.get(&ROUTER_FAMILIES[i].router).cloned());
+        Self { by_id, families }
+    }
+}
+
 pub struct Gateway {
     worker_registry: Arc<WorkerRegistry>,
     /// Copy-on-write: routers are registered at startup and only read per
     /// request, so a wait-free `load()` replaces a `DashMap` shard lock (and a
     /// `RwLock` for the default) that every request would contend on.
-    routers: ArcSwap<HashMap<RouterId, Arc<dyn RouterTrait>>>,
+    routers: ArcSwap<RouterTable>,
     default_router: ArcSwapOption<RouterId>,
     enable_igw: bool,
     /// The message threads of the Messages route: resolved before the
@@ -124,7 +143,7 @@ impl Gateway {
     pub fn new(worker_registry: Arc<WorkerRegistry>) -> Self {
         Self {
             worker_registry,
-            routers: ArcSwap::from_pointee(HashMap::new()),
+            routers: ArcSwap::from_pointee(RouterTable::default()),
             default_router: ArcSwapOption::empty(),
             enable_igw: false,
             threads: MessageThreads::new(),
@@ -217,10 +236,10 @@ impl Gateway {
     }
 
     pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
-        self.routers.rcu(|routers| {
-            let mut next: HashMap<_, _> = (**routers).clone();
-            next.insert(id.clone(), Arc::clone(&router));
-            next
+        self.routers.rcu(|table| {
+            let mut by_id = table.by_id.clone();
+            by_id.insert(id.clone(), Arc::clone(&router));
+            RouterTable::with(by_id)
         });
 
         if self.default_router.load().is_none() {
@@ -234,7 +253,7 @@ impl Gateway {
     }
 
     pub fn router_count(&self) -> usize {
-        self.routers.load().len()
+        self.routers.load().by_id.len()
     }
 
     /// The families' weights for a model, in [`ROUTER_FAMILIES`] order: a
@@ -242,22 +261,22 @@ impl Gateway {
     /// its router is mounted, else 0; 0 as well for a family shadowed by a
     /// family that has weight.
     fn family_weights(
-        &self,
+        table: &RouterTable,
         size: impl Fn(RoutingPool) -> usize,
     ) -> [usize; ROUTER_FAMILIES.len()] {
-        let routers = self.routers.load();
         // A family has weight when its router is mounted and every pool has workers.
-        let has_weight = |family: &RouterFamily| {
-            routers.contains_key(&family.router) && family.pools.iter().all(|pool| size(*pool) > 0)
+        let has_weight = |i: usize, family: &RouterFamily| {
+            table.families[i].is_some() && family.pools.iter().all(|pool| size(*pool) > 0)
         };
         let mut weights = [0usize; ROUTER_FAMILIES.len()];
         for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
             let shadowed = family.shadowed_by.as_ref().is_some_and(|shadow| {
                 ROUTER_FAMILIES
                     .iter()
-                    .any(|other| other.router == *shadow && has_weight(other))
+                    .enumerate()
+                    .any(|(j, other)| other.router == *shadow && has_weight(j, other))
             });
-            if !shadowed && has_weight(family) {
+            if !shadowed && has_weight(i, family) {
                 weights[i] = family.pools.iter().map(|pool| size(*pool)).sum();
             }
         }
@@ -270,29 +289,34 @@ impl Gateway {
     /// way). A family whose router is not mounted takes no part; `None` when
     /// none has weight.
     fn pick_router_by_weights(
-        &self,
+        table: &RouterTable,
         weights: &[usize; ROUTER_FAMILIES.len()],
     ) -> Option<Arc<dyn RouterTrait>> {
-        let routers = self.routers.load();
-        let mounted = |family: &RouterFamily| routers.contains_key(&family.router);
-        let total: usize = ROUTER_FAMILIES
-            .iter()
-            .zip(weights)
-            .filter(|(family, weight)| **weight > 0 && mounted(family))
-            .map(|(_, weight)| *weight)
-            .sum();
+        // The families in the draw: mounted, with weight.
+        let in_draw = |i: usize| weights[i] > 0 && table.families[i].is_some();
+        let (total, drawn) = (0..ROUTER_FAMILIES.len())
+            .filter(|i| in_draw(*i))
+            .fold((0usize, 0usize), |(total, drawn), i| {
+                (total + weights[i], drawn + 1)
+            });
         if total == 0 {
             return None;
         }
+        if drawn == 1 {
+            // One family in the draw takes every pick: no random number.
+            return (0..ROUTER_FAMILIES.len())
+                .find(|i| in_draw(*i))
+                .and_then(|i| table.families[i].clone());
+        }
         let pick = ((rand::random::<f64>() * total as f64) as usize).min(total - 1);
         let mut cum = 0usize;
-        for (family, weight) in ROUTER_FAMILIES.iter().zip(weights) {
-            if *weight == 0 || !mounted(family) {
+        for (i, weight) in weights.iter().enumerate() {
+            if !in_draw(i) {
                 continue;
             }
             cum += weight;
             if pick < cum {
-                return routers.get(&family.router).cloned();
+                return table.families[i].clone();
             }
         }
         None
@@ -304,6 +328,7 @@ impl Gateway {
         let spec = spec_for_provider(provider)?;
         self.routers
             .load()
+            .by_id
             .get(&RouterId::new(spec.router_id))
             .cloned()
     }
@@ -329,8 +354,9 @@ impl Gateway {
             }
         }
         let size = |pool: RoutingPool| snapshot.pool(pool).len();
-        let weights = self.family_weights(size);
-        self.pick_router_by_weights(&weights).or_else(|| {
+        let table = self.routers.load();
+        let weights = Self::family_weights(&table, size);
+        Self::pick_router_by_weights(&table, &weights).or_else(|| {
             self.incomplete_disaggregated_router(
                 size(RoutingPool::GrpcEncode),
                 size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
@@ -364,7 +390,7 @@ impl Gateway {
         http_pair_pools: usize,
     ) -> Option<Arc<dyn RouterTrait>> {
         let routers = self.routers.load();
-        let family = |ids: &[&RouterId]| ids.iter().find_map(|id| routers.get(*id).cloned());
+        let family = |ids: &[&RouterId]| ids.iter().find_map(|id| routers.by_id.get(*id).cloned());
         if grpc_pair_pools > 0 || grpc_encode > 0 {
             let ids: &[&RouterId] = match (grpc_encode > 0, grpc_pair_pools > 0) {
                 (true, true) => &[&router_ids::GRPC_EPD, &router_ids::GRPC_PD],
@@ -397,13 +423,16 @@ impl Gateway {
         }
         let size = |pool| snapshot.pool(pool).len();
         let grpc_prefill = size(RoutingPool::GrpcPrefill);
-        self.pick_router_by_weights(&[
-            grpc_prefill,
-            grpc_prefill,
-            0,
-            size(RoutingPool::GrpcPipelineRegular),
-            0,
-        ])
+        Self::pick_router_by_weights(
+            &self.routers.load(),
+            &[
+                grpc_prefill,
+                grpc_prefill,
+                0,
+                size(RoutingPool::GrpcPipelineRegular),
+                0,
+            ],
+        )
         .or_else(|| self.select_router_for_request(Some(model_id)))
     }
 
@@ -439,7 +468,7 @@ impl Gateway {
                     default_id.as_str(),
                     model_id
                 );
-                return self.routers.load().get(&**default_id).cloned();
+                return self.routers.load().by_id.get(&**default_id).cloned();
             }
         }
 
@@ -456,7 +485,7 @@ impl Gateway {
             self.default_router
                 .load()
                 .as_ref()
-                .and_then(|id| self.routers.load().get(&**id).cloned())
+                .and_then(|id| self.routers.load().by_id.get(&**id).cloned())
         })
     }
 
@@ -569,8 +598,8 @@ impl RouterTrait for Gateway {
         // Model info is fleet-wide: the default router answers, else any.
         let routers = self.routers.load();
         let router = match self.default_router.load_full() {
-            Some(id) => routers.get(&*id).cloned(),
-            None => routers.values().next().cloned(),
+            Some(id) => routers.by_id.get(&*id).cloned(),
+            None => routers.by_id.values().next().cloned(),
         };
         match router {
             Some(router) => router.get_model_info(req).await,
@@ -675,13 +704,16 @@ impl RouterTrait for Gateway {
                 // its prefill pool alone, whichever gRPC family is mounted.
                 let size = |pool| snapshot.pool(pool).len();
                 let grpc_prefill = size(RoutingPool::GrpcPrefill);
-                self.pick_router_by_weights(&[
-                    grpc_prefill,
-                    grpc_prefill,
-                    size(RoutingPool::HttpPrefill),
-                    size(RoutingPool::GrpcPipelineRegular),
-                    size(RoutingPool::HttpRegular),
-                ])
+                Self::pick_router_by_weights(
+                    &self.routers.load(),
+                    &[
+                        grpc_prefill,
+                        grpc_prefill,
+                        size(RoutingPool::HttpPrefill),
+                        size(RoutingPool::GrpcPipelineRegular),
+                        size(RoutingPool::HttpRegular),
+                    ],
+                )
                 // A model no pool serves goes to the default router, like
                 // every other route, so the answer is its model_not_found.
                 .or_else(|| self.select_router_for_request(Some(model_id)))
@@ -828,7 +860,7 @@ impl RouterTrait for Gateway {
                     "Decisions requires a regular HTTP or SGLang gRPC worker for this model",
                 );
             }
-            self.pick_router_by_weights(&[0, 0, 0, grpc, http])
+            Self::pick_router_by_weights(&self.routers.load(), &[0, 0, 0, grpc, http])
         } else {
             self.select_router_for_request(Some(model_id))
         };
@@ -876,7 +908,11 @@ impl RouterTrait for Gateway {
                     "SystemOne requires a regular HTTP worker for this model",
                 );
             }
-            self.routers.load().get(&router_ids::HTTP_REGULAR).cloned()
+            self.routers
+                .load()
+                .by_id
+                .get(&router_ids::HTTP_REGULAR)
+                .cloned()
         } else {
             self.select_router_for_request(Some(model_id))
         };
@@ -1015,7 +1051,7 @@ impl RouterTrait for Gateway {
 impl std::fmt::Debug for Gateway {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gateway")
-            .field("routers", &self.routers.load().len())
+            .field("routers", &self.routers.load().by_id.len())
             .field("enable_igw", &self.enable_igw)
             .field("workers_count", &self.worker_registry.get_all().len())
             .finish()
