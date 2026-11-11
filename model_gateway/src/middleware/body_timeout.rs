@@ -53,6 +53,18 @@ pub(crate) fn request_body_too_large_response() -> Response {
     )
 }
 
+/// The refusal of a body whose client made no progress for the stall
+/// timeout, under [`REQUEST_BODY_STALLED`]: one code and one message for
+/// every framing (the buffered read here, the streamed read in the HTTP
+/// router).
+pub(crate) fn request_body_stalled_response(timeout_secs: u64) -> Response {
+    create_error(
+        StatusCode::REQUEST_TIMEOUT,
+        REQUEST_BODY_STALLED,
+        format!("No request body bytes arrived from the client for {timeout_secs} seconds"),
+    )
+}
+
 const READING: u8 = 0;
 const STALLED: u8 = 1;
 const TIMED_OUT: u8 = 2;
@@ -103,11 +115,7 @@ fn settled(timeouts: RequestBodyTimeouts, outcome: &AtomicU8, response: Response
                 timeout_secs,
                 "Request body stalled waiting on the client; ending the request"
             );
-            create_error(
-                StatusCode::REQUEST_TIMEOUT,
-                REQUEST_BODY_STALLED,
-                format!("No request body bytes arrived from the client for {timeout_secs} seconds"),
-            )
+            request_body_stalled_response(timeout_secs)
         }
         TIMED_OUT => {
             let timeout_secs = timeouts.total.as_secs();
