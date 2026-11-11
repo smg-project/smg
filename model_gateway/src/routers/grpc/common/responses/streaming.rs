@@ -18,6 +18,7 @@ use openai_protocol::{
         ResponsesResponse, ResponsesUsage,
     },
 };
+use serde::Serialize;
 use serde_json::json;
 use smg_mcp::{self as mcp};
 use tokio::sync::oneshot;
@@ -107,6 +108,21 @@ fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
         Some("storage_unavailable") => "storage_unavailable",
         Some(_) => "other",
     }
+}
+
+/// The `response.output_text.delta` event of one token, serialized straight
+/// into its frame: the fields in the event's order (the bytes the `json!` map
+/// wrote under `preserve_order`), the item id and the delta borrowed rather
+/// than copied into a map per token.
+#[derive(Serialize)]
+struct OutputTextDelta<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    output_index: usize,
+    item_id: &'a str,
+    content_index: usize,
+    delta: &'a str,
 }
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
@@ -356,24 +372,6 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub fn emit_text_delta(
-        &mut self,
-        delta: &str,
-        output_index: usize,
-        item_id: &str,
-        content_index: usize,
-    ) -> serde_json::Value {
-        self.accumulated_text.push_str(delta);
-        json!({
-            "type": OutputTextEvent::DELTA,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "content_index": content_index,
-            "delta": delta
-        })
-    }
-
     pub fn emit_text_done(
         &mut self,
         output_index: usize,
@@ -603,11 +601,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Helper to add optional fields to JSON object
-    fn add_optional_field<T: serde::Serialize>(
-        obj: &mut serde_json::Value,
-        key: &str,
-        value: Option<&T>,
-    ) {
+    fn add_optional_field<T: Serialize>(obj: &mut serde_json::Value, key: &str, value: Option<&T>) {
         if let Some(val) = value {
             obj[key] = json!(val);
         }
@@ -1329,8 +1323,8 @@ impl ResponseStreamEventEmitter {
             }
 
             // Emit text delta
-            let event = self.emit_text_delta(content, output_index, &item_id, content_index);
-            self.send_event(&event, tx).await?;
+            self.send_text_delta(content, output_index, &item_id, content_index, tx)
+                .await?;
         }
         Ok(())
     }
@@ -1442,6 +1436,17 @@ impl ResponseStreamEventEmitter {
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("message");
+        self.send_typed(event_type, event, tx).await
+    }
+
+    /// One event of any serializable shape under `event_type`: the one frame
+    /// writer of this emitter, serialized once into the frame.
+    async fn send_typed<T: Serialize>(
+        &mut self,
+        event_type: &str,
+        event: &T,
+        tx: &SseSender,
+    ) -> Result<(), String> {
         let frame = self
             .encoder
             .encode_event(event_type, event)
@@ -1451,12 +1456,54 @@ impl ResponseStreamEventEmitter {
                     "Failed to serialize event: its type breaks the frame".to_string()
                 }
             })?;
-
         if tx.send(Ok(frame)).await.is_err() {
             return Err("Client disconnected".to_string());
         }
-
         Ok(())
+    }
+
+    /// The `response.output_text.delta` event of one token, sent as
+    /// [`OutputTextDelta`]; the text accumulates as it did under the map.
+    pub async fn send_text_delta(
+        &mut self,
+        delta: &str,
+        output_index: usize,
+        item_id: &str,
+        content_index: usize,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        self.accumulated_text.push_str(delta);
+        let event = OutputTextDelta {
+            kind: OutputTextEvent::DELTA,
+            sequence_number: self.next_sequence(),
+            output_index,
+            item_id,
+            content_index,
+            delta,
+        };
+        self.send_typed(OutputTextEvent::DELTA, &event, tx).await
+    }
+
+    /// [`Self::send_text_delta`] for the streams that log a failed send
+    /// instead of ending on it; `true` when the event went out.
+    pub async fn send_text_delta_best_effort(
+        &mut self,
+        delta: &str,
+        output_index: usize,
+        item_id: &str,
+        content_index: usize,
+        tx: &SseSender,
+    ) -> bool {
+        match self
+            .send_text_delta(delta, output_index, item_id, content_index, tx)
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("Failed to send event (likely client disconnect): {}", e);
+                false
+            }
+        }
     }
 
     /// Send event and log any errors (typically client disconnect)
@@ -1680,6 +1727,54 @@ mod tests {
         assert_responses_api_usage, responses_api_test_usage,
     };
 
+    /// The typed text-delta event writes the frame the `json!` event wrote,
+    /// byte for byte (the same keys in the same order, the same escaping, the
+    /// same sequence number), and accumulates the text the same way.
+    #[tokio::test]
+    async fn the_typed_text_delta_is_the_json_event_frame_byte_for_byte() {
+        let frames = |mut emitter: ResponseStreamEventEmitter, typed: bool| async move {
+            let (tx, mut rx) = sse_channel();
+            for (index, delta) in ["héllo \"there\"\n", "", "\u{1F600} tab\t"]
+                .into_iter()
+                .enumerate()
+            {
+                if typed {
+                    emitter
+                        .send_text_delta(delta, 1, "msg_1", index, &tx)
+                        .await
+                        .unwrap();
+                } else {
+                    // The event as the `json!` map wrote it before the typed form.
+                    emitter.accumulated_text.push_str(delta);
+                    let event = json!({
+                        "type": OutputTextEvent::DELTA,
+                        "sequence_number": emitter.next_sequence(),
+                        "output_index": 1,
+                        "item_id": "msg_1",
+                        "content_index": index,
+                        "delta": delta
+                    });
+                    emitter.send_event(&event, &tx).await.unwrap();
+                }
+            }
+            drop(tx);
+            let mut frames = Vec::new();
+            while let Some(Ok(bytes)) = rx.recv().await {
+                frames.push(bytes);
+            }
+            (frames, emitter.accumulated_text.clone())
+        };
+        let new =
+            |seq| ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), seq);
+        let (json_frames, json_text) = frames(new(7), false).await;
+        let (typed_frames, typed_text) = frames(new(7), true).await;
+        assert_eq!(typed_frames, json_frames);
+        assert_eq!(typed_text, json_text);
+        assert!(std::str::from_utf8(&typed_frames[0])
+            .unwrap()
+            .starts_with("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":"));
+    }
+
     /// The frame of an event: its `type` on the `event:` line and the JSON on
     /// the `data:` line, the text escaped as JSON; an error frame has no
     /// `event:` line.
@@ -1688,8 +1783,10 @@ mod tests {
         let mut emitter =
             ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
         let (tx, mut rx) = sse_channel();
-        let event = emitter.emit_text_delta("héllo \"there\"\n", 1, "msg_1", 0);
-        emitter.send_event(&event, &tx).await.unwrap();
+        emitter
+            .send_text_delta("héllo \"there\"\n", 1, "msg_1", 0, &tx)
+            .await
+            .unwrap();
         emitter
             .emit_error("engine unavailable", Some("server_error"), &tx)
             .await;
