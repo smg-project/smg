@@ -1045,8 +1045,13 @@ pub(crate) struct ResponseState {
     /// unchanged (completion, generate, decisions, embeddings, classify).
     pub engine_counts: Option<TokenCounts>,
 
-    /// Responses API iteration result (Harmony only, for tool loop orchestration)
-    pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
+    /// Responses API iteration result (Harmony only, for tool loop
+    /// orchestration). Behind a pointer: the field is empty on every other
+    /// path, and the dispatch context is boxed once per request; inline, its
+    /// 208 bytes (two usage objects among them) had pushed that box over the
+    /// allocator's 2,560-byte class edge on every chat, completion and
+    /// Messages request.
+    pub responses_iteration_result: Option<Box<super::harmony::ResponsesIterationResult>>,
 }
 
 impl RequestContext {
@@ -2385,5 +2390,25 @@ mod tests {
             )
         );
         server.abort();
+    }
+
+    /// The Harmony iteration result rides behind a pointer, and the dispatch
+    /// context, boxed once per request, fits the allocator's 2,560-byte class
+    /// on 64-bit targets: inline, the result's 208 bytes had taken the box
+    /// from 2,520 to 2,584 bytes, one class up, when the usage object it and
+    /// the final response carry grew by 32 bytes each. A field that grows
+    /// the context past the class needs its own read.
+    #[test]
+    fn the_iteration_result_rides_behind_a_pointer_and_the_dispatch_context_fits_its_class() {
+        let state = ResponseState::default();
+        assert_eq!(
+            size_of_val(&state.responses_iteration_result),
+            size_of::<usize>()
+        );
+        assert!(
+            size_of::<DispatchContext>() <= 2560,
+            "the dispatch context is {} bytes",
+            size_of::<DispatchContext>()
+        );
     }
 }

@@ -1641,7 +1641,7 @@ impl RequestPipeline {
                         rate_limit_cell
                             .settle(Self::recorded_settlement(&dctx.response))
                             .await;
-                        Ok(iteration_result)
+                        Ok(*iteration_result)
                     }
                     None => {
                         error!(
