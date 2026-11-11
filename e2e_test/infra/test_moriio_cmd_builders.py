@@ -21,13 +21,17 @@ def _moriio_lane(monkeypatch):
     monkeypatch.setenv("E2E_MORIIO_HOST", "10.0.0.7")
 
 
-def _worker(worker_type: WorkerType, tp: int | None = None) -> Worker:
+def _worker(
+    worker_type: WorkerType,
+    tp: int | None = None,
+    mode: ConnectionMode = ConnectionMode.HTTP,
+) -> Worker:
     return Worker(
         model_id=_MODEL,
         engine="vllm",
         port=50100,
         gpu_ids=[0],
-        mode=ConnectionMode.HTTP,
+        mode=mode,
         worker_type=worker_type,
         tp=tp,
     )
@@ -41,8 +45,9 @@ def _kv_config(worker: Worker) -> dict:
 @pytest.mark.parametrize(
     "worker_type,role", [(WorkerType.PREFILL, "kv_producer"), (WorkerType.DECODE, "kv_consumer")]
 )
-def test_a_pd_worker_runs_the_moriio_connector(worker_type, role):
-    config = _kv_config(_worker(worker_type))
+@pytest.mark.parametrize("mode", [ConnectionMode.HTTP, ConnectionMode.GRPC])
+def test_a_pd_worker_runs_the_moriio_connector(worker_type, role, mode):
+    config = _kv_config(_worker(worker_type, mode=mode))
 
     assert config["kv_connector"] == "MoRIIOConnector"
     assert config["kv_role"] == role
@@ -51,14 +56,22 @@ def test_a_pd_worker_runs_the_moriio_connector(worker_type, role):
     assert extra["http_port"] == "50100"
     assert extra["read_mode"] is True
     assert extra["backend"] == "rdma"
+    if role == "kv_producer":
+        # Sliced READ readers require this capability in the producer's
+        # handshake before they can post I/O against its source allocation.
+        assert extra.get("read_ack_fenced_hold") is True
+    else:
+        assert "read_ack_fenced_hold" not in extra
 
 
-def test_write_mode_turns_read_mode_off(monkeypatch):
+@pytest.mark.parametrize("worker_type", [WorkerType.PREFILL, WorkerType.DECODE])
+def test_write_mode_turns_read_mode_off(monkeypatch, worker_type):
     monkeypatch.setenv("E2E_VLLM_MORIIO_MODE", "write")
 
-    extra = _kv_config(_worker(WorkerType.DECODE))["kv_connector_extra_config"]
+    extra = _kv_config(_worker(worker_type))["kv_connector_extra_config"]
 
     assert extra["read_mode"] is False
+    assert "read_ack_fenced_hold" not in extra
 
 
 def test_the_xgmi_engine_can_be_chosen(monkeypatch):

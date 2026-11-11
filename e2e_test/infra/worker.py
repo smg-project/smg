@@ -665,7 +665,7 @@ class Worker:
         else:
             for port in self._moriio_ports:
                 reserve_port(port)
-        return {
+        extra = {
             "host_ip": moriio_host(),
             "http_port": str(self.port),
             "handshake_port": str(self.moriio_handshake_port),
@@ -673,6 +673,10 @@ class Worker:
             "read_mode": vllm_moriio_mode() == "read",
             "backend": vllm_moriio_backend(),
         }
+        if extra["read_mode"] and self.worker_type == WorkerType.PREFILL:
+            # Opt in to ACK-fenced source ownership for sliced READ readers.
+            extra["read_ack_fenced_hold"] = True
+        return extra
 
     def moriio_registration(self) -> dict:
         """``POST /workers`` fields that let SMG's HTTP PD router hand KV to this worker.
