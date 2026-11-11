@@ -123,8 +123,9 @@ pub struct BadFile(pub ConfigError);
 
 /// The reason of a refusal, for the file's own refusal to carry in front of
 /// its field and path: a parser's refusal names its entry's field with the
-/// value redacted, a rule its reason.
-fn entry_refusal(error: ConfigError) -> String {
+/// value redacted, a rule its reason. A language binding that reads a key
+/// file refuses a bad entry the same way.
+pub fn entry_refusal(error: ConfigError) -> String {
     match error {
         ConfigError::InvalidValue { reason, .. } | ConfigError::ValidationFailed { reason } => {
             reason
