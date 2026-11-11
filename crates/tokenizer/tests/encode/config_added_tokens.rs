@@ -236,6 +236,21 @@ fn an_entry_without_text_takes_no_id() {
 
     assert_eq!(tokenizer.token_to_id("<|audio_end|>"), None);
     assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 3);
+
+    // The same without a content key, and with a null content: the reference
+    // reads both as the empty text, and so does the loader.
+    for entry in [
+        json!({"special": true}),
+        json!({"content": null, "special": true}),
+    ] {
+        let dir = TempDir::new().expect("a temp dir");
+        let mut config = config(&[(2, "<|im_start|>"), (4, "<|audio_end|>")]);
+        config["added_tokens_decoder"]["3"] = entry;
+        let tokenizer =
+            load(&dir, &tokenizer_json(&[], &FILE_TOKENS), config).expect("the checkpoint loads");
+        assert_eq!(tokenizer.token_to_id("<|audio_end|>"), None);
+        assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 3);
+    }
 }
 
 #[test]

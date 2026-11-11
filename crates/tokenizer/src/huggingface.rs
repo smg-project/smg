@@ -217,7 +217,10 @@ pub(crate) const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|
 
 #[derive(Deserialize)]
 struct AddedTokenConfig {
-    content: String,
+    /// Missing or null in the file is the empty text: no token, as the
+    /// reference's binding reads it.
+    #[serde(default)]
+    content: Option<String>,
     #[serde(default)]
     single_word: bool,
     #[serde(default)]
@@ -713,7 +716,8 @@ impl HuggingFaceTokenizer {
                             config_path.display()
                         ))
                     })?;
-                if entry.content.is_empty() {
+                let content = entry.content.unwrap_or_default();
+                if content.is_empty() {
                     // No text is no token: the pipeline's add ignores it, and so
                     // does the placement below.
                     warn!(
@@ -723,7 +727,7 @@ impl HuggingFaceTokenizer {
                     continue;
                 }
                 let normalized = entry.normalized.unwrap_or(!entry.special);
-                let token = AddedToken::from(entry.content, entry.special)
+                let token = AddedToken::from(content, entry.special)
                     .single_word(entry.single_word)
                     .lstrip(entry.lstrip)
                     .rstrip(entry.rstrip)
