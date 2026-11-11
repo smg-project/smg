@@ -7,7 +7,10 @@ reads the release's version when that is higher than main's (crates.io and PyPI 
 version twice, so the next cut must start above what the release published). A component
 main already carries at a higher version keeps it, the gateway included: after a patch of an
 older line (v1.14.1 once v1.15.0 is out) main never goes back, since the nightly and the next
-cut derive their versions from it.
+cut derive their versions from it. The dependency floors a package puts on another of ours
+(a ``"smg-grpc-proto>=X.Y.Z"`` line of a pyproject) follow the release's as well: a release
+raises a floor when it ships fields the code reads, and a fresh install from main must not
+accept an older package; a floor main already raised higher stays.
 
 Usage:
     sync_versions.py <ref> <gateway-version>
@@ -30,6 +33,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION_PARTS = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+)|-(dev))?$")
+# a dependency floor line of a pyproject: the indent and quote, the name, the floor, the rest of the line
+FLOOR = re.compile(r'^(\s*")([A-Za-z0-9_.-]+)>=(\d+\.\d+\.\d+)(".*)$')
 
 
 def _checker():
@@ -54,6 +59,17 @@ def version_key(version: str) -> tuple[int, ...]:
     major, minor, patch, rc, dev = match.groups()
     stage = 0 if dev else 1 if rc else 2
     return (int(major), int(minor), int(patch), stage, int(rc or 0))
+
+
+def floors(text: str, names: set[str]) -> dict[str, list[tuple[str, str]]]:
+    """Per package name of ours, the floor lines of ``text`` in order: each line as written and
+    the floor it names."""
+    found: dict[str, list[tuple[str, str]]] = {}
+    for line in text.split("\n"):
+        match = FLOOR.match(line)
+        if match and match[2] in names:
+            found.setdefault(match[2], []).append((line, match[3]))
+    return found
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,6 +144,34 @@ def main(argv: list[str] | None = None) -> int:
         set_version(component.version_file, kind, theirs)
         if component.dep_key:
             pin(component.dep_key, theirs)
+
+    # the floors a package puts on another of ours: its k-th floor line for a name takes the
+    # release's k-th, as the release wrote it, when the release's floor is higher
+    names = {component.name for component in crv.PACKAGES}
+    for component in crv.PACKAGES:
+        theirs_text = repo.show(ref, component.version_file)
+        if theirs_text is None or not (ROOT / component.version_file).is_file():
+            continue
+        theirs = floors(theirs_text, names)
+        lines = repo.read(component.version_file).split("\n")
+        seen: dict[str, int] = {}
+        changed = False
+        for i, line in enumerate(lines):
+            match = FLOOR.match(line)
+            if not match or match[2] not in names:
+                continue
+            k = seen.get(match[2], 0)
+            seen[match[2]] = k + 1
+            if k >= len(theirs.get(match[2], [])):
+                continue
+            their_line, their_floor = theirs[match[2]][k]
+            if version_key(their_floor) <= version_key(match[3]):
+                continue
+            lines[i] = their_line
+            moved.append(f"{component.version_file} {match[2]}>=: {match[3]} -> {their_floor}")
+            changed = True
+        if changed:
+            repo.write(component.version_file, "\n".join(lines))
 
     if moved:
         print(f"sync_versions: {len(moved)} version line(s) follow {ref}:")

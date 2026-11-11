@@ -3872,6 +3872,66 @@ def test_sync_versions_moves_main_to_the_next_development_version_when_a_release
     assert repo.version_of("model_gateway/Cargo.toml") == "1.15.0-dev"
 
 
+def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sandbox) -> None:
+    """A release branch raises the floor a package puts on another of ours when it ships fields the
+    code reads (the servicer's floor on the proto package). After the release, main's floor follows
+    the branch's, the line as the branch wrote it; a floor on a package that is not ours is left to
+    the maintainer; a floor main already raised higher stays; a second run changes nothing."""
+    floor = '    "smg-grpc-proto>=0.4.0",  # the fields the servicer reads\n'
+    repo.commit_main(
+        "chore(servicer): the floors",
+        "grpc_servicer/pyproject.toml",
+        '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n'
+        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n',
+    )
+    repo.cut()
+    # the branch's bump raised both floors with what it published (by hand, as a cut's review does)
+    repo.git("switch", "--quiet", "release/1.14")
+    raised = '    "smg-grpc-proto>=0.5.0",  # 0.5.0 adds the fields the servicer reads\n'
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml")
+        .replace(floor, raised)
+        .replace('"grpcio>=1.60"', '"grpcio>=1.70"'),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(release): the servicer's floors")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    done = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    text = repo.read("grpc_servicer/pyproject.toml")
+    assert raised in text, text
+    assert '"grpcio>=1.60"' in text, "a floor on a package that is not ours is the maintainer's"
+    assert "grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0" in done.stdout
+    again = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert again.returncode == 0 and "already follows" in again.stdout, again.stdout
+    # a floor main raised above the branch's stays where main put it
+    higher = text.replace(raised, '    "smg-grpc-proto>=0.6.0",  # main went further\n')
+    repo.put("grpc_servicer/pyproject.toml", higher)
+    kept = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert kept.returncode == 0 and "already follows" in kept.stdout, kept.stdout
+    assert repo.read("grpc_servicer/pyproject.toml") == higher
+
+
 def test_sync_versions_usage_and_version_order() -> None:
     import importlib.util
 
