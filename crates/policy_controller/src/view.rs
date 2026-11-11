@@ -181,6 +181,13 @@ impl LoadRow {
     pub fn kv_usage(&self) -> f32 {
         f32::from(self.kv_usage_permille) / 1000.0
     }
+
+    /// The running requests' share of the KV cache as a ratio, `0.0` to
+    /// `1.0`: the occupancy a request waits on, the reclaimable prefix
+    /// cache left out (a report without the split carries its usage here).
+    pub fn active_kv(&self) -> f32 {
+        f32::from(self.active_kv_permille) / 1000.0
+    }
 }
 
 /// A tenant or a session key as the view carries it: its fingerprint, and the

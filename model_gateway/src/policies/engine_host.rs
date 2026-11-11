@@ -1084,6 +1084,61 @@ mod tests {
         assert_eq!(worker_id(a.as_ref()), worker_id(a.as_ref()));
     }
 
+    /// The legacy policy's case through the host: an idle worker whose cache
+    /// is full of reclaimable prefixes (usage 1.0, its running requests
+    /// holding none) beats a busy half-full one under the pressure term, and
+    /// a report without the split falls back to the usage it has.
+    #[test]
+    fn a_reclaimable_prefix_cache_does_not_make_an_idle_worker_busy_through_the_host() {
+        let decider = decider(&PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        });
+        let workers = pool(2);
+        let busy = || {
+            let mut busy = one_rank_load(0, 0.5, 2000.0);
+            busy.loads[0].active_token_usage = Some(0.5);
+            busy
+        };
+        let mut idle = one_rank_load(0, 1.0, 2000.0);
+        idle.loads[0].num_running_reqs = 0;
+        idle.loads[0].active_token_usage = Some(0.0);
+        let (tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (workers[0].url().to_string(), idle),
+            (workers[1].url().to_string(), busy()),
+        ]));
+        decider.set_load_receiver(Some(rx));
+        let leader = || {
+            let (decision, _) = decider.decide(&request(), &workers, &[]);
+            decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .first()
+                .map(|t| t.position)
+        };
+        assert_eq!(
+            leader(),
+            Some(0),
+            "the idle worker's reclaimable cache is no pressure"
+        );
+        // Without the split the usage stands in for the share: the first
+        // worker now reads full and the half-full one leads.
+        let mut unsplit = one_rank_load(0, 1.0, 2000.0);
+        unsplit.loads[0].num_running_reqs = 0;
+        tx.send(LoadSnapshot::from_loads_for_test(vec![
+            (workers[0].url().to_string(), unsplit),
+            (workers[1].url().to_string(), busy()),
+        ]))
+        .expect("the receiver lives");
+        assert_eq!(
+            leader(),
+            Some(1),
+            "a report without the split falls back to its usage"
+        );
+    }
+
     #[test]
     fn the_view_row_reads_the_load_feed_and_the_scorer_takes_the_idle_worker() {
         let decider = decider(&PolicyConfig::LeastLoad {
