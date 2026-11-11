@@ -14,6 +14,8 @@ BASELINE = (
     "e2e_test/infra/test_epd_cmd_builders.py",
 )
 COMPONENTS = (
+    ("scripts/ci_sglang_mxfp4_numeric.py", "scripts/tests/test_ci_sglang_mxfp4_numeric.py"),
+    ("scripts/ci_sglang_mxfp4_fallback.py", "scripts/tests/test_ci_sglang_mxfp4_fallback.py"),
     ("e2e_test/infra/cloud_credentials.py", "e2e_test/infra/test_cloud_credentials.py"),
     ("scripts/ci/validate_pr_benchmark.py", "scripts/ci/tests/test_validate_pr_benchmark.py"),
     ("scripts/ci_responses_evidence.py", "scripts/tests/test_ci_responses_evidence.py"),
@@ -35,6 +37,7 @@ COMPONENTS = (
 # that brings the suite, and both paths must exist: a suite the tree lacks is an
 # error, not a notice, so a deleted or renamed suite is noticed at once.
 REGRESSIONS = (
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_env.py"),
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_grpc_health.py"),
     ("scripts/ci_reap_job_processes.py", "scripts/tests/test_ci_reap_job_processes.py"),
     ("e2e_test/infra/gateway.py", "e2e_test/infra/test_cloud_mcp_readiness.py"),
