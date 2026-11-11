@@ -535,9 +535,6 @@ impl Config {
         if let Some(blocks) = kv_blocks {
             cfg.engine.kv_capacity_tokens = blocks * u64::from(cfg.engine.block_size);
         }
-        // `--output-tokens` doubles as the realistic engine's default output
-        // length when a request omits `max_tokens`.
-        cfg.engine.max_new_default = cfg.output_tokens;
         if cfg.http_count == 0 && cfg.grpc_count == 0 && cfg.zmq_count == 0 {
             return Err(format!(
                 "nothing to do: pass --http-count, --grpc-count, and/or --zmq-count\n\n{}",
