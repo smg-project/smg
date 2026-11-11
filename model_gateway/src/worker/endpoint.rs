@@ -253,7 +253,8 @@ impl Endpoint {
         self.port
     }
 
-    /// Path prefix, if the address carries one.
+    /// What follows the authority (a path prefix, query or fragment), if the
+    /// address carries anything.
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref()
     }
@@ -656,13 +657,21 @@ mod tests {
     /// userinfo delimiter. Before, `grpc://host:9000?token=a@b` parsed as the
     /// userinfo `host:9000?token=a` on the host `b`: a spurious "carries
     /// userinfo" warning, a masked form naming the wrong host and a key that
-    /// was not the backend's.
+    /// was not the backend's. The same tail without an `@` parses the same
+    /// way; before, the port parser read `9000?token=x` and refused it, while
+    /// `validate_worker_url` accepted the URL, so such a worker registered but
+    /// could not be found again by its address.
     #[test]
     fn an_at_sign_inside_a_query_or_fragment_is_not_userinfo() {
         for (spelling, key, masked) in [
             (
                 "grpc://host:9000?token=a@b",
                 "host:9000?token=a@b",
+                "grpc://host:9000",
+            ),
+            (
+                "grpc://host:9000?token=x",
+                "host:9000?token=x",
                 "grpc://host:9000",
             ),
             ("http://host:9000#a@b", "host:9000#a@b", "http://host:9000"),
