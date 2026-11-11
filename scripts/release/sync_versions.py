@@ -71,13 +71,26 @@ def line_of(text: str, start: int, end: int) -> tuple[int, int]:
     return first, len(text) if last < 0 else last
 
 
+def in_comment(text: str, start: int) -> bool:
+    """Whether ``text[start]`` sits in a TOML comment: a ``#`` outside quotes earlier on its line
+    (a comment that quotes a floor names no requirement)."""
+    quoted = False
+    for char in text[text.rfind("\n", 0, start) + 1 : start]:
+        if char == '"':
+            quoted = not quoted
+        elif char == "#" and not quoted:
+            return True
+    return False
+
+
 def floors(text: str, names: set[str]) -> dict[str, list[tuple[str, str, str | None]]]:
     """Per package name of ours, the floor requirements of ``text`` in order of appearance: each
     quoted requirement as written, the floor it names, and the whole line when the requirement
-    is alone on it (None when it shares the line, as in an extra's inline array)."""
+    is alone on it (None when it shares the line, as in an extra's inline array). A floor quoted
+    inside a comment is not one."""
     found: dict[str, list[tuple[str, str, str | None]]] = {}
     for match in FLOOR.finditer(text):
-        if match[1] in names:
+        if match[1] in names and not in_comment(text, match.start()):
             first, last = line_of(text, match.start(), match.end())
             line = text[first:last]
             alone = line if ALONE.match(line) else None
@@ -175,18 +188,23 @@ def main(argv: list[str] | None = None) -> int:
         end = 0
         for match in FLOOR.finditer(text):
             name, floor = match[1], match[2]
-            if name not in names:
+            if name not in names or in_comment(text, match.start()):
                 continue
             k = seen.get(name, 0)
             seen[name] = k + 1
-            if k >= len(theirs.get(name, [])):
+            if match.start() < end or k >= len(theirs.get(name, [])):
                 continue
             their_requirement, their_floor, their_line = theirs[name][k]
             if version_key(their_floor) <= version_key(floor):
                 continue
             first, last = line_of(text, match.start(), match.end())
             if their_line is not None and ALONE.match(text[first:last]):
-                pieces += [text[end:first], their_line]
+                # the release's requirement and comment, main's separator: main may have put an
+                # entry after the floor the release's array ends with
+                comma = "," if text[match.end() : match.end() + 1] == "," else ""
+                head = re.match(r'(\s*"[^"]+"),?', their_line)
+                assert head is not None  # ALONE matched the line
+                pieces += [text[end:first], head[1] + comma + their_line[head.end() :]]
                 end = last
             else:
                 pieces += [text[end : match.start()], their_requirement]
