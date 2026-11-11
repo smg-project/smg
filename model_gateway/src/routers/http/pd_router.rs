@@ -682,9 +682,13 @@ impl PDRouter {
         let (reservation, denial) = tenant_rate_limit::reserve(
             self.rate_limit_manager.as_deref(),
             tenant_meta,
-            &original_request,
             model,
-            None,
+            tenant_rate_limit::estimate(
+                self.rate_limit_manager.as_deref(),
+                tenant_meta,
+                &original_request,
+                None,
+            ),
         )
         .await;
 
@@ -2721,7 +2725,7 @@ impl RouterTrait for PDRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+        if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
         self.route_pd(headers, Some(tenant_meta), body, model_id)

@@ -233,9 +233,13 @@ impl ExternalRouterAdapter {
         let (reservation, denial) = tenant_rate_limit::reserve(
             self.rate_limit_manager.as_deref(),
             Some(tenant_meta),
-            &request,
             model_id,
-            None,
+            tenant_rate_limit::estimate(
+                self.rate_limit_manager.as_deref(),
+                Some(tenant_meta),
+                &request,
+                None,
+            ),
         )
         .await;
         let response = match denial {

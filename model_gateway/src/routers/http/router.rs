@@ -98,7 +98,7 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
-            tenant_rate_limit::{self, TenantCharge, TenantReservation},
+            tenant_rate_limit::{self, TenantCharge, TenantEstimate, TenantReservation},
         },
         BodyPolicy, RouterTrait,
     },
@@ -443,14 +443,25 @@ impl Router {
     /// reserves its estimate once, before any dispatch, and the one answer the
     /// dispatch paths converge on resolves the reservation once
     /// (`tenant_rate_limit::resolve`).
-    pub(crate) async fn route_typed_request<T: TenantCharge + serde::Serialize>(
-        &self,
-        headers: Option<&HeaderMap>,
-        tenant_meta: Option<&TenantRequestMeta>,
+    ///
+    /// A plain fn around an async block, not an async fn: everything the
+    /// route reads from the request by reference (whether it streams, its
+    /// routing derivatives, the tenant's estimate) is read here, before the
+    /// request moves into the lease, and the block uses the lease in place.
+    /// An async fn re-binds its by-value argument and keeps that local once
+    /// it has been borrowed, two copies of the request in the task beside
+    /// the lease's; the block holds the lease alone.
+    pub(crate) fn route_typed_request<'a, T>(
+        &'a self,
+        headers: Option<&'a HeaderMap>,
+        tenant_meta: Option<&'a TenantRequestMeta>,
         typed_req: T,
         route: &'static str,
-        model_id: &str,
-    ) -> Response {
+        model_id: &'a str,
+    ) -> impl Future<Output = Response> + Send + 'a
+    where
+        T: TenantCharge + serde::Serialize + Send + 'a,
+    {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
@@ -459,53 +470,64 @@ impl Router {
         // understands aliases; retry configs, hash rings and policies do not,
         // and an alias would silently fall back to router defaults.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
-        let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let outcome = self.begin_route(route, model_id, is_stream);
-
+        let estimate = tenant_rate_limit::estimate(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            &typed_req,
+            routing.text.as_deref(),
+        );
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
-        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
-        let retry_config = per_model_retry_config
-            .as_ref()
-            .unwrap_or(&self.retry_config);
-
-        let (reservation, denial) = self
-            .reserve_tenant_estimate(tenant_meta, &typed_req, model_id, routing.text.as_deref())
-            .await;
-
+        let per_model_retry_config = self
+            .worker_registry
+            .get_retry_config(canonical_model.as_deref().unwrap_or(model_id));
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
             typed_req,
             routing,
-            ReleasePoint::from_retry_config(retry_config),
+            ReleasePoint::from_retry_config(
+                per_model_retry_config
+                    .as_ref()
+                    .unwrap_or(&self.retry_config),
+            ),
         );
-        // The state the attempts share; `TypedAttempt` names each piece.
-        let tried = parking_lot::Mutex::new(Vec::new());
-        let ledger = AttemptLedger::default();
-        let attempt = TypedAttempt {
-            headers,
-            lease: &lease,
-            route,
-            model_id,
-            canonical_model: canonical_model.as_deref(),
-            is_stream,
-            ledger: &ledger,
-            tried: &tried,
-        };
+        async move {
+            let model_id = canonical_model.as_deref().unwrap_or(model_id);
+            let retry_config = per_model_retry_config
+                .as_ref()
+                .unwrap_or(&self.retry_config);
+            let outcome = self.begin_route(route, model_id, is_stream);
+            let (reservation, denial) = self
+                .reserve_tenant_estimate(tenant_meta, model_id, estimate)
+                .await;
+            // The state the attempts share; `TypedAttempt` names each piece.
+            let tried = parking_lot::Mutex::new(Vec::new());
+            let ledger = AttemptLedger::default();
+            let attempt = TypedAttempt {
+                headers,
+                lease: &lease,
+                route,
+                model_id,
+                canonical_model: canonical_model.as_deref(),
+                is_stream,
+                ledger: &ledger,
+                tried: &tried,
+            };
 
-        let response = if let Some(denied) = denial {
-            denied
-        } else if lease.release_point() == ReleasePoint::AfterDispatch {
-            self.dispatch_once(&attempt, outcome.endpoint).await
-        } else {
-            self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
-                .await
-        };
-        let response = self
-            .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
-            .await;
-        outcome.answered_typed(&response, start);
-        response
+            let response = if let Some(denied) = denial {
+                denied
+            } else if lease.release_point() == ReleasePoint::AfterDispatch {
+                self.dispatch_once(&attempt, outcome.endpoint).await
+            } else {
+                self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
+                    .await
+            };
+            let response = self
+                .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
+                .await;
+            outcome.answered_typed(&response, start);
+            response
+        }
     }
 
     /// The routing inputs of a request, derived once (for a typed request,
@@ -575,20 +597,19 @@ impl Router {
     /// dispatch: every attempt dispatches under this one reservation. With
     /// the rate limiter on and a tenant to charge, either the reservation or
     /// the denial, which is the request's answer, never retried; `(None,
-    /// None)` for a request outside the limiter (`tenant_rate_limit::reserve`).
-    async fn reserve_tenant_estimate<T: TenantCharge>(
+    /// None)` for a request outside the limiter (`tenant_rate_limit::reserve`;
+    /// `estimate` is `None` then, read before the request moved into its lease).
+    async fn reserve_tenant_estimate(
         &self,
         tenant_meta: Option<&TenantRequestMeta>,
-        typed_req: &T,
         model_id: &str,
-        routing_text: Option<&str>,
+        estimate: Option<TenantEstimate>,
     ) -> (Option<TenantReservation>, Option<Response>) {
         tenant_rate_limit::reserve(
             self.rate_limit_manager.as_deref(),
             tenant_meta,
-            typed_req,
             model_id,
-            routing_text,
+            estimate,
         )
         .await
     }
@@ -2593,7 +2614,7 @@ impl RouterTrait for Router {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+        if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
         self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
