@@ -52,7 +52,7 @@
 //! (another normalizer, a pre-tokenizer or regex construct outside the
 //! supported subset, a post-processor other than `ByteLevel` or a template
 //! of that shape, truncation or padding, added tokens with
-//! `single_word`/`lstrip`/`rstrip`) simply has no native path.
+//! `single_word`) simply has no native path.
 //!
 //! A tiktoken vocabulary is a byte-level BPE of this shape with no
 //! normalizer, one pattern, special tokens cut out of the raw text and no
@@ -633,8 +633,32 @@ impl Pieces {
     }
 }
 
-/// Added tokens by content and id, the list a matcher is built from.
-type AddedTokenList = Vec<(String, u32)>;
+/// An added token the path cuts out: its content and id, and whether the
+/// whitespace before or after a match is the token's (`lstrip`, `rstrip`,
+/// as `AddedVocabulary` reads them). Ordered by content, so a list sorts
+/// into a stable order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Added {
+    content: String,
+    id: u32,
+    lstrip: bool,
+    rstrip: bool,
+}
+
+impl Added {
+    /// A token that takes no whitespace: its content and id.
+    pub(crate) fn plain(content: String, id: u32) -> Self {
+        Self {
+            content,
+            id,
+            lstrip: false,
+            rstrip: false,
+        }
+    }
+}
+
+/// Added tokens, the list a matcher is built from.
+type AddedTokenList = Vec<Added>;
 
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
 /// matches them. The automaton's own search scans a text for the tokens'
@@ -651,6 +675,9 @@ type AddedTokenList = Vec<(String, u32)>;
 pub(crate) struct AddedTokens {
     automaton: AhoCorasick,
     ids: Vec<u32>,
+    /// Per token, whether the whitespace before / after a match is the
+    /// token's; none when no token of the set takes any.
+    strips: Option<Vec<(bool, bool)>>,
     prefixes: Option<Prefixes>,
 }
 
@@ -679,10 +706,10 @@ impl Prefixes {
 
     /// Whether the automaton's start-byte scan declines `tokens`: a first
     /// byte beyond ASCII, or more than three distinct first bytes.
-    fn wanted(tokens: &[(String, u32)]) -> bool {
+    fn wanted(tokens: &[Added]) -> bool {
         let mut firsts: Vec<u8> = tokens
             .iter()
-            .filter_map(|(content, _)| content.bytes().next())
+            .filter_map(|token| token.content.bytes().next())
             .collect();
         firsts.sort_unstable();
         firsts.dedup();
@@ -695,11 +722,11 @@ impl Prefixes {
     /// byte of ordinary text, where the automaton's own walk is cheaper),
     /// when even the one-byte prefixes exceed [`Self::MAX_COUNT`], or when
     /// the library declines the set.
-    fn of(tokens: &[(String, u32)]) -> Option<Self> {
+    fn of(tokens: &[Added]) -> Option<Self> {
         let distinct = |len: usize| {
             let mut prefixes: Vec<&[u8]> = tokens
                 .iter()
-                .map(|(content, _)| &content.as_bytes()[..content.len().min(len)])
+                .map(|token| &token.content.as_bytes()[..token.content.len().min(len)])
                 .collect();
             prefixes.sort_unstable();
             prefixes.dedup();
@@ -711,7 +738,7 @@ impl Prefixes {
             len -= 1;
             prefixes = distinct(len);
         }
-        let cut_short = tokens.iter().any(|(content, _)| content.len() > len);
+        let cut_short = tokens.iter().any(|token| token.content.len() > len);
         if prefixes.len() > Self::MAX_COUNT || (cut_short && len < Self::MIN_LEN) {
             return None;
         }
@@ -744,7 +771,7 @@ impl Prefixes {
 
 impl AddedTokens {
     /// The matcher over `tokens`, none for no tokens.
-    pub(crate) fn build(tokens: &[(String, u32)]) -> Result<Option<Self>, Declined> {
+    pub(crate) fn build(tokens: &[Added]) -> Result<Option<Self>, Declined> {
         if tokens.is_empty() {
             return Ok(None);
         }
@@ -758,37 +785,91 @@ impl AddedTokens {
             } else {
                 StartKind::Unanchored
             })
-            .build(tokens.iter().map(|(content, _)| content.as_bytes()))
+            .build(tokens.iter().map(|token| token.content.as_bytes()))
             .map_err(|e| Declined::from(format!("the added tokens form no automaton: {e}")))?;
         Ok(Some(Self {
             automaton,
-            ids: tokens.iter().map(|(_, id)| *id).collect(),
+            ids: tokens.iter().map(|token| token.id).collect(),
+            strips: tokens
+                .iter()
+                .any(|token| token.lstrip || token.rstrip)
+                .then(|| {
+                    tokens
+                        .iter()
+                        .map(|token| (token.lstrip, token.rstrip))
+                        .collect()
+                }),
             prefixes,
         }))
     }
 
     /// The added tokens in `text`, in order, each as its byte range and its
     /// index in the list: the leftmost-longest matches, each continuing after
-    /// the last. With prefixes, a token starts only where a prefix stands, so
+    /// the last (after the token's own end: a range widened over whitespace,
+    /// [`Self::stripped`], does not move the search, as the reference's loop
+    /// does not). With prefixes, a token starts only where a prefix stands, so
     /// the first prefix at or after the last match that begins a token begins
     /// the next one, and the longest token there is the match.
     fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
         let mut at = 0;
+        let mut taken = 0;
         std::iter::from_fn(move || loop {
             let Some(prefixes) = &self.prefixes else {
                 let input = Input::new(text).range(at..);
                 let found = self.automaton.find(input)?;
                 at = found.end();
-                return Some((found.range(), found.pattern().as_usize()));
+                let index = found.pattern().as_usize();
+                let range = self.stripped(text, found.range(), index, taken);
+                taken = range.end;
+                return Some((range, index));
             };
             let start = prefixes.next(text, at)?;
             let input = Input::new(text).range(start..).anchored(Anchored::Yes);
             if let Some(found) = self.automaton.find(input) {
                 at = found.end();
-                return Some((found.range(), found.pattern().as_usize()));
+                let index = found.pattern().as_usize();
+                let range = self.stripped(text, found.range(), index, taken);
+                taken = range.end;
+                return Some((range, index));
             }
             at = start + 1;
         })
+    }
+
+    /// The match `found` of the token at `index`, widened over the whitespace
+    /// the token takes: with `rstrip` the whitespace characters after it, with
+    /// `lstrip` those before it, not past `taken`, the end of the previous
+    /// match (`AddedVocabulary::find_matches`; its whitespace is Unicode
+    /// `White_Space`, which is `char::is_whitespace`).
+    fn stripped(
+        &self,
+        text: &str,
+        mut found: Range<usize>,
+        index: usize,
+        taken: usize,
+    ) -> Range<usize> {
+        let Some(strips) = &self.strips else {
+            return found;
+        };
+        let (lstrip, rstrip) = strips[index];
+        if lstrip {
+            let before: usize = text[..found.start]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_whitespace())
+                .map(char::len_utf8)
+                .sum();
+            found.start = (found.start - before).max(taken);
+        }
+        if rstrip {
+            let after: usize = text[found.end..]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(char::len_utf8)
+                .sum();
+            found.end += after;
+        }
+        found
     }
 
     /// The byte ranges of the added tokens in `text`, in order.
@@ -1088,7 +1169,7 @@ impl NativeEncoder {
         if replaces
             && normalized
                 .iter()
-                .any(|(content, _)| content.contains([' ', WORD_MARKER]))
+                .any(|token| token.content.contains([' ', WORD_MARKER]))
         {
             return Err(Declined::from(
                 "a byte-fallback vocabulary with an added token matched after the Replace \
@@ -1381,7 +1462,8 @@ impl NativeEncoder {
 
     /// The added tokens the path cuts out itself, those matched on the raw
     /// text and those matched after normalization (normalized here, once),
-    /// each in a stable order so leftmost-longest ties stay deterministic.
+    /// each in a stable order so leftmost-longest ties stay deterministic;
+    /// a token's `lstrip` / `rstrip` ride along, `single_word` declines.
     fn added_tokens_of<M: Model>(
         tokenizer: &TokenizerOf<M>,
         normalizer: Normalizer,
@@ -1393,20 +1475,25 @@ impl NativeEncoder {
         let mut raw = Vec::new();
         let mut normalized = Vec::new();
         for (&id, token) in added.get_added_tokens_decoder() {
-            if token.single_word || token.lstrip || token.rstrip || token.content.is_empty() {
+            if token.single_word || token.content.is_empty() {
                 return Err(Declined::from(format!(
-                    "added token {:?} with single_word, lstrip or rstrip, or without content",
+                    "added token {:?} with single_word, or without content",
                     token.content
                 )));
             }
+            let added = |content: String| Added {
+                content,
+                id,
+                lstrip: token.lstrip,
+                rstrip: token.rstrip,
+            };
             if token.normalized {
-                let content = match normalizer {
+                normalized.push(added(match normalizer {
                     Normalizer::None => token.content.clone(),
                     form => normalize(&token.content, form, None).into_owned(),
-                };
-                normalized.push((content, id));
+                }));
             } else {
-                raw.push((token.content.clone(), id));
+                raw.push(added(token.content.clone()));
             }
         }
         raw.sort();
@@ -1691,9 +1778,13 @@ impl NativeEncoder {
             pieces: Pieces::Matches,
         }];
         let chain = chain::Scanner::recognize(&stages);
+        let specials: Vec<Added> = specials
+            .iter()
+            .map(|(content, id)| Added::plain(content.clone(), *id))
+            .collect();
         Ok(Self {
             normalizer: Normalizer::None,
-            raw_added: AddedTokens::build(specials)?,
+            raw_added: AddedTokens::build(&specials)?,
             normalized_added: None,
             nfc_quick: None,
             end_anchored: false,

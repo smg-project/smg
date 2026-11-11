@@ -287,6 +287,8 @@ struct Shape {
     ignore_merges: bool,
     special: &'static [&'static str],
     added: &'static [(&'static str, bool)],
+    /// Added tokens with `lstrip` / `rstrip`: content, lstrip, rstrip.
+    stripped: &'static [(&'static str, bool, bool)],
 }
 
 fn shapes() -> Vec<Shape> {
@@ -307,6 +309,7 @@ fn shapes() -> Vec<Shape> {
                 "</think>",
             ],
             added: &[("<tool_call>", false), ("</tool_call>", false)],
+            stripped: &[],
         },
         Shape {
             name: "cl100k-ignore-merges",
@@ -318,6 +321,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: true,
             special: &["<|endoftext|>", "[gMASK]", "<sop>"],
             added: &[],
+            stripped: &[],
         },
         Shape {
             name: "three-splits",
@@ -335,6 +339,7 @@ fn shapes() -> Vec<Shape> {
                 "<｜User｜>",
             ],
             added: &[("<｜tool▁call▁begin｜>", true), ("<｜fim▁hole｜>", true)],
+            stripped: &[],
         },
         Shape {
             name: "inverted-removed",
@@ -346,6 +351,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|im_start|>", "<|im_end|>", "[e~[", "]~b]"],
             added: &[],
+            stripped: &[],
         },
         // A lone `Removed` split before a `ByteLevel` without its regex: the
         // gaps alone, under the generic walk (the single-stage loop takes a
@@ -378,6 +384,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         Shape {
             name: "possessive-clitic-class",
@@ -398,6 +405,7 @@ fn shapes() -> Vec<Shape> {
                 "<|role_end|>",
             ],
             added: &[("<tool_call>", false), ("<think>", false)],
+            stripped: &[],
         },
         Shape {
             name: "clitic-class",
@@ -414,6 +422,7 @@ fn shapes() -> Vec<Shape> {
                 "<|im_end|>",
             ],
             added: &[("<think>", false), ("<|tool_call_start|>", false)],
+            stripped: &[],
         },
         // `Digits` before the `ByteLevel` with its own regex: every numeric
         // character its own piece, the rest cut by the byte-level pattern.
@@ -427,6 +436,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[],
+            stripped: &[],
         },
         // NFKC before the `Digits` stage and the `ByteLevel`: compatibility
         // characters spell out first (a circled digit becomes a digit the
@@ -548,6 +558,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         Shape {
             name: "joined-letters",
@@ -592,6 +603,25 @@ fn shapes() -> Vec<Shape> {
                 ("### Instruction", true),
                 ("<tool_call>", false),
             ],
+            stripped: &[],
+        },
+        // Added tokens that take the whitespace beside them (`rstrip`, and
+        // `lstrip` with `rstrip`), as the reference's matcher widens them.
+        Shape {
+            name: "stripped-sentinels",
+            nfc: false,
+            pre_tokenizers: vec![
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[("<think>", false)],
+            stripped: &[
+                ("<|end|>", false, true),
+                ("<|user|>", false, true),
+                ("<|dummy_0|>", true, true),
+            ],
         },
     ]
 }
@@ -620,7 +650,10 @@ fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
             shape
                 .added
                 .iter()
-                .map(|(s, normalized)| AddedToken::from(*s, false).normalized(*normalized)),
+                .map(|(s, normalized)| AddedToken::from(*s, false).normalized(*normalized))
+                .chain(shape.stripped.iter().map(|(s, lstrip, rstrip)| {
+                    AddedToken::from(*s, false).lstrip(*lstrip).rstrip(*rstrip)
+                })),
         )
         .expect("added tokens");
     tokenizer
@@ -795,15 +828,20 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
     );
-    // An added token with lstrip.
+    // An added token with single_word; one with lstrip and rstrip is taken.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer
-        .add_special_tokens([AddedToken::from("<pad>", true).lstrip(true)])
+        .add_special_tokens([AddedToken::from("<pad>", true).single_word(true)])
         .expect("special token");
     assert_eq!(
         declined(&tokenizer),
-        "added token \"<pad>\" with single_word, lstrip or rstrip, or without content"
+        "added token \"<pad>\" with single_word, or without content"
     );
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer
+        .add_special_tokens([AddedToken::from("<pad>", true).lstrip(true).rstrip(true)])
+        .expect("special token");
+    assert!(NativeEncoder::from_tokenizer(&tokenizer).is_ok());
     // A regex outside the subset.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
@@ -941,6 +979,64 @@ fn the_punctuation_stage_holds_what_the_reference_cuts_on() {
             .len()
             == 3;
         assert_eq!(native, cuts, "U+{code:04X}");
+/// Added tokens with `lstrip` / `rstrip` take the whitespace beside them, as
+/// the reference's matcher widens them: the whitespace is in no id, the
+/// whitespace between an `rstrip` token and an `lstrip` token goes to the
+/// first, a token at the text's start or end takes what is there, and an
+/// unflagged token beside whitespace leaves it to the text.
+#[test]
+fn stripped_added_tokens_take_their_whitespace_as_tokenizers_does() {
+    let mut state = 0x57A1_57A1_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "stripped-sentinels")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let id = |s: &str| tokenizer.token_to_id(s).expect("an added token");
+    let ids = |s: &str| {
+        tokenizer
+            .encode(s, false)
+            .expect("tokenizers encodes")
+            .get_ids()
+            .to_vec()
+    };
+    let cases: [(&str, Vec<u32>); 7] = [
+        (
+            "a <|end|> b",
+            [ids("a "), vec![id("<|end|>")], ids("b")].concat(),
+        ),
+        (
+            "a \u{3000}<|dummy_0|>\t\n b",
+            [ids("a"), vec![id("<|dummy_0|>")], ids("b")].concat(),
+        ),
+        (
+            "<|end|> \u{A0}<|dummy_0|> x",
+            [vec![id("<|end|>"), id("<|dummy_0|>")], ids("x")].concat(),
+        ),
+        (" <|dummy_0|> ", vec![id("<|dummy_0|>")]),
+        ("<|end|>", vec![id("<|end|>")]),
+        (
+            "a <think> b",
+            [ids("a "), vec![id("<think>")], ids(" b")].concat(),
+        ),
+        (
+            "x <|user|><|end|>  <|user|>",
+            [
+                ids("x "),
+                vec![id("<|user|>"), id("<|end|>"), id("<|user|>")],
+            ]
+            .concat(),
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(ids(text), expected, "the reference on {text:?}");
+        assert_eq!(
+            native.encode(Some(model), text, false),
+            Ok(expected),
+            "{text:?}"
+        );
     }
 }
 
@@ -1152,6 +1248,7 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             .iter()
             .copied()
             .chain(shape.added.iter().map(|(s, _)| *s))
+            .chain(shape.stripped.iter().map(|(s, _, _)| *s))
             .collect();
         let mut compared = 0;
         for _ in 0..3 {
@@ -1317,10 +1414,10 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
     all.push((declined, true));
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     for (tokens, by_prefixes) in &all {
-        let list: Vec<(String, u32)> = tokens
+        let list: Vec<Added> = tokens
             .iter()
             .enumerate()
-            .map(|(i, token)| ((*token).to_owned(), 1000 + i as u32))
+            .map(|(i, token)| Added::plain((*token).to_owned(), 1000 + i as u32))
             .collect();
         let added = AddedTokens::build(&list)
             .expect("the tokens form an automaton")
@@ -1483,6 +1580,7 @@ fn ids_match_tokenizers_on_random_text_for_every_shape() {
             .iter()
             .copied()
             .chain(shape.added.iter().map(|(s, _)| *s))
+            .chain(shape.stripped.iter().map(|(s, _, _)| *s))
             .collect();
         for round in 0..2000 {
             let text = random_text(&mut state, 1 + round % 40, &added);
@@ -3011,6 +3109,7 @@ fn a_template_post_processor_frames_the_ids_on_request() {
         .iter()
         .copied()
         .chain(shape.added.iter().map(|(s, _)| *s))
+        .chain(shape.stripped.iter().map(|(s, _, _)| *s))
         .collect();
     for (name, post_processor) in forms {
         let mut tokenizer = tokenizer_of(shape, &mut state);
