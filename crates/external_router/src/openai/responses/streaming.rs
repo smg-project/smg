@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use openai_protocol::{
     event_types::{
         is_function_call_type, is_response_event, FunctionCallEvent, ItemType, McpEvent,
@@ -770,6 +770,200 @@ pub(super) async fn handle_simple_streaming_passthrough(
     response
 }
 
+/// What one relayed upstream stream ended with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayEnd {
+    /// The model finished without asking for a tool.
+    Answered,
+    /// The handler holds complete tool calls; the loop executes them.
+    ToolCalls,
+    /// The client is gone or the stream broke (its error event sent):
+    /// nothing follows.
+    Stopped,
+}
+
+/// The tool loop's flags the relay reads and sets across its iterations.
+struct RelayFlags {
+    /// Only the first upstream stream forwards `response.created` and
+    /// `response.in_progress`; a resumed stream's copies are skipped.
+    first_iteration: bool,
+    /// The MCP list-tools items go out once, at the first `in_progress`.
+    mcp_list_tools_sent: bool,
+}
+
+/// Relays one upstream event stream to the client: every block goes through
+/// the handler and is forwarded, buffered or dropped as it says; the MCP
+/// list-tools items go out at the first `in_progress` of the first stream
+/// (the bindings exist only with a session, [`StreamingEventContext::session`]);
+/// a tool-call trigger ends the relay with the calls pending in the handler.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The relay reads the loop's client side as the loop's own text did (the sender, the encoder, the sequence number) beside the handler and its two flags; a struct for one call would be a type the loop's other phases do not share."
+)]
+async fn relay_upstream_stream(
+    upstream_stream: &mut (impl Stream<Item = reqwest::Result<Bytes>> + Unpin),
+    handler: &mut StreamingToolHandler,
+    flags: &mut RelayFlags,
+    list_tools_bindings: &[(String, String)],
+    tx: &SseSender,
+    sse_encoder: &mut SseEncoder,
+    streaming_ctx: &StreamingEventContext<'_>,
+    sequence_number: &mut u64,
+) -> RelayEnd {
+    let mut chunk_processor = ChunkProcessor::new();
+    let mut seen_in_progress = false;
+    while let Some(chunk_result) = upstream_stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                chunk_processor.push_chunk(&chunk);
+
+                while let Some(raw_block) = chunk_processor.next_block() {
+                    // Parse event
+                    let (event_name, data) = parse_sse_block(&raw_block);
+
+                    if data.is_empty() {
+                        continue;
+                    }
+
+                    // Process through handler
+                    let action = handler.process_event(event_name, data.as_ref());
+
+                    match action {
+                        StreamAction::Forward => {
+                            // Parse data once and reuse for skip check, forwarding, and in_progress check
+                            let parsed = serde_json::from_str::<Value>(data.as_ref()).ok();
+
+                            // Skip response.created and response.in_progress on subsequent iterations
+                            let should_skip = if flags.first_iteration {
+                                false
+                            } else {
+                                parsed.as_ref().is_some_and(|v| {
+                                    matches!(
+                                        v.get("type").and_then(|t| t.as_str()),
+                                        Some(ResponseEvent::CREATED)
+                                            | Some(ResponseEvent::IN_PROGRESS)
+                                    )
+                                })
+                            };
+
+                            // Check in_progress before moving parsed into SseEventData
+                            let is_in_progress = !seen_in_progress
+                                && parsed.as_ref().is_some_and(|v| {
+                                    v.get("type").and_then(|t| t.as_str())
+                                        == Some(ResponseEvent::IN_PROGRESS)
+                                });
+
+                            if !should_skip {
+                                // Forward the event with pre-parsed value (moved, not cloned)
+                                if !forward_streaming_event(
+                                    SseEventData {
+                                        raw_block: &raw_block,
+                                        event_name,
+                                        data: data.as_ref(),
+                                        pre_parsed: parsed,
+                                    },
+                                    handler,
+                                    tx,
+                                    sse_encoder,
+                                    streaming_ctx,
+                                    sequence_number,
+                                )
+                                .await
+                                {
+                                    return RelayEnd::Stopped;
+                                }
+                            }
+
+                            if is_in_progress {
+                                seen_in_progress = true;
+                                if !flags.mcp_list_tools_sent {
+                                    if let Some(session) = streaming_ctx.session {
+                                        for (server_label, server_key) in list_tools_bindings {
+                                            let list_tools_index =
+                                                handler.allocate_synthetic_output_index();
+                                            if !send_mcp_list_tools_events(
+                                                tx,
+                                                session,
+                                                server_label,
+                                                list_tools_index,
+                                                sequence_number,
+                                                server_key,
+                                            )
+                                            .await
+                                            {
+                                                // Client disconnected
+                                                return RelayEnd::Stopped;
+                                            }
+                                        }
+                                    }
+                                    flags.mcp_list_tools_sent = true;
+                                }
+                            }
+                        }
+                        StreamAction::Buffer => {
+                            // Don't forward, just buffer
+                        }
+                        StreamAction::Drop => {
+                            // R6.7c native passthrough: upstream
+                            // emitted an `output_item.done` for a
+                            // hosted tool-call item that we did
+                            // NOT wrap as a function_call (and so
+                            // did not track in `pending_calls`).
+                            // The upstream envelope arrives
+                            // mis-ordered BEFORE
+                            // `response.<type>.completed`, so we
+                            // drop it here to preserve the wire
+                            // invariant that `output_item.done`
+                            // is the LAST event for a given item.
+                            // Unlike `ExecuteTools`, this does NOT
+                            // kick the tool loop — there is no
+                            // dispatched call to finish.
+                        }
+                        StreamAction::ExecuteTools {
+                            forward_triggering_event,
+                        } => {
+                            // When the upstream signals tool completion via
+                            // `output_item.done` (instead of a preceding
+                            // `function_call_arguments.done`), forwarding the
+                            // event here would emit an umbrella
+                            // `response.output_item.done` BEFORE
+                            // `response.<tool>.completed`, violating spec
+                            // sub-event ordering. The tool loop emits its own
+                            // `output_item.done` at the correct position after
+                            // the `.completed` sub-event; suppress here.
+                            if forward_triggering_event
+                                && !forward_streaming_event(
+                                    SseEventData {
+                                        raw_block: &raw_block,
+                                        event_name,
+                                        data: data.as_ref(),
+                                        pre_parsed: None,
+                                    },
+                                    handler,
+                                    tx,
+                                    sse_encoder,
+                                    streaming_ctx,
+                                    sequence_number,
+                                )
+                                .await
+                            {
+                                return RelayEnd::Stopped;
+                            }
+                            return RelayEnd::ToolCalls;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let message = format!("Stream error: {}", e.without_url());
+                send_error_event(tx, sse_encoder, sequence_number, STREAM_ERROR, &message).await;
+                return RelayEnd::Stopped;
+            }
+        }
+    }
+    RelayEnd::Answered
+}
+
 /// Handle streaming WITH MCP tool call interception and execution
 pub(super) fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
@@ -817,8 +1011,10 @@ pub(super) fn handle_streaming_with_tool_interception(
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
         let tools_json = current_payload.get("tools").cloned().unwrap_or(json!([]));
         let base_payload = current_payload.clone();
-        let mut mcp_list_tools_sent = false;
-        let mut is_first_iteration = true;
+        let mut flags = RelayFlags {
+            first_iteration: true,
+            mcp_list_tools_sent: false,
+        };
         let mut sequence_number: u64 = 0;
         let mut sse_encoder = SseEncoder::new();
         let mut next_output_index: usize = 0;
@@ -875,168 +1071,19 @@ pub(super) fn handle_streaming_with_tool_interception(
             if let Some(ref id) = preserved_response_id {
                 handler.original_response_id = Some(id.clone());
             }
-            let mut chunk_processor = ChunkProcessor::new();
-            let mut tool_calls_detected = false;
-            let mut seen_in_progress = false;
-
-            while let Some(chunk_result) = upstream_stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        chunk_processor.push_chunk(&chunk);
-
-                        while let Some(raw_block) = chunk_processor.next_block() {
-                            // Parse event
-                            let (event_name, data) = parse_sse_block(&raw_block);
-
-                            if data.is_empty() {
-                                continue;
-                            }
-
-                            // Process through handler
-                            let action = handler.process_event(event_name, data.as_ref());
-
-                            match action {
-                                StreamAction::Forward => {
-                                    // Parse data once and reuse for skip check, forwarding, and in_progress check
-                                    let parsed = serde_json::from_str::<Value>(data.as_ref()).ok();
-
-                                    // Skip response.created and response.in_progress on subsequent iterations
-                                    let should_skip = if is_first_iteration {
-                                        false
-                                    } else {
-                                        parsed.as_ref().is_some_and(|v| {
-                                            matches!(
-                                                v.get("type").and_then(|t| t.as_str()),
-                                                Some(ResponseEvent::CREATED)
-                                                    | Some(ResponseEvent::IN_PROGRESS)
-                                            )
-                                        })
-                                    };
-
-                                    // Check in_progress before moving parsed into SseEventData
-                                    let is_in_progress = !seen_in_progress
-                                        && parsed.as_ref().is_some_and(|v| {
-                                            v.get("type").and_then(|t| t.as_str())
-                                                == Some(ResponseEvent::IN_PROGRESS)
-                                        });
-
-                                    if !should_skip {
-                                        // Forward the event with pre-parsed value (moved, not cloned)
-                                        if !forward_streaming_event(
-                                            SseEventData {
-                                                raw_block: &raw_block,
-                                                event_name,
-                                                data: data.as_ref(),
-                                                pre_parsed: parsed,
-                                            },
-                                            &mut handler,
-                                            &tx,
-                                            &mut sse_encoder,
-                                            &streaming_ctx,
-                                            &mut sequence_number,
-                                        )
-                                        .await
-                                        {
-                                            return;
-                                        }
-                                    }
-
-                                    if is_in_progress {
-                                        seen_in_progress = true;
-                                        if !mcp_list_tools_sent {
-                                            for (server_label, server_key) in &list_tools_bindings {
-                                                let list_tools_index =
-                                                    handler.allocate_synthetic_output_index();
-                                                if !send_mcp_list_tools_events(
-                                                    &tx,
-                                                    &session,
-                                                    server_label,
-                                                    list_tools_index,
-                                                    &mut sequence_number,
-                                                    server_key,
-                                                )
-                                                .await
-                                                {
-                                                    // Client disconnected
-                                                    return;
-                                                }
-                                            }
-                                            mcp_list_tools_sent = true;
-                                        }
-                                    }
-                                }
-                                StreamAction::Buffer => {
-                                    // Don't forward, just buffer
-                                }
-                                StreamAction::Drop => {
-                                    // R6.7c native passthrough: upstream
-                                    // emitted an `output_item.done` for a
-                                    // hosted tool-call item that we did
-                                    // NOT wrap as a function_call (and so
-                                    // did not track in `pending_calls`).
-                                    // The upstream envelope arrives
-                                    // mis-ordered BEFORE
-                                    // `response.<type>.completed`, so we
-                                    // drop it here to preserve the wire
-                                    // invariant that `output_item.done`
-                                    // is the LAST event for a given item.
-                                    // Unlike `ExecuteTools`, this does NOT
-                                    // kick the tool loop — there is no
-                                    // dispatched call to finish.
-                                }
-                                StreamAction::ExecuteTools {
-                                    forward_triggering_event,
-                                } => {
-                                    // When the upstream signals tool completion via
-                                    // `output_item.done` (instead of a preceding
-                                    // `function_call_arguments.done`), forwarding the
-                                    // event here would emit an umbrella
-                                    // `response.output_item.done` BEFORE
-                                    // `response.<tool>.completed`, violating spec
-                                    // sub-event ordering. The tool loop emits its own
-                                    // `output_item.done` at the correct position after
-                                    // the `.completed` sub-event; suppress here.
-                                    if forward_triggering_event
-                                        && !forward_streaming_event(
-                                            SseEventData {
-                                                raw_block: &raw_block,
-                                                event_name,
-                                                data: data.as_ref(),
-                                                pre_parsed: None,
-                                            },
-                                            &mut handler,
-                                            &tx,
-                                            &mut sse_encoder,
-                                            &streaming_ctx,
-                                            &mut sequence_number,
-                                        )
-                                        .await
-                                    {
-                                        return;
-                                    }
-                                    tool_calls_detected = true;
-                                    break; // Exit stream processing to execute tools
-                                }
-                            }
-                        }
-
-                        if tool_calls_detected {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let message = format!("Stream error: {}", e.without_url());
-                        send_error_event(
-                            &tx,
-                            &mut sse_encoder,
-                            &mut sequence_number,
-                            STREAM_ERROR,
-                            &message,
-                        )
-                        .await;
-                        return;
-                    }
-                }
+            let end = relay_upstream_stream(
+                &mut upstream_stream,
+                &mut handler,
+                &mut flags,
+                &list_tools_bindings,
+                &tx,
+                &mut sse_encoder,
+                &streaming_ctx,
+                &mut sequence_number,
+            )
+            .await;
+            if end == RelayEnd::Stopped {
+                return;
             }
 
             next_output_index = handler.next_output_index();
@@ -1045,7 +1092,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             }
 
             // The model answered without asking for a tool: the loop's end.
-            if !tool_calls_detected {
+            if end == RelayEnd::Answered {
                 break (handler, ToolLoopEnd::Answered);
             }
 
@@ -1120,7 +1167,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             ) {
                 Ok(resume_payload) => {
                     current_payload = resume_payload;
-                    is_first_iteration = false;
+                    flags.first_iteration = false;
                 }
                 Err(e) => {
                     let message = format!("Failed to build resume payload: {e}");
@@ -1500,5 +1547,290 @@ mod tests {
             .expect("the routed-worker header");
         assert!(!header.contains("secret"), "{header}");
         assert_eq!(header, format!("http://***@127.0.0.1:{port}"));
+    }
+
+    /// The relay's inputs: a stream of chunks, one SSE block per chunk.
+    fn chunks(blocks: &[&str]) -> impl Stream<Item = reqwest::Result<Bytes>> + Unpin {
+        let frames: Vec<reqwest::Result<Bytes>> = blocks
+            .iter()
+            .map(|block| Ok(Bytes::from(format!("{block}\n\n"))))
+            .collect();
+        futures_util::stream::iter(frames)
+    }
+
+    const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\
+                           \"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\
+                           \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\
+                           \"in_progress\",\"output\":[]}}";
+    const IN_PROGRESS: &str = "event: response.in_progress\ndata: {\"type\":\
+                               \"response.in_progress\",\"sequence_number\":1,\"response\":{\"id\":\
+                               \"resp_1\",\"object\":\"response\",\"created_at\":1,\"model\":\"m\",\
+                               \"status\":\"in_progress\",\"output\":[]}}";
+    const DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\
+                         \"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"msg_1\",\
+                         \"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}";
+    const COMPLETED: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\
+                             \"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"object\":\
+                             \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\
+                             \"completed\",\"output\":[]}}";
+    const CALL_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":\
+                              \"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\
+                              \"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\
+                              \"call_1\",\"name\":\"lookup\",\"arguments\":\"\"}}";
+    const CALL_DONE: &str = "event: response.function_call_arguments.done\ndata: {\"type\":\
+                             \"response.function_call_arguments.done\",\"sequence_number\":2,\
+                             \"item_id\":\"fc_1\",\"output_index\":0,\"arguments\":\"{}\"}";
+
+    /// Relays `blocks` through a fresh context with no session; the client
+    /// reads the frames as they come, or is gone before the first one. Returns
+    /// the relay's end, the frames, the sequence number and the count of
+    /// blocks the relay left unread.
+    async fn relayed(
+        blocks: &[&str],
+        flags: &mut RelayFlags,
+        handler: &mut StreamingToolHandler,
+        connected: bool,
+    ) -> (RelayEnd, Vec<String>, u64, usize) {
+        let request = ResponsesRequest {
+            model: "m".to_string(),
+            input: ResponseInput::Text("hi".to_string()),
+            ..Default::default()
+        };
+        let ctx = StreamingEventContext {
+            original_request: &request,
+            previous_response_id: None,
+            session: None,
+            mcp_format_registry: None,
+        };
+        let (tx, rx) = sse_channel();
+        let rx = connected.then_some(rx);
+        let mut encoder = SseEncoder::new();
+        let mut sequence_number = 0;
+        let mut upstream = chunks(blocks);
+        let relay = async {
+            let end = relay_upstream_stream(
+                &mut upstream,
+                handler,
+                flags,
+                &[],
+                &tx,
+                &mut encoder,
+                &ctx,
+                &mut sequence_number,
+            )
+            .await;
+            drop(tx);
+            end
+        };
+        let read = async {
+            let mut frames = Vec::new();
+            if let Some(mut rx) = rx {
+                while let Some(frame) = rx.recv().await {
+                    let frame = frame.expect("a frame");
+                    frames.push(String::from_utf8(frame.to_vec()).expect("utf-8"));
+                }
+            }
+            frames
+        };
+        let (end, frames) = tokio::join!(relay, read);
+        let unread = upstream.count().await;
+        (end, frames, sequence_number, unread)
+    }
+
+    /// The first stream's events reach the client in order, re-stamped from
+    /// the stream's own sequence number; the upstream's `response.completed`
+    /// is not among them (the loop's end sends the terminal); the relay ends
+    /// answered with the response id kept and the list-tools step taken.
+    #[tokio::test]
+    async fn the_first_stream_is_forwarded_and_ends_answered() {
+        let mut flags = RelayFlags {
+            first_iteration: true,
+            mcp_list_tools_sent: false,
+        };
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        let (end, frames, sequence_number, unread) = relayed(
+            &[CREATED, IN_PROGRESS, DELTA, COMPLETED],
+            &mut flags,
+            &mut handler,
+            true,
+        )
+        .await;
+        assert_eq!(end, RelayEnd::Answered);
+        assert_eq!(unread, 0, "the stream is read to its end");
+        let events: Vec<&str> = frames
+            .iter()
+            .map(|frame| frame.split('\n').next().expect("an event line"))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "event: response.created",
+                "event: response.in_progress",
+                "event: response.output_text.delta"
+            ]
+        );
+        assert_eq!(sequence_number, 3);
+        assert_eq!(handler.original_response_id(), Some("resp_1"));
+        assert!(flags.mcp_list_tools_sent);
+    }
+
+    /// A resumed stream (after a tool round) skips its own `response.created`
+    /// and `response.in_progress`: the client saw the first stream's.
+    #[tokio::test]
+    async fn a_resumed_stream_skips_created_and_in_progress() {
+        let mut flags = RelayFlags {
+            first_iteration: false,
+            mcp_list_tools_sent: true,
+        };
+        let mut handler = StreamingToolHandler::with_starting_index(1);
+        let (end, frames, sequence_number, unread) = relayed(
+            &[CREATED, IN_PROGRESS, DELTA, COMPLETED],
+            &mut flags,
+            &mut handler,
+            true,
+        )
+        .await;
+        assert_eq!(end, RelayEnd::Answered);
+        assert_eq!(unread, 0, "the stream is read to its end");
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert!(frames[0].starts_with("event: response.output_text.delta"));
+        assert_eq!(sequence_number, 1);
+    }
+
+    /// A function call the upstream completes ends the relay with the call
+    /// pending in the handler: the loop's tool phase runs it, and the blocks
+    /// after the trigger are not read by this relay.
+    #[tokio::test]
+    async fn a_completed_tool_call_ends_the_relay_with_the_call_pending() {
+        let mut flags = RelayFlags {
+            first_iteration: true,
+            mcp_list_tools_sent: false,
+        };
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        let (end, _frames, _, unread) = relayed(
+            &[CREATED, CALL_ADDED, CALL_DONE, COMPLETED],
+            &mut flags,
+            &mut handler,
+            true,
+        )
+        .await;
+        assert_eq!(end, RelayEnd::ToolCalls);
+        assert_eq!(unread, 1, "the completed after the trigger is not read");
+        assert_eq!(handler.take_pending_calls().len(), 1);
+    }
+
+    /// A client that is gone before the first frame stops the relay at that
+    /// frame: the frame is numbered, its send fails, nothing is read further
+    /// and nothing reaches the client.
+    #[tokio::test]
+    async fn a_gone_client_stops_the_relay() {
+        let mut flags = RelayFlags {
+            first_iteration: true,
+            mcp_list_tools_sent: false,
+        };
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        let (end, frames, sequence_number, unread) = relayed(
+            &[CREATED, DELTA, COMPLETED],
+            &mut flags,
+            &mut handler,
+            false,
+        )
+        .await;
+        assert_eq!(end, RelayEnd::Stopped);
+        assert_eq!(unread, 2, "the relay stops at the first refused send");
+        assert!(frames.is_empty());
+        assert_eq!(sequence_number, 1);
+    }
+
+    /// The whole interception path against a stub upstream that answers one
+    /// four-event stream: the client reads the stream's events, the loop's
+    /// terminal and the sentinel.
+    #[tokio::test]
+    async fn a_tool_interception_stream_ends_with_the_terminal_and_the_sentinel() {
+        use std::sync::Arc;
+
+        use axum::{
+            http::{header::CONTENT_TYPE, StatusCode},
+            routing::any,
+            Router,
+        };
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+        use smg_mcp::McpConfig;
+
+        use crate::{
+            openai::context::StorageHandles, openai_bridge::FormatRegistry,
+            test_support::http_client,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let port = listener.local_addr().expect("an address").port();
+        let body = [CREATED, IN_PROGRESS, DELTA, COMPLETED].join("\n\n") + "\n\n";
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub upstream answering one event stream per request; aborted at the test's end"
+        )]
+        let upstream = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move || {
+                let body = body.clone();
+                async move { ([(CONTENT_TYPE, "text/event-stream")], body) }
+            }));
+            axum::serve(listener, app).await.expect("the stub serves");
+        });
+        let orchestrator = Arc::new(
+            McpOrchestrator::new(McpConfig::default())
+                .await
+                .expect("an orchestrator with no servers"),
+        );
+        let client = http_client();
+        let storage = StorageHandles {
+            response: Arc::new(MemoryResponseStorage::new()),
+            conversation: Arc::new(MemoryConversationStorage::new()),
+            conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+            request_context: None,
+            tenant: None,
+        };
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+                .expect("a request");
+        let req = StreamingRequest {
+            url: format!("http://127.0.0.1:{port}/v1/responses"),
+            payload: json!({"model": "m", "input": "hi", "stream": true}),
+            original_body: request,
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            storage: StorageHandles {
+                response: Arc::clone(&storage.response),
+                conversation: Arc::clone(&storage.conversation),
+                conversation_item: Arc::clone(&storage.conversation_item),
+                request_context: None,
+                tenant: None,
+            },
+        };
+        let response = handle_streaming_with_tool_interception(
+            &client,
+            None,
+            None,
+            req,
+            &orchestrator,
+            FormatRegistry::new(),
+            Vec::new(),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the stream to its end");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        assert!(text.contains("event: response.created\n"), "{text}");
+        assert!(
+            text.contains("event: response.output_text.delta\n"),
+            "{text}"
+        );
+        assert!(text.contains("event: response.completed\n"), "{text}");
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        upstream.abort();
     }
 }
