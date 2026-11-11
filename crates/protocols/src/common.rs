@@ -731,8 +731,8 @@ pub struct JsonSchemaFormat {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
     /// What the format is for, as the client describes it to the model.
-    /// Declared last and defaulted, so the derive's positional form keeps
-    /// reading `[name, schema, strict]` as it did.
+    // Declared last and defaulted, so the derive's positional form keeps
+    // reading `[name, schema, strict]` as it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
