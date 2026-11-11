@@ -486,6 +486,14 @@ fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Opti
 /// An explicit encoder dtype label wins; a direct SGLang worker otherwise
 /// reads the current connection's declaration, including after reconnects.
 fn encoder_dtype_label(worker: &dyn Worker) -> Option<String> {
+    let backend = worker.backend_client_if_initialized();
+    encoder_dtype_label_with_backend(worker, backend.as_deref())
+}
+
+fn encoder_dtype_label_with_backend(
+    worker: &dyn Worker,
+    backend: Option<&BackendClient>,
+) -> Option<String> {
     let spec = &worker.metadata().spec;
     if let Some(dtype) = spec
         .labels
@@ -497,8 +505,7 @@ fn encoder_dtype_label(worker: &dyn Worker) -> Option<String> {
     if spec.runtime_type != RuntimeType::Sglang {
         return None;
     }
-    let backend = worker.backend_client_if_initialized()?;
-    let BackendClient::Zmq(client) = backend.as_ref() else {
+    let BackendClient::Zmq(client) = backend? else {
         return None;
     };
     client.ready_response()?.multimodal_encoder_dtype.clone()
@@ -573,23 +580,8 @@ fn shared_image_wire_dtype(
 ) -> Option<EncoderDtype> {
     let mut shared = None;
     for worker in workers {
-        let label = encoder_dtype_label(worker.as_ref());
-        let spec = &worker.metadata().spec;
-        // A handshake still in flight may announce a narrower dtype before
-        // assembly. Keep the convertible layout until that fact is known.
-        if spec.runtime_type == RuntimeType::Sglang
-            && spec.connection_mode == ConnectionMode::Zmq
-            && label.is_none()
-            && worker.backend_client_if_initialized().is_none()
-        {
-            return None;
-        }
-        let dtype = image_wire_dtype(
-            worker.metadata().spec.runtime_type,
-            label,
-            device_normalizes(worker.as_ref()),
-            overrides,
-        )?;
+        let backend = worker.backend_client_if_initialized();
+        let dtype = image_wire_dtype_with_backend(worker.as_ref(), overrides, backend.as_deref())?;
         match shared {
             None => shared = Some(dtype),
             Some(existing) if existing == dtype => {}
@@ -597,6 +589,30 @@ fn shared_image_wire_dtype(
         }
     }
     shared
+}
+
+/// Use one connection snapshot for both the dtype and pending-handshake check.
+/// Initialization between those decisions must not freeze a float32 layout.
+fn image_wire_dtype_with_backend(
+    worker: &dyn Worker,
+    overrides: &DtypeOverrides,
+    backend: Option<&BackendClient>,
+) -> Option<EncoderDtype> {
+    let label = encoder_dtype_label_with_backend(worker, backend);
+    let spec = &worker.metadata().spec;
+    if spec.runtime_type == RuntimeType::Sglang
+        && spec.connection_mode == ConnectionMode::Zmq
+        && label.is_none()
+        && backend.is_none()
+    {
+        return None;
+    }
+    image_wire_dtype(
+        spec.runtime_type,
+        label,
+        device_normalizes(worker),
+        overrides,
+    )
 }
 
 /// One worker's image wire dtype under assembly's rules; `None` when no
@@ -919,6 +935,7 @@ mod tests {
                 .build(),
         );
         let policy = DtypeOverrides::default();
+        let pending_backend = pending.backend_client_if_initialized();
         assert_eq!(shared_image_wire_dtype(&[pending], &policy), None);
 
         for (advertised, explicit, expected) in [
@@ -961,6 +978,13 @@ mod tests {
                 worker: Arc::clone(&worker),
             };
             assert_eq!(mm_sglang_encoder_input_dtype(Some(&workers)), expected);
+            // Retain the snapshot from before initialization while the worker
+            // now has a live backend. The planner must not resample that backend.
+            assert!(worker.backend_client_if_initialized().is_some());
+            assert_eq!(
+                image_wire_dtype_with_backend(worker.as_ref(), &policy, pending_backend.as_deref()),
+                explicit.map(|_| expected),
+            );
             assert_eq!(shared_image_wire_dtype(&[worker], &policy), Some(expected));
         }
     }
