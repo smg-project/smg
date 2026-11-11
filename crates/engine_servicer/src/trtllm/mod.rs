@@ -134,12 +134,10 @@ pub struct TrtllmServicerConfig {
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
         let load = info::rank_load(self, dp_rank)?;
-        // The queued token-work is this servicer's own estimate for the
-        // rank (see `info::rank_load`), so every rank's record reports it.
-        let mut record = common::EngineLoad::from(&load);
-        record.waiting_uncached_tokens =
-            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
-        Some(record)
+        Some(crate::kv_events::record_with_queue(
+            &load,
+            load.num_waiting_uncached_tokens,
+        ))
     }
 
     fn engine_link(&self) -> &EngineLink {
