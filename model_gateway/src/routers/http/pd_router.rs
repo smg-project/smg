@@ -2130,6 +2130,25 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
+    /// The count request as the prefill worker receives it (its model the
+    /// canonical one) and the text the placement policies read, if they read
+    /// any: both taken before the send, so the request itself does not ride
+    /// in the route's task across it.
+    fn count_tokens_wire(
+        mut body: CountMessageTokensRequest,
+        canonical_model: Option<&str>,
+        policies_need_text: bool,
+    ) -> (Option<String>, serde_json::Result<Bytes>) {
+        let request_text = policies_need_text.then(|| body.extract_text_for_routing());
+        if let Some(canonical_model) = canonical_model {
+            canonical_model.clone_into(&mut body.model);
+        }
+        (
+            request_text,
+            serialize_json_sized(&body, None).map(Bytes::from),
+        )
+    }
+
     /// Select a PD pair and take its load. With Prefill admission enabled
     /// the selection runs at the head of the admission queue.
     async fn select_pd_pair_with_admission(
@@ -2739,16 +2758,21 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        mut body: CountMessageTokensRequest,
+        body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
         // Counting generates nothing, so it takes one prefill worker (which
         // holds the tokenizer and prompt template) and no KV handoff.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let request_text = self
-            .policies_need_request_text()
-            .then(|| body.extract_text_for_routing());
+        // The request is serialized before the send and never borrowed here:
+        // a borrowed local keeps its slot in the task across the awaits that
+        // follow, a second copy of the request per count.
+        let (request_text, wire) = Self::count_tokens_wire(
+            body,
+            canonical_model.as_deref(),
+            self.policies_need_request_text(),
+        );
         let Some(worker) = placement::select_single(
             &self.worker_registry,
             &self.policy_registry,
@@ -2771,11 +2795,8 @@ impl RouterTrait for PDRouter {
             );
         };
 
-        if let Some(canonical_model) = canonical_model.as_deref() {
-            canonical_model.clone_into(&mut body.model);
-        }
-        let body = match serialize_json_sized(&body, None) {
-            Ok(bytes) => Bytes::from(bytes),
+        let body = match wire {
+            Ok(bytes) => bytes,
             Err(e) => return Self::handle_serialization_error(e),
         };
         if let Some(response) = overload::shed_if_worker_overloaded(
