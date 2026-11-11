@@ -9,7 +9,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +19,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
+use memchr::memmem;
 use openai_protocol::{
     chat::{
         ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -213,15 +214,20 @@ fn frame_text(chunk: &[u8]) -> Cow<'_, str> {
 /// and a re-sliced stream every slice cut from one chunk. Read as one event,
 /// such a frame parses as nothing and everything after its first event is lost.
 fn sse_events(frame: &str) -> impl Iterator<Item = &str> {
-    // The blank line found by the SIMD two-byte search (`memchr`, a dependency
-    // of the gateway already): `str::split("\n\n")` runs the two-way substring
-    // searcher, which held 4.6 % of a Responses request's user instructions.
-    // A split at an ASCII pair is at a character boundary, so the slices are
-    // text.
+    // The blank line found by `memchr`'s substring searcher (a dependency of
+    // the gateway already), built once for the two bytes: a remainder at
+    // least a vector and a byte long takes its vector search, a shorter one
+    // (the usual tail: a keep-alive, the terminator, nothing) its Rabin-Karp
+    // scan. `str::split("\n\n")` built the two-way substring searcher per
+    // call, which held 4.6 % of a Responses request's user instructions, and
+    // the one-shot `memmem::find` builds a searcher per event as well. A split
+    // at an ASCII pair is at a character boundary, so the slices are text.
+    static BLANK_LINE: OnceLock<memmem::Finder<'static>> = OnceLock::new();
+    let blank_line = BLANK_LINE.get_or_init(|| memmem::Finder::new(b"\n\n"));
     let mut rest = Some(frame);
     std::iter::from_fn(move || {
         let text = rest?;
-        Some(match memchr::memmem::find(text.as_bytes(), b"\n\n") {
+        Some(match blank_line.find(text.as_bytes()) {
             Some(end) => {
                 rest = Some(&text[end + 2..]);
                 &text[..end]
