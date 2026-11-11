@@ -108,6 +108,15 @@ def rotate_previous_log(log_path: str) -> str | None:
     return rotated
 
 
+def validate_encode_worker_pair(engine: str, mode: ConnectionMode, worker_type: WorkerType) -> None:
+    """Reject unsupported encoders before cache changes or worker preparation."""
+    if worker_type == WorkerType.ENCODE and (engine != "tokenspeed" or mode != ConnectionMode.GRPC):
+        raise ValueError(
+            "EPD encode workers currently require TokenSpeed over gRPC; "
+            f"got engine={engine!r}, mode={getattr(mode, 'value', mode)!r}"
+        )
+
+
 @dataclass
 class Worker:
     """A single inference worker process."""
@@ -455,6 +464,7 @@ class Worker:
 
     def _build_cmd(self) -> list[str]:
         """Build engine-specific launch command using model specs."""
+        validate_encode_worker_pair(self.engine, self.mode, self.worker_type)
         spec = get_model_spec(self.model_id)
         model_path = spec["model"]
         tp_size = self.tp or spec.get("tp", 1)
@@ -1350,6 +1360,8 @@ def start_workers(
 
     if engine is None:
         engine = get_runtime()
+
+    validate_encode_worker_pair(engine, mode, worker_type)
 
     spec = get_model_spec(model_id)
     gpus_per_worker = gpus or tp or spec.get("tp", 1)
