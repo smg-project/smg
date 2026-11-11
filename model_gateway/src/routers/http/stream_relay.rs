@@ -271,30 +271,37 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::{
+        http::{HeaderMap, StatusCode},
+        response::Response,
+    };
     use bytes::Bytes;
-    use futures_util::stream;
+    use futures_util::{stream, Stream};
     use http_body_util::BodyExt;
 
     use super::{relay_streaming_body, ChunkMode, ChunkStep, Relay};
     use crate::{
-        routers::http::stream_failure::RelaySource,
+        routers::{common::sse::SSE_CHANNEL_BUFFER, http::stream_failure::RelaySource},
         worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
     };
 
-    /// The frames the client gets when the upstream yields `chunks` through
-    /// the relay in `mode`.
-    async fn frames_through(chunks: Vec<&'static [u8]>, mode: ChunkMode) -> Vec<Bytes> {
+    /// The relay of `upstream` in `mode`: a successful SSE head from a worker
+    /// at a port nobody listens on.
+    fn relay_of<S>(upstream: S, mode: ChunkMode) -> Response
+    where
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    {
         let worker: Arc<dyn Worker> =
             Arc::new(BasicWorkerBuilder::new("http://127.0.0.1:1").build());
-        let upstream = stream::iter(
-            chunks
-                .into_iter()
-                .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
-        );
-        let response = relay_streaming_body(
+        relay_streaming_body(
             upstream,
             Relay {
                 status: StatusCode::OK,
@@ -304,8 +311,18 @@ mod tests {
                 headers: HeaderMap::new(),
                 mode,
             },
+        )
+    }
+
+    /// The frames the client gets when the upstream yields `chunks` through
+    /// the relay in `mode`.
+    async fn frames_through(chunks: Vec<&'static [u8]>, mode: ChunkMode) -> Vec<Bytes> {
+        let upstream = stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
         );
-        let mut body = response.into_body();
+        let mut body = relay_of(upstream, mode).into_body();
         let mut frames = Vec::new();
         while let Some(frame) = body.frame().await {
             if let Ok(data) = frame.expect("a relayed frame").into_data() {
@@ -356,6 +373,41 @@ mod tests {
                 Bytes::from_static(b"data: a\n\n"),
                 Bytes::from_static(b"data: [DONE]\n\n")
             ]
+        );
+    }
+
+    /// A client that stops reading stops the upstream read: the relay holds
+    /// at most `SSE_CHANNEL_BUFFER` chunks for it, plus the one its parked
+    /// `send` carries, and never the rest of the stream. One frame the client
+    /// reads frees one slot.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_bounds_the_upstream_read_at_the_relays_buffer() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&pulled);
+        let upstream = stream::repeat_with(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, reqwest::Error>(Bytes::from_static(b"data: x\n\n"))
+        });
+        let mut body = relay_of(upstream, ChunkMode::Plain).into_body();
+
+        // The relay fills its channel and parks on the next send.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let unread = pulled.load(Ordering::SeqCst);
+        assert!(
+            (SSE_CHANNEL_BUFFER..=SSE_CHANNEL_BUFFER + 1).contains(&unread),
+            "the relay pulled {unread} chunks for a client that read none"
+        );
+
+        // One frame read frees one slot: one more chunk, not the stream.
+        body.frame()
+            .await
+            .expect("a frame")
+            .expect("a relayed frame");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_one = pulled.load(Ordering::SeqCst);
+        assert!(
+            (unread + 1..=unread + 2).contains(&after_one),
+            "the relay pulled {after_one} chunks after one frame was read, {unread} before"
         );
     }
 }
