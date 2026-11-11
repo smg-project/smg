@@ -4,6 +4,7 @@ mod glm53_flash;
 mod inkling;
 mod kimi_k25;
 mod kimi_k3;
+mod layouts;
 mod llama4;
 mod llava;
 mod minimax_m3;
