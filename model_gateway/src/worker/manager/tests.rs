@@ -92,17 +92,52 @@ async fn a_hanging_engine_id_read_expires_and_keeps_the_previous_id() {
     hold.abort();
 }
 
+/// A data-parallel rank row's re-read dials its engine's address: the row's
+/// own url is `{base}@{rank}`, which a dial reads as a userinfo delimiter, so
+/// a re-read of it never reaches the engine and the id of the dead process
+/// stays on every rank row (#2491).
+#[tokio::test]
+async fn a_rank_rows_engine_id_re_read_dials_the_engine() {
+    let (url, engine) = mock_engine_reporting(
+        "test-model",
+        SchedulerWire::Vllm,
+        &[("kv_engine_id", "eng-new")],
+    )
+    .await;
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url.replacen("http://", "grpc://", 1))
+            .worker_type(WorkerType::Prefill)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MooncakeConnector")
+            .kv_engine_id("eng-old")
+            .dp_config(0, 2)
+            .build(),
+    );
+    assert!(worker.url().ends_with("@0"), "{}", worker.url());
+
+    refresh_kv_engine_id_after_recovery(&worker, Duration::from_secs(5)).await;
+
+    assert_eq!(worker.kv_engine_id().as_deref(), Some("eng-new"));
+    assert!(worker.kv_engine_id_confirmed());
+    engine.abort();
+}
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use http::{header::AUTHORIZATION, HeaderMap};
+use mock_worker::config::SchedulerWire;
 use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerStatus},
 };
 
 use super::*;
-use crate::worker::{
-    circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
-    ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry, WorkerType,
+use crate::{
+    routers::grpc::test_engine::mock_engine_reporting,
+    worker::{
+        circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
+        ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry, WorkerType,
+    },
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {

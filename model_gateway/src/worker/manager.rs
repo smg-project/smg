@@ -1002,9 +1002,10 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
     {
         return;
     }
+    // A rank row's url carries its `@{rank}`; the engine listens at the base.
     let read = tokio::time::timeout(
         timeout,
-        discover_grpc_kv_engine_id(worker.url(), spec.runtime_type.as_str()),
+        discover_grpc_kv_engine_id(worker.base_url(), spec.runtime_type.as_str()),
     )
     .await;
     // A read that did not complete leaves the id unconfirmed, so the next
