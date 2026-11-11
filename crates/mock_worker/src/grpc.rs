@@ -2094,6 +2094,33 @@ mod tests {
         }
     }
 
+    /// A zero limit is a prefill-only request on the wire too: one complete
+    /// frame, no output token, `length`, a zero completion count; not the
+    /// worker's default length, which belongs to an omitted limit.
+    #[tokio::test]
+    async fn a_zero_limit_completes_with_no_output_token_on_a_realistic_worker() {
+        let (service, _stop) = scheduler_with_ranks(1, 65_109);
+        let mut stream = service
+            .generate(Request::new(generate_request("score", None, 0)))
+            .await
+            .expect("accepted")
+            .into_inner();
+        let mut frames = Vec::new();
+        while let Some(frame) = stream.next().await {
+            frames.push(frame.expect("a frame"));
+        }
+        let [frame] = frames.as_slice() else {
+            panic!("one complete frame, got {frames:?}");
+        };
+        let Some(ts::generate_response::Response::Complete(complete)) = &frame.response else {
+            panic!("a complete frame, got {frame:?}");
+        };
+        assert!(complete.output_ids.is_empty(), "{complete:?}");
+        assert_eq!(complete.finish_reason, "length");
+        assert_eq!(complete.completion_tokens, 0);
+        assert_eq!(complete.prompt_tokens, 4);
+    }
+
     /// A pinned request runs on its rank's engine; a pin past the worker's
     /// ranks is the caller's error, as the servicers answer it.
     #[tokio::test]
