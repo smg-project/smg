@@ -2514,9 +2514,14 @@ fn render_messages<'a>(
         .map_err(|e| anyhow!("Failed to get template: {e}"))?;
 
     // transformers adds `strftime_now` to the template environment; here it is
-    // a callable of the render context, bound to the render's instant.
-    let now = params.now.unwrap_or_else(render_instant);
-    let strftime_now = Value::from_function(move |format: String| strftime(&now, &format));
+    // a callable of the render context, bound to the render's instant. The
+    // instant is read when the template first writes it: a template that never
+    // calls `strftime_now` costs its render no wall-clock read, and one that
+    // calls it twice writes one instant.
+    let instant = params.now.map_or_else(OnceLock::new, OnceLock::from);
+    let strftime_now = Value::from_function(move |format: String| {
+        strftime(instant.get_or_init(render_instant), &format)
+    });
 
     // Convert messages to minijinja::Value (messages already processed by router)
     let minijinja_messages: Vec<Value> = messages.map(Value::from_serialize).collect();
