@@ -492,7 +492,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                         for mm_hash in batch.mm_hashes
                     )
                 # P may send KV remotely, but it still needs every incoming EC
-                # handle. Only a leg without EC parameters may rely on KV alone.
+                # handle. Only a request without EC parameters may rely on KV alone.
                 if (
                     missing_pixels
                     and (ec_transfer_params is not None or kv_transfer_params is None)
@@ -508,7 +508,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                     raise ValueError(
                         "multimodal payload carries grid tensors but no pixel_values and "
-                        f"{reason}; a pixel-less leg requires a handoff"
+                        f"{reason}; a pixel-less request requires a handoff"
                     )
                 # Preprocessed multimodal from Rust router.
                 # Token IDs already have expanded placeholders; tensors are
