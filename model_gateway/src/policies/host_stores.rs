@@ -1591,10 +1591,12 @@ mod tests {
         registry.register(Arc::clone(&worker)).expect("registered");
         let host = HostStores::new(Arc::clone(&registry), None, Some(&kv_monitor));
         let id = worker_id(worker.as_ref());
-        kv_monitor
-            .on_worker_added(&worker, crate::worker::SubscriptionKind::Events)
-            .await;
-        let index = kv_monitor.get_indexer("m").expect("the model's index");
+        // The index placed without a stream: the host is the only writer that
+        // interns the URL, so the slot's return below is deterministic (a
+        // subscription's task would intern it again with no ordering against
+        // this body).
+        let index = Arc::new(KvIndex::chain());
+        kv_monitor.set_index("m", Arc::clone(&index));
         // The batch's lookup: the worker resolves and its slot is interned.
         let feed = host.feed_of(id).expect("the feed of a live worker");
         // Then the registry drops the worker and the removal sweeps.
