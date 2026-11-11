@@ -1134,12 +1134,17 @@ impl RoundRobin {
         (bucket, tag << POSITION_BITS)
     }
 
-    /// The position a claim starts from: the shared counter's value mixed,
-    /// so sets seen first spread over the rows, and a set a full bucket
-    /// forgets takes a fresh row at each claim rather than the row its
-    /// cycle's length would fix.
+    /// The position a claim starts from: the shared counter's value through
+    /// the SplitMix64 finalizer, so sets seen first spread over the rows,
+    /// and a set a full bucket forgets takes a fresh row at each claim
+    /// rather than the row its cycle's length would fix. One multiply kept
+    /// claims a cycle's length apart on rows a cycle's length apart, and a
+    /// row count sharing a factor with it went unvisited.
     fn start_of(claim: u64) -> u64 {
-        claim.wrapping_mul(KEY_MIX) >> 32
+        let mut z = claim.wrapping_add(KEY_MIX);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) >> 32
     }
 
     fn advance(&self, key: u64) -> u64 {
@@ -1320,17 +1325,20 @@ mod tests {
     fn nine_sets_cycling_one_bucket_take_every_row() {
         // Nine keys of one bucket visited in a fixed cycle: eight words cannot
         // hold them, so every visit past the first eight draws anew, at the
-        // row its counter value draws. Reduced to two, three or four rows,
-        // every set still takes every row over the rounds, where a start that
-        // advanced by the cycle's length would have fixed one.
+        // row its counter value draws. Reduced to 2, 3, 4, 9, 12 or 14 rows,
+        // every set takes every row within a third of its even share over a
+        // thousand rounds, where a start that advanced by the cycle's length
+        // fixed one row, and one multiply left rows sharing a factor with
+        // the cycle's stride unvisited.
         let rr = RoundRobin::new();
         let bucket = RoundRobin::bucket_of(0x0123_4567_89ab_cdef).0;
         let keys: Vec<u64> = (1u64..)
             .filter(|&k| RoundRobin::bucket_of(k).0 == bucket)
             .take(9)
             .collect();
-        let rounds = 300u64;
-        let mut taken = vec![[[0u64; 4]; 3]; 9];
+        const ROWS: [usize; 6] = [2, 3, 4, 9, 12, 14];
+        let rounds = 1_000u64;
+        let mut taken = vec![[[0u64; 14]; ROWS.len()]; 9];
         for round in 0..rounds {
             for (n, &k) in keys.iter().enumerate() {
                 let position = rr.advance(k);
@@ -1339,16 +1347,16 @@ mod tests {
                     RoundRobin::start_of(9 * round + n as u64),
                     "round {round}, set {n}"
                 );
-                for (r, rows) in [2u64, 3, 4].into_iter().enumerate() {
-                    taken[n][r][(position % rows) as usize] += 1;
+                for (r, &rows) in ROWS.iter().enumerate() {
+                    taken[n][r][(position % rows as u64) as usize] += 1;
                 }
             }
         }
         for (n, set) in taken.iter().enumerate() {
-            for (r, rows) in [2usize, 3, 4].into_iter().enumerate() {
+            for (r, &rows) in ROWS.iter().enumerate() {
                 for (row, &count) in set[r][..rows].iter().enumerate() {
                     assert!(
-                        count * 5 >= rounds,
+                        count * rows as u64 * 3 >= rounds,
                         "set {n} over {rows} rows: row {row} taken {count} of {rounds}"
                     );
                 }
