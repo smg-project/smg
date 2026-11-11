@@ -13,6 +13,7 @@ pub mod inert;
 pub mod logging;
 pub mod messages_errors;
 pub mod metrics;
+pub mod request_coding;
 pub mod request_id;
 pub mod request_start;
 pub mod scheduler;
@@ -39,6 +40,7 @@ pub use messages_errors::{
     MessagesErrorEnvelopeLayer,
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
+pub use request_coding::refuse_encoded_request_body;
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use request_start::RequestStarted;
 pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};

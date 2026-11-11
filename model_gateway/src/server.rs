@@ -1648,8 +1648,10 @@ where
         // the access log; the trace context on the response; the Messages
         // envelope outside the body-size limit (a declared over-limit length
         // is refused by the limit layer before any route layer runs, and
-        // still leaves in the envelope); the payload limit on the request
-        // body (a declared over-limit length is refused there, in the
+        // still leaves in the envelope); the content-coding check (a body
+        // under a coding the gateway does not decode is refused by name, in
+        // the envelope, before any layer inside reads it); the payload limit
+        // on the request body (a declared over-limit length is refused there, in the
         // gateway's envelope, before any layer inside runs; a chunked upload
         // is capped on its way in); innermost, the default body limit.
         .layer(
@@ -1661,6 +1663,9 @@ where
                     middleware::trace_context_on_response,
                 ))
                 .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(axum::middleware::from_fn(
+                    middleware::refuse_encoded_request_body,
+                ))
                 .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
                 .layer(axum::extract::DefaultBodyLimit::max(max_payload_size)),
         )
