@@ -346,10 +346,13 @@ pub async fn reload_logged(
 
 /// `--secrets-auto-reload`: the directories of the key files the start read
 /// are watched (`DirectoryWatch`), and a change runs the reload the route
-/// runs, once a burst of changes has settled. A directory that cannot be
-/// watched refuses the start. A directory removed or moved away is said so
-/// once and watched again once it exists, with one reload then. The task runs
-/// for the lifetime of the server.
+/// runs, once a burst of changes has settled. The files are read once more
+/// as the watch starts: a file rotated between the start's read and the
+/// watch raises no event, and would stay out of force until its next
+/// rotation. A directory that cannot be watched refuses the start. A
+/// directory removed or moved away is said so once and watched again once it
+/// exists, with one reload then. The task runs for the lifetime of the
+/// server.
 pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::JoinHandle<()>> {
     let (wake, woken) = mpsc::channel(1);
     let mut watches = Vec::new();
@@ -366,6 +369,9 @@ pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::
         directories = watches.len(),
         "watching the key files; a change reloads the keys"
     );
+    // What changed between the start's read of the files and the watch is
+    // read now, as after a lost directory returns: no event reports it.
+    let _ = wake.try_send(());
     #[expect(
         clippy::disallowed_methods,
         reason = "the key-file watch runs for the lifetime of the server"
@@ -823,6 +829,45 @@ mod tests {
             assert!(
                 time::Instant::now() < deadline,
                 "the rotation was not reloaded"
+            );
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!serving.contains_token("k-one"), "the old key is out");
+        handle.abort();
+    }
+
+    /// A key rotated between the start's read of its file and the watch's
+    /// start raises no event: the watch reads the files once as it starts,
+    /// and the rotated key is in force without a further change.
+    #[tokio::test]
+    async fn a_rotation_before_the_watch_starts_is_in_force_once_it_starts() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = write(dir.path(), "key", "k-one\n");
+        let serving = AuthConfig::new(Some("k-one".into()));
+        let reloader = Arc::new(
+            SecretReloader::new(
+                SecretFiles {
+                    api_key: Some(file.clone()),
+                    ..SecretFiles::default()
+                },
+                &sources(SecretSource::File, None),
+                Some("k-one"),
+                &[],
+                serving.clone(),
+                None,
+            )
+            .expect("a file source"),
+        );
+
+        // Rotated before the watch exists: no event will ever report it.
+        let staged = write(dir.path(), "key.staged", "k-two\n");
+        std::fs::rename(&staged, &file).expect("renamed over the key file");
+        let handle = start_auto_reload(Arc::clone(&reloader)).expect("the directory is watched");
+        let deadline = time::Instant::now() + Duration::from_secs(10);
+        while !serving.contains_token("k-two") {
+            assert!(
+                time::Instant::now() < deadline,
+                "the rotation before the watch was not read"
             );
             time::sleep(Duration::from_millis(50)).await;
         }
