@@ -10,6 +10,7 @@ use tokio::time::timeout;
 
 mod constraint_failure_test;
 mod decisions_grpc_test;
+mod generate_media_test;
 mod grpc_chat_logprobs_test;
 mod grpc_completion_logprobs_test;
 mod grpc_context_length_test;

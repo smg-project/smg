@@ -42,6 +42,24 @@ impl GeneratePreparationStage {
         ctx: &mut RequestContext,
         request: &GenerateRequest,
     ) -> Result<(), Response> {
+        // The route declares media fields, and the paths that forward the
+        // body as given carry them to the engine; this pipeline sends text
+        // and token ids only. A request that names media is refused as the
+        // chat route refuses media no worker takes, instead of being served
+        // without it.
+        let media = media_fields(request);
+        if !media.is_empty() {
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                format!(
+                    "media input ({}) is not supported on the generate route over the gateway's \
+                     gRPC path: the route carries text and token ids to the engine, no media; send \
+                     media through the chat route",
+                    media.join(", ")
+                ),
+            ));
+        }
+
         // Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer = utils::resolve_tokenizer(ctx, "GeneratePreparationStage::prepare_generate")
             .map_err(|e| *e)?;
@@ -131,5 +149,75 @@ impl GeneratePreparationStage {
             .await
             .map_err(|e| format!("Tokenization failed: {e}"))?;
         Ok((text.to_string(), encoding.into_token_ids()))
+    }
+}
+
+/// The media fields of `request` that carry something: `image_data`,
+/// `video_data` and `audio_data` when present and naming an item (a null, an
+/// empty list, or a list of nulls and empty lists is no media, as the engine
+/// reads it).
+fn media_fields(request: &GenerateRequest) -> Vec<&'static str> {
+    [
+        ("image_data", &request.image_data),
+        ("video_data", &request.video_data),
+        ("audio_data", &request.audio_data),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.as_ref().is_some_and(carries_media))
+    .map(|(name, _)| name)
+    .collect()
+}
+
+/// Whether `value` names media as the engine reads it: anything but a null,
+/// or a list, nested to any depth, one of whose items does.
+fn carries_media(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Array(items) => items.iter().any(carries_media),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn request(extra: serde_json::Value) -> GenerateRequest {
+        let mut body = json!({"model": "m", "text": "hi"});
+        body.as_object_mut()
+            .expect("an object")
+            .extend(extra.as_object().expect("an object").clone());
+        serde_json::from_value(body).expect("a generate request")
+    }
+
+    /// A body names media when one of the three fields carries something; a
+    /// text-only body, a null, an empty list and a list of nulls and empty
+    /// lists do not.
+    #[test]
+    fn the_media_fields_that_carry_something_are_named() {
+        assert!(media_fields(&request(json!({}))).is_empty());
+        assert!(media_fields(&request(json!({"image_data": null}))).is_empty());
+        assert!(media_fields(&request(json!({"image_data": []}))).is_empty());
+        assert!(media_fields(&request(json!({"image_data": [null]}))).is_empty());
+        assert!(media_fields(&request(json!({"video_data": [[]]}))).is_empty());
+        assert!(media_fields(&request(json!({"audio_data": [null, [], [null]]}))).is_empty());
+        assert_eq!(
+            media_fields(&request(json!({"image_data": [[null, "a.png"]]}))),
+            ["image_data"]
+        );
+        assert_eq!(
+            media_fields(&request(
+                json!({"image_data": "data:image/png;base64,iVBORw0KGgo="})
+            )),
+            ["image_data"]
+        );
+        assert_eq!(
+            media_fields(&request(
+                json!({"video_data": ["clip.mp4"], "audio_data": "a.wav"})
+            )),
+            ["video_data", "audio_data"]
+        );
     }
 }
