@@ -282,7 +282,9 @@ impl ResponseProcessor {
     /// thinking tokens are the engine's, or the reasoning text's, when the request asked for
     /// thinking. A call whose arguments no `tool_use` input holds refuses the message
     /// (`SymphonyError::InputRefused`, the call named), rather than leave as `{}` without a word;
-    /// the caller counts the refusal under the table ([`telemetry::record_refused`]).
+    /// the caller counts the refusal under the table ([`telemetry::record_refused`]). A call whose
+    /// arguments are a whole value of another kind than an object (a double-encoded or bare string,
+    /// an array) carries `{}` with a word in the log ([`object_input`]), as on the older path.
     fn read_messages_with_symphony(
         dispatch: &DispatchMetadata,
         assignment: &Assignment,
@@ -323,6 +325,10 @@ impl ResponseProcessor {
                 refused.index, refused.name, refused.why
             )));
         }
+        // Arguments that are a whole value of another kind (a double-encoded or
+        // bare string, an array) become `{}` with a word in the log, as on the
+        // older path: the request side takes no other `input`.
+        object_inputs(&mut output.content, "read_messages_with_symphony");
         if !request.thinking_text_returned {
             utils::message_utils::omit_thinking_text(&mut output.content);
         }
@@ -1604,46 +1610,79 @@ fn messages_usage_from_counts(
 
 /// The `input` of a `tool_use` block from the arguments a tool call carries:
 /// the parsed object as it is, or an empty object when the arguments are
-/// missing, are not valid JSON, or are valid JSON that is not an object (a
-/// double-encoded or bare string, an array). The Messages contract makes
-/// `input` an object and the request side refuses anything else, so an answer
-/// never carries a value a client could not send back as history; the
-/// fallback is named once in the log, as the parse failure always was. (The
-/// Symphony reader refuses such a message instead; see
-/// `read_messages_with_symphony`.)
+/// missing, are not valid JSON, or are valid JSON that is not an object
+/// ([`object_input`]); the fallback is named once in the log, as the parse
+/// failure always was.
 fn tool_use_input(arguments: Option<&str>, tool_call_id: &str) -> serde_json::Value {
-    let empty = || serde_json::Value::Object(serde_json::Map::new());
     let Some(args) = arguments else {
-        return empty();
+        return serde_json::Value::Object(serde_json::Map::new());
     };
-    let why = match serde_json::from_str::<serde_json::Value>(args) {
-        Ok(value) if value.is_object() => return value,
-        Ok(other) => {
-            let kind = match other {
-                serde_json::Value::String(_) => "string",
-                serde_json::Value::Array(_) => "array",
-                serde_json::Value::Number(_) => "number",
-                serde_json::Value::Bool(_) => "boolean",
-                _ => "null",
-            };
-            format!("the arguments are valid JSON but not an object ({kind})")
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(value) => object_input(
+            value,
+            "process_non_streaming_messages_response",
+            tool_call_id,
+        ),
+        Err(e) => {
+            warn!(
+                function = "process_non_streaming_messages_response",
+                tool_call_id = %tool_call_id,
+                error = %e,
+                "Failed to parse tool call arguments, defaulting to empty object"
+            );
+            serde_json::Value::Object(serde_json::Map::new())
         }
-        Err(e) => e.to_string(),
+    }
+}
+
+/// A `tool_use` block's `input` as the Messages contract has it: the object
+/// itself, or an empty object for a whole value of another kind (a
+/// double-encoded or bare string, an array, a number, null), named once in the
+/// log under `function`. The request side refuses anything but an object, so an
+/// answer of either collected reader never carries a value a client could not
+/// send back as history. (The stream carries a call's arguments as written.)
+fn object_input(
+    value: serde_json::Value,
+    function: &'static str,
+    tool_call_id: &str,
+) -> serde_json::Value {
+    if value.is_object() {
+        return value;
+    }
+    let kind = match value {
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Bool(_) => "boolean",
+        _ => "null",
     };
     warn!(
-        function = "process_non_streaming_messages_response",
+        function = function,
         tool_call_id = %tool_call_id,
-        error = %why,
+        error = %format!("the arguments are valid JSON but not an object ({kind})"),
         "Failed to parse tool call arguments, defaulting to empty object"
     );
-    empty()
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// Every `tool_use` block of a collected answer with its `input` an object
+/// ([`object_input`]), in place.
+fn object_inputs(content: &mut [messages::ContentBlock], function: &'static str) {
+    for block in content {
+        if let messages::ContentBlock::ToolUse { id, input, .. } = block {
+            if !input.is_object() {
+                *input = object_input(std::mem::take(input), function, id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tool_use_input_tests {
     use serde_json::json;
+    use symphony::{adapt, Event, Events, FinishReason, Text};
 
-    use super::tool_use_input;
+    use super::{messages, object_inputs, tool_use_input};
 
     /// An answer's `tool_use.input` is always an object, as the request side
     /// requires it: the parsed object as it is; an empty object for missing
@@ -1671,6 +1710,52 @@ mod tool_use_input_tests {
                 json!({}),
                 "{arguments:?}"
             );
+        }
+    }
+
+    /// The Symphony reader's collected answer keeps the same contract: the
+    /// adapter holds a whole value of any kind as the block's `input` (an
+    /// object as it is, `"Paris"` or `[1, 2]` as written, none of them
+    /// refused), and the reader leaves every non-object as `{}`.
+    #[test]
+    fn a_symphony_tool_use_input_is_an_object() {
+        for (arguments, expected) in [
+            (r#"{"city":"Paris"}"#, json!({"city": "Paris"})),
+            (r#""Paris""#, json!({})),
+            (r#""{\"city\":\"Paris\"}""#, json!({})),
+            ("[1, 2]", json!({})),
+        ] {
+            let mut events = Events::new();
+            events.push(Event::ToolCallStart {
+                index: 0,
+                id: "call_1".into(),
+                name: "f".into(),
+                source: Text::new("", 0),
+            });
+            events.push(Event::ToolCallArguments {
+                index: 0,
+                json: arguments.into(),
+                source: Text::new("", 0),
+            });
+            events.push(Event::ToolCallEnd {
+                index: 0,
+                source: Text::new("", 0),
+            });
+            events.push(Event::Finish {
+                reason: FinishReason::ToolCalls,
+                tool_calls: 1,
+                reasoning_tokens: 0,
+            });
+            let mut output = adapt::messages::output(&events);
+            assert!(
+                output.refused.is_empty(),
+                "{arguments}: the adapter holds the value"
+            );
+            object_inputs(&mut output.content, "read_messages_with_symphony");
+            let messages::ContentBlock::ToolUse { input, .. } = &output.content[0] else {
+                panic!("{arguments}: no tool_use block");
+            };
+            assert_eq!(input, &expected, "{arguments}");
         }
     }
 }
