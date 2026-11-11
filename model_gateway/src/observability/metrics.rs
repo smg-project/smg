@@ -132,6 +132,14 @@ mod handles {
         pub(super) policy: &'static str,
     }
 
+    /// The static labels of `smg_policy_decisions_total`.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct DecisionLabels {
+        pub(super) profile: &'static str,
+        pub(super) outcome: &'static str,
+        pub(super) mode: &'static str,
+    }
+
     /// The handles of one label set of the stream-timing set, each built
     /// the first time a stream has something for it, so the series that
     /// exist are exactly the ones recorded to.
@@ -443,6 +451,8 @@ mod handles {
         pub(super) static ENGINE_LOADS: RefCell<EngineLoads> = RefCell::new(EngineLoads::default());
         /// `smg_worker_selection_total` by its static labels, then the model.
         pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(FxHashMap::default());
+        /// `smg_policy_decisions_total` by its static labels, then the model.
+        pub(super) static POLICY_DECISIONS: RefCell<ByLabels<DecisionLabels, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
         pub(super) static CACHE_AWARE_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_manual_policy_branch_total` by branch.
@@ -481,6 +491,7 @@ mod handles {
         WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
         ENGINE_LOADS.with_borrow_mut(|kept| *kept = EngineLoads::default());
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
+        POLICY_DECISIONS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
         CONSISTENT_HASHING_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -1342,6 +1353,13 @@ pub(crate) fn init_metrics() {
         "smg_cache_aware_policy_branch_total",
         "Cache-aware tree-mode selection branch (tree_match, spill, expected_wait_fallback, \
          first_healthy_fallback)"
+    );
+    describe_counter!(
+        "smg_policy_decisions_total",
+        "Decisions of the policy engine by model, profile (the profile that decided; none when \
+         no binding matched), outcome (pick, queue, or the shed's reason: saturated, flow_limit, \
+         no_endpoints, policy_declined, deadline) and mode (embedded: the engine in the gateway \
+         process)"
     );
     describe_counter!(
         "smg_cache_aware_prefix_margin_held_total",
@@ -2913,6 +2931,44 @@ impl Metrics {
             policy,
         };
         handles::WORKER_SELECTIONS.with_borrow_mut(|by_labels| {
+            handles::with_model_handle(
+                by_labels.entry(labels).or_default(),
+                model_id,
+                build,
+                |count| count.increment(1),
+            );
+        });
+    }
+
+    /// Record one decision of the policy engine: the profile that decided,
+    /// the outcome (a pick, a queue ticket, or a shed by its reason) and the
+    /// mode the engine runs in. The host passes labels it resolved once per
+    /// profile; nothing is formatted per decision.
+    pub fn record_policy_decision(
+        model_id: &str,
+        profile: &'static str,
+        outcome: &'static str,
+        mode: &'static str,
+    ) {
+        let build = |model: Arc<str>| {
+            counter!(
+                "smg_policy_decisions_total",
+                "model" => model,
+                "profile" => profile,
+                "outcome" => outcome,
+                "mode" => mode
+            )
+        };
+        if !handles::keep_handles() {
+            build(intern_model_label(model_id)).increment(1);
+            return;
+        }
+        let labels = handles::DecisionLabels {
+            profile,
+            outcome,
+            mode,
+        };
+        handles::POLICY_DECISIONS.with_borrow_mut(|by_labels| {
             handles::with_model_handle(
                 by_labels.entry(labels).or_default(),
                 model_id,

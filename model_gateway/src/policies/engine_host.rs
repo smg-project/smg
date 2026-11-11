@@ -19,10 +19,10 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Instant,
 };
@@ -34,12 +34,13 @@ use smg_policy_controller::{
     store::identity,
     Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId, LeaseKind,
     Lifecycle, LoadRow, Membership, Needs, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts,
-    Role, Scratch, Side, SignalSource, SpecError, Target, WorkerId,
+    Role, Scratch, ShedReason, Side, SignalSource, SpecError, Target, WorkerId,
 };
 use tracing::debug;
 
 use crate::{
     config::{PolicyConfig, PowerOfTwoLoadMetric},
+    observability::metrics::Metrics,
     policies::host_stores::HostStores,
     routers::common::pd_admission,
     worker::{
@@ -51,6 +52,45 @@ use crate::{
 
 /// The crate's least-load scorer, the one stage that prices token-work.
 const LEAST_LOAD: &str = "least-load";
+
+/// The `mode` label of every decision this host takes: the engine runs in
+/// the gateway process (the design's `embedded`; `remote` and `elected`
+/// arrive with the controller).
+const POLICY_MODE: &str = "embedded";
+
+/// The `profile` label of a decision no profile ran (a binding miss).
+const NO_PROFILE_LABEL: &str = "none";
+
+/// The `outcome` label of a decision: a pick, a queue ticket, or a shed by
+/// the reason the status table names.
+pub fn outcome_label(decision: &Decision) -> &'static str {
+    match decision {
+        Decision::Pick(_) => "pick",
+        Decision::Queue(_) => "queue",
+        Decision::Shed(shed) => match shed.reason {
+            ShedReason::Saturated => "saturated",
+            ShedReason::FlowLimit => "flow_limit",
+            ShedReason::NoEndpoints => "no_endpoints",
+            ShedReason::PolicyDeclined => "policy_declined",
+            ShedReason::Deadline => "deadline",
+        },
+    }
+}
+
+/// A profile's name as a `'static` label, interned once per distinct name
+/// for the process's life: a spec names a handful of profiles, and the
+/// decision counter's labels are then resolved once per host, never per
+/// decision.
+fn static_label(name: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut names = NAMES.get_or_init(Default::default).lock();
+    if let Some(known) = names.get(name) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
 
 /// Why the engine cannot serve a policy configuration in this build.
 #[derive(Debug, thiserror::Error)]
@@ -245,6 +285,9 @@ pub struct Decider {
     /// (`least_load`'s setting, the scorer's default under `power_of_two`),
     /// nothing otherwise.
     mean_prompt_tokens: u32,
+    /// The profiles' names as the decision counter's `profile` label, by
+    /// the engine's position, resolved once here.
+    profile_labels: Box<[&'static str]>,
 }
 
 impl std::fmt::Debug for Decider {
@@ -302,10 +345,17 @@ impl Decider {
 
     /// The engine for a document: `spec` validated and hosted. A request of
     /// unknown prompt size is booked at the mean prefill of the profile
-    /// named `default` when it prices tokens, nothing otherwise.
+    /// named `default` when it prices tokens, nothing otherwise. The
+    /// `profile` label of every decision is resolved here, once per profile.
     pub fn from_spec(spec: &PolicySpec) -> Result<Self, EngineHostError> {
+        let engine = spec.validate()?;
+        let profile_labels = engine
+            .profiles()
+            .iter()
+            .map(|profile| static_label(&profile.name))
+            .collect();
         Ok(Self {
-            engine: spec.validate()?,
+            engine,
             loads: RwLock::new(None),
             retired: Mutex::new(Retired::default()),
             #[cfg(test)]
@@ -314,7 +364,30 @@ impl Decider {
             origin: Instant::now(),
             seq: AtomicU64::new(1),
             mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
+            profile_labels,
         })
+    }
+
+    /// The `profile` label of a decision: the deciding profile's name, or
+    /// `none` for a binding miss.
+    fn profile_label(&self, profile: u16) -> &'static str {
+        self.profile_labels
+            .get(usize::from(profile))
+            .copied()
+            .unwrap_or(NO_PROFILE_LABEL)
+    }
+
+    /// What every decision leaves behind: one count under
+    /// `smg_policy_decisions_total`, by the profile that decided and the
+    /// outcome, with labels resolved once per profile.
+    fn observe(&self, request: &HostRequest<'_>, decision: &Decision) {
+        let profile = self.profile_label(decision.trace().profile);
+        Metrics::record_policy_decision(
+            request.model,
+            profile,
+            outcome_label(decision),
+            POLICY_MODE,
+        );
     }
 
     pub fn engine(&self) -> &Engine {
@@ -541,6 +614,7 @@ impl Decider {
                 ..Constraints::default()
             };
             let decision = self.engine.decide(&facts, &pool, candidates, &cx, scratch);
+            self.observe(request, &decision);
             (
                 decision,
                 self.lease(id, now, request.prompt_tokens, session_key),
@@ -644,6 +718,7 @@ impl Decider {
                 scratch,
             )
         });
+        self.observe(request, &decision);
         (
             decision,
             self.lease(id, now, request.prompt_tokens, session_key),
@@ -860,6 +935,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::ManualAssignmentMode,
+        observability::metrics::test_support::render_with_recorder,
         policies::{test_support, PolicyFactory},
         worker::{
             load_state::{one_rank_load, LoadSnapshot},
@@ -872,6 +948,36 @@ mod tests {
         let urls: Vec<String> = (0..n).map(|i| format!("http://w{i}:8000")).collect();
         let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
         test_support::make_workers(&refs)
+    }
+
+    /// Every decision counts once under `smg_policy_decisions_total`, by
+    /// the profile that decided and the outcome: two picks on the default
+    /// profile, one no-endpoints shed over an empty pool, all embedded.
+    #[test]
+    fn every_decision_counts_once_by_profile_and_outcome() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let decider =
+            Decider::from_configs(&round_robin, &round_robin, &round_robin).expect("round robin");
+        let workers = pool(2);
+        let request = HostRequest {
+            model: "m-count",
+            ..HostRequest::default()
+        };
+        let rendered = render_with_recorder(|| {
+            decider.decide(&request, &workers, &[]);
+            decider.decide(&request, &workers, &[]);
+            decider.decide(&request, &[], &[]);
+        });
+        for expected in [
+            "smg_policy_decisions_total{model=\"m-count\",profile=\"default\",outcome=\"pick\",mode=\"embedded\"} 2",
+            "smg_policy_decisions_total{model=\"m-count\",profile=\"default\",outcome=\"no_endpoints\",mode=\"embedded\"} 1",
+        ] {
+            assert!(
+                rendered.lines().any(|line| line == expected),
+                "missing {expected} in:\n{rendered}"
+            );
+        }
+        assert_eq!(decider.decisions(), 3);
     }
 
     /// Two workers under the same idle report, so only the engine's own
