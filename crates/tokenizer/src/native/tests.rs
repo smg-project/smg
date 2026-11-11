@@ -587,6 +587,53 @@ fn the_digits_stage_holds_what_is_numeric_accepts() {
     }
 }
 
+/// Two numeric characters the regex engine's `\p{N}` table lacks (U+11DE0
+/// and U+11DE1, numeric to the toolchain), with a merge across their
+/// boundary in the vocabulary: the reference's `Digits` under
+/// `individual_digits` cuts between them, so the merge never applies, and
+/// the native stage cuts there too.
+#[test]
+fn digits_the_engine_table_lacks_are_cut_apart_before_a_merge_across_them() {
+    let mut state = 0xD161_7000_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "digits-then-byte-level-regex")
+        .expect("the shape");
+    let mut tokenizer = tokenizer_of(&shape, &mut state);
+    let table = bytes_char();
+    let mut vocab = Vocab::default();
+    let mut alphabet: Vec<char> = table.to_vec();
+    alphabet.sort_unstable();
+    for ch in alphabet {
+        let id = vocab.len() as u32;
+        vocab.insert(ch.to_string(), id);
+    }
+    // The last byte of U+11DE0 and the first byte of U+11DE1, merged.
+    let (a, b) = (table[0xA0].to_string(), table[0xF0].to_string());
+    let id = vocab.len() as u32;
+    vocab.insert(format!("{a}{b}"), id);
+    let merges: Merges = vec![(a, b)];
+    tokenizer.with_model(
+        BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .expect("bpe"),
+    );
+    let native = seeded(&tokenizer);
+    for text in [
+        "\u{11DE0}\u{11DE1}",
+        "x\u{11DE0}\u{11DE1}y",
+        "\u{11DE0} \u{11DE1}",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
 #[test]
 fn a_batch_takes_the_direct_path_input_by_input() {
     use crate::traits::{Encoder, Encoding};
