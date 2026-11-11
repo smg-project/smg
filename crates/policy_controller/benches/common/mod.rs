@@ -45,6 +45,7 @@ pub fn build_view(fleet: &[WorkerState], out: &mut Vec<Candidate>) {
         out.push(Candidate {
             position: i as u32,
             id: WorkerId(w.id),
+            key: w.id as u32,
             health: Health {
                 healthy: w.healthy,
                 ..Health::default()
