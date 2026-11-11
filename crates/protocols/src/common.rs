@@ -44,6 +44,20 @@ pub(crate) fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// The routing text of a JSON `input`: the string itself, an array's string
+/// members joined on spaces, nothing for any other shape.
+pub(crate) fn routing_text_of_input(input: &Value) -> String {
+    match input {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
 /// Default model for endpoints where model is optional (e.g., /generate).
 /// Uses UNKNOWN_MODEL_ID so routers treat it as "any available worker."
 pub fn default_unknown_model() -> String {
@@ -3248,5 +3262,16 @@ mod tests {
             assert_eq!(details.accepted_prediction_tokens, Some(0));
             assert_eq!(details.rejected_prediction_tokens, None);
         }
+    }
+
+    /// The routing text of a JSON input: the string itself, an array's string
+    /// members joined on spaces, nothing for any other shape.
+    #[test]
+    fn a_json_inputs_routing_text_is_its_strings_joined() {
+        assert_eq!(routing_text_of_input(&json!("hello world")), "hello world");
+        assert_eq!(routing_text_of_input(&json!(["a", 1, "b", null])), "a b");
+        assert_eq!(routing_text_of_input(&json!([[1, 2], [3]])), "");
+        assert_eq!(routing_text_of_input(&json!({"text": "x"})), "");
+        assert_eq!(routing_text_of_input(&json!(7)), "");
     }
 }
