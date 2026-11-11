@@ -43,6 +43,17 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- A rerank worker's answer is read as `RerankWorkerResponse { results, usage, id }`: its `usage`
+  (a rerank server's `prompt_tokens` and `total_tokens`, read as the crate's `UsageInfo`, whose
+  `completion_tokens` defaults; a usage in another spelling is left out, as before) and its `id`
+  ride into the gateway's response, and
+  `RerankResponse::new` sorts the results by score, highest first, before `top_n` cuts them,
+  whatever order the worker sent. The crate read the results alone and kept the worker's order,
+  so a worker that did not sort lost its best documents to the cut and the response carried none
+  of the worker's usage. A `RerankRequest` without a `user` writes no `user` key, as one without a
+  `rid` writes none. Breaking: `RerankWorkerResponse` is a struct (the enum and its `into_results`
+  are gone) and `RerankResponse::new` takes `(results, model, usage, id)` where it took
+  `(results, model, request_id)`.
 - Breaking: `normalize_input_item` takes the item by value. A bare `{role, content}` message moves
   its content and role into the message item built from it, and every other item comes back as it
   was passed, so a caller that owns its input no longer copies each item; a caller holding a

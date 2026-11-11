@@ -1654,20 +1654,24 @@ impl Router {
     /// The worker's body is read as a [`RerankWorkerResponse`]: the bare
     /// result list or the Cohere-style `results` object, in either's spelling
     /// of the score and the document, so a worker of any of the rerank
-    /// contracts answers in the gateway's one shape. The results keep the
-    /// worker's order (every contract sorts them, highest score first);
-    /// `top_k` and `return_documents` are applied here, whatever the worker
-    /// made of them.
+    /// contracts answers in the gateway's one shape. The results are sorted
+    /// highest score first whatever order the worker used, and `top_k` and
+    /// `return_documents` are applied to that order, whatever the worker
+    /// made of them; the worker's `usage` and `id` are carried, the request's
+    /// `rid` naming the answer when given.
     ///
     /// The worker body read is capped at `max_body_bytes`; a larger body is a
-    /// misbehaving worker and yields a 502.
+    /// misbehaving worker and yields a 502 `upstream_response_too_large`; a
+    /// body cut short in transit a 502 `read_response_body_failed` and one in
+    /// no rerank shape a 502 `call_upstream_decode_error`, the relay's own codes
+    /// for a worker body it could not read and one it could not decode.
     async fn build_rerank_response(
         req: RerankResponseSpec,
         canonical_model: Option<&str>,
         response: Response,
         max_body_bytes: usize,
     ) -> Response {
-        let (_, response_body) = response.into_parts();
+        let (parts, response_body) = response.into_parts();
         let body_bytes = match to_bytes(response_body, max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1685,26 +1689,36 @@ impl Router {
                     );
                 }
                 error!("Failed to read rerank worker response: {e}");
-                return error::internal_error(
-                    "rerank_response_build_failed",
-                    "Failed to build rerank response",
+                return error::bad_gateway(
+                    "read_response_body_failed",
+                    format!("Failed to get response body: {e}"),
                 );
             }
         };
-        let rerank_results = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
-            Ok(response) => response.into_results(),
+        let worker = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
+            Ok(worker) => worker,
             Err(e) => {
-                error!("Failed to build rerank response: {e}");
-                return error::internal_error(
-                    "rerank_response_build_failed",
-                    "Failed to build rerank response",
+                let status = parts.status;
+                let content_type = parts
+                    .headers
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("no content type");
+                warn!(%status, content_type, "Rerank worker response is in no rerank shape: {e}");
+                return error::bad_gateway(
+                    "call_upstream_decode_error",
+                    format!(
+                        "Rerank response from worker ({status}, {content_type}) is not a rerank answer: {e}"
+                    ),
                 );
             }
         };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
-        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid);
-        // The worker's order stands: every rerank contract answers sorted,
-        // highest score first.
+        // The client's `rid` names the answer when given, the worker's id
+        // otherwise; the response sorts the results highest score first,
+        // whatever order the worker used, and `top_k` cuts that order.
+        let mut rerank_response =
+            RerankResponse::new(worker.results, model, worker.usage, req.rid.or(worker.id));
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
         }
@@ -3702,8 +3716,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_results_object_with_relevance_scores_is_answered_in_the_gateway_shape() {
-        // The Cohere-style object: no document echoed, the object's own
-        // fields beside `results` unread.
+        // The Cohere-style object: no document echoed, the object's `usage`
+        // carried, its `model` unread.
         let rerank = rerank_response_of(
             r#"{"model": "test-model", "object": "list",
                 "usage": {"prompt_tokens": 12, "total_tokens": 12},
@@ -3719,7 +3733,13 @@ mod tests {
             first.document, None,
             "a worker that echoes no document yields none"
         );
-        assert!(rerank.usage.is_none(), "the worker's usage is not read");
+        assert_eq!(
+            rerank
+                .usage
+                .map(|usage| (usage.prompt_tokens, usage.total_tokens)),
+            Some((12, 12)),
+            "the worker's usage is carried"
+        );
     }
 
     #[tokio::test]
@@ -3765,7 +3785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_in_no_rerank_shape_is_a_build_failure_not_a_pass_through() {
+    async fn a_body_in_no_rerank_shape_is_a_502_not_a_pass_through() {
         for body in [
             r#"{"error": {"message": "no reranker loaded"}}"#,
             r#"[{"index": 0}]"#,
@@ -3779,14 +3799,10 @@ mod tests {
                 usize::MAX,
             )
             .await;
-            assert_eq!(
-                response.status(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "{body}"
-            );
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{body}");
             assert_eq!(
                 extract_error_code_from_response(&response),
-                "rerank_response_build_failed",
+                "call_upstream_decode_error",
                 "{body}"
             );
         }
@@ -3826,6 +3842,91 @@ mod tests {
         assert_eq!(
             extract_error_code_from_response(&response),
             "upstream_response_too_large"
+        );
+    }
+
+    /// A worker body cut short in transit (a chunk, then the connection's
+    /// error) is a 502 under the relay's code for a body it could not read,
+    /// not the size cap's.
+    #[tokio::test]
+    async fn a_worker_body_cut_short_in_transit_is_a_502_read_failure() {
+        let req = rerank_request();
+        let upstream = Response::new(Body::from_stream(stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"[{\"index\": 0, \"score\": 0.9}")),
+            Err(std::io::Error::other("connection cut")),
+        ])));
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            upstream,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "read_response_body_failed"
+        );
+    }
+
+    /// A worker that answers unsorted: the best row survives `top_k`, and
+    /// the answer is sorted highest score first whatever the worker did.
+    #[tokio::test]
+    async fn an_unsorted_worker_answer_keeps_its_best_row_under_top_k() {
+        let req = rerank_request();
+        let upstream = Response::new(Body::from(
+            r#"[{"index":0,"relevance_score":0.1},{"index":1,"relevance_score":0.9}]"#,
+        ));
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            upstream,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        let rows: Vec<(usize, f32)> = rerank.results.iter().map(|r| (r.index, r.score)).collect();
+        assert_eq!(rows, [(1, 0.9)], "top_k keeps the best row, not the first");
+    }
+
+    /// The worker's `usage` and `id` ride in the answer, and the client's
+    /// `rid` names the answer when given.
+    #[tokio::test]
+    async fn the_worker_s_usage_and_id_are_carried_and_the_request_s_rid_names_the_answer() {
+        let body = r#"{"id":"rerank-up-1","model":"m","results":[{"index":0,"relevance_score":0.5}],"usage":{"prompt_tokens":11,"total_tokens":11}}"#;
+        let rerank = rerank_response_of(body).await;
+        assert_eq!(
+            rerank.id,
+            Some(openai_protocol::common::StringOrArray::String(
+                "rerank-up-1".to_string()
+            ))
+        );
+        let usage = rerank.usage.expect("the worker's usage is carried");
+        assert_eq!((usage.prompt_tokens, usage.total_tokens), (11, 11));
+
+        let req = RerankRequest {
+            top_k: None,
+            rid: Some(openai_protocol::common::StringOrArray::String(
+                "client-1".to_string(),
+            )),
+            ..rerank_request()
+        };
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            Response::new(Body::from(body)),
+            usize::MAX,
+        )
+        .await;
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            rerank.id,
+            Some(openai_protocol::common::StringOrArray::String(
+                "client-1".to_string()
+            ))
         );
     }
 
