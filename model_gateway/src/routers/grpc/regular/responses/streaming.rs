@@ -2175,7 +2175,10 @@ mod tests {
             .unwrap()
             .expect("the failed response is stored");
         assert_eq!(stored.raw_response["status"], "failed");
-        assert_eq!(stored.raw_response["error"]["code"], "stream_error");
+        assert_eq!(
+            stored.raw_response["error"], terminal["response"]["error"],
+            "the record carries the error the client saw"
+        );
     }
 
     #[test]
