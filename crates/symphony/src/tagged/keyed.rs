@@ -1055,6 +1055,17 @@ mod tests {
             .iter()
             .any(|(_, why)| *why == MalformedReason::CallWithoutName));
         assert!(malformed(&events).iter().all(|(text, _)| text.is_empty()));
+        assert_eq!(bytes(&events), format!("{text}{CLOSE}"));
+        // The separator alone before the close: the separator refused first, then the close on
+        // its own, two nameless calls, every byte in one event, no call started.
+        let text = "<tool_sep>\n";
+        let events = run_with(Tags::HY_V3, &[text], false);
+        assert_eq!(starts(&events), 0);
+        assert_eq!(bytes(&events), format!("{text}{CLOSE}"));
+        assert!(malformed(&events)
+            .iter()
+            .all(|(_, why)| *why == MalformedReason::CallWithoutName));
+        assert_eq!(malformed(&events).len(), 2);
     }
 
     #[test]

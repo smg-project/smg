@@ -236,8 +236,8 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-237 groups, 421 checkpoints, newest first.
-12 ready, 171 replaying a recorded set, 5 on main awaiting fixtures, 49 pending.
+238 groups, 422 checkpoints, newest first.
+12 ready, 172 replaying a recorded set, 5 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -248,6 +248,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-10-21 | [lfm3-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-omni-2b) | LiquidAI/LFM3-Omni-2B |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-19 | [lfm3-vl-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-vl-2b) | LiquidAI/LFM3-VL-2B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-16 | [nvidia-nemotron-labs-dory1.0-4b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-labs-dory1.0-4b-bf16) | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16 |  | `qwen3`, tagged calls | 27 | replaying the set | none |
+| 2026-10-15 | [hy-memory-30b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/hy-memory-30b-a3b) | tencent/Hy-Memory-30B-A3B |  | `hy_v3` | 19 | replaying the set | none |
 | 2026-10-15 | [muse-spark-open-816b-a42b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-spark-open-816b-a42b) | meta-models/Muse-Spark-Open-816B-A42B | Muse-Spark-Open-816B-A42B-NVFP4 | `muse_spark` | — | awaiting fixtures | none |
 | 2026-10-12 | [lfm2.5-24b-a2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm2.5-24b-a2b) | LiquidAI/LFM2.5-24B-A2B |  | `lfm2.5` | 9 | replaying the set | none |
 | 2026-10-12 | [nvidia-nemotron-3.5-super-vl-120b-a12b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-super-vl-120b-a12b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 |  | `qwen3`, tagged calls | 27 | replaying the set | `qwen_xml`, `nano_v3` |
