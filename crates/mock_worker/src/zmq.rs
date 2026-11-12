@@ -1700,7 +1700,10 @@ mod tests {
             .port();
         let mut cfg = test_config();
         cfg.role = Some(Role::Prefill);
-        cfg.bootstrap_base_port = Some(bootstrap_port);
+        // Two gRPC workers (none spawned here) hold the first two ports: the
+        // rank's port is numbered after them.
+        cfg.grpc_count = 2;
+        cfg.bootstrap_base_port = Some(bootstrap_port - 2);
         #[expect(
             clippy::disallowed_methods,
             reason = "serve loops until the test drops its handles"
