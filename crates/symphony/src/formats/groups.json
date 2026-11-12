@@ -189,5 +189,5 @@
   {"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "Qwen/WebWorld-32B", "also": ["WebWorld-8B", "WebWorld-14B"], "table": "qwen3", "opener": null, "after": null},
   {"model": "tencent/WeVisOne-VL-4B", "also": ["WeVisOne-VL-2B"], "table": "qwen3", "opener": null, "after": null},
-  {"model": "tencent/Youtu-Parsing-Omni", "also": [], "table": "plain", "opener": null, "after": null}
+  {"model": "tencent/Youtu-Parsing-Omni", "also": [], "table": "qwen3", "opener": "<|begin_of_text|>assistant\n", "after": null}
 ]

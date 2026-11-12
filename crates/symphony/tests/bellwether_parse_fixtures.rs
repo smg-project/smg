@@ -208,9 +208,6 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // 4B its primary): JSON calls, no thought; bellwether records each checkpoint's own sets.
     ("wevisone-vl-4b", GenerationPrompt::Plain),
     ("wevisone-vl-2b", GenerationPrompt::Plain),
-    // Mage-VL-Cowork writes the Qwen3 template over a vision-language stack of its own: JSON calls, the
-    // thought opened in the prompt and closed there when the request turns thinking off.
-    ("mage-vl-cowork", GenerationPrompt::OpensTheThought),
     ("qwen3-vl-30b-a3b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-32b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-235b-a22b-instruct", GenerationPrompt::Plain),
@@ -285,6 +282,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // an older template without a thought; the recorded outputs follow the former.
     ("qwen-agentworld-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
+    // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
+    // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
+    // off.
+    ("mage-vl-cowork", GenerationPrompt::OpensTheThought),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
@@ -424,7 +425,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("phi-4-multimodal-instruct", GenerationPrompt::Plain),
     // Youtu-Parsing-Omni's template writes Qwen3's thinking switch under turn headers of its own and
     // declares no tools; bellwether recorded one content case of it (the rest refused), read with the
-    // plain table: a thought the model may write is content until a set shows one.
+    // qwen3 table under the group's own opener: a thought the model writes is reasoning, as the
+    // switch says.
     (
         "youtu-parsing-omni",
         GenerationPrompt::ModelWritesTheThought,
@@ -1051,6 +1053,7 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "llama-3.3-nemotron-70b-reward-principle",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
+    ("youtu-parsing-omni", "<|begin_of_text|>assistant\n"),
 ];
 
 /// What a recorded model's own chat template writes after the thought's close before a call,
@@ -1579,6 +1582,14 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     // sixteen, and no fence probe.
     ("d1-2b", "parse/content-with-marker-in-code-fence"),
     ("lfm2.5-24b-a2b", "parse/content-with-marker-in-code-fence"),
+    // Youtu-Parsing-Omni: the set is the one content case bellwether could record (the template
+    // renders no thought in history), so the qwen3 table's two listed probes are not among its
+    // fixtures.
+    ("youtu-parsing-omni", "parse/reasoning-with-marker-text"),
+    (
+        "youtu-parsing-omni",
+        "parse/content-with-marker-in-code-fence",
+    ),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker

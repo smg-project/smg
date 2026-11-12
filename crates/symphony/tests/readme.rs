@@ -2613,7 +2613,7 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-10-09",
         smg: (None, None),
-        table: Some(Table::Plain),
+        table: Some(Table::Qwen3),
         set: Some(1),
         status: Status::Replaying,
     },
