@@ -1125,6 +1125,7 @@ mod tests {
         let above = i64::from(TokenId::MAX) + 1;
         let reason = invalid_image_token_id_reason(&json!({ "image_token_id": above }));
         assert!(reason.contains("2147483648"), "{reason}");
+        assert!(reason.contains("(at most 2147483647)"), "{reason}");
         let reason =
             invalid_image_token_id_reason(&json!({ "image_token_id": u64::from(u32::MAX) + 1 }));
         assert!(reason.contains("4294967296"), "{reason}");
