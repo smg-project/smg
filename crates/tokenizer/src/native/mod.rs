@@ -1079,6 +1079,7 @@ impl NativeEncoder {
         tracing::debug!(
             merges = chars.merges(),
             bytes = chars.bytes(),
+            bytes_without_a_token = chars.bytes_without_a_token(),
             ?marker,
             "the native encode path takes the byte-fallback vocabulary from character symbols"
         );

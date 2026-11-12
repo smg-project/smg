@@ -203,10 +203,11 @@ pub(super) enum ByteTokens {
 pub(super) struct MergeTable {
     /// The id of each byte's token ([`NO_BYTE_TOKEN`] for a byte without one).
     byte_ids: [u32; 256],
-    /// The bytes the vocabulary has no token for, when it lacks any: a piece
-    /// that holds one is the model's to merge (see
-    /// [`Self::lacks_a_token_for`]). `None` over a complete alphabet, the
-    /// usual case.
+    /// The bytes the vocabulary has no token for, when it lacks any: on the
+    /// byte-level path a piece that holds one is the model's to merge (see
+    /// [`Self::lacks_a_token_for`]); the character symbols' table never
+    /// reaches one (see `CharSymbols::from_model`). `None` over a complete
+    /// alphabet, the usual case.
     missing: Option<Box<[bool; 256]>>,
     /// `hot[(a - hot_base) << HOT_SIDE_BITS | (b - hot_base)]`: the merge of
     /// the pair `(a, b)` when both ids are within [`HOT_SIDE`] of the window
@@ -311,15 +312,14 @@ impl MergeTable {
                 ByteTokens::Alphabet => Cow::Borrowed(&*alphabet.encode_utf8(&mut utf8)),
                 ByteTokens::Hex => Cow::Owned(format!("<0x{byte:02X}>")),
             };
-            // A byte-level vocabulary without a token for a byte (some lack
-            // one for a byte no text of theirs holds): the pieces that hold
-            // it stay the model's, every other piece merges here. The
-            // character symbols' table spells every byte it falls back to.
+            // A vocabulary without a token for a byte (some lack one for a
+            // byte no text of theirs holds): on the byte-level path the
+            // pieces that hold it stay the model's, every other piece merges
+            // here; the character symbols' table spells a byte only for a
+            // character that is no token, and declines a missing byte that
+            // could be reached (`CharSymbols::from_model`).
             byte_ids[byte] = match model.token_to_id(&spelling) {
                 Some(id) => id,
-                None if tokens == ByteTokens::Hex => {
-                    return Err(Declined::from(format!("byte {byte:#04x} has no token")));
-                }
                 None => {
                     missing.get_or_insert_with(|| Box::new([false; 256]))[byte] = true;
                     NO_BYTE_TOKEN
@@ -573,6 +573,11 @@ impl MergeTable {
     #[inline(always)]
     pub(super) fn byte_id(&self, byte: u8) -> u32 {
         self.byte_ids[usize::from(byte)]
+    }
+
+    /// Whether the vocabulary has no token for `byte`.
+    pub(super) fn lacks_a_token_for_byte(&self, byte: u8) -> bool {
+        self.byte_ids[usize::from(byte)] == NO_BYTE_TOKEN
     }
 
     /// Whether `piece` holds a byte the vocabulary has no token for: such a
