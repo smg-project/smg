@@ -459,7 +459,7 @@ fn shapes() -> Vec<Shape> {
         // run that meets a word character stays whole for the template.
         Shape {
             name: "digit-groups-then-cased-template",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(DIGIT_GROUPS, SplitDelimiterBehavior::Isolated, false),
                 split(CASED, SplitDelimiterBehavior::Isolated, false),

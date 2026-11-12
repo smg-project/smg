@@ -542,6 +542,8 @@ struct Choice {
 /// digit run before the lookahead moves at most a few characters, the scanner
 /// moves forward one) reuses it with the count moved by the characters
 /// between, and a long digit run costs one scan instead of one per position.
+/// Keyed by the class's index: the parser gives every lookahead of a pattern
+/// the same classes, so the ops share the memo.
 #[derive(Clone, Copy)]
 struct RunMemo {
     class: usize,
@@ -571,6 +573,11 @@ struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     classes: Vec<Class>,
     case_insensitive: bool,
+    /// The digit class and the word class of the first digit-grouping
+    /// lookahead, reused by every later one: the ops then read the same
+    /// classes under the same indices and share the match loop's one run
+    /// memo ([`RunMemo`] is keyed by the index).
+    groups_ahead: Option<(usize, usize)>,
 }
 
 impl Pattern {
@@ -580,6 +587,7 @@ impl Pattern {
             chars: pattern.chars().peekable(),
             classes: Vec::new(),
             case_insensitive: false,
+            groups_ahead: None,
         };
         let mut root = parser.parse_alternation()?;
         if parser.chars.next().is_some() {
@@ -1897,14 +1905,23 @@ impl Parser<'_> {
                 return None;
             }
         }
-        let class = self.add_class(Class {
-            categories: CAT_DIGIT,
-            ..Class::default()
-        });
-        let word = self.add_class(Class {
-            categories: CAT_WORD,
-            ..Class::default()
-        });
+        // One pair of classes for every lookahead of the pattern (see
+        // `Parser::groups_ahead`).
+        let (class, word) = match self.groups_ahead {
+            Some(pair) => pair,
+            None => {
+                let class = self.add_class(Class {
+                    categories: CAT_DIGIT,
+                    ..Class::default()
+                });
+                let word = self.add_class(Class {
+                    categories: CAT_WORD,
+                    ..Class::default()
+                });
+                self.groups_ahead = Some((class, word));
+                (class, word)
+            }
+        };
         Some(Node::GroupsAhead { class, size, word })
     }
 
@@ -3157,6 +3174,7 @@ mod tests {
             chars: "a++b+".chars().peekable(),
             classes: Vec::new(),
             case_insensitive: false,
+            groups_ahead: None,
         };
         let root = parser.parse_alternation().expect("parses");
         assert_eq!(choices(&root), 1);
@@ -3305,7 +3323,12 @@ mod tests {
     fn a_long_digit_run_is_measured_once_whatever_follows() {
         let run = "1".repeat(4096);
         let arabic = "\u{663}".repeat(301);
-        for pattern in [DIGIT_GROUPS, r"\d{2}(?=(?:\d{3})*\b)|\d|[a-z]+"] {
+        for pattern in [
+            DIGIT_GROUPS,
+            r"\d{2}(?=(?:\d{3})*\b)|\d|[a-z]+",
+            // two lookaheads share the classes and the memo
+            r"\d{1,3}(?=(?:\d{3})*\b)|\d{1,2}(?=(?:\d{2})*\b)|[a-z]+",
+        ] {
             let parsed = Pattern::parse(pattern).expect("parses");
             for text in [
                 format!("{run}a"),
