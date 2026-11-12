@@ -1060,12 +1060,13 @@ mod tests {
         assert_eq!(grid(&dynamic, "video_grid_thw"), vec![2, 2, 4]);
         // The entry's video layout slices the clip by `patches_per_image`, the
         // legacy map's one sizes key, so the video output carries that count
-        // beside `patches_per_video`.
+        // beside `patches_per_video`: the grid's product, the encoder rows the
+        // assembler checks the item sizes against.
+        assert_eq!(grid(&dynamic, "patches_per_image"), vec![2 * 2 * 4]);
         assert_eq!(
             grid(&dynamic, "patches_per_image"),
             grid(&dynamic, "patches_per_video")
         );
-        assert_eq!(grid(&dynamic, "patches_per_image").len(), 1);
         assert!(matches!(
             dynamic.model_specific.get("video_second_per_grid"),
             Some(ModelSpecificValue::Tensor { data, .. }) if data == &[1.0]
