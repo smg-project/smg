@@ -787,14 +787,27 @@ mod tests {
         let unscored = [ProtoGenerateComplete::Sglang(
             sglang::GenerateComplete::default(),
         )];
+        let engine_sent = sglang::InputLogProbs {
+            token_ids: vec![11],
+            ..Default::default()
+        };
         let mut untouched: Vec<ProtoGenerateComplete> = (0..2)
-            .map(|_| ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default()))
+            .map(|_| {
+                ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                    input_logprobs: Some(engine_sent.clone()),
+                    ..Default::default()
+                })
+            })
             .collect();
 
         merge_prefill_logprobs(&unscored, &mut untouched);
 
-        assert!(untouched
-            .iter()
-            .all(|decode| decode.as_sglang().input_logprobs.is_none()));
+        for (position, decode) in untouched.iter().enumerate() {
+            assert_eq!(
+                decode.as_sglang().input_logprobs.as_ref(),
+                Some(&engine_sent),
+                "untouched decode answer {position}"
+            );
+        }
     }
 }
