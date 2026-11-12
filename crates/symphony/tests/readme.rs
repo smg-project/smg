@@ -1211,6 +1211,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "hy-memory-30b-a3b",
+        model: "tencent/Hy-Memory-30B-A3B",
+        also: &[],
+        released: "2026-10-15",
+        smg: (None, None),
+        table: Some(Table::HyV3),
+        set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "hy4-preview",
         model: "tencent/Hy4-preview",
         also: &[],

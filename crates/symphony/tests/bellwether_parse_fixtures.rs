@@ -391,6 +391,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Keyed arguments, each family under its own markers; the prompt opens the thought, Hy4's
     // whatever the request says.
     ("hy4-preview", GenerationPrompt::AlwaysOpensTheThought),
+    // Hy V3 (Hy-Memory) writes Hy4's grammar under the plain markers, with K2-Horizon's newlines
+    // and `<tool_sep>` after the name; its prompt closes the thought unless the request's
+    // `reasoning_effort` asks for one.
+    (
+        "hy-memory-30b-a3b",
+        GenerationPrompt::OpensTheThoughtByEffort,
+    ),
     ("ling-3.0-flash", GenerationPrompt::OpensTheThought),
     // GLM writes Ling's syntax with nothing between the tags; its prompt opens the thought
     // whatever the request says (the template has no thinking switch).
@@ -775,11 +782,13 @@ impl Recorded for Table {
             | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, the DSML tables, Kimi K2, LFM2.5,
+            // tagged ones' (no call comes of the fence); IQuest, Hy V3 (whose `<tool_call>` opens a
+            // call inside its block alone), the DSML tables, Kimi K2, LFM2.5,
             // MiniMax M2, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
             // `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
+            | Self::HyV3
             | Self::DeepSeekV3_2
             | Self::DeepSeekV3
             | Self::DeepSeekV3_1
@@ -821,6 +830,7 @@ impl Recorded for Table {
                 | Self::Qwen3TaggedDirect
                 | Self::SeedOss
                 | Self::Hy4
+                | Self::HyV3
                 | Self::Ling
                 | Self::IQuest
                 | Self::Glm
@@ -873,6 +883,11 @@ enum GenerationPrompt {
     /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
     /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
     OpensTheThoughtWhenAsked,
+    /// Hy V3 (Hy-Memory): `<think>` (the thought opened, no newline) when the request's
+    /// `reasoning_effort` is `low` or `high`, so the output starts inside the thought; otherwise
+    /// (`no_think`, the template's default) `<think></think>`, and the output starts in content.
+    /// `enable_thinking` moves nothing in this template.
+    OpensTheThoughtByEffort,
     /// Qwen3: nothing, and the model writes its own `<think>`; thinking off closes it in the
     /// prompt as above.
     ModelWritesTheThought,
@@ -928,6 +943,10 @@ impl GenerationPrompt {
             }
             (Self::OpensTheThoughtOrClosesIt, _) => opened,
             (Self::OpensTheThoughtOrTheAnswer, false) => opened,
+            (Self::OpensTheThoughtByEffort, _) if request.effort_asks_for_a_thought() => {
+                open.to_string()
+            }
+            (Self::OpensTheThoughtByEffort, _) => format!("{open}{close}"),
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
             (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
@@ -941,7 +960,10 @@ impl GenerationPrompt {
     fn writes_no_thought_unasked(self) -> bool {
         matches!(
             self,
-            Self::Plain | Self::OpensTheThoughtWhenAsked | Self::MarkerAlone
+            Self::Plain
+                | Self::OpensTheThoughtWhenAsked
+                | Self::OpensTheThoughtByEffort
+                | Self::MarkerAlone
         )
     }
 }
@@ -1663,6 +1685,17 @@ impl Request {
             == Some(false)
     }
 
+    /// Whether the request's `reasoning_effort`, the switch Hy V3's template reads, asks for a
+    /// thought: `low` or `high`; `no_think`, the default, and anything else leave it closed.
+    fn effort_asks_for_a_thought(&self) -> bool {
+        matches!(
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.reasoning_effort.as_deref()),
+            Some("low" | "high")
+        )
+    }
+
     fn enable_thinking(&self) -> Option<bool> {
         self.chat_template_kwargs
             .as_ref()
@@ -1674,6 +1707,7 @@ impl Request {
 struct ChatTemplateKwargs {
     enable_thinking: Option<bool>,
     thinking: Option<bool>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]

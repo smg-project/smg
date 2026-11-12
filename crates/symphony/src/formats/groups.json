@@ -71,6 +71,7 @@
   {"model": "h2oai/h2o-lightning-4b", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "NousResearch/Hermes-4-14B", "also": [], "table": "qwen2.5", "opener": null, "after": null},
   {"model": "FreedomIntelligence/HuatuoGPT-3-27B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
+  {"model": "tencent/Hy-Memory-30B-A3B", "also": [], "table": "hy_v3", "opener": null, "after": null},
   {"model": "tencent/Hy4-preview", "also": [], "table": "hy4", "opener": null, "after": null},
   {"model": "thinkingmachines/Inkling", "also": ["Inkling-Small", "Inkling-NVFP4"], "table": "inkling", "opener": null, "after": null},
   {"model": "IQuestLab/IQuest-Q1", "also": [], "table": "iquest", "opener": null, "after": null},

@@ -2,8 +2,9 @@
 //! style does not write: Ling's, with the template's newline after the call's name, after each
 //! `</arg_key>` and before `</tool_call>`; GLM 4.5 and 4.6's, with it after the name, after each
 //! `</arg_key>` and after each `</arg_value>`; K2-Horizon's, the same under `ifm|`-prefixed tags
-//! with the block's newline before each call and before its close; and Hy4's, every tag suffixed
-//! `:opensource` and the calls in a block. GLM 4.7's and IQuest's compact spelling keeps the
+//! with the block's newline before each call and before its close; Hy4's, every tag suffixed
+//! `:opensource` and the calls in a block; and Hy V3's, K2-Horizon's newlines under the plain tags
+//! with `<tool_sep>` after the name. GLM 4.7's and IQuest's compact spelling keeps the
 //! `glm_xml` style, the shape the gateway writes for it today.
 //!
 //! A call is the call's opener and the tool's name, then one `<arg_key>` and `<arg_value>` pair per
@@ -106,8 +107,9 @@ impl Ends<'_> {
     }
 }
 
-/// One call as its three parts: the opener with the name and the newline the spelling writes after
-/// it, the arguments, and the newline the spelling writes before the close with the close.
+/// One call as its three parts: the opener with the name, the text the spelling writes after the
+/// name (Hy V3's `<tool_sep>`) and its newline, the arguments, and the newline the spelling writes
+/// before the close with the close.
 fn call(
     markers: &CallMarkers<'_>,
     tags: &Tags,
@@ -116,7 +118,10 @@ fn call(
     parameters: &Value,
 ) -> (String, Grammar, String) {
     (
-        format!("{}{name}{}", markers.call_open, tags.newlines.after_name),
+        format!(
+            "{}{name}{}{}",
+            markers.call_open, tags.name_end, tags.newlines.after_name
+        ),
         arguments(tags, ends, parameters),
         format!("{}{}", tags.newlines.before_close, markers.call_close),
     )
@@ -389,6 +394,63 @@ mod tests {
         assert_eq!(block["triggers"], value!(["<tool_calls:opensource>"]));
         assert_eq!(block["tags"][0]["begin"], "<tool_calls:opensource>");
         assert_eq!(block["at_least_one"], true);
+    }
+
+    #[test]
+    fn hy_v3_writes_the_separator_after_the_name_and_k2_horizons_newlines() {
+        // Hy V3's template writes `<tool_calls>`, each call after a newline as `<tool_call>`, the
+        // name, `<tool_sep>` and a newline, GLM 4.6's pairs and `</tool_call>`, then a newline and
+        // `</tool_calls>` (every call of hy-memory-30b-a3b's recorded parse sets); a zero-argument
+        // call is its name, the separator and the newline.
+        let payload = formats::hy_v3()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let block = &payload["format"]["tags"][0];
+        assert_eq!(block["begin"], "<tool_calls>");
+        assert_eq!(block["end"], "</tool_calls>");
+        let inside = block["content"]["elements"]
+            .as_array()
+            .expect("calls, then the newline");
+        assert_eq!(inside[1], value!({"type": "const_string", "value": "\n"}));
+        let each = inside[0]["content"]["elements"]
+            .as_array()
+            .expect("the newline, then one of the calls");
+        assert_eq!(each[0], value!({"type": "const_string", "value": "\n"}));
+        let calls = each[1]["elements"].as_array().expect("two tools");
+        let weather = calls[0]["elements"].as_array().expect("a call's parts");
+        assert_eq!(weather[0]["value"], "<tool_call>get_weather<tool_sep>\n");
+        assert_eq!(weather[2]["value"], "</tool_call>");
+        let city = weather[1]["elements"][0]["elements"]
+            .as_array()
+            .expect("the first pair's parts");
+        assert_eq!(city[2]["value"], "</arg_key>\n<arg_value>");
+        assert_eq!(city[4]["value"], "</arg_value>\n");
+        let ping = calls[1]["elements"]
+            .as_array()
+            .expect("the zero-argument call's parts");
+        assert_eq!(ping[0]["value"], "<tool_call>ping<tool_sep>\n");
+        assert_eq!(ping[1]["type"], "star");
+        assert_eq!(ping[2]["value"], "</tool_call>");
+        // The separator is no tag: the prefix before the block excludes the block's markers and
+        // the four tags, and nothing else.
+        let with_prefix = formats::hy_v3()
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            with_prefix["format"]["elements"][0]["excludes"],
+            value!([
+                "<tool_calls>",
+                "</tool_calls>",
+                "<tool_call>",
+                "</tool_call>",
+                "<arg_key>",
+                "</arg_key>",
+                "<arg_value>",
+                "</arg_value>",
+            ])
+        );
     }
 
     #[test]

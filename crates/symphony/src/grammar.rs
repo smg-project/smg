@@ -3183,6 +3183,7 @@ mod tests {
             formats::Table::DeepSeekV4_1,
             formats::Table::DeepSeekV4,
             formats::Table::Hy4,
+            formats::Table::HyV3,
             formats::Table::Xlam,
             formats::Table::MinimaxM3,
             formats::Table::KimiK3,
