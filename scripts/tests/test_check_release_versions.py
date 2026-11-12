@@ -345,6 +345,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "pi": "1.3.0",
         "upsilon": "0.6.0",
         "zeta": "0.2.0",
+        "omicron": "1.0.0",
     }
     xi_pin = 'smg-xi = {{ package = "xi", version = "{}", path = "crates/xi" }}\n'
     put(root, "Cargo.toml", root_manifest(pins) + xi_pin.format("0.1.0"))
@@ -374,6 +375,13 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     for name, source in sources.items():
         put(root, f"crates/{name}/Cargo.toml", manifest(name, pins[name]) + deps)
         put(root, f"crates/{name}/src/lib.rs", source)
+    put(
+        root,
+        "crates/omicron/Cargo.toml",
+        manifest("omicron", "1.0.0")
+        + '\n[dependencies]\nxi = { path = "../xi", version = "0.1.0" }\n',
+    )
+    put(root, "crates/omicron/src/lib.rs", "pub struct O;\n")
     dev = '\n[dev-dependencies]\nxi = { path = "../xi", version = "0.1.0" }\n'
     put(root, "crates/pi/Cargo.toml", manifest("pi", pins["pi"]) + deps + dev)
     renamed = '\n[dependencies]\nkap_alias = { package = "kappa", path = "../kappa", version = "0.2.0" }\n'
@@ -489,6 +497,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         mod.crate("upsilon", "crates/upsilon", "upsilon"),
         mod.crate("zeta", "crates/zeta", "zeta"),
         mod.crate("xi", "crates/xi", "smg-xi"),
+        mod.crate("omicron", "crates/omicron", "omicron"),
     )
     by_name = {c.name: c for c in crates}
     repo = mod.Repo(root)
@@ -496,6 +505,9 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         requirements = mod.published_requirements(repo, "v1.0.0", by_name[name], crates)
         assert requirements == {"kappa": "0.2.0"}, name
     assert mod.published_requirements(repo, "v1.0.0", by_name["rho"], crates) == {"lambda": "1.0.0"}
+    # a published direct entry names the package, whatever the root's key for it
+    assert mod.published_requirements(repo, "v1.0.0", by_name["omicron"], crates) == {"xi": "0.1.0"}
+    assert mod.published_requirements(repo, "v1.0.0", by_name["pi"], crates) == {"kappa": "0.2.0"}
     assert mod.source_name(repo, by_name["sigma"], by_name["kappa"]) == "kap"
     assert mod.source_name(repo, by_name["tau"], by_name["kappa"]) == "kap_alias"
     assert mod.source_name(repo, by_name["rho"], by_name["lambda"]) == "lambda"
@@ -529,6 +541,10 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     left = "unchanged, but its published requirement kappa ^0.2.0 does not accept v0.3.0"
     for name, step in (("omega", "patch"), ("eta", "patch"), ("theta", "patch"), ("pi", "patch")):
         assert f"  ! {name} (crates/{name}/) — {left} [{step}]" in out, name
+    assert (
+        "  ! omicron (crates/omicron/) — unchanged, but its published requirement xi ^0.1.0 does not"
+        " accept v0.2.0 [patch]\n    ✗ crates/omicron/Cargo.toml has xi v0.1.0, expected v0.2.0\n"
+    ) in out
     for name, step in (
         ("sigma", "minor"),
         ("tau", "minor"),
@@ -561,8 +577,8 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     # pi's dev entry names xi by its package name, under a root key that differs (smg-xi): read, and left behind
     assert "crates/pi/Cargo.toml has xi v0.1.0, expected v0.2.0" in out
     assert "crates/rho/Cargo.toml has" not in out, "rho's entries are the root's (workspace = true)"
-    assert "Summary: 17 crate(s) with changes, 2 unchanged" in out
-    assert "18 issue(s) found." in out
+    assert "Summary: 18 crate(s) with changes, 2 unchanged" in out
+    assert "20 issue(s) found." in out
 
     code, out = check("plan")
     assert code == 0
@@ -584,6 +600,8 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "  minor kappa v0.2.0 → v0.3.0 (crates/kappa/Cargo.toml)",
         "  sync crates/tau/Cargo.toml kap_alias v0.2.0 → v0.3.0",
         "  sync crates/pi/Cargo.toml xi v0.1.0 → v0.2.0",
+        "  patch omicron v1.0.0 → v1.0.1 (crates/omicron/Cargo.toml)",
+        "  sync crates/omicron/Cargo.toml xi v0.1.0 → v0.2.0",
     ):
         assert line in out, line
     assert out.count("sync workspace Cargo.toml eta") == 1, out
@@ -608,6 +626,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         ("pi", "1.3.1"),
         ("upsilon", "0.7.0"),
         ("zeta", "0.3.0"),
+        ("omicron", "1.0.1"),
     ):
         assert (
             mod.read_version("cargo", (root / f"crates/{name}/Cargo.toml").read_text(), "")
@@ -625,6 +644,8 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     pi = (root / "crates/pi/Cargo.toml").read_text()
     assert 'xi = { path = "../xi", version = "0.2.0" }' in pi, pi
     assert mod.workspace_dep_version(root_toml, "smg-xi") == "0.2.0"
+    omicron = (root / "crates/omicron/Cargo.toml").read_text()
+    assert 'xi = { path = "../xi", version = "0.2.0" }' in omicron, omicron
     code, out = check()
     assert code == 0, out
     assert "All versions consistent." in out

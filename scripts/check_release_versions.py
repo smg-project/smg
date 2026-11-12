@@ -736,19 +736,23 @@ def published_requirements(
 ) -> dict[str, str]:
     """A crate's requirements on the workspace crates as its copy at the ref (the release tag
     that carries its version) carries them, per crate name: the root's pin for a
-    ``workspace = true`` entry, the entry's own version otherwise."""
+    ``workspace = true`` entry (keyed as the root keys it), the entry's own version otherwise
+    (a direct entry names the package: its ``package =``, else its key)."""
     root = repo.show(ref, "Cargo.toml") or ""
     by_key = {c.dep_key or c.name: c.name for c in crates}
+    packages = {c.name for c in crates}
     requirements: dict[str, str] = {}
     for key, spec in dependency_entries(manifest_at(repo, ref, component)):
-        key = spec.get("package", key) if isinstance(spec, dict) else key
-        name = by_key.get(key)
+        if isinstance(spec, dict) and spec.get("workspace"):
+            # a workspace entry is keyed as the root keys it
+            name, pinned = by_key.get(key), workspace_dep_version(root, key)
+        else:
+            # a direct entry names the package: its `package =`, else its key
+            package = spec.get("package", key) if isinstance(spec, dict) else key
+            name = package if package in packages else None
+            pinned = spec.get("version") if isinstance(spec, dict) else spec
         if name is None or name == component.name:
             continue
-        if isinstance(spec, dict) and spec.get("workspace"):
-            pinned = workspace_dep_version(root, key)
-        else:
-            pinned = spec.get("version") if isinstance(spec, dict) else spec
         if isinstance(pinned, str) and SEMVER.match(pinned):
             requirements[name] = pinned
     return requirements
