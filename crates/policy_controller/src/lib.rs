@@ -24,7 +24,8 @@
 //! - 4.4, the framework ([`framework`]): a [`Profile`] runs [`Filter`]s,
 //!   weighted [`Scorer`]s and one [`Picker`]; a [`Plan`] sequences profiles for
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
-//!   A scorer or picker allocates nothing per decision.
+//!   A scorer or picker allocates nothing per decision. The consistent-hash
+//!   scorer owns its ring ([`ring`]), fed by the membership hooks.
 //! - 4.6, the schema ([`spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists.
@@ -46,6 +47,7 @@ pub mod builtins;
 pub mod decision;
 pub mod framework;
 pub mod lease;
+pub mod ring;
 pub mod sessions;
 pub mod spec;
 pub mod store;
@@ -61,6 +63,7 @@ pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
     TransportClass,
 };
+pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
 pub use spec::{Needs, PolicySpec, SessionsSpec, SpecError, API_VERSION, PRESETS};
 pub use view::{

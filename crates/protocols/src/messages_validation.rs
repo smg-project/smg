@@ -131,8 +131,9 @@ fn role_name(role: &Role) -> &'static str {
 
 /// Every message carries content, except the optional final assistant
 /// message (a prefill), which may be empty but may not end in whitespace;
-/// every text block carries text. A `system` message in the array is this
-/// gateway's extension and is left to its own rules.
+/// every text block carries text, and every `tool_use` block's `input` is
+/// an object. A `system` message in the array is this gateway's extension
+/// and is left to its own rules.
 fn validate_message_contents(messages: &[InputMessage]) -> Result<(), ValidationError> {
     let last = messages.len().saturating_sub(1);
     for (index, message) in messages.iter().enumerate() {
@@ -161,6 +162,22 @@ fn validate_message_contents(messages: &[InputMessage]) -> Result<(), Validation
                 return Err(invalid(
                     "empty_text_block",
                     format!("messages.{index}: text content blocks must be non-empty"),
+                ));
+            }
+            // A `tool_use` block's `input` is the object the tool was called
+            // with: the public API refuses any other JSON value, and so does
+            // this gateway, before a string would be rendered as the call's
+            // arguments and answered as if the history were well-formed.
+            let not_an_object = blocks.iter().position(|block| {
+                matches!(block, InputContentBlock::ToolUse(tool_use) if !tool_use.input.is_object())
+            });
+            if let Some(position) = not_an_object {
+                return Err(invalid(
+                    "tool_use_input_not_an_object",
+                    format!(
+                        "messages.{index}.content.{position}.tool_use.input: Input should be a \
+                         valid dictionary"
+                    ),
                 ));
             }
         }
@@ -672,6 +689,40 @@ mod tests {
             twice.contains("messages.2.content.1: `tool_result` blocks must each answer a different `tool_use_id`: toolu_a is answered twice."),
             "{twice}"
         );
+    }
+
+    /// A `tool_use` block's `input` is the arguments object: a string, or any
+    /// other value, is refused naming the block; an object of any shape is
+    /// accepted, and a system prompt in its own field stays accepted beside
+    /// it.
+    #[test]
+    fn a_tool_use_input_is_an_object() {
+        let with_input = |input: Value| {
+            json!({"messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "toolu_a", "name": "get_weather", "input": input}
+                ]},
+                {"role": "user", "content": [tool_result("toolu_a")]}
+            ], "system": "You are terse."})
+        };
+        let string = rejection(with_input(json!("Paris")));
+        assert!(
+            string.contains(
+                "messages.1.content.1.tool_use.input: Input should be a valid dictionary"
+            ),
+            "{string}"
+        );
+        for other in [json!(["Paris"]), json!(1), json!(null)] {
+            let refused = rejection(with_input(other.clone()));
+            assert!(
+                refused.contains("messages.1.content.1.tool_use.input"),
+                "{other}: {refused}"
+            );
+        }
+        accepted(with_input(json!({"city": "Paris"})));
+        accepted(with_input(json!({})));
     }
 
     /// Consecutive messages of one role are one turn, as the public API

@@ -1128,6 +1128,7 @@ mod tests {
                 request_id: format!("r{i}"),
                 prompt_token_ids: (0..64).map(|t| t + i * 64).collect(),
                 max_new: 1,
+                choice: 0,
                 events: tx,
             });
             if let Ok(Ok(message)) = timeout(Duration::from_millis(50), sub.recv()).await {
@@ -1192,6 +1193,7 @@ mod tests {
                 request_id: format!("r{i}"),
                 prompt_token_ids: (0..64).map(|t| t + i * 64).collect(),
                 max_new: 1,
+                choice: 0,
                 events: tx,
             });
             if let Ok(Ok(message)) = timeout(Duration::from_millis(50), sub.recv()).await {

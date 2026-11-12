@@ -71,6 +71,13 @@ impl MemoryStore {
         Self::default()
     }
 
+    /// How many entries the health tables hold, over every gateway.
+    #[cfg(test)]
+    pub(super) fn health_entries(&self) -> usize {
+        let health = self.health.lock();
+        health.vetoes.len() + health.ok_at.len()
+    }
+
     /// How many resyncs were recorded for `reason`.
     pub fn resyncs(&self, reason: ResyncReason) -> u64 {
         self.kv
@@ -198,10 +205,15 @@ impl WorkersStore for MemoryStore {
                     probes: Probes::default(),
                 },
             );
-            return workers.record(MembershipChange::Replaced {
+            let change = workers.record(MembershipChange::Replaced {
                 old: old_id,
                 new: new_id,
             });
+            // The old incarnation's health leaves with its row, as on a
+            // removal and under the same lock: a veto or a completed dispatch
+            // keyed by the old id would outlive it for good.
+            self.health.lock().forget(old_id);
+            return change;
         }
         let id = identity(&facts.key, facts.incarnation);
         workers.by_key.insert(facts.key.clone(), id);
@@ -242,7 +254,14 @@ impl WorkersStore for MemoryStore {
         workers.guarded(id, revision)?;
         let row = workers.rows.remove(&id)?;
         workers.by_key.remove(&row.row.facts.key);
-        Some(workers.record(MembershipChange::Removed { id }))
+        let change = workers.record(MembershipChange::Removed { id });
+        // The health tables forget the worker with its row, under the workers
+        // lock: a veto or a completed dispatch keyed by an id that is gone
+        // would stay for good, the next incarnation having a new id, and the
+        // writers take the same lock first, so one racing the removal finds
+        // the row gone or writes before the tables are cleared.
+        self.health.lock().forget(id);
+        Some(change)
     }
 
     fn set_status(
@@ -309,6 +328,14 @@ struct HealthTables {
     /// The latest completed dispatch of class `Ok` on a worker by each
     /// gateway: the precedence rule is per gateway.
     ok_at: FxHashMap<(GatewayId, WorkerId), Instant>,
+}
+
+impl HealthTables {
+    /// Drop every gateway's entries on the worker.
+    fn forget(&mut self, id: WorkerId) {
+        self.vetoes.retain(|(_, worker), _| *worker != id);
+        self.ok_at.retain(|(_, worker), _| *worker != id);
+    }
 }
 
 /// The status machine of one probe over the row's counters: the registry's
@@ -388,13 +415,20 @@ impl HealthSink for MemoryStore {
     }
 
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
-        let mut health = self.health.lock();
         match until {
             Some(until) => {
-                health.vetoes.insert((gateway, id), until);
+                // Under the workers lock, taken before the health lock as
+                // every writer takes it: a veto landing after the worker's
+                // removal (a breaker opening on a torn-down worker's
+                // failures) would re-create its entry for good.
+                let workers = self.workers.lock();
+                if !workers.rows.contains_key(&id) {
+                    return;
+                }
+                self.health.lock().vetoes.insert((gateway, id), until);
             }
             None => {
-                health.vetoes.remove(&(gateway, id));
+                self.health.lock().vetoes.remove(&(gateway, id));
             }
         }
     }
@@ -409,6 +443,14 @@ impl HealthSink for MemoryStore {
 
     fn completed(&self, gateway: GatewayId, id: WorkerId, class: TransportClass, at: Instant) {
         if class != TransportClass::Ok {
+            return;
+        }
+        // Under the workers lock, taken before the health lock: a dispatch
+        // completing after its worker's removal (the usual order, a gateway's
+        // in-flight work ends after the row is gone) would re-create the
+        // entry for good.
+        let workers = self.workers.lock();
+        if !workers.rows.contains_key(&id) {
             return;
         }
         let mut health = self.health.lock();
@@ -657,10 +699,13 @@ impl KvEventSink for MemoryStore {
 
 // ----------------------------------------------------------- reservations
 
+/// A gateway's lease: the key a claim is held under.
+type LeaseKey = (GatewayId, LeaseId);
+
 #[derive(Default)]
 struct Reservations {
     held: FxHashMap<(WorkerId, ReservationKind), u32>,
-    by_lease: FxHashMap<LeaseId, Vec<(WorkerId, ReservationKind, u32)>>,
+    by_lease: FxHashMap<LeaseKey, Vec<(WorkerId, ReservationKind, u32)>>,
 }
 
 impl ReservationStore for MemoryStore {
@@ -670,7 +715,14 @@ impl ReservationStore for MemoryStore {
         self.workers.lock().rows.get(&id)?.row.facts.max_running
     }
 
-    fn try_reserve(&self, id: WorkerId, kind: ReservationKind, count: u32, lease: LeaseId) -> bool {
+    fn try_reserve(
+        &self,
+        gateway: GatewayId,
+        id: WorkerId,
+        kind: ReservationKind,
+        count: u32,
+        lease: LeaseId,
+    ) -> bool {
         // A worker the store does not know (never registered, or removed) is
         // refused before its window is read: a missing row is no live worker
         // without a bound, and a commit racing a removal gets nothing on it.
@@ -686,7 +738,7 @@ impl ReservationStore for MemoryStore {
         let mut reservations = self.reservations.lock();
         let holds_kind = reservations
             .by_lease
-            .get(&lease)
+            .get(&(gateway, lease))
             .is_some_and(|held| held.iter().any(|(_, k, _)| *k == kind));
         if holds_kind {
             return false;
@@ -699,15 +751,15 @@ impl ReservationStore for MemoryStore {
         *held = total;
         reservations
             .by_lease
-            .entry(lease)
+            .entry((gateway, lease))
             .or_default()
             .push((id, kind, count));
         true
     }
 
-    fn release(&self, lease: LeaseId) {
+    fn release(&self, gateway: GatewayId, lease: LeaseId) {
         let mut reservations = self.reservations.lock();
-        let Some(held) = reservations.by_lease.remove(&lease) else {
+        let Some(held) = reservations.by_lease.remove(&(gateway, lease)) else {
             return;
         };
         for (id, kind, count) in held {

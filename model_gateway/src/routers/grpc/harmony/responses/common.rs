@@ -18,7 +18,9 @@ use uuid::Uuid;
 use super::execution::{convert_mcp_tools_to_response_tools, ToolResult};
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
-    grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
+    grpc::common::responses::{
+        streaming::OutputItemKind, utils::resolve_function_identity, ResponsesContext,
+    },
 };
 
 /// Record of a single MCP tool call execution
@@ -116,7 +118,7 @@ pub(super) fn build_next_request_with_tools(
     // Add reasoning if present (from analysis channel)
     if let Some(analysis_text) = analysis {
         items.push(ResponseInputOutputItem::new_reasoning(
-            format!("reasoning_{assistant_id}"),
+            OutputItemKind::Reasoning.new_id(),
             vec![],
             vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,

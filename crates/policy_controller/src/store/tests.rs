@@ -4,14 +4,14 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    identity, BatchFacts, BatchOutcome, GatewayId, HealthSink, KvEventSink, LeaseRecord,
-    LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource, MembershipChange, MembershipTail,
-    MemoryStore, Pin, PollMode, ReservationKind, ReservationStore, ResyncReason, SessionsStore,
-    SnapshotChunk, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    identity, identity_of, BatchFacts, BatchOutcome, GatewayId, HealthSink, KvEventSink,
+    LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource, MembershipChange,
+    MembershipTail, MemoryStore, Pin, PollMode, ReservationKind, ReservationStore, ResyncReason,
+    SessionsStore, SnapshotChunk, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
 };
 use crate::{
     lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
-    view::{LoadRow, SignalSource, WorkerId},
+    view::{fingerprint, LoadRow, SignalSource, WorkerId},
 };
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
@@ -264,9 +264,10 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
 #[test]
 fn a_gateway_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear() {
     let store = MemoryStore::new();
+    // A registered worker: the health writers refuse an id without a row.
+    let id = ready(&store, "http://v:8000");
     let health: &dyn HealthSink = &store;
     let (g1, g2) = (GatewayId(1), GatewayId(2));
-    let id = WorkerId(5);
     let now = Instant::now();
     health.gateway_veto(g1, id, Some(now + Duration::from_secs(60)));
     assert!(health.vetoed(g1, id, now));
@@ -290,6 +291,63 @@ fn a_gateway_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear()
         !health.completed_ok_since(g1, id, now),
         "one gateway's dispatch keeps the worker routable for that gateway alone"
     );
+}
+
+#[test]
+fn a_removed_worker_leaves_the_health_tables_and_takes_no_late_write() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://d:8000");
+    let health: &dyn HealthSink = &store;
+    let (g1, g2) = (GatewayId(1), GatewayId(2));
+    let now = Instant::now();
+    health.gateway_veto(g1, id, Some(now + Duration::from_secs(60)));
+    health.gateway_veto(g2, id, Some(now + Duration::from_secs(1)));
+    health.completed(g1, id, TransportClass::Ok, now);
+    assert_eq!(store.health_entries(), 3);
+    let revision = WorkersStore::get(&store, id).expect("the row").revision;
+    store.remove(id, revision).expect("removed");
+    assert!(
+        !health.vetoed(g1, id, now),
+        "a standing veto on a removed worker is gone with it"
+    );
+    assert!(
+        !health.completed_ok_since(g1, id, now),
+        "and so is its completed dispatch"
+    );
+    assert_eq!(store.health_entries(), 0);
+    // A gateway's in-flight work on the worker ends after the removal: a
+    // late completion and a late veto write nothing under the gone id.
+    health.completed(g2, id, TransportClass::Ok, now + Duration::from_secs(2));
+    health.gateway_veto(g2, id, Some(now + Duration::from_secs(90)));
+    assert!(
+        !health.completed_ok_since(g2, id, now),
+        "a completion after the removal books nothing"
+    );
+    assert!(
+        !health.vetoed(g2, id, now + Duration::from_secs(3)),
+        "a veto after the removal masks nothing"
+    );
+    assert_eq!(store.health_entries(), 0, "and the tables stay empty");
+}
+
+#[test]
+fn a_replaced_incarnation_leaves_the_health_tables_with_its_row() {
+    let store = MemoryStore::new();
+    let old = ready(&store, "http://w:8000");
+    let health: &dyn HealthSink = &store;
+    let g = GatewayId(1);
+    let now = Instant::now();
+    health.gateway_veto(g, old, Some(now + Duration::from_secs(60)));
+    health.completed(g, old, TransportClass::Ok, now);
+    assert_eq!(store.health_entries(), 2);
+    let new = store.upsert(facts("http://w:8000", 2)).id();
+    assert_ne!(old, new, "a new incarnation under the key");
+    assert!(
+        !health.vetoed(g, old, now),
+        "the old incarnation's veto left with its row"
+    );
+    assert!(!health.completed_ok_since(g, old, now));
+    assert_eq!(store.health_entries(), 0, "and the new id starts clean");
 }
 
 /// A poll's row stands in for a silent rank's sample but never for its
@@ -648,9 +706,9 @@ fn a_reservation_is_all_or_nothing_within_the_window_and_released_by_its_lease()
     let rooms: &dyn ReservationStore = &store;
     assert_eq!(rooms.window(id, ReservationKind::Room), Some(4));
     let (a, b, c) = (LeaseId(1), LeaseId(2), LeaseId(3));
-    assert!(rooms.try_reserve(id, ReservationKind::Room, 3, a));
+    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 3, a));
     assert!(
-        !rooms.try_reserve(id, ReservationKind::Room, 2, b),
+        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 2, b),
         "five rooms do not fit a window of four"
     );
     assert_eq!(
@@ -658,17 +716,17 @@ fn a_reservation_is_all_or_nothing_within_the_window_and_released_by_its_lease()
         3,
         "nothing was claimed"
     );
-    assert!(rooms.try_reserve(id, ReservationKind::Room, 1, b));
+    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, b));
     assert!(
-        !rooms.try_reserve(id, ReservationKind::Room, 1, b),
+        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, b),
         "one reservation per kind per lease"
     );
-    assert!(rooms.try_reserve(id, ReservationKind::Slot, 1, b));
-    rooms.release(a);
-    rooms.release(a);
+    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Slot, 1, b));
+    rooms.release(GatewayId::LOCAL, a);
+    rooms.release(GatewayId::LOCAL, a);
     assert_eq!(rooms.held(id, ReservationKind::Room), 1);
-    assert!(rooms.try_reserve(id, ReservationKind::Room, 3, c));
-    rooms.release(b);
+    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 3, c));
+    rooms.release(GatewayId::LOCAL, b);
     assert_eq!(rooms.held(id, ReservationKind::Room), 3);
     assert_eq!(rooms.held(id, ReservationKind::Slot), 0);
     // A live worker without a bound has no window and the gate abstains; a
@@ -681,21 +739,55 @@ fn a_reservation_is_all_or_nothing_within_the_window_and_released_by_its_lease()
         .id();
     assert_eq!(rooms.window(unbounded, ReservationKind::Room), None);
     assert!(
-        rooms.try_reserve(unbounded, ReservationKind::Room, 100, LeaseId(9)),
+        rooms.try_reserve(
+            GatewayId::LOCAL,
+            unbounded,
+            ReservationKind::Room,
+            100,
+            LeaseId(9)
+        ),
         "no window: the gate abstains"
     );
     let unknown = WorkerId(77);
     assert_eq!(rooms.window(unknown, ReservationKind::Room), None);
     assert!(
-        !rooms.try_reserve(unknown, ReservationKind::Room, 1, LeaseId(10)),
+        !rooms.try_reserve(
+            GatewayId::LOCAL,
+            unknown,
+            ReservationKind::Room,
+            1,
+            LeaseId(10)
+        ),
         "a worker the store does not know is refused"
     );
     let revision = WorkersStore::get(&store, id).expect("the row").revision;
     store.remove(id, revision).expect("removed");
     assert!(
-        !rooms.try_reserve(id, ReservationKind::Room, 1, LeaseId(11)),
+        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, LeaseId(11)),
         "a removed worker is refused whatever its window was"
     );
+}
+
+#[test]
+fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://d:8000");
+    let rooms: &dyn ReservationStore = &store;
+    let (g1, g2) = (GatewayId(1), GatewayId(2));
+    assert!(rooms.try_reserve(g1, id, ReservationKind::Room, 2, LeaseId(1)));
+    assert!(
+        rooms.try_reserve(g2, id, ReservationKind::Room, 2, LeaseId(1)),
+        "the other gateway's lease of the same number is its own"
+    );
+    assert_eq!(rooms.held(id, ReservationKind::Room), 4);
+    rooms.release(g1, LeaseId(1));
+    assert_eq!(
+        rooms.held(id, ReservationKind::Room),
+        2,
+        "one gateway's release frees its own claim alone"
+    );
+    rooms.release(g2, LeaseId(1));
+    assert_eq!(rooms.held(id, ReservationKind::Room), 0);
 }
 
 #[test]
@@ -858,4 +950,14 @@ fn hello_pages_restore_exactly_what_they_list_and_a_gone_gateway_loses_its_lease
     assert_eq!(leases.drop_gateway(g1), 2);
     assert_eq!(leases.live(g1), 0);
     assert_eq!(leases.live(g2), 1);
+}
+
+#[test]
+fn the_identity_rule_reads_a_key_through_its_fingerprint() {
+    assert_eq!(
+        identity("http://w:8000", 3),
+        identity_of(fingerprint(b"http://w:8000"), 3),
+        "the wrapper and the rule agree"
+    );
+    assert_ne!(identity_of(0, 0), WorkerId(0), "an id is never 0");
 }

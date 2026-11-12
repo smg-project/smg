@@ -3927,3 +3927,88 @@ async fn assert_aborted_and_released(scheduler: &GatedScheduler, worker: &Arc<dy
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// Media the request got wrong as it sent it is refused under the media
+/// stage's own `invalid_multimodal_request`, a 400 with the connector's
+/// words, and nothing reaches the worker: a data URL that is not base64, one
+/// with no comma, one in the non-base64 form, a payload that is not an
+/// image, a URL that does not parse, a host the policy refuses, and a
+/// `max_long_side_pixel` out of range. Before, every one of these was a
+/// `media_fetch_failed` with nothing fetched.
+#[tokio::test]
+async fn deepseek_v41_media_refused_as_sent_answers_the_media_stages_code() {
+    let Some(dir) = deepseek_v41_model_dir().await else {
+        skip_no_tokenizer();
+        return;
+    };
+    let corn = format!("data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG));
+    let cases = [
+        (
+            "not base64",
+            serde_json::json!({"url": "data:image/png;base64,!!!"}),
+            "base64 decode error",
+        ),
+        (
+            "no comma",
+            serde_json::json!({"url": "data:image/png;base64"}),
+            "missing comma in data url",
+        ),
+        (
+            "not the base64 form",
+            serde_json::json!({"url": "data:image/svg+xml,<svg/>"}),
+            "only base64 encoded data URLs are supported",
+        ),
+        (
+            "not an image",
+            serde_json::json!({"url": "data:application/pdf;base64,JVBERi0xLjQK"}),
+            "image decode error",
+        ),
+        (
+            "not a URL",
+            serde_json::json!({"url": "not a url"}),
+            "invalid media URL",
+        ),
+        (
+            "a loopback host",
+            serde_json::json!({"url": "http://127.0.0.1:9/x.png"}),
+            "loopback",
+        ),
+        (
+            "a cap out of range",
+            serde_json::json!({"url": corn, "max_long_side_pixel": 0}),
+            "max_long_side_pixel",
+        ),
+    ];
+    for (name, image_url, words) in cases {
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": image_url}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            }),
+            true,
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON envelope");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(
+            body["error"]["code"], "invalid_multimodal_request",
+            "{name}: {body}"
+        );
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "{name}: {body}"
+        );
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(words), "{name}: {body}");
+        assert!(ids.is_empty(), "{name}: nothing reaches the worker");
+    }
+}

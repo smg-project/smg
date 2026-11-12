@@ -69,7 +69,8 @@ pub(crate) trait TonicStatusExt {
 
     /// The code the public API answers for a failure of the request's media
     /// (see [`TonicStatusExt::media_fault`]): the one the worker names in its
-    /// `smg-media-code` trailer (`media_too_large` for a size refusal), or
+    /// `smg-media-code` trailer (`invalid_multimodal_request` for media refused
+    /// as the request sent it, `media_too_large` for a size refusal), or
     /// `media_fetch_failed` from a worker that names none or one this router
     /// does not know.
     fn media_code(&self) -> MediaErrorCode;
@@ -504,6 +505,17 @@ mod tests {
         assert_eq!(too_large.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(too_large.media_code(), MediaErrorCode::TooLarge);
         assert_eq!(too_large.breaker_status(), None);
+
+        let refused = smg_grpc_client::stamp_media_code(
+            WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
+                "data URL parse error: missing comma in data url",
+            )),
+            "invalid_multimodal_request",
+        );
+        assert_eq!(refused.media_fault(), Some(WorkerMediaFault::Client));
+        assert_eq!(refused.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refused.media_code(), MediaErrorCode::InvalidRequest);
+        assert_eq!(refused.breaker_status(), None);
 
         let unknown = smg_grpc_client::stamp_media_code(
             WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument("new words")),

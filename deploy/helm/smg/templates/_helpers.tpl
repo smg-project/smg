@@ -250,8 +250,16 @@ Called from the router Deployment template.
 {{- end -}}
 {{- if .Values.router.adminPort }}
 {{- $admin := int .Values.router.adminPort -}}
-{{- if or (eq $admin (int .Values.router.port)) (eq $admin (int .Values.router.metrics.port)) (and .Values.router.mesh.enabled (eq $admin (int .Values.router.mesh.port))) -}}
-{{- fail (printf "router.adminPort %d is another listener's port (router.port, router.metrics.port or router.mesh.port): the gateway refuses two listeners on one port" $admin) -}}
+{{- $taken := "" -}}
+{{- if eq $admin (int .Values.router.port) -}}
+{{- $taken = "router.port" -}}
+{{- else if eq $admin (int .Values.router.metrics.port) -}}
+{{- $taken = "router.metrics.port" -}}
+{{- else if and .Values.router.mesh.enabled (eq $admin (int .Values.router.mesh.port)) -}}
+{{- $taken = "router.mesh.port" -}}
+{{- end -}}
+{{- if $taken -}}
+{{- fail (printf "router.adminPort %d equals %s: the gateway refuses two listeners on one port" $admin $taken) -}}
 {{- end }}
 - "--admin-port"
 - {{ .Values.router.adminPort | quote }}

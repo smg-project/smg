@@ -304,7 +304,8 @@ pub struct Candidate {
     /// Host-supplied admission bit: the decode's running window has a room
     /// nobody waiting at its gate is in line for.
     pub has_room: bool,
-    /// Milliseconds since the worker was admitted to the pool.
+    /// Milliseconds since the worker was admitted to the pool, saturating at
+    /// `u32::MAX` as `report_age_ms` does; never wrapping.
     pub admitted_age_ms: u32,
     /// Blocks the index learned about the worker since admission.
     pub indexed_growth: u32,
@@ -324,6 +325,19 @@ pub struct Candidate {
     /// wire numbers its fields in the record's order and this one came after
     /// the contract's first cut.
     pub active_sessions: u16,
+    /// The worker's stable identity for placement: its registration key's
+    /// fingerprint (the low 32 bits), equal across the handles of one worker
+    /// and across gateway replicas, where the id is the handle's. A ring
+    /// positions a member by it, so a replaced handle keeps its
+    /// predecessor's positions and every replica agrees on a key's owner.
+    /// Two members with equal keys share positions and the lower member
+    /// index owns first: by the birthday bound, n(n - 1) / 2 over 2^32, about
+    /// one chance in 8,600 over a pool of a thousand and one in 870,000 over
+    /// a hundred; the 64-bit form waits for the candidate's byte budget.
+    /// Zero when the host carries none. Last in the record (the wire numbers
+    /// its fields in the record's order; this one came after the contract's
+    /// first cut).
+    pub key: u32,
 }
 
 /// Media on the request: counts and bytes, for workers that take media.

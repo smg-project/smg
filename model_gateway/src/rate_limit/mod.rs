@@ -11,6 +11,7 @@
 mod backend;
 mod bucket;
 mod config;
+mod document;
 mod local_backend;
 mod manager;
 mod policy;
@@ -23,8 +24,9 @@ pub use backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlem
 pub use config::{
     ModelMatcherSpec, ModelRuleSpec, RateLimitConfigError, RateLimitYaml, TenantPolicySpec,
 };
+pub use document::{PolicyChanges, PolicySummary};
 pub use local_backend::PolicyReplacement;
-pub use manager::{RateLimitManager, Reservation};
+pub use manager::{DocumentOutcome, DocumentRefusal, RateLimitManager, Reservation};
 pub use policy::{CompiledPolicySet, ScopeLimits};
 pub use rejection::{rejection_response, RATE_LIMIT_ERROR_CODE};
 pub use reservation::{ReservationAttachment, SharedReservationHandle};

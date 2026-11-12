@@ -15,7 +15,14 @@ use crate::{
 /// every replica derives the same id from the same facts. Never `0`, which
 /// reads as absent wherever an id travels.
 pub fn identity(key: &str, incarnation: u64) -> WorkerId {
-    let id = fingerprint(key.as_bytes()) ^ incarnation.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    identity_of(fingerprint(key.as_bytes()), incarnation)
+}
+
+/// [`identity`] from the key's fingerprint, for a caller that holds it
+/// already: a host building a candidate row takes one pass over the URL for
+/// the id and the row's placement key both.
+pub fn identity_of(fingerprint: u64, incarnation: u64) -> WorkerId {
+    let id = fingerprint ^ incarnation.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     WorkerId(if id == 0 { 1 } else { id })
 }
 

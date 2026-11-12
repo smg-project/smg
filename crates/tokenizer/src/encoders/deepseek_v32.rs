@@ -17,8 +17,8 @@ use serde_json::Value;
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, find_last_user_index,
-        push_tools_and_response_format, to_json, tool_schemas, Turn, ASSISTANT, BOS, DSML, EOS,
-        THINKING_END, THINKING_START, USER,
+        push_tools_and_response_format, render_system_message, to_json, tool_schemas, Turn,
+        ASSISTANT, BOS, DSML, EOS, THINKING_END, THINKING_START, USER,
     },
     marks, RendererProfile,
 };
@@ -210,7 +210,7 @@ fn render_message(
     let opens_thinking = equals_last_user(index, last_user_idx) && thinking_mode.is_thinking();
 
     match turn.role {
-        "system" => render_system(&mut prompt, &turn),
+        "system" => render_system_message(&mut prompt, &turn, render_tools),
         "developer" => render_developer(&mut prompt, &turn, opens_thinking)?,
         "user" => render_user(&mut prompt, turn.content, opens_thinking),
         "tool" => {
@@ -242,18 +242,6 @@ fn thinking_token(opens_thinking: bool) -> &'static str {
     } else {
         THINKING_END
     }
-}
-
-/// A system message: its content (`system_msg_template` is "{content}"),
-/// then the tools and the response format it carries.
-fn render_system(prompt: &mut String, turn: &Turn<'_>) {
-    prompt.push_str(turn.content);
-    push_tools_and_response_format(
-        prompt,
-        turn.tools.as_deref(),
-        turn.response_format,
-        render_tools,
-    );
 }
 
 /// A developer message: a user message made of the tools and the response
@@ -786,6 +774,49 @@ mod tests {
             out,
             "<｜begin▁of▁sentence｜><｜User｜>Colour of the sky?<｜Assistant｜></think><｜User｜>\n\n# The user's message is: Answer in one word.<｜Assistant｜><think>"
         );
+    }
+
+    /// A system message renders its content first, then the tools block and
+    /// the response-format section it carries, each after a blank line, in
+    /// that order, before the user turn; the same in both thinking modes.
+    #[test]
+    fn a_system_message_renders_its_content_then_its_tools_then_its_response_format() {
+        let messages = [
+            json!({
+                "role": "system",
+                "content": "Use the tool.",
+                "tools": [{ "type": "function", "function": { "name": "lookup_weather",
+                    "description": "Look up", "parameters": { "type": "object",
+                    "properties": { "query": { "type": "string" } }, "required": ["query"] } } }],
+                "response_format": { "type": "json_object" },
+            }),
+            user("hello"),
+        ];
+        for (mode, thinking_token) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
+            let out = encode_messages(&messages, mode, &EncodeParams::default()).unwrap();
+            let tools = out.find("## Tools\n").expect("the tools block");
+            let format = out
+                .find("## Response Format:\n\n")
+                .expect("the response-format section");
+            assert!(
+                out.starts_with(&format!(
+                    "{BOS_TOKEN}Use the tool.\n\n## Tools\nYou have access"
+                )),
+                "{out}"
+            );
+            assert!(tools < format, "{out}");
+            assert!(
+                out[tools..format].contains(r#""name": "lookup_weather""#)
+                    && out.ends_with(&format!(
+                        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n\
+                         {{\"type\": \"json_object\"}}{USER_SP_TOKEN}hello{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    )),
+                "{out}"
+            );
+        }
     }
 
     /// The reference writes the response-format section under `if

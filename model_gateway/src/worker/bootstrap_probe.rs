@@ -493,7 +493,11 @@ mod tests {
 
     /// A loopback prefill side of one runtime and connector, registered with a
     /// bootstrap port.
-    fn loopback_leg(runtime: RuntimeType, kv_connector: Option<&str>, port: u16) -> impl Worker {
+    fn loopback_prefill_side(
+        runtime: RuntimeType,
+        kv_connector: Option<&str>,
+        port: u16,
+    ) -> impl Worker {
         let mut builder = BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
             .worker_type(WorkerType::Prefill)
             .runtime_type(runtime)
@@ -515,7 +519,7 @@ mod tests {
         let refused = RefusedAddress::reserve();
         let port = refused.port();
         for connector in [None, Some("NixlConnector"), Some("MoRIIOConnector")] {
-            let worker = loopback_leg(RuntimeType::Vllm, connector, port);
+            let worker = loopback_prefill_side(RuntimeType::Vllm, connector, port);
             assert_eq!(
                 effective_bootstrap_port(&worker),
                 Some((port, BootstrapPortSource::Registered)),
@@ -532,10 +536,11 @@ mod tests {
             (RuntimeType::Sglang, None),
             (RuntimeType::TokenSpeed, None),
         ] {
-            let dead = probe_partners_bootstrap_port(&loopback_leg(runtime, connector, port))
-                .await
-                .expect("the port is handed on the request path")
-                .expect_err("nothing listens there");
+            let dead =
+                probe_partners_bootstrap_port(&loopback_prefill_side(runtime, connector, port))
+                    .await
+                    .expect("the port is handed on the request path")
+                    .expect_err("nothing listens there");
             assert_eq!(
                 (dead.port, dead.source),
                 (port, BootstrapPortSource::Registered),

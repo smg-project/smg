@@ -40,10 +40,7 @@
 //! look the same from here, a request's future dropped without a response.
 
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
@@ -102,32 +99,6 @@ pub const CLIENT_CLOSED_REQUEST_CODE: &str = "client_closed_request";
 /// The type the SSE error event gives a stream the worker failed, shared with
 /// it so the two names cannot drift apart.
 pub const BODY_FAILED_CODE: &str = STREAM_ERROR_TYPE;
-
-/// The word of a streamed body's producer that the body told the client of a
-/// failure on its way out: the error event a stream the worker failed ends
-/// with, before its `[DONE]`. Such a body ends with its own last frame, so
-/// the frames alone say it went out in full; counted by them, a stream the
-/// engine cut was a plain 200. Handed to the edge's body wrapper with the
-/// body's duties ([`BodyDuties::failure`]) and read once the body has ended:
-/// the response then counts as its head's status with [`BODY_FAILED_CODE`],
-/// what the client read. One shared flag per streamed response; a body with
-/// no producer's word is counted by its frames alone.
-///
-/// [`BodyDuties::failure`]: super::edge_body::BodyDuties::failure
-#[derive(Clone, Debug, Default)]
-pub(crate) struct BodyFailure(Arc<AtomicBool>);
-
-impl BodyFailure {
-    /// The producer's word: the body ended with the client told of a failure.
-    pub(crate) fn tell(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    /// Whether the producer told of a failure.
-    pub(crate) fn told(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
 
 /// The length a response declares for its body: its `Content-Length`, or
 /// else what the body itself knows exactly. An HTTP/1.1 server writes that
@@ -215,7 +186,7 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = HttpMetricsFuture<S::Future>;
+    type Future = HttpMetricsFuture<TaskLocalFuture<RequestStarted, S::Future>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -259,9 +230,9 @@ where
     }
 }
 
-/// The metrics layer's future: the route's future with the request's start
-/// in its task local, with the edge's bookkeeping as its duty.
-pub type HttpMetricsFuture<F> = DutyFuture<TaskLocalFuture<RequestStarted, F>, EdgeDuty>;
+/// The metrics layer's future: `F`, the route's future under the request's
+/// start in its task local, with the edge's bookkeeping as its duty.
+pub type HttpMetricsFuture<F> = DutyFuture<F, EdgeDuty>;
 
 /// What the metrics layer holds for a request between its arrival and the
 /// route's answer: the edge's bookkeeping of the answer (the duration, the
@@ -869,6 +840,7 @@ mod client_closed_tests {
 
     use super::*;
     use crate::{
+        middleware::edge_body::BodyFailure,
         observability::inflight_tracker::InFlightRequestTracker, routers::error::create_error,
     };
 
@@ -1130,7 +1102,7 @@ mod client_closed_tests {
                     let failure = failure.clone();
                     async move {
                         let mut response = Response::new(body);
-                        BodyDuties::hand(&mut response, |duties| duties.failure = Some(failure));
+                        failure.carry(&mut response);
                         response
                     }
                 }),

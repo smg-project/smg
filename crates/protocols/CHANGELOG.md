@@ -4,6 +4,23 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ## Unreleased
 
+### Added
+
+- `ValidatedQuery<T>` and `ValidatedPath<T>`, behind the `axum` feature: a route's query string
+  and path segments read as the typed routes' body extractor reads a body. A query value the type
+  does not take, one that does not parse or a required one that is missing, and a path segment
+  that is not UTF-8 or does not parse as its type answer the gateway's JSON error envelope
+  (`400`, `error.code` `unknown_parameter`, `invalid_type`, `invalid_value` or
+  `missing_required_parameter`, `error.param` the parameter's or the segment's name) where the
+  framework answers text/plain; a rejection of the route's own making (a path parameter the
+  route does not declare, a shape the extractor cannot fill) keeps the framework's answer. The
+  gateway's model, Responses id, realtime and Conversations list and id routes read them.
+- `ChatCompletionRequest::dynamic_tools_for`, `declares_tools_for`, `effective_tool_list_for`,
+  `shared_tool_list_for` and `callable_tools_for`: the tool-set readers under a provider profile
+  the caller derived already, beside `template_thinking_for`. The readers without the suffix
+  derive the profile from the model id as before; a serving path that derives it once per
+  request no longer derives it again at each of them.
+
 ### Changed
 
 - Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
@@ -53,6 +70,24 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
+  (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
+  Messages request), as the vendor's contract for the family reads it: the request answers as one
+  with `thinking.type: disabled` does, no reasoning and `reasoning_tokens` 0. The profile had read
+  every effort value as thinking on, so a `none` was rendered into the template's effort tag and
+  the model reasoned anyway. `minimal` keeps thinking on under the profile, as the contract's
+  lowest level. An explicit `thinking.type` wins over the effort as before. Adds the profile's
+  second reading of the field, `ProviderProfile::template_reasoning_effort`, with
+  `ChatCompletionRequest::template_reasoning_effort_for`,
+  `CreateMessageRequest::template_reasoning_effort_for` and
+  `CountMessageTokensRequest::template_reasoning_effort_for`: the `reasoning_effort` a prompt is
+  rendered with, as the profile hands it to the template given the thinking preference the prompt
+  renders with. Every other profile hands the value over as sent; MiniMax hands over the levels
+  the contract names (`low`, `medium`, `high`, `xhigh`, `max`), `minimal` as `low`, and nothing
+  for any other value or while thinking is off, whether the typed toggle, the effort or, where the
+  template reads that key, its own `thinking_mode` switch sent in `chat_template_kwargs` says so
+  (the gateway applies the switch under the template's detected thinking key, as it does for the
+  mode itself; `ProviderProfile::thinking_from_template_kwargs` is the reading).
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
@@ -99,3 +134,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
   message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
   `reasoning: AssistantReasoning`, whose `text` is that option.
+- `EmbeddingRequest` and `ClassifyRequest` keep the fields they do not model in a flattened
+  `other` map, as `ChatCompletionRequest` and `CompletionRequest` do, so the HTTP relay forwards an
+  embeddings or classify body as the client wrote it (`truncate_prompt_tokens`,
+  `add_special_tokens`, `normalize`, `priority`, `extra_body`, ...). The relay re-serializes the
+  typed body and dropped every key the types did not declare. Breaking: the two structs gain the
+  field `other: serde_json::Map<String, Value>`.

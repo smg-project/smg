@@ -668,7 +668,7 @@ mod tests {
                 "{refused}"
             );
             assert_eq!(refused.fault(), MediaFault::Client);
-            assert_eq!(refused.code(), crate::error::MediaErrorCode::FetchFailed);
+            assert_eq!(refused.code(), crate::error::MediaErrorCode::InvalidRequest);
         }
         for rate in [705_600_u32, 768_000, 2_822_400, 67_108_864] {
             let decoded = decode_audio_mono_f32_symphonia(Bytes::from(wav_i16(rate, 1, &[0; 480])))

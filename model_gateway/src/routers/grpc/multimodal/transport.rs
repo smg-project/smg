@@ -16,13 +16,15 @@ use std::{
 };
 
 use llm_multimodal::{EncoderDtype, Modality};
-use openai_protocol::worker::{RuntimeType, TransportMode};
+use openai_protocol::worker::{ConnectionMode, RuntimeType, TransportMode};
 use smg_mm_rdma::{RdmaConfig, RdmaExporter};
 use tracing::{error, info, warn};
 
 use super::{serialize::wire_dtype, settings::mm_settings};
 use crate::{
-    routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable},
+    routers::grpc::{
+        backend_client::BackendClient, context::WorkerSelection, proto_wrapper::mm_shm_dev_writable,
+    },
     worker::{RoutingPool, Worker, WorkerRegistry},
 };
 
@@ -365,6 +367,20 @@ fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn Worker>>
     }
 }
 
+/// SGLang's declared floating encoder dtype, with float32 for older workers.
+pub(super) fn mm_sglang_encoder_input_dtype(workers: Option<&WorkerSelection>) -> EncoderDtype {
+    sglang_wire_dtype(mm_encoder_input_dtype_from_worker(workers).as_deref())
+}
+
+/// Accept only floating encoder inputs; unknown labels retain the legacy wire.
+fn sglang_wire_dtype(label: Option<&str>) -> EncoderDtype {
+    match label {
+        Some("bfloat16") => EncoderDtype::BFloat16,
+        Some("float16") => EncoderDtype::Float16,
+        _ => EncoderDtype::Float32,
+    }
+}
+
 /// The wire dtype for the vLLM encoder input.
 ///
 /// Defaults to float32 rather than to the narrower width the TokenSpeed path
@@ -467,15 +483,38 @@ fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Opti
     encoder_dtype_label(primary_worker(workers)?.as_ref())
 }
 
-/// The `multimodal_encoder_dtype` label a worker advertises, when it does.
+/// An explicit encoder dtype label wins; a direct SGLang worker otherwise
+/// reads the current connection's declaration, including after reconnects.
 fn encoder_dtype_label(worker: &dyn Worker) -> Option<String> {
-    worker
-        .metadata()
-        .spec
+    let backend = worker.backend_client_if_initialized();
+    encoder_dtype_label_with_backend(worker, backend.as_deref())
+}
+
+/// Preserve explicit labels; infer a dtype only when all connected engines agree.
+fn encoder_dtype_label_with_backend(
+    worker: &dyn Worker,
+    backend: Option<&BackendClient>,
+) -> Option<String> {
+    let spec = &worker.metadata().spec;
+    if let Some(dtype) = spec
         .labels
         .get("multimodal_encoder_dtype")
         .filter(|dtype| !dtype.is_empty())
-        .cloned()
+    {
+        return Some(dtype.clone());
+    }
+    if spec.runtime_type != RuntimeType::Sglang {
+        return None;
+    }
+    let BackendClient::Zmq(client) = backend? else {
+        return None;
+    };
+    let dtype = client.ready_response()?.multimodal_encoder_dtype.as_ref()?;
+    client
+        .engines()
+        .iter()
+        .all(|engine| engine.ready_response.multimodal_encoder_dtype.as_ref() == Some(dtype))
+        .then(|| dtype.clone())
 }
 
 /// The router's own encoder dtype overrides, read once from the environment.
@@ -540,18 +579,15 @@ fn shared_image_wire_dtype_over(
     shared_image_wire_dtype(&workers, overrides)
 }
 
+/// Defer one-pass writes until every destination has a known, matching dtype.
 fn shared_image_wire_dtype(
     workers: &[Arc<dyn Worker>],
     overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
     let mut shared = None;
     for worker in workers {
-        let dtype = image_wire_dtype(
-            worker.metadata().spec.runtime_type,
-            encoder_dtype_label(worker.as_ref()),
-            device_normalizes(worker.as_ref()),
-            overrides,
-        )?;
+        let backend = worker.backend_client_if_initialized();
+        let dtype = image_wire_dtype_with_backend(worker.as_ref(), overrides, backend.as_deref())?;
         match shared {
             None => shared = Some(dtype),
             Some(existing) if existing == dtype => {}
@@ -559,6 +595,30 @@ fn shared_image_wire_dtype(
         }
     }
     shared
+}
+
+/// Use one connection snapshot for both the dtype and pending-handshake check.
+/// Initialization between those decisions must not freeze a float32 layout.
+fn image_wire_dtype_with_backend(
+    worker: &dyn Worker,
+    overrides: &DtypeOverrides,
+    backend: Option<&BackendClient>,
+) -> Option<EncoderDtype> {
+    let label = encoder_dtype_label_with_backend(worker, backend);
+    let spec = &worker.metadata().spec;
+    if spec.runtime_type == RuntimeType::Sglang
+        && spec.connection_mode == ConnectionMode::Zmq
+        && label.is_none()
+        && backend.is_none()
+    {
+        return None;
+    }
+    image_wire_dtype(
+        spec.runtime_type,
+        label,
+        device_normalizes(worker),
+        overrides,
+    )
 }
 
 /// One worker's image wire dtype under assembly's rules; `None` when no
@@ -570,8 +630,7 @@ fn image_wire_dtype(
     overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
     let dtype = match runtime {
-        // Pinned on that wire, as its assembly pins it.
-        RuntimeType::Sglang => EncoderDtype::Float32,
+        RuntimeType::Sglang => sglang_wire_dtype(label.as_deref()),
         RuntimeType::Vllm if device_normalizes => return None,
         RuntimeType::Vllm => wire_dtype(
             &resolve_mm_vllm_encoder_input_dtype(overrides.vllm.clone(), label),
@@ -720,13 +779,14 @@ mod tests {
         Arc::new(builder.build())
     }
 
+    /// Pool planning agrees with assembly, including SGLang worker labels.
     #[test]
     fn a_worker_image_wire_dtype_is_what_its_assembly_writes() {
         let plain = DtypeOverrides::default();
         let bf16 = || Some("bfloat16".to_string());
         assert_eq!(
             image_wire_dtype(RuntimeType::Sglang, bf16(), false, &plain),
-            Some(EncoderDtype::Float32)
+            Some(EncoderDtype::BFloat16)
         );
         assert_eq!(
             image_wire_dtype(RuntimeType::Vllm, None, false, &plain),
@@ -778,7 +838,7 @@ mod tests {
         );
         assert_eq!(
             image_wire_dtype(RuntimeType::Sglang, bf16(), false, &overridden),
-            Some(EncoderDtype::Float32)
+            Some(EncoderDtype::BFloat16)
         );
     }
 
@@ -841,6 +901,122 @@ mod tests {
             shared_image_wire_dtype(&[worker("http://f", RuntimeType::Sglang, &[])], &plain),
             Some(EncoderDtype::Float32)
         );
+    }
+
+    /// Disagreeing SGLang workers must defer the wire write until selection.
+    #[test]
+    fn sglang_mixed_precision_fleet_defers_the_wire_write() {
+        let narrow = worker(
+            "http://half",
+            RuntimeType::Sglang,
+            &[("multimodal_encoder_dtype", "float16")],
+        );
+        let legacy = worker("http://legacy", RuntimeType::Sglang, &[]);
+        let policy = DtypeOverrides::default();
+        assert_eq!(
+            shared_image_wire_dtype(std::slice::from_ref(&narrow), &policy),
+            Some(EncoderDtype::Float16)
+        );
+        assert_eq!(shared_image_wire_dtype(&[narrow, legacy], &policy), None);
+    }
+
+    /// A real ZMQ handshake supplies SGLang's dtype without an explicit label;
+    /// overrides win and old or disagreeing schedulers retain float32. Before the handshake,
+    /// the one-pass planner must not freeze a layout in the legacy precision.
+    #[tokio::test]
+    async fn sglang_zmq_dtype_comes_from_the_handshake_unless_overridden() {
+        use engine_zmq_client::{
+            mock_engine::{connect_to_frontend, default_ready_response},
+            protocol::handshake::EngineCoreReadyResponse,
+            EngineId,
+        };
+
+        use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+        let pending: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///pending")
+                .runtime_type(RuntimeType::Sglang)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let policy = DtypeOverrides::default();
+        let pending_backend = pending.backend_client_if_initialized();
+        assert_eq!(shared_image_wire_dtype(&[pending], &policy), None);
+
+        for (advertised, explicit, expected) in [
+            (vec![Some("bfloat16")], None, EncoderDtype::BFloat16),
+            (vec![Some("float16"); 2], None, EncoderDtype::Float16),
+            (vec![Some("bfloat16"); 2], None, EncoderDtype::BFloat16),
+            (vec![None; 2], None, EncoderDtype::Float32),
+            (
+                vec![Some("bfloat16"), Some("float32")],
+                None,
+                EncoderDtype::Float32,
+            ),
+            (
+                vec![Some("float16"), Some("bfloat16")],
+                None,
+                EncoderDtype::Float32,
+            ),
+            (vec![Some("bfloat16"), None], None, EncoderDtype::Float32),
+            (vec![None, Some("bfloat16")], None, EncoderDtype::Float32),
+            (
+                vec![Some("bfloat16"), Some("float32")],
+                Some("float16"),
+                EncoderDtype::Float16,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+            let (handshake, input, output) = (ep("hs"), ep("in"), ep("out"));
+            let count = advertised.len();
+            let ranks = advertised.into_iter().enumerate().map(|(rank, dtype)| {
+                connect_to_frontend(
+                    &handshake,
+                    EngineId::from_engine_index(rank as u32),
+                    EngineCoreReadyResponse {
+                        multimodal_encoder_dtype: dtype.map(str::to_string),
+                        ..default_ready_response()
+                    },
+                )
+            });
+            let (client, engines) = tokio::join!(
+                ZmqEngineClient::connect(
+                    &handshake,
+                    &input,
+                    &output,
+                    count,
+                    "m".to_string(),
+                    EosTokenIds::default(),
+                    RuntimeType::Sglang,
+                    Duration::from_secs(10)
+                ),
+                futures::future::join_all(ranks),
+            );
+            let _engines: Vec<_> = engines.into_iter().map(Result::unwrap).collect();
+            let mut builder = BasicWorkerBuilder::new(ep("worker"))
+                .runtime_type(RuntimeType::Sglang)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .backend_client(BackendClient::Zmq(client.unwrap()));
+            if let Some(dtype) = explicit {
+                builder = builder.label("multimodal_encoder_dtype", dtype);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            let workers = WorkerSelection::Single {
+                worker: Arc::clone(&worker),
+            };
+            assert_eq!(mm_sglang_encoder_input_dtype(Some(&workers)), expected);
+            // Retain the snapshot from before initialization while the worker
+            // now has a live backend. The planner must not resample that backend.
+            assert!(worker.backend_client_if_initialized().is_some());
+            assert_eq!(
+                image_wire_dtype_with_backend(worker.as_ref(), &policy, pending_backend.as_deref()),
+                explicit.map(|_| expected),
+            );
+            assert_eq!(shared_image_wire_dtype(&[worker], &policy), Some(expected));
+        }
     }
 
     /// The stages see the fleet's wire dtype by default: the one-pass wire

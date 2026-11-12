@@ -237,7 +237,7 @@ fn discovered_worker_with(url: &str, health: HealthCheckConfig) -> Arc<dyn Worke
 }
 
 #[test]
-fn labels_follow_the_engine_for_local_non_zmq_workers_only() {
+fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
     let registry = Arc::new(WorkerRegistry::new());
     let local = discovered_worker("http://local:1");
     let local_id = registry.register(local.clone()).unwrap();
@@ -266,13 +266,15 @@ fn labels_follow_the_engine_for_local_non_zmq_workers_only() {
         &external
     ));
 
+    // A ZMQ engine reports its geometry at the handshake: the worker's own
+    // link holds it, and the refresh step reads the link.
     let zmq: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("ipc:///tmp/engine.sock")
             .connection_mode(ConnectionMode::Zmq)
             .build(),
     );
     let zmq_id = registry.register(zmq.clone()).unwrap();
-    assert!(!labels_follow_the_engine(&registry, &zmq_id, &zmq));
+    assert!(labels_follow_the_engine(&registry, &zmq_id, &zmq));
 
     registry.on_remote_worker_state(&smg_mesh::WorkerState {
         worker_id: "peer-w1".to_string(),
@@ -1144,6 +1146,58 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
     assert!(
         job_queue.get_status("http://local:11").is_some(),
         "a refresh job was submitted for the worker the contact promoted"
+    );
+}
+
+/// A handshake can complete while the worker's registration job is still
+/// running its last steps (the worker is in the registry from the register
+/// step on). The refresh that signal asks for is kept behind that job and
+/// run when it ends, never dropped: on the ZMQ wire it is what gives the
+/// worker its window, and a worker that stays in service has no next
+/// transition to retry on. The registration's status stays its own.
+#[tokio::test]
+async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
+    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    let app_context = create_test_app_context();
+    let registry = Arc::clone(&app_context.worker_registry);
+    let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+
+    let worker = discovered_worker_with(
+        "http://local:12",
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..HealthCheckConfig::default()
+        },
+    );
+    worker.set_status(WorkerStatus::NotReady);
+    let revision = worker.revision();
+    registry.register(worker.clone()).unwrap();
+    job_queue.hold_url_for_tests("http://local:12", "AddWorker");
+
+    apply_connect_signal_and_refresh(
+        &registry,
+        WorkerConnected {
+            url: "http://local:12".to_string(),
+            revision,
+        },
+        &mut HashMap::new(),
+        &test_config(),
+        Some(&job_queue),
+    )
+    .await;
+
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+    assert!(
+        job_queue.kept_for("http://local:12"),
+        "the refresh is kept behind the registration job"
+    );
+    assert_eq!(
+        job_queue
+            .get_status("http://local:12")
+            .expect("the registration's status")
+            .job_type,
+        "AddWorker",
+        "the registration keeps its own status"
     );
 }
 

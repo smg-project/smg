@@ -19,7 +19,7 @@ use axum::{
     response::Response,
 };
 use rand::RngExt;
-use smg_policy_controller::{Decision, Phase, Side, Target, WorkerId, MAX_TARGETS};
+use smg_policy_controller::{Decision, LeaseId, Phase, Side, Target, WorkerId, MAX_TARGETS};
 use tracing::{debug, warn};
 
 use crate::{
@@ -134,6 +134,12 @@ pub(crate) struct PlacementInputs<'a> {
     /// nothing else left is used whole, so a single worker is retried as
     /// before.
     pub tried: &'a [String],
+    /// The lease sequence the caller drew ([`Decider::begin`]) before it
+    /// captured the candidates it hands [`select_from`], so a worker retired
+    /// between that capture and the decision is booked by no commit of the
+    /// request. `None` numbers the lease when its view is built;
+    /// [`select_single`] draws the sequence at its own capture.
+    pub sequence: Option<LeaseId>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -241,13 +247,24 @@ pub(crate) fn select_single(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
+    // The request's sequence comes before the pool read: a worker retired
+    // from here on is booked by no commit of this request, however the
+    // retirement interleaves with the capture and the decision.
+    let sequence = policies.decider().map(|decider| decider.begin());
     let candidates = candidates(registry, model_id, pool, wire);
-    select_from(registry, policies, model_id, candidates.as_slice(), inputs)
+    select_from(
+        registry,
+        policies,
+        model_id,
+        candidates.as_slice(),
+        PlacementInputs { sequence, ..inputs },
+    )
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
-/// workers from a path that cannot pin a rank.
+/// workers from a path that cannot pin a rank. Such a caller draws the
+/// request's sequence before its capture ([`PlacementInputs::sequence`]).
 pub(crate) fn select_from(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -321,6 +338,7 @@ pub(crate) fn select_from(
                 overload_lifted: info.overload_lifted,
                 phase: Phase::Single,
                 has_capacity: None,
+                sequence: inputs.sequence,
             },
             eligible: &eligible,
             policy: policy.name(),
@@ -462,7 +480,7 @@ fn select_from_decided(rd: RegularDecision<'_>) -> Option<Arc<dyn Worker>> {
 
 /// The ids of a decision's targets, for the one re-decision after every one
 /// of them missed its commit; none for a shed.
-fn target_ids(decision: &Decision) -> ([WorkerId; MAX_TARGETS], usize) {
+pub(crate) fn target_ids(decision: &Decision) -> ([WorkerId; MAX_TARGETS], usize) {
     let targets = decision
         .pick()
         .map_or(&[][..], |pick| pick.targets.as_slice());
@@ -3732,6 +3750,102 @@ mod tests {
             selected.url(),
             "http://h:9",
             "nothing else is left: the one worker takes the retry"
+        );
+    }
+
+    /// The HTTP entry draws the request's sequence before it reads the pool:
+    /// a worker retired after that read and before the decision (here from
+    /// the per-request candidate filter, which runs after the read) is booked
+    /// by no commit of the request, so the rows its retirement pruned stay
+    /// gone.
+    #[test]
+    fn with_the_engine_switch_select_single_draws_the_sequence_before_its_capture() {
+        use std::{
+            collections::HashMap,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let policies = PolicyRegistry::new(least_load.clone()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &least_load,
+            &least_load,
+        );
+        let decider = policies.decider().expect("the engine serves least load");
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let workers: Vec<Arc<dyn Worker>> = ["http://h:1", "http://h:2"]
+            .iter()
+            .map(|url| registry.get_by_url(url).expect("registered"))
+            .collect();
+        // Two workers under the same idle report, so only the engine's own
+        // credit tells them apart.
+        let feed = TestFeed::attached_to(policies.get_policy_or_default(MODEL).as_ref());
+        decider.set_load_receiver(Some(feed.receiver()));
+        feed.publish(&HashMap::from([
+            ("http://h:1".to_string(), one_rank_load(0, 0.1, 2000.0)),
+            ("http://h:2".to_string(), one_rank_load(0, 0.1, 2000.0)),
+        ]));
+        let leader = || {
+            let request = HostRequest {
+                model: MODEL,
+                ..HostRequest::default()
+            };
+            let (decision, _) = decider.decide(&request, &workers, &[]);
+            decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .first()
+                .map(|t| t.position)
+        };
+        // One small booking on the second worker first, so the first one
+        // leads strictly and the request below is placed on it.
+        let small = HostRequest {
+            model: MODEL,
+            prompt_tokens: 1,
+            ..HostRequest::default()
+        };
+        let (decision, lease) = decider.decide(&small, &workers, &[]);
+        decider
+            .commit(&lease, &decision, Side::Single, |t| t.position == 1)
+            .expect("the second worker is booked");
+        assert_eq!(leader(), Some(0), "the first worker leads while idle");
+        // The filter runs after the pool read: the first worker's retirement
+        // lands there, once, and the captured pool still holds its handle.
+        let retired = AtomicBool::new(false);
+        let retire_the_first = |_: &dyn Worker| {
+            if !retired.swap(true, Ordering::Relaxed) {
+                policies.on_worker_removed(workers[0].as_ref());
+            }
+            true
+        };
+        let selected = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                candidate_filter: Some(&retire_the_first),
+                ..Default::default()
+            },
+        );
+        assert!(
+            retired.load(Ordering::Relaxed),
+            "the retirement landed after the capture"
+        );
+        assert_eq!(
+            selected.url(),
+            "http://h:1",
+            "the request is placed on the leading worker, retired or not"
+        );
+        // The retired handle still leads: the request's mean-size booking
+        // would have lost it to the one-token booking on the other worker.
+        assert_eq!(
+            leader(),
+            Some(0),
+            "the retired handle reads idle: the request's commit booked nothing on it"
         );
     }
 

@@ -41,6 +41,7 @@ use openai_protocol::{
     transcription::{AudioFile, TranscriptionRequest},
     UNKNOWN_MODEL_ID,
 };
+use smg_data_connector::MemoryConfig;
 use smg_external_router::spec_for_provider;
 use tracing::{debug, info, warn};
 
@@ -176,6 +177,13 @@ impl Gateway {
         self
     }
 
+    /// The gateway with its message threads in a store bounded as the
+    /// operator's `memory` section says.
+    fn with_thread_bounds(mut self, memory: &MemoryConfig) -> Self {
+        self.threads = MessageThreads::from_config(memory);
+        self
+    }
+
     fn try_register(
         &self,
         id: RouterId,
@@ -197,8 +205,18 @@ impl Gateway {
         config: &ServerConfig,
         app_context: &Arc<AppContext>,
     ) -> Result<Arc<Self>, String> {
+        let memory = config.router_config.memory.unwrap_or_default();
+        memory.validate()?;
+        info!(
+            "Message threads: at most {} turns, retention {}",
+            memory.max_responses,
+            memory
+                .retention()
+                .map_or_else(|| "none".to_string(), |r| format!("{} s", r.as_secs()))
+        );
         let mut gateway = Self::new(app_context.worker_registry.clone())
-            .with_policies(app_context.policy_registry.clone());
+            .with_policies(app_context.policy_registry.clone())
+            .with_thread_bounds(&memory);
         gateway.enable_igw = config.router_config.enable_igw;
         let gateway = Arc::new(gateway);
 
@@ -589,7 +607,12 @@ impl Gateway {
         // The header carries the client's rid itself: placement strips its
         // lineage suffixes once, as `derive_rid_key` does for a plain
         // request, so both paths key a nested rid alike. A rid over the
-        // header's byte cap goes as the derived key, which fits it.
+        // header's byte cap goes as the derived key, and placement's strip
+        // then takes a further suffix off a nested one: a key one level
+        // coarser than the plain request's, by choice, since no header would
+        // scatter the turns. A nested rid that crosses the cap mid-thread (a
+        // turn number gaining a digit, a `_r<n>` retry) moves to that coarser
+        // key at the crossing.
         let carried = if rid.len() <= ROUTING_KEY_HINT_MAX_BYTES {
             rid
         } else {
@@ -2377,22 +2400,34 @@ mod tests {
                 .clone()
         }
 
-        /// The routing key of the last request this router was handed.
-        fn last_routing_key(&self) -> Option<String> {
+        /// The value under `name` on the last request this router was handed.
+        fn last_header(&self, name: &str) -> Option<String> {
             let seen = self.seen.lock().unwrap();
             let headers = seen.last().expect("a request was routed").as_ref()?;
-            let key = headers.get("x-smg-routing-key")?;
-            Some(key.to_str().expect("a text key").to_string())
+            let value = headers.get(name)?;
+            Some(value.to_str().expect("a text key").to_string())
+        }
+
+        /// The routing key of the last request this router was handed.
+        fn last_routing_key(&self) -> Option<String> {
+            self.last_header("x-smg-routing-key")
         }
     }
 
     /// A gateway over one recording router, its policies built with the
     /// routing-key override on or off.
     fn recording_gateway(override_on: bool) -> (Gateway, Arc<HeaderRecordingRouter>) {
-        let config = RoutingKeyOverrideConfig {
+        recording_gateway_with(RoutingKeyOverrideConfig {
             enabled: override_on,
             ..Default::default()
-        };
+        })
+    }
+
+    /// A gateway over one recording router, its policies built with the
+    /// given routing-key override.
+    fn recording_gateway_with(
+        config: RoutingKeyOverrideConfig,
+    ) -> (Gateway, Arc<HeaderRecordingRouter>) {
         let policies = PolicyRegistry::with_override(PolicyConfig::RoundRobin, config);
         let gateway =
             Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
@@ -2405,9 +2440,11 @@ mod tests {
     /// Under the routing-key override a thread turn routes on its client's
     /// `rid` lineage, as a plain request does: the header carries the rid
     /// itself when the request set none, so placement's one strip gives the
-    /// plain request's key, nested suffixes included; a header the client set
-    /// wins; without the override, a client `rid` or a `thread`, nothing is
-    /// added.
+    /// plain request's key, nested suffixes included; a rid over the header's
+    /// byte cap goes as its derived key, which places one suffix coarser, and
+    /// a nested rid crossing the cap mid-thread moves to that coarser key at
+    /// the crossing; a header the client set wins; without the override, a
+    /// client `rid` or a `thread`, nothing is added.
     #[tokio::test]
     async fn a_thread_turn_carries_its_client_lineage_as_the_routing_key_under_the_override() {
         use serde_json::json;
@@ -2456,6 +2493,41 @@ mod tests {
         );
         assert_eq!(placed(&seen).as_deref(), Some("conv_t1"));
 
+        let base = "a".repeat(ROUTING_KEY_HINT_MAX_BYTES - 3);
+        let long = format!("{base}_t1_t2");
+        gateway
+            .route_messages(None, &meta, turn(json!(long), true), "m")
+            .await;
+        assert_eq!(
+            seen.last_routing_key().as_deref(),
+            policies.derive_rid_key(Some(&long)),
+            "a rid over the header's byte cap goes as its derived key"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some(base.as_str()),
+            "placed one suffix coarser than the plain request's key"
+        );
+
+        let near = "b".repeat(ROUTING_KEY_HINT_MAX_BYTES - 6);
+        for (rid, key, why) in [
+            (
+                format!("{near}_t1_t9"),
+                format!("{near}_t1"),
+                "a nested rid at the cap goes whole and places once stripped",
+            ),
+            (
+                format!("{near}_t1_t10"),
+                near.clone(),
+                "one byte over the cap, it moves to the coarser key",
+            ),
+        ] {
+            gateway
+                .route_messages(None, &meta, turn(json!(rid), true), "m")
+                .await;
+            assert_eq!(placed(&seen).as_deref(), Some(key.as_str()), "{why}");
+        }
+
         let mut mine = HeaderMap::new();
         mine.insert("x-smg-routing-key", "mine".parse().unwrap());
         gateway
@@ -2478,5 +2550,64 @@ mod tests {
             .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
             .await;
         assert_eq!(seen.last_routing_key(), None, "the override off");
+    }
+
+    /// With several routing-key names configured, the thread layer sends the
+    /// lineage key under the first, the one placement reads first; a client
+    /// header under a later name still wins, since the request then carries a
+    /// routing key already.
+    #[tokio::test]
+    async fn a_thread_turn_sends_its_lineage_key_under_the_first_configured_name() {
+        use serde_json::json;
+
+        let (gateway, seen) = recording_gateway_with(RoutingKeyOverrideConfig {
+            enabled: true,
+            headers: vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()],
+            ..Default::default()
+        });
+        let policies = gateway.policies.clone().expect("policies");
+        let meta = test_tenant_meta();
+        let turn = || -> CreateMessageRequest {
+            body(json!({
+                "model": "m", "max_tokens": 8, "rid": "conv_t2",
+                "thread": {"type": "create"},
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+        };
+        let placed = |seen: &HeaderRecordingRouter| -> Option<String> {
+            let headers = seen.last_headers()?;
+            policies
+                .sticky_header_key(Some(&headers))
+                .map(str::to_string)
+        };
+
+        gateway.route_messages(None, &meta, turn(), "m").await;
+        assert_eq!(
+            seen.last_header("x-routing-key").as_deref(),
+            Some("conv_t2"),
+            "the key goes out under the first configured name"
+        );
+        assert_eq!(
+            seen.last_header("x-smg-routing-key"),
+            None,
+            "nothing under the second"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some("conv"),
+            "placed once stripped"
+        );
+
+        let mut mine = HeaderMap::new();
+        mine.insert("x-smg-routing-key", "mine".parse().unwrap());
+        gateway
+            .route_messages(Some(&mine), &meta, turn(), "m")
+            .await;
+        assert_eq!(
+            seen.last_header("x-routing-key"),
+            None,
+            "a client header under the second name wins: nothing is added under the first"
+        );
+        assert_eq!(placed(&seen).as_deref(), Some("mine"));
     }
 }

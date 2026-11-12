@@ -174,6 +174,9 @@ pub struct JobQueue {
     /// The next waiter's id: what tells a caller's waiter from a later one
     /// under the same key.
     next_waiter_id: AtomicU64,
+    /// One job per URL, kept while another holds the URL
+    /// (`submit_or_defer`) and run by that job's completion (`run_kept`).
+    kept: Arc<DashMap<String, Job>>,
 }
 
 /// A job handed to the dispatcher with the id of the waiter for its outcome,
@@ -223,7 +226,8 @@ pub enum JobOutcomeError {
     /// The job did not end within the wait; it keeps running.
     TimedOut(Duration),
     /// A caller is waiting on a job under this key already: the job runs
-    /// once and its outcome goes to that caller.
+    /// once and its outcome goes to that caller. The key is written as a
+    /// log line writes it, a worker's address with its userinfo masked.
     InFlight(String),
 }
 
@@ -264,6 +268,7 @@ impl JobQueue {
         let status_map = Arc::new(DashMap::new());
         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let outcomes: Outcomes = Arc::new(DashMap::new());
+        let kept: Arc<DashMap<String, Job>> = Arc::new(DashMap::new());
 
         let queue = Arc::new(Self {
             tx,
@@ -272,6 +277,7 @@ impl JobQueue {
             concurrency_limit: concurrency_limit.clone(),
             outcomes: outcomes.clone(),
             next_waiter_id: AtomicU64::new(1),
+            kept: kept.clone(),
         });
 
         // Single dispatcher task
@@ -295,13 +301,22 @@ impl JobQueue {
                 let ctx_clone = ctx.clone();
                 let status_clone = status.clone();
                 let waiters_clone = waiters.clone();
+                let kept_clone = kept.clone();
 
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "Job processing task: bounded by the semaphore permit which is dropped when the task completes"
                 )]
                 tokio::spawn(async move {
-                    Self::process_job(queued, ctx_clone, status_clone, waiters_clone, permit).await;
+                    Self::process_job(
+                        queued,
+                        ctx_clone,
+                        status_clone,
+                        waiters_clone,
+                        kept_clone,
+                        permit,
+                    )
+                    .await;
                 });
             }
 
@@ -391,6 +406,94 @@ impl JobQueue {
                 // the wait for a slot, stays with that job).
                 Self::record_own_status(&self.status_map, &worker_url, job_type, None);
             })
+    }
+
+    /// `submit_unless_in_flight` for a submission that must not be lost: a
+    /// job that finds another of any type in flight under its URL is kept
+    /// (one per URL, the latest) and run by that job's completion
+    /// (`run_kept`), after it and never beside it. Returns `Ok(false)` for a
+    /// kept job. A job still kept once nothing is in flight (the holder ended
+    /// between the claim and the keeping, its completion finding nothing) is
+    /// this call's to submit.
+    pub async fn submit_or_defer(&self, mut job: Job) -> Result<bool, String> {
+        let worker_url = job.worker_url().to_string();
+        let job_type = job.job_type();
+        loop {
+            if Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
+                return self
+                    .submit_inner(job, true, None)
+                    .await
+                    .map(|()| true)
+                    .inspect_err(|_| {
+                        Self::record_own_status(&self.status_map, &worker_url, job_type, None);
+                    });
+            }
+            self.kept.insert(worker_url.clone(), job);
+            if Self::has_in_flight(&self.status_map, &worker_url) {
+                return Ok(false);
+            }
+            match self.kept.remove(&worker_url) {
+                Some((_, taken_back)) => job = taken_back,
+                None => return Ok(false),
+            }
+        }
+    }
+
+    /// Whether a job of any type is pending or processing under `url`.
+    fn has_in_flight(status_map: &DashMap<String, JobStatus>, url: &str) -> bool {
+        status_map
+            .get(url)
+            .is_some_and(|entry| matches!(entry.status.as_str(), "pending" | "processing"))
+    }
+
+    /// The job kept for `worker_url` (`submit_or_defer`), run on the heels of
+    /// the job that held the URL, on its task and under its own status; a job
+    /// queued for the URL in the meantime holds it first, and its completion
+    /// runs the kept one. Nothing waits on a kept job's outcome.
+    async fn run_kept(
+        worker_url: &str,
+        context: &Arc<AppContext>,
+        status_map: &Arc<DashMap<String, JobStatus>>,
+        kept: &DashMap<String, Job>,
+    ) {
+        while let Some((_, job)) = kept.remove(worker_url) {
+            let job_type = job.job_type();
+            if !Self::claim_unless_in_flight(status_map, worker_url, job_type) {
+                kept.insert(worker_url.to_string(), job);
+                if Self::has_in_flight(status_map, worker_url) {
+                    return;
+                }
+                continue;
+            }
+            debug!(
+                "Running the {} job kept for worker={} while another job held the URL",
+                job_type,
+                Job::shown_worker(job_type, worker_url)
+            );
+            Self::record_own_status(
+                status_map,
+                worker_url,
+                job_type,
+                Some(JobStatus::processing(job_type, worker_url)),
+            );
+            let start = std::time::Instant::now();
+            let result = Self::execute_job(&job, context).await;
+            Self::record_job_completion(job_type, worker_url, start.elapsed(), &result, status_map);
+        }
+    }
+
+    /// A job of `job_type` written as processing under `url`, standing in for
+    /// one the dispatcher is running.
+    #[cfg(test)]
+    pub(crate) fn hold_url_for_tests(&self, url: &str, job_type: &'static str) {
+        self.status_map
+            .insert(url.to_string(), JobStatus::processing(job_type, url));
+    }
+
+    /// Whether a job is kept for `url` (`submit_or_defer`).
+    #[cfg(test)]
+    pub(crate) fn kept_for(&self, url: &str) -> bool {
+        self.kept.contains_key(url)
     }
 
     /// Any in-flight job under the key blocks the claim, whatever its type.
@@ -490,7 +593,10 @@ impl JobQueue {
         // One waiter per key: a second caller for a job in flight is refused,
         // not handed the first caller's outcome (and the first its loss).
         match self.outcomes.entry(key.clone()) {
-            Entry::Occupied(_) => return Err(JobOutcomeError::InFlight(key)),
+            Entry::Occupied(_) => {
+                let shown = Job::shown_worker(job.job_type(), &key);
+                return Err(JobOutcomeError::InFlight(shown));
+            }
             Entry::Vacant(entry) => {
                 entry.insert(Waiter { id, sender: tx });
             }
@@ -546,6 +652,7 @@ impl JobQueue {
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
         outcomes: Outcomes,
+        kept: Arc<DashMap<String, Job>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let Queued { job, waiter } = queued;
@@ -596,6 +703,7 @@ impl JobQueue {
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
                 Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
+                Self::run_kept(&worker_url, &ctx, &status_map, &kept).await;
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
@@ -1367,10 +1475,11 @@ mod tests {
 
     /// A second caller for a job in flight is refused and the first keeps
     /// its waiter, so the outcome reaches the caller that submitted the job.
+    /// The refusal names the key as a log line writes it, its userinfo masked.
     #[tokio::test]
     async fn a_second_waiter_under_a_held_key_is_refused_and_the_first_kept() {
         let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
-        let key = "http://worker:8000".to_string();
+        let key = "http://user:secret@127.0.0.1:8000".to_string();
         let (first, first_rx) = oneshot::channel();
         queue.outcomes.insert(
             key.clone(),
@@ -1385,29 +1494,97 @@ mod tests {
                 Duration::from_secs(1),
             )
             .await;
-        assert_eq!(second, Err(JobOutcomeError::InFlight(key.clone())));
+        let shown = Job::shown_worker("RefreshWorkerLabels", &key);
+        assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(second, Err(JobOutcomeError::InFlight(shown)));
         assert_eq!(queue.outcomes.get(&key).map(|waiter| waiter.id), Some(1));
         JobQueue::deliver_outcome(&queue.outcomes, &key, Some(1), Ok("done".to_string()));
         assert!(matches!(first_rx.await, Ok(Ok(ref message)) if message == "done"));
     }
 
-    /// A submit the queue refuses leaves no waiter behind.
+    /// A caller whose wait ended leaves the key free: a second wait under
+    /// the same key is taken, carries the next waiter id, and is answered
+    /// with its own job's outcome once the dispatcher runs; a wait cancelled
+    /// while the queue is full frees the key the same way. The dispatcher's
+    /// one permit is held until the end, so the queued jobs wait.
     #[tokio::test]
-    async fn a_refused_submit_leaves_no_waiter() {
-        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
-        let refused = queue
-            .submit_and_wait(
-                Job::RefreshWorkerLabels {
-                    url: "http://worker:8000".to_string(),
-                },
-                Duration::from_secs(1),
-            )
+    async fn a_second_wait_under_a_freed_key_is_taken_and_answered_with_its_own_outcome() {
+        use crate::app_context::testing::app_context_for_tests;
+
+        let context = app_context_for_tests(
+            RouterConfig::default(),
+            Arc::new(crate::worker::WorkerRegistry::new()),
+            None,
+        );
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 1,
+                max_concurrent_jobs: 1,
+            },
+            Arc::downgrade(&context),
+        );
+        let key = "http://worker:8000".to_string();
+        let refresh = |url: &str| Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        let held = Arc::clone(&queue.concurrency_limit)
+            .acquire_owned()
+            .await
+            .expect("the dispatcher's permit");
+
+        // The first wait's job is taken off the channel and parks at the
+        // permit; the wait ends on its bound and the key is free again.
+        let first = queue
+            .submit_and_wait(refresh(&key), Duration::from_millis(20))
             .await;
-        assert!(matches!(refused, Err(JobOutcomeError::NotQueued(_))));
+        assert!(
+            matches!(first, Err(JobOutcomeError::TimedOut(_))),
+            "{first:?}"
+        );
         assert!(
             queue.outcomes.is_empty(),
-            "a refused submit leaves no waiter"
+            "the first caller's waiter left with it"
         );
+
+        // One plain submit fills the channel; a wait cancelled while it
+        // waits for a slot leaves nothing under the key either.
+        queue
+            .submit(refresh("http://other:8000"))
+            .await
+            .expect("the one slot");
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            queue.submit_and_wait(refresh(&key), Duration::from_secs(5)),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the wait for a slot outlives its bound: {cancelled:?}"
+        );
+        assert!(
+            queue.outcomes.is_empty(),
+            "the cancelled caller's waiter left with it"
+        );
+
+        // The second wait under the key is taken with the third id; once
+        // the dispatcher runs, the first job's late outcome reaches nobody
+        // and the second wait is answered by its own job.
+        let second = queue.submit_and_wait(refresh(&key), Duration::from_secs(5));
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                queue.outcomes.get(&key).map(|waiter| waiter.id),
+                Some(3),
+                "the second wait holds the key with the next id"
+            );
+            drop(held);
+        };
+        let (second, ()) = tokio::join!(second, release);
+        assert!(
+            matches!(second, Err(JobOutcomeError::Failed(ref reason)) if reason.contains("not initialized")),
+            "{second:?}"
+        );
+        assert!(queue.outcomes.is_empty());
     }
 
     /// A finished job's outcome reaches the waiter under its key once, and
@@ -1461,6 +1638,67 @@ mod tests {
             "{outcome:?}"
         );
         assert!(queue.outcomes.is_empty());
+    }
+
+    /// A caller leaving while its submit is parked on a slot (the queue full)
+    /// takes its waiter with it: the waiter is under the key while the submit
+    /// waits, gone when the caller is, and a later caller takes the key.
+    #[tokio::test]
+    async fn a_wait_cancelled_under_a_full_queue_leaves_no_waiter() {
+        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+
+        let context = app_context_for_tests(
+            RouterConfig::builder().build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
+        );
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 1,
+                max_concurrent_jobs: 1,
+            },
+            Arc::downgrade(&context),
+        );
+        // The queue's one slot, held for the whole test: every submit parks.
+        let slot = queue.tx.reserve().await.expect("the queue is open");
+        let key = "http://127.0.0.1:8000".to_string();
+
+        let mut wait = Box::pin(queue.submit_and_wait(
+            Job::RefreshWorkerLabels { url: key.clone() },
+            Duration::from_secs(5),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut wait)
+                .await
+                .is_err(),
+            "the submit parks on the held slot"
+        );
+        assert!(
+            queue.outcomes.contains_key(&key),
+            "the waiter is under the key while the submit waits"
+        );
+        drop(wait);
+        assert!(
+            queue.outcomes.is_empty(),
+            "the caller leaving took its waiter"
+        );
+
+        let mut later = Box::pin(queue.submit_and_wait(
+            Job::RefreshWorkerLabels { url: key.clone() },
+            Duration::from_secs(5),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut later)
+                .await
+                .is_err(),
+            "the later submit parks too"
+        );
+        assert!(
+            queue.outcomes.contains_key(&key),
+            "a later caller takes the key"
+        );
+        drop(later);
+        drop(slot);
     }
 
     fn spec_for(url: &str, router_config: &RouterConfig) -> WorkerSpec {
@@ -1696,6 +1934,97 @@ mod tests {
         assert!(queue.submit_unless_in_flight(job()).await.is_err());
         assert!(queue.status_map.get(url).is_none());
         assert!(queue.submit_unless_in_flight(job()).await.is_err());
+    }
+
+    /// A job that finds another in flight under its URL is kept and runs on
+    /// that job's heels instead of being dropped: a label refresh whose
+    /// worker's registration job is still ending (its handshake completed
+    /// during the last steps) would otherwise wait for a transition into
+    /// service a healthy worker never makes. The holder's status is left to
+    /// it; the kept job runs under its own once the holder ends. A test
+    /// context starts no workflow engine, so a job that runs ends failed
+    /// under its own status: that status is the run's evidence.
+    #[tokio::test]
+    async fn a_job_kept_behind_the_in_flight_one_runs_when_it_ends() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let url = "http://w:8000";
+        queue.hold_url_for_tests(url, "AddWorker");
+
+        let removal = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: None,
+        };
+        assert_eq!(queue.submit_or_defer(removal).await, Ok(false));
+        assert!(queue.kept_for(url), "the job is kept, not dropped");
+        assert_eq!(
+            queue.get_status(url).expect("the holder's status").job_type,
+            "AddWorker",
+            "the holder's status is left to it"
+        );
+
+        JobQueue::record_job_completion(
+            "AddWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(url, &context, &queue.status_map, &queue.kept).await;
+        assert!(!queue.kept_for(url));
+        let status = queue.get_status(url).expect("the kept job's own status");
+        assert_eq!(status.job_type, "RemoveWorker");
+        assert_eq!(
+            status.status, "failed",
+            "the kept job ran once the holder ended"
+        );
+    }
+
+    /// The wiring at `process_job`: a kept job runs at the completion of the
+    /// job that held the URL, through the dispatcher and not by hand. A hold
+    /// by hand keeps the first submission; a plain submission for the same
+    /// URL writes its pending status over the hold and becomes the holder;
+    /// when the dispatcher finishes it, the kept job runs under its own
+    /// status. Neither job's workflow runs in a test context, so both end
+    /// failed, and the URL's last status is the kept job's.
+    #[tokio::test]
+    async fn a_kept_job_runs_at_the_dispatcher_completion_of_its_holder() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let url = "http://w:8001";
+        queue.hold_url_for_tests(url, "AddWorker");
+        let kept = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: None,
+        };
+        assert_eq!(queue.submit_or_defer(kept).await, Ok(false));
+        assert!(queue.kept_for(url));
+
+        queue
+            .submit(Job::RefreshWorkerLabels {
+                url: url.to_string(),
+            })
+            .await
+            .expect("the holder is queued");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let last = queue
+                .get_status(url)
+                .map(|status| (status.job_type.to_string(), status.status.to_string()));
+            if !queue.kept_for(url)
+                && last == Some(("RemoveWorker".to_string(), "failed".to_string()))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kept job did not run at the holder's completion: kept={} last={last:?}",
+                queue.kept_for(url)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// A submission that fails must not leave its claim behind, or the next

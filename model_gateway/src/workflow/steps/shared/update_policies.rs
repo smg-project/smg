@@ -9,9 +9,51 @@ use wfaas::{
 };
 
 use crate::{
+    app_context::AppContext,
     worker::{ConnectionMode, SubscriptionKind, Worker},
     workflow::data::WorkerRegistrationData,
 };
+
+/// Start the worker's stream on the KV event monitor, or restart it for the
+/// object given when the registry replaced the worker in place. The stream
+/// follows the policy that places the worker, the role's policy for a
+/// prefill, decode or encode worker rather than the model's: its KV events
+/// into the model's index under a policy that reads the index
+/// (`needs_kv_events`), its load records alone otherwise, when the worker
+/// monitor wants loads at all (always by default; see
+/// `WorkerMonitor::loads_wanted`). Only gRPC workers stream. A registration
+/// and an update that rebuilt the worker both come through here, so the two
+/// cannot choose differently. A worker that streams nothing tells the
+/// monitor as well: it ends the stream a former object has under the URL,
+/// which nothing else on the replace path stops. The monitor reads the
+/// registry under its slot lock before it stops or starts anything, so a
+/// worker removed or replaced again while the add waited for an old task to
+/// end gets no stream.
+pub(crate) async fn start_kv_stream(
+    app_context: &AppContext,
+    worker: &Arc<dyn Worker>,
+    needs_kv_events: bool,
+) {
+    if *worker.connection_mode() != ConnectionMode::Grpc {
+        return;
+    }
+    let Some(monitor) = app_context.kv_event_monitor.as_ref() else {
+        return;
+    };
+    let kind = if needs_kv_events {
+        Some(SubscriptionKind::Events)
+    } else {
+        app_context
+            .worker_monitor
+            .as_ref()
+            .is_some_and(|loads| loads.loads_wanted(std::slice::from_ref(worker)))
+            .then_some(SubscriptionKind::Loads)
+    };
+    match kind {
+        Some(kind) => monitor.on_worker_added(worker, kind).await,
+        None => monitor.on_worker_added_without_stream(worker).await,
+    }
+}
 
 /// Unified step to update policy registry for registered workers.
 ///
@@ -154,31 +196,13 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
             // The worker's stream follows the policy that places it, the
             // role's policy for a prefill, decode or encode worker rather than
-            // the model's: its KV events into the model's index under a policy
-            // that reads the index, its load records alone otherwise, when
-            // the worker monitor wants loads at all (always by default; see
-            // `WorkerMonitor::loads_wanted`). The registry answers from the
-            // engine's needs for the worker's model and phase when the engine
-            // serves that policy. Only gRPC workers stream.
+            // the model's (see `start_kv_stream`). The registry answers from
+            // the engine's needs for the worker's model and phase when the
+            // engine serves that policy.
             let needs_kv_events = app_context
                 .policy_registry
                 .worker_needs_kv_events(worker.as_ref());
-            if *worker.connection_mode() == ConnectionMode::Grpc {
-                if let Some(ref monitor) = app_context.kv_event_monitor {
-                    let kind = if needs_kv_events {
-                        Some(SubscriptionKind::Events)
-                    } else {
-                        app_context
-                            .worker_monitor
-                            .as_ref()
-                            .is_some_and(|loads| loads.loads_wanted(std::slice::from_ref(worker)))
-                            .then_some(SubscriptionKind::Loads)
-                    };
-                    if let Some(kind) = kind {
-                        monitor.on_worker_added(worker, kind).await;
-                    }
-                }
-            }
+            start_kv_stream(&app_context, worker, needs_kv_events).await;
 
             Self::warn_on_cache_aware_without_kv_events(&model_id, worker, needs_kv_events);
 
@@ -281,6 +305,8 @@ mod tests {
             .policy_registry
             .set_kv_event_monitor(Some(Arc::clone(&monitor)));
         context.kv_event_monitor = Some(Arc::clone(&monitor));
+        // As the app wires the pair: the add reads the registry.
+        monitor.set_worker_registry(&context.worker_registry);
         (Arc::new(context), monitor)
     }
 

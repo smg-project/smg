@@ -1196,13 +1196,33 @@ async fn start_tokenspeed_encoder(
     )
 }
 
+/// A media item as the gateway builds it for the TokenSpeed wire: an image
+/// with a content hash, an inline feature and one placeholder token at
+/// `index` of the prompt (the worker checks the shape before it answers).
+fn tokenspeed_media_item(index: usize) -> ts::MultimodalItem {
+    ts::MultimodalItem {
+        modality: smg_grpc_client::common_proto::Modality::Image as i32,
+        content_hash: vec![u8::try_from(index).expect("a small index") + 1; 8],
+        encoder_input: Some(ts::TensorData {
+            shape: vec![1, 4],
+            dtype: "float32".to_string(),
+            payload: Some(ts::tensor_data::Payload::Inline(vec![0; 16].into())),
+        }),
+        placeholders: vec![ts::PlaceholderRange {
+            offset: u32::try_from(index).expect("a small index"),
+            length: 1,
+        }],
+        ..Default::default()
+    }
+}
+
 /// What the gateway sends a TokenSpeed encoder: the request's media items
 /// and one rendezvous room per item.
 fn tokenspeed_encode_request(id: &str, items: usize, rooms: &[i64]) -> enc::EncodeRequest {
     enc::EncodeRequest {
         request_id: id.to_string(),
         mm_inputs: Some(ts::MultimodalInputs {
-            items: vec![ts::MultimodalItem::default(); items],
+            items: (0..items).map(tokenspeed_media_item).collect(),
         }),
         items: rooms
             .iter()
@@ -1269,6 +1289,23 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
     }
     assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
 
+    // An item without its feature: the encode worker runs the tower on it
+    // and has no room to fall back on, so the request is refused and not
+    // counted.
+    let mut featureless = tokenspeed_encode_request("ts-e3", 1, &[43]);
+    featureless.mm_inputs.as_mut().expect("the items").items[0].encoder_input = None;
+    let refused = encoder
+        .encode(featureless)
+        .await
+        .expect_err("an item without its feature");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("media item 0")
+            && refused.message().contains("no encoder input"),
+        "{refused:?}"
+    );
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
     // A `Generate` went to the wrong pool: this worker takes `Encode`.
     let wrong_pool = scheduler
         .generate(request("ts-g1", &[1, 2, 3], false))
@@ -1292,6 +1329,139 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
         server_arg(&info, "disaggregation_bootstrap_port").is_some(),
         "{info:?}"
     );
+}
+
+/// The encoder servicer reads its feature through the generic tensor reader,
+/// not the scheduler's feature path: an SHM handle in a dtype the scheduler
+/// refuses for its feature is accepted here, with the byte length the
+/// generic reader checks.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_reads_an_shm_feature_as_the_encoder_servicer_does() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let before = encodes_served(&http, &fault, &name).await;
+    let mut shm = tokenspeed_encode_request("ts-shm", 1, &[45]);
+    shm.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float64".to_string(),
+        payload: Some(ts::tensor_data::Payload::Shm(
+            smg_grpc_client::common_proto::ShmHandle {
+                name: "smg-mm-enc".to_string(),
+                nbytes: 32,
+                ..Default::default()
+            },
+        )),
+    });
+    let answer = encoder
+        .encode(shm)
+        .await
+        .expect("a float64 SHM feature on the encoder")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    let mut short = tokenspeed_encode_request("ts-shm-short", 1, &[46]);
+    short.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float64".to_string(),
+        payload: Some(ts::tensor_data::Payload::Shm(
+            smg_grpc_client::common_proto::ShmHandle {
+                name: "smg-mm-enc".to_string(),
+                nbytes: 16,
+                ..Default::default()
+            },
+        )),
+    });
+    let refused = encoder
+        .encode(short)
+        .await
+        .expect_err("a byte length short of the shape");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(refused.message().contains("byte length 16"), "{refused:?}");
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+}
+
+/// Both servicers pull a remote handle for the item's feature alone: the
+/// encoder accepts a remote feature as the scheduler does, and a remote side
+/// tensor is refused, as the generic reader's `tensor_payload_bytes` refuses
+/// it on either.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_pulls_a_remote_feature_and_refuses_a_remote_side_tensor() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let before = encodes_served(&http, &fault, &name).await;
+    let remote = |nbytes: u64| {
+        Some(ts::tensor_data::Payload::Remote(
+            smg_grpc_client::common_proto::RemoteTensorHandle {
+                transport: "nixl".to_string(),
+                nbytes,
+                ..Default::default()
+            },
+        ))
+    };
+    let mut feature = tokenspeed_encode_request("ts-remote", 1, &[47]);
+    feature.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float16".to_string(),
+        payload: remote(8),
+    });
+    let answer = encoder
+        .encode(feature)
+        .await
+        .expect("a remote feature on the encoder")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    let mut side = tokenspeed_encode_request("ts-remote-side", 1, &[48]);
+    side.mm_inputs.as_mut().expect("the items").items[0]
+        .model_specific_tensors
+        .insert(
+            "image_grid_thw".to_string(),
+            ts::TensorData {
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+                payload: remote(24),
+            },
+        );
+    let refused = encoder
+        .encode(side)
+        .await
+        .expect_err("a remote side tensor the servicer refuses");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("image_grid_thw")
+            && refused.message().contains("remote payload"),
+        "{refused:?}"
+    );
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+}
+
+/// The engine's encoder takes exactly one media item under one room per
+/// request, named by a request id: the mock refuses the rest as the engine's
+/// adapter does, so a gateway that batched items into one `Encode` or dropped
+/// the id would not pass the mock row.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_takes_one_item_in_one_room_with_a_request_id() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let before = encodes_served(&http, &fault, &name).await;
+    for (id, items, rooms) in [("ts-one-two", 2usize, &[7i64, 8][..]), ("", 1, &[9][..])] {
+        let refused = encoder
+            .encode(tokenspeed_encode_request(id, items, rooms))
+            .await
+            .expect_err("refused as the engine's adapter refuses it");
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "{id:?}, {items} item(s), rooms {rooms:?}: {refused:?}"
+        );
+    }
+    assert_eq!(encodes_served(&http, &fault, &name).await, before);
+    let answer = encoder
+        .encode(tokenspeed_encode_request("ts-one", 1, &[10]))
+        .await
+        .expect("one item in one room with an id")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
 }
 
 #[tokio::test]
@@ -1353,7 +1523,7 @@ async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
     let with_media = |id: &str, rooms: Option<Vec<ts::EncodeItemBootstrapInfo>>| {
         let mut req = rendezvous(request(id, &[1, 2, 3], false), 8998);
         req.mm_inputs = Some(ts::MultimodalInputs {
-            items: vec![ts::MultimodalItem::default(); 2],
+            items: (0..2).map(tokenspeed_media_item).collect(),
         });
         req.encode_bootstrap_info = rooms.map(|items| ts::EncodeBootstrapInfo { items });
         req

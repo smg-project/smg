@@ -26,10 +26,6 @@ const MIN_IMAGE_TOKENS: usize = 16;
 const MAX_IMAGE_TOKENS: usize = 8000;
 /// The checkpoint's own video budget, in tokens.
 const MAX_VIDEO_TOKENS: usize = 240_000;
-/// The serving engine caps a clip at this many vision tokens (the
-/// checkpoint's own budget would starve its KV cache at startup profiling);
-/// images keep the checkpoint's budget.
-const VIDEO_TOKEN_CAP: usize = 30_000;
 
 #[derive(Clone, Copy)]
 struct Params {
@@ -128,10 +124,9 @@ impl Params {
                 Ok,
             )
         };
-        // Video budgets read video-named token keys first; without them a
-        // video processor config is budgeted the way the engine's own server
-        // budgets it, and an image config (the gateway's fallback for a video
-        // when there is none) keeps the checkpoint default: its image-scale
+        // Video budgets read video-named token keys first, then the video
+        // processor config's `max_image_tokens`. An image config used as a
+        // fallback keeps the checkpoint video default: its image-scale
         // `max_image_tokens` must not silently become a clip's volume cap.
         let (min_key, max_key, max_fallback) = if video {
             (
@@ -271,11 +266,8 @@ impl Params {
     }
 }
 
-/// The clip budget the serving engine's own server applies to a video
-/// processor config (one naming its `video_processor_type`): the config's
-/// `max_image_tokens` under the serving cap, the checkpoint default when the
-/// key is absent. Any other config is not a video processor's and keeps the
-/// checkpoint default.
+/// A video processor config's `max_image_tokens`, or the checkpoint video
+/// default when the key is absent or an image config is used as a fallback.
 fn video_token_budget(config: &PreProcessorConfig) -> Result<usize, TransformError> {
     if !config.extra.contains_key("video_processor_type") {
         return Ok(MAX_VIDEO_TOKENS);
@@ -283,7 +275,7 @@ fn video_token_budget(config: &PreProcessorConfig) -> Result<usize, TransformErr
     if !config.extra.contains_key("max_image_tokens") {
         return Ok(MAX_VIDEO_TOKENS);
     }
-    Ok(extra_usize(config, "max_image_tokens", MAX_VIDEO_TOKENS)?.min(VIDEO_TOKEN_CAP))
+    extra_usize(config, "max_image_tokens", MAX_VIDEO_TOKENS)
 }
 
 /// The reference's fused rescale and normalize for these settings
@@ -970,20 +962,29 @@ mod tests {
         .unwrap()
     }
 
-    /// A clip is budgeted the way the engine's own server budgets it: the
-    /// checkpoint's 240,000-token video budget under the 30,000-token serving
-    /// cap, which fits 32 frames of 3416x2060 on a 952x1540 canvas (68x110
-    /// patches, 16 x 34 x 55 = 29,920 tokens), the engine's own numbers for
-    /// such a clip. An image config in the video's place keeps the checkpoint
-    /// default rather than its image-scale budget, and an explicit
-    /// `max_video_tokens` stands.
+    /// A video config keeps its checkpoint's token budget. An image config
+    /// used for video keeps the video default, and explicit video token
+    /// budgets take precedence.
     #[test]
-    fn video_budget_follows_the_engines_serving_cap() {
+    fn video_budget_respects_the_checkpoint_token_budget() {
         let ppt = 2 * 28 * 28;
         let params = Params::from_config(&video_config(), true).unwrap();
-        assert_eq!(params.max_pixels, VIDEO_TOKEN_CAP * ppt);
+        assert_eq!(params.max_pixels, MAX_VIDEO_TOKENS * ppt);
         assert_eq!(params.min_pixels, 16 * ppt);
-        assert_eq!(params.geometry(32, 2060, 3416).unwrap().target, (952, 1540));
+        assert_eq!(
+            params.geometry(32, 2060, 3416).unwrap().target,
+            (2072, 3416)
+        );
+
+        for (tokens, side) in [(14_400, 3360), (40_000, 5600)] {
+            let mut config = video_config();
+            config
+                .extra
+                .insert("max_image_tokens".into(), serde_json::json!(tokens));
+            let params = Params::from_config(&config, true).unwrap();
+            assert_eq!(params.max_pixels, tokens * ppt);
+            assert_eq!(params.geometry(2, 5600, 5600).unwrap().target, (side, side));
+        }
 
         let image_fallback = Params::from_config(&config(MAX_IMAGE_TOKENS), true).unwrap();
         assert_eq!(image_fallback.max_pixels, MAX_VIDEO_TOKENS * ppt);

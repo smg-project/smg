@@ -13,14 +13,18 @@
 //! unchanged: a turn is a [`StoredResponse`] whose `input` holds the turn's
 //! request fields ([`TurnInput`]) and whose `raw_response` holds the answer,
 //! chained by `previous_response_id`, so a thread holds its conversation
-//! once, not once per turn. The store keeps the newest [`MAX_TURNS`] turns
-//! for [`TURN_RETENTION_SECS`] after they were written, the oldest evicted
-//! first, on every write; a thread is read back whole up to that count. A
-//! turn is written under its answer's id. An id that is already a stored
-//! turn's (a repeated `rid`, a backend's repeated id, a guess) would hand
-//! the client an id that continues another conversation, so the answer is
-//! reissued under a fresh id, in the answer the client reads and in the
-//! store.
+//! once, not once per turn. The public API deletes a thread no more than
+//! an hour after its last use, the reference a deployment's bound is read
+//! against. The store keeps the turns the operator's `memory` bounds
+//! allow, the `max_responses` and `retention_secs` of the memory history
+//! backend (unset: 10,000 turns, each for a day after it was written; a
+//! `retention_secs` of 3,600 stays within the API's hour), the oldest
+//! evicted first, on every write; a thread is read back whole up to that
+//! count. A turn is written under its answer's id.
+//! An id that is already a stored turn's (a repeated `rid`, a backend's
+//! repeated id, a guess) would hand the client an id that continues another
+//! conversation, so the answer is reissued under a fresh id, in the answer
+//! the client reads and in the store.
 //!
 //! A thread turn's message id is the gateway's: the request's `rid` is
 //! replaced by a fresh `msg_` id before the route (on the regular gRPC path
@@ -83,16 +87,11 @@ use crate::{
         request_id::{is_acceptable_inbound_id, REQUEST_ID},
     },
     observability::metrics::Metrics,
-    routers::{common::sse_rechunk::find_frame_end, error as route_error},
+    routers::{
+        common::sse_rechunk::{find_frame_end, DELIMITER_OVERLAP},
+        error as route_error,
+    },
 };
-
-/// The turns the store keeps: the newest 10,000, each for an hour after it
-/// was written (the public API deletes a thread no more than an hour after
-/// its last use). Over the count the oldest go first; both bounds are
-/// applied on every write. The count is also the depth a thread is read
-/// back to, so no kept thread is cut short of its create turn.
-const MAX_TURNS: usize = 10_000;
-const TURN_RETENTION_SECS: u64 = 60 * 60;
 
 /// An answer over this cannot be read back for its record: the Messages
 /// route's own answers are far smaller.
@@ -351,28 +350,43 @@ pub(crate) struct MessageThreads {
 }
 
 impl MessageThreads {
+    /// The threads under the default bounds ([`MemoryConfig::default`]).
     pub(crate) fn new() -> Self {
-        Self::bounded(MAX_TURNS)
+        Self::from_config(&MemoryConfig::default())
     }
 
-    /// The threads in a store of `max_turns` turns, each kept for the
-    /// retention period.
+    /// The threads in a store bounded as the operator's `memory` section
+    /// says: at most `max_responses` turns, each kept for `retention_secs`
+    /// after it was written, the oldest evicted first on every write. The
+    /// count is also the depth a thread is read back to, so no kept thread
+    /// is cut short of its create turn.
+    pub(crate) fn from_config(config: &MemoryConfig) -> Self {
+        Self {
+            store: MemoryResponseStorage::with_config(config),
+            max_turns: config.max_responses,
+            answer_limit: ANSWER_LIMIT,
+        }
+    }
+
+    /// The threads in a store of `max_turns` turns under the default
+    /// retention.
+    #[cfg(test)]
     fn bounded(max_turns: usize) -> Self {
-        Self::kept(max_turns, TURN_RETENTION_SECS)
+        Self::from_config(&MemoryConfig {
+            max_responses: max_turns,
+            ..MemoryConfig::default()
+        })
     }
 
     /// The threads in a store of `max_turns` turns, each kept for
     /// `retention_secs` after it was written.
+    #[cfg(test)]
     fn kept(max_turns: usize, retention_secs: u64) -> Self {
-        Self {
-            store: MemoryResponseStorage::with_config(&MemoryConfig {
-                max_responses: max_turns,
-                retention_secs: Some(retention_secs),
-                ..MemoryConfig::default()
-            }),
-            max_turns,
-            answer_limit: ANSWER_LIMIT,
-        }
+        Self::from_config(&MemoryConfig {
+            max_responses: max_turns,
+            retention_secs: Some(retention_secs),
+            ..MemoryConfig::default()
+        })
     }
 
     /// The threads with answers bounded at `answer_limit` bytes.
@@ -659,6 +673,10 @@ struct StreamedTurn {
     held: Vec<u8>,
     /// The bytes of the event not yet complete, parsed when it is.
     carry: Vec<u8>,
+    /// Where the last scan of `held` and of `carry` stopped: the next scan
+    /// resumes there, so an event that arrives in many frames is read once.
+    held_scanned: usize,
+    carry_scanned: usize,
     /// Every byte passes as it comes: `message_start` is through, or the
     /// stream opened with an error.
     passing: bool,
@@ -715,6 +733,8 @@ impl StreamedTurn {
             turn: Some(turn),
             held: Vec::new(),
             carry: Vec::new(),
+            held_scanned: 0,
+            carry_scanned: 0,
             passing: false,
             place: None,
             answer: None,
@@ -733,7 +753,8 @@ impl StreamedTurn {
         }
         self.held.extend_from_slice(&data);
         let mut out = Vec::new();
-        while let Some(end) = event_end(&self.held) {
+        while let Some(end) = event_end(&self.held, self.held_scanned) {
+            self.held_scanned = 0;
             match parse_event(&self.held[..end]) {
                 Ok(Some(MessageStreamEvent::MessageStart { message })) => {
                     let event: Vec<u8> = self.held.drain(..end).collect();
@@ -754,9 +775,11 @@ impl StreamedTurn {
                 _ => out.extend(self.held.drain(..end)),
             }
         }
+        self.held_scanned = self.held.len();
         if !self.passing && self.held.len() > EVENT_LIMIT {
             self.passing = true;
             out.append(&mut self.held);
+            self.held_scanned = 0;
             self.decline("no event end within the size limit");
         }
         (!out.is_empty()).then(|| Bytes::from(out))
@@ -818,7 +841,8 @@ impl StreamedTurn {
             return;
         }
         self.carry.extend_from_slice(data);
-        while let Some(end) = event_end(&self.carry) {
+        while let Some(end) = event_end(&self.carry, self.carry_scanned) {
+            self.carry_scanned = 0;
             let parsed = parse_event(&self.carry[..end]);
             self.carry.drain(..end);
             match parsed {
@@ -831,9 +855,11 @@ impl StreamedTurn {
                 break;
             }
         }
+        self.carry_scanned = self.carry.len();
         if self.place.is_some() && self.carry.len() > EVENT_LIMIT {
             self.decline("no event end within the size limit");
             self.carry.clear();
+            self.carry_scanned = 0;
         }
     }
 
@@ -960,6 +986,7 @@ impl HttpBody for StreamedTurn {
                     this.ended = true;
                     this.give_up();
                     let held = std::mem::take(&mut this.held);
+                    this.held_scanned = 0;
                     return if held.is_empty() {
                         Poll::Ready(None)
                     } else {
@@ -1116,9 +1143,19 @@ fn slot(index: u32) -> Option<usize> {
 
 /// The end of the first complete event in `buffer` (the index after its
 /// blank line, in any of the three framings the relay reads), when there is
-/// one.
-fn event_end(buffer: &[u8]) -> Option<usize> {
-    find_frame_end(buffer, 0).map(|(at, len)| at + len)
+/// one. `scanned` is where the last scan of this buffer stopped; the scan
+/// resumes a delimiter's overlap before it, since a four-byte delimiter can
+/// straddle the frame boundary the last scan ended at. An event that
+/// arrives in many frames is read once this way, not once per frame.
+fn event_end(buffer: &[u8], scanned: usize) -> Option<usize> {
+    let from = scanned.saturating_sub(DELIMITER_OVERLAP);
+    let end = find_frame_end(buffer, from);
+    #[cfg(test)]
+    tests::SCAN_POSITIONS.with(|cell| {
+        let visited = end.map_or(buffer.len(), |(at, _)| at + 1);
+        cell.set(cell.get() + visited.saturating_sub(from));
+    });
+    end.map(|(at, len)| at + len)
 }
 
 /// Data this gateway cannot read as a stream event. The answer it is part
@@ -1164,9 +1201,10 @@ fn start_event(message: &Message) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{cell::Cell, time::Duration};
 
     use axum::{body::Bytes, http::header, response::IntoResponse, Json};
+    use chrono::Utc;
     use futures::{stream, StreamExt};
     use tracing_test::traced_test;
 
@@ -1632,7 +1670,7 @@ mod tests {
     /// written later, stays.
     #[tokio::test]
     async fn a_reused_root_id_is_refused_not_spliced() {
-        let threads = MessageThreads::kept(MAX_TURNS, 4);
+        let threads = MessageThreads::kept(MemoryConfig::default().max_responses, 4);
         let create = |content: &str| {
             request(json!({
                 "system": "be brief",
@@ -1738,7 +1776,14 @@ mod tests {
     /// store itself let the turn go, not only the walk's depth.
     #[tokio::test]
     async fn an_evicted_create_turn_ends_the_thread() {
-        let threads = MessageThreads::bounded(2);
+        let threads = MessageThreads::from_config(&MemoryConfig {
+            max_responses: 2,
+            ..MemoryConfig::default()
+        });
+        assert_eq!(
+            threads.max_turns, 2,
+            "the chain is read back to the configured count, not the default"
+        );
         let last = thread(&threads, None, 3, "bounded").await;
         assert!(
             threads
@@ -2108,7 +2153,10 @@ mod tests {
 
     /// A stream that ends before its `message_stop`, or that carries an error
     /// event (here one a `message_stop` still follows), leaves no turn: the
-    /// continue from its id is the 404.
+    /// place is given back by the stream's end (at the error event on the
+    /// failed path, at the end-of-stream arm on the cut one), while the body
+    /// is still held (the drop guard is the other path), and the continue
+    /// from its id is the 404.
     #[tokio::test]
     async fn a_cut_or_failed_stream_leaves_no_turn() {
         let threads = MessageThreads::new();
@@ -2127,10 +2175,22 @@ mod tests {
             let answered = threads
                 .stored(turn.expect("a turn"), streamed(&bytes, &[]))
                 .await;
-            let read = to_bytes(answered.into_body(), usize::MAX)
+            let mut data = answered.into_body().into_data_stream();
+            let mut read = Vec::new();
+            while let Some(frame) = data.next().await {
+                read.extend_from_slice(&frame.expect("the stream"));
+            }
+            assert_eq!(read.as_slice(), bytes.as_slice());
+            let kept = threads
+                .store
+                .get_response(&ResponseId::from(id))
                 .await
-                .expect("the stream");
-            assert_eq!(read.as_ref(), bytes.as_slice());
+                .expect("the store");
+            assert!(
+                kept.is_none(),
+                "{id}: the place is given back by the stream's end, while the body is still held"
+            );
+            drop(data);
             let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
             assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{id}");
         }
@@ -2417,6 +2477,87 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
+    thread_local! {
+        /// The scan positions `event_end` visited on this thread, read by the
+        /// test that feeds one event in many frames.
+        pub(super) static SCAN_POSITIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// An event that arrives in many frames is scanned once: the scan of
+    /// each buffer resumes where it stopped, three bytes back, instead of
+    /// starting from the first byte at every frame.
+    #[tokio::test]
+    async fn an_event_in_many_frames_is_scanned_once() {
+        let threads = MessageThreads::new();
+        let text = "x".repeat(64 * 1024);
+        let bytes = sse(&text_events("msg_frames", &text));
+        let cuts: Vec<usize> = (1..bytes.len() / 1024).map(|k| k * 1024).collect();
+        let frames = cuts.len() + 1;
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        SCAN_POSITIONS.with(|cell| cell.set(0));
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &cuts))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        let positions = SCAN_POSITIONS.with(Cell::get);
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        assert!(
+            positions <= bytes.len() + 4 * frames,
+            "{positions} scan positions over {} bytes in {frames} frames",
+            bytes.len()
+        );
+        let stored = threads
+            .store
+            .get_response(&ResponseId::from("msg_frames"))
+            .await
+            .expect("the store");
+        assert!(stored.is_some(), "the turn is stored");
+    }
+
+    /// A frame boundary inside an event's delimiter still ends the event, at
+    /// every split of the two-byte and of the four-byte delimiter: the
+    /// resumed scan starts a delimiter's overlap back, before the first
+    /// `message_start` and within the answer alike.
+    #[tokio::test]
+    async fn a_delimiter_split_by_a_frame_boundary_still_ends_the_event() {
+        let events = text_events("msg_split", "hello");
+        let crlf: Vec<u8> = events
+            .iter()
+            .flat_map(|(name, data)| format!("event: {name}\r\ndata: {data}\r\n\r\n").into_bytes())
+            .collect();
+        for (bytes, delimiter) in [(sse(&events), 2), (crlf, 4)] {
+            let first_end = event_end(&bytes, 0).expect("the first event");
+            let second_end =
+                event_end(&bytes[first_end..], 0).expect("the second event") + first_end;
+            for cut in (1..delimiter).flat_map(|back| [first_end - back, second_end - back]) {
+                let threads = MessageThreads::new();
+                let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+                let answered = threads
+                    .stored(turn.expect("a turn"), streamed(&bytes, &[cut]))
+                    .await;
+                let read = to_bytes(answered.into_body(), usize::MAX)
+                    .await
+                    .expect("the stream");
+                assert_eq!(
+                    read.as_ref(),
+                    bytes.as_slice(),
+                    "cut at {cut} of a {delimiter}-byte delimiter"
+                );
+                let stored = threads
+                    .store
+                    .get_response(&ResponseId::from("msg_split"))
+                    .await
+                    .expect("the store");
+                assert!(
+                    stored.is_some(),
+                    "the turn is stored with the cut at {cut} of a {delimiter}-byte delimiter"
+                );
+            }
+        }
+    }
+
     /// A body with no event end within the limit is not a stream this
     /// gateway reads. Before `message_start`, the bytes pass to the client
     /// once they are over it, not at the body's end. After it, the place is
@@ -2483,6 +2624,30 @@ mod tests {
                 .resolve(continue_from("msg_noend", "again"), None)
                 .await,
         );
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A turn older than the operator's retention is gone when the store
+    /// next evicts: the thread ends with the public 404 and the client
+    /// replays.
+    #[tokio::test]
+    async fn a_turn_past_the_retention_ends_the_thread() {
+        let threads = MessageThreads::from_config(&MemoryConfig {
+            retention_secs: Some(60),
+            ..MemoryConfig::default()
+        });
+        let last = thread(&threads, None, 2, "aged").await;
+        let cont = || {
+            request(json!({
+                "messages": [{"role": "user", "content": "turn 3"}],
+                "thread": {"type": "continue", "previous_message_id": last}
+            }))
+        };
+        accepted(threads.resolve(cont(), None).await);
+        threads
+            .store
+            .evict_at(Utc::now() + chrono::Duration::seconds(61));
+        let refused = refusal(threads.resolve(cont(), None).await);
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
