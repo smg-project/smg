@@ -519,7 +519,7 @@ mod model_info_tests {
     #[tokio::test]
     async fn test_get_server_info_through_a_rank_row() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
-            port: 18203,
+            port: 18208,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
