@@ -425,11 +425,12 @@ pub(crate) enum Rendezvous {
     },
     /// A rendezvous field the request carries emptied (no host, or no port),
     /// reported under that field's name rather than as the field's absence:
-    /// the vLLM wire's typed pair, which the legacy connector path sends.
+    /// the vLLM wire's typed pair, which the legacy connector path sends. The
+    /// port is the wire's `uint32` as carried, so the refusal names it whole.
     Emptied {
         field: &'static str,
         host: String,
-        port: i32,
+        port: u32,
     },
     Opaque,
 }
@@ -534,11 +535,11 @@ impl MockScheduler {
     /// nowhere. The wire says which sides the gateway names it to: both on
     /// TokenSpeed and SGLang, the decode side on vLLM, whose prefill request
     /// carries the connector's parameters only when a connector relays them.
-    /// A named rendezvous needs a host and a port, and so does a field the
-    /// request carries emptied, reported under its own name. Its room may be 0: the
-    /// gateway draws SGLang rooms from 0 and a TokenSpeed room residue can
-    /// land on 0, and the engines take it. A prefill worker that bound a
-    /// bootstrap port refuses one naming another port, where its decode
+    /// A named rendezvous needs a host and a port (a field the request
+    /// carries emptied is refused under its own name). Its room may be 0:
+    /// the gateway draws SGLang rooms from 0 and a TokenSpeed room residue
+    /// can land on 0, and the engines take it. A prefill worker that bound
+    /// a bootstrap port refuses one naming another port, where its decode
     /// partner would come. A regular worker takes any request. The check
     /// comes before the realistic engine's hooks: a request sent to the wrong
     /// pool spends no armed fault.
