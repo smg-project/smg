@@ -1070,6 +1070,8 @@ impl KvEventMonitor {
                 block_sizes,
             } => {
                 let on_batch = |batch: &KvEventBatch| {
+                    #[cfg(test)]
+                    tests::panic_if_armed(sub.address);
                     applied = true;
                     Self::learn_block_size(block_sizes, sub.model_id, batch);
                 };
@@ -2554,8 +2556,8 @@ mod tests {
     /// Adds `ranks` ranks of an engine one rank wider, so the first connect
     /// waits in its grace; ends the engine inside the grace by `end`, and
     /// returns the subscribe calls made and the panics counted
-    /// (`smg_kv_event_subscription_failures_total{reason="panic"}`, summed
-    /// over every series, the engine's own included).
+    /// (`smg_kv_event_subscription_failures_total{reason="panic"}` summed
+    /// over every member's series, plus the orphan series).
     fn engine_ended_within_the_grace(ranks: usize, end: GraceEnd) -> (usize, f64) {
         use metrics_exporter_prometheus::PrometheusBuilder;
 
@@ -2601,13 +2603,43 @@ mod tests {
             .render()
             .lines()
             .filter(|line| {
-                line.starts_with("smg_kv_event_subscription_failures_total{")
-                    && line.contains("reason=\"panic\"")
+                (line.starts_with("smg_kv_event_subscription_failures_total{")
+                    && line.contains("reason=\"panic\""))
+                    || line.starts_with("smg_kv_event_subscription_orphan_panics_total ")
             })
             .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
             .sum();
         let calls = calls.lock().unwrap().len();
         (calls, panics)
+    }
+
+    /// The engine address whose next batch panics its task, armed by the
+    /// test that reads where a panic with members on the task is counted.
+    static PANIC_ON_BATCH_AT: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+    /// The hook `drain_stream` runs on every batch under the tests alone.
+    pub(super) fn panic_if_armed(address: &str) {
+        assert_ne!(
+            PANIC_ON_BATCH_AT.lock().as_deref(),
+            Some(address),
+            "a test's panic on a batch, with members on the task"
+        );
+    }
+
+    /// Arms the hook for one engine address until dropped.
+    struct ArmedPanic;
+
+    impl ArmedPanic {
+        fn arm(address: &str) -> Self {
+            *PANIC_ON_BATCH_AT.lock() = Some(address.to_owned());
+            Self
+        }
+    }
+
+    impl Drop for ArmedPanic {
+        fn drop(&mut self) {
+            *PANIC_ON_BATCH_AT.lock() = None;
+        }
     }
 
     /// The grace ends with the engine when its one rank is removed inside
@@ -2630,14 +2662,68 @@ mod tests {
         assert_eq!(panics, 0.0, "a stop inside the grace is no panic");
     }
 
-    /// With two ranks on the task, a stop inside the grace ends it with its
-    /// members present: a panic there would be counted under each member's
-    /// series, and none is.
+    /// With two ranks on the task, a stop inside the grace ends it with both
+    /// members on the stream. `stop` has taken their slots first, so a panic
+    /// there would land on the orphan series, as with one rank; none does.
     #[test]
-    fn a_stop_within_the_grace_with_two_ranks_counts_no_panic_under_a_member() {
+    fn a_stop_within_the_grace_with_two_ranks_counts_no_panic() {
         let (calls, panics) = engine_ended_within_the_grace(2, GraceEnd::Stopped);
         assert_eq!(calls, 0, "no connect: the engine ended inside its grace");
         assert_eq!(panics, 0.0, "a stop inside the grace is no panic");
+    }
+
+    /// A panic with members on the task is counted under each member and
+    /// not on the orphan series: the hook panics the task on its first
+    /// batch, with both ranks of a two-rank engine on it.
+    #[test]
+    fn a_panic_with_members_on_the_task_counts_under_each_member() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let members: Vec<String> = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (addr, server) = serve(Subscribe::Counted {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    script: vec![Ok(ranked_batch(0))],
+                })
+                .await;
+                let workers: Vec<Arc<dyn Worker>> =
+                    (0..2).map(|rank| rank_worker(addr, rank, 2)).collect();
+                let address = workers[0].base_url().to_string();
+                let _armed = ArmedPanic::arm(&address);
+                let monitor = KvEventMonitor::new();
+                for worker in &workers {
+                    monitor
+                        .on_worker_added(worker, SubscriptionKind::Events)
+                        .await;
+                }
+                wait_for_members(&monitor, &address, "the engine's entry is gone", None).await;
+                server.abort();
+                workers
+                    .iter()
+                    .map(|worker| worker.url().to_string())
+                    .collect()
+            })
+        });
+        let rendered = handle.render();
+        for member in &members {
+            let counted = rendered.lines().any(|line| {
+                line.starts_with("smg_kv_event_subscription_failures_total{")
+                    && line.contains("reason=\"panic\"")
+                    && line.contains(member.as_str())
+                    && line.ends_with(" 1")
+            });
+            assert!(counted, "the panic counts once under {member}:\n{rendered}");
+        }
+        assert!(
+            !rendered.contains("smg_kv_event_subscription_orphan_panics_total"),
+            "no orphan count with members on the task:\n{rendered}"
+        );
     }
 
     /// A rank worker that joins while a reconnect's subscribe call is

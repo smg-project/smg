@@ -451,16 +451,17 @@ impl KvEventMonitor {
                 );
                 // Counted under the engine's workers (the series the
                 // dashboards key on), which hold their workers. With none
-                // left on the task it is counted under the engine's own
-                // address, the key of its subscription: an alert on the
-                // series sees the panic either way, and no worker is looked
-                // up by name for a series the store may have retired.
+                // left on the task it is an orphan, counted on a series with
+                // no worker label: the engine's address is a worker's own URL
+                // on a plain engine, so a series keyed by it would bring a
+                // retired worker's back, and on a data-parallel engine the
+                // store would never retire it. The address is in the log line.
                 let members = {
                     let subs = slots.lock().await;
                     Self::members_of(&subs, &task_address, id)
                 };
                 if members.is_empty() {
-                    Metrics::record_kv_event_subscription_failure(&task_address, "panic");
+                    Metrics::record_kv_event_subscription_orphan_panic();
                 }
                 for member in &members {
                     Metrics::record_kv_event_subscription_failure(member, "panic");
