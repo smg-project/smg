@@ -8,12 +8,12 @@
 //! way; the gateway keeps its older parsers for such a model.
 //!
 //! The groups are bellwether's: the checkpoints that share a tokenizer and the wire the table
-//! reads (a template too, but for a checkpoint `docs/tables.md` notes as differing only outside
-//! the wire), recorded once by the group's primary. Every group whose table is on main is here, its primary and its
-//! other checkpoints under the primary's organisation, spelled in `groups.json` beside this
-//! module (one group per line; the crate's build script writes the file as the `GROUPS`
-//! constant); `tests/readme.rs` writes the README's models table from the same groups and checks
-//! that the two agree.
+//! reads (a template too, except for a checkpoint `docs/tables.md` notes as differing only
+//! outside the wire), recorded once by the group's primary. Every group whose table is on main is
+//! here, its primary and its other checkpoints under the primary's organisation, spelled in
+//! `groups.json` beside this module (one group per line; the crate's build script writes the file
+//! as the `GROUPS` constant); `tests/readme.rs` writes the README's models table from the same
+//! groups and checks that the two agree.
 //!
 //! A lookup matches the repository name, the text after the last path separator (either slash),
 //! exactly and without regard to case, under any organisation or path: `Qwen/Qwen3-8B`,
