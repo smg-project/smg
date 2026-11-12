@@ -236,7 +236,7 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-224 groups, 397 checkpoints, newest first.
+224 groups, 403 checkpoints, newest first.
 12 ready, 159 replaying a recorded set, 4 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
@@ -251,7 +251,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-09-21 | [mimo-v2.6-flash-rl](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-flash-rl) | XiaomiMiMo/MiMo-V2.6-Flash-RL |  | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
 | 2026-09-21 | [mimo-v2.6-pro-rl](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-pro-rl) | XiaomiMiMo/MiMo-V2.6-Pro-RL | MiMo-V2.6-Flash-MOPD, MiMo-V2.6-Pro-MOPD | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
 | 2026-09-11 | [atria-dawn-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/atria-dawn-preview) | internlm/Atria-Dawn-Preview | Atria-Dawn-Preview-Ascend-w8a8 | `glm` | 503,273 | replaying the set | none |
-| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash | DeepSeek-V4.1-Flash-1017 | `deepseek_v4.1` | 589,671 | replaying the set | `deepseek_v41`, `deepseek_v41` |
+| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash | DeepSeek-V4.1-Flash-1017, nvidia/DeepSeek-V4.1-Flash-1017-NVFP4, nvidia/DeepSeek-V4.1-Flash-NVFP4 | `deepseek_v4.1` | 589,671 | replaying the set | `deepseek_v41`, `deepseek_v41` |
 | 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | `minicpm5` | 589,277 | replaying the set | none |
 | 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B | K2-Horizon-32B, K2-Horizon-375B-A23B | `k2_horizon` | 12,814 | replaying the set | none |
 | 2026-09-01 | [nvidia-nemotronlabs-ai-for-media-sports-tennis](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotronlabs-ai-for-media-sports-tennis) | nvidia/NVIDIA-NemotronLabs-AI-for-Media-Sports-Tennis |  | — | 12,825 | pending | none |
@@ -260,7 +260,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-08-27 | [qwen-drive-1.0-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-drive-1.0-4b) | Qwen/Qwen-Drive-1.0-4B |  | `qwen3`, tagged calls | 474,543 | replaying the set | `qwen`, `qwen3` |
 | 2026-08-25 | [glm-5.3](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3) | zai-org/GLM-5.3 | GLM-5.3-BF16 | `glm` | 503,273 | replaying the set | `glm47_moe`, `glm45` |
 | 2026-08-25 | [glm-5.3-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3-flash) | zai-org/GLM-5.3-Flash | GLM-5.3-Flash-BF16 | `glm` | 503,273 | replaying the set | `glm47_moe`, `glm45` |
-| 2026-08-24 | [qwen3.8-flash-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-flash-next) | Qwen/Qwen3.8-Flash-Next |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
+| 2026-08-24 | [qwen3.8-flash-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-flash-next) | Qwen/Qwen3.8-Flash-Next | nvidia/Qwen3.8-Flash-Next-FP4-Local | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-09 | [dots3-note-prev](https://github.com/smg-project/bellwether/tree/main/fixtures/dots3-note-prev) | dots-studio/dots3-note-prev |  | `dots3` | 589,296 | replaying the set | none |
 | 2026-08-09 | [muse-glimmer-30b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-glimmer-30b) | meta-models/Muse-Glimmer-30B |  | `muse_spark` | 494,673 | replaying the set | none |
 | 2026-08-08 | [qwen3.8-2.4t-a95b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-2.4t-a95b) | Qwen/Qwen3.8-2.4T-A95B |  | `qwen3`, tagged calls | 474,553 | replaying the set | `qwen_xml`, `qwen3` |
@@ -277,7 +277,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-06-24 | [nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16) | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | none |
 | 2026-06-22 | [qwen-agentworld-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-agentworld-35b-a3b) | Qwen/Qwen-AgentWorld-35B-A3B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen`, `qwen3` |
 | 2026-06-16 | [glm-5.2](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.2) | zai-org/GLM-5.2 |  | `glm` | 492,389 | replaying the set | `glm47_moe`, `glm45` |
-| 2026-06-13 | [kimi-k3](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k3) | moonshotai/Kimi-K3 |  | `kimi_k3` | 54,418 | ready | `kimi_k3`, `kimi_k3` |
+| 2026-06-13 | [kimi-k3](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k3) | moonshotai/Kimi-K3 | Kimi-K3.1-Pro, nvidia/Kimi-K3.1-Pro-NVFP4 | `kimi_k3` | 54,418 | ready | `kimi_k3`, `kimi_k3` |
 | 2026-06-11 | [kimi-k2.7-code](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2.7-code) | moonshotai/Kimi-K2.7-Code |  | `kimi_k2` | 28 | replaying the set | `kimik2`, `kimi` |
 | 2026-06-03 | [nvidia-nemotron-3-ultra-550b-a55b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3-ultra-550b-a55b-bf16) | nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 | Nemotron-3-Labs-Ultra-Math-RL, NVIDIA-Nemotron-Labs-Teacher-Chat, NVIDIA-Nemotron-Labs-Teacher-Competition-Coding, NVIDIA-Nemotron-Labs-Teacher-General-Reasoning, NVIDIA-Nemotron-Labs-Teacher-Instruction-Following, NVIDIA-Nemotron-Labs-Teacher-STEM | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2026-06-02 | [minimax-m3](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m3) | MiniMaxAI/MiniMax-M3 |  | `minimax_m3` | 589,302 | replaying the set | `minimax_m3`, `minimax_m3` |
@@ -311,7 +311,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-03-02 | [gemma-4-e4b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/gemma-4-e4b-it) | google/gemma-4-E4B-it | gemma-4-E2B-it | `gemma4` | 478,241 | replaying the set | `json`, none |
 | 2026-03-01 | [areal-sea-235b-a22b](https://github.com/smg-project/bellwether/tree/main/fixtures/areal-sea-235b-a22b) | inclusionAI/AReaL-SEA-235B-A22B | AReaL-tau2-merge-sft-235B | `qwen3` | 554,276 | replaying the set | none |
 | 2026-02-28 | [qwen3.5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-2b) | Qwen/Qwen3.5-2B | ATH-MaaS/OvisOCR2, Qwen3.5-0.8B | `qwen3`, tagged calls | 461,722 | replaying the set | `qwen_xml`, `qwen3` |
-| 2026-02-27 | [qwen3.5-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-9b) | Qwen/Qwen3.5-9B | microsoft/FrogNano-4B-2609, Qwen3.5-4B | `qwen3`, tagged calls | 474,543 | replaying the set | `qwen_xml`, `qwen3` |
+| 2026-02-27 | [qwen3.5-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-9b) | Qwen/Qwen3.5-9B | microsoft/FrogNano-4B-2609, microsoft/UserRepGen-4B, Qwen3.5-4B | `qwen3`, tagged calls | 474,543 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-02-24 | [qwen3.5-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-27b) | Qwen/Qwen3.5-27B |  | `qwen3`, tagged calls | 54,179 | ready | `qwen_xml`, `qwen3` |
 | 2026-02-24 | [qwen3.5-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-35b-a3b) | Qwen/Qwen3.5-35B-A3B | Qwen3.5-122B-A10B, Qwen3.5-397B-A17B, xlangai/Qwen-CUA, xlangai/RoboFine-VLM-397B-A17B | `qwen3`, tagged calls | 474,543 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-02-13 | [webworld-32b](https://github.com/smg-project/bellwether/tree/main/fixtures/webworld-32b) | Qwen/WebWorld-32B | WebWorld-8B, WebWorld-14B | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |

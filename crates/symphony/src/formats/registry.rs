@@ -552,6 +552,25 @@ mod tests {
         }
     }
 
+    /// The renamed and re-quantized checkpoints of the last two months read with their groups'
+    /// tables once their groups list them: names whose template renders the same text as the
+    /// primary's and whose tokenizer files are the primary's.
+    #[test]
+    fn a_renamed_or_requantized_checkpoint_listed_by_its_group_resolves_to_the_groups_table() {
+        for (model, table) in [
+            ("moonshotai/Kimi-K3.1-Pro", Table::KimiK3),
+            ("nvidia/Kimi-K3.1-Pro-NVFP4", Table::KimiK3),
+            ("kimi-k3.1-pro", Table::KimiK3),
+            ("nvidia/DeepSeek-V4.1-Flash-NVFP4", Table::DeepSeekV4_1),
+            ("nvidia/DeepSeek-V4.1-Flash-1017-NVFP4", Table::DeepSeekV4_1),
+            ("microsoft/UserRepGen-4B", Table::Qwen3Tagged),
+            ("nvidia/Qwen3.8-Flash-Next-FP4-Local", Table::Qwen3Tagged),
+        ] {
+            assert_eq!(table_for(model), Some(table), "{model}");
+            assert!(for_model(model).is_some(), "{model}");
+        }
+    }
+
     #[test]
     fn a_model_the_registry_does_not_know_resolves_to_none() {
         for model in [
