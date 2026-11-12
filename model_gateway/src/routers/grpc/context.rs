@@ -255,7 +255,7 @@ pub(crate) struct ProcessingState {
 
     /// The provider profile of the request's model (`ProviderProfile::for_model`), derived once
     /// by the chat and Messages preparations and read by the later stages in place of a
-    /// derivation of their own (the output budget, the constraint's tool-call reading, the
+    /// derivation of their own (the constraint's tool-call reading, request building, the
     /// response spec). `None` on the other endpoints; a read then derives it itself.
     pub provider: Option<ProviderProfile>,
     /// The table's replay of the rendered prompt, as preparation read it for the forced call's

@@ -10,7 +10,6 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
-use openai_protocol::profile::ProviderProfile;
 use smg_policy_controller::{fingerprint, Side, Target};
 use tracing::{debug, error, warn};
 
@@ -359,14 +358,13 @@ impl<'a> SelectionInputs<'a> {
         intermediate: Option<&'a multimodal::MultimodalIntermediate>,
         refs: Option<&'a multimodal::MediaPlan>,
         media_refs_pipeline: PipelinePin,
-        provider: Option<ProviderProfile>,
     ) -> Self {
         let media_refs = refs.is_some();
         let needs_vision = multimodal::request_needs_vision(intermediate, refs);
         let context_requirements = if stage.mode == WorkerSelectionMode::EncodePrefillDecode {
             ContextRequirements::default()
         } else {
-            ContextRequirements::new_for(prep, &input.request_type, provider)
+            ContextRequirements::new(prep, &input.request_type)
         };
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
@@ -504,7 +502,6 @@ impl WorkerSelectionStage {
             ctx.state.multimodal_intermediate.as_ref(),
             ctx.state.multimodal_refs.as_ref(),
             ctx.state.media_refs_pipeline,
-            ctx.state.provider,
         );
         ctx.state.sticky_key = self
             .policy_registry
@@ -1920,6 +1917,7 @@ impl WorkerSelectionStage {
             takes_media(worker) && demand.context.admits(worker, model_id)
         }) {
             let mut largest = None;
+            let mut widest_decode = None;
             for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
                 if !WireConstraint::admits(wire, prefill.as_ref()) || !takes_media(prefill.as_ref())
                 {
@@ -1933,14 +1931,24 @@ impl WorkerSelectionStage {
                 }) {
                     let limit = pair_context_length(prefill.as_ref(), decode.as_ref(), model_id);
                     largest = largest.max(limit);
+                    // The budget is judged among the pairs that hold the
+                    // input: two maxima from different pairs would pass a
+                    // request no single pair holds, and placement would
+                    // answer a retryable 503 for it.
+                    if limit.is_none_or(|limit| demand.context.input_fits(limit)) {
+                        widest_decode = widest_decode.max(decode.context_length(model_id));
+                    }
                 }
             }
-            if let Some(limit) = largest {
-                demand
-                    .context
-                    .enforce(limit, model_id)
-                    .map_err(|response| PdSelectionFailure::Context(Box::new(response)))?;
-            }
+            // The input against the widest window a pair offers it, the
+            // budget against the widest decode window among the pairs that
+            // hold the input: the refusal names the window that bound the
+            // request, and a request no pair holds is a 400 here, never a
+            // 503 from placement.
+            demand
+                .context
+                .enforce_for_pair(largest, widest_decode, model_id)
+                .map_err(|response| PdSelectionFailure::Context(Box::new(response)))?;
         }
         let inputs = PlacementInputs {
             candidate_filter: Some(&fits),
@@ -2949,6 +2957,107 @@ mod tests {
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
+    }
+
+    /// Two pairing islands whose windows cross (island A: a wide prefill
+    /// window with a narrow decode one; island B: the reverse) and a request
+    /// that no single pair holds (its input fits A's pair window but its
+    /// budget only B's decode window): the capacity refusal judges the
+    /// budget among the pairs that hold the input, so the answer is the
+    /// 400 naming A's decode window, not a retryable 503 from placement. A
+    /// request B holds on its own (a small input, the same budget) pairs.
+    #[test]
+    fn select_pd_pair_refuses_a_request_no_island_holds_with_a_400() {
+        use crate::routers::grpc::context::{PreparationOutput, RequestType};
+
+        let model_id = "test-model-islands";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let register = |url: &str, worker_type: WorkerType, runtime: RuntimeType, window: u32| {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id).with_context_length(window))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(runtime)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        };
+        register(
+            "grpc://127.0.0.1:8300",
+            WorkerType::Prefill,
+            RuntimeType::Sglang,
+            32768,
+        );
+        register(
+            "grpc://127.0.0.1:8301",
+            WorkerType::Decode,
+            RuntimeType::Sglang,
+            4096,
+        );
+        register(
+            "grpc://127.0.0.1:8302",
+            WorkerType::Prefill,
+            RuntimeType::Vllm,
+            2048,
+        );
+        register(
+            "grpc://127.0.0.1:8303",
+            WorkerType::Decode,
+            RuntimeType::Vllm,
+            32768,
+        );
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+        let demands = |input_tokens: usize, budget: u32| PairDemands {
+            context: ContextRequirements::new(
+                &PreparationOutput::Generate {
+                    original_text: None,
+                    token_ids: vec![7; input_tokens],
+                },
+                &RequestType::Completion(Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "model": model_id,
+                        "prompt": "hi",
+                        "max_tokens": budget,
+                    }))
+                    .expect("a completion request"),
+                )),
+            ),
+            ..PairDemands::default()
+        };
+
+        match stage.select_pd_pair(
+            model_id,
+            PlacementInputs::default(),
+            None,
+            None,
+            demands(3072, 8192),
+        ) {
+            Err(PdSelectionFailure::Context(response)) => {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            Ok(_) => panic!("a request no island holds must not pair"),
+            Err(PdSelectionFailure::Placement(_)) => {
+                panic!("a request no island holds is a 400 at selection, not a placement failure")
+            }
+            Err(PdSelectionFailure::NoVisionCapablePrefill) => {
+                panic!("a request no island holds is a 400 at selection, not a vision refusal")
+            }
+        }
+
+        let (prefill, decode, _) = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs::default(),
+                None,
+                None,
+                demands(1024, 8192),
+            )
+            .expect("island B holds the small input and the budget");
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:8302");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8303");
     }
 
     /// TokenSpeed's direct-ZMQ engines carry the rendezvous on their generate
