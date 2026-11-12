@@ -1559,6 +1559,7 @@ mod tests {
         assert_eq!(stripped.mm_placeholders, batch.mm_placeholders);
         assert_eq!(stripped.im_token_id, batch.im_token_id);
         assert_eq!(stripped.batched_keys, ["image_grid_thw"]);
+        assert_eq!(stripped.keep_on_cpu_keys, ["image_grid_thw"]);
         // This family lays its pixels out flat: they are named in `flat_keys`
         // with their sizes tensor, never in `batched_keys`, and the identity
         // drops the entry with the pixels.
