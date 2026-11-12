@@ -748,9 +748,25 @@ fn resolve_template_thinking(
     request.template_thinking_for(provider)
 }
 
-/// gRPC backends require content parts the gateway knows how to render, and
-/// a refusal part only where the contract defines it: on an assistant turn.
+/// Validate content sent to a model template, using the tool declarations
+/// that the template will receive.
+pub(crate) fn validate_chat_template_content_parts(
+    request: &ChatCompletionRequest,
+) -> Result<(), String> {
+    validate_chat_parts(&request.messages, Some(request))
+}
+
+/// Validate gRPC chat content outside the regular template preparation path.
 pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
+    validate_chat_parts(messages, None)
+}
+
+/// Reject unsupported parts and permit a homogeneous list of declared Flash
+/// tool references only in a tool message sent to the model template.
+fn validate_chat_parts(
+    messages: &[ChatMessage],
+    template_request: Option<&ChatCompletionRequest>,
+) -> Result<(), String> {
     for message in messages {
         let content = match message {
             ChatMessage::System { content, .. }
@@ -770,6 +786,18 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
                             .get("type")
                             .and_then(Value::as_str)
                             .unwrap_or("<missing>");
+                        if let Some(request) = template_request.filter(|request| {
+                            type_name == "tool_reference"
+                                && matches!(message, ChatMessage::Tool { .. })
+                                && ProviderProfile::for_model(&request.model)
+                                    .supports_chat_tool_references(&request.model)
+                        }) {
+                            validate_tool_references(
+                                parts,
+                                request.tools.as_deref().unwrap_or_default(),
+                            )?;
+                            break;
+                        }
                         return Err(format!(
                             "Unsupported chat content part type {type_name:?} for gRPC backends"
                         ));
@@ -784,6 +812,33 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
                     _ => {}
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The template selects the reference path by the first block and emits only
+/// matching tools. Refuse mixed lists and unknown names before they can lose
+/// content in that rendering.
+fn validate_tool_references(parts: &[ContentPart], tools: &[Tool]) -> Result<(), String> {
+    for part in parts {
+        let fields = match part {
+            ContentPart::Unknown(fields)
+                if fields.get("type").and_then(Value::as_str) == Some("tool_reference") =>
+            {
+                fields
+            }
+            _ => return Err("tool_reference content must contain only tool references".into()),
+        };
+        let name = fields.get("name").and_then(Value::as_str);
+        if !name.is_some_and(|name| {
+            tools
+                .iter()
+                .any(|tool| tool.tool_type == "function" && tool.function.name == name)
+        }) {
+            return Err(
+                "tool_reference.name must name a function available to the template".into(),
+            );
         }
     }
     Ok(())

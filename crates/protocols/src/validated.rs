@@ -1556,6 +1556,211 @@ mod tests {
         }
     }
 
+    /// Omitted, null and true all keep Flash's sampling defaults and explicit values.
+    #[tokio::test]
+    async fn glm_flash_sampling_defaults_and_explicit_values() {
+        for do_sample in [None, Some(Value::Null), Some(json!(true))] {
+            let mut body = json!({
+                "model": "zai-org/GLM-5.3-Flash",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(do_sample) = do_sample {
+                body["do_sample"] = do_sample;
+            }
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(1.0), Some(0.95), None)
+            );
+
+            body["temperature"] = json!(0.7);
+            body["top_p"] = json!(0.8);
+            body["top_k"] = json!(20);
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.7), Some(0.8), Some(20))
+            );
+
+            body["top_p"] = json!(0);
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.7), Some(1.0), Some(1))
+            );
+        }
+    }
+
+    /// A registered Flash alias takes the same greedy override and validation as its model.
+    #[tokio::test]
+    async fn glm_flash_sampling_validates_effective_values_for_the_model_and_its_alias() {
+        use crate::profile::ProviderProfile;
+
+        const ALIAS: &str = "flash-sampling-chat-alias";
+        const CHECKPOINT: &str = "flash-sampling-chat-checkpoint";
+        ProviderProfile::register_model_aliases([
+            (ALIAS, "zai-org/GLM-5.3-Flash"),
+            ("glm-5.3-flash-sampling-checkpoint-alias", CHECKPOINT),
+        ]);
+        for model in ["zai-org/GLM-5.3-Flash", "glm53flash-fp8", ALIAS, CHECKPOINT] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "do_sample": false, "temperature": 99, "top_p": -1, "top_k": 0
+            });
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.0), Some(1.0), Some(1))
+            );
+
+            body["top_k"] = json!(20);
+            body["top_p"] = json!(0.9);
+            body["do_sample"] = json!(true);
+            body["temperature"] = json!(1.01);
+            let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["param"], "temperature");
+
+            body["temperature"] = json!(-0.01);
+            assert!(chat_request(&body.to_string()).await.is_err());
+            for temperature in [0.0, 1.0] {
+                body["temperature"] = json!(temperature);
+                assert!(chat_request(&body.to_string()).await.is_ok());
+            }
+            for invalid in [json!(0), json!("false"), json!([]), json!({})] {
+                body["do_sample"] = invalid;
+                let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(error["error"]["param"], "do_sample");
+            }
+        }
+    }
+
+    /// Flash-specific sampling rules leave neighboring models and their extensions alone.
+    #[tokio::test]
+    async fn glm_flash_sampling_rules_do_not_reach_other_models() {
+        for model in [
+            "glm-5.3-air",
+            "glm-5.3-flashlight",
+            "glm53flash2",
+            "local-model",
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "do_sample": false, "temperature": 1.5, "top_p": 0.7, "top_k": 20
+            });
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(1.5), Some(0.7), Some(20))
+            );
+            assert_eq!(req.other["do_sample"], false);
+            body["do_sample"] = json!("false");
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(req.other["do_sample"], "false");
+            body["top_p"] = json!(0);
+            let (status, _) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// The Chat Completions extractor applies the Flash budget to model names
+    /// and registered aliases, preserving both wire fields and their precedence.
+    #[tokio::test]
+    async fn glm53_flash_chat_output_budget() {
+        use serde_json::json;
+
+        use crate::profile::ProviderProfile;
+
+        const ALIAS: &str = "opaque-glm-flash-budget-test";
+        ProviderProfile::register_model_aliases([(ALIAS, "zai-org/GLM-5.3-Flash")]);
+
+        for (model, defaults_to) in [
+            ("glm-5.3-flash", Some(65_536)),
+            ("zai-org/GLM-5.3-Flash-FP8", Some(65_536)),
+            ("glm53flash", Some(65_536)),
+            (ALIAS, Some(65_536)),
+            ("glm-5.3", None),
+            ("glm-5.2", None),
+            ("glm-5.3-flashlight", None),
+            ("glm-5.3-flash2", None),
+            ("local-model", None),
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let request = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(request.output_token_cap(), defaults_to, "{model}");
+            if defaults_to.is_none() {
+                body["max_completion_tokens"] = json!(163_840);
+                let request = chat_request(&body.to_string()).await.unwrap();
+                assert_eq!(request.output_token_cap(), Some(163_840), "{model}");
+                continue;
+            }
+
+            body["max_tokens"] = Value::Null;
+            body["max_completion_tokens"] = Value::Null;
+            assert_eq!(
+                chat_request(&body.to_string())
+                    .await
+                    .unwrap()
+                    .output_token_cap(),
+                Some(65_536)
+            );
+
+            for fields in [
+                json!({"max_tokens": 1}),
+                json!({"max_tokens": 131_072}),
+                json!({"max_completion_tokens": 1}),
+                json!({"max_completion_tokens": 131_072}),
+                json!({"max_tokens": 131_072, "max_completion_tokens": 1}),
+                json!({"max_tokens": 1, "max_completion_tokens": 131_072}),
+            ] {
+                let mut input = body.clone();
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                let request = chat_request(&input.to_string()).await.unwrap();
+                assert_eq!(
+                    request.output_token_cap().map(u64::from),
+                    fields["max_completion_tokens"]
+                        .as_u64()
+                        .or_else(|| fields["max_tokens"].as_u64()),
+                    "{input}"
+                );
+                let serialized = serde_json::to_value(request).unwrap();
+                assert_eq!(serialized["max_tokens"], fields["max_tokens"], "{input}");
+                assert_eq!(
+                    serialized["max_completion_tokens"], fields["max_completion_tokens"],
+                    "{input}"
+                );
+            }
+
+            for (value, code) in [
+                (0, "integer_below_min_value"),
+                (131_073, "max_tokens_out_of_range"),
+            ] {
+                for (field, other) in [
+                    ("max_tokens", "max_completion_tokens"),
+                    ("max_completion_tokens", "max_tokens"),
+                ] {
+                    for other_value in [Value::Null, json!(1)] {
+                        body[field] = json!(value);
+                        body[other] = other_value;
+                        let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+                        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                        assert_eq!(error["error"]["code"], code, "{body}: {error}");
+                        assert_eq!(error["error"]["param"], field, "{body}: {error}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Both keys with the same text make a request, as before the alias. Both
     /// keys with different text are refused as a value, and the param names
     /// the message.

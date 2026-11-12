@@ -271,7 +271,10 @@ mod tests {
     use std::sync::Arc;
 
     use axum::http::StatusCode;
-    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use openai_protocol::{
+        chat::ChatCompletionRequest, model_card::ModelCard, validated::Normalizable,
+        worker::HealthCheckConfig,
+    };
 
     use super::*;
     use crate::{
@@ -410,6 +413,25 @@ mod tests {
             None
         )
         .is_ok());
+    }
+
+    /// A default applied at ingress is subject to the selected worker's window.
+    #[test]
+    fn glm53_flash_chat_default_obeys_the_worker_window() {
+        let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        request.normalize();
+        let request = RequestType::Chat(Arc::new(request));
+        assert_rejected(enforce_output_budget(
+            &request,
+            &single(Some(65_535)),
+            MODEL,
+            None,
+        ));
+        assert!(enforce_output_budget(&request, &single(Some(65_536)), MODEL, None).is_ok());
     }
 
     #[test]

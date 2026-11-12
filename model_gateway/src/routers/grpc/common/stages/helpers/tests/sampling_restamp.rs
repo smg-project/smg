@@ -1,10 +1,16 @@
 //! A retry re-applies the sampling defaults from the request's baseline, not from the previous
-//! worker.
+//! worker. Flash sampling also passes through request extraction and worker defaults.
 
 use std::sync::Arc;
 
-use openai_protocol::chat::ChatCompletionRequest;
-use smg_grpc_client::sglang_proto;
+use axum::{
+    body::{to_bytes, Body},
+    extract::FromRequest,
+    http::{Request, StatusCode},
+};
+use openai_protocol::{chat::ChatCompletionRequest, validated::ValidatedJson};
+use serde_json::{json, Value};
+use smg_grpc_client::{sglang_proto, SglangSchedulerClient, VllmEngineClient};
 
 use super::*;
 use crate::{
@@ -92,5 +98,83 @@ fn retry_reapplies_defaults_from_the_baseline_not_the_previous_worker() {
         let params = sglang_params(&plan);
         assert_eq!(params.temperature, 1.0);
         assert_eq!(params.top_k, 3);
+    }
+}
+
+/// Read a POST body through the production Chat Completions extractor.
+async fn chat_request(body: &Value) -> Result<ChatCompletionRequest, (StatusCode, Value)> {
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    match ValidatedJson::<ChatCompletionRequest>::from_request(request, &()).await {
+        Ok(ValidatedJson(req)) => Ok(req),
+        Err(response) => {
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            Err((status, serde_json::from_slice(&bytes).unwrap()))
+        }
+    }
+}
+
+/// Flash's normalized sampling values reach both engines through worker defaults.
+#[tokio::test]
+async fn glm_flash_sampling_reaches_vllm_and_sglang() {
+    let worker = worker_with_defaults(
+        "grpc://worker:30000",
+        Some(r#"{"temperature":0.5,"top_p":0.8,"top_k":9}"#),
+    );
+    for (do_sample, top_p, expected) in [
+        (None, None, (1.0, 0.95, 9)),
+        (Some(false), Some(0.7), (0.0, 1.0, 1)),
+        (Some(true), Some(0.0), (1.0, 1.0, 1)),
+    ] {
+        let mut body = json!({
+            "model": "zai-org/GLM-5.3-Flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": top_p,
+        });
+        if let Some(do_sample) = do_sample {
+            body["do_sample"] = json!(do_sample);
+        }
+        let req = chat_request(&body).await.unwrap();
+        let mask = Some(SamplingDefaultsMask::from_chat_request(&req));
+
+        let vllm = VllmEngineClient::build_generate_request_from_chat(
+            "vllm".into(),
+            &req,
+            String::new(),
+            vec![1],
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let sglang = SglangSchedulerClient::build_generate_request_from_chat_parts(
+            "sglang".into(),
+            &req,
+            String::new(),
+            vec![1],
+            Default::default(),
+        )
+        .unwrap();
+        let (temperature, top_p, top_k) = expected;
+        let mut vllm = ProtoGenerateRequest::Vllm(Box::new(vllm));
+        apply_sampling_defaults(&mut vllm, mask, Some(&worker));
+        let ProtoGenerateRequest::Vllm(vllm) = vllm else {
+            panic!("expected a vLLM request");
+        };
+        let params = vllm.sampling_params.unwrap();
+        assert_eq!(
+            (params.temperature, params.top_p, params.top_k),
+            (Some(temperature), top_p, top_k as u32),
+        );
+
+        let mut sglang = ProtoGenerateRequest::Sglang(Box::new(sglang));
+        apply_sampling_defaults(&mut sglang, mask, Some(&worker));
+        let ProtoGenerateRequest::Sglang(sglang) = sglang else {
+            panic!("expected an SGLang request");
+        };
+        let params = sglang.sampling_params.unwrap();
+        assert_eq!((params.temperature, params.top_p, params.top_k), expected);
     }
 }
