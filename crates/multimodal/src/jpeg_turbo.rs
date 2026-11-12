@@ -1121,7 +1121,22 @@ mod tests {
     /// sample decodes to 128, its components sampled as `sampling` says (one
     /// packed byte per component, the horizontal factor in the high nibble).
     /// Built here rather than stored: a byte table would be test data.
+    ///
+    /// The scan holds one block per sampling unit, which is the scan's count
+    /// only when the components share one interleaved MCU (two or more of
+    /// them) at least 16 columns wide (a horizontal factor of 2 or more
+    /// somewhere). 4:4:4 takes two MCUs, so half the blocks go unwritten:
+    /// libjpeg warns of the premature end, fills them with zeros and keeps
+    /// the frame, grey like the written half, so no pixel check would tell.
+    /// A single component's scan is not interleaved and takes the frame's
+    /// two blocks whatever its factors: one short at 1x1, exact at 2x1, two
+    /// over at 2x2. The builder refuses such lists.
     fn unequal_sampling_jpeg(sampling: &[u8]) -> Vec<u8> {
+        assert!(
+            sampling.len() >= 2 && sampling.iter().any(|&factors| factors >> 4 >= 2),
+            "one MCU of 16x8 takes two or more components, one with a horizontal \
+             factor of 2 or more: not {sampling:02X?}"
+        );
         let count = sampling.len();
         let mut jpeg = vec![0xFF, 0xD8];
         // DQT: one table of ones.
@@ -1180,6 +1195,22 @@ mod tests {
     /// which libjpeg-turbo 2.x's header call cannot name.
     fn unequal_sampling_cmyk_jpeg() -> Vec<u8> {
         unequal_sampling_jpeg(&[0x22, 0x11, 0x11, 0x11])
+    }
+
+    /// A list the builder cannot write is refused rather than written short:
+    /// three components sampled 1x1 each take two MCUs across the 16 columns.
+    #[test]
+    #[should_panic(expected = "one MCU of 16x8 takes two or more components")]
+    fn the_builder_refuses_a_list_whose_mcu_is_narrower_than_the_frame() {
+        unequal_sampling_jpeg(&[0x11, 0x11, 0x11]);
+    }
+
+    /// A single component's scan is not interleaved: its block count is the
+    /// component's own, not one MCU's.
+    #[test]
+    #[should_panic(expected = "one MCU of 16x8 takes two or more components")]
+    fn the_builder_refuses_a_single_component() {
+        unequal_sampling_jpeg(&[0x22]);
     }
 
     /// The reader finds the frame header behind the tables, in a file written

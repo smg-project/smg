@@ -50,7 +50,9 @@ pub(crate) struct MessagesPrompt<'a> {
     /// The thinking preference the prompt is rendered with
     /// (`CreateMessageRequest::template_thinking`).
     pub thinking: Option<bool>,
-    /// `output_config.effort`, rendered as the `reasoning_effort` kwarg.
+    /// `output_config.effort` as the provider profile hands it to the
+    /// template (`CreateMessageRequest::template_reasoning_effort_for`),
+    /// rendered as the `reasoning_effort` kwarg.
     pub reasoning_effort: Option<&'a str>,
     /// The request's tool choice, told to the template as the chat path
     /// tells it; a renderer that declares the tools under `none` writes its
@@ -70,7 +72,7 @@ impl<'a> MessagesPrompt<'a> {
             messages: &request.messages,
             system: request.system.as_ref(),
             thinking: request.template_thinking_for(provider),
-            reasoning_effort: request.reasoning_effort(),
+            reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
         }
     }
@@ -84,11 +86,12 @@ impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
 
 impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
     fn from(request: &'a CountMessageTokensRequest) -> Self {
+        let provider = ProviderProfile::for_model(&request.model);
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.template_thinking(),
-            reasoning_effort: request.reasoning_effort(),
+            thinking: request.template_thinking_for(provider),
+            reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
         }
     }

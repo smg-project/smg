@@ -1642,7 +1642,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "minimax-m3",
         model: "MiniMaxAI/MiniMax-M3",
-        also: &[],
+        also: &["MiniMax-M3.1-Flash"],
         released: "2026-06-02",
         smg: (Some("minimax_m3"), Some("minimax_m3")),
         table: Some(Table::MinimaxM3),

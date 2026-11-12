@@ -304,7 +304,8 @@ pub struct Candidate {
     /// Host-supplied admission bit: the decode's running window has a room
     /// nobody waiting at its gate is in line for.
     pub has_room: bool,
-    /// Milliseconds since the worker was admitted to the pool.
+    /// Milliseconds since the worker was admitted to the pool, saturating at
+    /// `u32::MAX` as `report_age_ms` does; never wrapping.
     pub admitted_age_ms: u32,
     /// Blocks the index learned about the worker since admission.
     pub indexed_growth: u32,

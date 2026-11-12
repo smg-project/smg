@@ -7,12 +7,13 @@
 //! `None` means the registry does not know the model, and the caller reads its output another
 //! way; the gateway keeps its older parsers for such a model.
 //!
-//! The groups are bellwether's: the checkpoints that share a tokenizer and a template, recorded
-//! once by the group's primary. Every group whose table is on main is here, its primary and its
-//! other checkpoints under the primary's organisation, spelled in `groups.json` beside this
-//! module (one group per line; the crate's build script writes the file as the `GROUPS`
-//! constant); `tests/readme.rs` writes the README's models table from the same groups and checks
-//! that the two agree.
+//! The groups are bellwether's: the checkpoints that share a tokenizer and the wire the table
+//! reads (a template too, except for a checkpoint `docs/tables.md` notes as differing only
+//! outside the wire), recorded once by the group's primary. Every group whose table is on main is
+//! here, its primary and its other checkpoints under the primary's organisation, spelled in
+//! `groups.json` beside this module (one group per line; the crate's build script writes the file
+//! as the `GROUPS` constant); `tests/readme.rs` writes the README's models table from the same
+//! groups and checks that the two agree.
 //!
 //! A lookup matches the repository name, the text after the last path separator (either slash),
 //! exactly and without regard to case, under any organisation or path: `Qwen/Qwen3-8B`,
@@ -651,6 +652,27 @@ mod tests {
             granite.turn_opener(),
             Some("<|start_of_role|>assistant<|end_of_role|>")
         );
+    }
+
+    /// MiniMax-M3.1-Flash is a checkpoint of the MiniMax-M3 group (the
+    /// MiniMax M3 section of `docs/tables.md`: the same tokenizer and wire,
+    /// a template that differs only outside the wire), so the `minimax_m3`
+    /// table reads it by its repository name as it reads the primary's; the
+    /// near-miss `MiniMax-M3.1` stays unknown.
+    #[test]
+    fn the_minimax_m3_1_flash_checkpoint_reads_with_the_m3_table() {
+        let primary = for_model("MiniMaxAI/MiniMax-M3").expect("MiniMax-M3");
+        for model in [
+            "MiniMax-M3.1-Flash",
+            "MiniMaxAI/MiniMax-M3.1-Flash",
+            "minimaxai/minimax-m3.1-flash",
+        ] {
+            let flash = for_model(model).expect(model);
+            assert_eq!(flash.name(), "minimax_m3", "{model}");
+            assert_eq!(flash.name(), primary.name(), "{model}");
+            assert_eq!(flash.turn_opener(), primary.turn_opener(), "{model}");
+        }
+        assert!(for_model("MiniMax-M3.1").is_none());
     }
 
     #[test]

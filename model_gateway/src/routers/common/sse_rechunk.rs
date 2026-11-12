@@ -78,7 +78,7 @@ pub struct RechunkPolicy {
 }
 
 /// An unterminated frame longer than this is forwarded as it comes.
-const MAX_FRAME_BYTES: usize = 1 << 20;
+pub(crate) const MAX_FRAME_BYTES: usize = 1 << 20;
 
 /// Delta fields whose text is buffered, in the order they are emitted.
 const PAYLOAD_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "content"];
@@ -1225,7 +1225,8 @@ fn classify_frame(frame: &[u8]) -> Frame<'_> {
 pub(crate) const DELIMITER_OVERLAP: usize = 3;
 
 /// Position and length of the first frame delimiter at or after `from`:
-/// `\r\n\r\n`, `\n\n` or `\r\r`.
+/// `\r\n\r\n`, `\n\n` or `\r\r`. The decode side's log-probability merge
+/// splits its chunks into frames with it too.
 pub(crate) fn find_frame_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     (from..buf.len()).find_map(|i| {
         if buf[i..].starts_with(b"\r\n\r\n") {

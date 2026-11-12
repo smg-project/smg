@@ -1380,6 +1380,61 @@ async fn a_tokenspeed_encode_worker_reads_an_shm_feature_as_the_encoder_servicer
     assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
 }
 
+/// Both servicers pull a remote handle for the item's feature alone: the
+/// encoder accepts a remote feature as the scheduler does, and a remote side
+/// tensor is refused, as the generic reader's `tensor_payload_bytes` refuses
+/// it on either.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_pulls_a_remote_feature_and_refuses_a_remote_side_tensor() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let before = encodes_served(&http, &fault, &name).await;
+    let remote = |nbytes: u64| {
+        Some(ts::tensor_data::Payload::Remote(
+            smg_grpc_client::common_proto::RemoteTensorHandle {
+                transport: "nixl".to_string(),
+                nbytes,
+                ..Default::default()
+            },
+        ))
+    };
+    let mut feature = tokenspeed_encode_request("ts-remote", 1, &[47]);
+    feature.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float16".to_string(),
+        payload: remote(8),
+    });
+    let answer = encoder
+        .encode(feature)
+        .await
+        .expect("a remote feature on the encoder")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    let mut side = tokenspeed_encode_request("ts-remote-side", 1, &[48]);
+    side.mm_inputs.as_mut().expect("the items").items[0]
+        .model_specific_tensors
+        .insert(
+            "image_grid_thw".to_string(),
+            ts::TensorData {
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+                payload: remote(24),
+            },
+        );
+    let refused = encoder
+        .encode(side)
+        .await
+        .expect_err("a remote side tensor the servicer refuses");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("image_grid_thw")
+            && refused.message().contains("remote payload"),
+        "{refused:?}"
+    );
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+}
+
 /// The engine's encoder takes exactly one media item under one room per
 /// request, named by a request id: the mock refuses the rest as the engine's
 /// adapter does, so a gateway that batched items into one `Encode` or dropped

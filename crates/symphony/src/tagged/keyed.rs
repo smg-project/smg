@@ -36,10 +36,11 @@ use std::borrow::Cow;
 use super::object::{Mode, Object};
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
-    markers::{Piece, Scanner},
+    markers::Scanner,
     tagged::{
-        end_cut_call, held_text, refuse, take_owned,
+        end_cut_call, held_text, refuse,
         value::{cut as cut_json, cut_opens_a_string, json, json_prefix, Kind},
+        TaggedAssembler,
     },
     Declared,
 };
@@ -267,19 +268,6 @@ impl Assembler {
         self.function.is_some()
     }
 
-    /// Append the next bytes of the call and push the events they complete. Every byte is the
-    /// call's until the engine says otherwise, so this takes them all.
-    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
-        if self.done {
-            return;
-        }
-        let scanned = self.scanner.feed(bytes);
-        for piece in scanned.pieces_of_delta() {
-            self.take(piece, declared, out);
-        }
-        self.scanner.reclaim(scanned);
-    }
-
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. A call that has not been
     /// named yet is named from the text so far; after the last value the object is closed, when
@@ -500,19 +488,6 @@ impl Assembler {
         true
     }
 
-    fn take<'d>(&mut self, piece: Piece<'d>, declared: &Declared, out: &mut Events<'d>) {
-        match piece {
-            Piece::Text(Cow::Borrowed(text)) => self.text(text, out),
-            // The join's part after a hold is a copy, nobody's delta: its events go out owned.
-            Piece::Text(Cow::Owned(text)) => {
-                let mut scratch = std::mem::take(&mut self.scratch);
-                take_owned(&text, &mut scratch, out, |text, out| self.text(text, out));
-                self.scratch = scratch;
-            }
-            Piece::Marker(tag) => self.tag(tag, declared, out),
-        }
-    }
-
     fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events) {
         let bytes = self.tags.text(tag);
         match &self.stage {
@@ -701,9 +676,32 @@ impl Assembler {
     }
 }
 
+impl TaggedAssembler for Assembler {
+    fn done(&self) -> bool {
+        self.done
+    }
+
+    fn scanner(&mut self) -> &mut Scanner {
+        &mut self.scanner
+    }
+
+    fn scratch(&mut self) -> &mut Events<'static> {
+        &mut self.scratch
+    }
+
+    /// The keyed syntax types its values by the key, read at the value's close, not here.
+    fn text<'d>(&mut self, text: &'d str, _declared: &Declared, out: &mut Events<'d>) {
+        Assembler::text(self, text, out);
+    }
+
+    fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events) {
+        Assembler::tag(self, tag, declared, out);
+    }
+}
+
 impl crate::engine::CallAssembler for Assembler {
     fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
-        self.feed(text, declared, out);
+        TaggedAssembler::feed(self, text, declared, out);
         text.len()
     }
 
