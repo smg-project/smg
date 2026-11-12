@@ -46,6 +46,7 @@ Usage:
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import logging
 import os
@@ -69,6 +70,7 @@ from infra.constants import (
     get_runtime,
     is_sglang,
     vllm_kv_backend,
+    vllm_moriio_backend,
     vllm_moriio_mode,
 )
 from infra.http_pd_stream_fault import assert_http_fault_outcomes, wait_for_fault_streams
@@ -115,6 +117,34 @@ _HEALTH_ARGS = [
 def _moriio_lane() -> bool:
     """vLLM PD with KV over MoRI-IO, which setup_backend runs on the HTTP PD router."""
     return get_runtime() == "vllm" and vllm_kv_backend() == "moriio"
+
+
+def _moriio_read_image_verifier():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci_moriio_read_image.py"
+    spec = importlib.util.spec_from_file_location("_pd_moriio_read_image", path)
+    if spec is None or spec.loader is None:
+        raise OSError(f"Cannot load READ source verifier: {path}")
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    return verifier
+
+
+def _moriio_asymmetric_tp_supported() -> bool:
+    """Only the installed reviewed AMD READ/RDMA cohort supports split KV heads."""
+    if not (
+        _moriio_lane()
+        and get_gpu_vendor() == "amd"
+        and vllm_moriio_mode() == "read"
+        and vllm_moriio_backend() == "rdma"
+    ):
+        return False
+    try:
+        _moriio_read_image_verifier().verify_installed()
+    except (ValueError, OSError, importlib.metadata.PackageNotFoundError):
+        # Legacy/local collection keeps the unsupported skip. Normal READ CI
+        # already fails the same mandatory source preflight before any workers.
+        return False
+    return True
 
 
 def _moriio_holds_memory_of(role: str) -> bool:
@@ -190,9 +220,10 @@ _TOPOLOGIES = (
             ("pd_grpc", (p, d, ptp, dtp)),
             id=f"{p}p{d}d-ptp{ptp}-dtp{dtp}",
             marks=pytest.mark.skipif(
-                _moriio_lane(),
-                reason="vLLM's MoRI-IO connector pairs unequal TP sizes only when every "
-                "rank holds all KV heads (vllm-project/vllm#46332); the model's 8 are split",
+                _moriio_lane() and not _moriio_asymmetric_tp_supported(),
+                reason="split KV heads require the installed reviewed AMD MoRI READ/RDMA "
+                "source cohort; legacy, WRITE and XGMI retain the unequal-TP restriction "
+                "(vllm-project/vllm#46332)",
             ),
         )
         for p, d, ptp, dtp in ([(1, 2, 2, 1), (2, 1, 1, 2)] if get_runtime() != "mock" else [])
