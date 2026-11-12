@@ -453,7 +453,7 @@ enum EncoderInput<'a> {
     /// The role runs the tower on the item: the feature rides inline unless
     /// one of the request's encode rooms (by item index) hands it over.
     Required { roomed: &'a [u32] },
-    /// The gateway's decode leg is the request's pixel-free clone: no feature
+    /// The gateway's decode side is the request's pixel-free clone: no feature
     /// and no rooms, the item's metadata alone.
     Detached,
 }
@@ -890,7 +890,7 @@ mod tests {
             .expect("the roomed item is accepted without its feature");
     }
 
-    /// The gateway's decode leg is the request's pixel-free clone (every
+    /// The gateway's decode side is the request's pixel-free clone (every
     /// item's encoder input taken out, the encode rooms dropped, the
     /// metadata kept): a decode worker takes it, and a prefill worker
     /// refuses the same form as the engine refuses a tower run on nothing.
