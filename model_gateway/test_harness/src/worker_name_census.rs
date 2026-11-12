@@ -8,9 +8,15 @@
 //! A worker's port is read from the three forms the tests write: a
 //! `TestWorkerConfig` constructor with the port first, the range constructors
 //! with a start port and a count, and the `port:` field of a `MockWorkerConfig`
-//! literal. A port is attributed to the enclosing `fn`, so one test naming its
-//! port twice is not a repeat. Ports computed at run time are not read, and
-//! port 0, which asks the system for a free port, names no worker.
+//! literal. A port is attributed to the enclosing `fn` of its file, so one test
+//! naming its port twice is not a repeat, and two tests of one name in two
+//! files are two. Ports computed at run time are not read, and port 0, which
+//! asks the system for a free port, names no worker.
+//!
+//! A binary is a top-level file under `tests/` with the directories and files
+//! it declares through `mod` and `#[path]`, as Cargo builds it. A directory no
+//! root declares is reported, so a test file nothing compiles is not read as a
+//! binary of its own.
 
 use std::{
     collections::BTreeMap,
@@ -19,7 +25,7 @@ use std::{
 };
 
 /// Where a binary's source names a worker port: the enclosing function (or the
-/// file scope) and the file and line.
+/// file scope), qualified by its file, and the file and line.
 #[derive(Debug, PartialEq, Eq)]
 struct Mention {
     scope: String,
@@ -32,6 +38,10 @@ const SINGLE_PORT_CONSTRUCTORS: [&str; 6] =
 
 /// The constructors whose first two arguments are a start port and a count.
 const RANGE_CONSTRUCTORS: [&str; 2] = ["healthy_workers", "slow_workers"];
+
+/// The directories under `tests/` no binary declares: shared modules taken by
+/// `#[path]` and the fixtures.
+const SHARED_DIRECTORIES: [&str; 2] = ["common", "fixtures"];
 
 /// The directory of the gateway's integration test binaries.
 fn tests_dir() -> PathBuf {
@@ -70,6 +80,20 @@ fn constructor_ports(line: &str) -> Vec<u16> {
     ports
 }
 
+/// The value of a `port:` field on `line`: the field itself, not the tail of
+/// `http_base_port:` or another field ending in the word.
+fn port_field(line: &str) -> Option<u16> {
+    line.match_indices("port:").find_map(|(index, _)| {
+        let preceded_by_identifier = line[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        (!preceded_by_identifier)
+            .then(|| leading_number(&line[index + "port:".len()..]))
+            .flatten()
+    })
+}
+
 /// The name a `fn` line declares, past its `pub`, `async`, `const` or
 /// `unsafe` words; `None` for every other line.
 fn declared_fn(line: &str) -> Option<&str> {
@@ -86,25 +110,25 @@ fn declared_fn(line: &str) -> Option<&str> {
     (end > 0).then(|| &name[..end])
 }
 
-/// Every worker port `source` names, by port: the enclosing `fn` and the
-/// line. `file` names the source in each place.
+/// Every worker port `source` names, by port: the enclosing `fn` of `file` and
+/// the line. A `MockWorkerConfig {` that opens a literal is tracked to its
+/// closing brace; a signature returning the type (`-> MockWorkerConfig {`)
+/// opens no literal.
 fn mentions(source: &str, file: &str, found: &mut BTreeMap<u16, Vec<Mention>>) {
-    let mut scope = String::from("the file scope");
+    let mut scope = format!("{file} (file scope)");
     let mut literal_depth = 0usize;
     for (index, line) in source.lines().enumerate() {
         if let Some(name) = declared_fn(line) {
-            scope = name.to_owned();
+            scope = format!("{file}::{name}");
         }
         let mut ports = constructor_ports(line);
-        if line.contains("MockWorkerConfig {") {
+        if line.contains("MockWorkerConfig {") && !line.contains("->") {
             literal_depth += 1;
         } else if literal_depth > 0 {
             literal_depth += line.matches('{').count();
         }
         if literal_depth > 0 {
-            if let Some((_, value)) = line.split_once("port:") {
-                ports.extend(leading_number(value));
-            }
+            ports.extend(port_field(line));
         }
         literal_depth = literal_depth.saturating_sub(line.matches('}').count());
         let place = format!("{file}:{}", index + 1);
@@ -151,36 +175,84 @@ fn sources_under(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// The test binaries under `tests`, each with its sources: a directory with
-/// its `<name>_tests.rs` root, or a single file of its own. The shared
-/// `common` modules and the fixtures belong to no binary.
-fn binaries(tests: &Path) -> BTreeMap<String, Vec<PathBuf>> {
+/// The modules a root file declares: the names of its `mod <name>;` lines and
+/// the files of its `#[path = "..."]` attributes.
+fn declared_modules(root: &str) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut paths = Vec::new();
+    for line in root.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#[path = \"") {
+            if let Some((path, _)) = rest.split_once('"') {
+                paths.push(path.to_owned());
+            }
+        }
+        let declaration = line
+            .strip_prefix("pub mod ")
+            .or_else(|| line.strip_prefix("mod "));
+        if let Some(name) = declaration.and_then(|rest| rest.strip_suffix(';')) {
+            names.push(name.trim().to_owned());
+        }
+    }
+    (names, paths)
+}
+
+/// The test binaries under `tests`, each with its sources, and the directories
+/// no binary declares. A binary is a top-level `.rs` file (one Cargo target)
+/// with the directories and files its `mod` and `#[path]` declarations name,
+/// the root itself last. The shared directories are no binary's.
+fn binaries(tests: &Path) -> (BTreeMap<String, Vec<PathBuf>>, Vec<String>) {
     let mut binaries = BTreeMap::new();
+    let mut claimed = Vec::new();
+    let mut directories = Vec::new();
     let Ok(entries) = fs::read_dir(tests) else {
-        return binaries;
+        return (binaries, directories);
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
             continue;
         };
         if path.is_dir() {
-            if name == "common" || name == "fixtures" {
-                continue;
+            if !SHARED_DIRECTORIES.contains(&name.as_str()) {
+                directories.push(name);
             }
-            let mut files = sources_under(&path);
-            let root = tests.join(format!("{name}_tests.rs"));
-            if root.is_file() {
-                files.push(root);
-            }
-            binaries.insert(name.to_owned(), files);
-        } else if let Some(stem) = name.strip_suffix(".rs") {
-            if !stem.ends_with("_tests") {
-                binaries.insert(stem.to_owned(), vec![path.clone()]);
+            continue;
+        }
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
+        let Ok(root) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let (names, paths) = declared_modules(&root);
+        let mut files = Vec::new();
+        for module in names {
+            let directory = tests.join(&module);
+            if directory.is_dir() {
+                files.extend(sources_under(&directory));
+                claimed.push(module);
+            } else if tests.join(format!("{module}.rs")).is_file() {
+                files.push(tests.join(format!("{module}.rs")));
             }
         }
+        for relative in paths {
+            let file = tests.join(&relative);
+            if file.is_file() {
+                files.push(file);
+            }
+            if let Some((directory, _)) = relative.split_once('/') {
+                claimed.push(directory.to_owned());
+            }
+        }
+        files.sort();
+        files.dedup();
+        files.push(path);
+        binaries.insert(stem.to_owned(), files);
     }
-    binaries
+    directories.retain(|directory| !claimed.contains(directory));
+    directories.sort();
+    (binaries, directories)
 }
 
 mod tests {
@@ -188,7 +260,7 @@ mod tests {
 
     #[test]
     fn a_port_two_tests_of_one_binary_name_is_a_repeat_and_a_port_named_twice_by_one_is_not() {
-        let source = "#[tokio::test]
+        let sample = "#[tokio::test]
 async fn first_test() {
     let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(18001)]).await;
     let again = TestWorkerConfig::healthy(18001);
@@ -226,9 +298,19 @@ fn fifth_test() {
 fn sixth_test() {
     let flaky = TestWorkerConfig::flaky(18030, 0.5);
 }
+
+fn helper() -> MockWorkerConfig {
+    let router = RouterConfig { port: 3002 };
+    MockWorkerConfig { http_base_port: 18051, port: 18050, ..Default::default() }
+}
+";
+        let other = "fn first_test() {
+    let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(18001)]).await;
+}
 ";
         let mut found = BTreeMap::new();
-        mentions(source, "sample.rs", &mut found);
+        mentions(sample, "sample.rs", &mut found);
+        mentions(other, "other.rs", &mut found);
         let described: Vec<String> = repeats(&found)
             .iter()
             .map(|(port, mentions)| {
@@ -242,14 +324,22 @@ fn sixth_test() {
         assert_eq!(
             described,
             vec![
-                "18001: first_test at sample.rs:3, first_test at sample.rs:4, second_test at sample.rs:10".to_owned(),
-                "18011: second_test at sample.rs:8, third_test at sample.rs:19".to_owned(),
-                "18030: fifth_test at sample.rs:33, sixth_test at sample.rs:37".to_owned(),
+                "18001: sample.rs::first_test at sample.rs:3, sample.rs::first_test at sample.rs:4, sample.rs::second_test at sample.rs:10, other.rs::first_test at other.rs:2".to_owned(),
+                "18011: sample.rs::second_test at sample.rs:8, sample.rs::third_test at sample.rs:19".to_owned(),
+                "18030: sample.rs::fifth_test at sample.rs:33, sample.rs::sixth_test at sample.rs:37".to_owned(),
             ]
         );
         assert!(
             !found.contains_key(&3001),
             "a router's port is not a worker's"
+        );
+        assert!(
+            !found.contains_key(&3002),
+            "a router's port in a helper returning a worker config"
+        );
+        assert!(
+            !found.contains_key(&18051),
+            "a base-port field is not the port field"
         );
         assert!(!found.contains_key(&0), "port 0 names no worker");
         assert_eq!(
@@ -262,28 +352,38 @@ fn sixth_test() {
             Some(2),
             "one test's port named twice"
         );
+        assert_eq!(
+            found.get(&18050).map(Vec::len),
+            Some(1),
+            "the helper's literal is read"
+        );
     }
 
     #[test]
-    fn binaries_group_a_directory_with_its_root_and_a_single_file_by_itself() {
+    fn binaries_follow_the_roots_declarations_and_report_a_directory_none_declares() {
         let dir =
             std::env::temp_dir().join(format!("smg-worker-name-census-{}", std::process::id()));
-        for file in [
-            "x/a.rs",
-            "x/sub/b.rs",
-            "x_tests.rs",
-            "y_test.rs",
-            "common/c.rs",
-            "fixtures/f.rs",
-            "notes.txt",
-        ] {
+        let files = [
+            ("x_tests.rs", "mod x;\n"),
+            ("x/a.rs", ""),
+            ("x/sub/b.rs", ""),
+            ("y_test.rs", ""),
+            ("z_test.rs", "#[path = \"shared/c.rs\"]\nmod c;\n"),
+            ("shared/c.rs", ""),
+            ("orphan/o.rs", ""),
+            ("common/c.rs", ""),
+            ("fixtures/f.rs", ""),
+            ("notes.txt", ""),
+        ];
+        for (file, text) in files {
             let path = dir.join(file);
             assert!(path
                 .parent()
                 .is_some_and(|parent| fs::create_dir_all(parent).is_ok()));
-            assert!(fs::write(&path, "").is_ok());
+            assert!(fs::write(&path, text).is_ok());
         }
-        let listed: Vec<(String, Vec<String>)> = binaries(&dir)
+        let (grouped, unclaimed) = binaries(&dir);
+        let listed: Vec<(String, Vec<String>)> = grouped
             .iter()
             .map(|(name, files)| {
                 let files = files
@@ -298,7 +398,7 @@ fn sixth_test() {
             listed,
             vec![
                 (
-                    "x".to_owned(),
+                    "x_tests".to_owned(),
                     vec![
                         "x/a.rs".to_owned(),
                         "x/sub/b.rs".to_owned(),
@@ -306,17 +406,28 @@ fn sixth_test() {
                     ]
                 ),
                 ("y_test".to_owned(), vec!["y_test.rs".to_owned()]),
+                (
+                    "z_test".to_owned(),
+                    vec!["shared/c.rs".to_owned(), "z_test.rs".to_owned()]
+                ),
             ]
         );
+        assert_eq!(unclaimed, vec!["orphan".to_owned()]);
     }
 
     #[test]
     fn no_two_tests_of_one_gateway_binary_name_the_same_worker_port() {
-        let binaries = binaries(&tests_dir());
+        let (binaries, unclaimed) = binaries(&tests_dir());
         assert!(
             !binaries.is_empty(),
             "no test binaries under {}",
             tests_dir().display()
+        );
+        assert!(
+            unclaimed.is_empty(),
+            "no test binary declares these directories under {}: {}",
+            tests_dir().display(),
+            unclaimed.join(", ")
         );
         let mut failures = Vec::new();
         for (binary, files) in &binaries {
