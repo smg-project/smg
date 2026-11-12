@@ -370,7 +370,7 @@ def publish(engine_checkout, output):
         state["events"].append({"phase": phase, **extra})
         write_json(record, state)
 
-    def command(phase, argv, until=None, capture=False):
+    def command(phase, argv, until=None, capture=False, cwd=None):
         until = deadline if until is None else until
         remaining = until - time.monotonic()
         assert remaining > 3, "engineering deadline expired"
@@ -379,6 +379,7 @@ def publish(engine_checkout, output):
         with log.open("xb") as stream:
             proc = subprocess.Popen(
                 argv,
+                cwd=cwd,
                 env=env,
                 stdout=subprocess.PIPE if capture else stream,
                 stderr=stream,
@@ -584,6 +585,7 @@ def publish(engine_checkout, output):
                     "test-smoke",
                 ],
                 capture=True,
+                cwd=output / "source",
             )
         )
         assert set(plan["target"]) == {"test", "test-smoke"}
@@ -619,6 +621,7 @@ def publish(engine_checkout, output):
                 "test",
                 "test-smoke",
             ],
+            cwd=output / "source",
         )
         state["both_full_targets_passed"] = True
         identity = digest((ENGINE + state["recipe_manifest_sha256"]).encode())[:20]
@@ -644,6 +647,7 @@ def publish(engine_checkout, output):
                 "test.output=type=registry",
                 "test",
             ],
+            cwd=output / "source",
         )
         publication = json.loads(metadata.read_text())["test"]
         pin = publication["containerimage.digest"]
