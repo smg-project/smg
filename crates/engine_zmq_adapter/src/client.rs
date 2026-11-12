@@ -2282,9 +2282,12 @@ mod tests {
     /// probe named is free only until a neighbour takes it. The worker's
     /// connect is raced against the engine's dial: a bind that finds the port
     /// taken ends that attempt at once, its engine dial abandoned with it,
-    /// and the next attempt starts on a fresh probe.
+    /// and the next attempt starts on a fresh probe. The panic after the last
+    /// attempt carries the last bind error and the address it failed on, the
+    /// bind's own words rather than the neighbour sentence alone.
     async fn connect_tcp_worker(mut probe: impl FnMut() -> u16) -> (ZmqEngineClient, MockEngine) {
         const ATTEMPTS: usize = 8;
+        let mut last_bind_error = String::new();
         for _ in 0..ATTEMPTS {
             let base_url = format!("tcp://127.0.0.1:{}", probe());
             let mut worker = std::pin::pin!(connect_with_eos(
@@ -2306,7 +2309,10 @@ mod tests {
                 engine = &mut engine => First::Engine(engine),
             };
             match first {
-                First::Worker(Err(error)) if error.contains("Address already in use") => continue,
+                First::Worker(Err(error)) if error.contains("Address already in use") => {
+                    last_bind_error = format!("{base_url}: {error}");
+                    continue;
+                }
                 First::Worker(worker) => {
                     let client = worker.expect("the tcp worker connects");
                     let engine = engine.await.expect("mock engine connected");
@@ -2319,7 +2325,20 @@ mod tests {
                 }
             }
         }
-        panic!("{ATTEMPTS} probed ports were taken before the worker could bind them");
+        panic!(
+            "{ATTEMPTS} probed ports were taken before the worker could bind them; \
+             the last bind: {last_bind_error}"
+        );
+    }
+
+    /// A port held through every attempt exhausts them, and the panic names
+    /// the bind's own error rather than the neighbours alone.
+    #[tokio::test]
+    #[should_panic(expected = "Address already in use")]
+    async fn a_port_held_through_every_attempt_puts_the_bind_error_in_the_panic() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = holder.local_addr().unwrap().port();
+        connect_tcp_worker(|| held).await;
     }
 
     /// A probed port a neighbour took before the worker bound it is probed

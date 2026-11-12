@@ -32,7 +32,8 @@ pub trait Duty {
 pin_project! {
     /// A layer's future: the route's future, then the layer's duty handed
     /// the answer, taken at the answer. Dropped before the answer, the duty
-    /// is told so.
+    /// is told so before the route's future is dropped: the layer's word
+    /// about the close comes before the route's own teardown.
     pub struct DutyFuture<F, D>
     where
         D: Duty,
@@ -183,5 +184,38 @@ mod tests {
             },
         ));
         assert_eq!(*log.borrow(), ["dropped"]);
+    }
+
+    /// A route future whose drop writes to the log.
+    struct LoggedRoute {
+        log: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Future for LoggedRoute {
+        type Output = Result<Response, ()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for LoggedRoute {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push("inner dropped");
+        }
+    }
+
+    #[test]
+    fn the_duty_is_told_before_the_routes_future_is_dropped() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        drop(DutyFuture::new(
+            LoggedRoute {
+                log: Rc::clone(&log),
+            },
+            Logged {
+                log: Rc::clone(&log),
+            },
+        ));
+        assert_eq!(*log.borrow(), ["unanswered", "inner dropped"]);
     }
 }
