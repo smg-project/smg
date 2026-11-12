@@ -19,6 +19,16 @@ pub(in crate::worker) const FLUSH_HTTP_TIMEOUT: Duration = Duration::from_secs(4
 /// gRPC client's profile deadline.
 pub(in crate::worker) const PROFILE_HTTP_TIMEOUT: Duration = Duration::from_secs(630);
 
+/// An admin call's failure as the worker reports it: the worker, the call
+/// and why.
+pub(in crate::worker) fn failed(url: &str, operation: &str, reason: String) -> WorkerError {
+    WorkerError::OperationFailed {
+        url: url.to_string(),
+        operation: operation.to_string(),
+        reason,
+    }
+}
+
 /// POST an admin endpoint on an HTTP worker and map the outcome to a
 /// [`WorkerResult`].
 pub(in crate::worker) async fn admin_http_post(
@@ -38,16 +48,8 @@ pub(in crate::worker) async fn admin_http_post(
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => Ok(()),
-        Ok(resp) => Err(WorkerError::OperationFailed {
-            url,
-            operation: operation.to_string(),
-            reason: format!("HTTP {}", resp.status()),
-        }),
-        Err(e) => Err(WorkerError::OperationFailed {
-            url,
-            operation: operation.to_string(),
-            reason: e.to_string(),
-        }),
+        Ok(resp) => Err(failed(&url, operation, format!("HTTP {}", resp.status()))),
+        Err(e) => Err(failed(&url, operation, e.to_string())),
     }
 }
 
@@ -57,22 +59,18 @@ fn require_backend_client(
     operation: &str,
     client: Option<Arc<BackendClient>>,
 ) -> WorkerResult<Arc<BackendClient>> {
-    client.ok_or_else(|| WorkerError::OperationFailed {
-        url: url.to_string(),
-        operation: operation.to_string(),
-        reason: "no backend client available".to_string(),
-    })
+    client.ok_or_else(|| failed(url, operation, "no backend client available".to_string()))
 }
 
 /// A ZMQ engine whose wire carries no control calls (vLLM's EngineCore, a
 /// TokenSpeed scheduler that declares none) has no admin RPC: refused before
 /// anything is sent.
 fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
-    WorkerError::OperationFailed {
-        url: url.to_string(),
-        operation: operation.to_string(),
-        reason: format!("{operation} is not supported over this engine's ZMQ wire"),
-    }
+    failed(
+        url,
+        operation,
+        format!("{operation} is not supported over this engine's ZMQ wire"),
+    )
 }
 
 /// The worker's backend client for an admin op, refused when the backend
@@ -98,19 +96,15 @@ pub(in crate::worker) fn admin_grpc_result(
 ) -> WorkerResult<()> {
     match result {
         Ok((true, _)) => Ok(()),
-        Ok((false, message)) => Err(WorkerError::OperationFailed {
-            url: url.to_string(),
-            operation: operation.to_string(),
-            reason: if message.is_empty() {
+        Ok((false, message)) => Err(failed(
+            url,
+            operation,
+            if message.is_empty() {
                 "backend reported failure".to_string()
             } else {
                 message
             },
-        }),
-        Err(status) => Err(WorkerError::OperationFailed {
-            url: url.to_string(),
-            operation: operation.to_string(),
-            reason: status.to_string(),
-        }),
+        )),
+        Err(status) => Err(failed(url, operation, status.to_string())),
     }
 }
