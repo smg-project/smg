@@ -83,7 +83,10 @@ use crate::{
         request_id::{is_acceptable_inbound_id, REQUEST_ID},
     },
     observability::metrics::Metrics,
-    routers::{common::sse_rechunk::find_frame_end, error as route_error},
+    routers::{
+        common::sse_rechunk::{find_frame_end, DELIMITER_OVERLAP},
+        error as route_error,
+    },
 };
 
 /// The turns the store keeps: the newest 10,000, each for an hour after it
@@ -659,6 +662,10 @@ struct StreamedTurn {
     held: Vec<u8>,
     /// The bytes of the event not yet complete, parsed when it is.
     carry: Vec<u8>,
+    /// Where the last scan of `held` and of `carry` stopped: the next scan
+    /// resumes there, so an event that arrives in many frames is read once.
+    held_scanned: usize,
+    carry_scanned: usize,
     /// Every byte passes as it comes: `message_start` is through, or the
     /// stream opened with an error.
     passing: bool,
@@ -715,6 +722,8 @@ impl StreamedTurn {
             turn: Some(turn),
             held: Vec::new(),
             carry: Vec::new(),
+            held_scanned: 0,
+            carry_scanned: 0,
             passing: false,
             place: None,
             answer: None,
@@ -733,7 +742,8 @@ impl StreamedTurn {
         }
         self.held.extend_from_slice(&data);
         let mut out = Vec::new();
-        while let Some(end) = event_end(&self.held) {
+        while let Some(end) = event_end(&self.held, self.held_scanned) {
+            self.held_scanned = 0;
             match parse_event(&self.held[..end]) {
                 Ok(Some(MessageStreamEvent::MessageStart { message })) => {
                     let event: Vec<u8> = self.held.drain(..end).collect();
@@ -754,9 +764,11 @@ impl StreamedTurn {
                 _ => out.extend(self.held.drain(..end)),
             }
         }
+        self.held_scanned = self.held.len();
         if !self.passing && self.held.len() > EVENT_LIMIT {
             self.passing = true;
             out.append(&mut self.held);
+            self.held_scanned = 0;
             self.decline("no event end within the size limit");
         }
         (!out.is_empty()).then(|| Bytes::from(out))
@@ -818,7 +830,8 @@ impl StreamedTurn {
             return;
         }
         self.carry.extend_from_slice(data);
-        while let Some(end) = event_end(&self.carry) {
+        while let Some(end) = event_end(&self.carry, self.carry_scanned) {
+            self.carry_scanned = 0;
             let parsed = parse_event(&self.carry[..end]);
             self.carry.drain(..end);
             match parsed {
@@ -831,9 +844,11 @@ impl StreamedTurn {
                 break;
             }
         }
+        self.carry_scanned = self.carry.len();
         if self.place.is_some() && self.carry.len() > EVENT_LIMIT {
             self.decline("no event end within the size limit");
             self.carry.clear();
+            self.carry_scanned = 0;
         }
     }
 
@@ -960,6 +975,7 @@ impl HttpBody for StreamedTurn {
                     this.ended = true;
                     this.give_up();
                     let held = std::mem::take(&mut this.held);
+                    this.held_scanned = 0;
                     return if held.is_empty() {
                         Poll::Ready(None)
                     } else {
@@ -1116,9 +1132,19 @@ fn slot(index: u32) -> Option<usize> {
 
 /// The end of the first complete event in `buffer` (the index after its
 /// blank line, in any of the three framings the relay reads), when there is
-/// one.
-fn event_end(buffer: &[u8]) -> Option<usize> {
-    find_frame_end(buffer, 0).map(|(at, len)| at + len)
+/// one. `scanned` is where the last scan of this buffer stopped; the scan
+/// resumes a delimiter's overlap before it, since a four-byte delimiter can
+/// straddle the frame boundary the last scan ended at. An event that arrives in many
+/// frames is read once this way, not once per frame.
+fn event_end(buffer: &[u8], scanned: usize) -> Option<usize> {
+    let from = scanned.saturating_sub(DELIMITER_OVERLAP);
+    let end = find_frame_end(buffer, from);
+    #[cfg(test)]
+    tests::SCAN_POSITIONS.with(|cell| {
+        let visited = end.map_or(buffer.len(), |(at, _)| at + 1);
+        cell.set(cell.get() + visited.saturating_sub(from));
+    });
+    end.map(|(at, len)| at + len)
 }
 
 /// Data this gateway cannot read as a stream event. The answer it is part
@@ -1164,7 +1190,7 @@ fn start_event(message: &Message) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{cell::Cell, time::Duration};
 
     use axum::{body::Bytes, http::header, response::IntoResponse, Json};
     use futures::{stream, StreamExt};
@@ -2429,6 +2455,87 @@ mod tests {
                 .await,
         );
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    }
+
+    thread_local! {
+        /// The scan positions `event_end` visited on this thread, read by the
+        /// test that feeds one event in many frames.
+        pub(super) static SCAN_POSITIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// An event that arrives in many frames is scanned once: the scan of
+    /// each buffer resumes where it stopped, three bytes back, instead of
+    /// starting from the first byte at every frame.
+    #[tokio::test]
+    async fn an_event_in_many_frames_is_scanned_once() {
+        let threads = MessageThreads::new();
+        let text = "x".repeat(64 * 1024);
+        let bytes = sse(&text_events("msg_frames", &text));
+        let cuts: Vec<usize> = (1..bytes.len() / 1024).map(|k| k * 1024).collect();
+        let frames = cuts.len() + 1;
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        SCAN_POSITIONS.with(|cell| cell.set(0));
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &cuts))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        let positions = SCAN_POSITIONS.with(Cell::get);
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        assert!(
+            positions <= bytes.len() + 4 * frames,
+            "{positions} scan positions over {} bytes in {frames} frames",
+            bytes.len()
+        );
+        let stored = threads
+            .store
+            .get_response(&ResponseId::from("msg_frames"))
+            .await
+            .expect("the store");
+        assert!(stored.is_some(), "the turn is stored");
+    }
+
+    /// A frame boundary inside an event's delimiter still ends the event, at
+    /// every split of the two-byte and of the four-byte delimiter: the
+    /// resumed scan starts a delimiter's overlap back, before the first
+    /// `message_start` and within the answer alike.
+    #[tokio::test]
+    async fn a_delimiter_split_by_a_frame_boundary_still_ends_the_event() {
+        let events = text_events("msg_split", "hello");
+        let crlf: Vec<u8> = events
+            .iter()
+            .flat_map(|(name, data)| format!("event: {name}\r\ndata: {data}\r\n\r\n").into_bytes())
+            .collect();
+        for (bytes, delimiter) in [(sse(&events), 2), (crlf, 4)] {
+            let first_end = event_end(&bytes, 0).expect("the first event");
+            let second_end =
+                event_end(&bytes[first_end..], 0).expect("the second event") + first_end;
+            for cut in (1..delimiter).flat_map(|back| [first_end - back, second_end - back]) {
+                let threads = MessageThreads::new();
+                let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+                let answered = threads
+                    .stored(turn.expect("a turn"), streamed(&bytes, &[cut]))
+                    .await;
+                let read = to_bytes(answered.into_body(), usize::MAX)
+                    .await
+                    .expect("the stream");
+                assert_eq!(
+                    read.as_ref(),
+                    bytes.as_slice(),
+                    "cut at {cut} of a {delimiter}-byte delimiter"
+                );
+                let stored = threads
+                    .store
+                    .get_response(&ResponseId::from("msg_split"))
+                    .await
+                    .expect("the store");
+                assert!(
+                    stored.is_some(),
+                    "the turn is stored with the cut at {cut} of a {delimiter}-byte delimiter"
+                );
+            }
+        }
     }
 
     /// A body with no event end within the limit is not a stream this
