@@ -1607,3 +1607,24 @@ fn the_packed_request_block_keeps_its_u64_sections_aligned() {
         );
     }
 }
+
+/// The lease-id layout's bounds as `LeaseOrigin` states them: terms below
+/// 2^31 fit the 31 id bits, the per-term counter starts at 1 and never wraps
+/// into the term bits, so a controller-minted id is never 0 and never repeats
+/// across terms. The sentences are pinned beside the layout they bound.
+#[test]
+fn the_lease_id_layout_states_its_bounds() {
+    let proto = std::fs::read_to_string(contracts_dir().join(PLUGIN_PROTO))
+        .expect("the plugin protocol reads");
+    for sentence in [
+        "terms\n// stay below 2^31",
+        "the counter starts at 1",
+        "bumps its term before it mints again",
+        "never 0 and\n// never repeats across terms",
+    ] {
+        assert!(
+            proto.contains(sentence),
+            "LeaseOrigin states the id bounds: {sentence:?}"
+        );
+    }
+}

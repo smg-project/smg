@@ -1,65 +1,46 @@
 // smg.policy.v1: the policy controller's gateway, ingestion, control and
 // replication protocol (design 5.2 and appendix A). The view and decision
 // vocabulary is in policy_plugin.proto; the relay frames carry the engine
-// wire's own messages (smg.grpc.common) unchanged, so a relay forwards what
-// it received and no second load or event message exists.
+// wire's own messages (smg.grpc.common) unchanged.
 //
-// Scopes and principals (design 5.2). Four credentialed scopes, each
+// Versioning: design appendix A (additive within v1). The package is
+// pre-release until the first shipped release that carries it; the rule
+// binds from then on.
+//
+// Scopes and principals: design 5.2. Four credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
-// metadata, never a message field the peer fills in:
-// - gateway: Session, Decide, WatchWorkers and Leader (read-only: the term
-//   floor of design 5.3). mTLS, or a per-gateway bearer token; the verified
-//   subject IS the gateway id that keys the leases. A
-//   Hello whose gateway_id differs from the subject, or a stream with no
-//   verified subject, is refused with UNAUTHENTICATED and the stream closes.
-// - ingestion: PushLoad, PushKvEvents. A per-relay credential; the relay's
-//   verified subject is recorded as the RELAY origin.
-// - control: the unary operator RPCs and WatchRegime. The existing control
-//   plane keys and roles: `user` reads (GetSnapshot, Explain, GetPolicySpec,
-//   Leader, WatchRegime), `admin` writes (the rest). Every call writes the
-//   audit event; an apply carries the spec digest and a one-line diff.
-// - replication: Replicate, and GetSnapshot as the re-sync base (served
-//   complete and unredacted to this scope only). A replica credential;
-//   ReplicaHello.replica_id must equal the verified subject.
-// Leader is served to every scope: a relay or a standby finds the leader
-// after a failover as a gateway does, read-only.
-// Standbys serve Leader, WatchWorkers, GetSnapshot and GetPolicySpec (from the
-// replicated documents: GenerationEvent and Snapshot.documents); Session and
-// Decide on a standby answer NotLeader / Busy { NOT_LEADER }.
-//
-// Fencing (design 5.3). Every ControllerFrame and DecideAnswer carries the
-// leader's term; every GatewayFrame carries the gateway's term floor. A
-// leader past its renew deadline sends NotLeader with an empty address and
-// releases nothing; a gateway raises its floor from Leader (polled on every
-// replica once a second) and rejects frames below it; the controller refuses
-// a frame whose floor is above its own term with FAILED_PRECONDITION (it is
-// no longer the leader and has not noticed).
-//
-// Flow (design 5.2). Budgets are relative to receipt, never absolute. Credits
-// are per Decide stream and ride that stream as deltas, as HTTP/2's
-// WINDOW_UPDATE: Welcome sets the initial window, each DecideRequest spends
-// one credit, no answer returns one, Credit frames on the DecideAnswer side
-// add more and the controller never takes credit back; with no credit the
-// gateway decides locally at once; a Decide whose budget is gone on arrival
-// is answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease; a Decision
-// that arrives after a fallback is answered with Released. Both HTTP/2
-// windows are set explicitly as the worker channels do.
-//
-// Error model (gRPC status; in-band messages where a stream cannot end):
-// - UNAUTHENTICATED: no verified principal, or Hello's id is not the subject.
-// - PERMISSION_DENIED: the scope or role does not cover the RPC.
-// - FAILED_PRECONDITION: not the leader (details: NotLeader); a term floor
-//   above the controller's term; a revision guard failed (Patch, Deregister)
-//   or the digest guard did (Apply's expected_digest).
-// - INVALID_ARGUMENT: a spec or registration rejected; ApplyResult.issues and
-//   the status detail carry the field path.
-// - RESOURCE_EXHAUSTED: a relay stream over its per-subscriber budget; a
-//   standby over its backlog (ReplicationBatch.resync_required precedes it).
-// - OUT_OF_RANGE / DATA_LOSS: never raised by the controller; a relay
-//   forwards them as RelayResync frames.
-// - UNAVAILABLE: a standby not yet synced for an RPC that needs the store.
-// - ABORTED: the leader fenced itself mid-stream; reconnect through Leader.
-// Within a stream: Busy, NotLeader, SpecAck { accepted: false }, Decline.
+// metadata, never a field a peer fills in. Gateway: Session, Decide,
+// WatchWorkers and Leader; a Hello whose gateway_id is not the verified
+// subject is refused with UNAUTHENTICATED and the stream closes. Ingestion:
+// PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
+// Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
+// WatchRegime), `admin` writes the rest; every call writes an audit event.
+// Replication: Replicate, and GetSnapshot as the re-sync base;
+// ReplicaHello.replica_id must equal the subject. Leader is served to every
+// scope; a standby serves Leader, WatchWorkers, GetSnapshot and GetPolicySpec
+// and answers Session and Decide with NotLeader / Busy { NOT_LEADER }.
+// Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
+// leader's term, every GatewayFrame the gateway's term floor. A gateway
+// raises its floor from Leader and rejects frames below it; the controller
+// refuses a floor above its own term with FAILED_PRECONDITION; a leader past
+// its renew deadline sends NotLeader with an empty address and releases
+// nothing.
+// Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
+// ride the Decide stream as deltas (Credit) and are never taken back; with
+// no credit the gateway decides locally; a Decide whose budget is gone on
+// arrival is answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease; a
+// Decision that arrives after a fallback is answered with Released.
+// Errors (gRPC status): UNAUTHENTICATED no verified principal, or Hello's
+// id is not the subject (the stream closes); PERMISSION_DENIED the scope or
+// role does not cover the RPC; FAILED_PRECONDITION not the leader (a
+// NotLeader in the status details), a floor above the term, a revision or
+// digest guard; INVALID_ARGUMENT a spec or registration rejected (the field
+// path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
+// relay over its per-subscriber budget or a standby over its backlog (a
+// resync_required batch precedes it); UNAVAILABLE a standby not yet synced;
+// ABORTED fenced mid-stream, reconnect through Leader; OUT_OF_RANGE and
+// DATA_LOSS never raised, forwarded as RelayResync. In-band within a stream:
+// Busy, NotLeader, SpecAck { accepted: false }, Decline.
 
 syntax = "proto3";
 package smg.policy.v1;
@@ -68,20 +49,17 @@ import "policy_plugin.proto";
 import "common.proto";
 
 service PolicyController {
-  // gateway scope
-  // One per gateway: identity, leases, pins, vetoes, acknowledgements in;
-  // welcome, terms, spec pushes and pre-emptions out.
+  // Gateway scope, one bidirectional stream per gateway: identity, leases,
+  // pins, vetoes and acks in; welcome, terms, spec pushes, pre-emptions out.
   rpc Session(stream GatewayFrame) returns (stream ControllerFrame);
-  // One per gateway runtime thread; demultiplexed into per-shard bounded
-  // queues.
+  // Gateway scope, one bidirectional stream per gateway runtime thread.
   rpc Decide(stream DecideRequest) returns (stream DecideAnswer);
-  // Membership, health, the id-to-URL map and the needs summary: a snapshot
-  // then the tail, resumable by epoch.
+  // Gateway scope, server stream: a snapshot then the tail, resumable by seq.
   rpc WatchWorkers(WatchWorkersRequest) returns (stream WorkerEvent);
-  // ingestion scope (relays only: a gateway in front of a host-local wire)
+  // Ingestion scope (relays only), client streams answered once at the end.
   rpc PushLoad(stream LoadReport) returns (Ack);
   rpc PushKvEvents(stream RelayKvFrame) returns (Ack);
-  // control scope
+  // Control scope, unary.
   rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerEvent);
   rpc PatchWorker(PatchWorkerRequest) returns (WorkerEvent);
   rpc DeregisterWorker(DeregisterWorkerRequest) returns (WorkerEvent);
@@ -90,25 +68,23 @@ service PolicyController {
   rpc ApplyPolicySpec(ApplyRequest) returns (ApplyResult);
   rpc GetPolicySpec(GetPolicySpecRequest) returns (PolicySpecDocument);
   rpc RollbackPolicySpec(RollbackRequest) returns (ApplyResult);
-  // Served by every replica to every scope: a gateway polls it for its term
-  // floor (design 5.3); the control plane reads it.
+  // Every scope, unary, served by every replica: a gateway polls it for its
+  // term floor.
   rpc Leader(LeaderRequest) returns (LeaderInfo);
+  // Control scope, unary.
   rpc StepDown(StepDownRequest) returns (Ack);
+  // Control scope, server stream.
   rpc WatchRegime(RegimeRequest) returns (stream Regime);
-  // replication scope (design 5.4): the leader's ordered log to a standby,
-  // acknowledged per batch, cut past a bounded backlog.
+  // Replication scope, one bidirectional stream per standby: the leader's
+  // ordered log, acknowledged per batch, cut past a bounded backlog.
   rpc Replicate(stream ReplicaFrame) returns (stream ReplicationBatch);
-  // Liveness and readiness are grpc.health.v1, not here: readiness is
-  // "leader and warm" or "standby and synced" (design 5.4).
+  // Liveness and readiness are grpc.health.v1, not here.
 }
 
-// ---------------------------------------------------------------------------
-// Session: gateway to controller.
-// ---------------------------------------------------------------------------
+// --- Session: gateway to controller -----------------------------------------
 
 message GatewayFrame {
   uint64 seq = 1;
-  // The highest term this gateway has seen.
   uint64 term_floor = 2;
   oneof frame {
     Hello hello = 3;
@@ -121,18 +97,15 @@ message GatewayFrame {
   }
 }
 
-// Identity and what the gateway holds. The leases, pins and vetoes follow in
-// HelloPage frames (design 8: a Hello storm after a failover is paged); the
-// counts here let the controller size the restore. About 60 bytes plus the
-// locality strings.
+// What the gateway holds; the leases, pins and vetoes follow in HelloPage
+// frames, the counts here size the restore.
 message Hello {
-  // Must equal the verified subject; a claim, not an authority.
+  // Must equal the verified subject.
   string gateway_id = 1;
   uint32 protocol_min = 2;
   uint32 protocol_max = 3;
   uint64 term_seen = 4;
   Locality locality = 5;
-  // Decide streams the gateway will open (its runtime threads).
   uint32 decide_streams = 6;
   // The spec generation its fallback engine runs.
   uint64 generation = 7;
@@ -144,14 +117,17 @@ message Hello {
   bool resume = 11;
   // The gateway's release string, for the audit log.
   string version = 16;
+  // Never assigned; kept out of use so a later field takes a fresh number.
+  reserved 12 to 15;
 }
 
 message Locality {
   string zone = 1;
-  // Topology keys as `key=value`, for the placement stages (design 4.4).
+  // Topology keys as `key=value`, for the placement stages.
   repeated string topology = 2;
 }
 
+// At most 64 KB a page (about 900 leases); the counts in Hello size the whole.
 message HelloPage {
   repeated LeaseAssertion leases = 1;
   repeated Pin pins = 2;
@@ -159,8 +135,7 @@ message HelloPage {
   bool last = 4;
 }
 
-// A lease the gateway still holds, controller-minted or local (design 8; the
-// two id spaces are disjoint by bit 63, see LeaseOrigin).
+// A lease the gateway still holds, controller-minted or local (LeaseOrigin).
 message LeaseAssertion {
   Lease lease = 1;
   bytes request_id = 2;
@@ -170,8 +145,7 @@ message LeaseAssertion {
   uint32 age_ms = 6;
 }
 
-// A recent session pin (design 5.3: the pins' second home). About 45 bytes
-// with a 21-byte model name.
+// A session pin the gateway holds.
 message Pin {
   fixed64 key = 1;
   fixed64 worker_id = 2;
@@ -201,20 +175,17 @@ message GatewayVeto {
   bool clear = 4;
 }
 
-// The gateway's answer to a SpecPush (design 4.6 generations).
+// The gateway's answer to a SpecPush.
 message SpecAck {
   uint64 generation = 1;
   bool accepted = 2;
   string error = 3;
 }
 
-// ---------------------------------------------------------------------------
-// Session: controller to gateway.
-// ---------------------------------------------------------------------------
+// --- Session: controller to gateway -----------------------------------------
 
 message ControllerFrame {
   uint64 seq = 1;
-  // The leader's term on every frame (design 5.3).
   uint64 term = 2;
   oneof frame {
     Welcome welcome = 3;
@@ -224,33 +195,28 @@ message ControllerFrame {
   }
 }
 
-// The controller's answer to Hello. The verified principal is echoed so a
-// misconfigured credential shows up in the gateway's log, not in a refused
-// lease weeks later.
+// The answer to Hello; `principal` echoes what the transport verified.
 message Welcome {
   uint32 protocol = 1;
   uint64 generation = 2;
   string controller_id = 3;
   Principal principal = 4;
   NeedsSummary needs = 5;
-  // Block size and seed rule per model, for the host's hashing step
-  // (design 4.1).
+  // Block size and seed rule per model, for the host's hashing step.
   repeated ModelHashing hashing = 6;
-  // Initial credit per Decide stream (DecideRequests the gateway may send
-  // before a Credit frame adds more); a new Decide stream starts here again.
+  // Initial credit per Decide stream; a new Decide stream starts here again.
   uint32 decide_window = 7;
   uint32 max_decide_streams = 8;
-  // The stream rule's grace period and the default dispatch TTL (design 4.3).
+  // The stream rule's grace period and the default dispatch TTL.
   uint32 grace_period_ms = 9;
   uint32 dispatch_ttl_ms = 10;
   // How often the gateway polls Leader for its term floor.
   uint32 leader_poll_ms = 11;
-  // Leases and pins restored from the Hello pages, for the gateway's log.
   uint32 leases_restored = 12;
   uint32 pins_restored = 13;
 }
 
-// What the transport verified (design 5.2).
+// What the transport verified.
 message Principal {
   string subject = 1;
   enum Scope {
@@ -272,8 +238,7 @@ message Principal {
   string role = 4;
 }
 
-// The validation's needs per model and role (design 4.6): what the host
-// feeds before any request exists.
+// What the host must feed per model and role, from the spec's validation.
 message NeedsSummary {
   repeated ModelNeeds models = 1;
 }
@@ -299,23 +264,19 @@ message ModelHashing {
   string seed_rule = 4;
 }
 
-// The term is on the frame. An empty address means "fenced, no leader
-// known": re-resolve through Leader.
+// An empty address means fenced, no leader known: re-resolve through Leader.
 message NotLeader {
   string leader_address = 1;
   string successor_id = 2;
 }
 
-// Reserved lifecycle frame: abort the named lease (design 4.2; off unless
-// admission.eviction).
+// Reserved: abort the named lease (off unless admission.eviction).
 message Preempt {
   fixed64 lease_id = 1;
   string reason = 2;
 }
 
-// The generation's document, pushed to every gateway so its fallback engine
-// runs the same spec (design 4.6); the gateway answers SpecAck. The document
-// is bounded (a few KB).
+// The generation's document for every fallback engine; answered by SpecAck.
 message SpecPush {
   uint64 generation = 1;
   string digest = 2;
@@ -325,13 +286,10 @@ message SpecPush {
   NeedsSummary needs = 5;
 }
 
-// ---------------------------------------------------------------------------
-// Decide: one stream per gateway runtime thread.
-// ---------------------------------------------------------------------------
+// --- Decide: one stream per gateway runtime thread --------------------------
 
 // Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
-// repeated Decide after a stream reset returns the standing decision
-// (design 4.3). About 110 bytes plus 8 per block hash and the headers.
+// repeated Decide after a stream reset returns the standing decision.
 message DecideRequest {
   bytes request_id = 1;
   RequestFacts facts = 2;
@@ -349,31 +307,22 @@ message DecideAnswer {
   }
 }
 
-// Credit added to this Decide stream, a delta as HTTP/2's WINDOW_UPDATE: each
-// DecideRequest spends one, no answer (Decision or Busy) returns one, the
-// controller grants less when it wants fewer in flight and never takes credit
-// back, and a new Decide stream starts again at Welcome.decide_window. About 6
-// bytes in its envelope; 20 on the wire with the gRPC and HTTP/2 framing.
+// Credit added to this Decide stream, a delta as HTTP/2's WINDOW_UPDATE:
+// each DecideRequest spends one, no answer returns one, the controller never
+// takes credit back; a new stream starts again at Welcome.decide_window.
 message Credit {
   uint32 window = 1;
 }
 
-// ---------------------------------------------------------------------------
-// WatchWorkers (design 5.2): the row carries what the gateway's pools derive
-// from (wire, role, runtime, PD eligibility), the id-to-URL map, the health
-// hint and the reachability; a watcher that lags past the server's buffer is
-// told to re-read a snapshot.
-// ---------------------------------------------------------------------------
+// --- WatchWorkers: membership, health, the id-to-URL map, the needs ---------
 
 message WatchWorkersRequest {
   // Empty for every model.
   repeated string models = 1;
-  // 0: a snapshot first, then the tail; otherwise the tail after this
-  // sequence number, exclusive (the first event sent is seq + 1, as Replicate
-  // resumes by last_applied_seq). When the buffer no longer holds seq + 1 the
-  // server answers one SnapshotRequired and ends the stream; the watcher
-  // reconnects with 0. Every event carries its own seq; membership_epoch
-  // moves only on a membership change and is not a resume point.
+  // 0: a snapshot first, then the tail; otherwise the tail after this seq,
+  // exclusive; when the buffer no longer holds seq + 1 the server answers one
+  // SnapshotRequired and ends the stream. membership_epoch moves only on a
+  // membership change and is no resume point.
   uint64 resume_seq = 2;
   bool with_needs = 3;
 }
@@ -389,14 +338,12 @@ message WorkerEvent {
     StatusChanged status = 7;
     WorkerRow relabelled = 8;
     NeedsSummary needs = 9;
-    // The tail cannot resume after the requested seq (the buffer starts at
-    // oldest_seq): the stream ends; re-read with resume_seq 0.
+    // The tail cannot resume after the requested seq: the stream ends.
     SnapshotRequired snapshot_required = 10;
   }
 }
 
-// Paged at 128 rows under one epoch; a watcher applies the pages and
-// switches at `last`.
+// Paged at 128 rows under one epoch; a watcher switches at `last`.
 message WorkerSnapshot {
   repeated WorkerRow workers = 1;
   bool last = 2;
@@ -406,11 +353,11 @@ message SnapshotRequired {
   uint64 oldest_seq = 1;
 }
 
-// Same registration key, new incarnation (design 5.1).
+// Same registration key, new incarnation.
 message Replaced {
   WorkerRow old = 1;
   WorkerRow new = 2;
-  // Runtime and breaker state carried over because the registration matched.
+  // Runtime and breaker state carried over.
   bool state_carried = 3;
 }
 
@@ -433,23 +380,18 @@ message StatusChanged {
   fixed64 worker_id = 1;
   WorkerStatus old = 2;
   WorkerStatus new = 3;
-  // HealthFlag bits after the transition: the hint the membership lane
-  // carried (design 5.1).
+  // HealthFlag bits after the transition.
   uint32 health = 4;
 }
 
-// The worker row of the store (design 5.1): 0.5 to 1.5 KB in memory, about
-// 270 bytes encoded with six short labels.
 message WorkerRow {
   fixed64 id = 1;
   string registration_key = 2;
   uint64 incarnation = 3;
   string url = 4;
-  // The one wire this registration serves (a registration is one URL on one
-  // wire); the view's `wire_modes` bits carry it with one bit set.
+  // The one wire this registration serves (one URL on one wire).
   WireMode wire = 5;
   Role role = 6;
-  // The registration's runtime name; interned per spec for the view.
   string runtime = 7;
   repeated string models = 8;
   uint32 dp_size = 9;
@@ -464,14 +406,13 @@ message WorkerRow {
   OverloadThresholds overload = 17;
   Signals signals = 18;
   uint32 kv_block_size = 19;
-  // The registration label `policy`: a lowest-precedence binding for the
-  // worker's model (design 4.6).
+  // The registration label `policy`: a lowest-precedence binding of the model.
   string policy = 20;
   repeated string topology = 21;
   uint32 max_running = 22;
 }
 
-// A host-local wire is reachable from one gateway only (design 4.1).
+// A host-local wire is reachable from one gateway only.
 message Reachability {
   oneof scope {
     bool any = 1;
@@ -479,8 +420,7 @@ message Reachability {
   }
 }
 
-// What one PD worker offers a rendezvous partner, as the gateway derives it
-// today, plus the class the store assigns (design 5.1).
+// What one PD worker offers a rendezvous partner, and the store's class.
 message PairingDescriptor {
   string protocol = 1;
   string connector = 2;
@@ -495,8 +435,7 @@ message PairingDescriptor {
   bool vision = 11;
 }
 
-// Per-worker overload overrides over the spec's defaults (design 4.6); unset
-// means the spec's value.
+// Per-worker overrides over the spec's defaults; unset means the spec's value.
 message OverloadThresholds {
   optional uint32 queue_limit = 1;
   optional uint32 kv_usage_permille = 2;
@@ -504,45 +443,35 @@ message OverloadThresholds {
   optional uint32 waiting_tokens_limit = 4;
 }
 
-// How the controller learns the worker's loads and events (design 5.1
-// `signals`).
+// How the controller learns the worker's loads and events.
 message Signals {
   bool events = 1;
   bool loads = 2;
   bool scrape = 3;
   uint32 scrape_interval_ms = 4;
-  // The scrape source's engine-family name map entry.
+  // The scrape source's engine-family name.
   string scrape_family = 5;
 }
 
-// ---------------------------------------------------------------------------
-// Ingestion scope: relays only (design 5.1). A gateway in front of a
-// host-local wire forwards the engine wire's records and batches as it
-// received them; the controller applies them through the same sinks as its
-// own subscriptions. The relay's verified subject is the origin.
-// ---------------------------------------------------------------------------
+// --- Ingestion scope: relays only -------------------------------------------
 
-// One load record of one rank. The record is the engine wire's EngineLoad
-// unchanged (about 48 bytes); the frame adds the worker, the rank, the
-// relay's source and receipt: about 20 bytes.
+// One load record of one rank: the engine wire's EngineLoad unchanged, with
+// the worker, the rank and the relay's receipt; a gateway in front of a
+// host-local wire forwards what it received, its verified subject the origin.
 message LoadReport {
   fixed64 worker_id = 1;
   // When the relay has no id yet (a worker it registered itself).
   string registration_key = 2;
   uint32 dp_rank = 3;
   smg.grpc.common.EngineLoad record = 4;
-  // EVENTS, POLL or SCRAPE at the relay; the controller records RELAY as the
-  // hop and keeps this as the record's own source.
+  // EVENTS, POLL or SCRAPE at the relay; the controller records the RELAY hop.
   SignalSource source = 5;
-  // The relay's receipt, microseconds since its stream opened; the controller
-  // stamps its own receipt and keeps both for the poll-mode arbitration.
+  // The relay's receipt, microseconds since its stream opened.
   uint64 received_offset_micros = 6;
   uint64 relay_seq = 7;
 }
 
-// One frame of a relayed KV event stream: the engine wire's batch unchanged,
-// or the stream's status the relay saw, so the controller can tell a relay
-// restart from an engine restart.
+// The engine wire's event batch unchanged, or the stream status the relay saw.
 message RelayKvFrame {
   fixed64 worker_id = 1;
   string registration_key = 2;
@@ -561,9 +490,7 @@ message RelaySubscribed {
   uint32 dp_size = 3;
 }
 
-// The engine wire's status codes as frames: OUT_OF_RANGE (the cursor
-// expired), DATA_LOSS (the subscriber fell behind), a clean end, an abandoned
-// snapshot, the relay's own restart, a same-URL replacement.
+// The engine wire's status codes and stream ends as frames.
 message RelayResync {
   enum Reason {
     REASON_UNSPECIFIED = 0;
@@ -583,9 +510,7 @@ message RelayEnded {
   string reason = 1;
 }
 
-// ---------------------------------------------------------------------------
-// Control scope: membership (design 5.2).
-// ---------------------------------------------------------------------------
+// --- Control scope: membership ----------------------------------------------
 
 message RegisterWorkerRequest {
   WorkerSpec spec = 1;
@@ -596,16 +521,14 @@ message RegisterWorkerRequest {
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
-  // Wait for the handshake (today's API waits for the whole registration
-  // workflow); otherwise the row is answered PENDING and the handshake runs
-  // in the controller, its result a StatusChanged on WatchWorkers.
+  // Wait for the handshake; otherwise the row is answered PENDING and the
+  // handshake's result is a StatusChanged on WatchWorkers.
   bool wait_ready = 3;
 }
 
-// What a registration says before the handshake fills the row.
+// A registration before the handshake fills the row.
 message WorkerSpec {
   string url = 1;
-  // One wire per registration, as on the row.
   WireMode wire = 2;
   Role role = 3;
   string runtime = 4;
@@ -615,7 +538,7 @@ message WorkerSpec {
   OverloadThresholds overload = 8;
   uint32 kv_block_size = 9;
   PairingDescriptor pairing = 10;
-  // 0: discover the data-parallel width (always on, design 4.1).
+  // 0: discover the data-parallel width (always on).
   uint32 dp_size = 11;
   Signals signals = 12;
   repeated string topology = 13;
@@ -634,17 +557,15 @@ message DeregisterWorkerRequest {
   fixed64 worker_id = 1;
   uint64 revision = 2;
   // Drain (no new leases, Removed after the last Completed) instead of an
-  // immediate removal that releases its leases (design 8).
+  // immediate removal that releases its leases.
   bool drain = 3;
 }
 
-// ---------------------------------------------------------------------------
-// Control scope: the store (design 5.2 GetSnapshot). Redacted by default:
-// URLs lose credentials, session keys and header values are fingerprinted,
-// plugin state dumps hash identifiers. The replication scope's call is
-// served complete and unredacted: it is a standby's re-sync base.
-// ---------------------------------------------------------------------------
+// --- Control scope: the store -----------------------------------------------
 
+// Redacted by default: URLs lose credentials, session keys and header values
+// are fingerprinted, plugin state dumps hash identifiers. The replication
+// scope's call is served complete and unredacted: a standby's re-sync base.
 message SnapshotRequest {
   enum Slice {
     SLICE_UNSPECIFIED = 0;
@@ -662,8 +583,7 @@ message SnapshotRequest {
   // Empty for every slice.
   repeated Slice slices = 1;
   repeated string models = 2;
-  // Admin only in the control scope: identifiers in clear. The replication
-  // scope's snapshot is unredacted without it.
+  // Admin only in the control scope: identifiers in clear.
   bool plain_identifiers = 3;
   // Rows per slice at most; `truncated` says when it bit.
   uint32 limit = 4;
@@ -684,24 +604,20 @@ message Snapshot {
   KvIndexSummary kv_index = 12;
   repeated GatewayRow gateways = 13;
   bool truncated = 14;
-  // The replication log position the snapshot is consistent with: a standby
-  // re-syncing after `resync_required` rejoins with `last_applied_seq` at
-  // this value (design 5.4). Non-zero only on a complete snapshot taken in
-  // the replication scope: every slice, every model, no `limit`, unredacted;
-  // a partial or redacted snapshot carries zero and is no re-sync base.
+  // The log position the snapshot is consistent with (a standby rejoins with
+  // `last_applied_seq` here); non-zero only on a complete, unredacted snapshot
+  // of the replication scope, zero on a partial or redacted one.
   uint64 replication_seq = 15;
-  // The interned-id table at that position, so the standby's index positions
-  // match the leader's.
+  // The interned-id table at that position.
   IdAssignment ids = 16;
-  // The current generation's document first, then every retained one in
-  // `spec.retained`'s order, as the gateways receive them: a standby re-syncing
-  // from this base serves GetPolicySpec and RollbackPolicySpec and runs the
-  // generation after promotion (design 5.4). Present with `replication_seq`;
-  // empty on a partial or redacted snapshot.
-  repeated SpecPush documents = 17;
+  // The current generation first, then every retained one in `spec.retained`'s
+  // order, each as the log replicates it (status and document), so a standby
+  // answers GetPolicySpec alike from either path; present with
+  // `replication_seq`.
+  repeated GenerationEvent documents = 17;
 }
 
-// The health precedence's inputs (design 5.1).
+// The health precedence's inputs.
 message HealthRow {
   fixed64 worker_id = 1;
   uint32 health = 2;
@@ -747,7 +663,7 @@ message PairRow {
 enum ApplyMode {
   APPLY_MODE_UNSPECIFIED = 0;
   APPLY_MODE_ENFORCE = 1;
-  // A new generation runs as the shadow of the current one (design 4.6).
+  // A new generation runs as the shadow of the current one.
   APPLY_MODE_AUDIT = 2;
   // Validate and report the needs diff; nothing persisted.
   APPLY_MODE_DRY_RUN = 3;
@@ -760,8 +676,7 @@ message SpecStatus {
   ApplyMode mode = 4;
   // Generations retained for RollbackPolicySpec.
   repeated uint64 retained = 5 [packed = true];
-  // `file` or `api`: the spec's two forms (design 4.6); it has no resource
-  // form.
+  // `file` or `api`.
   string source = 6;
 }
 
@@ -786,8 +701,6 @@ message KvIndexSummary {
   uint32 models = 5;
 }
 
-// What the controller knows per gateway, including the generation it
-// acknowledged (design 4.6).
 message GatewayRow {
   string gateway_id = 1;
   uint64 acknowledged_generation = 2;
@@ -798,9 +711,7 @@ message GatewayRow {
   uint32 protocol = 7;
 }
 
-// ---------------------------------------------------------------------------
-// Control scope: Explain and the spec (design 4.6, 5.2).
-// ---------------------------------------------------------------------------
+// --- Control scope: Explain and the spec ------------------------------------
 
 message ExplainRequest {
   oneof key {
@@ -811,10 +722,8 @@ message ExplainRequest {
   string gateway_id = 3;
 }
 
-// The durable record of one decision (design 4.6's sampled decision log), as
-// Explain and the author harness read it. Names are resolved from the
-// generation's spec; identities are redacted unless the principal is admin
-// and asked. About 800 bytes with eight scored candidates.
+// The durable record of one decision: names resolved from the generation's
+// spec, identities redacted unless the principal is admin and asked.
 message DecisionRecord {
   fixed64 decision_id = 1;
   bytes request_id = 2;
@@ -826,7 +735,7 @@ message DecisionRecord {
   RequestFacts request = 7;
   repeated Scored candidates = 8;
   Decision decision = 9;
-  // Which exposure each plugin saw (design 4.5).
+  // Which exposure each plugin saw.
   repeated PluginProjection projections = 10;
   // Joined later from the lifecycle; unset until then.
   Completed outcome = 11;
@@ -848,13 +757,12 @@ message ApplyRequest {
   // `yaml` or `json`.
   string format = 2;
   ApplyMode mode = 3;
-  // Optimistic concurrency: the digest of the generation the caller edited;
-  // FAILED_PRECONDITION when another apply landed first.
+  // The digest of the generation the caller edited; FAILED_PRECONDITION when
+  // another apply landed first.
   string expected_digest = 4;
 }
 
-// Persisted first, then applied (design 4.6). Under `source: file` the RPC
-// answers read_only.
+// Persisted first, then applied; under `source: file` the answer is read_only.
 message ApplyResult {
   bool accepted = 1;
   uint64 generation = 2;
@@ -903,13 +811,10 @@ message RollbackRequest {
   uint64 generation = 1;
 }
 
-// ---------------------------------------------------------------------------
-// Leadership and the regime (design 5.3, 5.4).
-// ---------------------------------------------------------------------------
+// --- Leadership and the regime ----------------------------------------------
 
 message LeaderRequest {
-  // Empty for the controller's own lease; a model for its group's lease
-  // (one lease per model group, design 5.5).
+  // Empty for the controller's own lease; a model for its group's lease.
   string model = 1;
 }
 
@@ -919,7 +824,7 @@ message LeaderInfo {
   string address = 2;
   uint64 term = 3;
   bool is_leader = 4;
-  // Synced on the three counts (design 5.4).
+  // Synced on replication lag, live ranks and generation (design 5.4).
   bool synced = 5;
   SyncState sync = 6;
   repeated GroupLeader groups = 7;
@@ -953,7 +858,7 @@ message RegimeRequest {
   uint32 interval_ms = 2;
 }
 
-// For autoscalers: per model group and zone (design 5.2).
+// For autoscalers: per model group and zone.
 message Regime {
   string model_group = 1;
   string zone = 2;
@@ -967,17 +872,11 @@ message Regime {
   uint64 generation = 9;
 }
 
-// ---------------------------------------------------------------------------
-// Replication (design 5.4). The typed log a standby applies: reservations
-// and their ends, pins, membership, health, loads and generations with their
-// documents, never
-// credits (the credit
-// stream alone would be a hundred times the rest at the leader's ceiling;
-// credits are rebuilt from Hello). Worker ids are interned in the same order
-// on every replica through IdAssignment, so a standby's index ids match the
-// leader's.
-// ---------------------------------------------------------------------------
+// --- Replication: the typed log a standby applies ---------------------------
 
+// Reservations and their ends, pins, membership, health, loads and
+// generations with their documents; never credits (rebuilt from Hello).
+// IdAssignment interns worker ids in the same order on every replica.
 message ReplicaFrame {
   oneof frame {
     ReplicaHello hello = 1;
@@ -1001,13 +900,10 @@ message ReplicationBatch {
   uint64 first_seq = 1;
   uint64 term = 2;
   repeated ReplicationEvent events = 3;
-  // The standby's backlog was cut: re-sync from GetSnapshot, then rejoin
-  // (design 5.4).
+  // The standby's backlog was cut: re-sync from GetSnapshot, then rejoin.
   bool resync_required = 4;
 }
 
-// Measured 40 bytes a load event, 78 a reservation, 27 its end, 46 a pin;
-// one worker row per membership event.
 message ReplicationEvent {
   oneof event {
     WorkerEvent membership = 1;
@@ -1021,24 +917,17 @@ message ReplicationEvent {
   }
 }
 
-// A generation as the leader applied it: the status (mode, source, the
-// retained list) and the document the gateways receive in SpecPush, so a
-// standby holds what it serves (GetPolicySpec, RollbackPolicySpec) and runs
-// after promotion (design 5.4); a rollback replicates the restored generation
-// the same way. Without it an api-applied document reaches gateways alone:
-// GetPolicySpec is a control-scope read a replica credential cannot make.
+// A generation as the leader applied it (the status, the document the
+// gateways receive), so a standby serves GetPolicySpec and RollbackPolicySpec
+// and runs it after promotion; a rollback replicates the restored one alike.
 message GenerationEvent {
   SpecStatus status = 1;
   SpecPush document = 2;
 }
 
-// A reservation's end, keyed as its row is: the gateway, the lease id (bit 63
-// tells a gateway-minted id from a controller-minted one) and the side (the
-// two sides of a pair share an id); the standby drops that row at once,
-// never at the lease's term (design 5.4). A controller-minted id carries
-// its minting term in bits 32 to 62 (policy_plugin.proto, LeaseOrigin), so
-// a lease restored from a Hello page after a failover never shares this
-// key with one the new leader mints.
+// A reservation's end, keyed as its row is: the gateway, the lease id
+// (LeaseOrigin, with its bounds) and the side (a pair's two sides share an
+// id); the standby drops the row at once, never at the lease's term.
 message LeaseEnd {
   string gateway_id = 1;
   fixed64 lease_id = 2;
