@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
+        layouts::{grid_patch_fields, grid_patch_layouts_for},
         MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{
@@ -493,44 +494,19 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         // its text stamps and never looks at it, but a value with no layout is
         // one every clip has to agree on, and clips sampled at different rates
         // do not.
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            (
-                "pixel_values_videos".to_string(),
-                FieldLayout::flat("patches_per_video"),
-            ),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
+        let mut fields = grid_patch_fields();
+        fields.insert(
+            "pixel_values_videos".to_string(),
+            FieldLayout::flat("patches_per_video"),
+        );
+        fields
     }
 
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
         // One map per modality: a video batch must not advertise the image
         // sizes key (or the other way round), or a request carrying both is
         // sliced by a tensor the batch does not have.
-        match modality {
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            _ => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-        }
+        grid_patch_layouts_for(modality)
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {

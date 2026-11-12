@@ -5,7 +5,10 @@ use serde_json::Value;
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     media::FrameSampling,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        layouts::{grid_patch_fields, grid_patch_layouts_for},
+        ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+    },
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{PreProcessorConfig, Qwen2VLProcessor, VisionPreProcessor},
 };
@@ -231,23 +234,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     /// the image layout. The legacy map below answers every modality with the
     /// image layout, which fails assembly for every video.
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
-        match modality {
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            _ => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-        }
+        grid_patch_layouts_for(modality)
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -255,17 +242,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         // patches_per_image tells how many patches belong to each image.
         // image_grid_thw is [num_images, 3]; the video fields follow the same
         // shapes per clip, and video_second_per_grid is one value per clip.
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
+        grid_patch_fields()
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {

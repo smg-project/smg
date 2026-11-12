@@ -5,8 +5,8 @@ use serde_json::Value;
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{
-        kimi_k25::MEDIA_PAD_TOKEN, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
-        ModelRegistryError, RegistryResult,
+        kimi_k25::MEDIA_PAD_TOKEN, layouts::grid_thws_patch_fields, MediaPartOrder, ModelMetadata,
+        ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{processors::KimiK3Processor, PreProcessorConfig, VisionPreProcessor},
@@ -143,14 +143,7 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
         // MoonViT patchification, same transport layout as K2.5:
         // encoder_input is [total_patches, patch_features], split by patches_per_image.
         // grid_thws is [num_images, 3] with (temporal, height, width) grid dimensions.
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("grid_thws".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-        ])
+        grid_thws_patch_fields()
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
