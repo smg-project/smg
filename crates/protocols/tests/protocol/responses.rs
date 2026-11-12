@@ -2295,6 +2295,23 @@ fn a_computer_call_output_with_null_safety_checks_parses() {
     );
 }
 
+/// A populated `acknowledged_safety_checks` reaches its value through the
+/// null-tolerant reader: the item round-trips unchanged.
+#[test]
+fn a_computer_call_output_keeps_its_acknowledged_safety_checks() {
+    let payload = json!({
+        "type": "computer_call_output",
+        "call_id": "call_1",
+        "output": {"type": "computer_screenshot", "file_id": "file_1"},
+        "acknowledged_safety_checks": [
+            {"id": "sc_1", "code": "malicious_instructions", "message": "m"}
+        ]
+    });
+    let item: ResponseInputOutputItem =
+        serde_json::from_value(payload.clone()).expect("deserialize");
+    assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
+}
+
 #[test]
 fn computer_call_output_item_round_trips_spec_shape() {
     let payload = json!({
