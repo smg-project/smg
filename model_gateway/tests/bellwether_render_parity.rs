@@ -247,8 +247,11 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "nvidia-nemotronlabs-ai-for-media-sports-basketball/render/thinking-history-with-reasoning-content",
-        "both sides hand this template the assistant turn's text as a parts list, which the \
-         template writes as it stands: Python's form in the reference run, JSON in the gateway",
+        "both sides hand this template the assistant turn's text as a parts list; its \
+         reasoning-content branch joins the list to the thought with `~`, which Jinja2 \
+         writes as Python's repr and minijinja in its own spelling, the operator the \
+         gateway's Python spelling cannot hook (crates/tokenizer/src/chat_template.rs); \
+         the cases that print the list through `string` match",
     ),
     (
         "nvidia-nemotronlabs-ai-for-media-sports-tennis/render/*",
