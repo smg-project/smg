@@ -1211,6 +1211,78 @@ mod tests {
         assert!(SecretFiles::default().names().next().is_none());
     }
 
+    /// Every key's file has its own name in the record, the tenant file's
+    /// between the shared key's and the control plane's: one name per
+    /// setting, in the order the reload reads the files.
+    #[test]
+    fn every_watched_file_is_named_once_in_the_reload_order() {
+        let files = SecretFiles {
+            api_key: Some(PathBuf::from("/keys/api-key")),
+            tenant_api_keys: Some(PathBuf::from("/keys/tenants")),
+            control_plane_api_keys: Some(PathBuf::from("/keys/control-plane")),
+        };
+        assert_eq!(
+            files.names().collect::<Vec<_>>(),
+            [
+                "api-key-file",
+                "tenant-api-keys-file",
+                "control-plane-api-keys-file"
+            ],
+            "one name per file, in the reload's order"
+        );
+        assert_eq!(files.count(), 3);
+        let tenants_alone = SecretFiles {
+            tenant_api_keys: Some(PathBuf::from("/keys/tenants")),
+            ..SecretFiles::default()
+        };
+        assert_eq!(
+            tenants_alone.names().collect::<Vec<_>>(),
+            ["tenant-api-keys-file"],
+            "the tenant file's own name"
+        );
+    }
+
+    /// The record's order is the reload's: a reloader over all three files
+    /// reports them in the order the record names them.
+    #[test]
+    fn a_reload_of_every_file_reports_them_in_the_reload_order() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let key = write(dir.path(), "key", "k-one\n");
+        let tenants = write(dir.path(), "tenants", "acme:t-one\n");
+        let cp = write(dir.path(), "cp", "ops:Ops:admin:cp-one\n");
+        let start = [TenantApiKeyEntry {
+            tenant_id: "acme".into(),
+            key: "t-one".into(),
+        }];
+        let set = ApiKeySet::new(vec![ApiKeyEntry::new("ops", "Ops", "cp-one", Role::Admin)]);
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                api_key: Some(key),
+                tenant_api_keys: Some(tenants),
+                control_plane_api_keys: Some(cp),
+            },
+            &sources(SecretSource::File, Some(SecretSource::File)),
+            Some("k-one"),
+            &start,
+            KeySets {
+                control_plane: Some(set),
+                ..KeySets::serving_alone(AuthConfig::with_tenant_keys(Some("k-one".into()), &start))
+            },
+        )
+        .expect("file sources");
+        let report = reloader.reload().expect("reloaded");
+        assert_eq!(
+            report
+                .files
+                .iter()
+                .map(|file| file.setting)
+                .collect::<Vec<_>>(),
+            reloader.files().names().collect::<Vec<_>>(),
+            "the reload reports the files in the order the record names them"
+        );
+        assert_eq!(report.files.len(), 3, "every file read");
+    }
+
     #[test]
     fn no_key_from_a_file_means_no_reloader() {
         let files = SecretFiles {
