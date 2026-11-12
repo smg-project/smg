@@ -6,11 +6,11 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
-        layouts::{grid_patch_fields, grid_patch_layouts_for},
-        MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+        layouts::grid_patch_layouts_for, MediaItemInfo, ModelMetadata, ModelProcessorSpec,
+        ModelRegistryError, RegistryResult,
     },
     types::{
-        EncoderFieldLayouts, FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId,
+        EncoderFieldLayouts, Modality, PlaceholderRange, PromptReplacement, TokenId,
         VideoSamplingInfo,
     },
     vision::{MiniMaxM3VisionProcessor, PreProcessorConfig, VisionPreProcessor},
@@ -486,26 +486,14 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         }
     }
 
-    fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        // Mirrors the engine's `_get_mm_fields_config` for M3: the pixel tensors are
-        // flat over patches and sliced per item by the grid product, while the
-        // grid triples are batched one row per item. The frame spacing the
-        // shared video processor emits is listed too: M3 reads the timing off
-        // its text stamps and never looks at it, but a value with no layout is
-        // one every clip has to agree on, and clips sampled at different rates
-        // do not.
-        let mut fields = grid_patch_fields();
-        fields.insert(
-            "pixel_values_videos".to_string(),
-            FieldLayout::flat("patches_per_video"),
-        );
-        fields
-    }
-
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
         // One map per modality: a video batch must not advertise the image
         // sizes key (or the other way round), or a request carrying both is
-        // sliced by a tensor the batch does not have.
+        // sliced by a tensor the batch does not have. The entry declares no
+        // legacy field map: this override is the one layout reader the
+        // request path has, and the frame spacing the shared video processor
+        // emits is batched here, so clips sampled at different rates join
+        // one batch (M3 reads the timing off its text stamps).
         grid_patch_layouts_for(modality)
     }
 
@@ -523,7 +511,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::registry::{test_helpers::TestTokenizer, ModelMetadata, Tokenizer};
+    use crate::{
+        registry::{test_helpers::TestTokenizer, ModelMetadata, Tokenizer},
+        types::FieldLayout,
+    };
 
     /// Vocabulary ids for M3's media markers, as the checkpoint declares them.
     const IMAGE_ID: TokenId = 200_025;
@@ -1286,29 +1277,6 @@ mod tests {
         assert_eq!(video.encoder_input, FieldLayout::flat("patches_per_video"));
         assert!(video.model_specific.contains_key("video_grid_thw"));
         assert!(!video.model_specific.contains_key("patches_per_image"));
-    }
-
-    #[test]
-    fn the_legacy_map_slices_the_video_pixels_by_their_patch_count() {
-        let layouts = MiniMaxM3VisionSpec.field_layouts();
-        assert_eq!(
-            layouts.get("pixel_values_videos"),
-            Some(&FieldLayout::flat("patches_per_video"))
-        );
-        assert_eq!(
-            layouts.get("pixel_values"),
-            Some(&FieldLayout::flat("patches_per_image"))
-        );
-        for key in [
-            "image_grid_thw",
-            "patches_per_image",
-            "video_grid_thw",
-            "patches_per_video",
-            "video_second_per_grid",
-        ] {
-            assert_eq!(layouts.get(key), Some(&FieldLayout::Batched), "{key}");
-        }
-        assert_eq!(layouts.len(), 7);
     }
 
     #[test]
