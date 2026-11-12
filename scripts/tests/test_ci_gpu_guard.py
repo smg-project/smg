@@ -148,6 +148,9 @@ exit 97
         (self.state / "free_after").write_text(str(int(time.time()) + seconds))
 
     def visible(self, pid: int) -> None:
+        if self.real_holder:
+            # This exact positive supplies its own Popen PID explicitly.
+            self.process(pid, "sleep 300", marker=THIS_JOB, device="/dev/nvidia0")
         (self.state / "visible_pid").write_text(str(pid))
 
     def listed_app(
@@ -214,11 +217,15 @@ exit 97
 
 @pytest.fixture
 def guard(tmp_path: Path, request: pytest.FixtureRequest) -> Guard:
-    # Only this unchanged upstream test asks the production cleanup to end
-    # its own real child. All other existing tests retain a fake-only guard.
+    # Only these unchanged upstream positives ask cleanup to end their own
+    # real children. All other existing tests retain a fake-only guard.
     return Guard(
         tmp_path,
-        real_holder=request.node.name == "test_a_holder_of_a_device_file_is_ended_through_proc",
+        real_holder=request.node.name
+        in {
+            "test_a_visible_holder_is_ended_and_the_cards_pass",
+            "test_a_holder_of_a_device_file_is_ended_through_proc",
+        },
     )
 
 
@@ -292,17 +299,20 @@ def test_full_cards_that_never_drain_fail_after_the_window_naming_an_outside_hol
 
 
 def test_a_visible_holder_is_ended_and_the_cards_pass(guard: Guard) -> None:
-    pid = 4242
-    guard.process(pid, "python -m fixture.engine", marker=THIS_JOB, device="/dev/nvidia0")
-    guard.busy()
-    guard.visible(pid)
-    result = guard.run(wait=30)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert (guard.proc / str(pid) / "stat").read_text() == f"{pid} (fixture) Z 0\n"
-    assert f"-9 {pid}" in guard.signals.read_text().splitlines()
-    assert f" {pid} " in result.stdout  # the process table listed it
-    assert error_lines(result.stdout) == []
-    assert result.elapsed < 10
+    holder = subprocess.Popen(["sleep", "300"])
+    try:
+        guard.busy()
+        guard.visible(holder.pid)
+        result = guard.run(wait=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert holder.wait(timeout=10) == -signal.SIGKILL
+        assert f" {holder.pid} " in result.stdout  # the process table listed it
+        assert error_lines(result.stdout) == []
+        assert result.elapsed < 10
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
 
 
 def test_a_holder_of_a_device_file_is_ended_through_proc(guard: Guard) -> None:
