@@ -344,6 +344,30 @@ fn shapes() -> Vec<Shape> {
             special: &["<|im_start|>", "<|im_end|>", "[e~[", "]~b]"],
             added: &[],
         },
+        // A lone `Removed` split before a `ByteLevel` without its regex: the
+        // gaps alone, under the generic walk (the single-stage loop takes a
+        // stage whose pieces are its matches). The literal is the space: the
+        // stage matches at every space, so the chunking sweeps find their
+        // cuts there (a lone stage that never matches at a space leaves a
+        // long text one unit).
+        Shape {
+            name: "removed-literal",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Split(
+                    Split::new(
+                        SplitPattern::String(" ".to_owned()),
+                        SplitDelimiterBehavior::Removed,
+                        false,
+                    )
+                    .expect("split"),
+                ),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+        },
         Shape {
             name: "byte-level-regex",
             normalizer: Normalizer::None,
