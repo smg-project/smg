@@ -451,10 +451,13 @@ mod tests {
         frames
     }
 
-    /// The events of `frames`, blank-line separated.
+    /// The events of `frames`, blank-line separated; a final fragment without
+    /// its terminator is a failure, since a client cannot dispatch it.
     fn events_of(frames: &[Bytes]) -> Vec<String> {
-        String::from_utf8(frames.concat())
-            .expect("UTF-8 SSE")
+        let text = String::from_utf8(frames.concat()).expect("UTF-8 SSE");
+        let (events, rest) = text.rsplit_once("\n\n").unwrap_or(("", text.as_str()));
+        assert!(rest.is_empty(), "an unterminated event: {rest:?}");
+        events
             .split("\n\n")
             .filter(|event| !event.is_empty())
             .map(str::to_owned)
