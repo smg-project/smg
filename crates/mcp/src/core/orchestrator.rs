@@ -1186,7 +1186,8 @@ impl McpOrchestrator {
         }
 
         // One recovery at a time per server; the lease's drop releases the
-        // lock on every exit path, a cancelled request's included.
+        // lock entry on every exit path, a cancelled request's included (the
+        // server's own entry is recover_static_server's to put back).
         let lease = ReconnectionLockLease::take(&self.reconnection_locks, name).await;
 
         // A client differing from the one that failed means another task
@@ -1332,25 +1333,17 @@ impl McpOrchestrator {
         mut arguments: Value,
         bound: Option<Duration>,
     ) -> McpResult<CallToolResult> {
-        // Resolve alias if needed
-        let (target_server, target_tool) = if let Some(alias) = &entry.alias_target {
-            // Apply argument mapping
-            if let Some(mapping) = &alias.arg_mapping {
-                arguments = Self::apply_arg_mapping(arguments, mapping);
-            }
-            (
-                alias.target.server_key().to_string(),
-                alias.target.tool_name().to_string(),
-            )
-        } else {
-            if let Some(mapping) = &entry.arg_mapping {
-                arguments = Self::apply_arg_mapping(arguments, mapping);
-            }
-            (
-                entry.server_key().to_string(),
-                entry.tool_name().to_string(),
-            )
+        // The server the call reaches is the one the recovery is keyed by;
+        // the tool and the argument mapping come from the alias's target or
+        // the entry itself.
+        let target_server = Self::target_server_key(entry);
+        let (target_tool, mapping) = match &entry.alias_target {
+            Some(alias) => (alias.target.tool_name(), alias.arg_mapping.as_ref()),
+            None => (entry.tool_name(), entry.arg_mapping.as_ref()),
         };
+        if let Some(mapping) = mapping {
+            arguments = Self::apply_arg_mapping(arguments, mapping);
+        }
 
         // Coerce argument types based on tool schema
         // LLMs often return numbers as strings (e.g., "5" instead of 5)
@@ -1358,13 +1351,13 @@ impl McpOrchestrator {
 
         // Build request. `CallToolRequestParams` is `#[non_exhaustive]` in rmcp
         // 1.7 (added `meta`/`task`), so construct via the builder.
-        let mut request = CallToolRequestParams::new(Cow::Owned(target_tool));
+        let mut request = CallToolRequestParams::new(Cow::Owned(target_tool.to_string()));
         if let Value::Object(map) = arguments {
             request = request.with_arguments(map);
         }
 
         // Execute on server
-        self.execute_on_server(&target_server, request, bound).await
+        self.execute_on_server(target_server, request, bound).await
     }
 
     /// Coerce argument types based on tool schema.
@@ -1937,44 +1930,6 @@ impl<'a> Drop for McpRequestContext<'a> {
         }
     }
 }
-#[cfg(test)]
-mod integration_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_reconnection_logic_flow() {
-        let _orchestrator = McpOrchestrator::new_test();
-        let name = "test-server";
-
-        // simulate a server in the registry
-        let manager = ReconnectionManager {
-            base_delay: Duration::from_millis(1),
-            max_retries: 3,
-            ..Default::default()
-        };
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let attempts_clone = Arc::clone(&attempts);
-
-        let result = manager
-            .reconnect(name, || {
-                let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    if count < 1 {
-                        Err(McpError::Transport("Handshake failed".to_string()))
-                    } else {
-                        Ok(())
-                    }
-                }
-            })
-            .await;
-
-        assert!(result.is_ok());
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-}
 /// A static server's reconnection lock, held for one recovery. The map's
 /// entry leaves with the last lease out, on every exit path: the release is
 /// the lease's drop, so a task dropped mid-await (a cancelled request)
@@ -2013,6 +1968,45 @@ impl Drop for ReconnectionLockLease<'_> {
         drop(self.guard.take());
         self.locks
             .remove_if(self.name, |_, held| Arc::strong_count(held) == 1);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_reconnection_logic_flow() {
+        let _orchestrator = McpOrchestrator::new_test();
+        let name = "test-server";
+
+        // simulate a server in the registry
+        let manager = ReconnectionManager {
+            base_delay: Duration::from_millis(1),
+            max_retries: 3,
+            ..Default::default()
+        };
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = Arc::clone(&attempts);
+
+        let result = manager
+            .reconnect(name, || {
+                let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if count < 1 {
+                        Err(McpError::Transport("Handshake failed".to_string()))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }
 
