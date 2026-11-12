@@ -629,4 +629,53 @@ mod tests {
             }
         }
     }
+
+    /// A tool schema and a history call's non-string arguments render with
+    /// Python's `json.dumps` spacing, `", "` between items and `": "` after a
+    /// key, as the engine's template writes them. The corpus test above reads
+    /// the template as its oracle, and the template shares the formatter, so
+    /// the spelling is pinned here in bytes.
+    #[test]
+    fn tool_schemas_and_call_arguments_render_with_pythons_json_spacing() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                    },
+                    "required": ["city"]
+                }
+            }
+        })];
+        let messages = vec![
+            json!({"role": "user", "content": "Weather?"}),
+            json!({"role": "assistant", "tool_calls": [{
+                "id": "a",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": {"city": "Paris", "window": {"days": 2, "hours": [6, 18]}}
+                }
+            }]}),
+            json!({"role": "tool", "tool_call_id": "a", "content": "Sunny"}),
+        ];
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        for template in [Template::Text, Template::Flash] {
+            let out = render(&messages, params(), template).unwrap();
+            assert!(
+                out.0.contains(r#""enum": ["celsius", "fahrenheit"]"#)
+                    && out.0.contains(r#"{"days": 2, "hours": [6, 18]}"#),
+                "{template:?}: {}",
+                out.0
+            );
+        }
+    }
 }
