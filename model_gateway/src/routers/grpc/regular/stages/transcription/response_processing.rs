@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::error;
 
 use crate::{
     observability::metrics::metrics_labels,
@@ -13,12 +12,14 @@ use crate::{
         error,
         grpc::{
             common::{response_formatting::TokenCounts, stages::ProcessStage},
-            context::{DispatchContext, FinalResponse},
+            context::{stage_output, wrong_response_spec, DispatchContext, FinalResponse},
             regular::processor,
             spec::ResponseSpec,
         },
     },
 };
+
+const FUNCTION: &str = "TranscriptionResponseProcessingStage::process";
 
 /// Transcription response processing stage.
 pub(crate) struct TranscriptionResponseProcessingStage {
@@ -39,48 +40,16 @@ impl ProcessStage for TranscriptionResponseProcessingStage {
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
         let ResponseSpec::Transcription(spec) = spec else {
-            error!(
-                function = "TranscriptionResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
-            ));
+            return Err(wrong_response_spec(FUNCTION));
         };
 
         let start_time = Instant::now();
 
-        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
-            error!(
-                function = "TranscriptionResponseProcessingStage::process",
-                "No execution result"
-            );
-            error::internal_error("no_execution_result", "No execution result")
-        })?;
+        let execution_result = stage_output(ctx.response.execution_result.take(), FUNCTION)?;
 
-        let dispatch = ctx
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| {
-                error!(
-                    function = "TranscriptionResponseProcessingStage::process",
-                    "Dispatch metadata not set"
-                );
-                error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
-            })?
-            .clone();
+        let dispatch = stage_output(ctx.dispatch.as_ref(), FUNCTION)?.clone();
 
-        let stop_decoder = ctx.response.stop_decoder.as_mut().ok_or_else(|| {
-            error!(
-                function = "TranscriptionResponseProcessingStage::process",
-                "Stop decoder not initialized"
-            );
-            error::internal_error(
-                "stop_decoder_not_initialized",
-                "Stop decoder not initialized",
-            )
-        })?;
+        let stop_decoder = stage_output(ctx.response.stop_decoder.as_mut(), FUNCTION)?;
 
         // Plain-text decode via the generate processor — no tool/reasoning
         // parsing, whole-file (transcription rejects streaming in preparation).
