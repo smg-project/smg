@@ -61,6 +61,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
+  (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
+  request carrying `in_memory` as an unknown variant, and wrote `in-memory`, which the public
+  API does not list, in the requests and responses it serialized.
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
