@@ -3073,6 +3073,7 @@ mod tests {
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
         crate::server::http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -3861,13 +3862,16 @@ mod tests {
     /// A Prefill admission refusal (the queue full, or a queued request that
     /// waited out its admission timeout) is this process's own backpressure:
     /// the retry layer does not replay it on another pair, where a plain
-    /// retryable answer, such as a worker's 503, is replayed.
+    /// retryable answer is replayed, a worker's 503 and its own 429 under
+    /// another code alike: the error code decides, not the status.
     #[test]
     fn a_prefill_admission_refusal_is_not_retried() {
         assert!(!PDRouter::should_retry_pd_response(&prefill_queue_full()));
         assert!(!PDRouter::should_retry_pd_response(&prefill_queue_timeout()));
         let worker_refusal = error::service_unavailable("worker_unavailable", "a worker is down");
         assert!(PDRouter::should_retry_pd_response(&worker_refusal));
+        let worker_busy = error::too_many_requests("worker_busy", "a worker is saturated");
+        assert!(PDRouter::should_retry_pd_response(&worker_busy));
     }
 
     /// A side that does not answer within the request's timeout ends the
