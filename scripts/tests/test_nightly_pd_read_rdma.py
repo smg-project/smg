@@ -26,6 +26,7 @@ def plan(
     event_name="workflow_dispatch",
     schedule="",
     read_image=READ_IMAGE,
+    read_enabled="",
 ):
     workflow = yaml.safe_load(WORKFLOW.read_text())
     script = next(
@@ -40,6 +41,7 @@ def plan(
             "EVENT_NAME": event_name,
             "SCHEDULE": schedule,
             "AMD_ENABLED": enabled,
+            "READ_ENABLED": read_enabled,
             "AMD_CONTAINER_OPTIONS": base_options,
             "AMD_RDMA_OPTIONS": options,
             "AMD_MORIIO_READ_IMAGE": read_image,
@@ -50,6 +52,7 @@ def plan(
         capture_output=True,
         text=True,
         check=False,
+        timeout=10,
     )
     values = {}
     if output.exists():
@@ -204,3 +207,100 @@ def test_write_ignores_unset_read_image_and_keeps_old_image_path(tmp_path):
     result, values = plan(tmp_path, engines="vllm-amd", read_image="")
     assert result.returncode == 0
     assert all("container_image" not in row for row in values["matrix"])
+
+
+@pytest.mark.parametrize("schedule", ["45 9 * * 1-6", "45 9 * * 0", "35 22 * * 0"])
+@pytest.mark.parametrize("enabled", ["false", "true"])
+def test_normal_read_unset_and_false_preserve_original_matrix(tmp_path, schedule, enabled):
+    (tmp_path / "unset").mkdir()
+    (tmp_path / "false").mkdir()
+    kwargs = {"event_name": "schedule", "schedule": schedule, "enabled": enabled}
+    unset, original = plan(tmp_path / "unset", **kwargs)
+    off, disabled = plan(tmp_path / "false", read_enabled="false", **kwargs)
+    assert unset.returncode == off.returncode == 0
+    assert original == disabled
+    assert not any(row.get("moriio_mode") == "read" for row in original["matrix"])
+    counts = {
+        "45 9 * * 0": 5,
+        "45 9 * * 1-6": 7 if enabled == "true" else 5,
+        "35 22 * * 0": 2 if enabled == "true" else 0,
+    }
+    assert len(original["matrix"]) == counts[schedule]
+
+
+@pytest.mark.parametrize("schedule", ["45 9 * * 1-6", "45 9 * * 0", "35 22 * * 0"])
+@pytest.mark.parametrize("enabled", ["false", "true"])
+def test_normal_read_opt_in_obeys_legs_and_cron_split_without_duplicates(
+    tmp_path, schedule, enabled
+):
+    (tmp_path / "old").mkdir()
+    (tmp_path / "new").mkdir()
+    kwargs = {"event_name": "schedule", "schedule": schedule, "enabled": enabled}
+    baseline, original = plan(tmp_path / "old", **kwargs)
+    result, values = plan(
+        tmp_path / "new",
+        read_enabled="true",
+        options="--device=/dev/infiniband",
+        **kwargs,
+    )
+    assert baseline.returncode == result.returncode == 0, result.stderr
+    eligible = enabled == "true" and schedule != "45 9 * * 0"
+    expected = original["matrix"] + (
+        [
+            {
+                "engine": "vllm",
+                "kv_backend": "moriio",
+                "moriio_mode": "read",
+                "moriio_backend": "rdma",
+                "vendor": "amd",
+                "container_image": READ_IMAGE,
+            }
+        ]
+        if eligible
+        else []
+    )
+    assert values["matrix"] == expected
+    if eligible:
+        assert values["amd_read_rdma_options_json"] == (
+            DEFAULT_AMD_OPTIONS + " --device=/dev/infiniband"
+        )
+    else:
+        assert values == original
+
+
+@pytest.mark.parametrize("engines", ["", "vllm-amd", "vllm-amd-moriio-read"])
+def test_normal_flag_does_not_change_manual_selection(tmp_path, engines):
+    (tmp_path / "old").mkdir()
+    (tmp_path / "new").mkdir()
+    kwargs = {"engines": engines, "enabled": "true", "options": "--device=/dev/infiniband"}
+    old, original = plan(tmp_path / "old", **kwargs)
+    new, values = plan(tmp_path / "new", read_enabled="true", **kwargs)
+    assert old.returncode == new.returncode == 0, new.stderr
+    assert values == original
+
+
+@pytest.mark.parametrize("schedule", ["45 9 * * 1-6", "35 22 * * 0"])
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"read_image": ""},
+        {"read_image": "example.invalid/read:latest"},
+        {
+            "read_image": "example.invalid/read@sha256:"
+            "749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+        },
+        {"options": ""},
+        {"test_filter": "1p1d"},
+    ],
+)
+def test_normal_read_invalid_requested_inputs_fail_before_matrix(tmp_path, schedule, override):
+    result, values = plan(
+        tmp_path,
+        read_enabled="true",
+        enabled="true",
+        event_name="schedule",
+        schedule=schedule,
+        **({"options": "--device=/dev/infiniband"} | override),
+    )
+    assert result.returncode != 0
+    assert "matrix" not in values

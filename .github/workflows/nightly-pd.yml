@@ -41,6 +41,7 @@ jobs:
           ENGINES: ${{ inputs.engines }}
           TEST_FILTER: ${{ inputs.filter }}
           AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
+          READ_ENABLED: ${{ vars.SMG_RUN_AMD_MORIIO_READ }}
           AMD_CONTAINER_OPTIONS: ${{ vars.SMG_AMD_CONTAINER_OPTIONS }}
           AMD_RDMA_OPTIONS: ${{ vars.SMG_AMD_RDMA_CONTAINER_OPTIONS }}
           AMD_MORIIO_READ_IMAGE: ${{ vars.SMG_AMD_MORIIO_READ_IMAGE }}
@@ -62,6 +63,13 @@ jobs:
                 wanted=""
                 if [ "$AMD_ENABLED" = true ]; then wanted="vllm-amd"; fi
                 ;;
+            esac
+          fi
+          # READ is an independent normal-schedule opt-in, selected only after
+          # the Sunday split. Dispatch inputs and default lanes stay unchanged.
+          if [ "$EVENT_NAME" = schedule ] && [ "$AMD_ENABLED" = true ] && [ "$READ_ENABLED" = true ]; then
+            case "$SCHEDULE" in
+              "45 9 * * 1-6"|"35 22 * * 0") wanted="$wanted vllm-amd-moriio-read" ;;
             esac
           fi
           read_image=""
@@ -103,9 +111,9 @@ jobs:
           # Mooncake default (TokenSpeed only has Mooncake). The NIXL row skips
           # the peer-restart tests: the SGLang prefill segfaults when its decode
           # comes back on the same address (#2503). vllm-amd is vLLM over NIXL
-          # and over MoRI-IO in WRITE mode; automatic READ mode is left out
-          # while its decode faults on its first transfer over XGMI on AMD's
-          # MI300X runners (vllm-project/vllm#61144).
+          # and over MoRI-IO in WRITE mode. The independent READ/RDMA opt-in
+          # uses the reviewed source-bound image, not the legacy WRITE image
+          # or its unsupported READ/XGMI path (vllm-project/vllm#61144).
           matrix=$(printf '%s\n' $wanted | jq --arg read_image "$read_image" -Rsc '
             split("\n") | map(select(length > 0)) |
             map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
