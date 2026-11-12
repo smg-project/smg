@@ -15,6 +15,7 @@
 use std::{collections::BTreeMap, pin::Pin};
 
 use enc::token_speed_encoder_server::{TokenSpeedEncoder, TokenSpeedEncoderServer};
+use engine_zmq_adapter::wire_tensor_tokenspeed;
 use futures::{Stream, StreamExt};
 use smg_grpc_client::{
     common_proto as common, tokenspeed_encoder_proto as enc,
@@ -285,20 +286,26 @@ fn check_encode_bootstrap(req: &ts::GenerateRequest) -> Result<(), Status> {
 
 /// A request's media items against the shape the engine requires before it
 /// places an embedding; the gateway builds them per wire, so a wrong item is
-/// a gateway regression the canned answer would otherwise hide. Each item:
-/// a specified modality, a content hash (the engine's pad value derives from
-/// it), placeholder spans inside the prompt, and, when the item names its
-/// placeholder token id, that the prompt's tokens of that id are exactly the
-/// items' spans. The encoder input is the prefill and regular roles' to
-/// require, inline or through a room of the request's `encode_bootstrap_info`
-/// (an encode worker ran the tower); the decode role takes the gateway's
-/// pixel-free clone of the request, every item's encoder input taken out and
-/// the rooms dropped, the metadata kept so decode pads the placeholders as
-/// prefill did.
+/// a gateway regression the canned answer would otherwise hide. The list
+/// holds at least one item (the adapter refuses the empty container). Each
+/// item: a specified modality, a content hash (the engine's pad value derives
+/// from it), its tensors read as the wire reads them, placeholder spans
+/// inside the prompt, and, when the item names its placeholder token id, that
+/// the prompt's tokens of that id are exactly the items' spans. The encoder
+/// input is the prefill and regular roles' to require, inline or through a
+/// room of the request's `encode_bootstrap_info` (an encode worker ran the
+/// tower); the decode role takes the gateway's pixel-free clone of the
+/// request, every item's encoder input taken out and the rooms dropped, the
+/// metadata kept so decode pads the placeholders as prefill did.
 fn check_mm_inputs(req: &ts::GenerateRequest, role: Option<Role>) -> Result<(), Status> {
     let Some(mm) = &req.mm_inputs else {
         return Ok(());
     };
+    if mm.items.is_empty() {
+        return Err(Status::invalid_argument(
+            "mock-worker: mm_inputs carries no items",
+        ));
+    }
     let prompt_ids = req
         .tokenized
         .as_ref()
@@ -316,15 +323,24 @@ fn check_mm_inputs(req: &ts::GenerateRequest, role: Option<Role>) -> Result<(), 
     check_media_items(&mm.items, Some(prompt_ids), encoder_input)
 }
 
-/// Whether an item carries its feature: an encoder input with bytes in it.
-fn has_encoder_input(item: &ts::MultimodalItem) -> bool {
-    item.encoder_input
-        .as_ref()
-        .is_some_and(|tensor| match &tensor.payload {
-            Some(ts::tensor_data::Payload::Inline(bytes)) => !bytes.is_empty(),
-            Some(_) => true,
-            None => false,
-        })
+/// Whether an item carries its feature, read as the wire reads a tensor (an
+/// inline payload whose bytes match the dtype and shape): a malformed one is
+/// refused on every role, as the engine's adapter refuses it.
+fn check_encoder_input(item: &ts::MultimodalItem, what: &str) -> Result<bool, Status> {
+    let Some(tensor) = &item.encoder_input else {
+        return Ok(false);
+    };
+    read_tensor(tensor, what, "encoder_input")?;
+    Ok(true)
+}
+
+/// An item's tensor through the wire's own reader, so the mock refuses the
+/// tensors the engine's adapter refuses; `name` is the field in the refusal.
+fn read_tensor(tensor: &ts::TensorData, what: &str, name: &str) -> Result<(), Status> {
+    wire_tensor_tokenspeed(tensor.clone()).map_err(|error| {
+        Status::invalid_argument(format!("mock-worker: {what}'s {name}: {error}"))
+    })?;
+    Ok(())
 }
 
 /// What a role asks of a media item's encoder input.
@@ -361,13 +377,17 @@ fn check_media_items(
                  from it)"
             )));
         }
+        let has_feature = check_encoder_input(item, &what)?;
         if let EncoderInput::Required { roomed } = encoder_input {
             let has_room = roomed.contains(&u32::try_from(index).unwrap_or(u32::MAX));
-            if !has_encoder_input(item) && !has_room {
+            if !has_feature && !has_room {
                 return Err(Status::invalid_argument(format!(
                     "mock-worker: {what} carries no encoder input and no encode room hands it over"
                 )));
             }
+        }
+        for (key, tensor) in &item.model_specific_tensors {
+            read_tensor(tensor, &what, key)?;
         }
         let spans = item
             .placeholders
@@ -801,5 +821,76 @@ mod tests {
         let status = refused(&prefill, clone("ts-mm-prefill")).await;
         assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
         assert!(status.message().contains("no encoder input"), "{status:?}");
+    }
+
+    /// The adapter refuses the empty container before any translation.
+    #[tokio::test]
+    async fn an_empty_items_list_is_refused() {
+        let (service, _stop) = service(65_366);
+        let status = refused(&service, with_items(request("ts-mm-none", &PROMPT), vec![])).await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("no items"), "{status:?}");
+    }
+
+    /// An item's tensors are read as the wire reads them: an inline payload
+    /// whose bytes match the dtype and shape, the encoder input and the
+    /// model-specific tensors alike.
+    #[tokio::test]
+    async fn a_tensor_is_read_as_the_wire_reads_it() {
+        let (service, _stop) = service(65_367);
+        let mut short = image_item(1, 2);
+        short.encoder_input.as_mut().expect("the feature").payload =
+            Some(ts::tensor_data::Payload::Inline(vec![0; 15].into()));
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-bytes", &PROMPT), vec![short]),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media item 0's encoder_input")
+                && status.message().contains("byte length 15"),
+            "{status:?}"
+        );
+        let mut handle = image_item(1, 2);
+        handle.encoder_input.as_mut().expect("the feature").payload =
+            Some(ts::tensor_data::Payload::Shm(common::ShmHandle::default()));
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-shm", &PROMPT), vec![handle]),
+        )
+        .await;
+        assert!(status.message().contains("inline"), "{status:?}");
+        let mut unfilled = image_item(1, 2);
+        unfilled
+            .encoder_input
+            .as_mut()
+            .expect("the feature")
+            .payload = None;
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-payload", &PROMPT), vec![unfilled]),
+        )
+        .await;
+        assert!(status.message().contains("no payload"), "{status:?}");
+        let mut grid = image_item(1, 2);
+        grid.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            ts::TensorData {
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+                payload: Some(ts::tensor_data::Payload::Inline(vec![0; 8].into())),
+            },
+        );
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-grid", &PROMPT), vec![grid]),
+        )
+        .await;
+        assert!(
+            status.message().contains("image_grid_thw")
+                && status.message().contains("byte length 8"),
+            "{status:?}"
+        );
     }
 }

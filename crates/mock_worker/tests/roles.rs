@@ -1289,6 +1289,23 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
     }
     assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
 
+    // An item without its feature: the encode worker runs the tower on it
+    // and has no room to fall back on, so the request is refused and not
+    // counted.
+    let mut featureless = tokenspeed_encode_request("ts-e3", 1, &[43]);
+    featureless.mm_inputs.as_mut().expect("the items").items[0].encoder_input = None;
+    let refused = encoder
+        .encode(featureless)
+        .await
+        .expect_err("an item without its feature");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("media item 0")
+            && refused.message().contains("no encoder input"),
+        "{refused:?}"
+    );
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
     // A `Generate` went to the wrong pool: this worker takes `Encode`.
     let wrong_pool = scheduler
         .generate(request("ts-g1", &[1, 2, 3], false))

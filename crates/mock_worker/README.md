@@ -62,18 +62,22 @@ engine does in that role; its `Generate` is refused as the wrong pool, and a
 prefill worker on that wire refuses a request whose `encode_bootstrap_info`
 does not name a rendezvous for each media item once.
 The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
-request's media items are checked against the shape the engine requires before
-the canned answer: a known modality, the TokenSpeed item's content hash and,
-on the prefill and regular roles, its encoder input (or the encode room that
-hands the item over; a decode worker takes the gateway's pixel-free clone,
-metadata alone), the SGLang batch's pixel tensor (or its feature hash) and a
-video's placeholder token id, placeholder spans inside the prompt and disjoint
-across the request's items, and, when the item names its placeholder token id,
-spans that cover exactly the prompt's tokens of that id; a wrong item is
-refused with `InvalidArgument` naming the item and the field, so a gateway
-regression in a wire's items reads as a red row on the mock. A reference batch
-on the SGLang wire (media URLs without a pixel tensor, the form the gateway
-hands a worker that processes media itself) is accepted as it stands: the
+request's media items are checked against the shape the engine's adapter
+requires before the canned answer: a known modality, the TokenSpeed item's
+content hash and, on the prefill and regular roles, its encoder input (or the
+encode room that hands the item over; a decode worker takes the gateway's
+pixel-free clone, metadata alone), the SGLang batch's pixel tensor (or its
+feature hash) and a video's placeholder token id, every tensor read through the
+wire's own reader (a dtype the wire carries and bytes matching the shape; an
+inline payload on the TokenSpeed wire), one SGLang batch per modality (image or
+video, an empty list reading as image) beside a primary batch, placeholder spans
+inside the prompt and disjoint across the request's items, and, when the item
+names its placeholder token id, spans that cover exactly the prompt's tokens of
+that id; a wrong item is refused with `InvalidArgument` naming the item and the
+field, so a gateway regression in a wire's items reads as a red row on the mock.
+A reference batch on the SGLang wire (media URLs without a pixel tensor, the
+form the gateway hands a worker that processes media itself) is the primary
+batch's alone, travels with no extra batch, and is accepted as it stands: the
 worker's processor or an encoder would resolve it, and the mock has neither.
 `--capture` records the TokenSpeed wire's requests only. Beside the scheduler
 service the server hosts the standard `grpc.health.v1` service (`Check`,

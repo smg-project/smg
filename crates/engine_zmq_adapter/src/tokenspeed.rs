@@ -1054,10 +1054,9 @@ pub fn translate_encode_request(
 /// viewing the request's bytes rather than copying them: a tensor of the
 /// auxiliary size then travels to the engine as a frame sharing that view.
 /// SHM/remote payloads never reach this translate: ZMQ assembly runs with SHM
-/// disabled and RDMA staging off.
-pub(crate) fn wire_tensor_tokenspeed(
-    tensor: tokenspeed_proto::TensorData,
-) -> Result<WireTensor, String> {
+/// disabled and RDMA staging off. The mock worker reads a request's tensors
+/// through it too, so it refuses exactly the tensors this wire refuses.
+pub fn wire_tensor_tokenspeed(tensor: tokenspeed_proto::TensorData) -> Result<WireTensor, String> {
     let bytes = match tensor.payload {
         Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => bytes,
         Some(_) => {

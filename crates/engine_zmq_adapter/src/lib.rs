@@ -40,6 +40,7 @@ mod structured_outputs;
 #[cfg(test)]
 mod test_support;
 mod tokenspeed;
+pub use tokenspeed::wire_tensor_tokenspeed;
 mod trtllm;
 mod vllm;
 
