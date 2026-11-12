@@ -243,8 +243,8 @@ impl TokenSpeedScheduler for MockScheduler {
 /// engine's prefill waits on that room and fails without it, so a request
 /// whose entries do not cover each of its items once is refused; a request
 /// without entries has no encoder (a prefill alone processes its own media).
-/// An info with entries and no media is refused by the first arm too: with
-/// no item, its first entry names an item outside the covered range.
+/// An info with entries and no media is refused too: with no item, its first
+/// entry's index is out of range (the refusal names item 0 of 0).
 fn check_encode_bootstrap(req: &ts::GenerateRequest) -> Result<(), Status> {
     let Some(info) = &req.encode_bootstrap_info else {
         return Ok(());

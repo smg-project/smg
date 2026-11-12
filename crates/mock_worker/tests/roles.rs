@@ -1562,6 +1562,21 @@ async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
         );
     }
 
+    // Rooms with no media at all: the first entry's index is out of range
+    // (item 0 of 0), refused as a room off the end is.
+    let mut no_media = with_media("ts-p4", Some(vec![room(0, 11)]));
+    no_media.mm_inputs = None;
+    let refused = client
+        .generate(no_media)
+        .await
+        .err()
+        .expect("a refused handoff, not a stream");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().ends_with("names item 0 of 0"),
+        "{refused:?}"
+    );
+
     // No rooms at all: a request without an encoder, served as before.
     let frames = generate(&client, with_media("ts-p3", None)).await;
     let Some(GenResp::Complete(complete)) = &frames[0].response else {
