@@ -2108,7 +2108,9 @@ mod tests {
 
     /// A stream that ends before its `message_stop`, or that carries an error
     /// event (here one a `message_stop` still follows), leaves no turn: the
-    /// continue from its id is the 404.
+    /// place is given back at the stream's end, while the body is still held
+    /// (the drop guard is the other path), and the continue from its id is
+    /// the 404.
     #[tokio::test]
     async fn a_cut_or_failed_stream_leaves_no_turn() {
         let threads = MessageThreads::new();
@@ -2127,10 +2129,22 @@ mod tests {
             let answered = threads
                 .stored(turn.expect("a turn"), streamed(&bytes, &[]))
                 .await;
-            let read = to_bytes(answered.into_body(), usize::MAX)
+            let mut data = answered.into_body().into_data_stream();
+            let mut read = Vec::new();
+            while let Some(frame) = data.next().await {
+                read.extend_from_slice(&frame.expect("the stream"));
+            }
+            assert_eq!(read.as_slice(), bytes.as_slice());
+            let kept = threads
+                .store
+                .get_response(&ResponseId::from(id))
                 .await
-                .expect("the stream");
-            assert_eq!(read.as_ref(), bytes.as_slice());
+                .expect("the store");
+            assert!(
+                kept.is_none(),
+                "{id}: the place is given back at the stream's end, while the body is still held"
+            );
+            drop(data);
             let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
             assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{id}");
         }
