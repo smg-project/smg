@@ -1286,14 +1286,18 @@ mod tests {
     /// exports nothing, so every byte rides inline) never reads the lane as
     /// staging, whatever the lane's switches and listener say, and so keeps
     /// the bound for TokenSpeed; the build is asked before any exporter is
-    /// built.
+    /// built. The build's own answer is pinned at compile time (a const
+    /// block, as clippy asks of an assertion on a constant), the reading's
+    /// at run time.
     #[cfg(not(feature = "mm-rdma"))]
     #[test]
     fn a_build_without_the_rdma_lane_keeps_the_bound() {
-        assert!(
-            !STAGES_OVER_RDMA,
-            "the default build carries the no-op exporter"
-        );
+        const {
+            assert!(
+                !STAGES_OVER_RDMA,
+                "the default build carries the no-op exporter"
+            )
+        };
         assert!(
             !rdma_lane_stages(),
             "the inert exporter is never read as a staging lane"
