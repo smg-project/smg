@@ -1136,6 +1136,66 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
     assert!(!scrape.contains("smg_symphony_refused_total"), "{scrape}");
 }
 
+/// A call whose arguments are a whole value of another kind than an object (a double-encoded
+/// string here) reaches the client as a `tool_use` block whose `input` is `{}`, as on the older
+/// path, through the real reader: nothing refused, nothing counted as refused, the output's own
+/// count clean. (The unit test beside `object_inputs` pins the rule; this one pins its wiring in
+/// `read_messages_with_symphony`.)
+#[tokio::test]
+async fn a_message_whose_tool_use_input_is_a_string_carries_an_empty_object() {
+    let output =
+        "<tool_call>\n{\"name\": \"lookup\", \"arguments\": \"\\\"Paris\\\"\"}\n</tool_call>";
+    let spec = || assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let (result, scrape) = scraped(
+        ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        )
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
+            spec(),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+        ),
+    )
+    .await;
+    server.abort();
+    let (message, _) = match result {
+        Ok(message) => message,
+        Err(response) => panic!("the message was refused with {}", response.status()),
+    };
+    let blocks = serde_json::to_value(&message.content).expect("the blocks");
+    assert_eq!(blocks.as_array().map(Vec::len), Some(1), "{blocks}");
+    assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+    assert_eq!(blocks[0]["name"], "lookup", "{blocks}");
+    assert_eq!(
+        blocks[0]["input"],
+        json!({}),
+        "a string input leaves as an empty object: {blocks}"
+    );
+    assert!(!scrape.contains("smg_symphony_refused_total"), "{scrape}");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"clean\""],
+    )
+    .expect("the clean count");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+}
+
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test
 /// runtime is single-threaded, so the local recorder sees every record of the future), the
 /// Symphony series it read being this test's own too (`telemetry::own_series`).
