@@ -40,7 +40,7 @@
  from dataclasses import replace
  from functools import lru_cache
  from typing import TYPE_CHECKING, List, Optional
-@@ -199,6 +203,165 @@
+@@ -199,6 +203,216 @@
  _is_xpu = is_xpu()
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
@@ -75,6 +75,51 @@
 +}
 +
 +
++def _original_shared_blob(entry, repository, revision):
++    """Recognize only snapshot -> original LFS entry -> same-Hub shared blob."""
++    if repository is None:
++        return False
++    try:
++        repository = Path(repository)
++        snapshot = repository / "snapshots" / revision
++        blobs = repository / "blobs"
++        if (
++            repository.name != "models--openai--gpt-oss-20b"
++            or repository.resolve(strict=True) != repository
++            or snapshot.resolve(strict=True) != snapshot
++            or blobs.resolve(strict=True) != blobs
++            or entry.parent != snapshot
++            or entry.suffix != ".safetensors"
++        ):
++            return False
++        first = Path(os.readlink(entry)).parts
++        if (
++            len(first) != 4
++            or first[:3] != ("..", "..", "blobs")
++            or len(first[3]) != 64
++            or any(c not in "0123456789abcdef" for c in first[3])
++        ):
++            return False
++        original = blobs / first[3]
++        second = Path(os.readlink(original)).parts
++        if (
++            len(second) != 5
++            or second[:3] != ("..", "..", "blobs")
++            or len(second[4]) != 64
++            or any(c not in "0123456789abcdef" for c in second[4])
++            or second[3] != second[4][:2]
++        ):
++            return False
++        shared = repository.parent / "blobs" / second[3] / second[4]
++        return (
++            shared.resolve(strict=True) == shared
++            and shared.is_file()
++            and entry.resolve(strict=True) == shared
++        )
++    except (OSError, ValueError):
++        return False
++
++
 +def _validate_gptoss_local_checkpoint(model_path):
 +    # model_specs resolves this alias before passing it to the engine. Accept
 +    # copies and cache symlinks only with the fixed original metadata/layout.
@@ -102,11 +147,17 @@
 +        raise ValueError("Local GPTOSS checkpoint has a foreign repository or revision")
 +
 +    def checkpoint_file(name):
-+        target = (resolved / name).resolve(strict=True)
++        entry = resolved / name
++        target = entry.resolve(strict=True)
 +        if not target.is_file() or not (
-+            target.is_relative_to(resolved) or target.is_relative_to(repository / "blobs")
++            target.is_relative_to(resolved)
++            or target.is_relative_to(repository / "blobs")
++            or _original_shared_blob(entry, repository, _GPTOSS_REVISION)
 +        ):
-+            raise ValueError("Local GPTOSS checkpoint file escapes its original repository")
++            raise ValueError(
++                f"Local GPTOSS checkpoint file escapes its original repository: "
++                f"{name}: {entry} -> {target}"
++            )
 +        return target
 +
 +    metadata = {}
@@ -206,7 +257,7 @@
  _is_shuffle_moe_mxfp4 = is_gfx95_supported()
  _is_cpu_amx_available = cpu_has_amx_support()
  
-@@ -296,16 +459,31 @@
+@@ -296,16 +510,31 @@
          self,
          ignored_layers: Optional[list[str]] = None,
          is_checkpoint_mxfp4_serialized: bool = False,
@@ -239,7 +290,7 @@
  
          if _is_hip:
              if is_gfx95_supported():
-@@ -342,7 +520,6 @@
+@@ -342,7 +571,6 @@
      def get_quant_method(
          self, layer: torch.nn.Module, prefix: str
      ) -> Optional[QuantizeMethodBase]:
@@ -247,7 +298,7 @@
          from sglang.srt.layers.linear import LinearBase
          from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
          from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-@@ -358,7 +535,10 @@
+@@ -358,7 +586,10 @@
                  return UnquantizedLinearMethod()
          elif isinstance(layer, FusedMoE):
              if self.is_checkpoint_mxfp4_serialized:
@@ -259,7 +310,7 @@
              else:
                  return Mxfp4DynamicQuantMoEMethod()
          else:
-@@ -374,8 +554,12 @@
+@@ -374,8 +605,12 @@
      def __init__(
          self,
          prefix: str,
@@ -272,7 +323,7 @@
  
          self.prefix = prefix
          self.topk_indices_dtype = None
-@@ -437,6 +621,10 @@
+@@ -437,6 +672,10 @@
          with_bias: bool = False,
          **extra_weight_attrs,
      ):
@@ -283,7 +334,7 @@
          self.num_experts = num_experts
          weight_dtype = torch.uint8
          scale_dtype = torch.uint8
-@@ -619,6 +807,33 @@
+@@ -619,6 +858,33 @@
              set_weight_attrs(w2_weight_bias, extra_weight_attrs)
  
      def process_weights_after_loading(self, layer):
@@ -317,7 +368,7 @@
          if self.use_marlin and not self.use_mega_moe:
              from sglang.srt.layers.quantization.marlin_utils import (
                  check_moe_marlin_supports_layer,
-@@ -1580,6 +1795,24 @@
+@@ -1580,6 +1846,24 @@
          layer: torch.nn.Module,
          dispatch_output: StandardDispatchOutput,
      ) -> CombineInput:
@@ -342,7 +393,7 @@
  
          from sglang.srt.layers.moe.token_dispatcher import (
              DispatchOutputChecker,
-@@ -1805,7 +2038,6 @@
+@@ -1805,7 +2089,6 @@
          params_dtype: torch.dtype,
          **extra_weight_attrs,
      ):

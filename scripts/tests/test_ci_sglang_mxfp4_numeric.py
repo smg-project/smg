@@ -233,3 +233,54 @@ def test_isolated_worker_resolution_loads_no_engine_or_infra_package(checkpoint_
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["worker_model_path"] == str(alias)
+
+
+def test_numeric_and_worker_accept_the_same_anchored_shared_shards(numeric, checkpoint_layout):
+    root, snapshot, alias, sdk, pins = checkpoint_layout
+    fixtures = load(
+        "shared_blob_fixtures", Path(__file__).with_name("test_ci_sglang_mxfp4_fallback.py")
+    )
+    links = fixtures.shared_blob_layout(snapshot)
+    alias.symlink_to(snapshot, target_is_directory=True)
+    selection = numeric.worker_checkpoint()
+    checked = numeric.identity_validator(sdk, pins)(selection["checkpoint_path"])
+    assert checked["resolved_path"] == str(snapshot)
+    for name, (_, target) in links.items():
+        actual = numeric.checkpoint_file(snapshot, name, Path(checked["repository"]))
+        assert actual == target == (snapshot / name).resolve()
+
+
+@pytest.mark.parametrize(
+    "bad", ["direct_shared", "foreign_repository", "third_hop", "dangling", "nonregular"]
+)
+def test_numeric_shared_shards_preserve_namespace_and_regularfile_checks(
+    numeric, checkpoint_layout, tmp_path, bad
+):
+    root, snapshot, alias, sdk, pins = checkpoint_layout
+    fixtures = load(
+        "shared_blob_negative_fixtures",
+        Path(__file__).with_name("test_ci_sglang_mxfp4_fallback.py"),
+    )
+    links = fixtures.shared_blob_layout(snapshot)
+    name = sorted(links)[0]
+    original, target = links[name]
+    shard = snapshot / name
+    if bad in ("direct_shared", "foreign_repository"):
+        shard.unlink()
+        if bad == "direct_shared":
+            shard.symlink_to(target)
+        else:
+            foreign = root / "hub/models--foreign--gpt-oss-20b/blobs" / original.name
+            foreign.parent.mkdir(parents=True)
+            foreign.symlink_to(target)
+            shard.symlink_to(foreign)
+    else:
+        target.unlink()
+        if bad == "third_hop":
+            outside = tmp_path / "outside"
+            outside.write_bytes(b"foreign")
+            target.symlink_to(outside)
+        elif bad == "nonregular":
+            target.mkdir()
+    with pytest.raises((ValueError, OSError)):
+        numeric.checkpoint_file(snapshot, name, snapshot.parents[1])

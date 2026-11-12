@@ -99,7 +99,12 @@ def identity_validator(sdk, pins):
     source = sdk / "srt/layers/quantization/mxfp4.py"
     if sha(source) != pins["sdk_files"]["srt/layers/quantization/mxfp4.py"]:
         raise ValueError("Installed checkpoint validator source mismatch")
-    names = {"_GPTOSS_REVISION", "_GPTOSS_METADATA_SHA256", "_validate_gptoss_local_checkpoint"}
+    names = {
+        "_GPTOSS_REVISION",
+        "_GPTOSS_METADATA_SHA256",
+        "_original_shared_blob",
+        "_validate_gptoss_local_checkpoint",
+    }
     nodes = [
         node
         for node in ast.parse(source.read_text()).body
@@ -109,26 +114,76 @@ def identity_validator(sdk, pins):
             and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
         )
     ]
-    if len(nodes) != 3:
+    if len(nodes) != 4:
         raise ValueError("Pinned engine checkpoint validator contract changed")
     namespace = {"Path": Path, "os": os, "hashlib": hashlib, "json": json}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
     return namespace["_validate_gptoss_local_checkpoint"]
 
 
+def _original_shared_blob(entry, repository, revision):
+    """Recognize only snapshot -> original LFS entry -> same-Hub shared blob."""
+    if repository is None:
+        return False
+    try:
+        repository = Path(repository)
+        snapshot = repository / "snapshots" / revision
+        blobs = repository / "blobs"
+        if (
+            repository.name != "models--openai--gpt-oss-20b"
+            or repository.resolve(strict=True) != repository
+            or snapshot.resolve(strict=True) != snapshot
+            or blobs.resolve(strict=True) != blobs
+            or entry.parent != snapshot
+            or entry.suffix != ".safetensors"
+        ):
+            return False
+        first = Path(os.readlink(entry)).parts
+        if (
+            len(first) != 4
+            or first[:3] != ("..", "..", "blobs")
+            or len(first[3]) != 64
+            or any(c not in "0123456789abcdef" for c in first[3])
+        ):
+            return False
+        original = blobs / first[3]
+        second = Path(os.readlink(original)).parts
+        if (
+            len(second) != 5
+            or second[:3] != ("..", "..", "blobs")
+            or len(second[4]) != 64
+            or any(c not in "0123456789abcdef" for c in second[4])
+            or second[3] != second[4][:2]
+        ):
+            return False
+        shared = repository.parent / "blobs" / second[3] / second[4]
+        return (
+            shared.resolve(strict=True) == shared
+            and shared.is_file()
+            and entry.resolve(strict=True) == shared
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def checkpoint_file(root, name, repository=None):
     p = Path(name)
     if p.name != name or p.suffix != ".safetensors":
         raise ValueError("Unsafe/non-safetensors checkpoint shard")
-    actual = (root / p).resolve(strict=True)
+    entry = root / p
+    actual = entry.resolve(strict=True)
     # A copy may read only its own shards or the same original HF blob store.
     if repository is None and root.parent.name == "snapshots" and root.name == REVISION:
         repository = root.parent.parent
     if not actual.is_file() or not (
         actual.is_relative_to(root)
         or (repository is not None and actual.is_relative_to(repository / "blobs"))
+        or _original_shared_blob(entry, repository, REVISION)
     ):
-        raise ValueError("Checkpoint shard escapes the selected checkpoint/original blobs")
+        raise ValueError(
+            f"Checkpoint shard escapes the selected checkpoint/original blobs: "
+            f"{name}: {entry} -> {actual}"
+        )
     return actual
 
 

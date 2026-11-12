@@ -22,11 +22,11 @@ FILES = {
     ),
     "srt/layers/quantization/mxfp4.py": (
         "10692c68bc5e1d412fc4489d2c469e9916948d396f209b5ba6835c942676d9f9",
-        "340272dfa0385314a2c2f0cf70bf9fc40b48a798eafd7408f7d3f5b3c864c75e",
+        "77170fb5097e5623276e8a70201bb39aea1b07fd078fb75a589173ccad2fa2ce",
     ),
 }
 PATCH = Path(__file__).with_name("patches") / "sglang-0.5.21-gptoss-gfx942.patch"
-PATCH_SHA = "331747abb11d443bdd659b4657a61d158b61367cc4403fcaed205f170ff209c1"
+PATCH_SHA = "f28f934faca6c84a8f66d8e3c364047ba4f9859cdcef07f31bbb1ed54a069f50"
 
 
 def enabled():

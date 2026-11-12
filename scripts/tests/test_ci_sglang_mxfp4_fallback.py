@@ -259,3 +259,102 @@ def test_engine_accepts_lexical_alias_under_symlinked_model_root(
     assert checked["canonical_root"] == str(root)
     assert checked["configured_root"] == str(lexical)
     ns["_validate_gptoss_local_checkpoint"](lexical / snapshot.relative_to(root))
+
+
+def shared_blob_layout(snapshot):
+    """Tiny files reproduce the observed two-hop cache layout, not weight content."""
+    repository = snapshot.parents[1]
+    blobs = repository / "blobs"
+    blobs.mkdir(exist_ok=True)
+    shared = repository.parent / "blobs"
+    result = {}
+    for shard in sorted(snapshot.glob("*.safetensors")):
+        lfs = hashlib.sha256((shard.name + "-original-lfs").encode()).hexdigest()
+        key = hashlib.sha256((shard.name + "-shared").encode()).hexdigest()
+        target = shared / key[:2] / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shard.rename(target)
+        original = blobs / lfs
+        original.symlink_to(Path("../../blobs") / key[:2] / key)
+        shard.symlink_to(Path("../../blobs") / lfs)
+        result[shard.name] = (original, target)
+    return result
+
+
+def test_original_snapshot_two_hop_shared_blobs(local_checkpoint):
+    root, snapshot, alias, ns = local_checkpoint
+    links = shared_blob_layout(snapshot)
+    assert len(links) == 3  # Actual pinned index, not a replacement checkpoint.
+    for selected in (snapshot, alias):
+        checked = ns["_validate_gptoss_local_checkpoint"](selected)
+        assert checked["resolved_path"] == str(snapshot)
+        for name, (original, target) in links.items():
+            assert ns["_original_shared_blob"](snapshot / name, snapshot.parents[1], snapshot.name)
+            assert (snapshot / name).resolve() == target
+            assert original.is_symlink() and target.is_file()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "direct_shared",
+        "foreign_repository",
+        "first_traversal",
+        "second_traversal",
+        "wrong_prefix",
+        "external_pool",
+        "symlink_pool",
+        "symlink_prefix",
+        "third_hop",
+        "dangling",
+        "nonregular",
+    ],
+)
+def test_shared_blob_chain_rejects_unanchored_or_escaping_links(local_checkpoint, tmp_path, bad):
+    root, snapshot, alias, ns = local_checkpoint
+    links = shared_blob_layout(snapshot)
+    name = sorted(links)[0]
+    original, target = links[name]
+    shard = snapshot / name
+    if bad in ("direct_shared", "foreign_repository", "first_traversal"):
+        shard.unlink()
+        if bad == "direct_shared":
+            shard.symlink_to(target)
+        elif bad == "foreign_repository":
+            foreign = root / "hub/models--foreign--gpt-oss-20b/blobs" / original.name
+            foreign.parent.mkdir(parents=True)
+            foreign.symlink_to(target)
+            shard.symlink_to(foreign)
+        else:
+            shard.symlink_to(Path("../../blobs/../blobs") / original.name)
+    elif bad in ("second_traversal", "wrong_prefix", "external_pool"):
+        original.unlink()
+        if bad == "second_traversal":
+            original.symlink_to(
+                Path("../../blobs") / target.parent.name / ".." / target.parent.name / target.name
+            )
+        elif bad == "wrong_prefix":
+            original.symlink_to(Path("../../blobs/ff") / target.name)
+        else:
+            outside = tmp_path / "external-pool" / target.name
+            outside.parent.mkdir()
+            outside.write_bytes(b"foreign")
+            original.symlink_to(outside)
+    elif bad in ("symlink_pool", "symlink_prefix"):
+        import shutil
+
+        directory = target.parent.parent if bad == "symlink_pool" else target.parent
+        outside = tmp_path / "relocated"
+        shutil.move(str(directory), outside)
+        directory.symlink_to(outside, target_is_directory=True)
+    else:
+        target.unlink()
+        if bad == "third_hop":
+            foreign = tmp_path / "third-hop"
+            foreign.write_bytes(b"foreign")
+            target.symlink_to(foreign)
+        elif bad == "nonregular":
+            target.mkdir()
+    assert not ns["_original_shared_blob"](shard, snapshot.parents[1], snapshot.name)
+    with pytest.raises((ValueError, OSError)):
+        ns["_validate_gptoss_local_checkpoint"](alias)
