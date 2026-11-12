@@ -18,7 +18,8 @@ use std::{
 };
 
 use engine_zmq_adapter::{
-    SglangGenerateStream, TokenSpeedGenerateStream, TrtllmGenerateStream, VllmGenerateStream,
+    FrontendFinish, SglangGenerateStream, TokenSpeedGenerateStream, TrtllmGenerateStream,
+    VllmGenerateStream,
 };
 use futures::Stream;
 use llm_tokenizer::stop::StopSequenceDecoder;
@@ -35,16 +36,12 @@ use crate::{
 };
 
 /// One choice's engine stream as the choices read it: the adapter's per-wire
-/// stream types, which yield the intermediate proto responses and park the
-/// engine's terminal `Complete` for the poll that follows its finish tick.
+/// stream types, which yield the intermediate proto responses, park the
+/// engine's terminal `Complete` for the poll that follows its finish tick and
+/// end from the frontend's side through [`FrontendFinish`].
 pub(crate) trait EngineChoice:
-    Stream<Item = Result<vllm::GenerateResponse, Status>> + Unpin + Send
+    FrontendFinish + Stream<Item = Result<vllm::GenerateResponse, Status>> + Unpin + Send
 {
-    /// Whether the engine's own `Complete` is parked for the next poll.
-    fn has_parked_complete(&self) -> bool;
-    /// The parked `Complete`, or a synthesized `abort` one: the terminal of
-    /// a choice ended before the engine's own finish.
-    fn complete_aborted(&mut self) -> vllm::GenerateResponse;
     /// The prefill the engine timed itself, taken once: the computed tokens
     /// with the engine's start and end seconds. `None` on a wire without
     /// engine timing, whose choices sample their prefill on the servicer's
@@ -56,68 +53,24 @@ pub(crate) trait EngineChoice:
 
 /// An engine stream of a token-only wire: the servicer matches the string
 /// stops, and ends the engine request with the matched stop on its
-/// `Complete`.
-pub(crate) trait MatchesStops: EngineChoice {
-    /// The terminal `Complete` of a choice the servicer's matcher ended, with
-    /// the ids and logprobs accumulated so far and `matched` as its stop.
-    fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse;
-}
+/// `Complete` ([`FrontendFinish::complete_with_matched_stop`]).
+pub(crate) trait MatchesStops: EngineChoice {}
 
 impl EngineChoice for VllmGenerateStream {
-    fn has_parked_complete(&self) -> bool {
-        VllmGenerateStream::has_parked_complete(self)
-    }
-
-    fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        VllmGenerateStream::complete_aborted(self)
-    }
-
     fn take_prefill_sample(&mut self) -> Option<(u32, f64, f64)> {
         VllmGenerateStream::take_prefill_sample(self)
     }
 }
 
-impl EngineChoice for SglangGenerateStream {
-    fn has_parked_complete(&self) -> bool {
-        SglangGenerateStream::has_parked_complete(self)
-    }
+impl EngineChoice for SglangGenerateStream {}
 
-    fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        SglangGenerateStream::complete_aborted(self)
-    }
-}
+impl EngineChoice for TokenSpeedGenerateStream {}
 
-impl EngineChoice for TokenSpeedGenerateStream {
-    fn has_parked_complete(&self) -> bool {
-        TokenSpeedGenerateStream::has_parked_complete(self)
-    }
+impl EngineChoice for TrtllmGenerateStream {}
 
-    fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        TokenSpeedGenerateStream::complete_aborted(self)
-    }
-}
+impl MatchesStops for VllmGenerateStream {}
 
-impl EngineChoice for TrtllmGenerateStream {
-    fn has_parked_complete(&self) -> bool {
-        TrtllmGenerateStream::has_parked_complete(self)
-    }
-
-    fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        TrtllmGenerateStream::complete_aborted(self)
-    }
-}
-
-impl MatchesStops for VllmGenerateStream {
-    fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
-        VllmGenerateStream::complete_with_matched_stop(self, matched)
-    }
-}
-
-impl MatchesStops for TokenSpeedGenerateStream {
-    fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
-        TokenSpeedGenerateStream::complete_with_matched_stop(self, matched)
-    }
-}
+impl MatchesStops for TokenSpeedGenerateStream {}
 
 /// What a wire makes of a choice's items: its proto response for one engine
 /// item under the request's id, with whatever it stamps on the way out, and
