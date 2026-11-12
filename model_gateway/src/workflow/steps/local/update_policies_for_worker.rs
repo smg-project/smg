@@ -267,6 +267,7 @@ mod tests {
         drop(first);
 
         let data = WorkerUpdateWorkflowData {
+            expected_id: None,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -328,6 +329,7 @@ mod tests {
         drop(first);
 
         let data = WorkerUpdateWorkflowData {
+            expected_id: None,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -400,6 +402,7 @@ mod tests {
         );
 
         let data = WorkerUpdateWorkflowData {
+            expected_id: None,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -466,6 +469,7 @@ mod tests {
         let url = second.url().to_string();
 
         let data = WorkerUpdateWorkflowData {
+            expected_id: None,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -559,6 +563,7 @@ mod tests {
         );
 
         let data = WorkerUpdateWorkflowData {
+            expected_id: None,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
