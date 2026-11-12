@@ -282,15 +282,29 @@ mod tests {
     #[test]
     fn media_digest_matches_length_prefixed_protobuf() {
         // Small, large and many short references exercise both paths and buffer flushes.
-        for urls in [
-            vec!["https://example.test/image.png".into()],
-            vec!["A".repeat(64 * 1024)],
-            (0..2048).map(|i| "x".repeat(i % 1000)).collect(),
-        ] {
-            let mm = MultimodalInputs {
-                image_urls: urls,
+        for mm in [
+            MultimodalInputs {
+                image_urls: vec!["https://example.test/image.png".into()],
                 ..Default::default()
-            };
+            },
+            MultimodalInputs {
+                image_urls: vec!["A".repeat(64 * 1024)],
+                ..Default::default()
+            },
+            MultimodalInputs {
+                image_urls: (0..2048).map(|i| "x".repeat(i % 1000)).collect(),
+                ..Default::default()
+            },
+            // Prost writes raw bytes through BufMut::put, which fills and advances chunks.
+            MultimodalInputs {
+                image_data: vec![vec![7; 70 * 1024], vec![9; 3]],
+                pixel_values: Some(TensorData {
+                    data: vec![1; 70 * 1024].into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
             let bytes = mm.encode_to_vec();
             let mut expected = Sha256::new();
             expected.update((bytes.len() as u64).to_le_bytes());
