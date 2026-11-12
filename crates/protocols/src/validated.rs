@@ -18,10 +18,13 @@ use std::borrow::Cow;
 use axum::{
     body::Bytes,
     extract::{
-        rejection::{BytesRejection, FailedToBufferBody, JsonRejection},
-        FromRequest, Request,
+        path::ErrorKind,
+        rejection::{
+            BytesRejection, FailedToBufferBody, JsonRejection, PathRejection, QueryRejection,
+        },
+        FromRequest, FromRequestParts, Path, Query, Request,
     },
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{header::CONTENT_TYPE, request::Parts, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -549,6 +552,98 @@ impl<T> std::ops::Deref for ValidatedJson<T> {
 impl<T> std::ops::DerefMut for ValidatedJson<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// A query string a route reads as `T` (the Conversations list route, the
+/// realtime routes): a value the type does not take is refused in the
+/// envelope, with the code the body extractor gives the same serde reason
+/// (`unknown_parameter`, `invalid_type`, ...) and `invalid_value` for a
+/// value that does not parse, where the framework answers text/plain.
+#[cfg(feature = "axum")]
+pub struct ValidatedQuery<T>(pub T);
+
+#[cfg(feature = "axum")]
+impl<S, T> FromRequestParts<S> for ValidatedQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(err) => Err(query_rejection(&err)),
+        }
+    }
+}
+
+/// A path segment a route reads as `T` (`/v1/models/{*id}`, the
+/// Conversations and Responses ids): a segment that is not UTF-8 or does not
+/// parse as the type is refused in the envelope as `invalid_value`, `param`
+/// the segment's name, where the framework answers text/plain. A rejection
+/// the route itself causes (no such parameter, a shape the extractor cannot
+/// fill) keeps the framework's answer: a 500 of the route's making, never a
+/// client's.
+#[cfg(feature = "axum")]
+pub struct ValidatedPath<T>(pub T);
+
+#[cfg(feature = "axum")]
+impl<S, T> FromRequestParts<S> for ValidatedPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<T>::from_request_parts(parts, state).await {
+            Ok(Path(value)) => Ok(Self(value)),
+            Err(err) => Err(path_rejection(err)),
+        }
+    }
+}
+
+/// The framework's prefix on a query string the type did not take.
+#[cfg(feature = "axum")]
+const QUERY_PREFIX: &str = "Failed to deserialize query string: ";
+
+#[cfg(feature = "axum")]
+fn query_rejection(err: &QueryRejection) -> Response {
+    let message = err.body_text();
+    let reason = message.strip_prefix(QUERY_PREFIX).unwrap_or(&message);
+    // The body extractor's code for the same serde reason; its fallback
+    // names JSON parsing, which a query string never had: a value that does
+    // not parse is `invalid_value`.
+    let code = match deserialize_code(reason) {
+        "json_parse_error" => "invalid_value",
+        code => code,
+    };
+    let param = param_from_deserialize_message(reason);
+    rejection(StatusCode::BAD_REQUEST, code, param, message)
+}
+
+#[cfg(feature = "axum")]
+fn path_rejection(err: PathRejection) -> Response {
+    match err {
+        PathRejection::FailedToDeserializePathParams(failed)
+            if failed.status() == StatusCode::BAD_REQUEST =>
+        {
+            let param = match failed.kind() {
+                ErrorKind::InvalidUtf8InPathParam { key }
+                | ErrorKind::ParseErrorAtKey { key, .. }
+                | ErrorKind::DeserializeError { key, .. } => Some(key.clone()),
+                _ => None,
+            };
+            rejection(
+                StatusCode::BAD_REQUEST,
+                "invalid_value",
+                param,
+                failed.body_text(),
+            )
+        }
+        other => other.into_response(),
     }
 }
 
@@ -1582,5 +1677,82 @@ mod tests {
                 .is_some_and(|m| m.contains("`reasoning_content` and `reasoning` disagree")),
             "{json}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "axum"))]
+mod query_tests {
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct Page {
+        limit: Option<usize>,
+    }
+
+    /// The limit the extractor read from `uri`, or the status and the body of
+    /// its refusal.
+    async fn extract(uri: &str) -> Result<Option<usize>, (StatusCode, Value)> {
+        let request = Request::builder().uri(uri).body(()).unwrap_or_default();
+        let (mut parts, ()) = request.into_parts();
+        match ValidatedQuery::<Page>::from_request_parts(&mut parts, &()).await {
+            Ok(ValidatedQuery(page)) => Ok(page.limit),
+            Err(response) => {
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                Err((status, serde_json::from_slice(&bytes).unwrap_or_default()))
+            }
+        }
+    }
+
+    /// A query string the type takes reaches the handler; a value the type
+    /// does not take is a 400 in the envelope, `invalid_value`, with the
+    /// framework's message.
+    #[tokio::test]
+    async fn a_query_string_the_type_does_not_take_is_refused_in_the_envelope() {
+        assert_eq!(extract("/list?limit=5").await, Ok(Some(5)));
+        assert_eq!(extract("/list").await, Ok(None));
+        let (status, body) = extract("/list?limit=-1").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(body["error"]["code"], "invalid_value", "{body}");
+        assert_eq!(body["error"]["param"], "limit", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with(QUERY_PREFIX),
+            "{body}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "axum"))]
+mod path_tests {
+    use super::*;
+
+    /// A path parameter the route did not declare is a rejection of the
+    /// route's own making: the framework's answer (a 500, text/plain)
+    /// reaches the client as it is, not as a 400 in the envelope.
+    #[tokio::test]
+    async fn a_rejection_of_the_routes_own_making_keeps_the_frameworks_answer() {
+        let request = Request::builder()
+            .uri("/items/7")
+            .body(())
+            .unwrap_or_default();
+        let (mut parts, ()) = request.into_parts();
+        let Err(response) = ValidatedPath::<u32>::from_request_parts(&mut parts, &()).await else {
+            panic!("a request no route matched carries no path parameters");
+        };
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
     }
 }
