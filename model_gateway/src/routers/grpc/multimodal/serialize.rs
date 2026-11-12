@@ -3,7 +3,7 @@
 
 use std::{collections::HashMap, time::Instant};
 
-use llm_multimodal::{EncoderDtype, EncoderInput, EncoderInputView, ModelSpecificValue};
+use llm_multimodal::{EncoderDtype, EncoderInput, EncoderInputView, ModelSpecificValue, WireBytes};
 use tracing::{info, warn};
 
 use super::log_mm_timing_enabled;
@@ -18,11 +18,11 @@ use crate::routers::grpc::proto_wrapper::{
 pub(super) fn serialize_encoder_input_owned(
     encoder_input: EncoderInput,
     dtype: &str,
-) -> anyhow::Result<(Vec<u8>, Vec<u32>, String)> {
+) -> anyhow::Result<(WireBytes, Vec<u32>, String)> {
     let dtype = wire_dtype(dtype, true);
     let shape = shape_u32(&encoder_input.view());
     let bytes = encoder_input
-        .into_bytes_as(dtype)
+        .into_wire_bytes_as(dtype)
         .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
     Ok((bytes, shape, dtype.to_string()))
 }
@@ -87,7 +87,7 @@ pub(super) fn serialize_tokenspeed_encoder_input_owned(
         return Ok(tensor);
     }
     let bytes = input
-        .into_bytes_as(dtype)
+        .into_wire_bytes_as(dtype)
         .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
     Ok(TokenSpeedTensor::inline(bytes, shape, dtype.to_string()))
 }
@@ -305,7 +305,10 @@ mod tests {
             let (actual, _, written) =
                 serialize_encoder_input_owned(preprocessed.encoder_input.clone(), dtype).unwrap();
             assert_eq!(written, dtype);
-            assert_eq!(actual, le_bytes(values.iter().map(|&value| convert(value))));
+            assert_eq!(
+                actual.as_slice(),
+                le_bytes(values.iter().map(|&value| convert(value)))
+            );
         }
     }
 
@@ -348,8 +351,8 @@ mod tests {
         let (data, shape, dtype) =
             serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "uint8").unwrap();
         assert_eq!(
-            (data, shape, dtype.as_str()),
-            (vec![0, 255, 51, 102, 153, 204], vec![1, 6], "uint8")
+            (data.as_slice(), shape, dtype.as_str()),
+            ([0, 255, 51, 102, 153, 204].as_slice(), vec![1, 6], "uint8")
         );
 
         let (data, _, dtype) =

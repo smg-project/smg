@@ -1,10 +1,10 @@
 //! Test gateway parsers and SSE events with exact gRPC frames.
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{pin::Pin, sync::atomic::Ordering, task::Poll, time::Duration};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::BufMut;
-use futures::{stream, StreamExt as _};
+use futures::{stream, Stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use openai_protocol::{
@@ -40,6 +40,11 @@ pub(super) fn runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("a current-thread runtime")
+}
+
+/// The next pull on `body`, polled once.
+pub(super) async fn pull(body: &mut DrivenBody) -> Poll<Option<Result<Bytes, std::io::Error>>> {
+    std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *body).poll_next(cx))).await
 }
 
 pub(crate) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
@@ -172,7 +177,7 @@ pub(super) fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
 pub(super) fn decoded_stream<M, S>(body: S) -> tonic::Streaming<M>
 where
     M: ProstMessage + Default + Send + 'static,
-    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+    S: Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
     let mut codec = tonic_prost::ProstCodec::<M, M>::default();
     tonic::Streaming::new_response(
@@ -188,7 +193,7 @@ where
 /// stream that was never dispatched (nothing to cancel on drop).
 fn response_stream<S>(body: S, client: VllmEngineClient) -> ProtoStream
 where
-    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+    S: Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
     let stream = AbortOnDropStream::new(decoded_stream(body), "eof-test".to_string(), client);
     // No generation was sent to the mock, so there is nothing to cancel.
@@ -924,6 +929,8 @@ pub(crate) fn response_processor() -> ResponseProcessor {
 pub(crate) fn messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
         prompt_tokens: 0,
+        max_tokens: 4096,
+        context_window: None,
         thinking_requested: thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -2286,10 +2293,12 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             ]
         );
         assert_eq!(events[1]["content_block"]["type"], "thinking");
+        // The engine's `length` after 17 tokens of a 4096-token budget is the
+        // window's; an EOF without a Complete ends the turn.
         assert_eq!(
             events[5]["delta"]["stop_reason"],
             if send_complete {
-                "max_tokens"
+                "model_context_window_exceeded"
             } else {
                 "end_turn"
             }
@@ -2325,6 +2334,8 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
             prompt_tokens: 0,
+            max_tokens: 4096,
+            context_window: None,
             thinking_requested: false,
             thinking_text_returned: true,
             reasoning_in_prefill: false,
@@ -2385,6 +2396,9 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
     let mut last = complete(0, finish);
     if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
         complete.output_ids = text.chars().map(u32::from).collect();
+        // The engine's count is the output's: a `length` finish past the
+        // request's budget of 16 is the budget's, not the window's.
+        complete.completion_tokens = complete.output_ids.len() as u32;
     }
     let (grpc_stream, server) = scripted_stream(vec![chunk(0, text), last], "0").await;
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
@@ -2694,6 +2708,8 @@ async fn messages_blocks_and_inputs(
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
         prompt_tokens: 0,
+        max_tokens: 4096,
+        context_window: None,
         thinking_requested: true,
         thinking_text_returned: true,
         reasoning_in_prefill: false,

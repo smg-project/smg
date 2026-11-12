@@ -37,6 +37,28 @@ use crate::routers::grpc::{
 /// Global Harmony encoding (lazy-initialized)
 static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 
+/// The text of a Responses message item's content parts as Harmony carries
+/// it: input text, output text and a refusal (losslessly text) verbatim. An
+/// image or a file part is refused by name, as chat audio is
+/// ([`reject_chat_audio`]), never dropped from the prompt behind an answer
+/// that reads as if the model had seen it.
+fn harmony_text_parts(parts: &[ResponseContentPart]) -> Result<Vec<String>, String> {
+    parts
+        .iter()
+        .map(|part| match part {
+            ResponseContentPart::OutputText { text, .. }
+            | ResponseContentPart::InputText { text } => Ok(text.clone()),
+            ResponseContentPart::Refusal { refusal } => Ok(refusal.clone()),
+            ResponseContentPart::InputImage { .. } => {
+                Err("Harmony does not support \"input_image\" content parts".to_string())
+            }
+            ResponseContentPart::InputFile { .. } => {
+                Err("Harmony does not support \"input_file\" content parts".to_string())
+            }
+        })
+        .collect()
+}
+
 fn reject_chat_audio(messages: &[ChatMessage]) -> Result<(), String> {
     let has_audio = messages.iter().any(|message| match message {
         ChatMessage::System { content, .. }
@@ -802,23 +824,9 @@ impl HarmonyBuilder {
                     _ => Role::User, // Default to user for unknown roles
                 };
 
-                // Extract text from content parts. `Refusal` is losslessly
-                // representable as text and is preserved verbatim. Image /
-                // file parts are currently dropped (R1/R2/R3 will implement
-                // full media handling).
-                let text_parts: Vec<String> = content
-                    .iter()
-                    .filter_map(|part| match part {
-                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                        ResponseContentPart::InputText { text } => Some(text.clone()),
-                        ResponseContentPart::Refusal { refusal } => Some(refusal.clone()),
-                        // R1/R2/R3 will implement full media handling
-                        ResponseContentPart::InputImage { .. }
-                        | ResponseContentPart::InputFile { .. } => None,
-                    })
-                    .collect();
-
-                let text = text_parts.join("\n");
+                // The text of the content parts; an image or a file part is
+                // refused (`harmony_text_parts`).
+                let text = harmony_text_parts(content)?.join("\n");
 
                 Ok(HarmonyMessage {
                     author: Author {
@@ -937,24 +945,7 @@ impl HarmonyBuilder {
 
                 let text = match content {
                     StringOrContentParts::String(s) => s.clone(),
-                    StringOrContentParts::Array(parts) => {
-                        // Extract text from content parts. `Refusal` is
-                        // losslessly representable as text and is preserved
-                        // verbatim. Image / file parts are currently dropped
-                        // (R1/R2/R3 will implement full media handling).
-                        parts
-                            .iter()
-                            .filter_map(|part| match part {
-                                ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                                ResponseContentPart::InputText { text } => Some(text.clone()),
-                                ResponseContentPart::Refusal { refusal } => Some(refusal.clone()),
-                                // R1/R2/R3 will implement full media handling
-                                ResponseContentPart::InputImage { .. }
-                                | ResponseContentPart::InputFile { .. } => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
+                    StringOrContentParts::Array(parts) => harmony_text_parts(parts)?.join("\n"),
                 };
 
                 Ok(HarmonyMessage {
@@ -1487,6 +1478,42 @@ mod tests {
         let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
         assert!(error.contains("vendor_media"));
         assert!(error.contains("gRPC"));
+    }
+
+    /// A Responses message item's `input_image` or `input_file` part has no
+    /// form in a Harmony prompt: the build refuses it by name, as it refuses
+    /// chat audio, instead of rendering the turn without it; a message item
+    /// and a simple input message alike.
+    #[test]
+    fn build_from_responses_refuses_image_and_file_parts() {
+        let builder = HarmonyBuilder::new();
+        let parts = [
+            (
+                json!({"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}),
+                "\"input_image\"",
+            ),
+            (
+                json!({"type": "input_file", "file_data": "JVBERi0xLjQK", "filename": "a.pdf"}),
+                "\"input_file\"",
+            ),
+        ];
+        for (part, name) in parts {
+            let inputs = [
+                json!([{"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hi"}, part.clone()
+                ]}]),
+                json!([{"role": "user", "content": [part.clone()]}]),
+            ];
+            for input in inputs {
+                let request: ResponsesRequest =
+                    serde_json::from_value(json!({"model": "gpt-oss-120b", "input": input}))
+                        .unwrap();
+                let error = builder
+                    .build_from_responses(&request)
+                    .expect_err("a media part is refused");
+                assert!(error.contains(name), "{error}");
+            }
+        }
     }
 
     #[test]

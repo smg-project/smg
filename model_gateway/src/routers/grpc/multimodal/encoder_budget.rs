@@ -10,13 +10,19 @@
 //! the inputs this pipeline precomputes, so the pipeline refuses them itself,
 //! on the per-item feature token count the placeholder expansion uses
 //! (nothing is counted twice), with the item's size and the budget in the
-//! same units. The worker-side pipeline takes the budget from its launcher;
+//! same units. An image is held to the budget twice: on the count its
+//! header's size alone gives, before any of its batch is decoded or any
+//! tensor built (a family whose crops grow with the plan writes hundreds of
+//! megabytes for an item the engine then never places), and on the count its
+//! preprocessing produced; a video or audio item, whose count comes from the
+//! sampled frames or the decoded length, on the produced count alone. The
+//! worker-side pipeline takes the budget from its launcher;
 //! the gateway's own placement takes the smallest a model's workers
 //! advertise, as it does the per-request item limits ([`super::item_limits`]).
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use llm_multimodal::{MediaItemInfo, Modality};
+use llm_multimodal::{ImageFrame, MediaItemInfo, Modality, VisionPreProcessor};
 
 use crate::worker::{Worker, WorkerRegistry};
 
@@ -132,11 +138,49 @@ pub(crate) fn check_item_feature_budget(
     }
 }
 
+/// Hold every image of a batch to the engine's budget before any of the
+/// batch is decoded or any tensor built, on the count its size alone gives:
+/// the size the header promised (`ImageFrame::size`, the dimensions the
+/// decode produces) through the processor's own size-to-count rule
+/// (`calculate_num_tokens`, the rule its preprocessing applies to the same
+/// size); the first image above the budget is the refusal, with the numbers
+/// and words of [`check_item_feature_budget`]. `None` is no budget. A size
+/// the processor's rule refuses is left to the preprocessing to report, so
+/// its own message stands.
+pub(crate) fn check_image_size_feature_budget(
+    processor: &dyn VisionPreProcessor,
+    images: &[Arc<ImageFrame>],
+    budget: Option<usize>,
+) -> Result<(), ItemOverEncoderBudget> {
+    let Some(budget) = budget else {
+        return Ok(());
+    };
+    for (index, image) in images.iter().enumerate() {
+        let size = image.size();
+        let Ok(feature_tokens) = processor.calculate_num_tokens(size.width, size.height) else {
+            continue;
+        };
+        if feature_tokens > budget {
+            return Err(ItemOverEncoderBudget {
+                modality: Modality::Image,
+                position: index + 1,
+                count: images.len(),
+                feature_tokens,
+                sampled_frames: None,
+                budget,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use llm_multimodal::VideoSamplingInfo;
+    use llm_multimodal::{
+        types::ImageSize, ImageSource, PreprocessedEncoderInputs, TransformError, VideoSamplingInfo,
+    };
 
     use super::*;
     use crate::worker::{
@@ -235,5 +279,78 @@ mod tests {
             worker("http://w6:50051", &[(MM_ENCODER_BUDGET_LABEL, "0")]),
         ]);
         assert_eq!(engine_encoder_budget(&unlabelled, MODEL), None);
+    }
+
+    /// A processor whose count is the image's pixel count, which refuses a
+    /// zero side as a resize rule would, and which must never be asked to
+    /// preprocess.
+    struct PixelCounted;
+
+    impl VisionPreProcessor for PixelCounted {
+        fn default_mean(&self) -> [f64; 3] {
+            [0.0; 3]
+        }
+        fn default_std(&self) -> [f64; 3] {
+            [1.0; 3]
+        }
+        fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+            if width == 0 || height == 0 {
+                return Err(TransformError::ShapeError("no side to resize".to_string()));
+            }
+            Ok(width as usize * height as usize)
+        }
+        fn model_name(&self) -> &'static str {
+            "pixel-counted"
+        }
+        fn preprocess(
+            &self,
+            _: &[&image::DynamicImage],
+        ) -> Result<PreprocessedEncoderInputs, TransformError> {
+            panic!("the size check must refuse before any preprocessing")
+        }
+    }
+
+    /// A `width` x `height` frame whose bytes are empty: its header size is
+    /// all there is, and a decode of it would fail, not count.
+    fn header_only(width: u32, height: u32) -> Arc<ImageFrame> {
+        Arc::new(ImageFrame::encoded(
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            format!("{width}x{height}"),
+            ImageSize::new(width, height),
+            None,
+        ))
+    }
+
+    /// One token over the budget on the header's size alone is refused with
+    /// the numbers and words of the check on the produced counts, before
+    /// anything is decoded; at the budget, and under it, the image is
+    /// admitted; no budget admits everything; a size the processor's own
+    /// rule refuses is left to the preprocessing to report.
+    #[test]
+    fn an_image_over_the_budget_on_its_header_size_is_refused_before_preprocessing() {
+        let images = [header_only(4, 4), header_only(64, 2)];
+        let error = check_image_size_feature_budget(&PixelCounted, &images, Some(127)).unwrap_err();
+        assert_eq!(
+            error,
+            ItemOverEncoderBudget {
+                modality: Modality::Image,
+                position: 2,
+                count: 2,
+                feature_tokens: 128,
+                sampled_frames: None,
+                budget: 127,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "image item 2 of 2 is 128 feature tokens, above the 127-token encoder budget the \
+             engine can place for one item; send a smaller image"
+        );
+        assert!(check_image_size_feature_budget(&PixelCounted, &images, Some(128)).is_ok());
+        assert!(check_image_size_feature_budget(&PixelCounted, &images, None).is_ok());
+        let refused_size = [header_only(0, 64)];
+        assert!(check_image_size_feature_budget(&PixelCounted, &refused_size, Some(1)).is_ok());
     }
 }

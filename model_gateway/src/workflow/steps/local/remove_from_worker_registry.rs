@@ -46,16 +46,14 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
             }
         }
 
-        let mut removed_count = 0;
-        for worker_url in worker_urls {
-            if app_context
-                .worker_registry
-                .remove_by_url(worker_url)
-                .is_some()
-            {
-                removed_count += 1;
-            }
-        }
+        // What each URL holds now, which a same-URL replacement during the
+        // drain makes differ from the worker found; the policy step asks
+        // after the models of both.
+        let removed: Vec<_> = worker_urls
+            .iter()
+            .filter_map(|worker_url| app_context.worker_registry.remove_by_url(worker_url))
+            .collect();
+        let removed_count = removed.len();
 
         // Log if some workers were already removed (e.g., by another process)
         if removed_count == worker_urls.len() {
@@ -74,6 +72,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
         // so this step no longer needs to push group-removed
         // notifications.
         refresh_worker_pool_sizes(&app_context.worker_registry, &unique_configs);
+        context.data.removed_workers = removed;
 
         Ok(StepResult::Success)
     }

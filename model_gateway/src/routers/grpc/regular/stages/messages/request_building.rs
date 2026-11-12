@@ -12,7 +12,7 @@ use crate::routers::{
     grpc::{
         common::stages::{
             helpers::{self, TagForStart},
-            BuildStage,
+            selection_context_length, BuildStage,
         },
         context::{
             stage_output, AttemptStamp, BuildOutput, ExecutionPlan, ExecutionPlanKind,
@@ -205,6 +205,13 @@ impl BuildStage for MessageRequestBuildingStage {
         )?;
         spec.reasoning_in_prefill = require_reasoning;
         spec.prompt_tokens = prompt_tokens;
+        // The selected worker's window, for the stop reason of a `length`
+        // finish (`MessagesResponseSpec::length_stop_reason`).
+        spec.context_window = ctx
+            .state
+            .workers
+            .as_ref()
+            .and_then(|workers| selection_context_length(workers, &ctx.input.model_id));
         spec.symphony = assignment;
         spec.parser_names.clone_from(&ctx.state.parser_names);
         Ok(BuildOutput {

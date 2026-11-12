@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 
+use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 
 use super::*;
-use crate::worker::{
-    circuit_breaker::{CircuitBreakerConfig, CircuitState},
-    test_support::no_health_check,
-    BasicWorkerBuilder, WorkerLoadGuard,
+use crate::{
+    observability::worker_metrics::{self, WorkerSeriesRecorder},
+    worker::{
+        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        test_support::no_health_check,
+        BasicWorkerBuilder, WorkerLoadGuard,
+    },
 };
 
 /// A worker whose breaker opens on one failed request and would stay
@@ -380,6 +384,116 @@ fn origin_tracks_local_and_mesh_registrations() {
     });
     let mesh_id = registry.get_id_by_url("http://remote:8080").unwrap();
     assert_eq!(registry.origin_of(&mesh_id), Some(WorkerOrigin::Mesh));
+}
+
+#[test]
+fn a_model_is_served_locally_only_by_a_worker_this_node_owns() {
+    let registry = WorkerRegistry::new();
+    assert!(!registry.serves_model_locally("llama-3"));
+
+    registry.on_remote_worker_state(&remote_state("peer-w1", "http://remote:8080", true, vec![]));
+    assert!(!registry.serves_model_locally("llama-3"));
+
+    let local: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://local:8080")
+            .model(ModelCard::new("llama-3"))
+            .build(),
+    );
+    registry.register(local).unwrap();
+    assert!(registry.serves_model_locally("llama-3"));
+    registry.remove_by_url("http://local:8080");
+    assert!(!registry.serves_model_locally("llama-3"));
+}
+
+#[test]
+fn a_worker_serves_locally_the_models_it_lists_now() {
+    // A refresh of an endpoint's model list rewrites the worker's models and
+    // leaves the model index as the registration wrote it. Its primary model,
+    // the first card, counts no more than the others once left out.
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.serves_model_locally("qwen"));
+    assert!(registry.serves_model_locally("llama"));
+
+    endpoint.set_models(vec![ModelCard::new("llama")]);
+    assert!(!registry.serves_model_locally("qwen"));
+    assert!(registry.serves_model_locally("llama"));
+}
+
+#[test]
+fn a_worker_registered_without_model_cards_serves_its_primary_model() {
+    // Indexed under its primary model alone, the `model_id` label or the
+    // wildcard id: a model list it discovers later leaves that out, and it
+    // still counts for it.
+    let registry = WorkerRegistry::new();
+    let labelled: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://labelled:8080")
+            .label("model_id", "llama")
+            .build(),
+    );
+    let unlabelled: Arc<dyn Worker> =
+        Arc::new(BasicWorkerBuilder::new("http://unlabelled:8080").build());
+    registry.register(Arc::clone(&labelled)).unwrap();
+    registry.register(Arc::clone(&unlabelled)).unwrap();
+    assert!(registry.serves_model_locally("llama"));
+    assert!(registry.serves_model_locally(unlabelled.model_id()));
+
+    labelled.set_models(vec![ModelCard::new("qwen")]);
+    unlabelled.set_models(vec![ModelCard::new("qwen")]);
+    assert!(registry.serves_model_locally("llama"));
+    assert!(registry.serves_model_locally(unlabelled.model_id()));
+}
+
+#[test]
+fn an_alias_is_not_a_model_served_locally() {
+    // Policies are keyed by canonical ids, which the routers resolve every
+    // alias to first.
+    let registry = WorkerRegistry::new();
+    registry
+        .register(worker_with_model_aliases(
+            "http://w1:8080",
+            "llama",
+            &["llama-latest"],
+            WorkerType::Regular,
+        ))
+        .unwrap();
+    assert!(registry.serves_model_locally("llama"));
+    assert!(!registry.serves_model_locally("llama-latest"));
+}
+
+#[test]
+fn a_worker_keeps_the_policy_of_every_model_it_serves_and_of_its_primary_model() {
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&endpoint),
+        ["qwen", "llama"]
+    );
+    // A refresh of its model list leaves llama in the model index, and its
+    // removal asks after llama all the same.
+    endpoint.set_models(vec![ModelCard::new("qwen"), ModelCard::new("mistral")]);
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&endpoint),
+        ["qwen", "mistral", "llama"]
+    );
+
+    // A worker registered before its models were known names its policy by
+    // its primary model, which the models it discovers later leave out.
+    let lazy: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://lazy:8080").build());
+    let primary = lazy.model_id().to_string();
+    lazy.set_models(vec![ModelCard::new("qwen")]);
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&lazy),
+        vec!["qwen".to_string(), primary]
+    );
 }
 
 /// The record a rebuild from a decoded spec is for.
@@ -1146,7 +1260,7 @@ fn remove_inner_aborts_when_origin_changed_before_lock() {
     // Models the post-promotion state: expecting Mesh, finding Local.
     assert!(
         registry
-            .remove_inner(&id, Some(WorkerOrigin::Mesh))
+            .remove_inner(&id, Some(WorkerOrigin::Mesh), None)
             .is_none(),
         "removal must abort when the origin no longer matches"
     );
@@ -3432,4 +3546,100 @@ fn clear_all_overload_flags_resets_every_model() {
     assert!(!b.is_overloaded());
     assert_eq!(registry.overloaded_worker_count("m1"), 0);
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
+}
+
+/// A removed worker's address stays retired in the series store while a
+/// handle to the worker lives (a late write of that handle lands nowhere),
+/// and the store's upkeep forgets it once the last handle is gone: the
+/// registry hands the store the removed worker's own witness.
+#[test]
+fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
+    let series = worker_metrics::installed_or_default();
+    let registry = WorkerRegistry::new();
+    let url = "http://retired-seam:8080";
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .health_config(no_health_check())
+            .build(),
+    );
+    let held = Arc::clone(&worker);
+    let id = registry.register(worker).unwrap();
+    assert!(!series.is_retired(url), "a registered address is live");
+
+    registry.remove(&id);
+    assert!(series.is_retired(url), "the removal retires the address");
+    series.run_upkeep();
+    assert!(
+        series.is_retired(url),
+        "a held worker keeps its address retired through the upkeep"
+    );
+
+    drop(held);
+    series.run_upkeep();
+    assert!(
+        !series.is_retired(url),
+        "the upkeep forgets the address once the removed worker is gone"
+    );
+}
+
+/// A worker replaced at its URL stays alive in the handles taken before the
+/// replacement (a load guard) and writes under the URL when they go: the
+/// registry hands the store its witness at the replacement, so once the URL
+/// is removed the upkeep keeps the address retired until that instance is
+/// gone too, and the guard's release lands nowhere.
+#[test]
+fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
+    let series = worker_metrics::installed_or_default();
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(series),
+    );
+    let url = "http://replaced-seam:8080";
+    let worker = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let listed = || {
+        let mut rendered = String::new();
+        series.render_into(&mut rendered);
+        rendered.lines().any(|line| {
+            line.starts_with("smg_worker_requests_active{")
+                && line.contains("worker=\"http://replaced-seam:8080\"")
+        })
+    };
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        let first = worker();
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let guard = WorkerLoadGuard::new(first, None);
+        assert!(
+            listed(),
+            "the guard's load is a series of the registered address"
+        );
+        assert!(registry.replace(&id, worker()), "a same-URL replacement");
+
+        registry.remove(&id);
+        assert!(series.is_retired(url), "the removal retires the address");
+        series.run_upkeep();
+        assert!(
+            series.is_retired(url),
+            "the replaced instance in its guard keeps the address retired"
+        );
+
+        drop(guard);
+        assert!(
+            !listed(),
+            "the guard's release after the removal lands nowhere"
+        );
+        series.run_upkeep();
+        assert!(
+            !series.is_retired(url),
+            "the upkeep forgets the address once the replaced instance is gone"
+        );
+    });
 }

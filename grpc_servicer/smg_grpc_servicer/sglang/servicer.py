@@ -227,6 +227,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Handle generation requests with streaming responses."""
         logger.info(f"Receive generation request: {request.request_id}")
 
+        response_generator = None
         try:
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
@@ -311,6 +312,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 f"{get_exception_traceback()}"
             )
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            if response_generator is not None:
+                await response_generator.aclose()
 
     async def Embed(
         self,

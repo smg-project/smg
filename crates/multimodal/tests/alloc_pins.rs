@@ -9,7 +9,7 @@
 //! allocates into the window. The decode's own calls depend on which decoder is loaded
 //! (TurboJPEG and libwebp are runtime bindings; their C allocations never reach this
 //! allocator), so the decode pin counts the large buffers only, per decoder: the TurboJPEG
-//! binding decodes a frame of a megabyte or more into a buffer from the pool, the fallback
+//! binding decodes a frame of 256 KiB or more into a buffer from the pool, the fallback
 //! decoder allocates its own.
 //! The warm pass returns its buffers the way a request does (the frame dropped, the wire
 //! payload sent), so the pins hold the steady state of the buffer pool: a decoded frame or a
@@ -18,9 +18,10 @@
 //!
 //! `MM_PINS_RECORD=1 cargo test -p llm-multimodal --test alloc_pins -- --nocapture`
 //! prints the table instead of asserting, for re-pinning after a change that moves a
-//! count on purpose. The preprocess calls are pinned per resize row path (scalar, or the
-//! vector rows of NEON and AVX2): a re-pin records each count on its own path, and a
-//! failing run prints its table with the failure.
+//! count on purpose. The preprocess calls are pinned per resize row path (the torch module's
+//! plain loops or NEON rows on the targets that run them, the Pillow-exact passes' portable
+//! rows, AVX2 arm or AVX-512 arm on x86-64): a re-pin records each count on its own path
+//! (`row_path` names this host's), and a failing run prints its table with the failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 mod common;
@@ -233,7 +234,7 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
 ///
 /// - decode: the large buffers of the decode (the decoded frame, the decoder's own planes,
 ///   a copy of a large encoded file; a small input decodes under the threshold), per
-///   decoder (`Frames`): the TurboJPEG binding takes a frame of a megabyte or more from the
+///   decoder (`Frames`): the TurboJPEG binding takes a frame of 256 KiB or more from the
 ///   buffer pool, where the warm pass left one, the fallback decoder allocates it. The
 ///   calls are not pinned: they differ between the two decoders in their bookkeeping.
 /// - copy: one call, one large buffer: the gateway's per-frame clone before the processor
@@ -268,39 +269,64 @@ impl Frames {
     }
 }
 
-/// A call count per resize row path. The resize's rows run through NEON on aarch64 and
-/// AVX2 on x86-64 (`vision/torch_resample.rs`): the vector width pass collects wide taps
-/// and a scratch row of its own, and its height pass skips the scalar path's sums buffer,
-/// so a class counts one or two calls more or fewer than on the scalar path. Both counts
-/// are recorded on their own path; CI runs this test on each architecture.
+/// A call count per resize row path. On the targets that run `vision/torch_resample.rs`
+/// the rows are its plain loops (`scalar`) or its NEON rows (`neon`: the vector width pass
+/// collects wide taps and a scratch row of its own, and its height pass skips the scalar
+/// path's sums buffer); on x86-64 they are the Pillow-exact passes of
+/// `vision/transforms.rs` (`portable`, or the `avx2` and `avx512` arms with a scratch row
+/// pair per band), so a class counts a few calls more or fewer per path. Every count is
+/// recorded on its own path (the other arms forced off on a host that has them); CI runs
+/// this test on each architecture.
 struct Calls {
     scalar: usize,
-    vector: usize,
+    neon: usize,
+    portable: usize,
+    avx2: usize,
+    avx512: usize,
 }
 
 impl Calls {
     fn here(&self) -> usize {
-        if vector_rows() {
-            self.vector
-        } else {
-            self.scalar
+        match row_path() {
+            "neon" => self.neon,
+            "portable" => self.portable,
+            "avx2" => self.avx2,
+            "avx512" => self.avx512,
+            _ => self.scalar,
         }
     }
 }
 
-/// Whether this host resizes through the vector rows, the way the crate decides it.
-fn vector_rows() -> bool {
+/// The rows this host resizes through, the way the crate decides them: on x86-64 the
+/// AVX-512 arm needs the five features `transforms::avx512::detected` reads, else AVX2, else
+/// the portable rows; on AArch64 the NEON rows or the plain loops; the plain loops elsewhere.
+fn row_path() -> &'static str {
     #[cfg(target_arch = "aarch64")]
     {
-        std::arch::is_aarch64_feature_detected!("neon")
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            "neon"
+        } else {
+            "scalar"
+        }
     }
     #[cfg(target_arch = "x86_64")]
     {
-        std::arch::is_x86_feature_detected!("avx2")
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+        {
+            "avx512"
+        } else if std::arch::is_x86_feature_detected!("avx2") {
+            "avx2"
+        } else {
+            "portable"
+        }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        false
+        "scalar"
     }
 }
 
@@ -314,7 +340,10 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 6038,
-            vector: 6037,
+            neon: 6037,
+            portable: 6037,
+            avx2: 6038,
+            avx512: 6037,
         },
         preprocess_large: 2,
         serialize_calls: 0,
@@ -327,22 +356,28 @@ const PINS: &[Pin] = &[
         },
         copy: (1, 0),
         preprocess_calls: Calls {
-            scalar: 1051,
-            vector: 1052,
+            scalar: 1050,
+            neon: 1051,
+            portable: 1048,
+            avx2: 1052,
+            avx512: 1052,
         },
-        preprocess_large: 1,
+        preprocess_large: 0,
         serialize_calls: 0,
     },
     Pin {
         class: "jpeg-grayscale",
         decode_large: Frames {
             fallback: 1,
-            turbo: 1,
+            turbo: 0,
         },
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 1370,
-            vector: 1371,
+            neon: 1371,
+            portable: 1368,
+            avx2: 1372,
+            avx512: 1372,
         },
         preprocess_large: 2,
         serialize_calls: 0,
@@ -355,10 +390,13 @@ const PINS: &[Pin] = &[
         },
         copy: (1, 0),
         preprocess_calls: Calls {
-            scalar: 1051,
-            vector: 1052,
+            scalar: 1050,
+            neon: 1051,
+            portable: 1048,
+            avx2: 1052,
+            avx512: 1052,
         },
-        preprocess_large: 1,
+        preprocess_large: 0,
         serialize_calls: 0,
     },
     Pin {
@@ -370,7 +408,10 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 1429,
-            vector: 1428,
+            neon: 1428,
+            portable: 1428,
+            avx2: 1429,
+            avx512: 1428,
         },
         preprocess_large: 1,
         serialize_calls: 0,
@@ -384,7 +425,10 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 15,
-            vector: 15,
+            neon: 15,
+            portable: 15,
+            avx2: 15,
+            avx512: 15,
         },
         preprocess_large: 0,
         serialize_calls: 0,
@@ -404,6 +448,7 @@ fn every_stage_allocates_what_it_allocates_today() {
     let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
     let record = std::env::var_os("MM_PINS_RECORD").is_some_and(|value| value == "1");
     let mut failures = Vec::new();
+    println!("resize rows: {}", row_path());
     println!("class | stage | calls | bytes | large");
     for class in classes() {
         let measured = measure(&processor, &class);
@@ -473,6 +518,7 @@ fn returned(inputs: PreprocessedEncoderInputs) {
             buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
         }
         EncoderInput::Wire { bytes, .. } => buffer_pool::recycle(bytes),
+        EncoderInput::SharedWire { bytes, .. } => bytes.recycle(),
         EncoderInput::F32(_) => {}
     }
 }
@@ -552,11 +598,14 @@ fn a_clip_s_frames_allocate_what_they_allocate_today() {
 }
 
 /// The four-frame clip's pins: the calls per resize row path and the large buffers
-/// of its preprocess. The scalar count is recorded with the resize's rows forced to
-/// the scalar loops (a host without the vector unit records the same).
+/// of its preprocess. A path's count is recorded with the other rows forced off (a
+/// host without the vector unit records the plain loops' count as it stands).
 const VIDEO_FRAMES: usize = 4;
 const VIDEO_CALLS: Calls = Calls {
     scalar: 8741,
-    vector: 8737,
+    neon: 8737,
+    portable: 8737,
+    avx2: 8741,
+    avx512: 8737,
 };
 const VIDEO_LARGE: usize = 4;

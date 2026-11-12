@@ -37,7 +37,7 @@ shopt -s inherit_errexit
 
 GATEWAY_SHARDS=3
 
-# shard | path filter | extra setup (comma-separated: golden, ffmpeg, postgres, wasm-fixtures) | test step timeout (minutes)
+# shard | path filter | extra setup (comma-separated: golden, ffmpeg, turbojpeg, postgres, wasm-fixtures) | test step timeout (minutes)
 SHARDS='
 gateway-unit rust-gateway    ffmpeg                 20
 gateway-1    rust-gateway    -                      20
@@ -45,7 +45,7 @@ gateway-2    rust-gateway    -                      20
 gateway-3    rust-gateway    -                      20
 bindings     rust-bindings   -                      20
 tokenizer    rust-tokenizer  -                      20
-multimodal   rust-multimodal golden,ffmpeg          20
+multimodal   rust-multimodal golden,ffmpeg,turbojpeg 20
 symphony     rust-symphony   -                      20
 agentic      rust-agentic    postgres,wasm-fixtures 20
 protocols    rust-protocols  -                      20
@@ -78,7 +78,7 @@ packages_of() {
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
         protocols)  echo openai-protocol smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
         engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
-        kv)         echo kv-index smg-mesh smg-mm-rdma smg-radix-tree ;;
+        kv)         echo kv-index smg-mesh smg-mm-rdma smg-policy-controller smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
         *) shard_row "$1" >/dev/null ;;
     esac
@@ -178,7 +178,7 @@ commands_of() {
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)
             local selectors
-            echo "-p kv-index -p smg-mesh -p smg-mm-rdma"
+            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"

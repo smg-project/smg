@@ -915,7 +915,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         PathItem {
             post: Some(operation(
                 "reloadSecrets",
-                "Read the key files the start read again and put their keys in force: the admin role alone, mounted only with control-plane authentication",
+                "Read the key files the start read again and put their keys in force, for the requests the gateway accepts; the shared key it sends upstream to its workers keeps the start's value until a restart. The admin role alone, mounted only with control-plane authentication",
                 None,
                 None,
                 {

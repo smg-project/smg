@@ -687,8 +687,8 @@ class Worker:
             self.admin_port = get_open_port()
             self._admin_port_auto = True
         # The disaggregation roles are the HTTP and the gRPC workers'; the
-        # encode role is the gRPC vLLM wire's alone (the mock answers the
-        # encoder-cache handoff there); the ZMQ workers take none.
+        # encode role is a gRPC worker's, on the vLLM and the TokenSpeed wires
+        # (the mock answers each wire's media handoff); the ZMQ workers take none.
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
             if self.mode == ConnectionMode.ZMQ:
                 raise ValueError(
@@ -733,8 +733,9 @@ class Worker:
         # an encode worker also binds the bootstrap port the gateway is told
         # of, where the probe finds it; all advertise the role in their
         # server args (the HTTP workers in ``/server_info``). The encode
-        # role takes the vLLM wire whatever the lane's wire; a class's own
-        # wire still comes after, and the mock takes the last.
+        # role takes the vLLM wire whatever the lane's wire (its default of
+        # the two wires with an encoder); a class's own wire still comes
+        # after, and the mock takes the last.
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
             cmd += ["--worker-type", self.worker_type.value]
             if self.worker_type == WorkerType.ENCODE:

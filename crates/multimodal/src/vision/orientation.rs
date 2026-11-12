@@ -397,11 +397,7 @@ mod neon {
         };
         for j in 0..16 {
             let x = x0 + j;
-            let row = if layout.reverse_rows {
-                out_h - 1 - x
-            } else {
-                x
-            };
+            let row = layout.row_of(out_h, x);
             // The destination run, a 48-byte slice as above.
             let start = (row * out_w + col0) * 3;
             let run = &mut out[start..start + 48];
@@ -431,6 +427,7 @@ mod avx2 {
     use multiversion::{multiversion, target::match_target};
 
     use super::Transpose;
+    use crate::vision::rgb_runs::avx2::place;
 
     /// The pixels of `row` in reverse order into `out_row` (cut to `row`'s
     /// length).
@@ -471,51 +468,26 @@ mod avx2 {
         }
     }
 
-    // The reverse of sixteen pixels: output byte `g` of the 48 is source
-    // byte `45 - 3 (g / 3) + g % 3`; each output word gathers from the three
-    // source words, zero (`0x80`) where a word holds none of its bytes.
-    const REVERSE_0: [[u8; 16]; 3] = [
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x0e,
-        ],
-        [
-            0x0d, 0x0e, 0x0f, 0x0a, 0x0b, 0x0c, 0x07, 0x08, 0x09, 0x04, 0x05, 0x06, 0x01, 0x02,
-            0x03, 0x80,
-        ],
-    ];
-    const REVERSE_1: [[u8; 16]; 3] = [
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x0f, 0x80,
-        ],
-        [
-            0x0f, 0x80, 0x0b, 0x0c, 0x0d, 0x08, 0x09, 0x0a, 0x05, 0x06, 0x07, 0x02, 0x03, 0x04,
-            0x80, 0x00,
-        ],
-        [
-            0x80, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-    ];
-    const REVERSE_2: [[u8; 16]; 3] = [
-        [
-            0x80, 0x0c, 0x0d, 0x0e, 0x09, 0x0a, 0x0b, 0x06, 0x07, 0x08, 0x03, 0x04, 0x05, 0x00,
-            0x01, 0x02,
-        ],
-        [
-            0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-    ];
+    /// The reverse of sixteen pixels: the masks of output word `out_word`,
+    /// whose byte `i` is output byte `g = 16 out_word + i` of the 48, source
+    /// byte `45 - 3 (g / 3) + g % 3`, gathered from the three source words.
+    const fn reverse_masks(out_word: usize) -> [[u8; 16]; 3] {
+        let mut masks = [[0x80; 16]; 3];
+        let mut word = 0;
+        while word < 3 {
+            let mut i = 0;
+            while i < 16 {
+                let g = 16 * out_word + i;
+                masks[word][i] = place(45 - 3 * (g / 3) + g % 3, word);
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const REVERSE_0: [[u8; 16]; 3] = reverse_masks(0);
+    const REVERSE_1: [[u8; 16]; 3] = reverse_masks(1);
+    const REVERSE_2: [[u8; 16]; 3] = reverse_masks(2);
 
     /// Forty-eight bytes (sixteen pixels) with the pixels in reverse order.
     #[inline]
@@ -548,71 +520,54 @@ mod avx2 {
         super::reverse_pixels_scalar(rest, out_rest);
     }
 
-    // Sixteen pixels of a row as four words of four-byte pixels (`r g b 0`),
-    // so the tile transposes as 32-bit lanes: word `q` holds pixels `4 q`
-    // to `4 q + 3`, gathered from the one or two 16-byte words of the run
-    // that hold them.
-    const WIDEN_0: [[u8; 16]; 1] = [[
-        0x00, 0x01, 0x02, 0x80, 0x03, 0x04, 0x05, 0x80, 0x06, 0x07, 0x08, 0x80, 0x09, 0x0a, 0x0b,
-        0x80,
-    ]];
-    const WIDEN_1: [[u8; 16]; 2] = [
-        [
-            0x0c, 0x0d, 0x0e, 0x80, 0x0f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80, 0x02, 0x03, 0x04, 0x80, 0x05, 0x06,
-            0x07, 0x80,
-        ],
-    ];
-    const WIDEN_2: [[u8; 16]; 2] = [
-        [
-            0x08, 0x09, 0x0a, 0x80, 0x0b, 0x0c, 0x0d, 0x80, 0x0e, 0x0f, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x80, 0x01, 0x02,
-            0x03, 0x80,
-        ],
-    ];
-    const WIDEN_3: [[u8; 16]; 1] = [[
-        0x04, 0x05, 0x06, 0x80, 0x07, 0x08, 0x09, 0x80, 0x0a, 0x0b, 0x0c, 0x80, 0x0d, 0x0e, 0x0f,
-        0x80,
-    ]];
+    /// Sixteen pixels of a row as four words of four-byte pixels (`r g b 0`),
+    /// so the tile transposes as 32-bit lanes: the masks of word `q`, which
+    /// holds pixels `4 q` to `4 q + 3`, byte `i` of it source byte
+    /// `3 (4 q + i / 4) + i % 4` for a channel and zero for the pad, gathered
+    /// from the `WORDS` source words from `first` on.
+    const fn widen_masks<const WORDS: usize>(q: usize, first: usize) -> [[u8; 16]; WORDS] {
+        // The words from `first` hold all twelve channel bytes of the four pixels.
+        assert!(16 * first <= 12 * q && 12 * q + 12 <= 16 * (first + WORDS));
+        let mut masks = [[0x80; 16]; WORDS];
+        let mut word = 0;
+        while word < WORDS {
+            let mut i = 0;
+            while i < 16 {
+                if i % 4 != 3 {
+                    masks[word][i] = place(3 * (4 * q + i / 4) + i % 4, first + word);
+                }
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const WIDEN_0: [[u8; 16]; 1] = widen_masks(0, 0);
+    const WIDEN_1: [[u8; 16]; 2] = widen_masks(1, 0);
+    const WIDEN_2: [[u8; 16]; 2] = widen_masks(2, 1);
+    const WIDEN_3: [[u8; 16]; 1] = widen_masks(3, 2);
 
-    // Back to 48 packed bytes: output word `o` gathers from the two
-    // four-byte-pixel words that hold its pixels.
-    const NARROW_0: [[u8; 16]; 2] = [
-        [
-            0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x0e, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01,
-            0x02, 0x04,
-        ],
-    ];
-    const NARROW_1: [[u8; 16]; 2] = [
-        [
-            0x05, 0x06, 0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x0e, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x02, 0x04, 0x05, 0x06,
-            0x08, 0x09,
-        ],
-    ];
-    const NARROW_2: [[u8; 16]; 2] = [
-        [
-            0x0a, 0x0c, 0x0d, 0x0e, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0c,
-            0x0d, 0x0e,
-        ],
-    ];
+    /// Back to 48 packed bytes: the masks of output word `o`, whose byte `i`
+    /// is packed byte `g = 16 o + i`, channel `g % 3` of pixel `g / 3`, at
+    /// `4 (g / 3) + g % 3` of the four-byte-pixel words, gathered from words
+    /// `o` and `o + 1`.
+    const fn narrow_masks(o: usize) -> [[u8; 16]; 2] {
+        let mut masks = [[0x80; 16]; 2];
+        let mut word = 0;
+        while word < 2 {
+            let mut i = 0;
+            while i < 16 {
+                let g = 16 * o + i;
+                masks[word][i] = place(4 * (g / 3) + g % 3, o + word);
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const NARROW_0: [[u8; 16]; 2] = narrow_masks(0);
+    const NARROW_1: [[u8; 16]; 2] = narrow_masks(1);
+    const NARROW_2: [[u8; 16]; 2] = narrow_masks(2);
 
     /// A run of sixteen pixels as four words of four-byte pixels.
     #[inline]
@@ -718,11 +673,7 @@ mod avx2 {
             };
             for (c, words) in (0..4).map(row_words).enumerate() {
                 let x = x0 + 4 * q + c;
-                let row = if layout.reverse_rows {
-                    out_h - 1 - x
-                } else {
-                    x
-                };
+                let row = layout.row_of(out_h, x);
                 let start = (row * out_w + col0) * 3;
                 out[start..start + 48].copy_from_slice(&words);
             }

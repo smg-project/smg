@@ -9,6 +9,7 @@ use std::{
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
 use llm_tokenizer::traits::Tokenizer;
+use openai_protocol::common::ResponseFormat;
 use rand::RngExt;
 use smg_grpc_client::{
     mlx_proto,
@@ -199,23 +200,49 @@ pub(crate) fn resolve_request_id_stamp(
             let stamp = IdStamp::Suffixed {
                 base: rid.to_string(),
             };
-            (format!("{rid}-{}", request_stamp_uuid(tenant_meta)), stamp)
+            (suffixed_id(rid, request_stamp_uuid(tenant_meta)), stamp)
         } else {
             (rid.to_string(), IdStamp::Exact)
         };
     }
     match middleware_request_id(tenant_meta) {
         Some(request_id) => (
-            format!("{request_id}-{}", request_stamp_uuid(tenant_meta)),
+            suffixed_id(request_id, request_stamp_uuid(tenant_meta)),
             IdStamp::Suffixed {
                 base: request_id.to_string(),
             },
         ),
         None => (
-            format!("{prefix}{}", request_stamp_uuid(tenant_meta)),
+            minted_id(prefix, request_stamp_uuid(tenant_meta)),
             IdStamp::Minted { prefix },
         ),
     }
+}
+
+/// `{base}-{uuid}`, written into one `String` of its exact size: a `format!`
+/// of these pieces starts its buffer empty and grows it twice on the way
+/// (three allocations per id on every gRPC request, measured on the mock
+/// bed), where the length is known before the first byte is written.
+fn suffixed_id(base: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(base.len() + 1 + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(base);
+    id.push('-');
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+/// `{prefix}{uuid}`, written into one `String` of its exact size (see
+/// `suffixed_id`).
+fn minted_id(prefix: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(prefix.len() + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(prefix);
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+fn push_hyphenated(id: &mut String, uuid: uuid::Uuid) {
+    let mut text = [0u8; uuid::fmt::Hyphenated::LENGTH];
+    id.push_str(uuid.hyphenated().encode_lower(&mut text));
 }
 
 /// Shared id + stamp for the batched completion fan-out. The shared id
@@ -232,11 +259,7 @@ pub(crate) fn resolve_batch_id_stamp(
         Some(rid) => (rid.to_string(), Some(rid.to_string()), disaggregated),
         None => match middleware_request_id(tenant_meta) {
             Some(request_id) => (request_id.to_string(), Some(request_id.to_string()), true),
-            None => (
-                format!("{prefix}{}", uuid::Uuid::now_v7()),
-                None,
-                disaggregated,
-            ),
+            None => (minted_id(prefix, uuid::Uuid::now_v7()), None, disaggregated),
         },
     };
     (
@@ -281,12 +304,8 @@ impl IdStamp {
     pub(crate) fn restamp(&self, plan: &mut ExecutionPlan) -> Result<(), Response> {
         match self {
             Self::Exact => Ok(()),
-            Self::Suffixed { base } => {
-                plan.set_request_id(format!("{base}-{}", uuid::Uuid::now_v7()))
-            }
-            Self::Minted { prefix } => {
-                plan.set_request_id(format!("{prefix}{}", uuid::Uuid::now_v7()))
-            }
+            Self::Suffixed { base } => plan.set_request_id(suffixed_id(base, uuid::Uuid::now_v7())),
+            Self::Minted { prefix } => plan.set_request_id(minted_id(prefix, uuid::Uuid::now_v7())),
             Self::Batch(batch) => {
                 let ExecutionPlan::Batch {
                     shared_request_id,
@@ -306,7 +325,7 @@ impl IdStamp {
                 let shared = batch
                     .stable_shared
                     .clone()
-                    .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
+                    .unwrap_or_else(|| minted_id(batch.prefix, uuid::Uuid::now_v7()));
                 for (i, request) in requests.iter_mut().enumerate() {
                     request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
                 }
@@ -469,18 +488,30 @@ impl ToolConstraintStamp {
     /// Capture the stamp for a built request that carries the forced call's
     /// structural tag. Nothing is captured for a JSON-schema constraint (no
     /// shape to follow) or when the backend's builder let the request's
-    /// `response_format` outrank the tool constraint (the request then
-    /// carries a schema, grammar or regex, never a structural tag).
-    /// `first_token` says the table built the tag for an engine that starts
-    /// the grammar at the first token.
+    /// `response_format` outrank the tool constraint: the request then
+    /// carries the body's own constraint, a schema, a grammar, a regex, or
+    /// the body's own structural tag, told from the forced call's by
+    /// `own_format`, the `response_format` as the builder read it (`None`
+    /// where the constraint set it aside). `first_token` says the table
+    /// built the tag for an engine that starts the grammar at the first
+    /// token.
     pub(crate) fn capture(
         unshaped: Option<(String, String)>,
         parser: Option<&str>,
         first_token: bool,
         request: &ProtoGenerateRequest,
+        own_format: Option<&ResponseFormat>,
     ) -> Option<Self> {
         let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
-        request.structural_tag()?;
+        let carried = request.structural_tag()?;
+        // The body's own tag rides as its builder wrote it
+        // (`response_format_constraint`): a request that carries it keeps it
+        // on every retry.
+        if let Some(own @ ResponseFormat::StructuralTag { .. }) = own_format {
+            if serde_json::to_string(own).is_ok_and(|tag| tag == carried) {
+                return None;
+            }
+        }
         Some(Self::Registry {
             constraint,
             parser: parser.map(str::to_string),
@@ -823,7 +854,7 @@ pub(crate) fn resolve_string_stops(
         ProtoGenerateRequest::Sglang(req) => {
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -833,7 +864,7 @@ pub(crate) fn resolve_string_stops(
             // not part of shared stop resolution.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -846,7 +877,7 @@ pub(crate) fn resolve_string_stops(
             // stops at EOS itself, so its translation carries no frontend ids.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }

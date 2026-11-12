@@ -540,6 +540,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Requests without that signal (HTTP, a PD side, a non-streaming
     /// generation) never form a pile.
     fn note_tracked_started(&self) {}
+    /// [`Self::note_tracked_started`] at `now_ms` on the gateway clock (the
+    /// liveness module's `now_ms`): a dispatch that read its instant once
+    /// stamps the run's start with it instead of reading again.
+    fn note_tracked_started_at(&self, _now_ms: u64) {
+        self.note_tracked_started();
+    }
     /// Record the end of a tracked request.
     fn note_tracked_ended(&self) {}
     /// Requests in flight whose responses the gateway sees one by one.
@@ -1880,6 +1886,10 @@ impl Worker for BasicWorker {
 
     fn note_tracked_started(&self) {
         self.runtime.load().note_tracked_started();
+    }
+
+    fn note_tracked_started_at(&self, now_ms: u64) {
+        self.runtime.load().note_tracked_started_at(now_ms);
     }
 
     fn note_tracked_ended(&self) {

@@ -29,7 +29,6 @@ use openai_protocol::{
         self, ContentBlock, ContentBlockDelta, Message, MessageDelta, MessageDeltaUsage,
         MessageStreamEvent,
     },
-    profile::ProviderProfile,
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde::Serialize;
@@ -54,11 +53,12 @@ use crate::{
             common::{
                 response_collection::drain_prefill,
                 response_formatting::{
-                    chat_usage, effective_weight_version, CompletionTokenTracker, TokenCounts,
+                    chat_usage, effective_weight_version, known_spec_drafted,
+                    CompletionTokenTracker, TokenCounts,
                 },
                 responses::{
-                    body_guards, build_sse_response_driven, build_sse_response_from_stream,
-                    driven_channel, DrivenBody, Reading,
+                    body_guards, build_sse_response_driven, build_sse_response_driven_with,
+                    build_sse_response_from_stream, driven_channel, Reading, ReadingEnd,
                 },
             },
             context,
@@ -72,9 +72,10 @@ use crate::{
             },
             utils,
             utils::{isolation::isolated, message_utils},
+            wire::StreamShape,
         },
     },
-    worker::{GuardedStream, PrefillLoadGuard},
+    worker::PrefillLoadGuard,
 };
 
 mod completion;
@@ -87,6 +88,8 @@ use self::{
         CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
+#[cfg(test)]
+use crate::routers::grpc::common::responses::DrivenBody;
 
 /// Running usage is separate from settlement state: only Complete messages
 /// authorize settlement, even when intermediate chunks already report counts.
@@ -110,6 +113,15 @@ struct ChatStreamTokenCounts {
 }
 
 impl ChatStreamUsage {
+    fn new(expected_choices: u32) -> Self {
+        Self {
+            choices: (0..expected_choices)
+                .map(|index| (index, ChatStreamTokenCounts::default()))
+                .collect(),
+            reasoning_parsed: false,
+        }
+    }
+
     fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
         let counts = self.choices.entry(chunk.index()).or_default();
         counts.prompt = chunk.prompt_tokens();
@@ -150,7 +162,14 @@ impl ChatStreamUsage {
             cached: self.choices.values().map(|c| c.cached).max().unwrap_or(0),
             reasoning: self.choices.values().map(|c| c.reasoning).sum(),
             spec_accepted: self.choices.values().map(|c| c.spec_accepted).sum(),
-            spec_drafted: self.choices.values().map(|c| c.spec_drafted).sum(),
+            // Expected but unseen choices retain the proto's unknown zero
+            // sentinel: they invalidate a measured partial proposal sum while
+            // preserving legacy all-zero/no-speculation usage defaults.
+            spec_drafted: known_spec_drafted(
+                self.choices
+                    .values()
+                    .map(|c| (c.spec_accepted, c.spec_drafted)),
+            ),
         };
         chat_usage(
             counts.usage(),
@@ -212,7 +231,7 @@ impl GenerateStreamUsage {
             cached: self.cached,
             reasoning: self.reasoning.values().sum(),
             spec_accepted: 0,
-            spec_drafted: 0,
+            spec_drafted: Some(0),
         }
     }
 
@@ -408,10 +427,11 @@ impl StreamingProcessor {
             chat_request.ignore_eos,
         );
 
-        // MiniMax's stream-QoS contract bounds per-event delta sizes. The HTTP
-        // relay re-slices the upstream body; here the gateway encodes the
-        // frames itself, so the channel is re-chunked on its way out.
-        let rechunk = chat_request.provider == ProviderProfile::Minimax;
+        // A wire that bounds its events' delta sizes (MiniMax's) has the
+        // channel re-chunked on its way out by its own numbers: the HTTP
+        // relay re-slices the upstream body, here the gateway encodes the
+        // frames itself.
+        let rechunk = chat_request.wire.rechunk_policy();
 
         // The body's channel: the reading parks on it until the body took
         // the frame before (see `driven_channel`).
@@ -453,13 +473,14 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source)
+                    if let Err(failure) = &result {
+                        utils::send_stream_failure(&tx, failure, &source)
                             .instrument(span)
                             .await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::PrefillDecode {
@@ -490,13 +511,14 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source)
+                    if let Err(failure) = &result {
+                        utils::send_stream_failure(&tx, failure, &source)
                             .instrument(span)
                             .await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::Embedding { .. } => Box::pin(async move {
@@ -507,6 +529,7 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                ReadingEnd::Failed
             }),
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => Box::pin(async move {
@@ -517,19 +540,19 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                ReadingEnd::Failed
             }),
         };
 
         // Return SSE response; its body holds the guards for as long as it lives.
-        let stream = GuardedStream::new(DrivenBody::new(reading, rx), guards);
-        if rechunk {
-            build_sse_response_from_stream(sse_rechunk::rechunk_stream(
+        build_sse_response_driven_with(reading, rx, guards, |stream| match rechunk {
+            Some(policy) => build_sse_response_from_stream(sse_rechunk::rechunk_stream(
+                policy,
                 stream,
                 sse_rechunk::NoopObserver,
-            ))
-        } else {
-            build_sse_response_from_stream(stream)
-        }
+            )),
+            None => build_sse_response_from_stream(stream),
+        })
     }
 
     /// Process streaming chunks from a single stream (Regular mode)
@@ -737,11 +760,12 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
+                    if let Err(failure) = &result {
+                        utils::send_stream_failure(&tx, failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::PrefillDecode {
@@ -768,11 +792,12 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
+                    if let Err(failure) = &result {
+                        utils::send_stream_failure(&tx, failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::Embedding { .. } => Box::pin(async move {
@@ -783,6 +808,7 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                ReadingEnd::Failed
             }),
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => Box::pin(async move {
@@ -793,6 +819,7 @@ impl StreamingProcessor {
                 )
                 .await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                ReadingEnd::Failed
             }),
         };
 
@@ -2341,18 +2368,19 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = result {
-                        span.in_scope(|| source.account(&failure));
+                    if let Err(failure) = &result {
+                        span.in_scope(|| source.account(failure));
                         let error_event = MessageStreamEvent::Error {
-                            error: messages::ErrorResponse {
-                                error_type: failure.messages_error_type().to_string(),
-                                message: failure.to_string(),
-                            },
+                            error: messages::ErrorResponse::new(
+                                failure.messages_error_type(),
+                                failure.to_string(),
+                            ),
                         };
                         let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                     // No data: [DONE] — Anthropic uses message_stop instead
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::PrefillDecode {
@@ -2383,44 +2411,47 @@ impl StreamingProcessor {
                         .await
                         .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = result {
+                    if let Err(failure) = &result {
                         // A decode side the engine failed without a reason is read against
                         // the pair's bootstrap port first, as the chat event is (see
                         // `StreamSource::explain`), so the event names a dead rendezvous.
-                        let explained = source.explain(&failure).await;
-                        let failure = explained.as_ref().unwrap_or(&failure);
+                        let explained = source.explain(failure).await;
+                        let failure = explained.as_ref().unwrap_or(failure);
                         span.in_scope(|| source.account(failure));
                         let error_event = MessageStreamEvent::Error {
-                            error: messages::ErrorResponse {
-                                error_type: failure.messages_error_type().to_string(),
-                                message: failure.to_string(),
-                            },
+                            error: messages::ErrorResponse::new(
+                                failure.messages_error_type(),
+                                failure.to_string(),
+                            ),
                         };
                         let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                         let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
+                    ReadingEnd::of(&result)
                 })
             }
             context::ExecutionResult::Embedding { .. } => Box::pin(async move {
                 let error_event = MessageStreamEvent::Error {
-                    error: messages::ErrorResponse {
-                        error_type: "invalid_request_error".to_string(),
-                        message: "Embeddings not supported for Messages API".to_string(),
-                    },
+                    error: messages::ErrorResponse::new(
+                        "invalid_request_error",
+                        "Embeddings not supported for Messages API",
+                    ),
                 };
                 let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
+                ReadingEnd::Failed
             }),
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => Box::pin(async move {
                 let error_event = MessageStreamEvent::Error {
-                    error: messages::ErrorResponse {
-                        error_type: "invalid_request_error".to_string(),
-                        message: "Batched results not supported for Messages API".to_string(),
-                    },
+                    error: messages::ErrorResponse::new(
+                        "invalid_request_error",
+                        "Batched results not supported for Messages API",
+                    ),
                 };
                 let mut buf = BytesMut::with_capacity(MESSAGES_EVENT_ROOM);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
+                ReadingEnd::Failed
             }),
         };
 
@@ -2604,6 +2635,7 @@ impl StreamingProcessor {
                 let reading = async move {
                     utils::send_error_sse(&tx, message, "invalid_request_error").await;
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    ReadingEnd::Failed
                 };
                 return build_sse_response_driven(Box::pin(reading), rx, guards);
             }
@@ -2710,9 +2742,10 @@ impl StreamingProcessor {
             .await
             .unwrap_or_else(|panicked| Err(panicked.into()));
 
-            match outcomes {
+            let end = match outcomes {
                 Err(failure) => {
                     utils::send_stream_failure(&tx, &failure, &source).await;
+                    ReadingEnd::Failed
                 }
                 Ok(outcomes) => {
                     let mut total_prompt = 0u32;
@@ -2720,6 +2753,8 @@ impl StreamingProcessor {
                     let mut total_reasoning = 0u32;
                     let mut total_spec_accepted = 0u32;
                     let mut total_spec_drafted = 0u32;
+                    let mut has_unknown_spec_draft_tokens = false;
+                    let mut has_unavailable_spec_draft_tokens = false;
                     let mut total_completion = 0u32;
                     let mut first_token_time: Option<Instant> = None;
                     let mut all_saw_complete = true;
@@ -2728,7 +2763,10 @@ impl StreamingProcessor {
                         total_cached += outcome.cached_tokens;
                         total_reasoning += outcome.reasoning_tokens;
                         total_spec_accepted += outcome.spec_accepted_tokens;
-                        total_spec_drafted += outcome.spec_draft_tokens;
+                        total_spec_drafted += outcome.spec_draft_tokens.unwrap_or(0);
+                        has_unavailable_spec_draft_tokens |= outcome.spec_draft_tokens.is_none();
+                        has_unknown_spec_draft_tokens |= outcome.spec_draft_tokens.is_none()
+                            || outcome.spec_draft_tokens == Some(0);
                         total_completion += outcome.completion_tokens;
                         all_saw_complete &= outcome.saw_complete;
                         first_token_time = match (first_token_time, outcome.first_token_time) {
@@ -2774,7 +2812,15 @@ impl StreamingProcessor {
                                     cached: total_cached,
                                     reasoning: total_reasoning,
                                     spec_accepted: total_spec_accepted,
-                                    spec_drafted: total_spec_drafted,
+                                    spec_drafted: if has_unknown_spec_draft_tokens
+                                        && (total_spec_drafted > 0
+                                            || total_spec_accepted > 0
+                                            || has_unavailable_spec_draft_tokens)
+                                    {
+                                        None
+                                    } else {
+                                        Some(total_spec_drafted)
+                                    },
                                 }
                                 .usage(),
                             ),
@@ -2788,7 +2834,7 @@ impl StreamingProcessor {
                     // left and ended the read, which is no completed
                     // generation and gets no terminal router metric.
                     if tx.is_closed() {
-                        return;
+                        return ReadingEnd::Complete;
                     }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
@@ -2801,10 +2847,12 @@ impl StreamingProcessor {
                         cached_tokens: Some(u64::from(total_cached)),
                         output_tokens: total_completion as u64,
                     });
+                    ReadingEnd::Complete
                 }
-            }
+            };
 
             let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+            end
         };
 
         build_sse_response_driven(Box::pin(reading), rx, guards)
@@ -3082,7 +3130,7 @@ impl StreamingProcessor {
     }
 }
 
-/// Add the provider's null placeholder without allocating a JSON value per
+/// Add the wire's null placeholder without allocating a JSON value per
 /// token or changing the shared Chat response type. A populated usage field
 /// is serialized only by `chunk`, so there is never a duplicate JSON key.
 #[derive(Serialize)]
@@ -3207,13 +3255,10 @@ struct ChatStream<'a> {
     start_time: Instant,
     first_token_time: Option<Instant>,
 
-    /// DeepSeek always reports aggregate usage on the final finish chunk;
-    /// the public dialect ends the stream with a usage-only chunk when
-    /// `include_usage` asks for one. Under `include_usage` every chunk that
-    /// carries no usage writes the `usage: null` placeholder, as the public
-    /// API does (`emit_usage_null`).
-    deepseek_usage: bool,
-    include_usage: bool,
+    /// The wire's rules for this stream, resolved once when it opened
+    /// (`Wire::stream`).
+    shape: StreamShape,
+    /// `shape.usage_null_placeholder`, read as every chunk is written.
     emit_usage_null: bool,
     continuous_usage: Option<ChatStreamUsage>,
 
@@ -3302,21 +3347,11 @@ impl<'a> ChatStream<'a> {
             ignore_eos,
         );
 
-        let deepseek_usage = spec.provider == ProviderProfile::DeepSeek;
-        let include_usage = spec
-            .stream_options
-            .as_ref()
-            .is_some_and(|opts| opts.include_usage.unwrap_or(false));
-        let emit_usage_null = include_usage;
-        let mut continuous_usage = spec
-            .stream_options
-            .as_ref()
-            .filter(|opts| {
-                !deepseek_usage
-                    && opts.include_usage.unwrap_or(false)
-                    && opts.continuous_usage_stats.unwrap_or(false)
-            })
-            .map(|_| ChatStreamUsage::default());
+        // The wire's rules for this stream, decided once here.
+        let shape = spec.wire.stream(spec.stream_options.as_ref());
+        let mut continuous_usage = shape
+            .continuous_usage
+            .then(|| ChatStreamUsage::new(spec.expected_choices));
 
         let reasoning_parser_name = processor
             .parser_resolver
@@ -3394,9 +3429,8 @@ impl<'a> ChatStream<'a> {
             pd_timing,
             start_time,
             first_token_time: None,
-            deepseek_usage,
-            include_usage,
-            emit_usage_null,
+            shape,
+            emit_usage_null: shape.usage_null_placeholder,
             continuous_usage,
             reasoning_parser_name,
             tool_parser_name,
@@ -4452,15 +4486,19 @@ impl<'a> ChatStream<'a> {
                 .unwrap_or(0),
             reasoning: choices.iter().map(|choice| choice.reasoning_tokens).sum(),
             spec_accepted: choices.iter().map(|choice| choice.spec_accepted).sum(),
-            spec_drafted: choices.iter().map(|choice| choice.spec_drafted).sum(),
+            spec_drafted: known_spec_drafted(
+                choices
+                    .iter()
+                    .map(|choice| (choice.spec_accepted, choice.spec_drafted)),
+            ),
         }
     }
 
-    /// The stream's usage when the client asked for one, from
-    /// [`Self::counts`]. Built by the non-streamed answer's builder: the
-    /// usage chunk carries the usage object that answer carries.
+    /// The stream's usage when its wire reports one, from [`Self::counts`].
+    /// Built by the non-streamed answer's builder: the usage chunk carries
+    /// the usage object that answer carries.
     fn final_usage(&self) -> Option<Usage> {
-        (self.deepseek_usage || self.include_usage).then(|| {
+        self.shape.reports_usage.then(|| {
             chat_usage(
                 self.counts().usage(),
                 (self.reasoning_parser_available || self.spec.symphony.is_some()).then(|| {
@@ -4508,11 +4546,14 @@ impl<'a> ChatStream<'a> {
 
             let matched_stop_value = choice.matched_stop.clone();
 
-            let finish_usage = if self.deepseek_usage && complete_usage && position == finished {
-                final_usage.cloned()
-            } else {
-                usage.cloned()
-            };
+            // The wire says which finish chunk carries the final usage
+            // (DeepSeek's last one).
+            let finish_usage =
+                if complete_usage && self.shape.final_usage_on.carries(position, finished) {
+                    final_usage.cloned()
+                } else {
+                    usage.cloned()
+                };
             let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
                 .add_choice_finish_reason(index, final_finish_reason, matched_stop_value)
@@ -4535,12 +4576,12 @@ impl<'a> ChatStream<'a> {
         Ok(())
     }
 
-    /// Phase 5: the OpenAI dialect keeps its opt-in, usage-only chunk.
+    /// Phase 5: the usage-only chunk of the wires that close with one.
     async fn send_usage_chunk(
         &mut self,
         final_usage: Option<Usage>,
     ) -> Result<(), utils::StreamFailure> {
-        if !self.deepseek_usage {
+        if self.shape.final_usage_on.sends_usage_chunk() {
             if let Some(final_usage) = final_usage {
                 let usage_chunk = ChatCompletionStreamResponse::builder(
                     &self.dispatch.request_id,
@@ -5668,11 +5709,16 @@ impl<'a> MessagesStream<'a> {
     }
 
     /// Phase 4: the `message_delta` with the stop reason and the usage. A
-    /// truncation stays max_tokens after a tool call started, as Chat keeps
+    /// truncation stays a truncation after a tool call started, as Chat keeps
     /// `length`: the call may be cut short.
     async fn send_message_delta(&mut self) -> Result<(), utils::StreamFailure> {
+        // The engines report the request's budget and the model's window
+        // alike as `length`; the spec tells them apart from the counts.
+        let truncation = self
+            .spec
+            .length_stop_reason(self.prompt_tokens, self.completion_tokens.total());
         let stop_reason = if self.finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
+            Some(truncation.clone())
         } else if self.has_tool_calls || self.finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if self.matched_stop.as_ref().is_some_and(Value::is_string) {
@@ -5684,13 +5730,15 @@ impl<'a> MessagesStream<'a> {
             Some(messages::StopReason::EndTurn)
         };
         // Symphony's stop reason is the `Finish` event's; a stop sequence the decoder or the
-        // engine matched is reported as such, as the message says.
+        // engine matched is reported as such, as the message says, and its `max_tokens` is the
+        // engine's `length`, read against the budget as above.
         let stop_reason = match self.symphony_stop.take() {
             Some(messages::StopReason::EndTurn)
                 if self.matched_stop.as_ref().is_some_and(Value::is_string) =>
             {
                 Some(messages::StopReason::StopSequence)
             }
+            Some(messages::StopReason::MaxTokens) => Some(truncation),
             Some(stop) => Some(stop),
             None => stop_reason,
         };

@@ -185,6 +185,7 @@ fn run_step(
         &answers(
             spec,
             (offered * (ramp.step_seconds + ramp.step_warmup + 2) as f64) as usize + 256,
+            settings.bed.fleet.wire(),
         ),
     )?;
     thread::sleep(Duration::from_secs(1));

@@ -6,6 +6,7 @@
 //! - Streaming accumulators for response building
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt,
     sync::Arc,
@@ -193,6 +194,18 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     naming_parser(build_sse_response(rx), parser)
 }
 
+/// The text of one frame of the chat stream's body: the gateway's own
+/// output, valid UTF-8, borrowed after the standard validator's one pass
+/// (its ASCII fast path reads a word at a time; the lossy conversion's
+/// chunk walk reads a byte at a time and held 5.5 % of a Responses request's
+/// user instructions). Bytes that are not UTF-8 are replaced as before.
+fn frame_text(chunk: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(chunk) {
+        Ok(text) => Cow::Borrowed(text),
+        Err(_) => String::from_utf8_lossy(chunk),
+    }
+}
+
 /// The SSE events of one frame of the chat stream's body.
 ///
 /// The chat pipeline writes whole events to the body, but not one per frame:
@@ -355,7 +368,7 @@ async fn process_and_transform_sse_stream(
             BodyRead::ClientLeft => return Err("Client disconnected".to_string()),
         };
 
-        let frame = String::from_utf8_lossy(&chunk);
+        let frame = frame_text(&chunk);
         for event in chat_sse_events(&frame) {
             match event {
                 ChatSseEvent::Done => break 'frames,
@@ -955,7 +968,7 @@ async fn execute_tool_loop_streaming_internal(
             Err(e) => {
                 let message = format!("Failed to convert request: {e}");
                 if startup.is_some() {
-                    let response = error::bad_request("convert_request_failed", message.clone());
+                    let response = error::bad_request(e.code(), message.clone());
                     let _ = signal_stream_startup(&mut startup, Err(response));
                     return Ok(());
                 }
@@ -1156,7 +1169,7 @@ async fn convert_and_accumulate_stream(
                 return Err(json!({"code": "stream_error", "message": "Client disconnected"}))
             }
         };
-        let frame = String::from_utf8_lossy(&chunk);
+        let frame = frame_text(&chunk);
         for event in chat_sse_events(&frame) {
             let mut chat_chunk = match event {
                 ChatSseEvent::Done => break 'frames,
@@ -2070,5 +2083,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(error["code"], "internal_error");
         assert_eq!(error["message"], "engine unavailable");
+    }
+
+    #[test]
+    fn a_frame_of_valid_bytes_is_borrowed_and_an_invalid_one_is_replaced() {
+        let valid = b"data: {\"id\":\"chatcmpl-1\"}\n\n";
+        let frame = frame_text(valid);
+        assert!(matches!(frame, Cow::Borrowed(_)));
+        assert_eq!(frame.as_ref(), std::str::from_utf8(valid).unwrap());
+
+        let invalid = b"data: \xff\n\n";
+        let frame = frame_text(invalid);
+        assert!(matches!(frame, Cow::Owned(_)));
+        assert_eq!(frame.as_ref(), "data: \u{FFFD}\n\n");
     }
 }

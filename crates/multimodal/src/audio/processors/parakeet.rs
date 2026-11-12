@@ -429,6 +429,7 @@ fn normalized(features: &[f32], valid: usize, n_mels: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn splits_long_audio_into_30_second_clips_and_pads_a_short_tail() {
@@ -582,37 +583,9 @@ mod tests {
     /// boundary (31 and 33 frames at a 160 hop), a whole clip, a clip and a
     /// tail, two clips and a tail; quiet, ordinary and loud.
     fn waveform_corpus() -> Vec<(String, DecodedAudio)> {
-        let mut corpus = Vec::new();
-        for samples in [
-            1usize, 1600, 4800, 4960, 5120, 16_000, 480_000, 480_800, 961_600,
-        ] {
-            for (scale, label) in [(0.001_f32, "quiet"), (0.5, "mid"), (1.0, "loud")] {
-                let mut state: u32 = 0x9E37_79B9 ^ samples as u32;
-                let wave: Vec<f32> = (0..samples)
-                    .map(|i| {
-                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                        let noise = (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0;
-                        ((i as f32 * 0.03).sin() * 0.7 + noise * 0.3) * scale
-                    })
-                    .collect();
-                corpus.push((
-                    format!("{samples} samples {label}"),
-                    DecodedAudio {
-                        samples: wave,
-                        sample_rate: 16_000,
-                    },
-                ));
-            }
-        }
-        let wave: Vec<f32> = (0..8_000).map(|i| (i as f32 * 0.05).sin() * 0.4).collect();
-        corpus.push((
-            "8000 samples at 8 kHz".to_string(),
-            DecodedAudio {
-                samples: wave,
-                sample_rate: 8_000,
-            },
-        ));
-        corpus
+        test_support::waveform_corpus(&[
+            1, 1600, 4800, 4960, 5120, 16_000, 480_000, 480_800, 961_600,
+        ])
     }
 
     fn rows_of(processor: &ParakeetAudioProcessor, audios: &[&DecodedAudio]) -> Vec<f32> {

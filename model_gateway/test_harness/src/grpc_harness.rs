@@ -59,6 +59,9 @@ pub async fn serve_mock_worker_with(
     configure: impl FnOnce(u16) -> mock_worker::config::Config,
 ) -> u16 {
     let (listener, port) = ephemeral_listener().await;
+    // A port an earlier test's engine served on keeps that engine's
+    // overrides; this engine starts from fresh ones.
+    mock_worker::overrides::fresh_for_port(port);
     tokio::spawn(mock_worker::grpc::serve_with_listener(
         Arc::new(configure(port)),
         listener,

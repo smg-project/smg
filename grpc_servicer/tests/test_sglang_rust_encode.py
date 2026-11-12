@@ -59,11 +59,22 @@ class FakeReceiver:
     def send_encode_request(self, obj, time_stats_json=None, on_dispatch_error=None):
         self.calls.append(obj)
         urls = list(self.encode_urls)
-        if not obj.image_data or not urls:
+        named = [
+            (modality, items)
+            for modality, items in (
+                (Modality.IMAGE, obj.image_data),
+                (Modality.VIDEO, obj.video_data),
+                (Modality.AUDIO, obj.audio_data),
+            )
+            if items
+        ]
+        if not named or not urls:
             obj.need_wait_for_mm_inputs = False
             return None
         obj.need_wait_for_mm_inputs = True
-        obj.num_items_assigned = {Modality.IMAGE: [len(obj.image_data), 0][: len(urls)]}
+        obj.num_items_assigned = {
+            modality: [len(items), 0][: len(urls)] for modality, items in named
+        }
         obj.encoder_urls = urls
         ready = threading.Event()
         if self.fail_with is not None:
@@ -85,9 +96,10 @@ def sglang(monkeypatch):
     FakeBootstrapServer.instances = []
     built = {}
 
-    def create_mm_receiver(server_args, encode_urls=None, **_kwargs):
+    def create_mm_receiver(server_args, encode_urls=None, **kwargs):
         built["server_args"] = server_args
         built["encode_urls"] = encode_urls
+        built["transport_mode"] = kwargs.get("transport_mode")
         return built["receiver"]
 
     _install(
@@ -105,9 +117,11 @@ def sglang(monkeypatch):
     )
 
     class GenerateReqInput:
-        def __init__(self, rid=None, image_data=None):
+        def __init__(self, rid=None, image_data=None, video_data=None, audio_data=None):
             self.rid = rid
             self.image_data = image_data
+            self.video_data = video_data
+            self.audio_data = audio_data
             self.need_wait_for_mm_inputs = None
             self.num_items_assigned = None
             self.encoder_urls = None
@@ -173,6 +187,8 @@ def test_dispatch_hands_rust_what_the_receiver_set_and_the_release(sglang):
     need_wait, assigned, urls, release = bridge.dispatch(
         "r1",
         ["data:image/png;base64,AA==", "https://example.test/b.png"],
+        [],
+        [],
         lambda message, code: errors.append((message, code)),
     )
     (request,) = sglang["receiver"].calls
@@ -214,6 +230,8 @@ def test_dispatch_releases_the_receivers_thread_when_the_answer_does_not_build(s
         bridge.dispatch(
             "r3",
             ["https://example.test/a.png"],
+            [],
+            [],
             lambda message, code: errors.append((message, code)),
         )
     sglang["receiver"].threads[0].join(timeout=5)
@@ -226,7 +244,7 @@ def test_dispatch_with_no_encoder_registered_leaves_the_wait_flag_off(sglang):
     sglang["receiver"] = FakeReceiver(encode_urls=[])
     bridge = rust_encode.EncodeDispatchBridge(_args(encoder_urls=[]))
     bridge.start()
-    assert bridge.dispatch("r2", ["https://example.test/a.png"], lambda *_: None) == (
+    assert bridge.dispatch("r2", ["https://example.test/a.png"], [], [], lambda *_: None) == (
         False,
         None,
         None,
@@ -236,7 +254,59 @@ def test_dispatch_with_no_encoder_registered_leaves_the_wait_flag_off(sglang):
 
 def test_dispatch_before_start_is_an_error(sglang):
     with pytest.raises(RuntimeError, match="not started"):
-        rust_encode.EncodeDispatchBridge(_args()).dispatch("r", ["u"], lambda *_: None)
+        rust_encode.EncodeDispatchBridge(_args()).dispatch("r", ["u"], [], [], lambda *_: None)
+
+
+def test_dispatch_hands_the_receiver_every_modality_in_its_own_field(sglang):
+    """Video and audio references travel as the engine's own frontend carries
+    them (``video_data`` / ``audio_data``), an empty list as the absent field;
+    the receiver's per-modality assignment comes back keyed by the modality's
+    enum value (image 1, video 2, audio 3)."""
+    urls = ["http://10.0.0.8:30001", "http://10.0.0.9:30001"]
+    sglang["receiver"] = FakeReceiver(encode_urls=urls)
+    bridge = rust_encode.EncodeDispatchBridge(_args(encoder_urls=urls))
+    bridge.start()
+    need_wait, assigned, snapshot, release = bridge.dispatch(
+        "r4",
+        ["https://example.test/a.png"],
+        ["https://example.test/clip.mp4"],
+        ["https://example.test/voice.wav"],
+        lambda *_: None,
+    )
+    (request,) = sglang["receiver"].calls
+    assert (request.image_data, request.video_data, request.audio_data) == (
+        ["https://example.test/a.png"],
+        ["https://example.test/clip.mp4"],
+        ["https://example.test/voice.wav"],
+    )
+    assert need_wait is True
+    assert assigned == {1: [1, 0], 2: [1, 0], 3: [1, 0]}
+    assert snapshot == urls
+    release()
+    # Audio alone leaves the other fields absent, as the frontend leaves them.
+    bridge.dispatch("r5", [], [], ["https://example.test/voice.wav"], lambda *_: None)
+    request = sglang["receiver"].calls[-1]
+    assert (request.image_data, request.video_data, request.audio_data) == (
+        None,
+        None,
+        ["https://example.test/voice.wav"],
+    )
+
+
+def test_the_receiver_mode_is_read_once_and_handed_to_the_receiver(sglang, monkeypatch):
+    """``transport_mode`` is what ``create_mm_receiver`` would pick on its own
+    (``SGLANG_ENCODER_MM_RECEIVER_MODE``, ``http`` by default), read when the
+    bridge is built and handed to the receiver: the mode Rust reads and the
+    receiver's are one read."""
+    monkeypatch.delenv(rust_encode.RECEIVER_MODE_ENV, raising=False)
+    sglang["receiver"] = FakeReceiver(encode_urls=[])
+    bridge = rust_encode.EncodeDispatchBridge(_args(encoder_urls=[]))
+    assert bridge.transport_mode == "http"
+    bridge.start()
+    assert sglang["transport_mode"] == "http"
+    monkeypatch.setenv(rust_encode.RECEIVER_MODE_ENV, "grpc")
+    assert rust_encode.EncodeDispatchBridge(_args()).transport_mode == "grpc"
+    assert bridge.transport_mode == "http", "read once, when the bridge was built"
 
 
 def test_the_transfer_backend_resolves_as_sglang_resolves_it(monkeypatch):

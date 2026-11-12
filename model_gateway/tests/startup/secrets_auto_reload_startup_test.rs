@@ -144,3 +144,60 @@ fn a_rotated_key_file_is_in_force_without_a_call() {
         assert!(!log.contains(key), "a key reached the log:\n{log}");
     }
 }
+
+/// Without control-plane keys the shared key is the admin routes'
+/// credential too, through the fallback. A rotation of its file moves the
+/// admin routes with the serving routes: the retired key is out everywhere.
+#[test]
+fn a_rotated_shared_key_leaves_the_admin_routes_too() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let serving = dir.path().join("api-key");
+    fs::write(&serving, format!("{SERVING_KEY}\n")).unwrap();
+    let [port, metrics_port] = free_ports();
+    let mut args = base_args(port, metrics_port);
+    args.extend(
+        [
+            "--api-key-file",
+            serving.to_str().unwrap(),
+            "--secrets-auto-reload",
+        ]
+        .map(str::to_string),
+    );
+    let addr = SocketAddr::from((IP, port));
+    let gateway = Gateway::start(&args, addr, &dir.path().join("gateway.log"));
+    if let Err(log) = log_with_line(
+        &gateway.log,
+        "secrets_auto_reload=\"on (1 files)\"",
+        EXIT_TIMEOUT,
+    ) {
+        panic!("the CREDENTIAL SOURCES record does not say the file is watched:\n{log}");
+    }
+    let workers = |key: &str| request(addr, "GET", "/workers", Some(key), None).map(|(s, _)| s);
+    assert_eq!(
+        workers(SERVING_KEY),
+        Some(200),
+        "the shared key opens the admin routes"
+    );
+    assert_eq!(workers(ROTATED_SERVING_KEY), Some(401));
+
+    rotate(&serving, &format!("{ROTATED_SERVING_KEY}\n"));
+    within_ten_seconds("the serving key's reload", || {
+        serving_accepts(addr, Some(ROTATED_SERVING_KEY))
+    });
+    // The admin fallback swaps after the serving set on the reload's thread,
+    // so the admin route is polled as the serving route was.
+    within_ten_seconds("the admin fallback's reload", || {
+        workers(ROTATED_SERVING_KEY) == Some(200)
+    });
+    assert_eq!(
+        workers(SERVING_KEY),
+        Some(401),
+        "the admin routes refuse the retired key"
+    );
+
+    let log = gateway.log();
+    for key in [SERVING_KEY, ROTATED_SERVING_KEY] {
+        assert!(!log.contains(key), "a key reached the log:\n{log}");
+    }
+}

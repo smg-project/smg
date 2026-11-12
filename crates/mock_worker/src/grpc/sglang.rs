@@ -18,7 +18,7 @@ use sg::{
 use smg_grpc_client::{common_proto as common, sglang_proto as sg};
 use tonic::{Request, Response, Status};
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, TokenizerStream};
+use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
 use crate::{engine::KvEventStream, script::MatchedStop};
 
 pub(super) type Server = SglangSchedulerServer<MockScheduler>;
@@ -37,6 +37,14 @@ impl SglangScheduler for MockScheduler {
         let req = request.into_inner();
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
+        let rendezvous = req
+            .disaggregated_params
+            .as_ref()
+            .map_or(Rendezvous::None, |info| Rendezvous::Named {
+                host: info.bootstrap_host.clone(),
+                port: info.bootstrap_port,
+                room: i64::from(info.bootstrap_room),
+            });
         let frames = self
             .generate_frames(GenerateInput {
                 request_id: req.request_id.clone(),
@@ -50,6 +58,7 @@ impl SglangScheduler for MockScheduler {
                     .then(|| usize::try_from(req.top_logprobs_num).unwrap_or(0)),
                 score_ids: req.token_ids_logprob.clone(),
                 pin: req.data_parallel_rank,
+                rendezvous,
             })
             .await?;
         let request_id = req.request_id;
@@ -307,6 +316,17 @@ mod tests {
         script::{self, Answer},
     };
 
+    /// The request with the rendezvous the gateway mints for a disaggregated
+    /// pair on this wire: the prefill side's bootstrap server and a room.
+    fn disaggregated(mut req: sg::GenerateRequest, port: i32) -> sg::GenerateRequest {
+        req.disaggregated_params = Some(sg::DisaggregatedParams {
+            bootstrap_host: "127.0.0.1".to_string(),
+            bootstrap_port: port,
+            bootstrap_room: 7,
+        });
+        req
+    }
+
     fn request(id: &str, input_ids: &[u32], stream: bool) -> sg::GenerateRequest {
         sg::GenerateRequest {
             request_id: id.to_string(),
@@ -543,6 +563,65 @@ mod tests {
         assert_eq!(info.server_type, "grpc");
     }
 
+    /// A prefill or decode worker on this wire refuses a request without its
+    /// `disaggregated_params`, as the HTTP wire refuses a request without its
+    /// `bootstrap_room`, and a prefill worker one naming a port other than the
+    /// one it bound; with the rendezvous the gateway mints it answers.
+    #[tokio::test]
+    async fn a_disaggregated_worker_refuses_a_request_without_its_rendezvous() {
+        let (prefill, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Prefill),
+                grpc_wire: SchedulerWire::Sglang,
+                bootstrap_base_port: Some(8998),
+                ..Config::default()
+            },
+            65_315,
+        );
+        let refused = prefill
+            .generate(Request::new(request("sw-r1", &[1, 2, 3], false)))
+            .await
+            .err()
+            .expect("no rendezvous, not a stream");
+        assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+        assert!(
+            refused.message().contains("disaggregated_params"),
+            "{refused:?}"
+        );
+        let elsewhere = prefill
+            .generate(Request::new(disaggregated(
+                request("sw-r2", &[1, 2, 3], false),
+                8999,
+            )))
+            .await
+            .err()
+            .expect("another port, not a stream");
+        assert_eq!(elsewhere.code(), Code::InvalidArgument, "{elsewhere:?}");
+        let (decode, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Decode),
+                grpc_wire: SchedulerWire::Sglang,
+                ..Config::default()
+            },
+            65_316,
+        );
+        let refused = decode
+            .generate(Request::new(request("sw-r3", &[1, 2, 3], false)))
+            .await
+            .err()
+            .expect("no rendezvous, not a stream");
+        assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+        let frames = read_frames(
+            &decode,
+            disaggregated(request("sw-r4", &[1, 2, 3], true), 8998),
+        )
+        .await;
+        assert!(
+            !frames.is_empty(),
+            "the decode side generates with the rendezvous"
+        );
+    }
+
     /// A prefill worker answers the prompt side's completion alone and
     /// advertises its role and bootstrap port in its server args, as the
     /// TokenSpeed wire does.
@@ -556,7 +635,11 @@ mod tests {
             },
             65_303,
         );
-        let frames = read_frames(&prefill, request("sw-prefill", &[1, 2, 3], false)).await;
+        let frames = read_frames(
+            &prefill,
+            disaggregated(request("sw-prefill", &[1, 2, 3], false), 8998),
+        )
+        .await;
         match frames.as_slice() {
             [frame] => match frame.response.as_ref() {
                 Some(GenResp::Complete(complete)) => {

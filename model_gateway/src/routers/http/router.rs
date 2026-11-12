@@ -11,10 +11,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -32,12 +29,11 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
-    profile::ProviderProfile,
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
     },
-    rerank::{RerankRequest, RerankResponse, RerankResult},
+    rerank::{RerankRequest, RerankResponse, RerankWorkerResponse},
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
@@ -79,15 +75,18 @@ use crate::{
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
-            sse_rechunk::{NoopObserver, SseRechunker},
+            sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
         external::GatewayWorker,
         gateway::Gateway,
-        grpc::utils::{
-            error_reason_for_response, error_type_for_response, error_type_from_status,
-            route_to_endpoint,
+        grpc::{
+            utils::{
+                error_reason_for_response, error_type_for_response, error_type_from_status,
+                route_to_endpoint,
+            },
+            wire::Wire,
         },
         http::{
             request_body::{
@@ -122,7 +121,8 @@ const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 #[derive(Clone, Copy)]
 struct StreamRelayMode {
     is_stream: bool,
-    rechunk: bool,
+    /// The numbers the stream is re-sliced by, when its wire asks for it.
+    rechunk: Option<RechunkPolicy>,
 }
 
 /// One dispatch attempt of a typed request: the inputs every stage of
@@ -273,8 +273,7 @@ impl Router {
 
                 match send_with_stale_conn_retry(request_builder).await {
                     Ok(res) => {
-                        let status = StatusCode::from_u16(res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let status = res.status();
 
                         // Preserve headers from backend
                         let response_headers =
@@ -441,14 +440,25 @@ impl Router {
     /// reserves its estimate once, before any dispatch, and the one answer the
     /// dispatch paths converge on resolves the reservation once
     /// (`tenant_rate_limit::resolve`).
-    pub(crate) async fn route_typed_request<T: TenantCharge + serde::Serialize>(
-        &self,
-        headers: Option<&HeaderMap>,
-        tenant_meta: Option<&TenantRequestMeta>,
+    ///
+    /// A plain fn around an async block, not an async fn: everything the
+    /// route reads from the request by reference (whether it streams, its
+    /// routing derivatives, the tenant's estimate) is read here, before the
+    /// request moves into the lease, and the block uses the lease in place.
+    /// An async fn re-binds its by-value argument and keeps that local once
+    /// it has been borrowed, two copies of the request in the task beside
+    /// the lease's; the block holds the lease alone.
+    pub(crate) fn route_typed_request<'a, T>(
+        &'a self,
+        headers: Option<&'a HeaderMap>,
+        tenant_meta: Option<&'a TenantRequestMeta>,
         typed_req: T,
         route: &'static str,
-        model_id: &str,
-    ) -> Response {
+        model_id: &'a str,
+    ) -> impl Future<Output = Response> + Send + 'a
+    where
+        T: TenantCharge + serde::Serialize + Send + 'a,
+    {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
@@ -457,53 +467,62 @@ impl Router {
         // understands aliases; retry configs, hash rings and policies do not,
         // and an alias would silently fall back to router defaults.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
-        let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let outcome = self.begin_route(route, model_id, is_stream);
-
+        let estimate = tenant_rate_limit::estimate(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            &typed_req,
+            routing.text.as_deref(),
+        );
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
-        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
-        let retry_config = per_model_retry_config
-            .as_ref()
-            .unwrap_or(&self.retry_config);
-
-        let (reservation, denial) = self
-            .reserve_tenant_estimate(tenant_meta, &typed_req, model_id, routing.text.as_deref())
-            .await;
-
+        let per_model_retry_config = self
+            .worker_registry
+            .get_retry_config(canonical_model.as_deref().unwrap_or(model_id));
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
             typed_req,
             routing,
-            ReleasePoint::from_retry_config(retry_config),
+            ReleasePoint::from_retry_config(
+                per_model_retry_config
+                    .as_ref()
+                    .unwrap_or(&self.retry_config),
+            ),
         );
-        // The state the attempts share; `TypedAttempt` names each piece.
-        let tried = parking_lot::Mutex::new(Vec::new());
-        let ledger = AttemptLedger::default();
-        let attempt = TypedAttempt {
-            headers,
-            lease: &lease,
-            route,
-            model_id,
-            canonical_model: canonical_model.as_deref(),
-            is_stream,
-            ledger: &ledger,
-            tried: &tried,
-        };
+        async move {
+            let model_id = canonical_model.as_deref().unwrap_or(model_id);
+            let retry_config = per_model_retry_config
+                .as_ref()
+                .unwrap_or(&self.retry_config);
+            let outcome = self.begin_route(route, model_id, is_stream);
+            let (reservation, denial) = tenant_rate_limit::reserve(estimate, model_id).await;
+            // The state the attempts share; `TypedAttempt` names each piece.
+            let tried = parking_lot::Mutex::new(Vec::new());
+            let ledger = AttemptLedger::default();
+            let attempt = TypedAttempt {
+                headers,
+                lease: &lease,
+                route,
+                model_id,
+                canonical_model: canonical_model.as_deref(),
+                is_stream,
+                ledger: &ledger,
+                tried: &tried,
+            };
 
-        let response = if let Some(denied) = denial {
-            denied
-        } else if lease.release_point() == ReleasePoint::AfterDispatch {
-            self.dispatch_once(&attempt, outcome.endpoint).await
-        } else {
-            self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
-                .await
-        };
-        let response = self
-            .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
-            .await;
-        outcome.answered_typed(&response, start);
-        response
+            let response = if let Some(denied) = denial {
+                denied
+            } else if lease.release_point() == ReleasePoint::AfterDispatch {
+                self.dispatch_once(&attempt, outcome.endpoint).await
+            } else {
+                self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
+                    .await
+            };
+            let response = self
+                .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
+                .await;
+            outcome.answered_typed(&response, start);
+            response
+        }
     }
 
     /// The routing inputs of a request, derived once (for a typed request,
@@ -567,28 +586,6 @@ impl Router {
             model_label: Cow::Borrowed(model_label),
             endpoint,
         }
-    }
-
-    /// Reserve the tenant's estimate once per logical request, before any
-    /// dispatch: every attempt dispatches under this one reservation. With
-    /// the rate limiter on and a tenant to charge, either the reservation or
-    /// the denial, which is the request's answer, never retried; `(None,
-    /// None)` for a request outside the limiter (`tenant_rate_limit::reserve`).
-    async fn reserve_tenant_estimate<T: TenantCharge>(
-        &self,
-        tenant_meta: Option<&TenantRequestMeta>,
-        typed_req: &T,
-        model_id: &str,
-        routing_text: Option<&str>,
-    ) -> (Option<TenantReservation>, Option<Response>) {
-        tenant_rate_limit::reserve(
-            self.rate_limit_manager.as_deref(),
-            tenant_meta,
-            typed_req,
-            model_id,
-            routing_text,
-        )
-        .await
     }
 
     /// The one dispatch of a request with retries disabled: the lease frees
@@ -878,20 +875,22 @@ impl Router {
     }
 
     /// How the attempt's answer is relayed: streamed or buffered, and
-    /// re-chunked to the provider's packet-size contract when the model the
-    /// client asked for has one (the profile follows the requested model, as
-    /// request validation selects it, not the alias-resolved id).
+    /// re-chunked when the wire of the model the client asked for re-slices
+    /// its stream ([`Wire::rechunk_policy`]; the wire follows the requested
+    /// model, as request validation selects it, not the alias-resolved id).
     fn relay_mode_for_attempt<T: GenerationRequest>(
         attempt: &TypedAttempt<'_, T>,
     ) -> StreamRelayMode {
         let is_stream = attempt.is_stream;
-        let rechunk = is_stream
-            && attempt.route == "/v1/chat/completions"
-            && attempt.lease.with_view(|view| {
-                view.request.get_model().is_some_and(|model| {
-                    ProviderProfile::for_model(model) == ProviderProfile::Minimax
+        let rechunk = (is_stream && attempt.route == "/v1/chat/completions")
+            .then(|| {
+                attempt.lease.with_view(|view| {
+                    view.request
+                        .get_model()
+                        .and_then(|model| Wire::for_model(model).rechunk_policy())
                 })
-            });
+            })
+            .flatten();
         StreamRelayMode { is_stream, rechunk }
     }
 
@@ -1068,8 +1067,7 @@ impl Router {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let status = res.status();
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -1183,8 +1181,7 @@ impl Router {
             Err(response) => return response,
         };
 
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
 
         Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
 
@@ -1437,10 +1434,11 @@ impl Router {
     /// Relay a worker response to the client. A streaming response flows
     /// through a bounded channel with the load guard attached to the body; a
     /// buffered response is read capped at the ingress payload limit. With
-    /// `rechunk`, SSE delta payloads are re-sliced to the provider's
-    /// packet-size contract. A streamed body the worker ends with an error
-    /// after a successful head is accounted to `source` and, when it is SSE,
-    /// ended with the typed error event.
+    /// `rechunk`, SSE delta payloads are re-sliced to the bounds of the wire
+    /// of the model the client asked for ([`Wire::rechunk_policy`]). A streamed
+    /// body the worker ends with an error after a successful head is
+    /// accounted to `source` and, when it is SSE, ended with the typed error
+    /// event.
     async fn forward_worker_response(
         &self,
         res: reqwest::Response,
@@ -1449,8 +1447,7 @@ impl Router {
         load_guard: WorkerLoadGuard,
     ) -> Response {
         let StreamRelayMode { is_stream, rechunk } = mode;
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
 
         if is_stream {
             // Preserve headers for streaming response
@@ -1474,12 +1471,9 @@ impl Router {
                 Some(ct) => ct.starts_with("text/event-stream"),
                 None => status.is_success(),
             };
-            let rechunker =
-                (rechunk && upstream_sse).then(|| SseRechunker::with_observer(NoopObserver));
-            if rechunker.is_some() {
-                // Re-chunking changes the body length.
-                response_headers.remove(CONTENT_LENGTH);
-            }
+            let rechunker = rechunk
+                .filter(|_| upstream_sse)
+                .map(|policy| SseRechunker::with_observer(policy, NoopObserver));
             let mut response = relay_streaming_body(
                 res.bytes_stream(),
                 Relay {
@@ -1626,7 +1620,7 @@ impl Router {
             res,
             StreamRelayMode {
                 is_stream,
-                rechunk: false,
+                rechunk: None,
             },
             source,
             load_guard,
@@ -1641,6 +1635,14 @@ impl Router {
     /// has to be canonicalized here. `canonical_model` is set only when the
     /// client addressed the model by an alias; reporting the alias would make
     /// this route disagree with every other one about which model ran.
+    ///
+    /// The worker's body is read as a [`RerankWorkerResponse`]: the bare
+    /// result list or the Cohere-style `results` object, in either's spelling
+    /// of the score and the document, so a worker of any of the rerank
+    /// contracts answers in the gateway's one shape. The results keep the
+    /// worker's order (every contract sorts them, highest score first);
+    /// `top_k` and `return_documents` are applied here, whatever the worker
+    /// made of them.
     ///
     /// The worker body read is capped at `max_body_bytes`; a larger body is a
     /// misbehaving worker and yields a 502.
@@ -1674,8 +1676,8 @@ impl Router {
                 );
             }
         };
-        let rerank_results = match serde_json::from_slice::<Vec<RerankResult>>(&body_bytes) {
-            Ok(results) => results,
+        let rerank_results = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
+            Ok(response) => response.into_results(),
             Err(e) => {
                 error!("Failed to build rerank response: {e}");
                 return error::internal_error(
@@ -1686,7 +1688,8 @@ impl Router {
         };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
         let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid);
-        // Sorting is handled by Python worker (serving_rerank.py)
+        // The worker's order stands: every rerank contract answers sorted,
+        // highest score first.
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
         }
@@ -2214,6 +2217,7 @@ impl Router {
                     .any_model_retry_override_enables_retries(),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
             tenant_rate_limited: self.rate_limit_manager.is_some(),
+            message_thread: header_utils::anthropic_beta_named(headers, "message-threads"),
         })
     }
 
@@ -2581,7 +2585,7 @@ impl RouterTrait for Router {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+        if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
         self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
@@ -2869,6 +2873,7 @@ mod tests {
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
+    use openai_protocol::{profile::ProviderProfile, rerank::RerankResult};
     use serde_json::{json, Value};
 
     use super::*;
@@ -2879,8 +2884,9 @@ mod tests {
         policies::as_cache_aware,
         routers::common::{
             body_policy::{
-                REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
-                REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
+                REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
+                REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                REASON_WASM_REQUEST_HOOK,
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
             test_support::fast_retry_config,
@@ -3601,6 +3607,123 @@ mod tests {
         .unwrap()
     }
 
+    /// The gateway's response to a worker that answered `body`, with every
+    /// document asked for and no `top_k`.
+    async fn rerank_response_of(body: &str) -> RerankResponse {
+        let req = RerankRequest {
+            top_k: None,
+            return_documents: true,
+            ..rerank_request()
+        };
+        let upstream = Response::new(Body::from(body.to_string()));
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            upstream,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the body is read: {body}"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_results_object_with_relevance_scores_is_answered_in_the_gateway_shape() {
+        // The Cohere-style object: no document echoed, the object's own
+        // fields beside `results` unread.
+        let rerank = rerank_response_of(
+            r#"{"model": "test-model", "object": "list",
+                "usage": {"prompt_tokens": 12, "total_tokens": 12},
+                "results": [{"index": 1, "relevance_score": 0.93},
+                            {"index": 0, "relevance_score": 0.07}]}"#,
+        )
+        .await;
+        assert_eq!(rerank.model, "test-model");
+        let (first, second) = (&rerank.results[0], &rerank.results[1]);
+        assert_eq!((first.index, first.score), (1, 0.93));
+        assert_eq!((second.index, second.score), (0, 0.07));
+        assert_eq!(
+            first.document, None,
+            "a worker that echoes no document yields none"
+        );
+        assert!(rerank.usage.is_none(), "the worker's usage is not read");
+    }
+
+    #[tokio::test]
+    async fn a_document_object_and_the_text_spelling_read_as_the_document() {
+        let rerank = rerank_response_of(
+            r#"{"id": "r1", "model": "test-model", "usage": {"total_tokens": 9},
+                "results": [{"index": 0, "document": {"text": "d1"}, "relevance_score": 0.8}]}"#,
+        )
+        .await;
+        assert_eq!(rerank.results[0].document.as_deref(), Some("d1"));
+
+        let rerank = rerank_response_of(
+            r#"[{"index": 1, "score": 0.6, "text": "d2"}, {"index": 0, "score": 0.4}]"#,
+        )
+        .await;
+        assert_eq!(rerank.results[0].document.as_deref(), Some("d2"));
+        assert_eq!(rerank.results[1].document, None);
+        assert_eq!((rerank.results[1].index, rerank.results[1].score), (0, 0.4));
+    }
+
+    #[tokio::test]
+    async fn top_k_and_return_documents_apply_to_a_results_object_as_to_the_native_list() {
+        // `rerank_request` asks for one result and no documents.
+        let req = rerank_request();
+        let body = r#"{"results": [{"index": 0, "document": {"text": "d1"}, "relevance_score": 0.9},
+                                   {"index": 1, "document": {"text": "d2"}, "relevance_score": 0.5}]}"#;
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            Response::new(Body::from(body)),
+            usize::MAX,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rerank.results.len(), 1, "top_k truncates the worker's list");
+        assert_eq!(
+            rerank.results[0].document, None,
+            "return_documents false drops the echoed document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_in_no_rerank_shape_is_a_build_failure_not_a_pass_through() {
+        for body in [
+            r#"{"error": {"message": "no reranker loaded"}}"#,
+            r#"[{"index": 0}]"#,
+            "not json",
+        ] {
+            let req = rerank_request();
+            let response = Router::build_rerank_response(
+                RerankResponseSpec::from(&req),
+                None,
+                Response::new(Body::from(body)),
+                usize::MAX,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{body}"
+            );
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "rerank_response_build_failed",
+                "{body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn build_rerank_response_accepts_body_at_limit() {
         let req = rerank_request();
@@ -3935,6 +4058,28 @@ mod tests {
             headers.insert(CONTENT_LENGTH, len.parse().unwrap());
         }
         headers
+    }
+
+    /// A request that names the message-threads beta buffers: the thread
+    /// layer rebuilds the turn from its body before the route.
+    #[test]
+    fn a_message_thread_turn_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        let mut headers = headers_with_content_length(Some("64"));
+        headers.insert(
+            "anthropic-beta",
+            "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_MESSAGE_THREAD)
+        );
     }
 
     #[test]
@@ -5437,7 +5582,7 @@ mod tests {
                 reqwest::Response::from(upstream),
                 StreamRelayMode {
                     is_stream: true,
-                    rechunk: false,
+                    rechunk: None,
                 },
                 RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
                 WorkerLoadGuard::with_key(Arc::clone(&worker), None),
@@ -6403,6 +6548,225 @@ mod tests {
         let (status, _) = posted(app, request).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         drop(listener);
+    }
+
+    /// A worker that answers the chat route with `body` as one sized answer
+    /// under `content_type`: hyper writes the `Content-Length` an upstream
+    /// that knows its length would.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_sized_worker(body: &'static str, content_type: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move { ([(CONTENT_TYPE, content_type)], body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A streamed SSE relay may change the body's length, by re-slicing it
+    /// or by ending a cut stream with its error event, so a sized upstream
+    /// answer reaches the client without the upstream's `Content-Length` on
+    /// the re-sliced path and on the plain path alike, its text whole.
+    #[tokio::test]
+    async fn a_streamed_sse_relay_drops_the_upstreams_content_length() {
+        use openai_protocol::validated::Normalizable;
+
+        const BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: [DONE]\n\n";
+        let url = spawn_sized_worker(BODY, "text/event-stream").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert!(
+                !response.headers().contains_key(CONTENT_LENGTH),
+                "{model}: the Content-Length of a sized upstream answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let text: String = sse_events(std::str::from_utf8(&bytes).unwrap())
+                .iter()
+                .filter_map(|event| event.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .filter_map(|json| {
+                    json["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(text, "Hello", "{model}: the text is whole");
+        }
+    }
+
+    /// A streamed answer that is not SSE is relayed byte for byte, on the
+    /// re-chunking model and the plain one alike, so a sized upstream answer
+    /// keeps the upstream's `Content-Length` and reaches the client whole.
+    #[tokio::test]
+    async fn a_streamed_relay_keeps_the_content_length_of_a_sized_non_sse_answer() {
+        use openai_protocol::validated::Normalizable;
+
+        const BODY: &str = "{\"id\":\"sized\",\"object\":\"chat.completion\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\
+                            \"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}";
+        let url = spawn_sized_worker(BODY, "application/json").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|length| length.to_str().ok()),
+                Some(BODY.len().to_string().as_str()),
+                "{model}: the upstream's Content-Length of a sized non-SSE answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                BODY.as_bytes(),
+                "{model}: the bytes are whole"
+            );
+        }
+    }
+
+    /// Whether `bytes` hold a whole HTTP/1 request: the head and as many
+    /// body bytes as its `Content-Length` declares.
+    fn request_complete(bytes: &[u8]) -> bool {
+        let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&bytes[..head_end]);
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        bytes.len() >= head_end + 4 + length
+    }
+
+    /// A worker that answers one request with a sized SSE head (the
+    /// `Content-Length` of the whole `body`) and closes the connection after
+    /// the first `sent` bytes of it: an upstream that knew its length and
+    /// went away mid-body.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_sized_sse_worker_cut_after(body: &'static str, sent: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // The whole request first, so the close is a clean end of the
+            // answer and never a reset of unread request bytes.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request_complete(&request) {
+                match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => request.extend_from_slice(&buf[..n]),
+                    _ => return,
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body.as_bytes()[..sent]).await;
+            let _ = sock.flush().await;
+            // The socket drops here, short of the declared length.
+        });
+        format!("http://{addr}")
+    }
+
+    /// The plain path ends a cut stream with its error event too, so a sized
+    /// upstream answer that is cut reaches the client without the upstream's
+    /// `Content-Length`: the frames that arrived, the typed error event and
+    /// `[DONE]` under no declared length the event would overrun.
+    #[tokio::test]
+    async fn a_cut_sized_stream_on_the_plain_path_ends_with_its_error_event_and_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let url = spawn_sized_sse_worker_cut_after(BODY, first).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a cut stream's length is not the upstream's"
+        );
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body ends cleanly after the error event")
+            .to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        assert_eq!(events[0], BODY[..first].trim_end());
+        let error: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[2], "data: [DONE]");
     }
 }
 

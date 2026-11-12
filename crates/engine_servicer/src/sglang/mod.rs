@@ -21,7 +21,7 @@
 //! each later one); the decode side keeps the pin.
 //!
 //! The language side of encode/prefill disaggregation (`--language-only`)
-//! works as behind the engine's own frontend: a request's image references
+//! works as behind the engine's own frontend: a request's media references
 //! go to the encoders through the dispatcher the launcher supplies (SGLang's
 //! own receiver, in the launcher process) before the request reaches the
 //! scheduler, the scheduler's request carries what that dispatch set (its
@@ -261,7 +261,7 @@ pub struct SglangServicerConfig {
     pub servicer: ServicerConfig,
     pub model: SglangModelInfo,
     /// The encode dispatch of a language-side worker under encode/prefill
-    /// disaggregation (`--language-only`): a request's image references go
+    /// disaggregation (`--language-only`): a request's media references go
     /// to the encoders through it before the request reaches the scheduler,
     /// as the engine's own frontend sends them ([`SglangEncodeDispatcher`]).
     /// `None` on every other worker: a request of references is refused.
@@ -288,12 +288,10 @@ impl crate::kv_events::RankLoads for State {
         // load tail), never another rank's figures; a rank past the
         // connected ones gets no record.
         let load = info::rank_load(self, dp_rank)?;
-        // The queued token-work is this servicer's own estimate for the
-        // rank (see `info::rank_load`), so every rank's record reports it.
-        let mut record = smg_grpc_client::common_proto::EngineLoad::from(&load);
-        record.waiting_uncached_tokens =
-            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
-        Some(record)
+        Some(crate::kv_events::record_with_queue(
+            &load,
+            load.num_waiting_uncached_tokens,
+        ))
     }
 
     fn engine_link(&self) -> &EngineLink {

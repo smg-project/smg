@@ -3,10 +3,9 @@ use openai_protocol::{
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
-use tracing::debug;
 
 use crate::{
+    channel::Channel,
     request_fields::{logit_bias_by_token_id, OutputConstraint},
     BoxedTraceInjector,
 };
@@ -38,22 +37,7 @@ impl MlxEngineClient {
         "MLX"
     );
 
-    /// Abort a request
-    pub async fn abort_request(
-        &self,
-        request_id: String,
-        _reason: String,
-    ) -> Result<(), tonic::Status> {
-        debug!("Sending abort request for {}", request_id);
-        let request = Request::new(proto::AbortRequest {
-            request_ids: vec![request_id.clone()],
-        });
-
-        let mut client = self.client.clone();
-        let _response = client.abort(request).await?;
-        debug!("Abort response received for {}", request_id);
-        Ok(())
-    }
+    crate::impl_abort_without_reason!(proto);
 
     crate::impl_get_tokenizer!();
 

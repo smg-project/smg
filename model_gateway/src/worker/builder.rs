@@ -19,6 +19,7 @@ use super::{
     metadata::DecodingLabels,
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
+    Worker,
 };
 use crate::{
     config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
@@ -93,6 +94,54 @@ impl BasicWorkerBuilder {
             overload_defaults: OverloadThresholds::default(),
             discovered_labels: HashMap::new(),
         }
+    }
+
+    /// A builder over a live worker's resolved state: the spec, HTTP/2, the
+    /// discovered labels, the health config and endpoint, the resilience,
+    /// the breaker config, the ZMQ bounds, the overload block, a
+    /// materialized HTTP client and the current status, so a rebuild keeps
+    /// what registration resolved. The caller applies its own changes, the
+    /// gateway's overload defaults and the connect signal, then shares the
+    /// KV engine state with the worker it replaces.
+    pub(crate) fn carrying(worker: &Arc<dyn Worker>) -> Self {
+        let metadata = worker.metadata();
+        let mut builder = Self::from_spec((*metadata.spec).clone())
+            .http2(worker.http2())
+            .discovered_labels((*metadata.discovered_labels).clone())
+            .health_config(metadata.health_config.clone())
+            .health_endpoint(metadata.health_endpoint.clone())
+            .resilience(worker.resilience().clone())
+            // The resolved thresholds stand as the defaults the spec's block
+            // re-resolves against, so a rebuild without the gateway config at
+            // hand keeps the effective thresholds.
+            .overload(metadata.spec.overload)
+            .overload_defaults(metadata.overload)
+            .zmq_startup_timeout(metadata.zmq_startup_timeout)
+            .status(worker.status());
+        // `from_spec` starts on the built-in breaker config; with the live one
+        // the registry's replacement adopts the live breaker and its state.
+        if let Some(config) = worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .map(BasicWorker::circuit_breaker_config)
+        {
+            builder = builder.circuit_breaker_config(config);
+        }
+        if let Some(timeout) = metadata.zmq_request_timeout {
+            builder = builder.zmq_request_timeout(timeout);
+        }
+        // A never-HTTP worker keeps a deferred client slot.
+        if let Some(client) = worker.http_client_handle_if_initialized() {
+            builder = builder.http_client(client);
+        }
+        builder
+    }
+
+    /// The engine's KV block size in tokens as a registration states it;
+    /// `None` leaves it to what the engine's streams report.
+    pub fn kv_block_size(mut self, tokens: Option<usize>) -> Self {
+        self.spec.kv_block_size = tokens;
+        self
     }
 
     /// Set the bootstrap port (for prefill workers in PD disaggregation)

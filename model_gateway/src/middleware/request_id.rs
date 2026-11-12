@@ -44,7 +44,7 @@ const RANDOM_PART_LEN: usize = 24;
 /// so putting it on a response copies a reference to its text, not the text.
 static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// The header the Messages API's SDKs read the request id from.
-static REQUEST_ID: HeaderName = HeaderName::from_static("request-id");
+pub(crate) static REQUEST_ID: HeaderName = HeaderName::from_static("request-id");
 
 /// The longest inbound request id the gateway honours, in bytes. The ids
 /// proxies and clients commonly mint are 32 to 55 characters (a hex request
@@ -56,8 +56,9 @@ pub(super) const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
 /// Whether an inbound request id is one the gateway honours: one to
 /// [`MAX_INBOUND_REQUEST_ID_LEN`] visible-ASCII characters, no space among
 /// them. The HTTP parser lets a horizontal tab through, so a header value
-/// that parses as a string is not enough.
-fn is_acceptable_inbound_id(value: &str) -> bool {
+/// that parses as a string is not enough. The rule for every id the gateway
+/// echoes: the message-thread route applies it to a client's `rid`.
+pub(crate) fn is_acceptable_inbound_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_INBOUND_REQUEST_ID_LEN
         && value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))

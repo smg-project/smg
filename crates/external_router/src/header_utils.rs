@@ -64,6 +64,18 @@ pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_routing_key_hint_named(headers, &HEADER_ROUTING_KEY)
 }
 
+/// Whether the request's `anthropic-beta` header names the beta `name`
+/// (its dated form, `name-YYYY-MM-DD`): the header may repeat, and each value
+/// may list several betas, comma separated.
+pub fn anthropic_beta_named(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|beta| beta.trim().starts_with(name))
+}
+
 /// Declared size of the incoming raw body; pre-sizes reserialization buffers.
 pub fn content_length(headers: Option<&HeaderMap>) -> Option<usize> {
     headers?
@@ -419,6 +431,32 @@ mod tests {
     use rustls::crypto::ring;
 
     use super::*;
+
+    /// The beta is found in a repeated header and in a comma-separated list,
+    /// by its undated name; another beta or no header is not it.
+    #[test]
+    fn anthropic_beta_named_reads_repeated_and_listed_values() {
+        let mut headers = HeaderMap::new();
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        assert!(anthropic_beta_named(&headers, "interleaved-thinking"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static(
+                "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12",
+            ),
+        );
+        assert!(anthropic_beta_named(&headers, "message-threads"));
+        assert!(anthropic_beta_named(
+            &headers,
+            "fine-grained-tool-streaming"
+        ));
+        assert!(!anthropic_beta_named(&headers, "threads"));
+    }
 
     #[test]
     fn preserve_response_headers_drops_smg_owned_error_code() {
