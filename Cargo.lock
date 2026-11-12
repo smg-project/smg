@@ -7976,6 +7976,7 @@ dependencies = [
 name = "smg-policy-controller"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "criterion",
  "parking_lot 0.13.0",
  "prost-build",
