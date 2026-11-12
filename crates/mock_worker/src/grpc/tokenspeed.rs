@@ -12,7 +12,7 @@
 //! The admin fan-out's flush and profile RPCs are answered by the core, the
 //! same on every wire.
 
-use std::pin::Pin;
+use std::{collections::BTreeMap, pin::Pin};
 
 use enc::token_speed_encoder_server::{TokenSpeedEncoder, TokenSpeedEncoderServer};
 use futures::{Stream, StreamExt};
@@ -61,6 +61,7 @@ impl TokenSpeedScheduler for MockScheduler {
             }
         }
         check_encode_bootstrap(&req)?;
+        check_mm_inputs(&req, self.cfg.role)?;
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
         let rendezvous = req
@@ -282,6 +283,115 @@ fn check_encode_bootstrap(req: &ts::GenerateRequest) -> Result<(), Status> {
     Ok(())
 }
 
+/// A request's media items against the shape the engine requires before it
+/// places an embedding; the gateway builds them per wire, so a wrong item is
+/// a gateway regression the canned answer would otherwise hide. Each item:
+/// a specified modality, a content hash (the engine's pad value derives from
+/// it), placeholder spans inside the prompt, and, when the item names its
+/// placeholder token id, that the prompt's tokens of that id are exactly the
+/// items' spans. The encoder input is the prefill and regular roles' to
+/// require, inline or through a room of the request's `encode_bootstrap_info`
+/// (an encode worker ran the tower); the decode role takes the gateway's
+/// pixel-free clone of the request, every item's encoder input taken out and
+/// the rooms dropped, the metadata kept so decode pads the placeholders as
+/// prefill did.
+fn check_mm_inputs(req: &ts::GenerateRequest, role: Option<Role>) -> Result<(), Status> {
+    let Some(mm) = &req.mm_inputs else {
+        return Ok(());
+    };
+    let prompt_ids = req
+        .tokenized
+        .as_ref()
+        .map_or(&[][..], |tokenized| tokenized.input_ids.as_slice());
+    let roomed: Vec<u32> = req
+        .encode_bootstrap_info
+        .as_ref()
+        .map(|info| info.items.iter().map(|entry| entry.item_index).collect())
+        .unwrap_or_default();
+    let encoder_input = if role == Some(Role::Decode) {
+        EncoderInput::Detached
+    } else {
+        EncoderInput::Required { roomed: &roomed }
+    };
+    check_media_items(&mm.items, Some(prompt_ids), encoder_input)
+}
+
+/// Whether an item carries its feature: an encoder input with bytes in it.
+fn has_encoder_input(item: &ts::MultimodalItem) -> bool {
+    item.encoder_input
+        .as_ref()
+        .is_some_and(|tensor| match &tensor.payload {
+            Some(ts::tensor_data::Payload::Inline(bytes)) => !bytes.is_empty(),
+            Some(_) => true,
+            None => false,
+        })
+}
+
+/// What a role asks of a media item's encoder input.
+#[derive(Clone, Copy)]
+enum EncoderInput<'a> {
+    /// The role runs the tower on the item: the feature rides inline unless
+    /// one of the request's encode rooms (by item index) hands it over.
+    Required { roomed: &'a [u32] },
+    /// The gateway's decode leg is the request's pixel-free clone: no feature
+    /// and no rooms, the item's metadata alone.
+    Detached,
+}
+
+/// The item checks shared by `Generate` (with its prompt and the role's
+/// expectation of the encoder input) and `Encode` (no prompt, and the feature
+/// required on every item: the encoder runs the tower on it).
+fn check_media_items(
+    items: &[ts::MultimodalItem],
+    prompt_ids: Option<&[u32]>,
+    encoder_input: EncoderInput<'_>,
+) -> Result<(), Status> {
+    let mut covered: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut claimed = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let what = format!("media item {index}");
+        if item.modality() == common::Modality::Unspecified {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} carries an unspecified modality"
+            )));
+        }
+        if item.content_hash.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} carries no content hash (the engine's pad value derives \
+                 from it)"
+            )));
+        }
+        if let EncoderInput::Required { roomed } = encoder_input {
+            let has_room = roomed.contains(&u32::try_from(index).unwrap_or(u32::MAX));
+            if !has_encoder_input(item) && !has_room {
+                return Err(Status::invalid_argument(format!(
+                    "mock-worker: {what} carries no encoder input and no encode room hands it over"
+                )));
+            }
+        }
+        let spans = item
+            .placeholders
+            .iter()
+            .map(|placeholder| (placeholder.offset, placeholder.length));
+        let length = super::check_placeholder_spans(
+            prompt_ids,
+            spans,
+            item.placeholder_token_id,
+            &mut claimed,
+            &what,
+        )?;
+        if let Some(id) = item.placeholder_token_id {
+            *covered.entry(id).or_default() += length;
+        }
+    }
+    if let Some(prompt_ids) = prompt_ids {
+        for (id, length) in covered {
+            super::check_placeholder_tokens(prompt_ids, id, length)?;
+        }
+    }
+    Ok(())
+}
+
 /// The engine's encoder service, served by an encode worker beside the
 /// scheduler: the gateway hands it a request's media with one rendezvous
 /// room per item and reads its acceptance. The embedding would travel to the
@@ -308,6 +418,9 @@ impl TokenSpeedEncoder for MockScheduler {
             return Err(Status::invalid_argument(
                 "mock-worker: an encode request's room is never 0",
             ));
+        }
+        if let Some(mm) = &req.mm_inputs {
+            check_media_items(&mm.items, None, EncoderInput::Required { roomed: &[] })?;
         }
         // The realistic engine's fault and admission hooks apply as to the
         // prefill role, and the request counts in flight until its answer; an
@@ -385,5 +498,299 @@ fn logprobs(logprobs: LogProbs) -> ts::OutputLogProbs {
                 token_ids: position.ids,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::Code;
+
+    use super::*;
+    use crate::config::{Config, SchedulerWire};
+
+    fn service(port: u16) -> (MockScheduler, tokio::sync::watch::Sender<bool>) {
+        MockScheduler::for_tests(
+            Config {
+                grpc_wire: SchedulerWire::TokenSpeed,
+                ..Config::default()
+            },
+            port,
+        )
+    }
+
+    fn request(id: &str, input_ids: &[u32]) -> ts::GenerateRequest {
+        ts::GenerateRequest {
+            request_id: id.to_string(),
+            tokenized: Some(ts::TokenizedInput {
+                input_ids: input_ids.to_vec(),
+                ..Default::default()
+            }),
+            sampling_params: Some(ts::SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        }
+    }
+
+    /// An image item as the gateway builds it: placeholder token 9 under one
+    /// span, an eight-byte content hash, an inline feature.
+    fn image_item(offset: u32, length: u32) -> ts::MultimodalItem {
+        ts::MultimodalItem {
+            modality: common::Modality::Image as i32,
+            content_hash: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            encoder_input: Some(ts::TensorData {
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+                payload: Some(ts::tensor_data::Payload::Inline(vec![0; 16].into())),
+            }),
+            placeholders: vec![ts::PlaceholderRange { offset, length }],
+            placeholder_token_id: Some(9),
+            ..Default::default()
+        }
+    }
+
+    fn with_items(
+        mut req: ts::GenerateRequest,
+        items: Vec<ts::MultimodalItem>,
+    ) -> ts::GenerateRequest {
+        req.mm_inputs = Some(ts::MultimodalInputs { items });
+        req
+    }
+
+    async fn refused(service: &MockScheduler, req: ts::GenerateRequest) -> Status {
+        match service.generate(Request::new(req)).await {
+            Err(status) => status,
+            Ok(_) => panic!("the malformed media item was accepted"),
+        }
+    }
+
+    /// The prompt `[1, 9, 9, 2]`: one image under tokens 1..=2.
+    const PROMPT: [u32; 4] = [1, 9, 9, 2];
+
+    #[tokio::test]
+    async fn a_well_formed_media_item_is_accepted() {
+        let (service, _stop) = service(65_340);
+        let mut stream = service
+            .generate(Request::new(with_items(
+                request("ts-mm-ok", &PROMPT),
+                vec![image_item(1, 2)],
+            )))
+            .await
+            .expect("a well-formed item is accepted")
+            .into_inner();
+        assert!(stream.next().await.is_some(), "the answer streams");
+    }
+
+    #[tokio::test]
+    async fn a_media_item_without_a_content_hash_is_refused() {
+        let (service, _stop) = service(65_341);
+        let mut item = image_item(1, 2);
+        item.content_hash.clear();
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-hash", &PROMPT), vec![item]),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media item 0") && status.message().contains("content hash"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_item_without_placeholders_is_refused() {
+        let (service, _stop) = service(65_342);
+        let mut item = image_item(1, 2);
+        item.placeholders.clear();
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-spans", &PROMPT), vec![item]),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("no placeholders"), "{status:?}");
+        let mut zero = image_item(1, 2);
+        zero.placeholders[0].length = 0;
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-zero", &PROMPT), vec![zero]),
+        )
+        .await;
+        assert!(status.message().contains("length 0"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn a_placeholder_outside_the_prompt_is_refused() {
+        let (service, _stop) = service(65_343);
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-out", &PROMPT), vec![image_item(3, 2)]),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("outside the prompt of 4 tokens"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placeholder_that_does_not_cover_its_token_is_refused() {
+        let (service, _stop) = service(65_344);
+        // The span sits on token 1, not on the placeholder token 9.
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-cover", &PROMPT), vec![image_item(0, 2)]),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("not its placeholder token 9"),
+            "{status:?}"
+        );
+        // One placeholder token the spans leave out: an item the gateway dropped.
+        let status = refused(
+            &service,
+            with_items(
+                request("ts-mm-stray", &[1, 9, 9, 9]),
+                vec![image_item(1, 2)],
+            ),
+        )
+        .await;
+        assert!(
+            status.message().contains("holds 3 placeholder token(s) 9")
+                && status.message().contains("cover 2"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_placeholders_across_items_are_refused() {
+        let (service, _stop) = service(65_348);
+        let status = refused(
+            &service,
+            with_items(
+                request("ts-mm-overlap", &PROMPT),
+                vec![image_item(1, 1), image_item(1, 1)],
+            ),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media item 1")
+                && status
+                    .message()
+                    .contains("overlaps an earlier placeholder at token 1"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_item_with_an_unspecified_modality_is_refused() {
+        let (service, _stop) = service(65_345);
+        let mut item = image_item(1, 2);
+        item.modality = common::Modality::Unspecified as i32;
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-mod", &PROMPT), vec![item]),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("unspecified modality"),
+            "{status:?}"
+        );
+    }
+
+    /// Without an encoder input the item is refused, as the engine refuses a
+    /// tower run on nothing; a prefill whose `encode_bootstrap_info` hands the
+    /// item a room takes it without one (the encode worker ran the tower).
+    #[tokio::test]
+    async fn a_media_item_without_an_encoder_input_needs_an_encode_room() {
+        let (service, _stop) = service(65_346);
+        let mut item = image_item(1, 2);
+        item.encoder_input = None;
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-feat", &PROMPT), vec![item.clone()]),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("no encoder input"), "{status:?}");
+        let (prefill, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Prefill),
+                grpc_wire: SchedulerWire::TokenSpeed,
+                bootstrap_base_port: Some(8998),
+                ..Config::default()
+            },
+            65_347,
+        );
+        let mut req = with_items(request("ts-mm-room", &PROMPT), vec![item]);
+        req.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+            bootstrap_host: "127.0.0.1".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 7,
+        });
+        req.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo {
+            items: vec![ts::EncodeItemBootstrapInfo {
+                item_index: 0,
+                bootstrap_host: "127.0.0.1".to_string(),
+                bootstrap_port: 8999,
+                bootstrap_room: 11,
+            }],
+        });
+        prefill
+            .generate(Request::new(req))
+            .await
+            .expect("the roomed item is accepted without its feature");
+    }
+
+    /// The gateway's decode leg is the request's pixel-free clone (every
+    /// item's encoder input taken out, the encode rooms dropped, the
+    /// metadata kept): a decode worker takes it, and a prefill worker
+    /// refuses the same form as the engine refuses a tower run on nothing.
+    #[tokio::test]
+    async fn a_decode_worker_takes_the_pixel_free_clone_a_prefill_worker_refuses_it() {
+        let mut item = image_item(1, 2);
+        item.encoder_input = None;
+        let clone = |id: &str| {
+            let mut req = with_items(request(id, &PROMPT), vec![item.clone()]);
+            req.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+                bootstrap_host: "127.0.0.1".to_string(),
+                bootstrap_port: 8996,
+                bootstrap_room: 7,
+            });
+            req
+        };
+        let (decode, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Decode),
+                grpc_wire: SchedulerWire::TokenSpeed,
+                ..Config::default()
+            },
+            65_356,
+        );
+        let mut stream = decode
+            .generate(Request::new(clone("ts-mm-decode")))
+            .await
+            .expect("the decode side takes the pixel-free clone")
+            .into_inner();
+        assert!(stream.next().await.is_some(), "the answer streams");
+        let (prefill, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Prefill),
+                grpc_wire: SchedulerWire::TokenSpeed,
+                bootstrap_base_port: Some(8996),
+                ..Config::default()
+            },
+            65_357,
+        );
+        let status = refused(&prefill, clone("ts-mm-prefill")).await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("no encoder input"), "{status:?}");
     }
 }

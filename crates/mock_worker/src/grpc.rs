@@ -434,6 +434,93 @@ pub(crate) enum Rendezvous {
     Opaque,
 }
 
+/// One media item's placeholder spans against the prompt, as the engines
+/// check them before they place its embedding: at least one span, none
+/// empty, each inside the prompt when there is one (an encode request has
+/// none), none over a token an earlier span of the request claimed
+/// (`claimed` holds the request's spans so far, one list shared across its
+/// items), and, when the item names its placeholder token id, every prompt
+/// token under its spans is that id. Returns the spans' total length, which
+/// the caller sums per token id for [`check_placeholder_tokens`]. `what`
+/// names the item in the refusal.
+pub(crate) fn check_placeholder_spans(
+    prompt_ids: Option<&[u32]>,
+    spans: impl IntoIterator<Item = (u32, u32)>,
+    placeholder_token_id: Option<u32>,
+    claimed: &mut Vec<(usize, usize)>,
+    what: &str,
+) -> Result<usize, Status> {
+    let mut covered = 0usize;
+    let mut any = false;
+    for (offset, length) in spans {
+        any = true;
+        if length == 0 {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} carries a placeholder of length 0 at offset {offset}"
+            )));
+        }
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let end = start.checked_add(usize::try_from(length).unwrap_or(usize::MAX));
+        let end = if let Some(prompt_ids) = prompt_ids {
+            let Some(end) = end.filter(|end| *end <= prompt_ids.len()) else {
+                return Err(Status::invalid_argument(format!(
+                    "mock-worker: {what}'s placeholder at offset {offset} of length {length} lies \
+                     outside the prompt of {} tokens",
+                    prompt_ids.len()
+                )));
+            };
+            if let Some(id) = placeholder_token_id {
+                if let Some(other) = prompt_ids[start..end].iter().find(|token| **token != id) {
+                    return Err(Status::invalid_argument(format!(
+                        "mock-worker: {what}'s placeholder at offset {offset} of length {length} \
+                         covers token {other}, not its placeholder token {id}"
+                    )));
+                }
+            }
+            end
+        } else {
+            // An encode request has no prompt: the span is held against the
+            // request's other spans alone.
+            end.unwrap_or(usize::MAX)
+        };
+        if let Some(&(from, _)) = claimed.iter().find(|(from, to)| start < *to && *from < end) {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what}'s placeholder at offset {offset} of length {length} overlaps \
+                 an earlier placeholder at token {}",
+                start.max(from)
+            )));
+        }
+        claimed.push((start, end));
+        covered += end - start;
+    }
+    if !any {
+        return Err(Status::invalid_argument(format!(
+            "mock-worker: {what} carries no placeholders"
+        )));
+    }
+    Ok(covered)
+}
+
+/// The prompt's placeholder tokens against the items' spans: every prompt
+/// token equal to `id` belongs to an item's span (`covered` is the spans'
+/// total under that id, a count of distinct tokens as the spans are
+/// disjoint), so an item the gateway dropped, or a placeholder it left
+/// unexpanded, is refused rather than fed to the engine as text.
+pub(crate) fn check_placeholder_tokens(
+    prompt_ids: &[u32],
+    id: u32,
+    covered: usize,
+) -> Result<(), Status> {
+    let in_prompt = prompt_ids.iter().filter(|token| **token == id).count();
+    if in_prompt != covered {
+        return Err(Status::invalid_argument(format!(
+            "mock-worker: the prompt holds {in_prompt} placeholder token(s) {id} and the media \
+             items' spans cover {covered}"
+        )));
+    }
+    Ok(())
+}
+
 /// The logprobs of a frame's tokens: the sampled token's per position, the
 /// alternatives the request asked for, and on a completion the score of each
 /// token id the request asked for (empty elsewhere).

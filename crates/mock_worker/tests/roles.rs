@@ -1196,13 +1196,33 @@ async fn start_tokenspeed_encoder(
     )
 }
 
+/// A media item as the gateway builds it for the TokenSpeed wire: an image
+/// with a content hash, an inline feature and one placeholder token at
+/// `index` of the prompt (the worker checks the shape before it answers).
+fn tokenspeed_media_item(index: usize) -> ts::MultimodalItem {
+    ts::MultimodalItem {
+        modality: smg_grpc_client::common_proto::Modality::Image as i32,
+        content_hash: vec![u8::try_from(index).expect("a small index") + 1; 8],
+        encoder_input: Some(ts::TensorData {
+            shape: vec![1, 4],
+            dtype: "float32".to_string(),
+            payload: Some(ts::tensor_data::Payload::Inline(vec![0; 16].into())),
+        }),
+        placeholders: vec![ts::PlaceholderRange {
+            offset: u32::try_from(index).expect("a small index"),
+            length: 1,
+        }],
+        ..Default::default()
+    }
+}
+
 /// What the gateway sends a TokenSpeed encoder: the request's media items
 /// and one rendezvous room per item.
 fn tokenspeed_encode_request(id: &str, items: usize, rooms: &[i64]) -> enc::EncodeRequest {
     enc::EncodeRequest {
         request_id: id.to_string(),
         mm_inputs: Some(ts::MultimodalInputs {
-            items: vec![ts::MultimodalItem::default(); items],
+            items: (0..items).map(tokenspeed_media_item).collect(),
         }),
         items: rooms
             .iter()
@@ -1353,7 +1373,7 @@ async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
     let with_media = |id: &str, rooms: Option<Vec<ts::EncodeItemBootstrapInfo>>| {
         let mut req = rendezvous(request(id, &[1, 2, 3], false), 8998);
         req.mm_inputs = Some(ts::MultimodalInputs {
-            items: vec![ts::MultimodalItem::default(); 2],
+            items: (0..2).map(tokenspeed_media_item).collect(),
         });
         req.encode_bootstrap_info = rooms.map(|items| ts::EncodeBootstrapInfo { items });
         req
