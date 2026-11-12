@@ -410,10 +410,10 @@ def test_epd_roles_this_process_cannot_serve_are_refused_up_front(monkeypatch):
     language-only launch on a backend the scheduler ranks receive on passes
     (the encode dispatch runs in this process), as do the prefill/decode
     roles with one scheduler rank (the wire carries the bootstrap fields)
-    and a plain worker; a prefill/decode leg with more than one rank passes
-    too (the servicer places a prefill leg's request on the rank of its room
-    and a decode leg's on its pin) but for the one shape the engine cannot
-    serve: a prefill leg of several plain data-parallel replicas, whose KV
+    and a plain worker; a prefill/decode side with more than one rank passes
+    too (the servicer places a prefill side's request on the rank of its room
+    and a decode side's on its pin) but for the one shape the engine cannot
+    serve: a prefill side of several plain data-parallel replicas, whose KV
     sender fails every request of a non-zero room residue (every replica is
     attention-DP rank 0). Attention DP passes (the newer releases'
     ``attn_dp_size`` beside ``dp_size=1``, the pinned release's ``dp_size``
@@ -966,9 +966,9 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
 
 
 def test_a_disaggregation_role_plans_its_warm_up_without_a_peer(monkeypatch, tmp_path):
-    """A prefill or decode leg plans the warm-up as a single engine does and
+    """A prefill or decode side plans the warm-up as a single engine does and
     holds readiness for it; the plan's inputs carry the engine's stand-in
-    bootstrap host, so the requests are bound for nobody and the leg warms up
+    bootstrap host, so the requests are bound for nobody and the side warms up
     before its peer is there."""
     monkeypatch.setitem(
         sys.modules,
@@ -1230,7 +1230,7 @@ def test_a_language_only_launch_plans_the_warm_up_as_a_plain_worker(monkeypatch)
     the first forward of a fresh scheduler is paid before the health flips,
     not by the first request. The encoder-only role is the engine's own
     server and plans nothing."""
-    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: None)  # no image leg here
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: None)  # no image request here
     launcher = rust.SglangLauncher()
     facts = {"is_generation": True, "max_context_length": 4096, "vocab_size": 1024}
     language_side = launcher.warmup_inputs(
@@ -1253,7 +1253,7 @@ def test_a_language_only_launch_ends_its_warm_up_with_one_image_through_the_enco
     the text shapes of a single engine and ends them with one image through
     the encoders, built from the model's own template (the scheduler's media
     path has a first-use cost no text request reaches); the wire gets that
-    material. A template without an image placeholder leaves the leg out; a
+    material. A template without an image placeholder leaves the media request out; a
     plain worker and the encoder-only role never render the prompt."""
     facts = {"is_generation": True, "max_context_length": 4096, "vocab_size": 1024}
     language = _server_args(
@@ -1294,7 +1294,7 @@ def test_a_language_only_launch_ends_its_warm_up_with_one_image_through_the_enco
     wire.close()
     # A plain worker and the encoder-only role never render the prompt.
     monkeypatch.setattr(
-        rust, "media_warmup", lambda *args, **kwargs: pytest.fail("no image leg on this worker")
+        rust, "media_warmup", lambda *args, **kwargs: pytest.fail("no image request on this worker")
     )
     assert rust.SglangLauncher().warmup_inputs(_server_args(), facts).media_leg is False
     assert rust.SglangLauncher().warmup_inputs(_server_args(encoder_only=True), facts) is None

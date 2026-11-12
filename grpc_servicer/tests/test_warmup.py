@@ -270,7 +270,7 @@ def test_a_prompt_never_exceeds_the_step_nor_the_context_less_its_output():
     assert max(lengths) == 999  # the context's bound stands in for the step
 
 
-# The window/step pairs the plans are built from on the test legs and the
+# The window/step pairs the plans are built from on the test runs and the
 # fleet's recipes: an 8k context at the engine's default 8k step (the pair
 # that reached the context's edge), a 16k context at a 16k step, a long
 # context at a 16k step, a 4k chunk under a long context, a 1k chunk under an
@@ -445,7 +445,7 @@ def test_an_engine_that_asks_for_every_prefill_length_gets_the_remainders_last_i
         "prefill 40 tokens (chunk remainder)",
     ]
     assert "9 prefill shapes, 7 measured again, 55 chunk remainders)" in plan.describe()
-    # The fast level leaves them: a test leg or a quick start takes the merged
+    # The fast level leaves them: a test run or a quick start takes the merged
     # ladder alone, and the shipped default (full) carries the hazard's answer.
     fast = plan_warmup(dataclasses.replace(SMALL, every_prefill_length=True), "fast")
     assert not any(s.kind == "remainder" for s in fast.steps)
@@ -1085,11 +1085,11 @@ def test_each_wire_drives_the_plan_through_the_engines_own_service(add, engine, 
 
 
 def test_the_sglang_wire_carries_a_lone_legs_stand_in_bootstrap():
-    """A prefill or decode leg's plan runs without its peer: every request
+    """A prefill or decode side's plan runs without its peer: every request
     carries the engine's stand-in bootstrap (the host and room 0) the way the
     engine's own warm-up sends it; a single engine's requests carry none. Over
     two ranks each request is pinned to its rank and its stand-in room is that
-    rank, so a prefill leg, which places a disaggregated request by its room's
+    rank, so a prefill side, which places a disaggregated request by its room's
     residue, runs the request where the plan pinned it."""
     seen = _Seen()
     server, target = _serve(sgl_grpc.add_SglangSchedulerServicer_to_server, _SglangEngine(seen))
@@ -1396,7 +1396,7 @@ def test_the_vllm_wire_pins_each_request_to_its_rank_over_the_servicers_port():
 
 
 def test_a_media_leg_follows_the_second_pass_and_precedes_the_chunk_remainders():
-    """An engine module that asks for the media leg gets one step with one
+    """An engine module that asks for the media request gets one step with one
     media request per rank, after the measured second pass and before the
     chunk remainders (a budget cut takes the remainders first); without the
     flag no request carries media, and the start line counts the item."""
@@ -1413,7 +1413,7 @@ def test_a_media_leg_follows_the_second_pass_and_precedes_the_chunk_remainders()
     step = with_media.steps[media_at]
     assert [(r.media, r.max_tokens) for r in step.requests] == [(True, 1)]
     assert "one media item" in with_media.describe()
-    # The fast level has no remainders: the media leg ends the plan, one per rank.
+    # The fast level has no remainders: the media request ends the plan, one per rank.
     two_ranks = plan_warmup(
         dataclasses.replace(SMALL, media_leg=True, data_parallel_size=2), "fast"
     )
@@ -1422,7 +1422,7 @@ def test_a_media_leg_follows_the_second_pass_and_precedes_the_chunk_remainders()
 
 
 def test_the_sglang_wire_sends_the_media_leg_as_a_client_names_an_image():
-    """The media leg's request carries the rendered prompt and its ids (not
+    """The media request carries the rendered prompt and its ids (not
     the plan's drawn ids) and the image as a reference on the multimodal
     slot; a plain request keeps the plan's ids and no media; a media request
     on a wire given no media is an error, never a text request."""
@@ -1475,7 +1475,7 @@ def test_the_media_leg_material_comes_from_the_models_own_template(caplog):
     item and the question, its ids are that prompt's tokens, the image is the
     engine's own minimal PNG as a data URL; no tokenizer directory, a
     tokenizer that does not load, or a template that renders no image
-    placeholder leaves the leg out, with the reason in the log."""
+    placeholder leaves the media request out, with the reason in the log."""
 
     class _Tokenizer:
         def __init__(self, placeholder):
@@ -1523,7 +1523,7 @@ def test_a_render_that_raises_is_a_warning_with_its_traceback(caplog):
     that renders no image placeholder) are INFO lines. A render that raises
     (a tokenizer that does not load, a template that fails, a tokenization
     error) is a fault worth a look: its line is a WARNING and carries the
-    traceback; the leg is still left out and the servicer starts."""
+    traceback; the media request is still left out and the servicer starts."""
 
     class _Tokenizer:
         def apply_chat_template(self, messages, tokenize, add_generation_prompt):
@@ -1536,10 +1536,12 @@ def test_a_render_that_raises_is_a_warning_with_its_traceback(caplog):
         assert sglang_warmup.media_warmup("/tok", load_tokenizer=broken) is None
         assert sglang_warmup.media_warmup("/tok", load_tokenizer=lambda d: _Tokenizer()) is None
         assert sglang_warmup.media_warmup(None, load_tokenizer=broken) is None
-    legs = [r for r in caplog.records if r.getMessage().startswith("Planned warm-up: no image leg")]
-    assert [r.levelno for r in legs] == [logging.WARNING, logging.WARNING, logging.INFO]
-    assert [type(r.exc_info[1]) for r in legs[:2]] == [OSError, ValueError]
-    assert legs[2].exc_info is None
+    omitted = [
+        r for r in caplog.records if r.getMessage().startswith("Planned warm-up: no image request")
+    ]
+    assert [r.levelno for r in omitted] == [logging.WARNING, logging.WARNING, logging.INFO]
+    assert [type(r.exc_info[1]) for r in omitted[:2]] == [OSError, ValueError]
+    assert omitted[2].exc_info is None
     assert "Traceback (most recent call last)" in caplog.text
     assert "OSError: no tokenizer.json" in caplog.text
     assert "ValueError: the template failed to render" in caplog.text
@@ -1591,7 +1593,7 @@ def test_the_vllm_inputs_come_from_the_resolved_configuration():
 def test_a_lone_legs_plan_marks_every_request_and_says_so():
     lone = plan_warmup(dataclasses.replace(SMALL, lone_leg_bootstrap="2.2.2.2"), "fast")
     assert {r.lone_leg_bootstrap for s in lone.steps for r in s.requests} == {"2.2.2.2"}
-    assert "the requests carrying the lone leg's stand-in bootstrap" in lone.describe()
+    assert "the requests carrying the lone side's stand-in bootstrap" in lone.describe()
     plain = plan_warmup(SMALL, "fast")
     assert {r.lone_leg_bootstrap for s in plain.steps for r in s.requests} == {None}
     assert "stand-in bootstrap" not in plain.describe()
@@ -1686,7 +1688,7 @@ def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypa
     )
     assert sglang_warmup.warmup_inputs(SimpleNamespace(), facts).max_num_seqs == 0
     assert sglang_warmup.warmup_inputs(args, {**facts, "is_generation": False}) is None
-    # A prefill or decode leg plans as a single engine does, its requests
+    # A prefill or decode side plans as a single engine does, its requests
     # bound for nobody: the engine's own stand-in bootstrap host rides along.
     monkeypatch.setitem(
         sys.modules,

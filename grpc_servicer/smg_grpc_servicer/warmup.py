@@ -41,9 +41,9 @@ flips, so the first-time costs are paid while nothing is routed here:
   lazily loads a never-used kernel on that count's first use; during serving,
   with a collective of the overlapped previous chunk still in flight, that
   load has deadlocked the forward. The ``fast`` level plans none of them and
-  leaves that hazard open (the start log says so): it is for a test leg or a
+  leaves that hazard open (the start log says so): it is for a test run or a
   quick restart, and the shipped default is ``full``;
-- the **media leg**, when the engine module asks for it
+- the **media request**, when the engine module asks for it
   (:attr:`WarmupInputs.media_leg`): one request carrying one media item
   through the engine's own media path, after the second pass and before the
   chunk remainders, so the first-use cost of that path (a kernel compiled on
@@ -223,8 +223,8 @@ class WarmupInputs:
     #: hazard open, and :func:`plan_for` warns so.
     every_prefill_length: bool = False
     #: The bootstrap host the engine's scheduler takes as a transfer to
-    #: nobody (its own warm-up's stand-in), when the engine is one leg of a
-    #: disaggregated pair: every request carries it, so the leg warms up
+    #: nobody (its own warm-up's stand-in), when the engine is one side of a
+    #: disaggregated pair: every request carries it, so the side warms up
     #: without its peer. ``None`` for a single engine.
     lone_leg_bootstrap: str | None = None
     #: Whether this engine runs prefill alone: the prefill side of a
@@ -263,7 +263,7 @@ class WarmupRequest:
     #: The data-parallel rank the request is pinned to; ``None`` leaves the
     #: servicer's own routing to pick the engine (one rank, or no pinning).
     data_parallel_rank: int | None = None
-    #: A lone leg's stand-in bootstrap host
+    #: A lone side's stand-in bootstrap host
     #: (:attr:`WarmupInputs.lone_leg_bootstrap`), for the wire to carry.
     lone_leg_bootstrap: str | None = None
     #: The request carries one media item: the wire supplies the item and the
@@ -329,7 +329,7 @@ class WarmupPlan:
             f"{self.inputs.max_num_batched_tokens}"
             + (f" on each of {ranks} data-parallel ranks" if ranks > 1 else "")
             + (
-                ", the requests carrying the lone leg's stand-in bootstrap"
+                ", the requests carrying the lone side's stand-in bootstrap"
                 if self.inputs.lone_leg_bootstrap
                 else ""
             )
@@ -472,10 +472,10 @@ def plan_warmup(
     """The steps for ``inputs`` at ``level``, in the order they run: the
     decode staircase first (cheap, and every ramp's first shapes), then the
     prefill shapes by length, the odd variants, the second pass, the media
-    leg when the inputs ask for one, and, when
+    request when the inputs ask for one, and, when
     the inputs ask for every prefill length, the chunk remainders in
     :func:`spread_order` at the ``full`` level (the ``fast`` level keeps the
-    merged ladder: a test leg or a quick start takes the classes alone, and
+    merged ladder: a test run or a quick start takes the classes alone, and
     the shipped default is ``full``). A prompt never exceeds the admission
     step, nor the context less its output and the positions the engine's
     scheduler keeps back (:attr:`WarmupInputs.context_reserve_tokens`), so
