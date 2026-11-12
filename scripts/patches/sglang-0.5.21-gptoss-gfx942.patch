@@ -29,16 +29,18 @@
              "mxfp4": Mxfp4Config,
 --- a/python/sglang/srt/layers/quantization/mxfp4.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4.py
-@@ -18,6 +18,8 @@
+@@ -18,6 +18,10 @@
  from __future__ import annotations
  
  import os
 +import logging
-+import re
++import hashlib
++import json
++from pathlib import Path
  from dataclasses import replace
  from functools import lru_cache
  from typing import TYPE_CHECKING, List, Optional
-@@ -199,6 +201,102 @@
+@@ -199,6 +203,143 @@
  _is_xpu = is_xpu()
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
@@ -66,20 +68,61 @@
 +    return True
 +
 +
++_GPTOSS_REVISION = "6cee5e81ee83917806bbde320786a8fb61efebee"
++_GPTOSS_METADATA_SHA256 = {
++    "config.json": "3a2a26ded679375b7928ddeca59764df7cea83220c1961035f6d6e232659e9ce",
++    "model.safetensors.index.json": "0e085b977c4c9942f85938828e8c989ed7d5cdabf852e4da6a67c116cd502cd1",
++}
++
++
++def _validate_gptoss_local_checkpoint(model_path):
++    # model_specs resolves this alias before passing it to the engine. Accept
++    # copies and cache symlinks only with the fixed original metadata/layout.
++    root = Path(os.environ.get("ROUTER_LOCAL_MODEL_PATH", "/models")).resolve(strict=True)
++    repository = root / "hub/models--openai--gpt-oss-20b"
++    snapshot = repository / "snapshots" / _GPTOSS_REVISION
++    path = Path(model_path)
++    if not path.is_absolute() or path not in (root / "openai/gpt-oss-20b", snapshot):
++        raise ValueError("Unrecognized local original GPTOSS checkpoint path")
++    resolved = path.resolve(strict=True)
++    if not resolved.is_relative_to(root) or not resolved.is_dir():
++        raise ValueError("Local GPTOSS checkpoint escapes the configured model root")
++    if resolved.is_relative_to(root / "hub") and resolved != snapshot:
++        raise ValueError("Local GPTOSS checkpoint has a foreign repository or revision")
++
++    def checkpoint_file(name):
++        target = (resolved / name).resolve(strict=True)
++        if not target.is_file() or not (
++            target.is_relative_to(resolved) or target.is_relative_to(repository / "blobs")
++        ):
++            raise ValueError("Local GPTOSS checkpoint file escapes its original repository")
++        return target
++
++    metadata = {}
++    for name, expected in _GPTOSS_METADATA_SHA256.items():
++        target = checkpoint_file(name)
++        if target.stat().st_size > 1024 * 1024:
++            raise ValueError("Oversized original GPTOSS metadata")
++        body = target.read_bytes()
++        if hashlib.sha256(body).hexdigest() != expected:
++            raise ValueError("Local GPTOSS metadata differs from the fixed original revision")
++        metadata[name] = json.loads(body)
++    for name in set(metadata["model.safetensors.index.json"]["weight_map"].values()):
++        if Path(name).name != name or not name.endswith(".safetensors"):
++            raise ValueError("Invalid original GPTOSS shard name")
++        checkpoint_file(name)
++    # This pins config/index and file layout, not every checkpoint weight byte.
++
++
 +def _validate_gfx942_gptoss_bf16_model(model_path, hf_config, quantization):
 +    if not _gfx942_gptoss_bf16_requested():
 +        return
-+    path = str(model_path).rstrip("/")
-+    original = path == "openai/gpt-oss-20b" or bool(
-+        re.fullmatch(
-+            r"/models/hub/models--openai--gpt-oss-20b/snapshots/[0-9a-f]{40}", path
-+        )
-+    )
-+    if (
-+        not original
-+        or getattr(hf_config, "model_type", None) != "gpt_oss"
-+        or quantization != "mxfp4"
-+    ):
++    if str(model_path).rstrip("/") != "openai/gpt-oss-20b":
++        try:
++            _validate_gptoss_local_checkpoint(model_path)
++        except (OSError, ValueError) as exc:
++            raise ValueError("GPTOSS fallback requires the validated original local checkpoint") from exc
++    if getattr(hf_config, "model_type", None) != "gpt_oss" or quantization != "mxfp4":
 +        raise ValueError(
 +            "GPTOSS gfx942 BF16 fallback requires original openai/gpt-oss-20b MXFP4 checkpoint"
 +        )
@@ -141,7 +184,7 @@
  _is_shuffle_moe_mxfp4 = is_gfx95_supported()
  _is_cpu_amx_available = cpu_has_amx_support()
  
-@@ -296,16 +394,31 @@
+@@ -296,16 +437,31 @@
          self,
          ignored_layers: Optional[list[str]] = None,
          is_checkpoint_mxfp4_serialized: bool = False,
@@ -174,7 +217,7 @@
  
          if _is_hip:
              if is_gfx95_supported():
-@@ -342,7 +455,6 @@
+@@ -342,7 +498,6 @@
      def get_quant_method(
          self, layer: torch.nn.Module, prefix: str
      ) -> Optional[QuantizeMethodBase]:
@@ -182,7 +225,7 @@
          from sglang.srt.layers.linear import LinearBase
          from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
          from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-@@ -358,7 +470,10 @@
+@@ -358,7 +513,10 @@
                  return UnquantizedLinearMethod()
          elif isinstance(layer, FusedMoE):
              if self.is_checkpoint_mxfp4_serialized:
@@ -194,7 +237,7 @@
              else:
                  return Mxfp4DynamicQuantMoEMethod()
          else:
-@@ -374,8 +489,12 @@
+@@ -374,8 +532,12 @@
      def __init__(
          self,
          prefix: str,
@@ -207,7 +250,7 @@
  
          self.prefix = prefix
          self.topk_indices_dtype = None
-@@ -437,6 +556,10 @@
+@@ -437,6 +599,10 @@
          with_bias: bool = False,
          **extra_weight_attrs,
      ):
@@ -218,7 +261,7 @@
          self.num_experts = num_experts
          weight_dtype = torch.uint8
          scale_dtype = torch.uint8
-@@ -619,6 +742,33 @@
+@@ -619,6 +785,33 @@
              set_weight_attrs(w2_weight_bias, extra_weight_attrs)
  
      def process_weights_after_loading(self, layer):
@@ -252,7 +295,7 @@
          if self.use_marlin and not self.use_mega_moe:
              from sglang.srt.layers.quantization.marlin_utils import (
                  check_moe_marlin_supports_layer,
-@@ -1580,6 +1730,24 @@
+@@ -1580,6 +1773,24 @@
          layer: torch.nn.Module,
          dispatch_output: StandardDispatchOutput,
      ) -> CombineInput:
@@ -277,7 +320,7 @@
  
          from sglang.srt.layers.moe.token_dispatcher import (
              DispatchOutputChecker,
-@@ -1805,7 +1973,6 @@
+@@ -1805,7 +2016,6 @@
          params_dtype: torch.dtype,
          **extra_weight_attrs,
      ):
