@@ -3274,4 +3274,15 @@ mod tests {
         assert_eq!(routing_text_of_input(&json!({"text": "x"})), "");
         assert_eq!(routing_text_of_input(&json!(7)), "");
     }
+
+    /// The type names the validation messages print, one per JSON shape.
+    #[test]
+    fn a_json_values_type_name_is_the_word_a_validation_message_prints() {
+        assert_eq!(json_type_name(&Value::Null), "null");
+        assert_eq!(json_type_name(&json!(true)), "a boolean");
+        assert_eq!(json_type_name(&json!(1)), "a number");
+        assert_eq!(json_type_name(&json!("x")), "a string");
+        assert_eq!(json_type_name(&json!([])), "an array");
+        assert_eq!(json_type_name(&json!({})), "an object");
+    }
 }
