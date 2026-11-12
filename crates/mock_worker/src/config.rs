@@ -127,9 +127,10 @@ pub struct Config {
     /// the TokenSpeed gRPC wire's encoder service); each advertises the role
     /// in its
     /// server info as the engines do (`disaggregation_mode`, or `kv_role`
-    /// and `ec_role` behind their connectors on the vLLM wire). One process
-    /// gives the role to one wire's workers; the ZMQ workers take none.
-    /// `None` is a regular worker.
+    /// and `ec_role` behind their connectors on the vLLM wire; the ZMQ ranks
+    /// declare it in their handshake). One process gives the role to one
+    /// wire's workers, the encode role to the gRPC wire's alone. `None` is a
+    /// regular worker.
     pub role: Option<Role>,
     /// First bootstrap port of the prefill or encode workers
     /// (`--bootstrap-base-port`): worker `i` binds `base + i`, where a
@@ -612,27 +613,25 @@ impl Config {
                 cfg.grpc_wire.as_str()
             ));
         }
-        if cfg.role.is_some() {
-            if cfg.zmq_count > 0 {
-                return Err(
-                    "--worker-type is the HTTP and gRPC workers' role: the ZMQ workers of this \
-                     mock take none"
-                        .to_string(),
-                );
-            }
-            if cfg.http_count > 0 && cfg.grpc_count > 0 {
-                return Err(
-                    "--worker-type gives one wire's workers the role: pass --http-count or \
-                     --grpc-count, not both (worker i of either wire would bind the same \
-                     bootstrap port)"
-                        .to_string(),
-                );
-            }
+        if cfg.role.is_some() && cfg.http_count > 0 && (cfg.grpc_count > 0 || cfg.zmq_count > 0) {
+            return Err(
+                "--worker-type gives one wire's workers the role: pass --http-count or \
+                 --grpc-count/--zmq-count, not both (worker i of either wire would bind the \
+                 same bootstrap port)"
+                    .to_string(),
+            );
         }
         if cfg.role == Some(Role::Encode) && cfg.http_count > 0 {
             return Err(
                 "--worker-type encode is a gRPC worker's role: the HTTP workers have no encode \
                  role (pass --grpc-count with --grpc-wire vllm or tokenspeed)"
+                    .to_string(),
+            );
+        }
+        if cfg.role == Some(Role::Encode) && cfg.zmq_count > 0 {
+            return Err(
+                "--worker-type encode is the gRPC wire's role: the ZMQ ranks of this mock serve \
+                 prefill and decode, not encode"
                     .to_string(),
             );
         }
@@ -1320,12 +1319,12 @@ mod tests {
         );
     }
 
-    /// The prefill and decode roles are the HTTP and the gRPC workers',
-    /// with the same bootstrap numbering on both wires, one wire per
-    /// process; the ZMQ workers take none and the encode role is a gRPC
-    /// wire's.
+    /// The prefill and decode roles are one wire's workers' per process: the
+    /// HTTP or the gRPC workers with the same bootstrap numbering, or the
+    /// ZMQ ranks numbered after the gRPC workers; the encode role is the gRPC
+    /// wire's alone.
     #[test]
-    fn the_prefill_and_decode_roles_are_the_http_and_grpc_workers() {
+    fn the_prefill_and_decode_roles_are_one_wires_workers() {
         let grpc = ["--grpc-base-port", "19000", "--grpc-count", "2"];
         let cfg = parse(&grpc).expect("gRPC flags parse");
         assert_eq!((cfg.role, cfg.bootstrap_base_port), (None, None));
@@ -1389,16 +1388,34 @@ mod tests {
                 .expect_err("one wire's workers take the role")
                 .contains("not both")
         );
-        assert!(parse(&[
+        let zmq = [
             "--zmq-handshake",
             "ipc:///tmp/mock-handshake",
             "--zmq-count",
             "1",
-            "--worker-type",
-            "prefill",
-        ])
-        .expect_err("the ZMQ workers take no role")
-        .contains("ZMQ workers"));
+        ];
+        let zmq_prefill = parse(
+            &[
+                &zmq[..],
+                &["--worker-type", "prefill", "--bootstrap-base-port", "8998"],
+            ]
+            .concat(),
+        )
+        .expect("ZMQ prefill ranks");
+        assert_eq!(zmq_prefill.role, Some(Role::Prefill));
+        assert_eq!(
+            zmq_prefill.bootstrap_port_for(zmq_prefill.grpc_count),
+            Some(8998),
+            "the first rank's port, numbered after the gRPC workers"
+        );
+        assert!(parse(&[&zmq[..], &["--worker-type", "encode"]].concat())
+            .expect_err("the ZMQ ranks have no encode role")
+            .contains("not encode"));
+        assert!(
+            parse(&[&zmq[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
+                .expect_err("one wire's workers take the role")
+                .contains("not both")
+        );
         assert!(parse(
             &[
                 &grpc[..],

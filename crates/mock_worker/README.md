@@ -334,8 +334,8 @@ the request arrives); an HTTP worker answers the bare 499.
 
 ## Prefill/decode roles
 
-`--worker-type prefill|decode` gives the HTTP or the gRPC workers of a
-process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
+`--worker-type prefill|decode` gives the HTTP, the gRPC or the ZMQ workers of
+a process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
 <url> <bootstrap port> --decode <url>`) runs with no engine behind it. The
 gateway detects the mock by the scheduler service it serves (or, on the HTTP
 wire, by its model list) and runs that wire's PD protocol: both sides get the
@@ -343,6 +343,14 @@ same request, with the rendezvous the gateway mints (the wire's rendezvous
 field on the gRPC wires, named below; `bootstrap_host`, `bootstrap_port` and
 `bootstrap_room` in the request body on the HTTP wire, whose PD router is its
 own code path), and the client reads the decode side's output.
+
+A ZMQ rank declares the role in its handshake's ready response as the engines
+do (`disaggregation_mode`, the request types it takes, and for a prefill the
+`bootstrap_host` and `bootstrap_port` of the port it binds, numbered after
+the gRPC workers), which is where a gateway checks a worker registered for a
+role. A prefill rank answers the prompt side alone, as on the gRPC wires;
+the vLLM dialect's request carries no rendezvous, so there is none to read.
+The encode role stays the gRPC wire's.
 
 - A **prefill** worker answers every request with the prompt side's
   completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
