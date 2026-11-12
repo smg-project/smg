@@ -250,6 +250,7 @@ class Gateway:
                     f"EPD gateway ({len(encodes)} encode, "
                     f"{len(prefills)} prefill, {len(decodes)} decode)"
                 ),
+                worker_urls=self._fleet_urls(mode_args),
                 workers=fleet,
             )
         elif is_pd_mode:
@@ -279,6 +280,7 @@ class Gateway:
                 extra_args=extra_args,
                 num_workers=len(fleet) or None,
                 log_msg=f"PD gateway ({len(prefills)} prefill, {len(decodes)} decode)",
+                worker_urls=self._fleet_urls(mode_args),
                 workers=fleet,
             )
         elif is_cloud_mode:
@@ -416,6 +418,17 @@ class Gateway:
         if not tail:
             return f"its output file {self.log_path} is empty"
         return f"last {len(tail)} lines of {self.log_path}:\n" + "\n".join(tail)
+
+    @staticmethod
+    def _fleet_urls(mode_args: list[str]) -> list[str]:
+        """The worker URLs a disaggregated launch names: the token after each
+        ``--encode``, ``--prefill`` and ``--decode`` flag, which the readiness
+        wait takes as its registration gate."""
+        return [
+            mode_args[i + 1]
+            for i, arg in enumerate(mode_args[:-1])
+            if arg in ("--encode", "--prefill", "--decode")
+        ]
 
     def _launch(
         self,
