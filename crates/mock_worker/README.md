@@ -349,9 +349,10 @@ the request arrives); an HTTP worker answers the bare 499.
 
 ## Prefill/decode roles
 
-`--worker-type prefill|decode` gives the HTTP, the gRPC or the ZMQ workers of
-a process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
-<url> <bootstrap port> --decode <url>`) runs with no engine behind it. The
+`--worker-type prefill|decode` gives a process's HTTP workers alone, or its
+gRPC workers and ZMQ ranks together, a role in a disaggregated fleet, so a
+gateway in PD mode (`--prefill <url> <bootstrap port> --decode <url>`) runs
+with no engine behind it. The
 gateway detects the mock by the scheduler service it serves (or, on the HTTP
 wire, by its model list) and runs that wire's PD protocol: both sides get the
 same request, with the rendezvous the gateway mints (the wire's rendezvous
@@ -362,10 +363,13 @@ own code path), and the client reads the decode side's output.
 A ZMQ rank declares the role in its handshake's ready response as the engines
 do (`disaggregation_mode`, the request types it takes, and for a prefill the
 `bootstrap_host` and `bootstrap_port` of the port it binds, numbered after
-the gRPC workers), which is where a gateway checks a worker registered for a
-role. A prefill rank answers the prompt side alone, as on the gRPC wires;
-the vLLM dialect's request carries no rendezvous, so there is none to read.
-The encode role stays the gRPC wire's.
+the gRPC workers: rank `I`, counting `--zmq-start-index`, binds
+`base + grpc_count + I` of `--bootstrap-base-port <base>`), which is where a
+gateway checks a worker registered for a role. A ZMQ prefill rank needs the
+base port: its handshake is the only place the port reaches the gateway, so
+the flags are refused without one. A prefill rank answers the prompt side
+alone, as on the gRPC wires; the vLLM dialect's request carries no
+rendezvous, so there is none to read. The encode role stays the gRPC wire's.
 
 - A **prefill** worker answers every request with the prompt side's
   completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
@@ -397,10 +401,11 @@ The encode role stays the gRPC wire's.
   for a prefill worker registered without a port): the worker on that port
   takes it, one on another refuses it.
 
-No KV moves between the two: the decode side has the prompt. ZMQ workers
-take no role, and one process gives the role to one wire's workers (worker
-`i` of either wire would bind the same bootstrap port); the encode role is
-the vLLM and the TokenSpeed gRPC wires'.
+No KV moves between the two: the decode side has the prompt. One process
+gives the role to its HTTP workers alone or to its gRPC workers and ZMQ ranks
+together (an HTTP worker `i` and a gRPC worker `i` would bind the same
+bootstrap port; the ZMQ ranks bind after the gRPC workers); the encode role
+is the vLLM and the TokenSpeed gRPC wires'.
 
 Every gRPC worker advertises the pairing protocol its environment names
 (`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:
