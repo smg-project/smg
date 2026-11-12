@@ -15,7 +15,8 @@
 #[cfg(test)]
 use std::sync::mpsc as test_mpsc;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{hash_map::DefaultHasher, BTreeSet, HashSet},
+    hash::{Hash, Hasher},
     ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -311,15 +312,21 @@ struct TransitionTestHooks {
     before_lock: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
 }
 
-/// Pauses the removal of a data-parallel group's last rank row at the seam
-/// between the base reservation's retirement and the row's departure: the
-/// removal reports in, then waits to be let go. The interleaving proof
-/// places a registration of the same URL in that window.
+/// Pauses the removal of a data-parallel row at the seam between the row's
+/// departure and its group reservation's retirement, under the group lock:
+/// the removal reports in, then waits to be let go. The interleaving proofs
+/// place a sibling's removal and a registration of the same URL at that
+/// seam, and watch for the next taker of a group lock.
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct RemovalTestHooks {
     at_group_seam: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
+    before_group_lock: Option<test_mpsc::Sender<()>>,
 }
+
+/// Stripes of [`WorkerRegistry::group_url_locks`]: base URLs that share a
+/// stripe wait for each other, which costs nothing on the admin plane.
+const GROUP_URL_LOCK_STRIPES: usize = 64;
 
 /// Worker registry with model-based indexing
 #[derive(Debug)]
@@ -385,6 +392,13 @@ pub struct WorkerRegistry {
 
     #[cfg(test)]
     removal_test_hooks: parking_lot::Mutex<RemovalTestHooks>,
+
+    /// One lock per base URL, striped by hash. A data-parallel row's removal
+    /// holds its URL's lock from the row's departure, through the scan for
+    /// siblings, to the group reservation's retirement; a creation holds it
+    /// across its reservation and its conflict check. Admin plane only, held
+    /// for microseconds; no request path takes it.
+    group_url_locks: Box<[parking_lot::Mutex<()>]>,
 
     /// Workers indexed by worker type
     type_workers: Arc<DashMap<WorkerType, Vec<WorkerId>>>,
@@ -485,6 +499,9 @@ impl WorkerRegistry {
             transition_test_hooks: parking_lot::Mutex::new(TransitionTestHooks::default()),
             #[cfg(test)]
             removal_test_hooks: parking_lot::Mutex::new(RemovalTestHooks::default()),
+            group_url_locks: (0..GROUP_URL_LOCK_STRIPES)
+                .map(|_| parking_lot::Mutex::new(()))
+                .collect(),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::with_hasher(FxBuildHasher)),
@@ -1882,6 +1899,39 @@ impl WorkerRegistry {
             .remove_if(url, |_, id| !self.workers.contains_key(id));
     }
 
+    /// A creation's reservation of `url`, taken under the URL's group lock
+    /// together with the check that nothing live answers to the URL: `Ok`
+    /// with the id the creation's Location names, `Err` with the id of the
+    /// plain worker or the data-parallel group that holds the URL. A row's
+    /// removal holds the same lock from its departure to its group's
+    /// retirement, so a creation never sees a group between the two.
+    pub fn reserve_for_create(&self, url: &str) -> Result<WorkerId, WorkerId> {
+        #[cfg(test)]
+        self.note_the_group_lock_attempt();
+        let _group = self.group_url_lock(url).lock();
+        let id = self.reserve_id_for_url(url);
+        if self.workers.contains_key(&id) || self.has_dp_rows_for(url) {
+            Err(id)
+        } else {
+            Ok(id)
+        }
+    }
+
+    /// Whether a data-parallel row of the engine at `base_url` is registered.
+    fn has_dp_rows_for(&self, base_url: &str) -> bool {
+        self.workers
+            .iter()
+            .any(|row| row.value().is_dp_aware() && row.value().base_url() == base_url)
+    }
+
+    /// The stripe of [`Self::group_url_locks`] a base URL hashes to.
+    fn group_url_lock(&self, base_url: &str) -> &parking_lot::Mutex<()> {
+        let mut hasher = DefaultHasher::new();
+        base_url.hash(&mut hasher);
+        let stripe = (hasher.finish() % self.group_url_locks.len() as u64) as usize;
+        &self.group_url_locks[stripe]
+    }
+
     // ───────────────────────────────────────────────────────────────────
     // 7. Remove
     // ───────────────────────────────────────────────────────────────────
@@ -1960,32 +2010,24 @@ impl WorkerRegistry {
         // clearing afterwards would leak the count, and routing snapshots
         // that still hold this worker must already see it ineligible by the
         // time the removal becomes visible.
+        // A data-parallel row's removal holds its base URL's group lock from
+        // here to its group reservation's retirement below. A creation of
+        // the URL reserves and checks under the same lock, so it finds the
+        // group with its row, or no group and no reservation: never the id
+        // of a group whose last row has left.
+        let mut group = None;
         if let Some(entry) = self.workers.get(worker_id) {
             let worker = Arc::clone(entry.value());
             drop(entry);
             self.set_worker_overloaded(&worker, false);
             Self::demote_before_removal(&worker);
-            // A data-parallel group's registration reserved its base URL's
-            // id, the group id its Location names. The reservation leaves
-            // before the group's last rank row does: a registration of the
-            // URL that lands in between reserves a fresh id and is refused
-            // while the row stands, and nothing retires that id after it,
-            // where a retirement after the row's departure took the id a
-            // registration had just been answered.
             if worker.is_dp_aware() {
-                let base = worker.base_url();
-                let last_row = !self.workers.iter().any(|row| {
-                    row.key() != worker_id
-                        && row.value().is_dp_aware()
-                        && row.value().base_url() == base
-                });
-                if last_row {
-                    self.url_to_id
-                        .remove_if(base, |_, id| !self.workers.contains_key(id));
-                }
+                let base = worker.base_url().to_string();
+                #[cfg(test)]
+                self.note_the_group_lock_attempt();
+                let guard = self.group_url_lock(&base).lock();
+                group = Some((base, guard));
             }
-            #[cfg(test)]
-            self.pause_at_group_seam();
         }
 
         // The membership-order read guard keeps the rebuild scan from
@@ -2004,6 +2046,21 @@ impl WorkerRegistry {
             // fresh series retired under it.
             Metrics::remove_worker_metrics(worker.url(), Arc::downgrade(&worker));
             self.url_to_id.remove(worker.url());
+            // A data-parallel group's registration reserved its base URL's
+            // id, the group id its Location names. The reservation leaves
+            // with the group's last row, under the group lock taken above:
+            // a sibling's removal running at the same time waits for its
+            // turn and finds the group empty, and a creation of the URL
+            // waits and finds the reservation gone.
+            if let Some((base, guard)) = group.take() {
+                #[cfg(test)]
+                self.pause_at_group_seam();
+                if !self.has_dp_rows_for(&base) {
+                    self.url_to_id
+                        .remove_if(base.as_str(), |_, id| !self.workers.contains_key(id));
+                }
+                drop(guard);
+            }
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
             self.worker_origins.remove(worker_id);
@@ -2764,6 +2821,28 @@ impl WorkerRegistry {
                 .expect("the paused transition is waiting");
             paused.join().expect("the transition did not panic")
         })
+    }
+
+    /// Test support: the URL's reservation as the map holds it, live worker
+    /// or not (`get_id_by_url` answers only for a live worker).
+    pub(crate) fn reservation_of(&self, url: &str) -> Option<WorkerId> {
+        self.url_to_id.get(url).map(|id| id.clone())
+    }
+
+    /// Reports a group lock about to be taken, when a test watches for it.
+    fn note_the_group_lock_attempt(&self) {
+        if let Some(watcher) = self.removal_test_hooks.lock().before_group_lock.take() {
+            let _ = watcher.send(());
+        }
+    }
+
+    /// Test support: receives one message when the next taker of a group
+    /// lock, a removal's or a creation's, is about to take it, before any
+    /// wait for the lock.
+    pub(crate) fn watch_the_next_group_lock_attempt(&self) -> test_mpsc::Receiver<()> {
+        let (tx, rx) = test_mpsc::channel();
+        self.removal_test_hooks.lock().before_group_lock = Some(tx);
+        rx
     }
 
     /// The pause at the group seam of a removal, when a test armed it.

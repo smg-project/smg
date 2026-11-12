@@ -583,35 +583,33 @@ impl WorkerService {
         let worker_url = config.url.clone();
         let queue = self.get_job_queue()?;
 
-        // Reserve (or retrieve) a stable ID for the 202 response.
-        // If this URL already has an active worker, reject with 409. A worker
-        // its removal is draining holds the URL for the drain window; that
-        // answer says so and when to retry, instead of offering a PUT or a
-        // PATCH of a worker that is leaving.
-        // A data-parallel engine's rows hold their own IDs, so its group is the
-        // conflict for the bare URL: a second POST must not release the
-        // reservation the first one's Location resolves through.
-        let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
-        if let Some(existing) = self.worker_registry.get(&worker_id) {
-            return Err(if existing.status() == WorkerStatus::Draining {
-                WorkerServiceError::RemovalInProgress {
-                    url: worker_url,
-                    worker_id,
-                    drain_secs: existing.metadata().health_config.drain_settle_secs,
-                }
-            } else {
-                WorkerServiceError::Conflict {
-                    url: worker_url,
-                    worker_id,
-                }
-            });
-        }
-        if !self.dp_group_for_url(&worker_url).is_empty() {
-            return Err(WorkerServiceError::Conflict {
-                url: worker_url,
-                worker_id,
-            });
-        }
+        // Reserve (or retrieve) a stable ID for the 202 response, under the
+        // URL's group lock with the check that nothing live answers to it:
+        // a plain worker, or a data-parallel group, whose rows hold their
+        // own IDs and whose reservation a second POST must not release (the
+        // first one's Location resolves through it). A row's removal holds
+        // the same lock from its departure to its group's retirement. A
+        // worker its removal is draining holds the URL for the drain window;
+        // that answer says so and when to retry, instead of offering a PUT
+        // or a PATCH of a worker that is leaving.
+        let worker_id = match self.worker_registry.reserve_for_create(&worker_url) {
+            Ok(worker_id) => worker_id,
+            Err(worker_id) => {
+                return Err(match self.worker_registry.get(&worker_id) {
+                    Some(existing) if existing.status() == WorkerStatus::Draining => {
+                        WorkerServiceError::RemovalInProgress {
+                            url: worker_url,
+                            worker_id,
+                            drain_secs: existing.metadata().health_config.drain_settle_secs,
+                        }
+                    }
+                    _ => WorkerServiceError::Conflict {
+                        url: worker_url,
+                        worker_id,
+                    },
+                });
+            }
+        };
 
         let job = Job::AddWorker {
             config: Box::new(config),

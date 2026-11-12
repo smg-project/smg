@@ -1244,15 +1244,14 @@ fn a_state_from_another_key_for_an_imports_address_stays_a_health_hint() {
     );
 }
 
-/// A registration of a data-parallel group's URL that lands while the
-/// group's last rank row is on its way out keeps the id it was answered:
-/// the group's reservation is retired before the row leaves, so the
-/// newcomer reserves a fresh id and nothing retires it afterwards. In
-/// that window the URL maps to nothing (not to the deleted group's id)
-/// while the row still stands, which is what refuses the create with a
-/// conflict until the row has left.
+/// A registration of a data-parallel group's URL that arrives while the
+/// group's last row is on its way out. The creation reserves and checks
+/// under the group lock the removal holds from the row's departure to the
+/// group's retirement, so it waits at the lock and then reserves a fresh id
+/// that nothing retires afterwards; taken without the lock it kept the
+/// deleted group's id.
 #[test]
-fn a_registration_during_the_last_rank_rows_removal_keeps_its_reservation() {
+fn a_registration_during_the_last_rows_removal_waits_for_the_groups_retirement() {
     let registry = WorkerRegistry::new();
     let url = "http://10.0.0.16:8000";
     let row = |rank: usize| -> Arc<dyn Worker> {
@@ -1267,36 +1266,90 @@ fn a_registration_during_the_last_rank_rows_removal_keeps_its_reservation() {
     let first = registry.register(row(0)).unwrap();
     let last = registry.register(row(1)).unwrap();
     registry.remove(&first);
-    let mut window = None;
-    registry.with_another_write_at_the_group_seam(
-        |registry| registry.remove(&last),
-        |registry| {
-            let lookup = registry.get_id_by_url(url);
-            let row_stands = registry.get(&last).is_some();
-            window = Some((lookup, row_stands, registry.reserve_id_for_url(url)));
-        },
+    let mut created = None;
+    std::thread::scope(|scope| {
+        let mut creation = None;
+        registry.with_another_write_at_the_group_seam(
+            |registry| registry.remove(&last),
+            |_| {
+                let lock_attempt = registry.watch_the_next_group_lock_attempt();
+                creation = Some(scope.spawn(|| registry.reserve_for_create(url)));
+                lock_attempt
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the creation reaches the group lock");
+                assert!(registry.get(&last).is_none(), "the row has left at the seam");
+                assert_eq!(
+                    registry.reservation_of(url).as_ref(),
+                    Some(&group_id),
+                    "the group's id stands until the removal retires it; the waiting creation has not touched it"
+                );
+            },
+        );
+        created = Some(
+            creation
+                .take()
+                .expect("the creation was started")
+                .join()
+                .expect("the creation did not panic"),
+        );
+    });
+    let created = created
+        .expect("the creation ran")
+        .expect("the registration is not refused: the group is gone");
+    assert_ne!(created, group_id, "the deleted group's id is not answered");
+    assert_eq!(
+        registry.reservation_of(url),
+        Some(created),
+        "the fresh reservation stands after the group's retirement"
     );
-    let (lookup, row_stands, reserved) = window.expect("the newcomer ran in the window");
+}
+
+/// Two removals of a group's last two rows that run at the same time, as
+/// worker auto-recovery submits them, one job per row. Each row's departure
+/// and the group's retirement happen under the URL's group lock, so the
+/// second removal waits for the first and finds the group empty: the
+/// deleted group's id is not answered to the next registration of the URL.
+#[test]
+fn two_removals_of_a_groups_last_rows_retire_its_id() {
+    let registry = WorkerRegistry::new();
+    let url = "http://10.0.0.17:8000";
+    let row = |rank: usize| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .dp_config(rank, 2)
+                .build(),
+        )
+    };
+    let group_id = registry.reserve_id_for_url(url);
+    let first = registry.register(row(0)).unwrap();
+    let last = registry.register(row(1)).unwrap();
+    std::thread::scope(|scope| {
+        registry.with_another_write_at_the_group_seam(
+            |registry| registry.remove(&first),
+            |_| {
+                // The sibling's removal runs alongside the paused one. Under
+                // the group lock it departs only once the paused removal has
+                // let go, so this wait is a bound, never the ordering: it
+                // ends early only on a tree whose removals do not wait.
+                scope.spawn(|| {
+                    registry.remove(&last);
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while registry.get(&last).is_some() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            },
+        );
+    });
+    assert!(
+        registry.get(&first).is_none() && registry.get(&last).is_none(),
+        "both rows have left"
+    );
     assert_ne!(
-        reserved, group_id,
-        "the deleted group's id is not answered again"
-    );
-    assert_eq!(
         registry.reserve_id_for_url(url),
-        reserved,
-        "the newcomer's reservation survives the group's retirement"
-    );
-    assert_eq!(
-        lookup, None,
-        "the window maps the URL to nothing, not to the old id"
-    );
-    assert!(
-        row_stands,
-        "the row still stands in the window: the create is refused"
-    );
-    assert!(
-        registry.get(&last).is_none(),
-        "and the row has left after it"
+        group_id,
+        "the last removal to finish retired the group's id: it is not answered again"
     );
 }
 
