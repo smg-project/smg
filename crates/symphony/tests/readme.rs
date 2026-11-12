@@ -2099,6 +2099,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "nvidia-nemotronlabs-ai-for-media-sports-basketball",
+        model: "nvidia/NVIDIA-NemotronLabs-AI-for-Media-Sports-Basketball",
+        also: &[],
+        released: "2026-09-17",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(11),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "nvidia-nemotronlabs-ai-for-media-sports-tennis",
         model: "nvidia/NVIDIA-NemotronLabs-AI-for-Media-Sports-Tennis",
         also: &[],
