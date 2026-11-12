@@ -567,9 +567,12 @@ impl KvEventMonitor {
     /// resync. A whole-engine member pools every rank's blocks in one state,
     /// so its clear also starts the other ranks' cursors over: their next
     /// batch is taken as a first one instead of clearing the index a second
-    /// time, and a replay pending on one of them counts as missed too. A
-    /// pinned member holds its own rank alone and the other cursors keep
-    /// their place: their ranks' restarts clear their own members.
+    /// time, and a replay pending on one of them counts as missed too; a
+    /// pinned member of such a rank is cleared with it, its own pending
+    /// replay counted, since its next batch comes as a first one as well. A
+    /// pinned member holds its own rank alone and, with no whole-engine
+    /// member beside it, the other cursors keep their place: their ranks'
+    /// restarts clear their own members.
     fn clear_rank(
         indexer: &KvIndex,
         state: &mut EngineStreamState,
@@ -580,19 +583,39 @@ impl KvEventMonitor {
         let rank = batch_rank.unwrap_or(0);
         let whole_engine = state.members.iter().any(|member| member.rank.is_none());
         let mut dropped = 0;
+        // The ranks whose cursors start over beside the restarting one, each
+        // with the replay it had pending.
+        let mut started_over: Vec<(i32, u64)> = Vec::new();
         if whole_engine {
             for (other, cursor) in &mut state.ranks {
                 if *other != rank {
-                    dropped += cursor.pending_gap();
+                    let gap = cursor.pending_gap();
+                    dropped += gap;
                     cursor.reset();
+                    started_over.push((*other, gap));
                 }
             }
         }
-        for member in state.members.iter_mut().filter(|m| m.takes(batch_rank)) {
+        for member in &mut state.members {
+            // A pinned member of a rank whose cursor started over has lost
+            // its place with it: cleared here, as its own rank's restart
+            // would clear it, so the rank's next batch (taken as a first
+            // one) does not land beside its old blocks.
+            let own_gap = member
+                .rank
+                .and_then(|mine| started_over.iter().find(|(other, _)| *other == mine))
+                .map(|(_, gap)| *gap);
+            if !member.takes(batch_rank) && own_gap.is_none() {
+                continue;
+            }
             if let Some(worker_id) = member.worker_id {
                 Self::apply_cleared(worker_id, indexer, &mut member.index);
             }
-            let missed = pending + if member.rank.is_none() { dropped } else { 0 };
+            let missed = match (member.rank, own_gap) {
+                (None, _) => pending + dropped,
+                (Some(_), Some(gap)) => gap,
+                (Some(_), None) => pending,
+            };
             Metrics::record_kv_event_missed_batches(&member.url, missed);
             Metrics::record_kv_event_resync(&member.url, reason.as_str());
         }
@@ -958,6 +981,16 @@ mod tests {
         /// does; the engine's stream names every rank's batches.
         fn pin(&mut self, rank: i32) {
             self.state.members[0].rank = Some(rank);
+        }
+
+        /// A rank worker `grpc://w1:9000@<rank>` joins the whole-engine
+        /// member's stream: a plain registration widened by discovery.
+        fn join_pinned(&mut self, rank: i32) {
+            let url = format!("grpc://w1:9000@{rank}");
+            let worker_id = self.indexer.intern_worker(&url).unwrap();
+            let mut member = Member::new(test_worker(&url), Some(worker_id));
+            member.rank = Some(rank);
+            self.state.members.push(member);
         }
 
         /// An engine of `ranks` rank workers, `grpc://w1:9000@<rank>` each,
@@ -2001,6 +2034,67 @@ mod tests {
         assert_eq!(sim.state.ranks[&1].cursor(), Cursor::Live(1));
         assert_eq!(sim.state.ranks[&5].cursor(), Cursor::Live(1));
         assert_eq!(sim.state.resume_sequence(), 2);
+    }
+
+    /// Mixed membership, a plain registration widened by a rank worker: the
+    /// whole-engine member's clear on rank 0's restart starts rank 1's cursor
+    /// over, so the pinned rank-1 member is cleared with it and counts the
+    /// resync; rank 1's next batch is a first one for both. Without that
+    /// clear the pinned member would keep its old blocks beside the batches
+    /// that follow its own publisher's restart.
+    #[test]
+    fn a_whole_engine_clear_clears_the_pinned_member_of_a_rank_it_starts_over() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let restarts = |url: &str| {
+            series_value(
+                &handle,
+                "smg_kv_event_resyncs_total",
+                &[&format!("worker=\"{url}\""), "reason=\"publisher_restart\""],
+            )
+        };
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            Metrics::init_kv_event_series("grpc://w1:9000@1");
+            let mut sim = Sim::new();
+            sim.join_pinned(1);
+            sim.feed(&batch(1, Some(0), vec![stored(None, &[1, 2])]));
+            sim.feed(&batch(2, Some(0), vec![stored(Some(2), &[3])]));
+            sim.feed(&batch(1, Some(1), vec![stored(None, &[101, 102])]));
+            sim.feed(&batch(2, Some(1), vec![stored(Some(102), &[103])]));
+            assert_eq!((sim.blocks_of(0), sim.blocks_of(1)), (6, 3));
+            // Rank 0's publisher restarts (a sequence below its cursor on a
+            // fresh connection): the whole-engine member is cleared, rank 1's
+            // cursor starts over and the pinned member of rank 1 goes with it.
+            sim.state.reconnected();
+            assert_eq!(
+                sim.feed(&batch(1, Some(0), vec![stored(None, &[7])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(
+                (sim.blocks_of(0), sim.blocks_of(1)),
+                (1, 0),
+                "the pinned member of the restarted cursor holds nothing"
+            );
+            assert_eq!(
+                (restarts("grpc://w1:9000"), restarts("grpc://w1:9000@1")),
+                (Some(1.0), Some(1.0)),
+                "both members count the resync once"
+            );
+            // Rank 1's publisher restarts too: a first batch for both, no
+            // second clear.
+            assert_eq!(
+                sim.feed(&batch(1, Some(1), vec![stored(None, &[111])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!((sim.blocks_of(0), sim.blocks_of(1)), (2, 1));
+            assert_eq!(
+                (restarts("grpc://w1:9000"), restarts("grpc://w1:9000@1")),
+                (Some(1.0), Some(1.0))
+            );
+        });
     }
 
     /// A rank's publisher restart clears the member that stands for that
