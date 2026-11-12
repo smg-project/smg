@@ -488,6 +488,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[("<think>", false)],
+            stripped: &[],
         },
         // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
         // split on ASCII digits after the map (the reference cuts the mapped
@@ -1345,6 +1346,59 @@ fn a_stage_after_the_byte_level_reads_the_image() {
                 Ok(reference.get_ids().to_vec()),
                 "{name}: parallel {parallel}"
             );
+        }
+    }
+    // The two configurations whose decline rows went with this change, on
+    // the direct path now: a regex `Split` after the `ByteLevel` that reads
+    // beyond ASCII through the engine's `\p{N}`, and one with the end
+    // anchor, where `end_anchored` and `mapped_from` both hold (over the
+    // image `$` holds only at an image piece's end: a `\n` is `Ċ` there);
+    // then the first again with its pieces dropped (`Removed`) and with its
+    // gaps dropped (`Removed` inverted): the image walk skips the dropped
+    // span and its raw cursor still advances over it, which in the CJK
+    // texts is a byte inside a character.
+    let base = &shapes()[0];
+    for (pattern, behavior, invert, anchored) in [
+        (r"\p{N}", SplitDelimiterBehavior::Isolated, false, false),
+        (r"[a-z]+$", SplitDelimiterBehavior::Isolated, false, true),
+        (r"\p{N}", SplitDelimiterBehavior::Removed, false, false),
+        (r"\p{N}", SplitDelimiterBehavior::Removed, true, false),
+    ] {
+        let mut tokenizer = tokenizer_of(base, &mut state);
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+            byte_level(false),
+            split(pattern, behavior, invert),
+        ]))));
+        let native = seeded(&tokenizer);
+        assert_eq!(
+            native.mapped_from,
+            Some(0),
+            "{pattern} {behavior:?} {invert}"
+        );
+        assert_eq!(
+            native.end_anchored, anchored,
+            "{pattern} {behavior:?} {invert}"
+        );
+        for text in [
+            "abc\ndef",
+            "x\u{B2}\n",
+            "abc",
+            "ab1c2 d\u{BD}e",
+            "x\u{BC}y\n\n",
+            "\u{4E32}\n\u{4E39}",
+            "12 ab\nAB cd",
+            "tab\there\n",
+            "\n",
+            "",
+        ] {
+            let reference = tokenizer.encode(text, false).expect("encode");
+            for parallel in [false, true] {
+                assert_eq!(
+                    native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                    Ok(reference.get_ids().to_vec()),
+                    "{pattern} {behavior:?} {invert}: {text:?} parallel {parallel}"
+                );
+            }
         }
     }
 }
