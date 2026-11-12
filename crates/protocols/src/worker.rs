@@ -1130,13 +1130,17 @@ mod job_status_tests {
 
     #[test]
     fn a_status_carries_its_word_its_message_and_a_stamp_of_now() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let seconds_since_epoch = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        };
+        let before = seconds_since_epoch();
         let pending = JobStatus::pending("AddWorker", "http://w:8000");
         let processing = JobStatus::processing("AddWorker", "http://w:8000");
         let failed = JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string());
+        let after = seconds_since_epoch();
         let words = |status: &JobStatus| (status.status.clone(), status.message.clone());
         assert_eq!(words(&pending), ("pending".to_string(), None));
         assert_eq!(words(&processing), ("processing".to_string(), None));
@@ -1148,8 +1152,8 @@ mod job_status_tests {
             assert_eq!(status.job_type, "AddWorker");
             assert_eq!(status.worker_url, "http://w:8000");
             assert!(
-                (now..=now + 5).contains(&status.timestamp),
-                "stamped now, not at {}",
+                (before..=after).contains(&status.timestamp),
+                "stamped between {before} and {after}, not at {}",
                 status.timestamp
             );
         }
