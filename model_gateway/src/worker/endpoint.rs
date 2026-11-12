@@ -384,11 +384,6 @@ impl Endpoint {
             ..self.clone()
         }
     }
-
-    /// Render this endpoint with the workflow's rank suffix.
-    pub fn render_with_rank(&self, rank: usize) -> String {
-        format!("{}@{rank}", self.render())
-    }
 }
 
 impl fmt::Debug for Endpoint {
@@ -682,7 +677,6 @@ mod tests {
     fn render_brackets_ipv6_so_the_port_stays_readable() {
         let endpoint = Endpoint::parse("http://[fd00::1]:8080").unwrap();
         assert_eq!(endpoint.render(), "http://[fd00::1]:8080");
-        assert_eq!(endpoint.render_with_rank(2), "http://[fd00::1]:8080@2");
     }
 
     #[test]

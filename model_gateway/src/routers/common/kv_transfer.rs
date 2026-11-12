@@ -170,7 +170,7 @@ pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, Str
     };
     if worker.dp_rank().is_some() {
         return Err(format!(
-            "{url}: MoRI-IO PD pins both legs of a request to one data-parallel rank itself; \
+            "{url}: MoRI-IO PD pins both sides of a request to one data-parallel rank itself; \
              register the engine once, with a dp_size label, instead of one worker per rank"
         ));
     }
@@ -243,7 +243,7 @@ pub(crate) fn moriio_dp_mismatch_error(
 ) -> Option<String> {
     (prefill.dp_size != decode.dp_size).then(|| {
         format!(
-            "prefill dp_size={} but decode dp_size={}: MoRI-IO PD sends both legs of a \
+            "prefill dp_size={} but decode dp_size={}: MoRI-IO PD sends both sides of a \
              request to the same data-parallel rank, so both engines need the same dp_size",
             prefill.dp_size, decode.dp_size
         )
@@ -502,7 +502,7 @@ pub(crate) fn moriio_side_channel_error(
             .map_or_else(|| "none".to_string(), Value::to_string)
     };
     Some(format!(
-        "prefill reports MoRI-IO side channel handshake {} / notify {}, but the decode leg \
+        "prefill reports MoRI-IO side channel handshake {} / notify {}, but the decode worker \
          was told {} / {}; set labels {MORIIO_HANDSHAKE_PORT_LABEL} / \
          {MORIIO_NOTIFY_PORT_LABEL} on the prefill worker",
         shown("remote_handshake_port"),

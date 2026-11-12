@@ -1,5 +1,5 @@
-//! The parts of a request every engine client reads alike: the schema a chat
-//! request's `response_format` asks for, and a plain generate request's sampling
+//! The parts of a request every engine client reads alike: the constraint a
+//! chat request's `response_format` asks for, and a plain generate request's sampling
 //! parameters with the shared defaults applied, and the one structured constraint
 //! a completion or plain request names. Each client places the values in its own
 //! proto; what differs between engines (the constraint variant, how a disabled
@@ -14,22 +14,30 @@ use openai_protocol::{
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 
-/// The JSON schema a chat request's `response_format` constrains the output to:
-/// `{"type":"object"}` for `json_object`, the given schema for `json_schema`,
-/// nothing for `text` or none.
-pub fn response_format_schema(request: &ChatCompletionRequest) -> Result<Option<String>, String> {
-    let json_object;
-    let schema = match &request.response_format {
-        Some(ResponseFormat::JsonObject) => {
-            json_object = serde_json::json!({"type": "object"});
-            &json_object
+/// The constraint a chat request's `response_format` puts on the output, with
+/// its text: a JSON schema (`{"type":"object"}` for `json_object`, the given
+/// schema for `json_schema`), or a structural tag (the object as it arrived,
+/// `type` included, which is what the engines' own servers hand their grammar
+/// compiler); nothing for `text` or none.
+pub fn response_format_constraint(
+    request: &ChatCompletionRequest,
+) -> Result<Option<(ConstraintKind, String)>, String> {
+    let (kind, text) = match &request.response_format {
+        Some(ResponseFormat::JsonObject) => (
+            ConstraintKind::JsonSchema,
+            serde_json::to_string(&serde_json::json!({"type": "object"})),
+        ),
+        Some(ResponseFormat::JsonSchema { json_schema }) => (
+            ConstraintKind::JsonSchema,
+            serde_json::to_string(&json_schema.schema),
+        ),
+        Some(format @ ResponseFormat::StructuralTag { .. }) => {
+            (ConstraintKind::StructuralTag, serde_json::to_string(format))
         }
-        Some(ResponseFormat::JsonSchema { json_schema }) => &json_schema.schema,
         Some(ResponseFormat::Text) | None => return Ok(None),
     };
-    serde_json::to_string(schema)
-        .map(Some)
-        .map_err(|e| format!("Failed to serialize JSON schema: {e}"))
+    text.map(|text| Some((kind, text)))
+        .map_err(|e| format!("Failed to serialize the response_format constraint: {e}"))
 }
 
 /// Which of a chat body's own format fields request building set aside: the
@@ -69,10 +77,11 @@ impl OutputConstraint {
 }
 
 /// A chat body's own format constraints as the engine's request reads them:
-/// the schema its `response_format` asks for ([`response_format_schema`]), its
-/// `ebnf` and its `regex`, each absent when set aside.
+/// the constraint its `response_format` asks for
+/// ([`response_format_constraint`]), its `ebnf` and its `regex`, each absent
+/// when set aside.
 pub struct BodyFormat<'a> {
-    pub schema: Option<String>,
+    pub format: Option<(ConstraintKind, String)>,
     pub ebnf: Option<&'a str>,
     pub regex: Option<&'a str>,
 }
@@ -83,10 +92,10 @@ pub fn body_format(
     set_aside: FormatSetAside,
 ) -> Result<BodyFormat<'_>, String> {
     Ok(BodyFormat {
-        schema: if set_aside.response_format {
+        format: if set_aside.response_format {
             None
         } else {
-            response_format_schema(request)?
+            response_format_constraint(request)?
         },
         ebnf: request.ebnf.as_deref().filter(|_| !set_aside.grammar),
         regex: request.regex.as_deref().filter(|_| !set_aside.grammar),
@@ -116,13 +125,14 @@ pub fn logit_bias_by_token_text(bias: Option<&HashMap<String, f32>>) -> HashMap<
     bias.map_or_else(HashMap::new, HashMap::clone)
 }
 
-/// The kind of structured constraint a request names: a JSON schema, a regex
-/// or an EBNF grammar. Each client spells it in its own proto.
+/// The kind of structured constraint a request names: a JSON schema, a regex,
+/// an EBNF grammar or a structural tag. Each client spells it in its own proto.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstraintKind {
     JsonSchema,
     Regex,
     Ebnf,
+    StructuralTag,
 }
 
 /// The one structured constraint among `json_schema`, `regex` and `ebnf`, with
@@ -259,30 +269,49 @@ mod tests {
     }
 
     #[test]
-    fn response_format_schema_per_kind() {
+    fn response_format_constraint_per_kind() {
         assert_eq!(
-            response_format_schema(&chat(serde_json::json!({}))),
+            response_format_constraint(&chat(serde_json::json!({}))),
             Ok(None)
         );
         assert_eq!(
-            response_format_schema(&chat(
+            response_format_constraint(&chat(
                 serde_json::json!({"response_format": {"type": "text"}})
             )),
             Ok(None)
         );
         assert_eq!(
-            response_format_schema(&chat(
+            response_format_constraint(&chat(
                 serde_json::json!({"response_format": {"type": "json_object"}})
             )),
-            Ok(Some(r#"{"type":"object"}"#.to_string()))
+            Ok(Some((
+                ConstraintKind::JsonSchema,
+                r#"{"type":"object"}"#.to_string()
+            )))
         );
         let schema =
             serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}});
         assert_eq!(
-            response_format_schema(&chat(serde_json::json!({
+            response_format_constraint(&chat(serde_json::json!({
                 "response_format": {"type": "json_schema", "json_schema": {"name": "s", "schema": schema}}
             }))),
-            Ok(Some(serde_json::to_string(&schema).unwrap()))
+            Ok(Some((
+                ConstraintKind::JsonSchema,
+                serde_json::to_string(&schema).unwrap()
+            )))
+        );
+        // a structural tag is the object as it arrived, `type` included
+        let tag = serde_json::json!({
+            "type": "structural_tag",
+            "structures": [{"begin": "<w>", "schema": schema, "end": "</w>"}],
+            "triggers": ["<w>"]
+        });
+        assert_eq!(
+            response_format_constraint(&chat(serde_json::json!({"response_format": tag}))),
+            Ok(Some((
+                ConstraintKind::StructuralTag,
+                serde_json::to_string(&tag).unwrap()
+            )))
         );
     }
 
@@ -338,7 +367,13 @@ mod tests {
         }));
 
         let all = body_format(&request, FormatSetAside::default()).expect("read");
-        assert_eq!(all.schema.as_deref(), Some(r#"{"type":"object"}"#));
+        assert_eq!(
+            all.format,
+            Some((
+                ConstraintKind::JsonSchema,
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
         assert_eq!(
             (all.ebnf, all.regex),
             (Some("root ::= \"x\""), Some("[a-z]+"))
@@ -353,7 +388,7 @@ mod tests {
         )
         .expect("read");
         assert_eq!(
-            answered.schema, None,
+            answered.format, None,
             "the schema the tag answers is not read"
         );
         assert_eq!(
@@ -370,7 +405,7 @@ mod tests {
         )
         .expect("read");
         assert!(
-            whole_turn.schema.is_none() && whole_turn.ebnf.is_none() && whole_turn.regex.is_none()
+            whole_turn.format.is_none() && whole_turn.ebnf.is_none() && whole_turn.regex.is_none()
         );
     }
 

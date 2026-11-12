@@ -611,9 +611,11 @@ class SglangLauncher(RustLauncher):
         self.encode = EncodeDispatchBridge(args)
         logger.info(
             "Encode dispatch for the language-only worker: SGLang's own receiver in this "
-            "process, %d encoder URL(s) configured, bootstrap port %s",
+            "process, %d encoder URL(s) configured, bootstrap port %s, receiver mode %s "
+            "(http encoders take image, video and audio references; grpc takes images only)",
             len(self.encode.encoder_urls),
             getattr(args, "encoder_bootstrap_port", None),
+            self.encode.transport_mode,
         )
         return {"encode_dispatcher": self.encode}
 

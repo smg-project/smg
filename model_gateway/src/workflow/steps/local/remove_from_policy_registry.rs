@@ -21,8 +21,8 @@ static CACHE_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CA
 
 /// Step to remove workers from the policy registry.
 ///
-/// Removes each worker from cache-aware policies and notifies
-/// the policy registry of worker removal.
+/// Removes each worker from cache-aware policies and drops the policy of a
+/// model that no worker of this node serves any more.
 pub struct RemoveFromPolicyRegistryStep;
 
 impl RemoveFromPolicyRegistryStep {
@@ -78,17 +78,38 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             if let Some(ref monitor) = app_context.kv_event_monitor {
                 monitor.on_worker_removed(worker.url()).await;
             }
-
-            // Drop the state the policies keep on the worker (a load-aware
-            // policy's dispatch tally) so it does not leak under churn.
-            app_context
-                .policy_registry
-                .remove_worker_from_policies(worker.url());
         }
 
+        // Drop the state the policies and the hosted engine keep on the
+        // removed workers (a load-aware policy's dispatch tally by URL, the
+        // engine's rows by handle) so it does not leak under churn. The
+        // workers the registry step removed count as well as the ones found:
+        // a same-URL replacement during the drain is a handle of its own,
+        // and each handle is pruned once.
+        let mut pruned: Vec<usize> = Vec::new();
+        for worker in workers_to_remove
+            .iter()
+            .chain(&context.data.removed_workers)
+        {
+            let handle = Arc::as_ptr(worker).cast::<()>() as usize;
+            if !pruned.contains(&handle) {
+                pruned.push(handle);
+                app_context
+                    .policy_registry
+                    .on_worker_removed(worker.as_ref());
+            }
+        }
+
+        // The removed workers' URLs leave their models' trees too, those of
+        // the models they were registered with as well as the ones they list
+        // now: a same-URL replacement during the drain is the one removed,
+        // and its models can differ from the found worker's.
         let mut cache_removals: HashMap<String, HashSet<String>> = HashMap::new();
-        for worker in workers_to_remove {
-            for model_id in WorkerRegistry::worker_model_ids(worker) {
+        for worker in workers_to_remove
+            .iter()
+            .chain(&context.data.removed_workers)
+        {
+            for model_id in WorkerRegistry::policy_model_ids(worker) {
                 cache_removals
                     .entry(model_id)
                     .or_default()
@@ -97,10 +118,25 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         }
         Self::remove_cache_state(Arc::clone(&app_context.policy_registry), cache_removals).await;
 
-        for worker in workers_to_remove {
-            app_context
-                .policy_registry
-                .on_worker_removed(worker.model_id());
+        // The workers have left the worker registry: a model none of this
+        // node's workers serves any more loses its policy. Asked of the
+        // registry rather than counted, so a worker registered again, or a
+        // mesh import removed here, cannot keep a policy alive or end it
+        // early. Every model a worker was registered with or lists now is
+        // asked after, not its primary alone: a worker listing several
+        // models can be the last to serve one whose own workers left first.
+        // The workers the registry step removed count as well as the ones
+        // found, since a same-URL replacement during the drain is the one
+        // removed.
+        let models: HashSet<String> = workers_to_remove
+            .iter()
+            .chain(&context.data.removed_workers)
+            .flat_map(WorkerRegistry::policy_model_ids)
+            .collect();
+        for model_id in &models {
+            if !app_context.worker_registry.serves_model_locally(model_id) {
+                app_context.policy_registry.on_model_unserved(model_id);
+            }
         }
 
         debug!(

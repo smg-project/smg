@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     config::{MultimodalComponents, MultimodalModelConfig, VisionProcessors},
-    encoder_budget::check_item_feature_budget,
+    encoder_budget::{check_image_size_feature_budget, check_item_feature_budget},
     log_mm_timing_enabled,
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
@@ -29,6 +29,9 @@ use super::{
     PromptBinding, RegistryTokenizer,
 };
 use crate::observability::metrics::Metrics;
+
+#[path = "batch_image_cache.rs"]
+mod batch_image_cache;
 
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
@@ -56,7 +59,9 @@ struct PlanContext<'a> {
     image_wire_dtype: Option<EncoderDtype>,
     transparency: TransparencyPolicy,
     /// The engine's per-item bound in feature tokens, when known (see
-    /// [`super::encoder_budget`]).
+    /// [`super::encoder_budget`]): held to on an image's header size before
+    /// anything is decoded, and on every item's produced count after its
+    /// preprocessing.
     encoder_budget: Option<usize>,
 }
 
@@ -163,8 +168,10 @@ impl Fetched {
 /// Process a protocol-independent, ordered media plan.
 ///
 /// `encoder_budget` is the engine's per-item bound in feature tokens, when
-/// known (see [`super::encoder_budget`]): an item above it is refused once
-/// its features are counted, before anything reaches the engine.
+/// known (see [`super::encoder_budget`]): an image above it on its header
+/// size alone is refused before any of its batch is decoded or any tensor
+/// built, and any item above it on its produced count is refused once its
+/// features are counted; nothing above it reaches the engine.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_multimodal_plan(
     plan: MediaPlan,
@@ -320,7 +327,7 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
         .with_video_frame_sampling(frame_sampling)
         .with_image_transparency(ctx.transparency)
         .with_minimax_sglang_resize(
-            ctx.spec.name() == "minimax_m3"
+            ctx.spec.resizes_source_images()
                 && ctx
                     .model_config
                     .preprocessor_config
@@ -328,7 +335,7 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
                     .unwrap_or(false),
         )
         .with_minimax_image_resize(
-            ctx.spec.name() == "minimax_m3"
+            ctx.spec.resizes_source_images()
                 && !ctx
                     .model_config
                     .preprocessor_config
@@ -540,24 +547,29 @@ fn intermediate_of(
         .with_encoder_input_format(spec.encoder_input_format()))
 }
 
-/// Preprocess one modality's batch: a small image batch through the pixel
-/// cache, image by image, when the cache is on and the processor allows it;
-/// every other batch whole, on the blocking pool.
+/// Preprocess one modality's batch, using the pixel cache for eligible images.
+/// An image the engine can
+/// never place is refused first, on the size its header gave and the
+/// processor's own size-to-count rule, before any of the batch is decoded
+/// or any tensor built; the counts the preprocessing produces are held to
+/// the same budget in [`prepared_part`].
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
 ) -> Result<PreprocessedEncoderInputs> {
+    if let MediaBatch::Images(images) = media {
+        if let Ok(processor) = ctx.vision_processors.image() {
+            check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
+        }
+    }
     if let Some(preprocessed) = cached_images(media, ctx).await? {
         return Ok(preprocessed);
     }
     preprocess_batch(media, ctx).await
 }
 
-/// The per-image path through the pixel cache for an image batch the cache
-/// takes: one image, or fewer than 32 of a processor that preprocesses each
-/// image independently (retaining individual tensors plus their concatenation
-/// is costly for large requests, which keep their whole-batch allocation
-/// path). `None` sends the batch down the whole-batch path.
+/// Batch misses for processors that support slicing the result into cache
+/// entries. Use the per-image path for other eligible requests.
 async fn cached_images(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
@@ -569,20 +581,20 @@ async fn cached_images(
         return Ok(None);
     };
     let processor = ctx.vision_processors.image();
-    if !(images.len() == 1
-        || (images.len() < 32 && processor.is_ok_and(|p| p.supports_per_image_preprocessing())))
-    {
+    let independent = processor
+        .as_ref()
+        .is_ok_and(|processor| processor.supports_per_image_preprocessing());
+    let batch_cache = ctx.image_wire_dtype == Some(EncoderDtype::BFloat16)
+        && !images.is_empty()
+        && processor.is_ok_and(|processor| processor.supports_bf16_batch_cache());
+    let per_image_cache = images.len() == 1 || (images.len() < 32 && independent);
+    if batch_cache {
+        return batch_image_cache::preprocess(images, cache, ctx, !per_image_cache).await;
+    }
+    if !per_image_cache {
         return Ok(None);
     }
-    let config = serde_json::json!({
-        "model_id": ctx.model_id,
-        "model_type": ctx.model_type,
-        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
-        // A one-pass result is only right for its own wire.
-        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
-        "transparency": ctx.transparency,
-    });
-    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config, &ctx.model_config.config)?;
+    let fingerprint = image_cache_fingerprint(ctx)?;
     // Deduplicate within the request even if the result cannot fit
     // in the cache. Record every position before scheduling work.
     let mut unique = HashMap::new();
@@ -654,6 +666,23 @@ async fn cached_images(
     .context("Image batch assembly task panicked")?
     .context("Image batch assembly failed")
     .map(Some)
+}
+
+/// Identify the model, wire format and image policy in the pixel cache.
+fn image_cache_fingerprint(ctx: &PlanContext<'_>) -> Result<u64> {
+    let config = serde_json::json!({
+        "model_id": ctx.model_id,
+        "model_type": ctx.model_type,
+        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
+        // A one-pass result is only right for its own wire.
+        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
+        "transparency": ctx.transparency,
+    });
+    Ok(config_fingerprint(
+        ctx.tokenizer_id,
+        &config,
+        &ctx.model_config.config,
+    )?)
 }
 
 /// `work` on the blocking pool, with the time its task waited in the pool's
@@ -730,20 +759,7 @@ async fn preprocess_batch(
 
     on_pool(ctx.model_id, move || match media_for_preprocess {
         MediaBatch::Images(images) => {
-            // Decode every frame first, in parallel on the preprocessing
-            // pool, rather than one photo after another on this thread.
-            ImageFrame::decode_all(&images)
-                .map_err(llm_multimodal::MultiModalError::Media)?;
-            let processor = vision_processors.image()?;
-            // The frames' own pixels, borrowed from the cells `decode_all`
-            // just filled: no processor owns, consumes or mutates its input,
-            // so the batch costs one pointer per image instead of a deep copy
-            // of every decoded image.
-            let decoded: Vec<&image::DynamicImage> = images
-                .iter()
-                .map(|frame| frame.image().map_err(llm_multimodal::MultiModalError::Media))
-                .collect::<Result<_, _>>()?;
-            preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
+            preprocess_image_frames(&images, &vision_processors, image_wire_dtype)
         }
         MediaBatch::Videos(videos) => {
             let processor = vision_processors.video()?;
@@ -905,6 +921,31 @@ async fn preprocess_image_batch(
     })
     .await
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
+}
+
+/// Decode a batch in parallel and borrow its frames for the vision processor.
+fn preprocess_image_frames(
+    images: &[Arc<ImageFrame>],
+    vision_processors: &VisionProcessors,
+    image_wire_dtype: Option<EncoderDtype>,
+) -> Result<PreprocessedEncoderInputs> {
+    // Decode every frame first, in parallel on the preprocessing
+    // pool, rather than one photo after another on this thread.
+    ImageFrame::decode_all(images).map_err(llm_multimodal::MultiModalError::Media)?;
+    let processor = vision_processors.image()?;
+    // The frames' own pixels, borrowed from the cells `decode_all`
+    // just filled: no processor owns, consumes or mutates its input,
+    // so the batch costs one pointer per image instead of a deep copy
+    // of every decoded image.
+    let decoded: Vec<&image::DynamicImage> = images
+        .iter()
+        .map(|frame| {
+            frame
+                .image()
+                .map_err(llm_multimodal::MultiModalError::Media)
+        })
+        .collect::<Result<_, _>>()?;
+    preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
 }
 
 /// The images preprocessed: laid out in `wire_dtype` in one pass when the
@@ -1133,14 +1174,26 @@ mod tests {
     use crate::observability::metrics::test_support::global_recorder;
 
     /// The queue wait is measured on the pool thread before the work and
-    /// recorded there: a task behind the one held thread records a wait of
-    /// at least the hold, and a task whose awaiting future was dropped while
-    /// it queued records its wait all the same.
+    /// recorded there: a task behind the one held thread records at least
+    /// the time from its queueing to the hold's release and at most the time
+    /// from just before its queueing to the drain's end, once every record is
+    /// in (the test's own instants bracket each wait from both sides, so a
+    /// wait measured from an instant taken too early fails too), a task whose
+    /// awaiting future was dropped while it queued records its wait all the
+    /// same, and the record is taken before the work runs.
     #[test]
     fn the_pool_queue_wait_is_recorded_on_the_pool_thread() {
-        use std::{collections::BTreeMap, future::Future, task::Poll};
+        use std::{
+            collections::BTreeMap,
+            future::Future,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                mpsc as std_mpsc,
+            },
+            task::Poll,
+        };
 
-        use tokio::sync::mpsc;
+        use tokio::sync::{mpsc, oneshot};
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1148,59 +1201,99 @@ mod tests {
             .build()
             .expect("a runtime");
         runtime.block_on(async {
-            let (tx, mut rx) = mpsc::unbounded_channel::<(&'static str, f64)>();
-            let hold = tokio::task::spawn_blocking(|| {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            // Each record: who, the wait, and whether the work had run.
+            let (tx, mut rx) = mpsc::unbounded_channel::<(&'static str, f64, bool)>();
+            // The hold takes the pool's one thread, says so, and keeps it
+            // until the test releases it once both tasks are queued behind.
+            let (taken_tx, taken_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std_mpsc::channel::<()>();
+            let hold = tokio::task::spawn_blocking(move || {
+                let _ = taken_tx.send(());
+                let _ = release_rx.recv();
             });
+            taken_rx.await.expect("the hold took the thread");
+
             // Polled once, so its task is queued behind the hold, then dropped.
             let dropped_tx = tx.clone();
             let mut dropped = Box::pin(on_pool_recording(
                 || (),
                 move |waited| {
-                    let _ = dropped_tx.send(("dropped", waited));
+                    let _ = dropped_tx.send(("dropped", waited, false));
                 },
             ));
+            // Stamped before the poll, so the task's own clock starts after it.
+            let dropped_before = Instant::now();
             std::future::poll_fn(|cx| {
                 let _ = dropped.as_mut().poll(cx);
                 Poll::Ready(())
             })
             .await;
+            // Stamped after the poll, so the task's own clock started first.
+            let dropped_queued = Instant::now();
             drop(dropped);
-            // Its work takes 300 ms: a wait read before the work stays near
-            // the 50 ms hold, one read after it would pass 300 ms.
+
+            // Queued behind both, then awaited; its work sets a flag the
+            // record closure reads, so the order of the two is recorded.
+            let worked = Arc::new(AtomicBool::new(false));
+            let worked_by_work = Arc::clone(&worked);
+            let worked_by_record = Arc::clone(&worked);
             let awaited_tx = tx.clone();
-            let value = on_pool_recording(
-                || {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+            let mut awaited = Box::pin(on_pool_recording(
+                move || {
+                    worked_by_work.store(true, Ordering::SeqCst);
                     7
                 },
                 move |waited| {
-                    let _ = awaited_tx.send(("awaited", waited));
+                    let _ = awaited_tx.send((
+                        "awaited",
+                        waited,
+                        worked_by_record.load(Ordering::SeqCst),
+                    ));
                 },
-            )
-            .await
-            .expect("the work ran");
+            ));
+            let awaited_before = Instant::now();
+            std::future::poll_fn(|cx| {
+                let _ = awaited.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            let awaited_queued = Instant::now();
+
+            // Stamped before the release, so no record can precede it.
+            let released = Instant::now();
+            release_tx.send(()).expect("the hold is waiting");
+            let value = awaited.await.expect("the work ran");
             assert_eq!(value, 7);
             hold.await.expect("the hold ran");
             drop(tx);
+
             let mut seen = BTreeMap::new();
-            while let Some((who, waited)) = rx.recv().await {
-                seen.insert(who, waited);
+            while let Some((who, waited, worked_first)) = rx.recv().await {
+                seen.insert(who, (waited, worked_first));
             }
-            for who in ["awaited", "dropped"] {
-                let waited = seen
+            // Stamped once every sender is gone: each record was sent before
+            // its sender dropped, whatever order the pool ran the tasks in.
+            let done = Instant::now();
+            for (who, before, queued) in [
+                ("dropped", dropped_before, dropped_queued),
+                ("awaited", awaited_before, awaited_queued),
+            ] {
+                let (waited, _) = seen
                     .get(who)
                     .unwrap_or_else(|| panic!("{who}: no wait recorded"));
+                let held = released.duration_since(queued).as_secs_f64();
                 assert!(
-                    *waited >= 0.02,
-                    "{who}: waited {waited} s behind a 50 ms hold"
+                    *waited >= held,
+                    "{who}: waited {waited} s, queued {held} s before the release"
+                );
+                let bracket = done.duration_since(before).as_secs_f64();
+                assert!(
+                    *waited <= bracket,
+                    "{who}: waited {waited} s, but {bracket} s passed from before its queueing to the drain's end"
                 );
             }
-            let awaited = seen["awaited"];
-            assert!(
-                awaited < 0.25,
-                "the wait was read before the work, not after: {awaited} s"
-            );
+            let (_, worked_first) = seen["awaited"];
+            assert!(!worked_first, "the wait was recorded after the work ran");
         });
     }
 

@@ -7,11 +7,11 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, on_field,
+        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, json_type_name, on_field,
         validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
-        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest,
-        ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
-        ToolChoiceValue, ToolReference, Usage,
+        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse, FunctionChoice,
+        GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
+        ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -26,6 +26,9 @@ use crate::{
 // Chat Messages
 // ============================================================================
 
+/// One message of a chat conversation, tagged by its `role` (system, user,
+/// assistant, tool, function, developer or root), carrying the content and
+/// fields that role has.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "role")]
@@ -47,11 +50,23 @@ pub enum ChatMessage {
         #[schemars(skip)]
         ext: KimiUserExt,
     },
+    /// An earlier model turn, replayed by the client. The refusal, the audio
+    /// reference and the deprecated function call are carried as the client
+    /// sent them, for an upstream that reads them; the gRPC chat template
+    /// never sees them, as the engines' own chat utils leave them out.
+    ///
+    /// The variant is the largest of the enum, so its room is every turn's:
+    /// the deprecated function call and the provider extension ride behind a
+    /// pointer each, which keeps a turn under 192 bytes (a history of four
+    /// turns in the allocator's 768-byte class, of eight in the 1,536 one).
     #[serde(rename = "assistant")]
     Assistant {
         content: Option<MessageContent>,
+        refusal: Option<String>,
         name: Option<String>,
+        audio: Option<ChatAssistantAudio>,
         tool_calls: Option<Vec<ToolCall>>,
+        function_call: Option<Box<FunctionCallResponse>>,
         /// Reasoning content for O1-style models (an engine extension), read
         /// from `reasoning_content` or `reasoning`; see [`AssistantReasoning`].
         #[serde(flatten)]
@@ -90,6 +105,13 @@ pub enum ChatMessage {
         content: MessageContent,
         name: Option<String>,
     },
+}
+
+/// The audio answer of an earlier assistant turn, referred to by its id: the
+/// history carries the reference, not the audio.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatAssistantAudio {
+    pub id: String,
 }
 
 /// The reasoning text of an assistant message on input. It is read from
@@ -179,6 +201,8 @@ impl<'de> Deserialize<'de> for AssistantReasoning {
     }
 }
 
+/// A message's content as the wire carries it: one text string, or a list of
+/// typed parts (text, image, audio, video, refusal).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -260,6 +284,9 @@ impl MessageContent {
 // Chat Completion Request
 // ============================================================================
 
+/// A request to the chat completions route: the conversation so far, the model,
+/// and the sampling, tool, response-format and streaming parameters, validated
+/// together before dispatch.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Default, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_chat_cross_parameters"))]
@@ -722,25 +749,31 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 4. Validate structured output conflicts
-    let has_json_format = matches!(
+    // 4. Validate structured output conflicts: a response format that
+    //    constrains the output (a JSON one, a structural tag) beside a grammar
+    //    of the request's own
+    let has_format_constraint = matches!(
         req.response_format,
-        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        Some(
+            ResponseFormat::JsonObject
+                | ResponseFormat::JsonSchema { .. }
+                | ResponseFormat::StructuralTag { .. }
+        )
     );
 
-    if has_json_format && req.regex.is_some() {
+    if has_format_constraint && req.regex.is_some() {
         return Err(invalid_at(
             "regex",
             "regex_conflicts_with_json",
-            "cannot use regex constraint with JSON response format",
+            "cannot use regex constraint with a JSON or structural_tag response format",
         ));
     }
 
-    if has_json_format && req.ebnf.is_some() {
+    if has_format_constraint && req.ebnf.is_some() {
         return Err(invalid_at(
             "ebnf",
             "ebnf_conflicts_with_json",
-            "cannot use EBNF constraint with JSON response format",
+            "cannot use EBNF constraint with a JSON or structural_tag response format",
         ));
     }
 
@@ -754,8 +787,8 @@ fn validate_chat_cross_parameters(
     .filter(|&&x| x)
     .count();
 
-    // Only `regex` beside `ebnf` reaches this rule (a JSON format beside
-    // either was refused above); the second constraint is the one named.
+    // Only `regex` beside `ebnf` reaches this rule (a format beside either
+    // was refused above); the second constraint is the one named.
     if constraint_count > 1 {
         return Err(invalid_at(
             "ebnf",
@@ -880,18 +913,6 @@ fn validate_tool_choice(
             )),
         }),
         ToolChoice::Function { .. } | ToolChoice::Value(_) => Ok(()),
-    }
-}
-
-/// The JSON type of a value, for error messages (`a string`, `an array`, ...).
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
     }
 }
 
@@ -1146,6 +1167,8 @@ impl GenerationRequest for ChatCompletionRequest {
 // Response Types
 // ============================================================================
 
+/// The complete (non-streamed) answer of the chat completions route, object
+/// `chat.completion`: the choices with their messages, and the usage.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionResponse {
@@ -1201,6 +1224,9 @@ pub struct ChatCompletionMessage {
     // Note: audio is not added yet
 }
 
+/// One generated alternative of a chat completion: its index, the assistant
+/// message, the log probabilities (`null` unless requested) and the reason
+/// generation stopped.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatChoice {
     pub index: u32,
@@ -1217,6 +1243,9 @@ pub struct ChatChoice {
     pub hidden_states: Option<Vec<f32>>,
 }
 
+/// One chunk of a streamed chat completion, object `chat.completion.chunk`: the
+/// choices' deltas and, when requested, the usage (on the last chunk, or the
+/// running usage on every chunk with `continuous_usage_stats`).
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionStreamResponse {
@@ -1252,6 +1281,9 @@ pub struct ChatMessageDelta {
     pub reasoning_content: Option<String>,
 }
 
+/// One alternative's part of a streamed chunk: its index, the delta since the
+/// previous chunk, the log probabilities when requested, and the finish reason
+/// once it stops.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatStreamChoice {
     pub index: u32,
@@ -1328,7 +1360,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessageDelta,
+        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, ChatMessageDelta,
         ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
         ThinkingParam, ThinkingType,
     };
@@ -1967,6 +1999,35 @@ mod tests {
             {"role": "assistant", "content": null, "tool_calls": [call("c3")]}
         ]);
         assert_eq!(request(history).history_tool_calls_count(), 3);
+    }
+
+    /// The deprecated function call and the provider extension of an
+    /// assistant turn ride behind a pointer each. The variant is the enum's
+    /// largest, so its room is every chat message's: 176 bytes on 64-bit
+    /// targets before the refusal, the audio reference and the function call
+    /// were kept, 272 with the two inline, and the history of four turns the
+    /// reader grows a vector to had left the allocator's 768-byte class for
+    /// the 1,280 one (eight turns the 1,536 for the 2,560) on every chat
+    /// request. Under 192 bytes a turn, both histories are back in their
+    /// class. A field that grows the turn past it needs its own read.
+    #[test]
+    fn an_assistant_turns_function_call_and_provider_extension_ride_behind_a_pointer_each() {
+        let message: ChatMessage =
+            serde_json::from_value(json!({"role": "assistant", "content": "Hello."}))
+                .expect("a plain assistant turn");
+        let ChatMessage::Assistant {
+            function_call, ext, ..
+        } = &message
+        else {
+            panic!("not an assistant turn");
+        };
+        assert_eq!(size_of_val(function_call), size_of::<usize>());
+        assert_eq!(size_of_val(&ext.tools), size_of::<usize>());
+        assert!(
+            size_of::<ChatMessage>() <= 192,
+            "a chat message is {} bytes",
+            size_of::<ChatMessage>()
+        );
     }
 }
 

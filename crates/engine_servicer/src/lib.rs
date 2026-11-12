@@ -26,6 +26,7 @@
 //! already passes, on a listener of their own.
 
 mod admin;
+mod choice;
 mod embed;
 pub mod engine_hash;
 mod engine_link;
@@ -61,7 +62,8 @@ use std::{pin::Pin, time::Duration};
 
 pub use engine_zmq_adapter::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncodeRelease, EncoderDispatchErrorReq, SglangEncodeDispatcher,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq,
+    SglangEncodeDispatcher,
 };
 pub use error::ServicerError;
 use futures::Stream;

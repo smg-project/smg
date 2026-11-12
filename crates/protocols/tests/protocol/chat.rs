@@ -245,3 +245,127 @@ fn the_schema_keeps_reasoning_content_on_the_assistant_message() {
     assert!(!properties.contains_key("reasoning"), "{properties:?}");
     assert!(!properties.contains_key("text"), "{properties:?}");
 }
+
+/// A replayed assistant turn keeps its refusal, its audio reference and its
+/// deprecated function call when the request is written back for an upstream.
+/// The crate dropped all three while reading the message, so a provider
+/// received a refused turn as a bare `{"role": "assistant"}`.
+#[test]
+fn an_assistant_turns_refusal_audio_and_function_call_are_written_back() {
+    let turn = json!({
+        "role": "assistant",
+        "content": null,
+        "refusal": "I can't help with that.",
+        "audio": {"id": "audio_abc123"},
+        "function_call": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+    });
+    let request = request(vec![
+        json!({"role": "user", "content": "What is the weather in Paris?"}),
+        turn.clone(),
+        json!({"role": "function", "name": "get_weather", "content": "18C"}),
+    ])
+    .unwrap();
+    request.validate().unwrap();
+
+    let ChatMessage::Assistant {
+        refusal,
+        audio,
+        function_call,
+        ..
+    } = &request.messages[1]
+    else {
+        panic!("not an assistant message");
+    };
+    assert_eq!(refusal.as_deref(), Some("I can't help with that."));
+    assert_eq!(
+        audio.as_ref().map(|audio| audio.id.as_str()),
+        Some("audio_abc123")
+    );
+    assert_eq!(
+        function_call.as_ref().map(|call| call.name.as_str()),
+        Some("get_weather")
+    );
+
+    let written = &serde_json::to_value(&request).unwrap()["messages"][1];
+    for key in ["refusal", "audio", "function_call"] {
+        assert_eq!(written[key], turn[key], "{key}");
+    }
+}
+
+/// The public API requires an audio reference's id and a function call's
+/// name: a turn that carries either without it is refused while the request
+/// is read, where the crate used to drop the key unread.
+#[test]
+fn an_audio_reference_without_its_id_or_a_function_call_without_its_name_is_refused() {
+    for (turn, missing) in [
+        (json!({"audio": {}}), "`id`"),
+        (json!({"function_call": {"arguments": "{}"}}), "`name`"),
+    ] {
+        let error = request(vec![
+            json!({"role": "user", "content": "hi"}),
+            assistant(turn.clone()),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(missing), "{turn}: {error}");
+    }
+}
+
+/// An assistant turn without them is written back as before: none of the
+/// three keys appears, not even as a null.
+#[test]
+fn an_assistant_turn_without_them_is_written_back_unchanged() {
+    let request = request(vec![
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "Hello."}),
+    ])
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&request).unwrap()["messages"][1],
+        json!({"role": "assistant", "content": "Hello."})
+    );
+}
+
+/// The published schema names the three fields on the assistant message, so
+/// the generated clients can send them.
+#[test]
+fn the_schema_carries_the_assistant_turns_refusal_audio_and_function_call() {
+    let schema = serde_json::to_value(schemars::schema_for!(ChatCompletionRequest)).unwrap();
+    let mut assistants = Vec::new();
+    message_schemas(&schema, "assistant", &mut assistants);
+    assert_eq!(assistants.len(), 1, "{schema}");
+    let properties = assistants[0]["properties"].as_object().unwrap();
+    for key in ["refusal", "audio", "function_call"] {
+        assert!(properties.contains_key(key), "{key}: {properties:?}");
+    }
+}
+
+/// A `json_schema` response format keeps its description when the request is
+/// written back for an upstream; the crate dropped it while reading the
+/// format. Without one, the format is written as before.
+#[test]
+fn a_json_schema_response_formats_description_is_written_back() {
+    let with = json!({"type": "json_schema", "json_schema": {
+        "name": "city", "description": "A city and its country.",
+        "schema": {"type": "object"}, "strict": true
+    }});
+    let mut without = with.clone();
+    without["json_schema"]
+        .as_object_mut()
+        .unwrap()
+        .remove("description");
+    for format in [with, without] {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Name a city."}],
+            "response_format": format.clone()
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        assert!(!request.other.contains_key("response_format"));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["response_format"],
+            format
+        );
+    }
+}

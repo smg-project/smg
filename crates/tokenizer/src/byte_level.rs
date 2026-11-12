@@ -14,10 +14,10 @@
 //! the window's already-emitted prefix always consists of complete
 //! sequences, so the lossy decode of the pending bytes alone is the text the
 //! reference would emit: the same pieces at the same tokens, and over a
-//! whole stream exactly `decode(all_ids)`, except at the end: the pending
-//! buffer holds at most the bytes since the last emission, normally one
-//! partial character, and the stream's end releases it as `decode` renders
-//! the same bytes minus a character the end cut short (see `cut_start`).
+//! whole stream exactly `decode(all_ids)`: the pending buffer holds at most
+//! the bytes since the last emission, normally one partial character, and
+//! the stream's end releases it as `decode` renders the same bytes, a
+//! character the end cut short as one replacement character.
 
 use std::{
     borrow::Cow,
@@ -28,7 +28,10 @@ use std::{
 use anyhow::{anyhow, Result};
 use tokenizers::{decoders::DecoderWrapper, Tokenizer as HfTokenizer};
 
-use crate::traits::{IncrementalDecoder, TokenIdType};
+use crate::{
+    traits::{IncrementalDecoder, TokenIdType},
+    word_cache::{token_of, Listing},
+};
 
 /// Highest code point in the byte-level alphabet plus one (the 68 bytes that
 /// are not printable Latin-1 map to U+0100..=U+0143).
@@ -128,6 +131,25 @@ fn span(start: usize, end: usize) -> (u32, u32) {
     (start as u32, end as u32)
 }
 
+/// The largest id of the vocabulary, added tokens included: the model's as
+/// the file's one-pass read saw it, against the added tokens' own; through
+/// the whole vocabulary (a clone of its map and every token) only where no
+/// read gave it, a model built in memory say.
+pub(crate) fn max_token_id(tokenizer: &HfTokenizer, model_max_id: Option<u32>) -> Option<u32> {
+    match model_max_id {
+        Some(model) => {
+            let added = tokenizer
+                .get_added_vocabulary()
+                .get_added_tokens_decoder()
+                .keys()
+                .copied()
+                .max();
+            Some(added.map_or(model, |added| added.max(model)))
+        }
+        None => tokenizer.get_vocab(true).values().copied().max(),
+    }
+}
+
 /// Builds a [`ByteLevelTable`] one id at a time, from 0 up.
 pub(crate) struct ByteLevelTableBuilder {
     spans: Vec<(u32, u32)>,
@@ -216,16 +238,26 @@ pub(crate) fn decoder_kind(decoder: Option<&DecoderWrapper>) -> String {
 impl ByteLevelTable {
     /// `None` unless the tokenizer decodes with a plain `ByteLevel` decoder.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
+        Self::build_with_max_id(tokenizer, None, None)
+    }
+
+    /// [`Self::build`] with the model's largest id as the file's read saw
+    /// it, when it did (see [`max_token_id`]).
+    pub(crate) fn build_with_max_id(
+        tokenizer: &HfTokenizer,
+        model_max_id: Option<u32>,
+        listing: Option<&Listing>,
+    ) -> Option<Arc<Self>> {
         if !matches!(tokenizer.get_decoder(), Some(DecoderWrapper::ByteLevel(_))) {
             return None;
         }
-        let max_id = tokenizer.get_vocab(true).values().copied().max()?;
+        let max_id = max_token_id(tokenizer, model_max_id)?;
         let count = max_id as usize + 1;
         let added = tokenizer.get_added_vocabulary();
         let mut table = ByteLevelTableBuilder::with_capacity(count);
         let mut bytes = Vec::new();
         for id in 0..count {
-            match tokenizer.id_to_token(id as u32) {
+            match token_of(tokenizer, listing, id as u32) {
                 Some(token) => {
                     bytes.clear();
                     push_token_bytes(&token, &mut bytes);
@@ -458,8 +490,9 @@ fn settled(text: &str) -> bool {
 /// before it render as `String::from_utf8_lossy` renders them, a complete
 /// character as it is and an invalid sequence (a stray byte the model wrote)
 /// as the replacement character; the bytes from it on are the start of a
-/// character the model never finished, and a stream's end releases nothing
-/// for them.
+/// character the model never finished, which a byte-level stream's end
+/// renders as one replacement character, as `decode` does, and which a
+/// ByteFallback vocabulary's window counts to keep off its end.
 pub(crate) fn cut_start(bytes: &[u8]) -> usize {
     let mut index = 0;
     while index < bytes.len() {
@@ -542,14 +575,11 @@ impl IncrementalDecoder for ByteLevelIncremental {
         // The emitted text ends at a character boundary, so the pending
         // bytes alone are the tail `decode` renders for the whole stream:
         // the complete characters among them as they are, an invalid
-        // sequence as the replacement character. A sequence the end cut
-        // short is left out: it is the start of a character the model never
-        // finished, and a replacement character for it would be ours.
-        let kept = &self.pending[..cut_start(&self.pending)];
-        let released = !kept.is_empty();
-        out.push_str(&String::from_utf8_lossy(kept));
+        // sequence and a sequence the end cut short (the start of a
+        // character the model never finished) as the replacement character.
+        out.push_str(&String::from_utf8_lossy(&self.pending));
         self.pending.clear();
-        Ok(released)
+        Ok(true)
     }
 
     fn reset(&mut self) {
@@ -575,6 +605,48 @@ pub(crate) mod tests {
 
     pub(crate) const SPECIAL: &str = "<|im_end|>";
     const ADDED: &str = "<tool>";
+
+    /// The lookup the decode tables take agrees with `id_to_token` on
+    /// every id, with the read's listing and without it: an added token
+    /// first, then the model's token; and the table built from the
+    /// listing is the table built from the model.
+    #[test]
+    fn the_token_lookup_and_the_table_agree_with_and_without_the_listing() {
+        use crate::word_cache::{token_of, Listing};
+        let mut tokenizer = byte_level_tokenizer();
+        tokenizer
+            .add_tokens([AddedToken::from(ADDED, false)])
+            .expect("add token");
+        let vocab: Vocab = tokenizer.get_vocab(false).into_iter().collect();
+        let listing = Listing::of(&vocab).expect("a dense vocabulary lists");
+        assert_eq!(listing.len() as usize, vocab.len());
+        let model_max_id = Some(listing.len() - 1);
+        let max_id = max_token_id(&tokenizer, model_max_id).expect("ids");
+        assert!(
+            max_id >= listing.len(),
+            "the added tokens sit past the model's ids"
+        );
+        for id in 0..=max_id + 1 {
+            let expected = tokenizer.id_to_token(id);
+            assert_eq!(
+                token_of(&tokenizer, Some(&listing), id).as_deref(),
+                expected.as_deref(),
+                "id {id} with the listing"
+            );
+            assert_eq!(
+                token_of(&tokenizer, None, id).as_deref(),
+                expected.as_deref(),
+                "id {id} without it"
+            );
+        }
+        let listed = ByteLevelTable::build_with_max_id(&tokenizer, model_max_id, Some(&listing))
+            .expect("a byte-level table");
+        let swept = ByteLevelTable::build_with_max_id(&tokenizer, model_max_id, None)
+            .expect("a byte-level table");
+        for id in 0..=max_id + 1 {
+            assert_eq!(listed.token_bytes(id), swept.token_bytes(id), "id {id}");
+        }
+    }
 
     fn alphabet() -> Vec<char> {
         let mut chars: Vec<(u8, char)> = CHAR_BYTES
@@ -975,6 +1047,42 @@ pub(crate) mod tests {
         dec.step(c3).expect("step");
         dec.reset();
         assert!(dec.pending().is_empty());
+    }
+
+    /// A character the end of the stream cut short, two, three and four
+    /// bytes long, and a lone continuation byte: the end renders each as
+    /// `decode` renders the same ids, one replacement character after the
+    /// text before it, and holds the bytes until then.
+    #[test]
+    fn the_end_renders_a_cut_character_as_decode_does() {
+        let tokenizer = byte_level_tokenizer();
+        let table = ByteLevelTable::build(&tokenizer).expect("table");
+        let id = |token: &str| tokenizer.token_to_id(token).expect("token");
+        let h = id("h");
+        let cases: [(Vec<u32>, &str); 4] = [
+            (vec![h, id("Ã")], "h\u{FFFD}"),
+            (vec![h, id("Ġà"), id("¤")], "h \u{FFFD}"),
+            (vec![h, id("ðŁ"), id(&byte_token(0x98))], "h\u{FFFD}"),
+            (vec![h, id("©")], "h\u{FFFD}"),
+        ];
+        for (ids, text) in cases {
+            let mut dec = ByteLevelIncremental::new(Arc::clone(&table), false, UnknownId::Drop);
+            let mut out = String::new();
+            for &id in &ids {
+                dec.step_into(id, &mut out).expect("step");
+            }
+            assert_eq!(out, "h", "{ids:?}: the cut bytes are held");
+            assert!(dec.finish_into(&mut out).expect("finish"));
+            assert_eq!(out, text, "{ids:?}");
+            assert_eq!(
+                out,
+                tokenizer.decode(&ids, false).expect("decode"),
+                "{ids:?}: as decode renders the ids"
+            );
+            assert!(dec.pending().is_empty());
+            assert!(!dec.finish_into(&mut out).expect("a second finish"));
+            assert_eq!(out, text);
+        }
     }
 
     /// The three piece-timing shapes the reference fixtures exercise, each

@@ -99,6 +99,11 @@ pub struct RouterConfig {
     /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
     pub pd_pairing_mode: PdPairingMode,
+    /// Which implementation decides worker selection (`--policy-engine`):
+    /// the policies over worker handles, or the policy engine over its
+    /// bounded view. The switch of the migration and its rollback.
+    #[serde(default)]
+    pub policy_engine: PolicyEngineMode,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -123,7 +128,10 @@ pub struct RouterConfig {
     /// counted in the same `smg_http_connections_rejected_total`. `0` is no
     /// bound. The bound is the admin listener's own, so the control plane
     /// stays reachable while the data plane is saturated, and a client that
-    /// reaches the admin listener cannot hold it open without limit.
+    /// reaches the admin listener cannot hold it open without limit. Needs
+    /// `admin_port` (the validator refuses the bound without it). Probes on
+    /// the admin port fall under the bound like any connection;
+    /// `health_check_port` is the listener no bound covers.
     #[serde(default)]
     pub admin_max_connections: usize,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
@@ -1205,6 +1213,30 @@ pub enum ManualAssignmentMode {
     Delegate,
 }
 
+/// Which implementation decides worker selection (`--policy-engine`): the
+/// policies over worker handles, or the policy engine over its bounded
+/// view. `legacy` until the migration flips the default; the flag is the
+/// rollback. Under `engine` the validator refuses a policy whose stages the
+/// engine does not carry in this build.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyEngineMode {
+    #[default]
+    Legacy,
+    Engine,
+}
+
+impl PolicyEngineMode {
+    /// Parse the CLI spelling (`legacy` / `engine`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Some(Self::Legacy),
+            "engine" => Some(Self::Engine),
+            _ => None,
+        }
+    }
+}
+
 /// How strictly PD placement pairs a prefill with a decode on their KV
 /// transfer protocol (#2483). A descriptor component an engine does not report
 /// is "unknown".
@@ -2169,6 +2201,7 @@ impl Default for RouterConfig {
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
             pd_pairing_mode: PdPairingMode::default(),
+            policy_engine: PolicyEngineMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             pd_readiness: None,
@@ -2335,19 +2368,6 @@ impl RouterConfig {
         self.discovery.is_some()
     }
 
-    /// Check if metrics are enabled
-    pub fn has_metrics(&self) -> bool {
-        self.metrics.is_some()
-    }
-
-    /// Check if tracing is enabled
-    pub fn has_tracing(&self) -> bool {
-        match &self.trace_config {
-            Some(trace_config) => trace_config.enable_trace,
-            None => false,
-        }
-    }
-
     pub fn effective_prefill_queue_size(&self) -> usize {
         self.prefill_queue_size
             .unwrap_or(DEFAULT_PREFILL_QUEUE_SIZE)
@@ -2380,6 +2400,28 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The switch reads the CLI's two spellings, any case, and nothing else;
+    /// a configuration without the field is the legacy path.
+    #[test]
+    fn policy_engine_mode_parses_its_two_spellings_and_defaults_to_legacy() {
+        assert_eq!(
+            PolicyEngineMode::parse("engine"),
+            Some(PolicyEngineMode::Engine)
+        );
+        assert_eq!(
+            PolicyEngineMode::parse(" Legacy "),
+            Some(PolicyEngineMode::Legacy)
+        );
+        assert_eq!(PolicyEngineMode::parse("remote"), None);
+        assert_eq!(
+            RouterConfig::default().policy_engine,
+            PolicyEngineMode::Legacy
+        );
+        let parsed: RouterConfig =
+            serde_json::from_value(serde_json::to_value(RouterConfig::default()).unwrap()).unwrap();
+        assert_eq!(parsed.policy_engine, PolicyEngineMode::Legacy);
+    }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is
     /// never written there, the rest of the derive's form is kept.
@@ -3712,28 +3754,6 @@ discovery:
     }
 
     #[test]
-    fn test_has_metrics() {
-        let config = RouterConfig::default();
-        assert!(!config.has_metrics());
-
-        let config = RouterConfig::builder()
-            .metrics_config(MetricsConfig::default())
-            .build_unchecked();
-        assert!(config.has_metrics());
-    }
-
-    #[test]
-    fn test_has_tracing() {
-        let config = RouterConfig::default();
-        assert!(!config.has_tracing());
-
-        let config = RouterConfig::builder()
-            .enable_trace("localhost:4317")
-            .build_unchecked();
-        assert!(config.has_tracing());
-    }
-
-    #[test]
     fn test_large_worker_lists() {
         let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{i}")).collect();
 
@@ -3829,8 +3849,11 @@ discovery:
         assert_eq!(config.mode.worker_count(), 4);
         assert_eq!(config.policy.name(), "power_of_two");
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
     }
 
     #[test]
@@ -3871,8 +3894,11 @@ discovery:
         assert_eq!(config.mode.worker_count(), 3);
         assert_eq!(config.policy.name(), "cache_aware");
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
     }
 
     #[test]
@@ -3917,8 +3943,11 @@ discovery:
             .build_unchecked();
 
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
         assert_eq!(config.mode_type(), "regular");
 
         let json = serde_json::to_string_pretty(&config).unwrap();

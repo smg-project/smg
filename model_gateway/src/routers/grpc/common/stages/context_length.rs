@@ -241,7 +241,7 @@ fn enforce_output(max_tokens: Option<u32>, limit: u32, model_id: &str) -> Result
 /// advertises one. A disaggregated prompt must fit both the prefill and the
 /// decode engine, so the smaller window governs. Encode workers process media,
 /// not the token prompt, and are not consulted.
-fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u32> {
+pub(crate) fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u32> {
     match workers {
         WorkerSelection::Single { worker } => worker.context_length(model_id),
         WorkerSelection::Disaggregated {

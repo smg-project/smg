@@ -14,16 +14,16 @@ use std::{
     },
 };
 
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{BoxedTraceInjector, NoopTraceInjector};
+use crate::{channel::Channel, BoxedTraceInjector, NoopTraceInjector};
 
 /// Process-global cache of connected channels, keyed by encode-worker endpoint.
 ///
 /// The EPD encode stage dispatches one `Encode` RPC per image per request, so
 /// without pooling every call paid a fresh TCP + HTTP/2 (+ TLS) handshake on the
-/// request's critical path. A `tonic::Channel` is cheap to clone and multiplexes
+/// request's critical path. A [`Channel`] is cheap to clone and multiplexes
 /// concurrent RPCs over a single HTTP/2 connection, so we reuse one channel per
 /// endpoint — the same connection reuse the prefill/decode sides already get from
 /// their cached per-worker client.

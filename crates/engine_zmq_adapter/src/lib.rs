@@ -59,7 +59,8 @@ pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
 pub use sglang_encode::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncodeRelease, EncoderDispatchErrorReq, SglangEncodeDispatcher,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq,
+    SglangEncodeDispatcher,
 };
 pub use sglang_mm_hash::SglangCpuMmHasher;
 pub use sockets::{zmq_handshake_address, Handshake};
@@ -70,7 +71,8 @@ pub use structured_outputs::{
 };
 pub use tokenspeed::{
     qwen35_lineage, to_tokenspeed_response, translate_encode_request, EncodeRendezvous,
-    GridTensors, MropeLayout, TokenSpeedGenerateStream,
+    GridTensors, MropeLayout, OmniLayout, PositionFacts, PositionRule, RuleFamily,
+    TokenSpeedGenerateStream,
 };
 pub use trtllm::{to_trtllm_response, TrtllmGenerateStream};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};

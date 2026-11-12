@@ -12,10 +12,20 @@ use std::{
 };
 
 use engine_zmq_client::mock_engine::MOCK_DEADLINE;
+use smg_grpc_client::common_proto::KvEventBatch;
 use tokio::time::timeout;
+use tonic::Streaming;
 use tracing_subscriber::EnvFilter;
 
 use crate::{kv_events::KvEventRelay, ServicerConfig};
+
+/// The handshake endpoint of one test: an IPC socket under its own
+/// directory. A probed TCP port is not reserved, so two tests running in
+/// parallel could pick the same one and a mock engine would handshake with
+/// the other test's servicer and wait forever for its INIT.
+pub(crate) fn handshake_address(dir: &Path) -> String {
+    format!("ipc://{}", dir.join("handshake").display())
+}
 
 /// The servicer configuration every servicer test starts from: an ephemeral
 /// port, the engine's data-plane sockets under the test's own directory,
@@ -274,6 +284,24 @@ pub(crate) async fn bound_publisher() -> (zeromq::PubSocket, String) {
             .to_string(),
     );
     (publisher, format!("tcp://*:{port}"))
+}
+
+/// The stream's next batch within five seconds (the reads' own deadline, not
+/// the mock engine's): a timeout, a status or a closed stream fails the test
+/// at the reading line.
+#[track_caller]
+pub(crate) fn next_batch(
+    stream: &mut Streaming<KvEventBatch>,
+) -> impl Future<Output = KvEventBatch> + '_ {
+    let caller = Location::caller();
+    async move {
+        match timeout(Duration::from_secs(5), stream.message()).await {
+            Ok(Ok(Some(batch))) => batch,
+            Ok(Ok(None)) => panic!("{caller}: the stream closed before a batch"),
+            Ok(Err(status)) => panic!("{caller}: the stream failed: {status}"),
+            Err(_) => panic!("{caller}: no batch within five seconds"),
+        }
+    }
 }
 
 /// The first two batches of a publisher the relay subscribed to at boot,

@@ -5,7 +5,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -156,8 +159,9 @@ impl Default for JobQueueConfig {
 
 /// Job queue manager for worker validation and removal operations
 pub struct JobQueue {
-    /// Channel for submitting jobs
-    tx: mpsc::Sender<Job>,
+    /// Channel for submitting jobs, each with the id of the waiter for its
+    /// outcome when a caller waits on it
+    tx: mpsc::Sender<Queued>,
     /// Weak reference to AppContext to avoid circular dependencies
     context: Weak<AppContext>,
     /// Job status tracking by worker URL
@@ -167,10 +171,47 @@ pub struct JobQueue {
     /// The waiters of [`Self::submit_and_wait`], by job key: a job's outcome
     /// is handed to its waiter when the job ends.
     outcomes: Outcomes,
+    /// The next waiter's id: what tells a caller's waiter from a later one
+    /// under the same key.
+    next_waiter_id: AtomicU64,
+}
+
+/// A job handed to the dispatcher with the id of the waiter for its outcome,
+/// when a caller waits on it: the outcome goes to that waiter alone, never to
+/// a later caller's under the same key.
+struct Queued {
+    job: Job,
+    waiter: Option<u64>,
+}
+
+/// The caller waiting on a job's outcome under the job's key, one per key
+/// at a time; `id` is the caller's own, so a caller leaving takes its own
+/// entry alone.
+struct Waiter {
+    id: u64,
+    sender: oneshot::Sender<Result<String, String>>,
 }
 
 /// The waiters for a job's outcome, by job key.
-type Outcomes = Arc<DashMap<String, oneshot::Sender<Result<String, String>>>>;
+type Outcomes = Arc<DashMap<String, Waiter>>;
+
+/// Removes the caller's waiter when the caller leaves
+/// [`JobQueue::submit_and_wait`] by any path: a submit refused, a wait
+/// cancelled while the queue is full, a timeout, or the outcome delivered
+/// (which removed it already). The entry goes only while it is still this
+/// caller's, so a later waiter under the same key stays.
+struct WaiterSlot {
+    outcomes: Outcomes,
+    key: String,
+    id: u64,
+}
+
+impl Drop for WaiterSlot {
+    fn drop(&mut self) {
+        self.outcomes
+            .remove_if(&self.key, |_, waiter| waiter.id == self.id);
+    }
+}
 
 /// Why [`JobQueue::submit_and_wait`] returned no success message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +222,9 @@ pub enum JobOutcomeError {
     Failed(String),
     /// The job did not end within the wait; it keeps running.
     TimedOut(Duration),
+    /// A caller is waiting on a job under this key already: the job runs
+    /// once and its outcome goes to that caller.
+    InFlight(String),
 }
 
 impl std::fmt::Display for JobOutcomeError {
@@ -189,6 +233,7 @@ impl std::fmt::Display for JobOutcomeError {
             Self::NotQueued(reason) => write!(f, "Failed to submit job: {reason}"),
             Self::Failed(reason) => f.write_str(reason),
             Self::TimedOut(wait) => write!(f, "Job timeout after {}s", wait.as_secs()),
+            Self::InFlight(key) => write!(f, "A job for {key} is in flight; wait for its outcome"),
         }
     }
 }
@@ -226,6 +271,7 @@ impl JobQueue {
             status_map: status_map.clone(),
             concurrency_limit: concurrency_limit.clone(),
             outcomes: outcomes.clone(),
+            next_waiter_id: AtomicU64::new(1),
         });
 
         // Single dispatcher task
@@ -239,7 +285,7 @@ impl JobQueue {
             reason = "Core job dispatcher loop: runs for the lifetime of the gateway and drains cleanly when the channel sender is dropped on shutdown"
         )]
         tokio::spawn(async move {
-            while let Some(job) = rx.recv().await {
+            while let Some(queued) = rx.recv().await {
                 // Acquire permit (blocks if at concurrency limit)
                 let Ok(permit) = sem.clone().acquire_owned().await else {
                     error!("Semaphore closed, stopping dispatcher");
@@ -255,7 +301,7 @@ impl JobQueue {
                     reason = "Job processing task: bounded by the semaphore permit which is dropped when the task completes"
                 )]
                 tokio::spawn(async move {
-                    Self::process_job(job, ctx_clone, status_clone, waiters_clone, permit).await;
+                    Self::process_job(queued, ctx_clone, status_clone, waiters_clone, permit).await;
                 });
             }
 
@@ -292,7 +338,7 @@ impl JobQueue {
         if !Self::claim(&self.status_map, &worker_url, job_type) {
             return Ok(false);
         }
-        self.submit_inner(job, true)
+        self.submit_inner(job, true, None)
             .await
             .map(|()| true)
             .inspect_err(|_| {
@@ -336,7 +382,7 @@ impl JobQueue {
         if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
             return Ok(false);
         }
-        self.submit_inner(job, true)
+        self.submit_inner(job, true, None)
             .await
             .map(|()| true)
             .inspect_err(|_| {
@@ -366,15 +412,21 @@ impl JobQueue {
 
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
-        self.submit_inner(job, false).await
+        self.submit_inner(job, false, None).await
     }
 
     /// `submit`, with the pending status written over this job's own claim
     /// alone when `claimed` ([`Self::submit_if_idle`],
     /// [`Self::submit_unless_in_flight`]): a job of another type that took the
     /// URL during the wait for a slot keeps its entry, where a plain submission
-    /// writes its own over whatever is there.
-    async fn submit_inner(&self, job: Job, claimed: bool) -> Result<(), String> {
+    /// writes its own over whatever is there. `waiter` is the id of the caller
+    /// waiting on the outcome, [`Self::submit_and_wait`]'s own; none otherwise.
+    async fn submit_inner(
+        &self,
+        job: Job,
+        claimed: bool,
+        waiter: Option<u64>,
+    ) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
         let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
@@ -410,7 +462,7 @@ impl JobQueue {
         if let Some(model) = &tokenizer_load {
             context.tokenizer_load_failures.load_started(model);
         }
-        permit.send(job);
+        permit.send(Queued { job, waiter });
 
         let (queue_depth, available_permits) = self.get_load_info();
         debug!(
@@ -434,9 +486,22 @@ impl JobQueue {
     ) -> Result<String, JobOutcomeError> {
         let key = job.worker_url().to_string();
         let (tx, rx) = oneshot::channel();
-        self.outcomes.insert(key.clone(), tx);
-        if let Err(reason) = self.submit(job).await {
-            self.outcomes.remove(&key);
+        let id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
+        // One waiter per key: a second caller for a job in flight is refused,
+        // not handed the first caller's outcome (and the first its loss).
+        match self.outcomes.entry(key.clone()) {
+            Entry::Occupied(_) => return Err(JobOutcomeError::InFlight(key)),
+            Entry::Vacant(entry) => {
+                entry.insert(Waiter { id, sender: tx });
+            }
+        }
+        // The waiter leaves with the caller, whichever way the caller leaves.
+        let _slot = WaiterSlot {
+            outcomes: Arc::clone(&self.outcomes),
+            key,
+            id,
+        };
+        if let Err(reason) = self.submit_inner(job, false, Some(id)).await {
             return Err(JobOutcomeError::NotQueued(reason));
         }
         match tokio::time::timeout(timeout, rx).await {
@@ -445,18 +510,23 @@ impl JobQueue {
             Ok(Err(_)) => Err(JobOutcomeError::Failed(
                 "the job ended without an outcome".to_string(),
             )),
-            Err(_) => {
-                self.outcomes.remove(&key);
-                Err(JobOutcomeError::TimedOut(timeout))
-            }
+            Err(_) => Err(JobOutcomeError::TimedOut(timeout)),
         }
     }
 
-    /// Hands a finished job's outcome to the waiter under its key, if any;
-    /// a waiter that gave up (its receiver dropped) is a no-op.
-    fn deliver_outcome(outcomes: &Outcomes, key: &str, outcome: Result<String, String>) {
-        if let Some((_, waiter)) = outcomes.remove(key) {
-            let _ = waiter.send(outcome);
+    /// Hands a finished job's outcome to the waiter the job was queued for,
+    /// while that waiter is still under the key. A job queued without a
+    /// waiter, or whose waiter left and a later caller took the key, delivers
+    /// nothing; a waiter that gave up (its receiver dropped) is a no-op.
+    fn deliver_outcome(
+        outcomes: &Outcomes,
+        key: &str,
+        waiter: Option<u64>,
+        outcome: Result<String, String>,
+    ) {
+        let Some(id) = waiter else { return };
+        if let Some((_, waiter)) = outcomes.remove_if(key, |_, waiter| waiter.id == id) {
+            let _ = waiter.sender.send(outcome);
         }
     }
 
@@ -472,12 +542,13 @@ impl JobQueue {
 
     /// Process a single job with status tracking and error handling
     async fn process_job(
-        job: Job,
+        queued: Queued,
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
         outcomes: Outcomes,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
+        let Queued { job, waiter } = queued;
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
         let start = std::time::Instant::now();
@@ -524,7 +595,7 @@ impl JobQueue {
                     ctx.worker_registry.release_reservation(&worker_url);
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
-                Self::deliver_outcome(&outcomes, &worker_url, result);
+                Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
@@ -532,7 +603,7 @@ impl JobQueue {
                     worker_url.clone(),
                     JobStatus::failed(job_type, &worker_url, error_msg.clone()),
                 );
-                Self::deliver_outcome(&outcomes, &worker_url, Err(error_msg));
+                Self::deliver_outcome(&outcomes, &worker_url, waiter, Err(error_msg));
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
                     job_type,
@@ -1196,6 +1267,7 @@ fn build_external_worker_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm::{WasmModuleDescriptor, WasmModuleType};
 
     /// A job line writes a worker's address masked and a non-address name as
     /// it is; a job type the list does not name counts as a worker's, so a
@@ -1227,16 +1299,152 @@ mod tests {
         }
     }
 
+    /// A wasm module job's key is the uuid the submitter assigned (the
+    /// registration) or named (the removal): the in-flight claim, the status
+    /// entry and the outcome waiter hang on it, so a second submission for
+    /// one uuid is refused while the first runs, and the answer names the
+    /// module the job registered.
+    #[test]
+    fn a_wasm_module_jobs_key_is_the_module_uuid() {
+        let module_uuid = uuid::Uuid::now_v7();
+        let descriptor = WasmModuleDescriptor {
+            name: "twin".to_string(),
+            file_path: "/tmp/twin.wasm".to_string(),
+            module_type: WasmModuleType::Middleware,
+            attach_points: Vec::new(),
+            add_result: None,
+        };
+        let registration = Job::AddWasmModule {
+            config: Box::new(WasmModuleConfigRequest::new(descriptor, module_uuid)),
+        };
+        assert_eq!(registration.worker_url(), module_uuid.to_string());
+        let removal = Job::RemoveWasmModule {
+            request: Box::new(WasmModuleRemovalRequest::new(module_uuid)),
+        };
+        assert_eq!(removal.worker_url(), module_uuid.to_string());
+    }
+
+    /// A caller's waiter leaves with the caller: the slot removes the entry
+    /// under its key while the entry is still this caller's, and leaves a
+    /// later caller's waiter under the same key alone.
+    #[test]
+    fn a_waiter_slot_removes_its_own_waiter_alone() {
+        let outcomes: Outcomes = Arc::new(DashMap::new());
+        let (first, _first_rx) = oneshot::channel();
+        outcomes.insert(
+            "job-1".to_string(),
+            Waiter {
+                id: 1,
+                sender: first,
+            },
+        );
+        drop(WaiterSlot {
+            outcomes: Arc::clone(&outcomes),
+            key: "job-1".to_string(),
+            id: 1,
+        });
+        assert!(outcomes.is_empty(), "the caller's own waiter goes with it");
+
+        let (later, _later_rx) = oneshot::channel();
+        outcomes.insert(
+            "job-1".to_string(),
+            Waiter {
+                id: 2,
+                sender: later,
+            },
+        );
+        drop(WaiterSlot {
+            outcomes: Arc::clone(&outcomes),
+            key: "job-1".to_string(),
+            id: 1,
+        });
+        assert_eq!(
+            outcomes.get("job-1").map(|waiter| waiter.id),
+            Some(2),
+            "a later waiter under the key stays"
+        );
+    }
+
+    /// A second caller for a job in flight is refused and the first keeps
+    /// its waiter, so the outcome reaches the caller that submitted the job.
+    #[tokio::test]
+    async fn a_second_waiter_under_a_held_key_is_refused_and_the_first_kept() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let key = "http://worker:8000".to_string();
+        let (first, first_rx) = oneshot::channel();
+        queue.outcomes.insert(
+            key.clone(),
+            Waiter {
+                id: 1,
+                sender: first,
+            },
+        );
+        let second = queue
+            .submit_and_wait(
+                Job::RefreshWorkerLabels { url: key.clone() },
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(second, Err(JobOutcomeError::InFlight(key.clone())));
+        assert_eq!(queue.outcomes.get(&key).map(|waiter| waiter.id), Some(1));
+        JobQueue::deliver_outcome(&queue.outcomes, &key, Some(1), Ok("done".to_string()));
+        assert!(matches!(first_rx.await, Ok(Ok(ref message)) if message == "done"));
+    }
+
+    /// A submit the queue refuses leaves no waiter behind.
+    #[tokio::test]
+    async fn a_refused_submit_leaves_no_waiter() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let refused = queue
+            .submit_and_wait(
+                Job::RefreshWorkerLabels {
+                    url: "http://worker:8000".to_string(),
+                },
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(refused, Err(JobOutcomeError::NotQueued(_))));
+        assert!(
+            queue.outcomes.is_empty(),
+            "a refused submit leaves no waiter"
+        );
+    }
+
     /// A finished job's outcome reaches the waiter under its key once, and
     /// the waiter is gone; a key without a waiter is a no-op.
     #[tokio::test]
     async fn an_outcome_reaches_its_waiter_once() {
         let outcomes: Outcomes = Arc::new(DashMap::new());
         let (tx, rx) = oneshot::channel();
-        outcomes.insert("job-1".to_string(), tx);
-        JobQueue::deliver_outcome(&outcomes, "job-2", Ok("stray".to_string()));
-        JobQueue::deliver_outcome(&outcomes, "job-1", Ok("done".to_string()));
+        outcomes.insert("job-1".to_string(), Waiter { id: 1, sender: tx });
+        JobQueue::deliver_outcome(&outcomes, "job-2", Some(1), Ok("stray".to_string()));
+        JobQueue::deliver_outcome(&outcomes, "job-1", Some(1), Ok("done".to_string()));
         assert!(matches!(rx.await, Ok(Ok(ref message)) if message == "done"));
+        assert!(outcomes.is_empty());
+    }
+
+    /// A job's outcome goes to the waiter it was queued for alone: after that
+    /// waiter left and a later caller took the key, the late outcome reaches
+    /// nobody, and a job queued without a waiter delivers nothing.
+    #[tokio::test]
+    async fn a_late_outcome_does_not_reach_a_later_waiter() {
+        let outcomes: Outcomes = Arc::new(DashMap::new());
+        let (tx, mut rx) = oneshot::channel();
+        outcomes.insert("job-1".to_string(), Waiter { id: 2, sender: tx });
+        JobQueue::deliver_outcome(
+            &outcomes,
+            "job-1",
+            Some(1),
+            Ok("the first job's".to_string()),
+        );
+        JobQueue::deliver_outcome(&outcomes, "job-1", None, Ok("a plain submit's".to_string()));
+        assert_eq!(outcomes.get("job-1").map(|waiter| waiter.id), Some(2));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        JobQueue::deliver_outcome(&outcomes, "job-1", Some(2), Ok("its own".to_string()));
+        assert!(matches!(rx.await, Ok(Ok(ref message)) if message == "its own"));
         assert!(outcomes.is_empty());
     }
 

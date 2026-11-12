@@ -272,9 +272,10 @@ impl WordArena {
         self.word(table).load(Ordering::Relaxed) as u32 as usize
     }
 
-    /// The child continuing with `head`, as `(run, generation)`.
+    /// Live entries of a table (`NONE` has none). Every table keeps its live
+    /// count in the word after its header, a window's child table and a run's
+    /// partials table alike, so both kinds are read here.
     #[inline]
-    /// Live entries of a child table (`NONE` has none).
     pub(super) fn table_live(&self, table: u32) -> usize {
         if table == NONE {
             0
@@ -283,6 +284,7 @@ impl WordArena {
         }
     }
 
+    /// The child continuing with `head`, as `(run, generation)`.
     pub(super) fn table_find(&self, table: u32, head: u64) -> Option<(u32, u32)> {
         if table == NONE {
             return None;
@@ -535,14 +537,6 @@ impl WordArena {
     pub(super) fn partials_shape(&self, table: u32) -> (usize, usize) {
         let header = self.word(table).load(Ordering::Relaxed);
         (header as u32 as usize, (header >> 32) as usize)
-    }
-
-    pub(super) fn partials_live(&self, table: u32) -> usize {
-        if table == NONE {
-            0
-        } else {
-            self.word(table + 1).load(Ordering::Relaxed) as usize
-        }
     }
 
     /// Live `(worker, cutoff)` entries, in slot order.

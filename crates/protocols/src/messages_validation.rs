@@ -29,8 +29,8 @@ use validator::ValidationError;
 use crate::{
     common::invalid,
     messages::{
-        CreateMessageRequest, InputContent, InputContentBlock, InputMessage, Role, ThinkingConfig,
-        Tool,
+        CreateMessageRequest, InputContent, InputContentBlock, InputMessage, MessageThread, Role,
+        ThinkingConfig, Tool,
     },
 };
 
@@ -47,7 +47,7 @@ const PASSTHROUGH_CUSTOM_TOOL_FIELDS: &[&str] = &[
 pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError> {
     validate_sampling(req)?;
     validate_message_contents(&req.messages)?;
-    validate_tool_pairing(&req.messages)?;
+    validate_thread(req)?;
     validate_stop_sequences(req.stop_sequences.as_deref())?;
     validate_tools(req.tools.as_deref())?;
     validate_output_format(req)?;
@@ -95,6 +95,30 @@ fn validate_sampling(req: &CreateMessageRequest) -> Result<(), ValidationError> 
         ));
     }
     Ok(())
+}
+
+/// A `continue` request carries the messages since the answer it continues
+/// and nothing the thread keeps from its create request: `system` and
+/// `tools` are refused, as the public API refuses them. Its tool pairing is
+/// judged on the conversation the gateway rebuilds (a `tool_result` that
+/// opens the request answers the stored answer's `tool_use`); every other
+/// request's pairing is judged here.
+fn validate_thread(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    if !matches!(req.thread, Some(MessageThread::Continue { .. })) {
+        return validate_tool_pairing(&req.messages);
+    }
+    let kept = match (req.system.is_some(), req.tools.is_some()) {
+        (false, false) => return Ok(()),
+        (true, false) => "system",
+        (false, true) => "tools",
+        (true, true) => "system or tools",
+    };
+    Err(invalid(
+        "thread_continue_carries_create_fields",
+        format!(
+            "thread: a continue request sends no {kept}: the thread keeps the create request's"
+        ),
+    ))
 }
 
 fn role_name(role: &Role) -> &'static str {
@@ -455,7 +479,10 @@ mod tests {
     }
 
     use super::*;
-    use crate::sampling_params::{validate_top_k_value, validate_top_p_value};
+    use crate::{
+        messages::CountMessageTokensRequest,
+        sampling_params::{validate_top_k_value, validate_top_p_value},
+    };
 
     #[test]
     fn sampling_parameters_take_the_public_range() {
@@ -784,5 +811,85 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    /// The `thread` field reads the public shapes: a create, a continue
+    /// naming its previous message (one without it is refused as the
+    /// field's deserializer refuses a missing field).
+    #[test]
+    fn the_thread_field_reads_the_public_shapes() {
+        assert_eq!(
+            request(json!({"thread": {"type": "create"}})).thread,
+            Some(MessageThread::Create)
+        );
+        assert_eq!(
+            request(json!({"thread": {"type": "continue", "previous_message_id": "msg_1"}})).thread,
+            Some(MessageThread::Continue {
+                previous_message_id: "msg_1".to_string()
+            })
+        );
+        let body = json!({
+            "model": "m", "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thread": {"type": "continue"}
+        });
+        let refused = serde_json::from_value::<CreateMessageRequest>(body)
+            .expect_err("a continue names its previous message")
+            .to_string();
+        assert!(refused.contains("previous_message_id"), "{refused}");
+    }
+
+    /// A continue request sends the messages since the answer it continues,
+    /// not the `system` or `tools` the thread keeps; its tool pairing waits
+    /// for the rebuilt conversation, every other request's is judged here.
+    #[test]
+    fn a_continue_request_sends_no_system_or_tools() {
+        let cont = json!({"type": "continue", "previous_message_id": "msg_1"});
+        accepted(json!({"thread": cont}));
+        assert!(rejection(json!({"thread": cont, "system": "be brief"}))
+            .contains("thread: a continue request sends no system:"));
+        let tools = json!([{"name": "f", "input_schema": {"type": "object"}}]);
+        assert!(rejection(json!({"thread": cont, "tools": tools}))
+            .contains("thread: a continue request sends no tools:"));
+        assert!(
+            rejection(json!({"thread": cont, "system": "be brief", "tools": tools}))
+                .contains("thread: a continue request sends no system or tools:")
+        );
+        let result_first = json!([{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "42"}
+        ]}]);
+        accepted(json!({"thread": cont, "messages": result_first}));
+        // The fixed fields a continue request repeats include `tool_choice`,
+        // judged against the thread's tools once the conversation is rebuilt.
+        accepted(json!({"thread": cont, "tool_choice": {"type": "tool", "name": "f"}}));
+        assert!(
+            rejection(json!({"tool_choice": {"type": "tool", "name": "f"}}))
+                .contains("'tool_choice' is only allowed when 'tools' are specified")
+        );
+        assert!(
+            rejection(json!({"thread": {"type": "create"}, "messages": result_first}))
+                .contains("unexpected `tool_use_id`")
+        );
+        assert!(rejection(json!({"messages": result_first})).contains("unexpected `tool_use_id`"));
+    }
+
+    /// A count reads the whole conversation: `thread` is refused there.
+    #[test]
+    fn a_count_takes_no_thread() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thread": {"type": "create"}
+        });
+        let request: CountMessageTokensRequest =
+            serde_json::from_value(body).expect("a well-formed count request");
+        let refused = request
+            .validate()
+            .expect_err("a count takes no thread")
+            .to_string();
+        assert!(
+            refused.contains("thread: count_tokens takes no thread"),
+            "{refused}"
+        );
     }
 }

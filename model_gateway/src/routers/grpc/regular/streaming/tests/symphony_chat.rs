@@ -531,6 +531,69 @@ const CUT_CALL_TAILS: [(&str, &str); 2] = [
     ),
 ];
 
+/// A streamed call the token limit cut: the stream finishes `length` with the call's name and
+/// `arguments`, its bytes as the model wrote them, and nothing of the call as content; the
+/// arguments as streamed, for a check of their shape.
+async fn streamed_cut_call_keeps_its_bytes(
+    responses: Vec<proto::GenerateResponse>,
+    spec: ChatResponseSpec,
+    output: &str,
+    arguments: &str,
+) -> String {
+    let (result, events) = stream_events(responses, true, spec).await;
+    assert!(result.is_ok(), "{output:?}: {result:?}");
+    let calls = tool_call_deltas(&events);
+    assert_eq!(
+        calls[0]["function"]["name"], "lookup",
+        "{output:?}: {events:#?}"
+    );
+    let streamed: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+    assert_eq!(
+        chat_text(&events, 0, "content"),
+        "",
+        "nothing of the call is content: {output:?}: {events:#?}"
+    );
+    let finish = events
+        .iter()
+        .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .expect("a finish chunk");
+    assert_eq!(finish, "length", "{output:?}");
+    streamed
+}
+
+/// A whole call the token limit cut, folded over `format` after `prompt`: the choice finishes
+/// `length` with the call's name and `arguments`, its bytes as the model wrote them, and nothing
+/// of the call as content.
+async fn whole_cut_call_keeps_its_bytes(
+    output: &str,
+    arguments: &str,
+    format: Format,
+    prompt: &str,
+) {
+    let (choice, _) = fold_finished(output, format, prompt, "length").await;
+    let calls = choice.message.tool_calls.as_ref().expect("the call");
+    assert_eq!(calls.len(), 1, "{output:?}");
+    assert_eq!(calls[0].function.name, "lookup");
+    assert_eq!(
+        calls[0].function.arguments.as_deref(),
+        Some(arguments),
+        "{output:?}: {choice:?}"
+    );
+    assert_eq!(
+        choice.message.content, None,
+        "nothing of the call is content: {output:?}: {choice:?}"
+    );
+    assert_eq!(
+        choice.finish_reason.as_deref(),
+        Some("length"),
+        "{output:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (tail, arguments) in CUT_CALL_TAILS {
@@ -545,28 +608,7 @@ async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_fin
             chunk(0, &output[inside..]),
             complete(0, "length"),
         ];
-        let (result, events) = stream_events(responses, true, spec).await;
-        assert!(result.is_ok(), "{tail:?}: {result:?}");
-        let calls = tool_call_deltas(&events);
-        assert_eq!(
-            calls[0]["function"]["name"], "lookup",
-            "{tail:?}: {events:#?}"
-        );
-        let streamed: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        assert_eq!(streamed, arguments, "{tail:?}: {events:#?}");
-        assert_eq!(
-            chat_text(&events, 0, "content"),
-            "",
-            "nothing of the call is content: {tail:?}: {events:#?}"
-        );
-        let finish = events
-            .iter()
-            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
-            .expect("a finish chunk");
-        assert_eq!(finish, "length", "{tail:?}");
+        streamed_cut_call_keeps_its_bytes(responses, spec, &output, arguments).await;
     }
 }
 
@@ -574,20 +616,7 @@ async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_fin
 async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (tail, arguments) in CUT_CALL_TAILS {
         let output = format!("{CUT_CALL_PREFIX}{tail}");
-        let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length").await;
-        let calls = choice.message.tool_calls.as_ref().expect("the call");
-        assert_eq!(calls.len(), 1, "{tail:?}");
-        assert_eq!(calls[0].function.name, "lookup");
-        assert_eq!(
-            calls[0].function.arguments.as_deref(),
-            Some(arguments),
-            "{tail:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.message.content, None,
-            "nothing of the call is content: {tail:?}: {choice:?}"
-        );
-        assert_eq!(choice.finish_reason.as_deref(), Some("length"), "{tail:?}");
+        whole_cut_call_keeps_its_bytes(&output, arguments, deepseek_v4_1(), "<think>").await;
     }
 }
 
@@ -681,6 +710,8 @@ pub(super) fn assigned_message(
 ) -> MessagesResponseSpec {
     MessagesResponseSpec {
         prompt_tokens: 0,
+        max_tokens: 4096,
+        context_window: None,
         first_tool_call_only: false,
         thinking_requested: thinking,
         thinking_text_returned: true,
@@ -879,13 +910,22 @@ async fn two_symphony_messages_never_share_a_tool_use_id() {
 
 #[tokio::test]
 async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() {
-    // The token limit.
-    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The token limit: the five tokens are the whole budget.
+    let mut spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    spec.max_tokens = 5;
     let (result, events) =
         message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(message_blocks(&events)[0].2, "Hello");
     assert_eq!(message_stop_reason(&events), "max_tokens");
+    // The same cut short of the budget: the window was filled.
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let (_, events) =
+        message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
+    assert_eq!(
+        message_stop_reason(&events),
+        "model_context_window_exceeded"
+    );
     // The turn's end.
     let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
     let (_, events) =
@@ -2061,28 +2101,7 @@ async fn a_streamed_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_cal
             chunk(0, &output[output.len() - 2..]),
             complete(0, "length"),
         ];
-        let (result, events) = stream_events(responses, true, spec).await;
-        assert!(result.is_ok(), "{output:?}: {result:?}");
-        let calls = tool_call_deltas(&events);
-        assert_eq!(
-            calls[0]["function"]["name"], "lookup",
-            "{output:?}: {events:#?}"
-        );
-        let streamed: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
-        assert_eq!(
-            chat_text(&events, 0, "content"),
-            "",
-            "nothing of the call is content: {output:?}: {events:#?}"
-        );
-        let finish = events
-            .iter()
-            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
-            .expect("a finish chunk");
-        assert_eq!(finish, "length", "{output:?}");
+        streamed_cut_call_keeps_its_bytes(responses, spec, output, arguments).await;
     }
 }
 
@@ -2090,24 +2109,7 @@ async fn a_streamed_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_cal
 async fn a_whole_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length()
 {
     for (output, arguments) in PYTHONIC_CUT_CALLS {
-        let (choice, _) = fold_finished(output, llama4(), PYTHONIC_PROMPT, "length").await;
-        let calls = choice.message.tool_calls.as_ref().expect("the call");
-        assert_eq!(calls.len(), 1, "{output:?}");
-        assert_eq!(calls[0].function.name, "lookup");
-        assert_eq!(
-            calls[0].function.arguments.as_deref(),
-            Some(arguments),
-            "{output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.message.content, None,
-            "nothing of the call is content: {output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.finish_reason.as_deref(),
-            Some("length"),
-            "{output:?}"
-        );
+        whole_cut_call_keeps_its_bytes(output, arguments, llama4(), PYTHONIC_PROMPT).await;
     }
 }
 
@@ -2141,56 +2143,18 @@ async fn a_streamed_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_a
             chunk(0, &output[output.len() - 1..]),
             complete(0, "length"),
         ];
-        let (result, events) = stream_events(responses, true, spec).await;
-        assert!(result.is_ok(), "{output:?}: {result:?}");
-        let calls = tool_call_deltas(&events);
-        assert_eq!(
-            calls[0]["function"]["name"], "lookup",
-            "{output:?}: {events:#?}"
-        );
-        let streamed: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+        let streamed = streamed_cut_call_keeps_its_bytes(responses, spec, output, arguments).await;
         assert!(
             serde_json::from_str::<Value>(&streamed).is_err(),
             "the arguments stay cut: {streamed:?}"
         );
-        assert_eq!(
-            chat_text(&events, 0, "content"),
-            "",
-            "nothing of the call is content: {output:?}: {events:#?}"
-        );
-        let finish = events
-            .iter()
-            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
-            .expect("a finish chunk");
-        assert_eq!(finish, "length", "{output:?}");
     }
 }
 
 #[tokio::test]
 async fn a_whole_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (output, arguments) in GEMMA_CUT_CALLS {
-        let (choice, _) = fold_finished(output, gemma4(), GEMMA_PROMPT, "length").await;
-        let calls = choice.message.tool_calls.as_ref().expect("the call");
-        assert_eq!(calls.len(), 1, "{output:?}");
-        assert_eq!(calls[0].function.name, "lookup");
-        assert_eq!(
-            calls[0].function.arguments.as_deref(),
-            Some(arguments),
-            "{output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.message.content, None,
-            "nothing of the call is content: {output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.finish_reason.as_deref(),
-            Some("length"),
-            "{output:?}"
-        );
+        whole_cut_call_keeps_its_bytes(output, arguments, gemma4(), GEMMA_PROMPT).await;
     }
 }
 
@@ -2227,52 +2191,14 @@ async fn a_streamed_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_a
             chunk(0, &output[output.len() - 2..]),
             complete(0, "length"),
         ];
-        let (result, events) = stream_events(responses, true, spec).await;
-        assert!(result.is_ok(), "{output:?}: {result:?}");
-        let calls = tool_call_deltas(&events);
-        assert_eq!(
-            calls[0]["function"]["name"], "lookup",
-            "{output:?}: {events:#?}"
-        );
-        let streamed: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
-        assert_eq!(
-            chat_text(&events, 0, "content"),
-            "",
-            "nothing of the call is content: {output:?}: {events:#?}"
-        );
-        let finish = events
-            .iter()
-            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
-            .expect("a finish chunk");
-        assert_eq!(finish, "length", "{output:?}");
+        streamed_cut_call_keeps_its_bytes(responses, spec, output, arguments).await;
     }
 }
 
 #[tokio::test]
 async fn a_whole_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (output, arguments) in KEYED_CUT_CALLS {
-        let (choice, _) = fold_finished(output, glm4(), KEYED_PROMPT, "length").await;
-        let calls = choice.message.tool_calls.as_ref().expect("the call");
-        assert_eq!(calls.len(), 1, "{output:?}");
-        assert_eq!(calls[0].function.name, "lookup");
-        assert_eq!(
-            calls[0].function.arguments.as_deref(),
-            Some(arguments),
-            "{output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.message.content, None,
-            "nothing of the call is content: {output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.finish_reason.as_deref(),
-            Some("length"),
-            "{output:?}"
-        );
+        whole_cut_call_keeps_its_bytes(output, arguments, glm4(), KEYED_PROMPT).await;
     }
 }
 

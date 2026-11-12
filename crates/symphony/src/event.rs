@@ -726,30 +726,39 @@ mod tests {
         assert_eq!(reasoning_text_tokens(&[]), 0);
     }
 
-    #[test]
-    fn forbidden_calls_drops_every_call_and_the_finish_counts_none() {
-        let call = |index: u32| {
-            [
-                Event::ToolCallStart {
-                    index,
-                    id: format!("call_{index}"),
-                    name: "f".to_string(),
-                    source: Text::uncounted("<"),
-                },
-                Event::ToolCallArguments {
-                    index,
-                    json: "{}".into(),
-                    source: Text::uncounted("{}"),
-                },
-                Event::ToolCallEnd {
-                    index,
-                    source: Text::uncounted(">"),
-                },
-            ]
-        };
+    /// A whole call at `index`: its opener, its arguments and its closer, each one run of
+    /// uncounted source bytes.
+    fn call(index: u32) -> [Event<'static>; 3] {
+        [
+            Event::ToolCallStart {
+                index,
+                id: format!("call_{index}"),
+                name: "f".to_string(),
+                source: Text::uncounted("<"),
+            },
+            Event::ToolCallArguments {
+                index,
+                json: "{}".into(),
+                source: Text::uncounted("{}"),
+            },
+            Event::ToolCallEnd {
+                index,
+                source: Text::uncounted(">"),
+            },
+        ]
+    }
+
+    /// Content, then two whole calls: what the passes that drop calls start from.
+    fn content_then_two_calls() -> Vec<Event<'static>> {
         let mut events = vec![Event::Content(Text::uncounted("x"))];
         events.extend(call(0));
         events.extend(call(1));
+        events
+    }
+
+    #[test]
+    fn forbidden_calls_drops_every_call_and_the_finish_counts_none() {
+        let mut events = content_then_two_calls();
         events.push(Event::Finish {
             reason: FinishReason::ToolCalls,
             tool_calls: 2,
@@ -812,28 +821,7 @@ mod tests {
 
     #[test]
     fn first_call_only_keeps_the_first_call_and_caps_the_finish() {
-        let call = |index: u32| {
-            [
-                Event::ToolCallStart {
-                    index,
-                    id: format!("call_{index}"),
-                    name: "f".to_string(),
-                    source: Text::uncounted("<"),
-                },
-                Event::ToolCallArguments {
-                    index,
-                    json: "{}".into(),
-                    source: Text::uncounted("{}"),
-                },
-                Event::ToolCallEnd {
-                    index,
-                    source: Text::uncounted(">"),
-                },
-            ]
-        };
-        let mut events = vec![Event::Content(Text::uncounted("x"))];
-        events.extend(call(0));
-        events.extend(call(1));
+        let mut events = content_then_two_calls();
         events.push(Event::Finish {
             reason: FinishReason::ToolCalls,
             tool_calls: 2,

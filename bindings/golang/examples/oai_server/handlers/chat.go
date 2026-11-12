@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	smg "github.com/lightseek/smg/go-grpc-sdk"
+	smg "github.com/smg-project/smg/bindings/golang"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 

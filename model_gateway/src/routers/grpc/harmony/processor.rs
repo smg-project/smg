@@ -218,7 +218,8 @@ impl HarmonyResponseProcessor {
         // The usage from the engine's counters, built as the streamed answer
         // builds its usage chunk: with the reasoning tokens the parser
         // counted and every detail counter present as the OpenAI API sends it.
-        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let counts =
+            response_formatting::TokenCounts::of_collected(&all_responses, chat_request.choices());
         let usage = chat_usage(counts, total_reasoning_tokens);
 
         // Final ChatCompletionResponse
@@ -470,7 +471,7 @@ mod tests {
             cached: 0,
             reasoning,
             spec_accepted: 0,
-            spec_drafted: 0,
+            spec_drafted: Some(0),
         }
     }
 

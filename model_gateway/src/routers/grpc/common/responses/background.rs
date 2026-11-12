@@ -42,8 +42,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
+    response::Response,
 };
 use futures::{future::BoxFuture, FutureExt};
 use openai_protocol::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse};
@@ -60,6 +59,7 @@ use tracing::{debug, info, warn};
 use super::ResponsesContext;
 use crate::routers::{
     common::{
+        json_response,
         persistence_utils::{self, build_stored_response, extract_input_items},
         sse::{sse_channel, SseSender},
     },
@@ -1049,7 +1049,7 @@ async fn cancel_with(
                         response_id,
                         "Background response closed as cancelled; no task runs it on this gateway"
                     );
-                    (StatusCode::OK, Json(raw)).into_response()
+                    json_response(&raw)
                 }
                 Ok(Transition::Terminal(raw)) => answer_for_closed(raw),
                 Ok(Transition::Missing) => error::not_found(
@@ -1098,7 +1098,7 @@ fn response_not_found(id: &str) -> Response {
 /// the `cancelled` object, or the refusal its status earns.
 fn answer_for_closed(raw: Value) -> Response {
     match raw["status"].as_str().unwrap_or("unknown") {
-        "cancelled" => (StatusCode::OK, Json(raw)).into_response(),
+        "cancelled" => json_response(&raw),
         "completed" | "incomplete" => error::bad_request(
             "response_already_completed",
             "Cannot cancel completed response",
@@ -1115,6 +1115,7 @@ fn answer_for_closed(raw: Value) -> Response {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use axum::response::IntoResponse;
     use smg_data_connector::{MemoryResponseStorage, ResponseStorageError};
     use tokio::sync::oneshot;
 
@@ -1206,6 +1207,33 @@ mod tests {
             Ok(())
         };
         (work, dropped_rx)
+    }
+
+    /// Delete `id`'s record while `run` works under the watch: the run ends
+    /// within five seconds, its work is dropped (`dropped_rx` fires), nothing
+    /// is written under the deleted id and `registry` holds nothing in flight.
+    async fn the_delete_ends_the_run(
+        storage: &Arc<dyn ResponseStorage>,
+        id: &str,
+        run: tokio::task::JoinHandle<()>,
+        dropped_rx: oneshot::Receiver<()>,
+        registry: &BackgroundResponses,
+    ) {
+        storage
+            .delete_response(&ResponseId::from(id))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the run ends once its record is gone")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert_eq!(
+            stored_raw(storage, id).await,
+            Value::Null,
+            "nothing is written under the deleted {id}"
+        );
+        assert_eq!(registry.in_flight(), 0);
     }
 
     /// A memory store that counts its writes.
@@ -1831,21 +1859,7 @@ mod tests {
             Duration::from_millis(10),
         ));
         wait_for_status(&storage, "resp_1", "in_progress").await;
-        storage
-            .delete_response(&ResponseId::from("resp_1"))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("the run ends once its record is gone")
-            .unwrap();
-        dropped_rx.await.expect("the work was dropped");
-        assert_eq!(
-            stored_raw(&storage, "resp_1").await,
-            Value::Null,
-            "nothing is written under the deleted id"
-        );
-        assert_eq!(registry.in_flight(), 0);
+        the_delete_ends_the_run(&storage, "resp_1", task, dropped_rx, &registry).await;
     }
 
     /// A store that never shows the record (no history backend, or a record
@@ -1905,21 +1919,7 @@ mod tests {
             "the watch read the record: {} calls",
             flaky.calls()
         );
-        storage
-            .delete_response(&ResponseId::from("resp_1"))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("the run ends once its record is gone")
-            .unwrap();
-        dropped_rx.await.expect("the work was dropped");
-        assert_eq!(
-            stored_raw(&storage, "resp_1").await,
-            Value::Null,
-            "nothing is written under the deleted id"
-        );
-        assert_eq!(registry.in_flight(), 0);
+        the_delete_ends_the_run(&storage, "resp_1", task, dropped_rx, &registry).await;
     }
 
     /// The guard of the terminal persist is the conditional write: an open

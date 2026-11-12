@@ -1,0 +1,125 @@
+name: Benchmark - Policy Engine
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/benchmark-policy-engine.yml'
+      - '.github/bench-gates/policy-engine.toml'
+      - 'scripts/bench_gate.py'
+      - 'crates/policy_controller/Cargo.toml'
+      - 'crates/policy_controller/benches/decision.rs'
+      - 'crates/policy_controller/src/**'
+      - '!crates/policy_controller/src/**/tests/**'
+      - '!crates/policy_controller/src/**/*_test.rs'
+  pull_request:
+    branches: [ main, release/** ]
+    paths:
+      - '.github/workflows/benchmark-policy-engine.yml'
+      - '.github/bench-gates/policy-engine.toml'
+      - 'scripts/bench_gate.py'
+      - 'crates/policy_controller/Cargo.toml'
+      - 'crates/policy_controller/benches/decision.rs'
+      - 'crates/policy_controller/src/**'
+      - '!crates/policy_controller/src/**/tests/**'
+      - '!crates/policy_controller/src/**/*_test.rs'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
+
+concurrency:
+  group: benchmark-policy-engine-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Policy Engine (decision)
+    if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # Every bench binary of this job, the gate's pair and the summary run's,
+      # places every function on a 64-byte boundary, so a pull request's code
+      # size does not move the unchanged hot functions into another placement
+      # class (the two speed states of identical code described in
+      # .github/bench-gates/policy-engine.toml). RUSTFLAGS replaces the list in
+      # .cargo/config.toml, so the outliner flag is repeated here.
+      RUSTFLAGS: -C llvm-args=-enable-machine-outliner=never -C llvm-args=-align-all-functions=6
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 100
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      # A pull request is gated: its bench binary and the base branch's (the merge
+      # commit's first parent) are built in this checkout, run interleaved on this
+      # runner and compared id by id by scripts/bench_gate.py against the thresholds
+      # in .github/bench-gates/policy-engine.toml; the job fails on a gated regression.
+      # A push to main keeps the single summary run.
+      # The base's binary is built with the pull request's bench sources (the gate
+      # file's `sources`), so the two differ in the measured code alone.
+      - name: Build the pull request's benchmark
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 40
+        run: |
+          source "$HOME/.cargo/env"
+          mkdir -p "$RUNNER_TEMP/bench-gate"
+          cp scripts/bench_gate.py .github/bench-gates/policy-engine.toml "$RUNNER_TEMP/bench-gate/"
+          python3 scripts/bench_gate.py build --gates .github/bench-gates/policy-engine.toml \
+            --out "$RUNNER_TEMP/bench-gate/pr" -- \
+            cargo bench -p smg-policy-controller --bench decision --no-run
+
+      - name: Build the base branch's benchmark
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 40
+        run: |
+          source "$HOME/.cargo/env"
+          head=$(git rev-parse HEAD)
+          git -c advice.detachedHead=false checkout --quiet "$(git rev-parse HEAD^1)"
+          python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --gates "$RUNNER_TEMP/bench-gate/policy-engine.toml" \
+            --sources-from "$head" --out "$RUNNER_TEMP/bench-gate/base" -- \
+            cargo bench -p smg-policy-controller --bench decision --no-run
+          git checkout --quiet "$head"
+
+      - name: Run the benchmark gate
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 40
+        run: |
+          set -o pipefail
+          python3 scripts/bench_gate.py run --gates .github/bench-gates/policy-engine.toml \
+            --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
+            --cwd crates/policy_controller --out bench-gate 2>&1 | tee benchmark_output.txt
+
+      - name: Run benchmark
+        if: github.event_name != 'pull_request'
+        timeout-minutes: 40
+        run: |
+          source "$HOME/.cargo/env"
+          set -o pipefail
+          cargo bench -p smg-policy-controller --bench decision 2>&1 | tee benchmark_output.txt
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: policy-engine-results-${{ github.sha }}
+          path: |
+            target/criterion/policy_engine*/
+            benchmark_output.txt
+            bench-gate/
+          retention-days: 30
+
+      - name: Summary
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          echo "## Policy Engine Benchmark (decision)" >> $GITHUB_STEP_SUMMARY
+          if [ -f benchmark_output.txt ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -100 benchmark_output.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

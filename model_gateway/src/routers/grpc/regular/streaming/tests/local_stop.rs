@@ -395,6 +395,9 @@ async fn mock_engine_worker(step_ms: f64) -> (String, JoinHandle<()>) {
         },
         ..mock_worker::config::Config::default()
     });
+    // A port an earlier test's engine served on keeps that engine's
+    // overrides; this engine starts from fresh ones.
+    mock_worker::overrides::fresh_for_port(port);
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
     (format!("http://127.0.0.1:{port}"), server)
 }

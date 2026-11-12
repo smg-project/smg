@@ -166,6 +166,40 @@ fn a_refusal_part_reaches_the_template_as_the_turns_text() {
     );
 }
 
+/// A replayed turn's refusal, audio reference and deprecated function call stay
+/// out of the template's messages, as the engines' own chat utils leave them
+/// out: the template gets the same turn as it would without them.
+#[test]
+fn a_replayed_refusal_audio_and_function_call_stay_out_of_the_template() {
+    let with: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "Let me look.",
+         "refusal": "I can't share that.",
+         "audio": {"id": "audio_abc123"},
+         "function_call": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+        {"role": "assistant", "content": null, "refusal": "I can't help with that."},
+        {"role": "function", "name": "get_weather", "content": "18C"}
+    ]))
+    .unwrap();
+    let without: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "Let me look."},
+        {"role": "assistant", "content": null},
+        {"role": "function", "name": "get_weather", "content": "18C"}
+    ]))
+    .unwrap();
+    for format in [
+        ChatTemplateContentFormat::String,
+        ChatTemplateContentFormat::OpenAI,
+    ] {
+        assert_eq!(
+            process_content_format(&with, format, None).unwrap(),
+            process_content_format(&without, format, None).unwrap(),
+            "{format:?}"
+        );
+    }
+}
+
 #[test]
 fn test_transform_messages_string_format() {
     let messages = vec![ChatMessage::User {
