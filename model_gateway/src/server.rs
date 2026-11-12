@@ -3360,6 +3360,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
             .allow_methods([
                 http::Method::GET,
                 http::Method::POST,
+                http::Method::PUT,
                 http::Method::PATCH,
                 http::Method::DELETE,
                 http::Method::OPTIONS,
@@ -3367,18 +3368,22 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
             .allow_headers([
                 http::header::CONTENT_TYPE,
                 http::header::AUTHORIZATION,
+                http::header::IF_MATCH,
                 http::header::HeaderName::from_static("anthropic-version"),
                 http::header::HeaderName::from_static("anthropic-beta"),
                 http::header::HeaderName::from_static("traceparent"),
                 http::header::HeaderName::from_static("tracestate"),
             ])
-            // The request id under both of its names and the echoed trace
-            // context, readable by browser clients.
+            // The request id under both of its names, the echoed trace
+            // context, and the document routes' ETag and revision, readable
+            // by browser clients.
             .expose_headers([
                 http::header::HeaderName::from_static("x-request-id"),
                 http::header::HeaderName::from_static("request-id"),
                 http::header::HeaderName::from_static("traceparent"),
                 http::header::HeaderName::from_static("tracestate"),
+                http::header::ETAG,
+                rate_limit_document::REVISION_HEADER,
             ])
     };
 
@@ -3980,6 +3985,83 @@ mod tests {
             assert!(
                 exposed.split(',').any(|value| value.trim() == header),
                 "missing {header}"
+            );
+        }
+    }
+
+    /// A browser client under a named origin can replace the tenant
+    /// rate-limit document: the preflight allows `PUT` and `If-Match`, and
+    /// the answer's `ETag` and revision are readable.
+    #[tokio::test]
+    async fn configured_cors_allows_the_document_write() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/admin/v1/rate-limits/tenants",
+                axum::routing::put(|| async { StatusCode::OK }),
+            )
+            .layer(
+                create_cors_layer(vec!["https://client.example".into()])
+                    .expect("a configured origin list attaches the layer"),
+            );
+        let preflight = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/admin/v1/rate-limits/tenants")
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", "PUT")
+                    .header("access-control-request-headers", "content-type,if-match")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success());
+        let listed = |name: &str| {
+            preflight.headers()[name]
+                .to_str()
+                .unwrap()
+                .split(',')
+                .map(|value| value.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            listed("access-control-allow-methods")
+                .iter()
+                .any(|m| m == "put"),
+            "PUT is not allowed"
+        );
+        assert!(
+            listed("access-control-allow-headers")
+                .iter()
+                .any(|h| h == "if-match"),
+            "If-Match is not allowed"
+        );
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri("/admin/v1/rate-limits/tenants")
+                    .header("origin", "https://client.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let exposed = response.headers()["access-control-expose-headers"]
+            .to_str()
+            .unwrap();
+        for header in ["etag", "x-smg-config-revision"] {
+            assert!(
+                exposed
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case(header)),
+                "{header} is not exposed"
             );
         }
     }

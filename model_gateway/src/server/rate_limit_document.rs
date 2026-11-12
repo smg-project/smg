@@ -34,8 +34,9 @@ use crate::{
 /// root.
 const RESOURCE: &str = "rate-limits/tenants";
 
-/// The revision in force, beside `ETag` on every answer about the document.
-const REVISION_HEADER: HeaderName = HeaderName::from_static("x-smg-config-revision");
+/// The revision in force, beside `ETag` on every answer about the document;
+/// the named-origin CORS policy exposes both to browser clients.
+pub(super) const REVISION_HEADER: HeaderName = HeaderName::from_static("x-smg-config-revision");
 
 /// `?dry_run=true` on a write.
 #[derive(Deserialize)]
