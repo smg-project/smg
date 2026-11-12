@@ -508,7 +508,7 @@ async fn test_v1_messages_thread_store_follows_the_operator_memory_bounds() {
     let ctx = AppTestContext::new_with_config(
         config,
         vec![MockWorkerConfig {
-            port: 18307,
+            port: 18308,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
