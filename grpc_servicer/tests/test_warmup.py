@@ -1666,6 +1666,7 @@ def test_an_engine_that_runs_prefill_alone_keeps_the_media_step(level, ranks):
 
 
 def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypatch, caplog):
+    """Warmup preserves resolved server limits and the engine bootstrap sentinel."""
     args = SimpleNamespace(max_running_requests=64, chunked_prefill_size=8192, context_length=None)
     facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
     inputs = sglang_warmup.warmup_inputs(args, facts)
@@ -1690,11 +1691,9 @@ def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypa
     assert sglang_warmup.warmup_inputs(args, {**facts, "is_generation": False}) is None
     # A prefill or decode side plans as a single engine does, its requests
     # bound for nobody: the engine's own stand-in bootstrap host rides along.
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.disaggregation.utils",
-        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
-    )
+    from smg_grpc_servicer.sglang import compat
+
+    monkeypatch.setattr(compat, "get_disaggregation_types", lambda: (object, "2.2.2.2"))
     for role in ("prefill", "decode"):
         side = sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode=role), facts)
         assert side.lone_leg_bootstrap == "2.2.2.2"

@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import zmq
 
+from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
 from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
@@ -237,9 +238,12 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
         kv_used_tokens: int = 0,
         kv_total_tokens: int = 0,
         hidden_rows: list[list[list[float]] | None] | None = None,
+        output_adapter: SchedulerOutputAdapter | None = None,
     ) -> BatchTokenIDSlimOutput:
-        if out.output_ids is None:
-            raise ValueError("BatchTokenIDOutput.output_ids is required on the slim wire")
+        """Normalize engine rows onto the unchanged wire. Streaming callers must
+        reuse their socket adapter so sparse counts survive between batches."""
+        adapter = output_adapter if output_adapter is not None else SchedulerOutputAdapter()
+        rows, prompt_tokens, cached_tokens = adapter.read(out)
         count = len(out.rids or [])
 
         def column(values, default):
@@ -264,13 +268,13 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
 
         return cls(
             rids=list(out.rids or []),
-            output_ids=[list(ids) for ids in out.output_ids],
+            output_ids=rows,
             finished_reasons=[str((r or {}).get("type") or "") for r in reasons],
             finished_messages=[(r or {}).get("message") for r in reasons],
             finished_matched=[matched(r) for r in reasons],
-            prompt_tokens=column(out.prompt_tokens, 0),
+            prompt_tokens=prompt_tokens,
             completion_tokens=column(out.completion_tokens, 0),
-            cached_tokens=column(out.cached_tokens, 0),
+            cached_tokens=cached_tokens,
             output_token_logprobs_val=[
                 list(v or []) for v in column(out.output_token_logprobs_val, None)
             ],
@@ -402,6 +406,8 @@ class BatchEmbeddingSlimOutput(msgspec.Struct, tag=True, array_like=True):
     def from_full(
         cls, out: BatchEmbeddingOutput, *, engine_index: int = 0, **load
     ) -> BatchEmbeddingSlimOutput:
+        """Encode terminal embeddings with dense or sparse engine counts."""
+        prompt_tokens, cached_tokens = SchedulerOutputAdapter().read_usage(out)
         count = len(out.rids or [])
 
         def column(values, default):
@@ -435,8 +441,8 @@ class BatchEmbeddingSlimOutput(msgspec.Struct, tag=True, array_like=True):
         return cls(
             rids=list(out.rids or []),
             embeddings=embeddings,
-            prompt_tokens=column(out.prompt_tokens, 0),
-            cached_tokens=column(out.cached_tokens, 0),
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
             finished_reasons=reasons,
             finished_messages=messages,
             finished_status=statuses,
@@ -740,6 +746,7 @@ class MsgpackSendSocket:
     """
 
     def __init__(self, engine_index: int = 0) -> None:
+        """Own the transport and per-request tracing, hidden rows and counts."""
         self.socket: zmq.Socket | None = None
         self.engine_index = engine_index
         self._load_probe: Callable[[], LoadSnapshot] | None = None
@@ -753,6 +760,7 @@ class MsgpackSendSocket:
         # The elements of each request's cumulative hidden-state list already
         # consumed (the wire carries each output's new rows).
         self.hidden_rows = HiddenStateRows()
+        self.output_adapter = SchedulerOutputAdapter()
 
     def attach(
         self,
@@ -856,6 +864,7 @@ class MsgpackSendSocket:
                     output,
                     engine_index=self.engine_index,
                     hidden_rows=self.hidden_rows.column(output),
+                    output_adapter=self.output_adapter,
                     **self._load_tail(),
                 )
             )
@@ -905,6 +914,7 @@ class MsgpackSendSocket:
     def send_terminal_abort(self, rid: str, message: str, status: int | None = 400) -> None:
         """One request's terminal ``abort`` output with no tokens; a request
         this side refused is the client's error (400) unless told otherwise."""
+        self.output_adapter.forget(rid)
         self._send_slim(
             BatchTokenIDSlimOutput(
                 rids=[rid],
@@ -1231,11 +1241,11 @@ def request_layouts() -> dict[str, list[str]]:
         TokenizedEmbeddingReqInput,
         TokenizedGenerateReqInput,
     )
-    from sglang.srt.managers.schedule_batch import (
-        MultimodalDataItem,
-        MultimodalProcessorOutput,
-    )
     from sglang.srt.sampling.sampling_params import SamplingParams
+
+    from smg_grpc_servicer.sglang.compat import get_multimodal_types
+
+    _, MultimodalDataItem, MultimodalProcessorOutput = get_multimodal_types()
 
     return {
         cls.__name__: list(cls.__struct_fields__)

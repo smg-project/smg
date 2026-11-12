@@ -14,18 +14,17 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent import futures
+from traceback import format_exc as get_exception_traceback
 from typing import Any
 
 import grpc
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
-from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
@@ -38,6 +37,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     configuration_exit,
     guarded_exit,
 )
+from smg_grpc_servicer.sglang.compat import get_disaggregation_types
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
@@ -58,6 +58,8 @@ from smg_grpc_servicer.sglang.scheduler_watchdog import wait_for_scheduler_shutd
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
 from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
 from smg_grpc_servicer.warmup import parse_setting, plan_for, run_warmup
+
+DisaggregationMode, FAKE_BOOTSTRAP_HOST = get_disaggregation_types()
 
 logger = logging.getLogger(__name__)
 

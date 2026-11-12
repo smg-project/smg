@@ -14,8 +14,12 @@ servicer_mod = _servicer_fixture
 
 @pytest.fixture
 def health_probe(monkeypatch, servicer_mod):
+    """Create a health request with the same output-state ownership as a real manager."""
     manager_mod = sys.modules["smg_grpc_servicer.sglang.request_manager"]
     manager = manager_mod.GrpcRequestManager.__new__(manager_mod.GrpcRequestManager)
+    from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
+
+    manager.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     manager.gracefully_exit = False
     manager.is_pause = False
     manager.last_receive_tstamp = 0.0

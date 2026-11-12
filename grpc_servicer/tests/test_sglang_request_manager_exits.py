@@ -78,7 +78,7 @@ def manager(monkeypatch):
     scheduler."""
     exporter = InMemorySpanExporter()
     symbols = {
-        "sglang.srt.disaggregation.utils": "DisaggregationMode",
+        "sglang.srt.disaggregation.utils": "DisaggregationMode FAKE_BOOTSTRAP_HOST",
         "sglang.srt.managers.io_struct": (
             "AbortReq BatchEmbeddingOutput BatchTokenIDOutput FlushCacheReqOutput "
             "GetInternalStateReqOutput HealthCheckOutput ProfileReqOutput "
@@ -119,6 +119,9 @@ def manager(monkeypatch):
 
     sent: list = []
     rm = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
+    from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
+
+    rm.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     rm.rid_to_state = {}
     rm.metrics_collector = None  # added field from PR; test fixture only
     rm.disaggregation_mode = "null"
