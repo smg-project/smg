@@ -1764,7 +1764,7 @@ const GROUPS: &[Group] = &[
         model: "MiniMaxAI/MiniMax-H3-Image-PE",
         also: &[],
         released: "2026-11-08",
-        smg: (None, None),
+        smg: (Some("minimax_m2"), Some("minimax")),
         table: Some(Table::Qwen3Tagged),
         set: Some(28),
         status: Status::Replaying,
