@@ -817,6 +817,10 @@ impl RequestPipeline {
                             self.record_retries_exhausted(endpoint);
                         }
                     }
+                    // The last dispatch's record names the decision that
+                    // placed it; `run`'s refusal header replaces it only when
+                    // a later re-selection left selections of its own.
+                    Self::attach_cache_trace(&dctx, &mut failure);
                     return Err(failure);
                 };
 
@@ -861,13 +865,23 @@ impl RequestPipeline {
             .collect()
     }
 
+    /// The last dispatch's trace header on the response that answers it: the
+    /// served response, or the failure of the last attempt.
+    fn attach_cache_trace(ctx: &DispatchContext, response: &mut Response) {
+        if let Some(value) = ctx
+            .cache_trace
+            .as_deref()
+            .and_then(|trace| http::HeaderValue::from_str(trace).ok())
+        {
+            response
+                .headers_mut()
+                .insert(cache_trace::REQUEST_HEADER, value);
+        }
+    }
+
     /// Attribute a response to the worker from the successful dispatch attempt.
     fn routed_response(ctx: &DispatchContext, mut response: Response) -> Response {
-        if let Some(trace) = ctx.cache_trace.as_ref() {
-            if let Ok(value) = http::HeaderValue::from_str(trace) {
-                response.headers_mut().insert("x-smg-cache-trace", value);
-            }
-        }
+        Self::attach_cache_trace(ctx, &mut response);
         // Which parser read a chat completion, so a client comparing the two can tell.
         if let Some(parser) = ctx.parser {
             response.headers_mut().insert(

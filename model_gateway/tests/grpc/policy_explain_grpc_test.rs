@@ -18,15 +18,18 @@ use axum::{
 use openai_protocol::worker::WorkerStatus;
 use serde_json::{json, Value};
 use smg::{
-    config::{PolicyEngineMode, RoutingMode},
+    config::{PolicyEngineMode, RetryConfig, RoutingMode},
     worker::{RuntimeType, Worker, WorkerType},
 };
+use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
+use tonic::{Response, Status};
 use tower::ServiceExt;
 
 use crate::common::{
+    engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream},
     grpc_harness::{
         grpc_router, grpc_router_config, grpc_test_context, grpc_workers, serve_canned_worker,
-        Canned,
+        serve_engine, Canned,
     },
     test_app::create_test_app_with_context,
 };
@@ -203,4 +206,77 @@ async fn a_traced_shed_is_explained_by_the_id_its_refusal_names() {
         Some(0),
         "{record}"
     );
+}
+
+/// A worker whose every generation fails: the dispatch to it is refused.
+struct Refusing;
+
+#[tonic::async_trait]
+impl TokenSpeedAnswers for Refusing {
+    async fn generate(
+        &self,
+        _request: tonic::Request<ts::GenerateRequest>,
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
+        Err(Status::unavailable("every generation is refused"))
+    }
+}
+
+/// A request whose last dispatch attempt fails gets its decision named too:
+/// two workers refuse in turn, the retry ends on the second, and the refused
+/// response carries the trace header of that dispatch, whose id the explain
+/// route answers with the pick's record.
+#[tokio::test]
+async fn a_traced_dispatch_that_fails_is_explained_by_the_id_its_refusal_names() {
+    let (first, second) = (
+        serve_engine(Refusing.into_server()).await,
+        serve_engine(Refusing.into_server()).await,
+    );
+    let config = grpc_router_config()
+        .mode(RoutingMode::Regular {
+            worker_urls: vec![],
+        })
+        .round_robin_policy()
+        .policy_engine(PolicyEngineMode::Engine)
+        .retry_config(RetryConfig {
+            max_retries: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        })
+        .build_unchecked();
+    let app_context = grpc_test_context(config, MODEL).await;
+    let workers = grpc_workers(
+        &[(first, WorkerType::Regular), (second, WorkerType::Regular)],
+        RuntimeType::TokenSpeed,
+        MODEL,
+    );
+    let router = grpc_router(&app_context, workers).await;
+    let app = create_test_app_with_context(Arc::from(router), Arc::clone(&app_context));
+
+    let (status, header, body) = traced_request(&app).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let header = header.expect("a failed dispatch that asked for its record gets the trace header");
+    assert_eq!(
+        header["attempt"], 1,
+        "the last attempt's dispatch: {header}"
+    );
+    let selection = &header["selections"][0];
+    let worker = selection["worker"]
+        .as_str()
+        .expect("the record names the worker placed");
+    let prediction = &selection["prediction"];
+    assert_eq!(prediction["source"], "policy_engine", "{header}");
+    assert_eq!(prediction["outcome"], "pick", "{header}");
+    let id = prediction["decision_id"]
+        .as_u64()
+        .expect("the refusal names the decision id");
+
+    let (status, record) = explain(&app, &id.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_eq!(record["decision_id"], id);
+    assert_eq!(record["model"], MODEL);
+    assert_eq!(record["outcome"], "pick");
+    assert_eq!(record["stage"], "round-robin");
+    assert_eq!(record["targets"][0]["worker"], worker, "{record}");
 }

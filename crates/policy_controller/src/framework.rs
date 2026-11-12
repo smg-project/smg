@@ -805,8 +805,10 @@ impl Engine {
                 dp_rank: c.dp_rank,
                 pair: None,
             });
+            // The pin settled it: no picker ran.
             let mut trace = Trace {
                 profile: index,
+                stage: "sessions",
                 survivors: buf.kept.len() as u32,
                 seed: facts.seed,
                 generation: pool.generation,
@@ -905,10 +907,11 @@ impl Engine {
         };
         let mut targets = Targets::new();
         picker.pick(facts, candidates, kept, &buf.scores, band, &mut targets);
-        let trace = trace_of(index, facts, pool, candidates, kept, &buf.scores);
+        let mut trace = trace_of(index, facts, pool, candidates, kept, &buf.scores);
         if targets.is_empty() {
             return shed(ShedReason::PolicyDeclined, picker.name(), trace);
         }
+        trace.stage = picker.name();
         Decision::Pick(Pick {
             targets,
             trace,
@@ -1293,7 +1296,8 @@ mod tests {
 
     /// The trace names the stage that settled the decision: the picker for
     /// a pick, the filter that left nothing for a shed, the binding stage
-    /// (with no profile) when no binding matched the request.
+    /// (with no profile) when no binding matched the request, the pin for a
+    /// keyed hit and the assignment's picker for a keyed placement.
     #[test]
     fn the_trace_names_the_stage_that_settled_the_decision() {
         let pick = decide_single(&engine(), &[candidate(0, 1), candidate(1, 2)]);
@@ -1334,6 +1338,48 @@ mod tests {
             }
             other => panic!("an unbound model answered {other:?}"),
         }
+
+        // A keyed request under a sessions rule: the assignment's picker
+        // places a fresh key and a respill, the pin settles a hit.
+        let keyed = session_engine(SESSIONS);
+        let mut pool = vec![candidate(0, 1), candidate(1, 0)];
+        let fresh = decide_keyed(&keyed, &pool, 7, 10);
+        assert_eq!(fresh.trace().stage, "best", "{fresh:?}");
+        assert!(
+            matches!(
+                fresh,
+                Decision::Pick(Pick {
+                    session: SessionVerdict::Claimed(_),
+                    ..
+                })
+            ),
+            "{fresh:?}"
+        );
+        let hit = decide_keyed(&keyed, &pool, 7, 20);
+        assert_eq!(hit.trace().stage, "sessions", "{hit:?}");
+        assert!(
+            matches!(
+                hit,
+                Decision::Pick(Pick {
+                    session: SessionVerdict::Pinned,
+                    ..
+                })
+            ),
+            "{hit:?}"
+        );
+        pool[1].session_in_flight = SESSIONS.inflight_cap;
+        let respill = decide_keyed(&keyed, &pool, 7, 30);
+        assert_eq!(respill.trace().stage, "best", "{respill:?}");
+        assert!(
+            matches!(
+                respill,
+                Decision::Pick(Pick {
+                    session: SessionVerdict::Respill,
+                    ..
+                })
+            ),
+            "{respill:?}"
+        );
     }
 
     #[test]

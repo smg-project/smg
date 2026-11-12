@@ -127,8 +127,9 @@ pub struct Trace {
     /// profiles; [`Trace::NO_PROFILE`] when no profile ran.
     pub profile: u16,
     /// The stage that settled the decision: the picker that chose for a
-    /// pick (the prefill side's for a pair), the filter or picker that left
-    /// nothing for a shed, `binding` when no profile matched the request.
+    /// pick (the prefill side's for a pair), `sessions` when a key's pin
+    /// did, the filter or picker that left nothing for a shed, `binding`
+    /// when no profile matched the request.
     pub stage: &'static str,
     /// Candidates after the filters.
     pub survivors: u32,
