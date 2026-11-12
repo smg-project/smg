@@ -2263,3 +2263,28 @@ def test_model_info_advertises_the_encoder_cache_connector():
         "ec_producer",
         [],
     )
+
+
+@pytest.mark.parametrize("policy", ["", "requested", "always"])
+def test_vllm_binding_advertises_decoding_policy(tmp_path, policy):
+    """The Python constructor carries the engine declaration onto the real Rust RPC."""
+    import grpc
+    from smg.servicer import VllmGrpcServer
+    from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+
+    started = VllmGrpcServer(
+        "127.0.0.1:0",
+        f"ipc://{tmp_path}/engine",
+        f"ipc://{tmp_path}/handshake",
+        "/nonexistent/model",
+        constrained_decoding=policy,
+        engine_startup_timeout_secs=60.0,
+    )
+    try:
+        with grpc.insecure_channel(started.address) as channel:
+            info = vllm_engine_pb2_grpc.VllmEngineStub(channel).GetServerInfo(
+                vllm_engine_pb2.GetServerInfoRequest(), timeout=10
+            )
+        assert info.constrained_decoding == policy
+    finally:
+        started.stop(timeout_secs=5.0)
