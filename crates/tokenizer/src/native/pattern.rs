@@ -520,6 +520,9 @@ pub(crate) struct Pattern {
     reads_word_boundary: bool,
     /// Whether the pattern holds `\A`, `\z` or `\G` (see [`Self::anchored`]).
     anchored: bool,
+    /// Whether the pattern holds a `+` after a bare interval inside the
+    /// digit-grouping lookahead (see [`Self::repeats_bare_interval`]).
+    bare_interval_repeat: bool,
 }
 
 /// The matcher of a pattern: a hand-written scanner for the two template
@@ -605,7 +608,9 @@ struct Choice {
 /// moves forward one) reuses it with the count moved by the characters
 /// between, and a long digit run costs one scan instead of one per position.
 /// Keyed by the class's index: the parser gives every lookahead of a pattern
-/// the same classes, so the ops share the memo.
+/// over one category the same class, so those ops share the memo; a pattern
+/// over two categories measures two runs, the memo serving the last one
+/// measured.
 #[derive(Clone, Copy)]
 struct RunMemo {
     class: usize,
@@ -646,6 +651,9 @@ struct Parser<'a> {
     /// first group wherever it stands, so a second group declines
     /// ([`Parser::parse_repeated_character`]).
     captured: bool,
+    /// Whether a digit-grouping lookahead's group was a bare interval under
+    /// `+` (see [`Pattern::repeats_bare_interval`]).
+    bare_interval_repeat: bool,
 }
 
 impl Pattern {
@@ -657,6 +665,7 @@ impl Pattern {
             case_insensitive: false,
             groups_ahead: Vec::new(),
             captured: false,
+            bare_interval_repeat: false,
             word: None,
         };
         let mut root = parser.parse_alternation()?;
@@ -694,6 +703,7 @@ impl Pattern {
             end_anchored,
             reads_word_boundary,
             anchored,
+            bare_interval_repeat: parser.bare_interval_repeat,
         })
     }
 
@@ -738,6 +748,16 @@ impl Pattern {
     /// pool would move (see `NativeEncoder::stages_from`).
     pub(super) fn anchored(&self) -> bool {
         self.anchored
+    }
+
+    /// Whether the pattern holds a `+` after a bare interval inside the
+    /// digit-grouping lookahead, `\p{N}{3}+`: a repeat of the interval to the
+    /// engine behind `tokenizers`' `Split`, which this parser reads, and a
+    /// possessive mark to the engine behind tiktoken (one interval, nothing
+    /// given back), so the tiktoken constructor declines such a pattern (see
+    /// `NativeEncoder::from_ranks`).
+    pub(super) fn repeats_bare_interval(&self) -> bool {
+        self.bare_interval_repeat
     }
 
     /// Whether every class of the pattern is the decimal digits, so that
@@ -2179,7 +2199,10 @@ impl Parser<'_> {
     /// under `{n}`, in a plain or an atomic group (over a body of fixed
     /// width nothing can back off, so the two are one) under `*` or `+`, or
     /// bare under `+` (a `+` after an interval is a repeat of the interval
-    /// to the engine); what follows it is `\z`, or `(?:\P{X}|$)` or
+    /// to the engine behind `tokenizers`' `Split`; the engine behind tiktoken
+    /// reads a possessive mark there, so that constructor declines the bare
+    /// form, [`Pattern::repeats_bare_interval`]); what follows it is `\z`,
+    /// or `(?:\P{X}|$)` or
     /// `(?!\p{X})` (the escape of the group's own class `X`, `\d` for the
     /// decimal digits too), or, over the decimal digits, `\b`. Read as one
     /// op over the run ahead
@@ -2209,7 +2232,17 @@ impl Parser<'_> {
         }
         let min = match self.chars.next()? {
             '*' if grouped => 0,
-            '+' => 1,
+            '+' => {
+                // After a bare interval, a repeat of the interval to the
+                // engine behind `tokenizers`' `Split`, read so here, and a
+                // possessive mark to the engine behind tiktoken (one
+                // interval, nothing given back), whose constructor declines
+                // it ([`Pattern::repeats_bare_interval`]).
+                if !grouped {
+                    self.bare_interval_repeat = true;
+                }
+                1
+            }
             _ => return None,
         };
         let end = match self.chars.next()? {
@@ -3034,6 +3067,30 @@ mod tests {
         }
     }
 
+    /// A `+` after a bare interval inside the lookahead is recorded (the
+    /// tiktoken constructor declines it: a possessive mark to its engine); a
+    /// grouped repeat is not.
+    #[test]
+    fn a_bare_interval_repeat_inside_the_lookahead_is_recorded() {
+        for (pattern, bare) in [
+            (DIGIT_GROUP_HEAD, true),
+            (r"\d(?=\d{3}+\z)", true),
+            (r"\p{N}(?=\p{N}{3}+(?!\p{N}))", true),
+            (r"\p{N}(?=(?:\p{N}{3})+(?!\p{N}))", false),
+            (WIDE_DIGIT_GROUPS, false),
+            (DIGIT_GROUPS, false),
+            (NUMBER_GROUPS, false),
+        ] {
+            assert_eq!(
+                Pattern::parse(pattern)
+                    .expect("parses")
+                    .repeats_bare_interval(),
+                bare,
+                "{pattern}"
+            );
+        }
+    }
+
     /// Our matches of `pattern` in `text`.
     fn matches_of(pattern: &str, text: &str) -> Vec<(usize, usize)> {
         Pattern::parse(pattern)
@@ -3820,6 +3877,7 @@ mod tests {
             case_insensitive: false,
             groups_ahead: Vec::new(),
             captured: false,
+            bare_interval_repeat: false,
             word: None,
         };
         let root = parser.parse_alternation().expect("parses");

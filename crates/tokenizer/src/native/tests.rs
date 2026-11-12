@@ -493,6 +493,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[("<think>", false)],
+            stripped: &[],
         },
         // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
         // split on ASCII digits after the map (the reference cuts the mapped
@@ -548,6 +549,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[("<think>", false)],
+            stripped: &[],
         },
         // The digit-grouping split before the cased template and a
         // `ByteLevel` without its regex: a digit run is cut into groups of
@@ -4437,6 +4439,17 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
     assert_eq!(
         declined(&ranks, r"\d(?=\d{3}+\z)|[a-z]+|\s", &[]),
         r"a split pattern anchored to its text (\A, \z or \G): \d(?=\d{3}+\z)|[a-z]+|\s"
+    );
+    // A `+` after a bare interval inside the lookahead: a repeat of the
+    // interval to the tokenizers engine, a possessive mark to this file's
+    // own; the grouped repeat means the same to both and stays.
+    assert_eq!(
+        declined(&ranks, r"\p{N}(?=\p{N}{3}+(?!\p{N}))|[a-z]+|\s", &[]),
+        r"a split pattern with a `+` after a bare interval, which the file's own encoder reads as a possessive mark: \p{N}(?=\p{N}{3}+(?!\p{N}))|[a-z]+|\s"
+    );
+    assert!(
+        NativeEncoder::from_ranks(&ranks, r"\p{N}(?=(?:\p{N}{3})+(?!\p{N}))|[a-z]+|\s", &[])
+            .is_ok()
     );
     assert_eq!(
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),
