@@ -581,9 +581,11 @@ message Snapshot {
   uint64 replication_seq = 15;
   // The interned-id table at that position.
   IdAssignment ids = 16;
-  // The current generation's document first, then every retained one in
-  // `spec.retained`'s order; present with `replication_seq`.
-  repeated SpecPush documents = 17;
+  // The current generation first, then every retained one in `spec.retained`'s
+  // order, each as the log replicates it (status and document), so a standby
+  // answers GetPolicySpec alike from either path; present with
+  // `replication_seq`.
+  repeated GenerationEvent documents = 17;
 }
 
 // The health precedence's inputs.
