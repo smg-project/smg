@@ -466,12 +466,6 @@ impl GrpcRouter {
                 "Responses endpoint not implemented",
             );
         };
-        let Some(harmony_pipeline) = self.harmony_pipeline.as_ref() else {
-            return error::not_implemented(
-                "responses_not_implemented",
-                "Responses endpoint not implemented",
-            );
-        };
 
         // 0. Fast worker validation (fail-fast before expensive operations)
         if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
@@ -494,17 +488,14 @@ impl GrpcRouter {
         if body.background == Some(true) {
             if responses_context.background.enabled() {
                 let request_context = smg_data_connector::current_request_context();
-                let ctx = if is_harmony {
-                    self.harmony_responses_context(
-                        harmony_pipeline,
-                        harmony_responses_context,
-                        request_context,
-                    )
+                let base = if is_harmony {
+                    harmony_responses_context
                 } else {
-                    ResponsesContext {
-                        request_context,
-                        ..responses_context.clone()
-                    }
+                    responses_context
+                };
+                let ctx = ResponsesContext {
+                    request_context,
+                    ..base.clone()
                 };
                 return self
                     .route_background_responses(
@@ -526,11 +517,10 @@ impl GrpcRouter {
                 model_id,
                 body.stream.unwrap_or(false)
             );
-            let harmony_ctx = self.harmony_responses_context(
-                harmony_pipeline,
-                harmony_responses_context,
-                smg_data_connector::current_request_context(),
-            );
+            let harmony_ctx = ResponsesContext {
+                request_context: smg_data_connector::current_request_context(),
+                ..harmony_responses_context.clone()
+            };
 
             if body.stream.unwrap_or(false) {
                 serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
@@ -550,28 +540,6 @@ impl GrpcRouter {
             )
             .await
         }
-    }
-
-    /// The per-request context of the Harmony Responses path: the Harmony
-    /// pipeline with the shared storage and MCP handles and this request's
-    /// storage context.
-    fn harmony_responses_context(
-        &self,
-        harmony_pipeline: &RequestPipeline,
-        harmony_responses_context: &ResponsesContext,
-        request_context: Option<smg_data_connector::RequestContext>,
-    ) -> ResponsesContext {
-        ResponsesContext::new(
-            Arc::new(harmony_pipeline.clone()),
-            self.shared_components.clone(),
-            harmony_responses_context.response_storage.clone(),
-            harmony_responses_context.conversation_storage.clone(),
-            harmony_responses_context.conversation_item_storage.clone(),
-            harmony_responses_context.mcp_orchestrator.clone(),
-            harmony_responses_context.mcp_format_registry.clone(),
-            request_context,
-            harmony_responses_context.background.clone(),
-        )
     }
 
     /// `background: true`: the `queued` Response object is stored under a new
