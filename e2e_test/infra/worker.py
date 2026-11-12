@@ -482,6 +482,7 @@ class Worker:
                     raise ValueError(
                         "The fixed GPT-OSS fallback owns its checkpoint and generic Triton/none MoE flags"
                     )
+                served_model_args = []
                 if model_path == "openai/gpt-oss-20b":
                     # The numeric preflight uses this same original revision.
                     # A local copy/alias remains the selected model unchanged.
@@ -494,10 +495,27 @@ class Worker:
                         / "models--openai--gpt-oss-20b/snapshots"
                         / "6cee5e81ee83917806bbde320786a8fb61efebee"
                     )
+                    # The checkpoint is local, but the suite and gateway still
+                    # address the original HF model ID. SGLang otherwise uses
+                    # the snapshot path as its advertised served model name.
+                    named = False
+                    for index, arg in enumerate(configured):
+                        flag, equals, value = arg.partition("=")
+                        if flag == "--served-model-name":
+                            if not equals:
+                                value = configured[index + 1] if index + 1 < len(configured) else ""
+                            if value != self.model_id:
+                                raise ValueError(
+                                    "The fixed GPT-OSS fallback owns its served model name"
+                                )
+                            named = True
+                    if not named:
+                        served_model_args = ["--served-model-name", self.model_id]
                 spec = {
                     **spec,
                     "sglang_args": [
                         *spec.get("sglang_args", []),
+                        *served_model_args,
                         "--moe-runner-backend",
                         "triton",
                         "--moe-a2a-backend",
