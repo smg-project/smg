@@ -21,6 +21,8 @@ Two modes:
 - `GET /v1/models` → one model, `owned_by: sglang` (backend/model detection)
 - `POST /v1/chat/completions` · `/v1/completions` · `/generate` — non-stream JSON
   or SSE (`data: {chunk}\n\n … data: [DONE]\n\n`)
+- `POST /v1/messages` — the same answers in the Messages shape: one JSON
+  message, or the `message_start` … `message_stop` event stream (no `[DONE]`)
 - `GET /v1/loads?include=core` → `WorkerLoadResponse` (load-aware policies)
 - `POST /flush_cache` · `/start_profile` · `/stop_profile` — the gateway's admin
   fan-out: the flush clears the engine's cache (a canned worker has none) and
@@ -43,15 +45,21 @@ and SGLang wires, with `disaggregation_transfer_backend` mooncake, and
 `kv_role` behind `kv_connector` MooncakeConnector on the vLLM one, whose info
 is a struct of named fields the admin API's info patch sets by name: the mock
 moves no KV cache and names Mooncake as its transport on every wire). The
-encode role (`--worker-type encode`) is the vLLM wire's alone: the worker
-advertises `ec_role` ec_producer behind `ec_connector` ECCPUConnector (a prefill
-worker on that wire advertises the consumer side), reads as vision-capable with
-a worker-side media processor (`mm_processor` mock, so the gateway forwards
-media references to it), and answers every `Generate` that carries
-`ec_transfer_params_json` with the encoder's token-less completion, the media
-identity (the prompt ids as sent, one hash per media item) and one pull handle
-per hash naming its own address; the TokenSpeed encoder is a separate service
-the mock does not serve, and the SGLang wire has no encode role.
+encode role (`--worker-type encode`) is the two wires' with an encoder. On the
+vLLM wire the worker advertises `ec_role` ec_producer behind `ec_connector`
+ECCPUConnector (a prefill worker on that wire advertises the consumer side),
+reads as vision-capable with a worker-side media processor (`mm_processor`
+mock, so the gateway forwards media references to it), and answers every
+`Generate` that carries `ec_transfer_params_json` with the encoder's token-less
+completion, the media identity (the prompt ids as sent, one hash per media
+item) and one pull handle per hash naming its own address. On the TokenSpeed
+wire the worker mounts the engine's encoder service beside the scheduler's:
+its `Encode` takes a request's media with one rendezvous room per item
+(refused without), runs the realistic engine's admission hooks, counts in the
+admin API's `encodes` and answers accepted; its `Generate` is refused as the
+wrong pool, and a prefill worker on that wire refuses a request whose
+`encode_bootstrap_info` does not name a rendezvous for each media item once.
+The SGLang wire has no encode role.
 `--capture` records the TokenSpeed wire's requests only. Beside the scheduler
 service the server hosts the standard `grpc.health.v1` service (`Check`,
 `Watch`): the empty name and the served scheduler service are SERVING exactly
@@ -252,8 +260,14 @@ The unit tests decode both wires with the Rust relay's own normalizer
 engines do not expose:
 
 - `GET /admin/health` — `ok`;
-- `GET /admin/fleet` — every engine (`grpc:<port>` / `http:<port>` /
-  `zmq:<index>`) with cache size, load, cached blocks and preemptions;
+- `GET /admin/fleet` — every worker of the process (`grpc:<port>` /
+  `http:<port>` / `zmq:<index>`): a realistic engine with cache size, load,
+  cached blocks and preemptions under `"engine": "realistic"` and, in a
+  canned process, each listener with its name under `"engine": "canned"`
+  alone (a realistic process lists its engines alone, since a listener
+  registers before its engine spawns; a listener joins the fleet once its
+  bootstrap port, when it has one, is bound, so a worker that stopped at
+  that bind is never listed);
 - `GET /admin/requests?since=<seq>&limit=<n>` — admitted requests with the
   serving worker, prompt/cached tokens, queue wait and the **arrival-time
   oracle**: the most cached tokens any worker of the process held when the
@@ -325,10 +339,10 @@ process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
 <url> <bootstrap port> --decode <url>`) runs with no engine behind it. The
 gateway detects the mock by the scheduler service it serves (or, on the HTTP
 wire, by its model list) and runs that wire's PD protocol: both sides get the
-same request, with the rendezvous the gateway mints (`kv_bootstrap_info` on
-the gRPC wires; `bootstrap_host`, `bootstrap_port` and `bootstrap_room` in
-the request body on the HTTP wire, whose PD router is its own code path), and
-the client reads the decode side's output.
+same request, with the rendezvous the gateway mints (the wire's rendezvous
+field on the gRPC wires, named below; `bootstrap_host`, `bootstrap_port` and
+`bootstrap_room` in the request body on the HTTP wire, whose PD router is its
+own code path), and the client reads the decode side's output.
 
 - A **prefill** worker answers every request with the prompt side's
   completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
@@ -343,19 +357,26 @@ the client reads the decode side's output.
   scripted: the answers a test states go to the decode side) and advertises
   `disaggregation_mode: decode`.
 
-- On the HTTP wire either side refuses a request that carries no
-  `bootstrap_room` (a 400, as the engines' disaggregated servers answer one),
-  and a prefill worker one whose `bootstrap_port` is not the port it bound:
-  its decode partner would rendezvous elsewhere for the handoff this mock
-  stands in for. A missing or null `bootstrap_port` reads as the engines'
-  default, 8998 (what the gateway sends for a prefill worker registered
-  without a port): the worker on that port takes it, one on another
-  refuses it.
+- Either side refuses a request that carries no rendezvous, as the engines'
+  disaggregated servers answer one: on the HTTP wire a 400 for a missing
+  `bootstrap_room`, on the gRPC wires `InvalidArgument` for a missing
+  `kv_bootstrap_info` (TokenSpeed), `disaggregated_params` (SGLang) or
+  `kv_transfer_params_json` (vLLM, the typed `kv_transfer_params` also
+  taken), or for a named rendezvous without a host or a port (a room of 0 is
+  one the gateway can mint, and is taken). On the
+  vLLM wire the decode side alone refuses: the gateway names the pair to it,
+  and the prefill request carries the connector's parameters only when a
+  connector relays them. A prefill worker refuses one whose bootstrap port is
+  not the port it bound: its decode partner would rendezvous elsewhere for
+  the handoff this mock stands in for. On the HTTP wire a missing or null
+  `bootstrap_port` reads as the engines' default, 8998 (what the gateway sends
+  for a prefill worker registered without a port): the worker on that port
+  takes it, one on another refuses it.
 
 No KV moves between the two: the decode side has the prompt. ZMQ workers
 take no role, and one process gives the role to one wire's workers (worker
 `i` of either wire would bind the same bootstrap port); the encode role is
-the vLLM gRPC wire's alone.
+the vLLM and the TokenSpeed gRPC wires'.
 
 Every gRPC worker advertises the pairing protocol its environment names
 (`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:
@@ -368,7 +389,8 @@ admission (`fail?status=S`, counted under `failed_total`), the admission
 delay and rate (`pause` freezes the passes, which the prompt side never
 takes). With no output to cut after, an armed cut (`after_tokens=K`) fires
 as its status at once, and `finish=error` ends the prompt side with `error`
-whatever the status; both count under `cut_total`, as on any worker. The
+whatever the status (a 500 on `/v1/messages`, which has no `error` stop
+reason); both count under `cut_total`, as on any worker. The
 engine itself never runs the prompt: nothing is admitted and no record is
 left.
 
@@ -431,8 +453,10 @@ ones), the keyed answers under its prompt's key. Nothing found is a miss,
 counted per worker, and the request goes to the canned or realistic engine as
 if no script existed. A scripted answer is served by the wire, not by the
 engine simulator: no load, no KV events, no request record. The prompt's text
-is what an HTTP worker was sent (a message's string content or the `text` of
-its parts, a prompt string or the strings of a prompt array); a gRPC worker
+is what an HTTP worker was sent (the Messages request's top-level `system`,
+a string or text blocks, read ahead of the messages; a message's string
+content or the `text` of its parts; a prompt string or the strings of a
+prompt array); a gRPC worker
 reads the rendered text the gateway sends beside the ids (`original_text`)
 and decodes the ids with its `--tokenizer` only when that is empty, as a ZMQ
 worker always does. Either reads the prompt only while answers filed under a
@@ -444,10 +468,18 @@ the `Complete` (`output_ids`, `finish_reason`, `matched_stop`,
 `cached_tokens`, `output_logprobs` when `return_logprob` is set); a ZMQ rank
 pushes one `EngineCoreOutputs` batch per frame, the prompt's prefill stats
 on the first, the finish reason and `stop_reason` on the last; an HTTP worker
-answers `/v1/chat/completions`, `/v1/completions` and `/generate` with the
+answers `/v1/chat/completions`, `/v1/completions`, `/generate` and `/v1/messages` with the
 `output_text` pieces (one SSE frame per `chunk_tokens` pieces, the finish
 frame with `matched_stop`, under `stream_options.include_usage` a usage
-chunk of its own, then `[DONE]`; or one JSON body) and keys its prompt on its synthetic ids, one
+chunk of its own, then `[DONE]`; or one JSON body; on `/v1/messages` the pieces are
+`content_block_delta` events between `message_start` and `message_stop`, the
+`message_delta` carrying the stop reason, a text stop as `stop_sequence` (a
+token-id stop is none) and the output usage, with no usage chunk and no
+`[DONE]`; a scripted or armed `error` finish answers a 500 there, as the
+Messages shape has no `error` stop reason, and the gateway retries a 500 on
+another worker, so a scripted error on this route takes the next queued
+answer with it, while the completion routes pass a scripted `error` through
+as a 200 with its finish reason) and keys its prompt on its synthetic ids, one
 per whitespace word of the prompt text (`http::synth_token_ids`). An answer
 without `output_ids` is encoded on the token wires with the worker's
 `--tokenizer`, which must then name local tokenizer files (a directory with

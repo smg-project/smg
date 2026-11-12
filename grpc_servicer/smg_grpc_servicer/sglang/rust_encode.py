@@ -1,7 +1,7 @@
 """The encode dispatch of a language-side worker, for the Rust servicer.
 
 Under encode/prefill disaggregation a ``--language-only`` worker runs no
-vision tower: the frontend hands each request's image references to the
+vision tower: the frontend hands each request's media references to the
 encoders and tells the scheduler to wait for their embeddings. SGLang's own
 frontend (its tokenizer manager) does that with two objects of its own in the
 tokenizer-manager process: an ``EncoderBootstrapServer`` (where encoders
@@ -13,7 +13,8 @@ service, the dispatch thread, the failure notice back to the scheduler).
 :class:`EncodeDispatchBridge` hosts those same two objects in the servicer
 process, where the Python servicer and the prefill side's bootstrap server
 already live, and drives them per request for the Rust server: it builds
-the ``GenerateReqInput`` the receiver reads (``rid`` and ``image_data``),
+the ``GenerateReqInput`` the receiver reads (``rid`` and ``image_data``,
+``video_data``, ``audio_data``: the engine's own field per modality),
 calls ``send_encode_request`` and hands Rust what the receiver set on it
 (the wait flag, the per-encoder assignment, the encoder snapshot) plus the
 release the receiver's thread waits for before it may report a failure. The
@@ -23,6 +24,7 @@ protocol is the binding's (``smg.servicer.SglangGrpcServer(encode_dispatcher=...
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -34,6 +36,18 @@ logger = logging.getLogger(__name__)
 #: assembles the embeddings and processes the prompt itself), which neither
 #: servicer runs.
 SCHEDULER_RECEIVE_BACKENDS = ("zmq_to_scheduler", "mooncake")
+
+#: The engine's receiver mode switch: ``http`` encoders take every modality the
+#: encoder runtime runs (image, video, audio), the ``grpc`` encoder service
+#: takes images only. The Rust server reads the bridge's mode once and refuses
+#: what the mode does not take before it dispatches.
+RECEIVER_MODE_ENV = "SGLANG_ENCODER_MM_RECEIVER_MODE"
+
+
+def resolve_receiver_mode() -> str:
+    """The receiver mode ``create_mm_receiver`` picks when handed none: the
+    environment's, ``http`` (the engine's own default) when unset or blank."""
+    return os.environ.get(RECEIVER_MODE_ENV, "").strip() or "http"
 
 
 def resolve_encoder_transfer_backend(server_args: Any) -> str:
@@ -77,6 +91,9 @@ class EncodeDispatchBridge:
     def __init__(self, server_args: Any):
         self.server_args = server_args
         self.encoder_urls: list[str] = list(getattr(server_args, "encoder_urls", None) or [])
+        # One read of the environment: the receiver is built in this mode and
+        # the Rust server reads it off the bridge when it is built.
+        self.transport_mode: str = resolve_receiver_mode()
         self.bootstrap_server: Any | None = None
         self.mm_receiver: Any | None = None
 
@@ -87,7 +104,8 @@ class EncodeDispatchBridge:
     def start(self) -> None:
         """Start the bootstrap server and the receiver, as SGLang's own
         frontend does: the shared URL list is pre-filled with ``--encoder-urls``
-        and grows as encoders register. Idempotent."""
+        and grows as encoders register; the receiver runs in the mode this
+        bridge reports to Rust. Idempotent."""
         if self.started:
             return
         from sglang.srt.disaggregation.encoder.receiver import (
@@ -99,13 +117,16 @@ class EncodeDispatchBridge:
         host = getattr(self.server_args, "host", None) or "0.0.0.0"
         port = int(getattr(self.server_args, "encoder_bootstrap_port", 8997) or 8997)
         self.bootstrap_server = EncoderBootstrapServer(host=host, port=port, urls=self.encoder_urls)
-        self.mm_receiver = create_mm_receiver(self.server_args, encode_urls=self.encoder_urls)
+        self.mm_receiver = create_mm_receiver(
+            self.server_args, transport_mode=self.transport_mode, encode_urls=self.encoder_urls
+        )
         logger.info(
             "Encode dispatch started for the language-only worker: bootstrap server on %s:%s, "
-            "%d encoder URL(s) configured",
+            "%d encoder URL(s) configured, receiver mode %s",
             host,
             port,
             len(self.encoder_urls),
+            self.transport_mode,
         )
 
     def _ensure_runtime_context(self) -> None:
@@ -120,10 +141,18 @@ class EncodeDispatchBridge:
             publish(self.server_args, role="tokenizer")
 
     def dispatch(
-        self, rid: str, image_urls: list[str], on_error: Callable[[str, int], None]
+        self,
+        rid: str,
+        image_urls: list[str],
+        video_urls: list[str],
+        audio_urls: list[str],
+        on_error: Callable[[str, int], None],
     ) -> tuple[bool, dict[int, list[int]] | None, list[str] | None, Callable[[], None] | None]:
-        """One request's dispatch, from the Rust server's blocking thread:
-        what the receiver set on the request (``need_wait_for_mm_inputs``,
+        """One request's dispatch, from the Rust server's blocking thread: the
+        references go to the receiver by modality, as the engine's own frontend
+        carries them (``image_data``, ``video_data``, ``audio_data``; an empty
+        list is the absent field), and back come what the receiver set on the
+        request (``need_wait_for_mm_inputs``,
         ``num_items_assigned`` keyed by the modality's enum value,
         ``encoder_urls``) and the release the receiver's thread waits for
         before it reports a failure through ``on_error`` (``error_msg``,
@@ -134,7 +163,12 @@ class EncodeDispatchBridge:
             raise RuntimeError("the encode dispatch was not started")
         from sglang.srt.managers.io_struct import GenerateReqInput
 
-        request = GenerateReqInput(rid=rid, image_data=list(image_urls))
+        request = GenerateReqInput(
+            rid=rid,
+            image_data=list(image_urls) or None,
+            video_data=list(video_urls) or None,
+            audio_data=list(audio_urls) or None,
+        )
         dispatch_ready = self.mm_receiver.send_encode_request(
             request,
             on_dispatch_error=lambda error: on_error(

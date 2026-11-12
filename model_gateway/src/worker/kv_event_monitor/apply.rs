@@ -154,7 +154,7 @@ impl KvEventMonitor {
                 warn!(
                     worker_id,
                     indexed,
-                    "KV cache group view created after the worker's main blocks were indexed; its rule stays off until the worker's next clear"
+                    "KV cache group view created after the worker's main blocks were indexed; its rule stays off until the worker's next clear or a restart leaves the view complete"
                 );
             }
             worker_blocks.view(indexer, worker_id).created_over(indexed);
@@ -430,7 +430,7 @@ impl KvEventMonitor {
                     worker_blocks.counters.group_view_late += 1;
                     warn!(
                         worker_id,
-                        indexed = signal.len(),
+                        main_signal_dropped = signal.len(),
                         groups = groups.len(),
                         "KV cache group view restarted over the blocks of more than one main-signal group, or of one the rule cannot read; its rule stays off until the worker's next clear"
                     );
@@ -610,8 +610,11 @@ pub(crate) struct WorkerIndexCounters {
     /// name under a parent it did not know (the view's own counts, copied).
     pub(crate) group_dropped: u64,
     pub(crate) group_unnamed: u64,
-    /// Views created after the worker's main blocks were indexed: their rule
-    /// stays off until the worker's next clear.
+    /// Views whose rule went off when they were made or restarted: created
+    /// after the worker's main blocks were indexed (off until the worker's
+    /// next clear, or until a restart leaves the view complete), or
+    /// restarted over the blocks of more than one main-signal group (or of
+    /// one the rule cannot read), off until the worker's next clear.
     pub(crate) group_view_late: u64,
     /// Main stores with a block that carried no tokens: nothing to index under.
     pub(crate) tokenless_stores: u64,
@@ -970,44 +973,23 @@ mod tests {
 
     #[test]
     fn a_proto_block_becomes_its_engine_and_content_hashes() {
-        let block = KvBlock {
-            block_hash: 42,
-            token_ids: vec![1, 2, 3, 4],
-            block_size: 4,
-            lora_id: None,
-            cache_level: None,
-            ..Default::default()
-        };
-        let stored = convert_kv_block(&block, XXH3_SEED);
+        let proto = block(42, &[1, 2, 3, 4]);
+        let stored = convert_kv_block(&proto, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash::from(42i64));
         assert_eq!(stored.content_hash, compute_content_hash(&[1, 2, 3, 4]));
     }
 
     #[test]
     fn a_negative_engine_hash_keeps_its_bits() {
-        let block = KvBlock {
-            block_hash: -1,
-            token_ids: vec![10, 20],
-            block_size: 2,
-            lora_id: None,
-            cache_level: None,
-            ..Default::default()
-        };
-        let stored = convert_kv_block(&block, XXH3_SEED);
+        let proto = block(-1, &[10, 20]);
+        let stored = convert_kv_block(&proto, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash(u64::MAX));
     }
 
     #[test]
     fn a_block_without_tokens_hashes_the_empty_content() {
-        let block = KvBlock {
-            block_hash: 100,
-            token_ids: vec![],
-            block_size: 0,
-            lora_id: None,
-            cache_level: None,
-            ..Default::default()
-        };
-        let stored = convert_kv_block(&block, XXH3_SEED);
+        let proto = block(100, &[]);
+        let stored = convert_kv_block(&proto, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash::from(100i64));
         assert_eq!(stored.content_hash, compute_content_hash(&[]));
     }
@@ -1018,24 +1000,7 @@ mod tests {
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
         let stored = KvBlocksStored {
-            blocks: vec![
-                KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![10, 20, 30, 40],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-                KvBlock {
-                    block_hash: 2,
-                    token_ids: vec![50, 60, 70, 80],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-            ],
+            blocks: vec![block(1, &[10, 20, 30, 40]), block(2, &[50, 60, 70, 80])],
             parent_block_hash: None,
             ..Default::default()
         };
@@ -1051,28 +1016,14 @@ mod tests {
         let mut wb = WorkerIndexState::default();
 
         let stored1 = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(1, &[10, 20, 30, 40])],
             parent_block_hash: None,
             ..Default::default()
         };
         KvEventMonitor::apply_stored(&stored1, w1, &indexer, &mut wb);
 
         let stored2 = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 2,
-                token_ids: vec![50, 60, 70, 80],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(2, &[50, 60, 70, 80])],
             parent_block_hash: Some(1),
             ..Default::default()
         };
@@ -1088,14 +1039,7 @@ mod tests {
 
         // Pass parent_block_hash for an untracked worker — should fallback to no parent.
         let stored = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(1, &[10, 20, 30, 40])],
             parent_block_hash: Some(999),
             ..Default::default()
         };
@@ -1110,24 +1054,7 @@ mod tests {
         let mut wb = WorkerIndexState::default();
 
         let stored = KvBlocksStored {
-            blocks: vec![
-                KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![10, 20, 30, 40],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-                KvBlock {
-                    block_hash: 2,
-                    token_ids: vec![50, 60, 70, 80],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-            ],
+            blocks: vec![block(1, &[10, 20, 30, 40]), block(2, &[50, 60, 70, 80])],
             parent_block_hash: None,
             ..Default::default()
         };
@@ -1149,14 +1076,7 @@ mod tests {
         let mut wb = WorkerIndexState::default();
 
         let stored = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(1, &[10, 20, 30, 40])],
             parent_block_hash: None,
             ..Default::default()
         };
@@ -1175,14 +1095,7 @@ mod tests {
         let event = KvCacheEvent {
             event_id: 1,
             data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                blocks: vec![KvBlock {
-                    block_hash: 42,
-                    token_ids: vec![1, 2, 3, 4],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                }],
+                blocks: vec![block(42, &[1, 2, 3, 4])],
                 parent_block_hash: None,
                 ..Default::default()
             })),
@@ -1201,14 +1114,7 @@ mod tests {
         let stored_event = KvCacheEvent {
             event_id: 1,
             data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                blocks: vec![KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![1, 2, 3, 4],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                }],
+                blocks: vec![block(1, &[1, 2, 3, 4])],
                 parent_block_hash: None,
                 ..Default::default()
             })),
@@ -1237,14 +1143,7 @@ mod tests {
             &KvCacheEvent {
                 event_id: 1,
                 data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                    blocks: vec![KvBlock {
-                        block_hash: 1,
-                        token_ids: vec![1, 2, 3, 4],
-                        block_size: 4,
-                        lora_id: None,
-                        cache_level: None,
-                        ..Default::default()
-                    }],
+                    blocks: vec![block(1, &[1, 2, 3, 4])],
                     parent_block_hash: None,
                     ..Default::default()
                 })),
@@ -1282,14 +1181,19 @@ mod tests {
 
     const TOKENS: [u32; 4] = [10, 20, 30, 40];
 
+    /// A block of these tokens at this hash, as wide as its tokens, the rest default.
+    fn block(hash: i64, tokens: &[u32]) -> KvBlock {
+        KvBlock {
+            block_hash: hash,
+            token_ids: tokens.to_vec(),
+            block_size: tokens.len() as i32,
+            ..Default::default()
+        }
+    }
+
     fn stored_event(hash: i64, tokens: &[u32]) -> KvBlocksStored {
         KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: hash,
-                token_ids: tokens.to_vec(),
-                block_size: tokens.len() as i32,
-                ..Default::default()
-            }],
+            blocks: vec![block(hash, tokens)],
             ..Default::default()
         }
     }
@@ -2156,14 +2060,7 @@ mod tests {
         tokens: &[u32],
     ) -> KvCacheEvent {
         store_event(KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: hash,
-                token_ids: tokens.to_vec(),
-                block_size: tokens.len() as i32,
-                lora_id: None,
-                cache_level: None,
-                ..Default::default()
-            }],
+            blocks: vec![block(hash, tokens)],
             parent_block_hash: parent,
             group_idx: Some(group),
             kv_cache_spec_kind: Some("sliding_window".to_string()),
@@ -2690,6 +2587,110 @@ mod tests {
         );
         assert_eq!(view.retained_blocks(), 0);
         assert!(wb.knows_group(0) && wb.knows_group(2));
+    }
+
+    /// The restart's wait is bounded. Hashes-only stores of the window group
+    /// before any main group fill the worker's view with blocks waiting for
+    /// a name; when the main group shows, the signal's own block finds the
+    /// wait full and is counted dropped, and the worker's counter reads the
+    /// view's count after the restart.
+    #[test]
+    fn a_signal_block_the_restarts_full_wait_refuses_counts_as_dropped() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 1, None, &TOKENS)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+
+        // Blocks the view has no name for wait in it, up to its bound: fill
+        // the wait in batches until a batch adds nothing.
+        const BATCH: i64 = 1 << 16;
+        let waiting_store = |from: i64| {
+            let hashes: Vec<i64> = (from..from + BATCH).collect();
+            group_store(0, Some("sliding_window"), Some(64), &hashes)
+        };
+        KvEventMonitor::apply_events(&[waiting_store(1_000)], w1, &indexer, &mut wb);
+        let view = wb
+            .groups
+            .clone()
+            .expect("the hashes-only store gives a view");
+        let mut from = 1_000 + BATCH;
+        let mut filled = false;
+        for _ in 0..64 {
+            let waiting = view.pending_blocks();
+            KvEventMonitor::apply_events(&[waiting_store(from)], w1, &indexer, &mut wb);
+            from += BATCH;
+            if view.pending_blocks() == waiting {
+                filled = true;
+                break;
+            }
+        }
+        assert!(filled, "the wait has a bound");
+        let full = view.pending_blocks();
+        let dropped = view.dropped_blocks();
+        assert!(dropped > 0, "the last batch found the wait full");
+        assert_eq!(wb.counters.group_dropped, dropped);
+
+        // The main group shows: the signal's block leaves the index and
+        // asks the full wait for a place; refused, it is counted dropped,
+        // and the counter reads the view.
+        let mut main = stored_event(2, &SECOND);
+        main.group_idx = Some(1);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(main)], w1, &indexer, &mut wb);
+        assert_eq!(wb.counters.main_signal_dropped, 1);
+        assert!(view.is_complete(), "the restart made the view complete");
+        assert_eq!(view.pending_blocks(), full, "the wait is still full");
+        assert_eq!(
+            view.dropped_blocks(),
+            dropped + 1,
+            "the signal's block found the wait full"
+        );
+        assert_eq!(
+            wb.counters.group_dropped,
+            view.dropped_blocks(),
+            "the counter reads the view after the restart"
+        );
+    }
+
+    /// Two groups gave a worker its main signal and their blocks left the
+    /// index before the main group showed: the restart finds no block under
+    /// the view, so the view is complete and no late view is counted.
+    #[test]
+    fn a_restart_over_no_blocks_counts_no_late_view() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        KvEventMonitor::apply_events(
+            &[
+                window_only_store(0, 1, None, &TOKENS),
+                window_only_store(2, 2, None, &SECOND),
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        KvEventMonitor::apply_events(&[removal_in(0, 1), removal_in(2, 2)], w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0, "the signals' blocks left");
+        assert_eq!(wb.counters.window_only_removals, 2);
+
+        let mut main = stored_event(1, &TOKENS);
+        main.group_idx = Some(1);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(main)], w1, &indexer, &mut wb);
+        let view = wb.groups.clone().expect("the restart makes the view");
+        assert!(view.is_complete(), "nothing stood under the view");
+        assert_eq!(wb.counters.main_signal_dropped, 0);
+        assert_eq!(
+            wb.counters.group_view_late, 0,
+            "no late view over no blocks"
+        );
+        assert!(wb.knows_group(0) && wb.knows_group(2));
+        assert_eq!(indexer.current_size(), 1, "the main group's block is in");
     }
 
     /// A window-only worker's second copy of a block (an engine's resend)

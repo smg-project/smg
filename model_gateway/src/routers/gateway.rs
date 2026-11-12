@@ -8,11 +8,20 @@
 //! size of the pools they would select from, so traffic can migrate between
 //! HTTP and gRPC and between regular and disaggregated fleets gradually.
 
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, HeaderValue},
+    response::Response,
+};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -39,14 +48,17 @@ use crate::{
     app_context::AppContext,
     config::RoutingMode,
     middleware::TenantRequestMeta,
+    policies::PolicyRegistry,
     routers::{
-        common::body_policy::REASON_MODEL_SELECTION,
+        common::{body_policy::REASON_MODEL_SELECTION, header_utils::ROUTING_KEY_HINT_MAX_BYTES},
         error as route_error,
         factory::{router_ids, RouterId},
         grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
+        message_threads::{MessageThreads, ThreadTurn},
         BodyPolicy, RouterFactory, RouterTrait,
     },
     server::ServerConfig,
+    tenant::storage_tenant,
     worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry},
 };
 
@@ -99,14 +111,42 @@ const ROUTER_FAMILIES: [RouterFamily; 5] = [
     },
 ];
 
+/// The default router, resolved when it is set or mounted and read per
+/// request as it is: a single-router gateway reached its one router through
+/// a hash of the id and a probe of the map on every request (about 0.5 % of
+/// a chat request's user instructions on the mock bed). `router` is `None`
+/// while the id names a router that is not mounted, which the lookup read as
+/// no router before.
+struct DefaultRouter {
+    id: RouterId,
+    router: Option<Arc<dyn RouterTrait>>,
+}
+
 pub struct Gateway {
     worker_registry: Arc<WorkerRegistry>,
     /// Copy-on-write: routers are registered at startup and only read per
     /// request, so a wait-free `load()` replaces a `DashMap` shard lock (and a
     /// `RwLock` for the default) that every request would contend on.
     routers: ArcSwap<HashMap<RouterId, Arc<dyn RouterTrait>>>,
-    default_router: ArcSwapOption<RouterId>,
+    /// The mounted router of every family in [`ROUTER_FAMILIES`] order, read
+    /// by the weighted pick per request: the pick and the weights hashed every
+    /// family's id against the map, twice, on every request (a dozen SipHash
+    /// runs for five families); the array is resolved once, at the mount.
+    family_routers: ArcSwap<[Option<Arc<dyn RouterTrait>>; ROUTER_FAMILIES.len()]>,
+    default_router: ArcSwapOption<DefaultRouter>,
+    /// The mount path's lock: `register_router` and `set_default_router`
+    /// each read one swapped value and store another (the map, then the
+    /// default), and two of them interleaving could leave the default
+    /// without a router that is mounted; serialized, a mount and a default
+    /// named for it converge in either order. Requests never take it.
+    mounts: Mutex<()>,
     enable_igw: bool,
+    /// The message threads of the Messages route: resolved before the
+    /// family routers see a request, stored after one answers.
+    threads: MessageThreads,
+    /// The policies' reading of the routing key, for a thread turn's lineage
+    /// key; `None` where a gateway is built without them (tests).
+    policies: Option<Arc<PolicyRegistry>>,
 }
 
 /// The answer when no router serves a request: the JSON error object, a 404
@@ -120,9 +160,20 @@ impl Gateway {
         Self {
             worker_registry,
             routers: ArcSwap::from_pointee(HashMap::new()),
+            family_routers: ArcSwap::from_pointee(std::array::from_fn(|_| None)),
             default_router: ArcSwapOption::empty(),
+            mounts: Mutex::new(()),
             enable_igw: false,
+            threads: MessageThreads::new(),
+            policies: None,
         }
+    }
+
+    /// The gateway with the policies a thread turn's routing key is read
+    /// through: the registry the routers select workers with.
+    pub fn with_policies(mut self, policies: Arc<PolicyRegistry>) -> Self {
+        self.policies = Some(policies);
+        self
     }
 
     fn try_register(
@@ -146,7 +197,8 @@ impl Gateway {
         config: &ServerConfig,
         app_context: &Arc<AppContext>,
     ) -> Result<Arc<Self>, String> {
-        let mut gateway = Self::new(app_context.worker_registry.clone());
+        let mut gateway = Self::new(app_context.worker_registry.clone())
+            .with_policies(app_context.policy_registry.clone());
         gateway.enable_igw = config.router_config.enable_igw;
         let gateway = Arc::new(gateway);
 
@@ -211,20 +263,44 @@ impl Gateway {
     }
 
     pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
+        let _mount = self.mounts.lock().unwrap_or_else(PoisonError::into_inner);
         self.routers.rcu(|routers| {
             let mut next: HashMap<_, _> = (**routers).clone();
             next.insert(id.clone(), Arc::clone(&router));
             next
         });
+        if let Some(index) = ROUTER_FAMILIES
+            .iter()
+            .position(|family| family.router == id)
+        {
+            self.family_routers.rcu(|families| {
+                let mut next = (**families).clone();
+                next[index] = Some(Arc::clone(&router));
+                next
+            });
+        }
 
-        if self.default_router.load().is_none() {
-            self.default_router.store(Some(Arc::new(id.clone())));
-            info!("Set default router to {}", id.as_str());
+        match &*self.default_router.load() {
+            None => {
+                info!("Set default router to {}", id.as_str());
+                self.store_default_router(id, Some(router));
+            }
+            // The default named before its router was mounted, or mounted
+            // again under its id: the default reads the router just mounted.
+            Some(default) if default.id == id => self.store_default_router(id, Some(router)),
+            Some(_) => {}
         }
     }
 
     pub fn set_default_router(&self, id: RouterId) {
-        self.default_router.store(Some(Arc::new(id)));
+        let _mount = self.mounts.lock().unwrap_or_else(PoisonError::into_inner);
+        let router = self.routers.load().get(&id).cloned();
+        self.store_default_router(id, router);
+    }
+
+    fn store_default_router(&self, id: RouterId, router: Option<Arc<dyn RouterTrait>>) {
+        self.default_router
+            .store(Some(Arc::new(DefaultRouter { id, router })));
     }
 
     pub fn router_count(&self) -> usize {
@@ -239,19 +315,20 @@ impl Gateway {
         &self,
         size: impl Fn(RoutingPool) -> usize,
     ) -> [usize; ROUTER_FAMILIES.len()] {
-        let routers = self.routers.load();
+        let mounted = self.family_routers.load();
         // A family has weight when its router is mounted and every pool has workers.
-        let has_weight = |family: &RouterFamily| {
-            routers.contains_key(&family.router) && family.pools.iter().all(|pool| size(*pool) > 0)
+        let has_weight = |i: usize, family: &RouterFamily| {
+            mounted[i].is_some() && family.pools.iter().all(|pool| size(*pool) > 0)
         };
         let mut weights = [0usize; ROUTER_FAMILIES.len()];
         for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
             let shadowed = family.shadowed_by.as_ref().is_some_and(|shadow| {
                 ROUTER_FAMILIES
                     .iter()
-                    .any(|other| other.router == *shadow && has_weight(other))
+                    .enumerate()
+                    .any(|(j, other)| other.router == *shadow && has_weight(j, other))
             });
-            if !shadowed && has_weight(family) {
+            if !shadowed && has_weight(i, family) {
                 weights[i] = family.pools.iter().map(|pool| size(*pool)).sum();
             }
         }
@@ -267,12 +344,11 @@ impl Gateway {
         &self,
         weights: &[usize; ROUTER_FAMILIES.len()],
     ) -> Option<Arc<dyn RouterTrait>> {
-        let routers = self.routers.load();
-        let mounted = |family: &RouterFamily| routers.contains_key(&family.router);
-        let total: usize = ROUTER_FAMILIES
+        let mounted = self.family_routers.load();
+        let total: usize = mounted
             .iter()
             .zip(weights)
-            .filter(|(family, weight)| **weight > 0 && mounted(family))
+            .filter(|(router, weight)| **weight > 0 && router.is_some())
             .map(|(_, weight)| *weight)
             .sum();
         if total == 0 {
@@ -280,13 +356,14 @@ impl Gateway {
         }
         let pick = ((rand::random::<f64>() * total as f64) as usize).min(total - 1);
         let mut cum = 0usize;
-        for (family, weight) in ROUTER_FAMILIES.iter().zip(weights) {
-            if *weight == 0 || !mounted(family) {
+        for (router, weight) in mounted.iter().zip(weights) {
+            let Some(router) = router else { continue };
+            if *weight == 0 {
                 continue;
             }
             cum += weight;
             if pick < cum {
-                return routers.get(&family.router).cloned();
+                return Some(Arc::clone(router));
             }
         }
         None
@@ -427,13 +504,13 @@ impl Gateway {
     ) -> Option<Arc<dyn RouterTrait>> {
         // In single-router mode (enable_igw=false), always use the default router
         if !self.enable_igw {
-            if let Some(default_id) = &*self.default_router.load() {
+            if let Some(default) = &*self.default_router.load() {
                 debug!(
                     "Single-router mode: using default router {} for model {:?}",
-                    default_id.as_str(),
+                    default.id.as_str(),
                     model_id
                 );
-                return self.routers.load().get(&**default_id).cloned();
+                return default.router.clone();
             }
         }
 
@@ -450,7 +527,7 @@ impl Gateway {
             self.default_router
                 .load()
                 .as_ref()
-                .and_then(|id| self.routers.load().get(&**id).cloned())
+                .and_then(|default| default.router.clone())
         })
     }
 
@@ -470,6 +547,92 @@ impl Gateway {
         match self.select_router_for_request(model) {
             Some(router) => run(router).await,
             None => miss(),
+        }
+    }
+
+    /// The router of a Messages request: in IGW mode an empty message (a
+    /// `max_tokens` of 0) may go to a router that answers it without an
+    /// engine. Takes the request's `max_tokens`, not the request: a local
+    /// that was borrowed keeps its slot in the route's task across the awaits
+    /// that follow, a second copy of the request per plain request.
+    fn select_messages_router(
+        &self,
+        max_tokens: u32,
+        model_id: &str,
+    ) -> Option<Arc<dyn RouterTrait>> {
+        if self.enable_igw && max_tokens == 0 {
+            self.select_router_for_empty_message(model_id)
+        } else {
+            self.select_router_for_request(Some(model_id))
+        }
+    }
+
+    /// Under the routing-key override a plain request routes on its `rid`
+    /// lineage; a thread turn's `rid` is the minted message id by the time a
+    /// router reads it, so its client's key rides the configured routing-key
+    /// header instead, when the request set none. The headers with that key,
+    /// or `None` when nothing changes: no policies, the override off, no
+    /// client `rid`, a routing-key header already set (it wins), or a key
+    /// that is no header value.
+    fn thread_lineage_headers(
+        &self,
+        headers: Option<&HeaderMap>,
+        turn: Option<&ThreadTurn>,
+    ) -> Option<HeaderMap> {
+        let policies = self.policies.as_ref()?;
+        let rid = turn?.trace()?;
+        let key = policies.derive_rid_key(Some(rid))?;
+        if policies.resolve_routing_key(headers).is_some() {
+            return None;
+        }
+        let name = policies.routing_key_header()?.clone();
+        // The header carries the client's rid itself: placement strips its
+        // lineage suffixes once, as `derive_rid_key` does for a plain
+        // request, so both paths key a nested rid alike. A rid over the
+        // header's byte cap goes as the derived key, which fits it.
+        let carried = if rid.len() <= ROUTING_KEY_HINT_MAX_BYTES {
+            rid
+        } else {
+            key
+        };
+        let value = HeaderValue::from_str(carried).ok()?;
+        let mut with_key = headers.cloned().unwrap_or_default();
+        with_key.insert(name, value);
+        Some(with_key)
+    }
+
+    /// A thread turn: resolved before the router sees it (a create as it
+    /// came, a continue as the rebuilt conversation), routed under its
+    /// client's lineage key where the override asks one, stored after the
+    /// router answers.
+    async fn route_messages_thread(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: CreateMessageRequest,
+        model_id: &str,
+    ) -> Response {
+        let (body, turn) = match self
+            .threads
+            .resolve(body, storage_tenant(tenant_meta))
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(refused) => return refused,
+        };
+        let lineage = self.thread_lineage_headers(headers, turn.as_ref());
+        let headers = lineage.as_ref().or(headers);
+        let response = match self.select_messages_router(body.max_tokens, model_id) {
+            Some(router) => {
+                router
+                    .route_messages(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => no_router(),
+        };
+        match turn {
+            Some(turn) => self.threads.stored(turn, response).await,
+            None => response,
         }
     }
 }
@@ -512,10 +675,9 @@ impl RouterTrait for Gateway {
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
         // Model info is fleet-wide: the default router answers, else any.
-        let routers = self.routers.load();
         let router = match self.default_router.load_full() {
-            Some(id) => routers.get(&*id).cloned(),
-            None => routers.values().next().cloned(),
+            Some(default) => default.router.clone(),
+            None => self.routers.load().values().next().cloned(),
         };
         match router {
             Some(router) => router.get_model_info(req).await,
@@ -581,12 +743,21 @@ impl RouterTrait for Gateway {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        let router = if self.enable_igw && body.max_tokens == 0 {
-            self.select_router_for_empty_message(model_id)
-        } else {
-            self.select_router_for_request(Some(model_id))
-        };
-        match router {
+        // A thread turn runs as its own boxed future: its locals (the chain
+        // walk, the rebuild, the answer read back) would otherwise size every
+        // plain request's task. The request is read by value and moved, never
+        // borrowed, before the awaits: a borrowed local keeps a second copy of
+        // the request in every plain request's task (`is_some()` borrows it;
+        // the `matches!` reads the discriminant in place).
+        #[expect(
+            clippy::redundant_pattern_matching,
+            reason = "is_some() borrows the request; a borrowed local keeps its slot in the task"
+        )]
+        if matches!(body.thread, Some(_)) {
+            return Box::pin(self.route_messages_thread(headers, tenant_meta, body, model_id))
+                .await;
+        }
+        match self.select_messages_router(body.max_tokens, model_id) {
             Some(router) => {
                 router
                     .route_messages(headers, tenant_meta, body, model_id)
@@ -968,6 +1139,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::{RouteRequestMeta, TenantKey},
         routers::{factory::router_ids, tests::error_shape},
         worker::{
@@ -1063,6 +1235,34 @@ mod tests {
         let manager = Arc::new(manager);
         manager.register_router(router_ids::HTTP_REGULAR, Arc::new(StubRouter));
         manager
+    }
+
+    /// The default router is whatever is mounted under its id, whenever it
+    /// is mounted: named before its router, it is no router until the mount;
+    /// mounted again under its id, it reads the new router; another router
+    /// mounted beside it does not move it.
+    #[test]
+    fn the_default_router_follows_the_router_mounted_under_its_id() {
+        let gateway = test_gateway(false);
+        gateway.set_default_router(router_ids::HTTP_PD);
+        assert!(gateway.select_router_for_request(None).is_none());
+
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        let mounted = gateway
+            .select_router_for_request(None)
+            .expect("the default, once mounted");
+
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        let remounted = gateway
+            .select_router_for_request(None)
+            .expect("the default, mounted again");
+        assert!(!Arc::ptr_eq(&mounted, &remounted));
+
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
+        let still = gateway
+            .select_router_for_request(Some("any-model"))
+            .expect("the default, with another router beside it");
+        assert!(Arc::ptr_eq(&remounted, &still));
     }
 
     /// A lone router speaks for itself — a forward-capable one keeps
@@ -1641,6 +1841,23 @@ mod tests {
         .unwrap()
     }
 
+    /// A plain Messages request's task holds the request once: a local
+    /// borrowed before the move keeps a second copy across the awaits (the
+    /// task read 1,072 bytes around a 488-byte request that way, 584 with
+    /// the request moved).
+    #[test]
+    fn a_plain_messages_task_holds_the_request_once() {
+        let gateway = test_gateway(true);
+        let meta = test_tenant_meta();
+        let task = gateway.route_messages(None, &meta, message_request(1), "m");
+        let task = size_of_val(&*task);
+        let request = size_of::<CreateMessageRequest>();
+        assert!(
+            task < 2 * request,
+            "the task is {task} bytes around a request of {request}"
+        );
+    }
+
     /// The name of the router that answered a Messages request for `m`.
     async fn messages_router(gateway: &Gateway, max_tokens: u32) -> String {
         let response = gateway
@@ -2118,5 +2335,148 @@ mod tests {
             .select_router_for_request(Some("model-alias"))
             .expect("alias should select the PD router");
         assert_eq!(router.router_type(), "pd");
+    }
+
+    /// A router double that records the headers of each Messages request it
+    /// is handed and answers 200 with an empty body.
+    #[derive(Debug, Default)]
+    struct HeaderRecordingRouter {
+        seen: Mutex<Vec<Option<HeaderMap>>>,
+    }
+
+    #[async_trait]
+    impl RouterTrait for HeaderRecordingRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_messages(
+            &self,
+            headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: CreateMessageRequest,
+            _model_id: &str,
+        ) -> Response {
+            self.seen.lock().unwrap().push(headers.cloned());
+            StatusCode::OK.into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    impl HeaderRecordingRouter {
+        /// The headers of the last request this router was handed.
+        fn last_headers(&self) -> Option<HeaderMap> {
+            self.seen
+                .lock()
+                .unwrap()
+                .last()
+                .expect("a request was routed")
+                .clone()
+        }
+
+        /// The routing key of the last request this router was handed.
+        fn last_routing_key(&self) -> Option<String> {
+            let seen = self.seen.lock().unwrap();
+            let headers = seen.last().expect("a request was routed").as_ref()?;
+            let key = headers.get("x-smg-routing-key")?;
+            Some(key.to_str().expect("a text key").to_string())
+        }
+    }
+
+    /// A gateway over one recording router, its policies built with the
+    /// routing-key override on or off.
+    fn recording_gateway(override_on: bool) -> (Gateway, Arc<HeaderRecordingRouter>) {
+        let config = RoutingKeyOverrideConfig {
+            enabled: override_on,
+            ..Default::default()
+        };
+        let policies = PolicyRegistry::with_override(PolicyConfig::RoundRobin, config);
+        let gateway =
+            Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
+        let recorder = Arc::new(HeaderRecordingRouter::default());
+        gateway.register_router(router_ids::HTTP_REGULAR, recorder.clone());
+        gateway.set_default_router(router_ids::HTTP_REGULAR);
+        (gateway, recorder)
+    }
+
+    /// Under the routing-key override a thread turn routes on its client's
+    /// `rid` lineage, as a plain request does: the header carries the rid
+    /// itself when the request set none, so placement's one strip gives the
+    /// plain request's key, nested suffixes included; a header the client set
+    /// wins; without the override, a client `rid` or a `thread`, nothing is
+    /// added.
+    #[tokio::test]
+    async fn a_thread_turn_carries_its_client_lineage_as_the_routing_key_under_the_override() {
+        use serde_json::json;
+
+        let turn = |rid: serde_json::Value, thread: bool| -> CreateMessageRequest {
+            let mut request = json!({
+                "model": "m", "max_tokens": 8, "rid": rid,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if thread {
+                request["thread"] = json!({"type": "create"});
+            }
+            body(request)
+        };
+        let meta = test_tenant_meta();
+
+        let (gateway, seen) = recording_gateway(true);
+        let policies = gateway.policies.clone().expect("policies");
+        let placed = |seen: &HeaderRecordingRouter| -> Option<String> {
+            let headers = seen.last_headers()?;
+            policies
+                .sticky_header_key(Some(&headers))
+                .map(str::to_string)
+        };
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(
+            seen.last_routing_key().as_deref(),
+            Some("conv_t2"),
+            "the header carries the rid itself"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some("conv"),
+            "placed once stripped"
+        );
+
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t1_t2"), true), "m")
+            .await;
+        assert_eq!(
+            placed(&seen).as_deref(),
+            policies.derive_rid_key(Some("conv_t1_t2")),
+            "a nested suffix keys as the plain request does"
+        );
+        assert_eq!(placed(&seen).as_deref(), Some("conv_t1"));
+
+        let mut mine = HeaderMap::new();
+        mine.insert("x-smg-routing-key", "mine".parse().unwrap());
+        gateway
+            .route_messages(Some(&mine), &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(placed(&seen).as_deref(), Some("mine"));
+
+        gateway
+            .route_messages(None, &meta, turn(json!(null), true), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "no client rid");
+
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), false), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "a plain request");
+
+        let (gateway, seen) = recording_gateway(false);
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "the override off");
     }
 }

@@ -49,13 +49,19 @@ const ASR_MODEL: &str = "qwen3-asr-dispatch-ttft-test-model";
 const TRANSCRIPT_IDS: [u32; 3] = [100, 101, 102];
 const OUTPUT_TOKENS: u32 = 3;
 const HELD_HEADERS_DELAY: Duration = Duration::from_millis(300);
-const POST_FIRST_DELAY: Duration = Duration::from_millis(120);
-/// The most a first token may carry over the hold: the first chunk arrives
-/// with the headers, so the in-stream delay (`POST_FIRST_DELAY`, longer than
-/// this slack) is never part of it.
-const FIRST_TOKEN_SLACK: Duration = Duration::from_millis(100);
-/// What a worker that fails its attempt spends before failing it.
-const FAILED_ATTEMPT_DELAY: Duration = Duration::from_millis(400);
+const POST_FIRST_DELAY: Duration = Duration::from_millis(600);
+/// The most a first token may carry over the hold on a loaded machine: the
+/// first chunk arrives with the headers, so the in-stream delay
+/// (`POST_FIRST_DELAY`, longer than this slack) is never part of it. The
+/// worst first-token stall measured under a heavy parallel build load was
+/// 283 ms; at a moderate load the stalls stay under 100 ms.
+const FIRST_TOKEN_SLACK: Duration = Duration::from_millis(500);
+const _: () = assert!(FIRST_TOKEN_SLACK.as_millis() < POST_FIRST_DELAY.as_millis());
+/// What a worker that fails its attempt spends before failing it: longer
+/// than the slack, so the retry case tells a TTFT anchored at the answering
+/// attempt from one anchored at the request's entry.
+const FAILED_ATTEMPT_DELAY: Duration = Duration::from_millis(700);
+const _: () = assert!(FIRST_TOKEN_SLACK.as_millis() < FAILED_ATTEMPT_DELAY.as_millis());
 
 /// The engine of these cases: the RPC await absorbs the hold, with the first
 /// chunk already buffered when it returns, like a Python servicer holding

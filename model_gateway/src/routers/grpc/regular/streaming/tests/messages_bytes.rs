@@ -9,9 +9,9 @@
 //! event, intended or not, fails here. Set `SMG_RECORD_SSE_FIXTURES=1` to
 //! rewrite them from the current code.
 
-use std::{pin::Pin, sync::Arc};
+use std::sync::Arc;
 
-use futures::{Stream, StreamExt as _};
+use futures::StreamExt as _;
 use smg_grpc_client::vllm_engine::proto;
 use symphony::{formats::qwen3, CallSyntax};
 use tokio::sync::oneshot;
@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use super::{
     super::*,
     eof::{
-        chat_spec, chunk, complete, complete_with_prompt, dispatch, messages_spec, processor,
+        chat_spec, chunk, complete, complete_with_prompt, dispatch, messages_spec, processor, pull,
         scripted_stream, staged_stream, CharacterTokenizer,
     },
     sse_bytes::assert_recorded_bytes,
@@ -122,6 +122,10 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
     };
     let spec = MessagesResponseSpec {
         prompt_tokens: 0,
+        // The `length` scenario's one token is its whole budget: the recorded
+        // bytes say `max_tokens`.
+        max_tokens: 1,
+        context_window: None,
         thinking_requested: scenario.thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -309,6 +313,7 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
             )
             .await;
         assert!(result.is_ok(), "{result:?}");
+        ReadingEnd::Complete
     };
     let mut body = DrivenBody::new(Box::pin(reading), rx);
     // `message_start` (the body's own yield follows it), then the frame
@@ -339,10 +344,10 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
     // The pull after it: pending, so the connection writes the first
     // token's frame before the reading runs on. With one yield at the
     // hand-off it is the burst's frame.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    let next = pull(&mut body).await;
     assert!(
-        pull.is_pending(),
-        "the pull after the first token's frame must be pending, not a frame: {pull:?}"
+        next.is_pending(),
+        "the pull after the first token's frame must be pending, not a frame: {next:?}"
     );
     let rest: Vec<String> = body
         .map(|frame| String::from_utf8(frame.expect("a write").to_vec()).expect("text"))

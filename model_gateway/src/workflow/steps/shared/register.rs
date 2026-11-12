@@ -119,6 +119,19 @@ fn pool_groups_touched(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -
     groups
 }
 
+/// The models a registration of `workers` may move workers off: every model
+/// whose policy a worker it replaces at the same URL keeps
+/// ([`WorkerRegistry::policy_model_ids`]). Whether a worker of this node, the
+/// replacement included, still serves each one is asked once the
+/// registration is written.
+fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> HashSet<String> {
+    workers
+        .iter()
+        .filter_map(|worker| registry.get_by_url(worker.url()))
+        .flat_map(|replaced| WorkerRegistry::policy_model_ids(&replaced))
+        .collect()
+}
+
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
@@ -142,13 +155,24 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // worker's group must refresh the group it leaves as well as the one
         // it joins, and only the registry as it is now knows the former.
         let touched_groups = pool_groups_touched(&app_context.worker_registry, workers);
+        let left_models = models_left(&app_context.worker_registry, workers);
 
         for worker in workers {
+            // The handle this URL had before the write: a registration that
+            // replaces it tells the policy registry, as a removal would, so
+            // the engine's rows of the retired handle do not outlive it (the
+            // policies' URL-keyed state carries over to the replacement).
+            let previous = app_context.worker_registry.get_by_url(worker.url());
             let worker_id = register_worker(
                 &app_context.worker_registry,
                 Arc::clone(worker),
                 &registration_mode,
             )?;
+            if let Some(previous) = previous.filter(|previous| !Arc::ptr_eq(previous, worker)) {
+                app_context
+                    .policy_registry
+                    .on_worker_replaced(previous.as_ref(), worker.as_ref());
+            }
             debug!(
                 "Registered worker {} (model: {}) with ID {:?}",
                 worker.redacted_url(),
@@ -208,6 +232,15 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // Update Layer 3 worker pool size metrics per unique
         // `(worker_type, connection_mode, model_id)` the registration touched.
         refresh_worker_pool_sizes(&app_context.worker_registry, &touched_groups);
+
+        // A replacement that moved a worker to another model, or that lists
+        // a model fewer, takes the policy of each model no worker of this
+        // node serves any more, as the worker's removal would.
+        for model_id in &left_models {
+            if !app_context.worker_registry.serves_model_locally(model_id) {
+                app_context.policy_registry.on_model_unserved(model_id);
+            }
+        }
 
         // WorkerMonitor subscribes to registry events directly (see
         // `worker::monitor::WorkerMonitor::start_event_loop`), so this

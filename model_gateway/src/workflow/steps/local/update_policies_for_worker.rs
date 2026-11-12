@@ -59,8 +59,9 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
                 }
             }
 
-            // Notify policy registry of the update
-            app_context.policy_registry.on_worker_added(model_id, None);
+            // Only a registration builds a model's policy: an update that
+            // lands after the model's last worker was removed must not leave
+            // the model one for its next registration to inherit.
             for worker in workers.iter() {
                 worker.set_completion_sink(Some(app_context.policy_registry.completion_sink()));
             }

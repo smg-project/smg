@@ -51,8 +51,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
-        Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, handshake_address, http_get,
+        next_batch, servicer_config, Bounded,
     },
     tokenizer_bundle, ServicerError,
 };
@@ -98,7 +98,7 @@ fn ec_cpu_model_info(role: &str) -> VllmModelInfo {
     }
 }
 
-/// A pixel-less batch naming its media by hash alone: a consumer's leg.
+/// A pixel-less batch naming its media by hash alone: a consumer's request.
 fn pixel_less_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
     vllm::MultimodalInputs {
         mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
@@ -236,14 +236,6 @@ fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmS
     }
 }
 
-/// The handshake endpoint of one test: an IPC socket under its own
-/// directory. A probed TCP port is not reserved, so two tests running in
-/// parallel could pick the same one and a mock engine would handshake with
-/// the other test's servicer and wait forever for its INIT.
-fn handshake_address(dir: &std::path::Path) -> String {
-    format!("ipc://{}", dir.join("handshake").display())
-}
-
 /// The handshake endpoint is free again: ZMQ unlinks the ipc socket file once
 /// the bound socket is dropped, so a fresh listener can take the path.
 async fn assert_handshake_released(handshake: &str) {
@@ -299,6 +291,19 @@ async fn harness_with(
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     config.media_processor = media_processor;
+    started(dir, handshake, config, tokenizer).await
+}
+
+/// The servicer started on `config` (with `tokenizer` when a test brings
+/// its own), one mock engine handshaken on `handshake` and waited for, the
+/// client connected: the single-engine harness [`harness_with`] and
+/// [`metrics_harness_with`] hand back.
+async fn started(
+    dir: tempfile::TempDir,
+    handshake: String,
+    config: VllmServicerConfig,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+) -> Harness {
     let server = match tokenizer {
         Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
         None => VllmServicerServer::start(config),
@@ -1300,7 +1305,7 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// An encode-prefill-decode leg carries encoder-cache transfer parameters:
+/// An encode-prefill-decode request carries encoder-cache transfer parameters:
 /// the encoder's request (a pull connector's empty object, or a push
 /// connector's consumer destination and transfer ids), or the prefill side's
 /// with the encoder's handles. This servicer runs no encoder-cache connector
@@ -1332,7 +1337,7 @@ async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
             "ec-prefill",
             r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
         ),
-        // The encoder leg of a pull connector: an empty object, the payload
+        // The encoder's request of a pull connector: an empty object, the payload
         // the Router sends most often, is parameters all the same.
         ("ec-encode-pull", "{}"),
     ] {
@@ -1362,7 +1367,7 @@ async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
 }
 
 /// With an encoder-cache connector in the engine, the four info fields are
-/// advertised as the launcher reports them, a leg's transfer parameters go
+/// advertised as the launcher reports them, a request's transfer parameters go
 /// to the engine as the connector's extra argument (a pull connector's empty
 /// object included, beside no KV params) and the connector's answer comes
 /// back on the `Complete`, as the Python servicer carries them.
@@ -1430,9 +1435,9 @@ async fn encoder_cache_transfer_parameters_pass_through_both_ways() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A consumer's leg (the prefill side of an encode-prefill-decode fleet)
+/// A consumer's request (the prefill side of an encode-prefill-decode fleet)
 /// brings pixel-less batches: the engine fetches their encodings by the
-/// handles in the transfer parameters, so a leg whose handles do not cover
+/// handles in the transfer parameters, so a request whose handles do not cover
 /// every item is refused before the engine, in the Python servicer's words
 /// (an empty object, a CPU handle without an address, a Mooncake transfer
 /// id short of one occurrence); one whose handles cover them goes through.
@@ -1481,7 +1486,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
     assert_eq!(engine_request.request_id, "ec-c-ok");
     assert!(
         engine_request.mm_features.is_none(),
-        "a pixel-less leg carries no features"
+        "a pixel-less request carries no features"
     );
 
     // The prefill side's realistic payload, grid tensors and hashes without
@@ -1504,7 +1509,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
         .client
         .generate(request)
         .await
-        .expect("a grid-only batch on an encoder-cache leg goes through")
+        .expect("a grid-only batch on an encoder-cache request goes through")
         .into_inner();
     let engine_request = recv_add(&mut h.engine_in).await;
     assert_eq!(engine_request.request_id, "ec-c-grid");
@@ -1542,7 +1547,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// An encoder's leg with router-preprocessed pixels: its `Complete` carries
+/// An encoder's request with router-preprocessed pixels: its `Complete` carries
 /// the media identity (the prompt's ids, the batch without its pixels) beside
 /// the connector's handles, and on a CPU connector a completion short of a
 /// handle for one of the items is refused instead of becoming a handoff.
@@ -1595,7 +1600,7 @@ async fn encoder_cache_producer_completion_carries_the_identity_and_the_cpu_hand
             .client
             .generate(request)
             .await
-            .expect("an encoder's leg is admitted")
+            .expect("an encoder's request is admitted")
             .into_inner();
         let engine_request = recv_add(&mut h.engine_in).await;
         assert_eq!(engine_request.request_id, id);
@@ -2124,11 +2129,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .expect("subscribe")
         .into_inner();
     for expected in [0, 1] {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -2644,11 +2645,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .expect("subscribe")
         .into_inner();
     for expected in 0..=3 {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -3019,11 +3016,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         .await
         .expect("publish");
     let second = loop {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         if batch.sequence_number != 0 {
             break batch;
         }
@@ -4766,7 +4759,7 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// Expanded media must be refused before normal engine admission; a PD leg
+/// Expanded media must be refused before normal engine admission; a PD request
 /// still releases its remote prefill through the abort-only notice.
 #[tokio::test]
 async fn expanded_context_rejection_preserves_pd_cleanup() {
@@ -5078,28 +5071,7 @@ async fn metrics_harness_with(
     let mut config = config(dir.path(), &handshake, model);
     config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
     config.media_processor = media_processor;
-    let server = match tokenizer {
-        Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
-        None => VllmServicerServer::start(config),
-    }
-    .expect("servicer starts");
-    let engine = connect_to_frontend(
-        &handshake,
-        EngineId::from_engine_index(0),
-        default_ready_response(),
-    )
-    .await
-    .expect("mock engine handshake");
-    wait_until(|| server.engine_ready()).await;
-    let client = VllmEngineClient::new(grpc_channel(server.address()).await);
-    let (engine_in, engine_out) = engine.split();
-    Harness {
-        server,
-        engine_in,
-        engine_out,
-        client,
-        _dir: dir,
-    }
+    started(dir, handshake, config, tokenizer).await
 }
 
 /// One scrape of the servicer's metrics listener.

@@ -460,7 +460,10 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{event::DropReason, testing::bytes};
+    use crate::{
+        event::DropReason,
+        testing::{bytes, indexed_calls as calls},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -479,24 +482,6 @@ mod tests {
         }
         assembler.finish(&mut out);
         out.into_owned().drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(u32, String, String)> {
-        let mut calls: Vec<(u32, String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { index, name, .. } => {
-                    calls.push((*index, name.clone(), String::new()));
-                }
-                Event::ToolCallArguments { json, .. } => {
-                    if let Some(last) = calls.last_mut() {
-                        last.2.push_str(json);
-                    }
-                }
-                _ => {}
-            }
-        }
-        calls
     }
 
     #[test]

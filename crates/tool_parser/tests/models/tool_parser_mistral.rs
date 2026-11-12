@@ -219,21 +219,10 @@ Let me execute these searches for you."#;
 
 #[tokio::test]
 async fn test_mistral_streaming_closing_bracket() {
-    use openai_protocol::common::Tool;
-
     // Test that closing ] is stripped for Mistral array format
     let mut parser = MistralParser::new();
 
-    let tools = vec![Tool {
-        tool_type: "function".to_string(),
-        function: openai_protocol::common::Function {
-            name: "get_weather".to_string(),
-            description: Some("Get weather".to_string()),
-            parameters: Some(json!({})),
-            strict: None,
-            extra: Default::default(),
-        },
-    }];
+    let tools = vec![common::tool("get_weather", "Get weather")];
 
     let chunks = vec![
         "[TOOL_CALLS] ",
@@ -279,21 +268,10 @@ async fn test_mistral_streaming_closing_bracket() {
 
 #[tokio::test]
 async fn test_mistral_streaming_bracket_in_text_after_tools() {
-    use openai_protocol::common::Tool;
-
     // Test that ] in normal text AFTER tool calls is preserved
     let mut parser = MistralParser::new();
 
-    let tools = vec![Tool {
-        tool_type: "function".to_string(),
-        function: openai_protocol::common::Function {
-            name: "get_weather".to_string(),
-            description: Some("Get weather".to_string()),
-            parameters: Some(json!({})),
-            strict: None,
-            extra: Default::default(),
-        },
-    }];
+    let tools = vec![common::tool("get_weather", "Get weather")];
 
     let chunks = vec![
         "[TOOL_CALLS] ",

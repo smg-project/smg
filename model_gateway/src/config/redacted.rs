@@ -30,6 +30,7 @@ const PLAIN: &[&str] = &[
     "cache_boundaries",
     "routing_key_override",
     "pd_pairing_mode",
+    "policy_engine",
     "host",
     "port",
     "health_check_port",
@@ -211,9 +212,10 @@ fn build_identity() -> Value {
     })
 }
 
-/// The sources record in the words of the start-up line: `flag`, `env` or
-/// `file` per secret, `null` for a secret that was not given. The entry
-/// counts are the sets in force, which a reload of the key files moves.
+/// The sources record in the words of the start-up line: `flag`, `env`,
+/// `file` or `launcher` per secret, `null` for a secret that was not given.
+/// The entry counts are the sets in force, which a reload of the key files
+/// moves.
 fn secret_sources(sources: &SecretSources, keys: &KeysInForce) -> Value {
     json!({
         "api_key": sources.api_key.map(SecretSource::as_str),

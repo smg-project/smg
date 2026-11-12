@@ -289,6 +289,11 @@ impl VisionPreProcessor for Qwen3VLProcessor {
         true
     }
 
+    /// BF16 patch rows and their metadata are independent between images.
+    fn supports_bf16_batch_cache(&self) -> bool {
+        true
+    }
+
     fn emits_pixel_bytes(&self) -> bool {
         true
     }
@@ -334,6 +339,11 @@ impl VisionPreProcessor for Qwen3VLProcessor {
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         self.inner.calculate_num_tokens(width, height)
+    }
+
+    /// Number of stored patch elements for one image.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
     }
 
     fn model_name(&self) -> &'static str {

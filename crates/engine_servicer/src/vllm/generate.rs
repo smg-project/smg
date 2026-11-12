@@ -3,31 +3,21 @@
 //! decoded output, and merges the choices into one response stream that the
 //! `Abort` RPC can end.
 
-use std::{
-    collections::BTreeMap,
-    ops::ControlFlow,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Instant,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use engine_zmq_adapter::{
     fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
     VllmGenerateStream, ZmqEngineClient,
 };
-use futures::Stream;
-use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 
 use super::{encoder_cache, media::process_media_refs, State};
 use crate::{
+    choice::{Plain, Shape, StopMatched},
     load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe},
-    metrics::{complete_finish_reason, ChoiceMetrics},
-    requests::HeldTerminal,
-    stop_match::{stop_decoder, StopMatcher},
-    stream::{poll_engine_item, Choice, Choices, RequestStream},
+    stop_match::stop_decoder,
+    stream::{Choices, RequestStream},
     BoxStream,
 };
 
@@ -261,11 +251,11 @@ async fn submit(
             "This model does not support generation",
         ));
     }
-    // An encode-prefill-decode leg (the encoder's request with the consumer's
+    // An encode-prefill-decode request (the encoder's with the consumer's
     // destination, or the prefill side's with the encoder's handles) rides
     // the engine's encoder-cache connector, which the launcher reports off
     // `ec_transfer_config` and `GetServerInfo` advertises, so a Router selects
-    // an engine without one for neither side. A leg that arrives there all
+    // an engine without one for neither side. A request that arrives there all
     // the same is refused here, before the media stage or the engine sees it
     // (the engine would run it as a plain request and the caller would read
     // a completion without the handles), in the shape a media reference is
@@ -273,7 +263,7 @@ async fn submit(
     if !state.model.supports_ec_transfer && ec_transfer_params_sent(&req) {
         return Err(Status::invalid_argument(NO_ENCODER_CACHE));
     }
-    // On an engine with a connector, the leg's parameters (a JSON object; a
+    // On an engine with a connector, the request's parameters (a JSON object; a
     // malformed field is refused by the adapter's parse) are checked as the
     // Python servicer checks them: a consumer's pixel-less batches need a
     // usable handle per media item before the engine sees the request.
@@ -288,7 +278,7 @@ async fn submit(
         encoder_cache::check_consumer_handoff(&req, &state.model, params)?;
     }
     let ec_producer_leg = ec_params.is_some() && encoder_cache::is_producer(&state.model);
-    let request_id = req.request_id.clone();
+    let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
     let (registration, cancel) =
@@ -311,7 +301,7 @@ async fn submit(
         Some((media, identity)) => (Some(media), identity.map(Arc::new)),
         None => (None, None),
     };
-    // An encoder's leg with router-preprocessed batches gets its identity
+    // An encoder's request with router-preprocessed batches gets its identity
     // from the batches themselves (the media stage saw no reference).
     let media_identity = media_identity.or_else(|| {
         ec_producer_leg
@@ -395,16 +385,30 @@ async fn submit(
             Some(_) => stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?,
             None => None,
         };
-        choices.push(ChoiceStream::new(
-            Arc::clone(state),
-            sub,
+        // Each choice's engine request went to its own rank (an unpinned
+        // fan-out is placed per choice): its tokens are credited there. Its
+        // prefill sample comes from the engine's timing, so its probe stays
+        // unarmed.
+        let load = ChoiceLoad::new(
+            rank_of(sub.engine_index()),
+            sub.index(),
+            PrefillProbe::default(),
+        );
+        choices.push(StopMatched::new(
+            Plain::new(
+                Arc::clone(state),
+                Arc::clone(&request_id),
+                sub,
+                streaming,
+                metrics.choice(),
+                load,
+                VllmShape {
+                    media_identity: media_identity.clone(),
+                    ec_producer_leg,
+                },
+            ),
             decoder,
-            streaming,
             min_tokens,
-            media_identity.clone(),
-            ec_producer_leg,
-            request_id.clone(),
-            metrics.choice(),
         ));
     }
     Ok(Box::pin(
@@ -412,73 +416,32 @@ async fn submit(
     ))
 }
 
-/// One choice of a generate request: the ZMQ-mapped stream plus the string
-/// stop matcher the engine cannot run itself.
-struct ChoiceStream {
-    state: Arc<State>,
-    /// `None` once this choice ended (terminal response yielded or error).
-    /// Dropping it before the engine's own terminal output aborts the
-    /// engine-side request.
-    inner: Option<VllmGenerateStream>,
-    /// Decodes the output incrementally and matches the request's string
-    /// stops, honouring `min_tokens`.
-    stops: StopMatcher,
-    /// Whether the client asked for incremental chunks. A non-streaming
-    /// request receives only the terminal `Complete`, as from the Python
-    /// servicer (`output_kind=FINAL_ONLY`).
-    streaming: bool,
-    /// A frontend-synthesized terminal `Complete` to yield next.
-    pending: Option<vllm::GenerateResponse>,
-    /// This choice's observation of the request's metrics.
-    metrics: ChoiceMetrics,
-    /// A PD prefill side's account of the media it processed, stamped on
-    /// every `Complete` of the request for the decode side.
+/// What this wire stamps on a choice's responses and checks on the engine's
+/// terminal: a PD prefill side's account of the media it processed, on every
+/// `Complete` of the request for the decode side; on the encoder side of an
+/// encoder-cache handoff, the connector's handle for every media item of that
+/// identity (`encoder_cache::check_producer_handles`). The vLLM proto is the
+/// intermediate itself, so nothing else converts.
+struct VllmShape {
     media_identity: Option<Arc<vllm::MediaIdentity>>,
-    /// Whether this is an encoder's encoder-cache leg: its terminal
-    /// `Complete` must return the connector's handle for every media item of
-    /// the identity (`encoder_cache::check_producer_handles`).
+    /// Whether this is the encoder side of an encoder-cache handoff.
     ec_producer_leg: bool,
-    /// The request this choice belongs to, for the load tracker.
-    request_id: String,
-    /// This choice's share of the load tracker's bookkeeping; its prefill
-    /// sample comes from the wire's engine timing, so its probe stays unarmed.
-    load: ChoiceLoad,
 }
 
-impl ChoiceStream {
-    #[expect(clippy::too_many_arguments)]
-    fn new(
-        state: Arc<State>,
-        inner: VllmGenerateStream,
-        decoder: Option<StopSequenceDecoder>,
-        streaming: bool,
-        min_tokens: u32,
-        media_identity: Option<Arc<vllm::MediaIdentity>>,
-        ec_producer_leg: bool,
-        request_id: String,
-        metrics: ChoiceMetrics,
-    ) -> Self {
-        Self {
-            media_identity,
-            ec_producer_leg,
-            request_id,
-            load: ChoiceLoad::new(
-                rank_of(inner.engine_index()),
-                inner.index(),
-                PrefillProbe::default(),
-            ),
-            state,
-            inner: Some(inner),
-            stops: StopMatcher::new(decoder, min_tokens),
-            streaming,
-            pending: None,
-            metrics,
-        }
-    }
+impl Shape for VllmShape {
+    type Engine = VllmGenerateStream;
+    type State = State;
+    type Response = vllm::GenerateResponse;
 
-    /// A terminal response with the request's media identity on it, when
-    /// there is one; anything else passes through.
-    fn stamped(&self, mut response: vllm::GenerateResponse) -> vllm::GenerateResponse {
+    // The pass-through on the poll path: inlined always, so the response is
+    // not moved through the call.
+    #[inline(always)]
+    fn convert(
+        &self,
+        _request_id: &str,
+        _engine: Option<&VllmGenerateStream>,
+        mut response: vllm::GenerateResponse,
+    ) -> vllm::GenerateResponse {
         if let (Some(identity), Some(vllm::generate_response::Response::Complete(complete))) =
             (self.media_identity.as_deref(), response.response.as_mut())
         {
@@ -486,180 +449,13 @@ impl ChoiceStream {
         }
         response
     }
-}
 
-impl Choice for ChoiceStream {
-    /// End this choice on an abort: the `Complete` it was about to yield, the
-    /// engine's parked one, or a synthesized `abort` one; `None` once it has
-    /// already ended. Dropping the engine stream aborts the engine side.
-    fn abort(&mut self) -> Option<vllm::GenerateResponse> {
-        if let Some(complete) = self.pending.take() {
-            self.inner = None;
-            return Some(self.stamped(complete));
-        }
-        let mut inner = self.inner.take()?;
-        let complete = inner.complete_aborted();
-        if let Some(reason) = complete_finish_reason(&complete) {
-            self.metrics.ended(reason);
-        }
-        Some(self.stamped(complete))
-    }
-}
-
-impl HeldTerminal for ChoiceStream {
-    type Response = vllm::GenerateResponse;
-
-    /// The terminal this choice already holds, when the engine (or a stop
-    /// string) finished it before the poll that would have yielded it: the
-    /// `Complete` it was about to yield, or the engine's parked one. `None`
-    /// for a choice still open, which is left as it is.
-    fn finished(&mut self) -> Option<vllm::GenerateResponse> {
-        if let Some(complete) = self.pending.take() {
-            self.inner = None;
-            return Some(self.stamped(complete));
-        }
-        let inner = self.inner.as_mut()?;
-        if !inner.has_parked_complete() {
-            return None;
-        }
-        // `complete_aborted` yields the parked `Complete` when there is one.
-        let complete = inner.complete_aborted();
-        if let Some(reason) = complete_finish_reason(&complete) {
-            self.metrics.ended(reason);
-        }
-        self.inner = None;
-        Some(self.stamped(complete))
-    }
-
-    /// Whether this choice is still open: neither ended nor holding its
-    /// terminal.
-    fn is_open(&self) -> bool {
-        self.pending.is_none() && self.inner.is_some()
-    }
-}
-
-type ChoiceItem = Result<vllm::GenerateResponse, Status>;
-
-impl Stream for ChoiceStream {
-    type Item = ChoiceItem;
-
-    /// Forward engine output and account for input capacity before frontend stop handling.
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(complete) = this.pending.take() {
-                // The frontend ended this choice: drop the engine stream so the
-                // engine-side request is aborted, then deliver the Complete.
-                this.inner = None;
-                return Poll::Ready(Some(Ok(this.stamped(complete))));
+    fn completed(&self, state: &State, complete: &vllm::GenerateComplete) -> Result<(), Status> {
+        match self.media_identity.as_deref() {
+            Some(identity) if self.ec_producer_leg => {
+                encoder_cache::check_producer_handles(&state.model, identity, complete)
             }
-            let item = match poll_engine_item(&mut this.inner, &mut this.metrics, cx) {
-                ControlFlow::Continue(item) => item,
-                ControlFlow::Break(poll) => return poll,
-            };
-            if let Some((tokens, start, end)) = this
-                .inner
-                .as_mut()
-                .and_then(|inner| inner.take_prefill_sample())
-            {
-                this.state
-                    .shared
-                    .loads
-                    .prefill_computed(this.load.rank(), tokens, start, end);
-            }
-            let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
-            else {
-                // The engine's own terminal `Complete` (or an empty response)
-                // passes through as-is; the engine stream ends after it, and
-                // the choice is no longer open once the `Complete` is out (a
-                // shutdown landing before the next poll must not cut it; the
-                // engine stream has already seen the finish, so dropping it
-                // sends no abort).
-                let mut ended = false;
-                if let Some(vllm::generate_response::Response::Complete(complete)) =
-                    item.response.as_ref()
-                {
-                    this.load.count_prompt(
-                        &this.state.shared.loads,
-                        &this.request_id,
-                        complete.prompt_tokens,
-                        complete.cached_tokens,
-                        Instant::now(),
-                    );
-                    this.metrics.complete(
-                        &complete.finish_reason,
-                        complete.prompt_tokens,
-                        complete.cached_tokens,
-                    );
-                    ended = true;
-                    if this.ec_producer_leg {
-                        if let Some(identity) = this.media_identity.as_deref() {
-                            if let Err(status) = encoder_cache::check_producer_handles(
-                                &this.state.model,
-                                identity,
-                                complete,
-                            ) {
-                                this.inner = None;
-                                this.metrics.failed(status.code());
-                                return Poll::Ready(Some(Err(status)));
-                            }
-                        }
-                    }
-                }
-                let response = this.stamped(item);
-                if ended {
-                    this.inner = None;
-                }
-                return Poll::Ready(Some(Ok(response)));
-            };
-            let tokens = u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX);
-            // The metrics' clock read serves the load tracker's window too.
-            let at = this
-                .metrics
-                .chunk(tokens, chunk.prompt_tokens, chunk.cached_tokens)
-                .unwrap_or_else(Instant::now);
-            let loads = &this.state.shared.loads;
-            this.load.count_prompt(
-                loads,
-                &this.request_id,
-                chunk.prompt_tokens,
-                chunk.cached_tokens,
-                at,
-            );
-            this.load.generated(loads, tokens, at);
-            let matched = match this.stops.feed(&chunk.token_ids) {
-                Ok(matched) => matched,
-                Err(status) => {
-                    this.inner = None;
-                    this.metrics.failed(status.code());
-                    return Poll::Ready(Some(Err(status)));
-                }
-            };
-            {
-                if let Some(matched) = matched {
-                    if let Some(inner) = this.inner.as_mut() {
-                        // A stop string that is also a single token reaches the
-                        // engine as a stop id, so the engine may finish on the
-                        // very tick the string matched. Its parked `Complete`
-                        // already holds the accumulated ids and logprobs; let
-                        // it through instead of synthesizing an empty one.
-                        if !inner.has_parked_complete() {
-                            this.pending = Some(inner.complete_with_matched_stop(matched));
-                            this.metrics.string_stop();
-                        }
-                    }
-                    if !this.streaming {
-                        continue;
-                    }
-                    // The triggering delta goes out first, as vLLM's own
-                    // frontend delivers the step that matched.
-                    return Poll::Ready(Some(Ok(item)));
-                }
-            }
-            if !this.streaming {
-                continue;
-            }
-            return Poll::Ready(Some(Ok(item)));
+            _ => Ok(()),
         }
     }
 }

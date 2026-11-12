@@ -76,9 +76,13 @@ async fn removed_worker_series_leave_the_scrape() {
         "one family header per metric name:\n{body}"
     );
 
-    assert!(registry.remove(&worker_id).is_some());
+    let removed = registry
+        .remove(&worker_id)
+        .expect("the registration is removed");
     // Writes that arrive after the removal: a health check that raced it,
-    // the outcome of a request that was in flight.
+    // the outcome of a request that was in flight. Their writers hold the
+    // worker, as every path that can write for an address does; the store
+    // keeps the address retired while any of them can.
     Metrics::set_worker_health(URL, true);
     Metrics::record_worker_cb_outcome(URL, "failure");
     let body = scrape(addr).await;
@@ -86,6 +90,7 @@ async fn removed_worker_series_leave_the_scrape() {
         worker_lines(&body).is_empty(),
         "series of the removed worker still in the scrape:\n{body}"
     );
+    drop(removed);
 
     // The same address registered again (a pod IP reused) records again,
     // from fresh series.
@@ -98,8 +103,15 @@ async fn removed_worker_series_leave_the_scrape() {
         has_family(&lines, "smg_worker_health{") && has_family(&lines, "smg_worker_cb_state{"),
         "series missing after re-registration:\n{body}"
     );
+    // The removed registration's count (closed -> open, 1) never returns.
+    // The fresh breaker publishes its transition counters at zero while it is
+    // built: once the removed instance is gone from every handle, the store
+    // has forgotten the address and those zeros stand, as for any new worker.
     assert!(
-        !has_family(&lines, "smg_worker_cb_transitions_total{"),
+        lines
+            .iter()
+            .filter(|line| line.starts_with("smg_worker_cb_transitions_total{"))
+            .all(|line| line.ends_with(" 0")),
         "the removed registration's counter came back:\n{body}"
     );
 }

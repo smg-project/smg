@@ -1,6 +1,6 @@
 [package]
 name = "llm-multimodal"
-version = "1.15.0"
+version = "1.16.0"
 edition = "2021"
 description = "Multimodal processing for vision and other modalities"
 license = "Apache-2.0"
@@ -78,6 +78,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # The wire benchmark measures the process's CPU time.
 rustix = { version = "1", default-features = false, features = ["time"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+# The baseline harness runs the gateway's allocator (jemalloc with the gateway's options), so its cells read the
+# page-return policy production runs, not the system allocator's. Guarded like the gateway's own edge, and built
+# with the statistics the `smg` executable builds it with.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dev-dependencies]
+tikv-jemallocator = { workspace = true, features = ["stats"] }
 
 [build-dependencies]
 cc = "1"

@@ -815,6 +815,17 @@ fn process_content_format_with_order(
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
 
             if let Some(obj) = message_json.as_object_mut() {
+                // The engines' chat utils build an assistant turn for the
+                // template from its content, tool calls, reasoning and name. A
+                // replayed refusal, audio reference or deprecated function call
+                // is kept for an upstream and left out here, so the prompt is
+                // the one the engine itself renders.
+                if obj.get("role").and_then(Value::as_str) == Some("assistant") {
+                    for key in ["refusal", "audio", "function_call"] {
+                        obj.remove(key);
+                    }
+                }
+
                 // skip_serializing_none omits content when None (a tool-call-only
                 // assistant turn, the OpenAI shape), and a function result with
                 // `content: null` keeps its null on the wire. The engine's chat

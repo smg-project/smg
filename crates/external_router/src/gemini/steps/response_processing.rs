@@ -9,7 +9,10 @@ use axum::{
 };
 use serde_json::Value;
 
-use crate::gemini::{context::RequestContext, state::StepResult};
+use crate::{
+    gemini::{context::RequestContext, state::StepResult},
+    json_utils::is_missing_or_empty,
+};
 
 /// Finalize the non-streaming response and return it to the client.
 ///
@@ -61,13 +64,5 @@ fn patch_response_metadata(response_json: &mut Value, ctx: &RequestContext) {
                 Value::String(prev_id.clone()),
             );
         }
-    }
-}
-
-/// Check if a JSON value is missing, null, or an empty string.
-fn is_missing_or_empty(value: Option<&Value>) -> bool {
-    match value {
-        None => true,
-        Some(v) => v.is_null() || v.as_str().is_some_and(|s| s.is_empty()),
     }
 }

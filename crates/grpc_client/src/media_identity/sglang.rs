@@ -1,13 +1,52 @@
-//! Early, pixel-less SGLang PD preprocessing identity. A failed check leaves
-//! the original reference request untouched so its worker can process it.
+//! The SGLang wire's identity: its batch message under the rule, and the
+//! check the two sides of a disaggregated request share (a version, the
+//! processor's key, the request's digest), early, before either scheduler
+//! waits for its KV peer. A failed check leaves the original reference
+//! request untouched so its worker can process it.
 use prost::Message;
 use sha2::{Digest, Sha256};
 
+use super::{Batch, Kept};
 use crate::sglang_proto::{GenerateRequest, MediaIdentity, MultimodalInputs};
 
+/// The worker label both sides advertise their processor contract under.
 pub const LABEL: &str = "sglang_media_identity";
+/// The contract's version; an identity of another is declined.
 pub const VERSION: u32 = 1;
 const MAX_IDENTITY_BYTES: usize = 4 * 1024 * 1024;
+
+impl Batch for MultimodalInputs {
+    /// The batch's one feature hash.
+    fn hashed(&self) -> bool {
+        self.feature_hash.is_some()
+    }
+
+    /// Every tensor on this wire is inline bytes.
+    fn readable(&self, key: &str) -> bool {
+        self.model_specific_tensors.contains_key(key)
+    }
+
+    /// This wire slices no tensor by a sizes tensor.
+    fn sizes_key(&self, _key: &str) -> Option<&str> {
+        None
+    }
+
+    fn without_pixels(&self, kept: &Kept) -> Self {
+        Self {
+            modalities: self.modalities.clone(),
+            model_specific_tensors: self
+                .model_specific_tensors
+                .iter()
+                .filter(|(key, _)| kept.has(key))
+                .map(|(key, tensor)| (key.clone(), tensor.clone()))
+                .collect(),
+            im_token_id: self.im_token_id,
+            mm_placeholders: self.mm_placeholders.clone(),
+            feature_hash: self.feature_hash,
+            ..Default::default()
+        }
+    }
+}
 
 /// Recognize reference-only inputs without raw media or processor tensors.
 pub fn has_media_refs(req: &GenerateRequest) -> bool {
@@ -140,18 +179,14 @@ pub fn validate(identity: &MediaIdentity, req: &GenerateRequest, key: &str) -> b
     })
 }
 
-/// Clone metadata while dropping reference-counted pixel storage from the control response.
-pub fn pixel_less(mm: &MultimodalInputs) -> MultimodalInputs {
-    let mut identity = mm.clone(); // Tensor bytes are reference counted.
-    identity.pixel_values = None;
-    identity
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sglang_proto::{
-        DisaggregatedParams, PlaceholderRange, SamplingParams, TensorData, TokenizedInput,
+    use crate::{
+        media_identity::identity,
+        sglang_proto::{
+            DisaggregatedParams, PlaceholderRange, SamplingParams, TensorData, TokenizedInput,
+        },
     };
 
     #[test]
@@ -220,6 +255,38 @@ mod tests {
             mm_inputs: Some(mm),
         };
         (req, identity)
+    }
+
+    /// The processed batch's identity keeps the grid alone of its tensors,
+    /// with the placeholders, the token id, the modalities and the feature
+    /// hash, and passes the wire's check; a batch without the feature hash
+    /// has none.
+    #[test]
+    fn the_identity_keeps_the_grid_alone_and_passes_the_check() {
+        let (req, bound) = fixture();
+        let mut processed = bound.mm_inputs.clone().unwrap();
+        processed.pixel_values = Some(TensorData::default());
+        processed
+            .model_specific_tensors
+            .insert("aspect_ratios".into(), TensorData::default());
+        let stripped = identity(&processed).expect("an identity");
+        assert!(stripped.pixel_values.is_none());
+        assert_eq!(
+            stripped.model_specific_tensors.keys().collect::<Vec<_>>(),
+            ["image_grid_thw"]
+        );
+        assert_eq!(stripped.mm_placeholders, processed.mm_placeholders);
+        assert_eq!(stripped.im_token_id, Some(7));
+        assert_eq!(stripped.modalities, ["image"]);
+        assert_eq!(stripped.feature_hash, Some(u64::MAX));
+        let checked = MediaIdentity {
+            mm_inputs: Some(stripped),
+            ..bound
+        };
+        assert!(validate(&checked, &req, "key"));
+
+        processed.feature_hash = None;
+        assert!(identity(&processed).is_none());
     }
 
     #[test]

@@ -3,10 +3,11 @@ use openai_protocol::{
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
 use crate::{
+    channel::Channel,
     request_fields::{
         body_format, completion_constraint, logit_bias_by_token_id, plain_constraint, stop_strings,
         ConstraintKind, OutputConstraint, PlainSampling,
@@ -72,22 +73,7 @@ impl VllmEngineClient {
         }
     }
 
-    /// Abort a request
-    pub async fn abort_request(
-        &self,
-        request_id: String,
-        _reason: String,
-    ) -> Result<(), tonic::Status> {
-        debug!("Sending abort request for {}", request_id);
-        let request = Request::new(proto::AbortRequest {
-            request_ids: vec![request_id.clone()],
-        });
-
-        let mut client = self.client.clone();
-        let _response = client.abort(request).await?;
-        debug!("Abort response received for {}", request_id);
-        Ok(())
-    }
+    crate::impl_abort_without_reason!(proto);
 
     crate::impl_admin_ops!();
     crate::impl_get_tokenizer!();
@@ -239,8 +225,8 @@ impl VllmEngineClient {
         let mut constraints = Vec::new();
 
         let format = body_format(request, set_aside)?;
-        if let Some(schema) = format.schema {
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema));
+        if let Some(constraint) = Self::constraint_of(format.format) {
+            constraints.push(constraint);
         }
 
         // vLLM supports: json_schema, regex, grammar, structural_tag, json_object, choice
@@ -430,21 +416,7 @@ impl VllmEngineClient {
         }
     }
 
-    /// Submit an embedding request
-    pub async fn embed(
-        &self,
-        req: proto::EmbedRequest,
-    ) -> Result<proto::EmbedResponse, tonic::Status> {
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.embed(request).await?;
-        Ok(response.into_inner())
-    }
+    crate::impl_embed!(proto);
 
     fn build_grpc_sampling_params_from_completion(
         request: &CompletionRequest,
@@ -490,6 +462,9 @@ impl VllmEngineClient {
             ConstraintKind::JsonSchema => proto::sampling_params::Constraint::JsonSchema(value),
             ConstraintKind::Regex => proto::sampling_params::Constraint::Regex(value),
             ConstraintKind::Ebnf => proto::sampling_params::Constraint::Grammar(value),
+            ConstraintKind::StructuralTag => {
+                proto::sampling_params::Constraint::StructuralTag(value)
+            }
         })
     }
 
@@ -533,42 +508,8 @@ impl VllmEngineClient {
 // Proto → protocol type conversions (load metrics)
 // ---------------------------------------------------------------------------
 
-impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
-    /// Preserve the rank's measured input capacity separately from generation rate.
-    fn from(load: proto::SchedulerLoad) -> Self {
-        Self {
-            dp_rank: load.dp_rank,
-            num_running_reqs: load.num_running_reqs,
-            num_waiting_reqs: load.num_waiting_reqs,
-            num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
-            num_total_reqs: load.num_total_reqs,
-            num_used_tokens: load.num_used_tokens,
-            max_total_num_tokens: load.max_total_num_tokens,
-            token_usage: load.token_usage,
-            gen_throughput: load.gen_throughput,
-            prefill_throughput: load.prefill_throughput,
-            cache_hit_rate: load.cache_hit_rate,
-            utilization: load.utilization,
-            max_running_requests: load.max_running_requests,
-            // vLLM disagg mapping is out of scope here; canonical PD fields
-            // stay None until the vLLM proto exposes them.
-            ..Default::default()
-        }
-    }
-}
-
-impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
-    fn from(resp: proto::GetLoadsResponse) -> Self {
-        Self {
-            timestamp: resp.timestamp,
-            version: resp.version,
-            dp_rank_count: resp.dp_rank_count,
-            loads: resp.loads.into_iter().map(Into::into).collect(),
-            aggregate: None,
-            sampled_at: None,
-        }
-    }
-}
+// The disaggregation fields stay absent until this wire exposes them.
+crate::impl_rank_load_conversions!(proto);
 
 #[cfg(test)]
 mod tests {
@@ -1022,6 +963,10 @@ mod tests {
             (
                 ConstraintKind::Ebnf,
                 proto::sampling_params::Constraint::Grammar("v".to_string()),
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                proto::sampling_params::Constraint::StructuralTag("v".to_string()),
             ),
         ] {
             assert_eq!(

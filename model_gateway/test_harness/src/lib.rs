@@ -358,7 +358,8 @@ impl AppTestContext {
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();
-            let manager = Gateway::new(app_context.worker_registry.clone());
+            let manager = Gateway::new(app_context.worker_registry.clone())
+                .with_policies(app_context.policy_registry.clone());
             let router_id = Gateway::determine_router_id(&config.mode, config.connection_mode);
             let manager = Arc::new(manager);
             manager.register_router(router_id, Arc::from(inner_router));
@@ -473,10 +474,14 @@ async fn build_test_app_context(
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::with_override(
-        config.policy.clone(),
-        config.routing_key_override.clone(),
-    ));
+    let policy_registry = Arc::new(
+        PolicyRegistry::with_override(config.policy.clone(), config.routing_key_override.clone())
+            .with_policy_engine(
+                config.policy_engine,
+                config.mode.get_prefill_policy(&config.policy),
+                config.mode.get_decode_policy(&config.policy),
+            ),
+    );
 
     // Initialize storage backends (Memory for tests, unless the caller brought
     // its own: a history store that is down, for one).

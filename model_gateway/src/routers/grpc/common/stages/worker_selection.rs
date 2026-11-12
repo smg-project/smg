@@ -826,7 +826,7 @@ impl WorkerSelectionStage {
 
     /// Keep known grid-bearing decode identities on vision-capable workers.
     /// EPD references are unresolved: prefer vision when available, but let
-    /// dispatch validate the resulting identity before using a stripped leg.
+    /// dispatch validate the resulting identity before using a stripped decode request.
     fn decode_side_needs_vision(
         &self,
         request: &RequestType,
@@ -1328,7 +1328,7 @@ impl WorkerSelectionStage {
     /// 404 of a model nobody serves.
     fn role_missing(model_id: &str, missing: &[&'static str]) -> Response {
         placement::no_available_workers(format!(
-            "No {} worker is registered for model '{model_id}' at the moment (its other leg \
+            "No {} worker is registered for model '{model_id}' at the moment (its other side \
              is): the pair is incomplete",
             missing.join(" or ")
         ))
@@ -1438,10 +1438,10 @@ impl WorkerSelectionStage {
         response
     }
 
-    /// Workers serve the model but none of the leg's workers processes media
+    /// Workers serve the model but none of the pool's workers processes media
     /// references. Preparation answers this verdict for the pool as
     /// registered (`multimodal::resolve_mm_processing`); here it is the
-    /// backstop for a pool that changed in between, or a disaggregated leg
+    /// backstop for a pool that changed in between, or a disaggregated side
     /// none of whose workers does. Terminal: capability cannot change within
     /// a retry window. Its one rate-limited line is written by
     /// [`Self::report_refusal`] at the stage's entry points, like the pool's
@@ -3130,6 +3130,16 @@ mod tests {
         )))
     }
 
+    /// The gRPC wire constraint of a `runtime` worker: no media refs, any pipeline.
+    fn grpc_wire(runtime: RuntimeType) -> WireConstraint {
+        WireConstraint {
+            runtime,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+            pipeline: PipelinePin::Any,
+        }
+    }
+
     /// A retry context with a retained wire and no extra request constraints.
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
@@ -3212,15 +3222,7 @@ mod tests {
             None,
         );
 
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
         for _ in 0..8 {
             stage
                 .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
@@ -3277,15 +3279,7 @@ mod tests {
             WorkerSelectionMode::Regular,
             None,
         );
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::TokenSpeed,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
         let decided_on = |worker: &Arc<dyn Worker>| {
             utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
                 worker: Arc::clone(worker),
@@ -3384,15 +3378,7 @@ mod tests {
                 mode,
                 None,
             );
-            let mut ctx = dispatch_ctx(
-                model_id,
-                WireConstraint {
-                    runtime: RuntimeType::TokenSpeed,
-                    connection: ConnectionMode::Grpc,
-                    requires_media_refs: false,
-                    pipeline: PipelinePin::Any,
-                },
-            );
+            let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
             ctx.constraint_decided_on =
                 Some(utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
                     worker: Arc::clone(&workers[2]),
@@ -3469,15 +3455,7 @@ mod tests {
                 mode,
                 None,
             );
-            let mut ctx = dispatch_ctx(
-                model_id,
-                WireConstraint {
-                    runtime: RuntimeType::TokenSpeed,
-                    connection: ConnectionMode::Grpc,
-                    requires_media_refs: false,
-                    pipeline: PipelinePin::Any,
-                },
-            );
+            let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
             let prep = PreparationOutput::Generate {
                 original_text: None,
                 token_ids: vec![7; 24],
@@ -3554,15 +3532,7 @@ mod tests {
             WorkerSelectionMode::Regular,
             None,
         );
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
         let mut headers = HeaderMap::new();
         headers.insert("x-smg-routing-key", "session-42".parse().unwrap());
         ctx.headers = Some(headers);
@@ -3666,15 +3636,7 @@ mod tests {
             None,
         );
 
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
         for _ in 0..8 {
             stage
                 .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
@@ -3733,15 +3695,7 @@ mod tests {
             WorkerSelectionMode::Regular,
             None,
         );
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
 
         let response = stage
             .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
@@ -3788,12 +3742,7 @@ mod tests {
             WorkerSelectionMode::Regular,
             None,
         );
-        let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
-            requires_media_refs: false,
-            pipeline: PipelinePin::Any,
-        };
+        let wire = grpc_wire(RuntimeType::Vllm);
         let namespace = |salt: &str| {
             CacheNamespace::derive(&CachePartition {
                 cache_salt: Some(salt),
@@ -3847,10 +3796,8 @@ mod tests {
                 let mut ctx = dispatch_ctx(
                     "epd-retry",
                     WireConstraint {
-                        runtime: RuntimeType::Vllm,
-                        connection: ConnectionMode::Grpc,
                         requires_media_refs: refs,
-                        pipeline: PipelinePin::Any,
+                        ..grpc_wire(RuntimeType::Vllm)
                     },
                 );
                 let request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
@@ -4271,7 +4218,7 @@ mod tests {
                                 None
                             )
                             .is_ok(),
-                        "unresolved refs may use a stripped decode leg when no vision D exists"
+                        "unresolved refs may use a stripped decode request when no vision D exists"
                     );
                 }
             }
@@ -4341,10 +4288,8 @@ mod tests {
         }
 
         let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
             requires_media_refs: true,
-            pipeline: PipelinePin::Any,
+            ..grpc_wire(RuntimeType::Vllm)
         };
         let worker = stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -4405,10 +4350,8 @@ mod tests {
         );
         // The wire pin alone carries the media-refs fact on retries.
         let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
             requires_media_refs: true,
-            pipeline: PipelinePin::Any,
+            ..grpc_wire(RuntimeType::Vllm)
         };
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -4577,10 +4520,9 @@ mod tests {
             let mut ctx = dispatch_ctx(
                 model_id,
                 WireConstraint {
-                    runtime: RuntimeType::Vllm,
-                    connection: ConnectionMode::Grpc,
                     requires_media_refs: true,
                     pipeline: pin,
+                    ..grpc_wire(RuntimeType::Vllm)
                 },
             );
             for _ in 0..6 {
@@ -4814,12 +4756,7 @@ mod tests {
             ))
             .unwrap();
         let stage = regular_stage(Arc::clone(&worker_registry));
-        let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
-            requires_media_refs: false,
-            pipeline: PipelinePin::Any,
-        };
+        let wire = grpc_wire(RuntimeType::Vllm);
 
         let stage = &stage;
         let reselected = |needs_vision: bool| async move {
@@ -5687,12 +5624,7 @@ mod tests {
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
-        let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
-            requires_media_refs: false,
-            pipeline: PipelinePin::Any,
-        };
+        let wire = grpc_wire(RuntimeType::Vllm);
 
         let stage = &stage;
         let prefill_workers = |needs_vision: bool| async move {
@@ -6339,12 +6271,7 @@ mod tests {
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
-        let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
-            requires_media_refs: false,
-            pipeline: PipelinePin::Any,
-        };
+        let wire = grpc_wire(RuntimeType::Vllm);
 
         let stage = &stage;
         let decode_workers = |decode_needs_vision: bool| async move {

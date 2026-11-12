@@ -17,7 +17,7 @@ use engine_zmq_client::{
             EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics,
             StopReason,
         },
-        request::{EngineCoreRequest, MmFeaturesPayload},
+        request::{EngineCoreRequest, MmFeaturesPayload, ReasoningParserKwargs},
         sampling::EngineCoreSamplingParams,
         structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
     },
@@ -628,7 +628,7 @@ fn translate_batches_for(
     if batches.is_empty() {
         return Ok(TranslatedMedia::default());
     }
-    // A pixel-less batch is a remote leg's: a PD decode side's (remote KV) or
+    // A pixel-less batch is a remote side's: a PD decode side's (remote KV) or
     // an encoder-cache consumer's (the encoder's handles).
     let has_remote_transfer =
         kv_transfer_params(req)?.is_some() || ec_transfer_params(req)?.is_some();
@@ -724,6 +724,17 @@ pub(crate) fn translate_request_with_media(
     eos: &EosTokenIds,
     support: StructuredOutputsSupport,
 ) -> Result<EngineCoreRequest, String> {
+    let reasoning_parser_kwargs = req
+        .chat_template_kwargs_json
+        .as_deref()
+        .map(|json| {
+            serde_json::from_str(json)
+                .map(|chat_template_kwargs| ReasoningParserKwargs {
+                    chat_template_kwargs,
+                })
+                .map_err(|error| format!("invalid chat_template_kwargs_json: {error}"))
+        })
+        .transpose()?;
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
@@ -779,6 +790,7 @@ pub(crate) fn translate_request_with_media(
         data_parallel_rank,
         cache_salt,
         reasoning_ended: grammar_from_first_token.then_some(true),
+        reasoning_parser_kwargs,
         ..EngineCoreRequest::default()
     })
 }
@@ -838,8 +850,8 @@ pub(crate) fn ec_transfer_params(
 }
 
 /// The connector params as `SamplingParams.extra_args`, where vLLM's own
-/// frontend puts them: a PD leg's KV-transfer params, an encode-prefill-decode
-/// leg's encoder-cache params, either or both; `None` without any.
+/// frontend puts them: a PD request's KV-transfer params, an encode-prefill-decode
+/// request's encoder-cache params, either or both; `None` without any.
 fn connector_extra_args(
     kv_transfer_params: Option<serde_json::Value>,
     ec_transfer_params: Option<serde_json::Value>,

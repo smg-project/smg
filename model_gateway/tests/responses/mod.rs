@@ -5,3 +5,4 @@ mod history_tenant_scope_test;
 mod mcp_test;
 mod responses_history_test;
 mod stored_response_persist_test;
+mod unsupported_input_parts_test;

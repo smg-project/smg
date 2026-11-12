@@ -2455,17 +2455,23 @@ fn the_block_scan_counts_the_bytes_the_byte_wise_scan_counted() {
     // other, and a difference at every byte of every such pair: the difference
     // falls on each side of every word edge and inside the tail under one word.
     let text: Vec<u8> = (0..40u8).map(|i| b'a' + i % 26).collect();
-    for len_a in 0..=text.len() {
-        for len_b in 0..=text.len() {
-            let a = &text[..len_a];
-            let b = &text[..len_b];
+    assert_scan_is_byte_wise(&text, 0..=text.len());
+}
+
+/// Every pair of the lengths, equal and one a prefix of the other, counts as
+/// the byte-wise scan counts, and a difference written at every byte of every
+/// such pair is found there, in both orders.
+fn assert_scan_is_byte_wise(text: &[u8], lengths: impl Iterator<Item = usize> + Clone) {
+    for len_a in lengths.clone() {
+        for len_b in lengths.clone() {
+            let (a, b) = (&text[..len_a], &text[..len_b]);
             assert_eq!(
                 common_byte_prefix(a, b),
                 byte_wise_prefix(a, b),
                 "{len_a} {len_b}"
             );
             for at in 0..len_a.min(len_b) {
-                let mut b = text[..len_b].to_vec();
+                let mut b = b.to_vec();
                 b[at] = b'#';
                 assert_eq!(common_byte_prefix(a, &b), at, "{len_a} {len_b} {at}");
                 assert_eq!(common_byte_prefix(&b, a), at, "{len_a} {len_b} {at}");
@@ -2482,7 +2488,18 @@ fn the_scans_count_whole_characters_around_the_word_edges() {
     // (the difference inside a character), by one of another width, or by
     // ending there (a prefix). The character count and the byte offset are the
     // character-wise walk's, in both argument orders.
-    let cases: [(char, char, char); 3] = [('é', 'è', 'z'), ('中', '丮', 'é'), ('😀', '😁', '中')];
+    // The near character differs in the last byte (the three first cases),
+    // in the second byte of a three- and a four-byte character, and in the
+    // third byte of a four-byte character: every byte position of a
+    // character where the scan can stop.
+    let cases: [(char, char, char); 6] = [
+        ('é', 'è', 'z'),
+        ('中', '丮', 'é'),
+        ('😀', '😁', '中'),
+        ('中', '乐', 'é'),
+        ('😀', '𐀀', '中'),
+        ('😀', '🙀', '中'),
+    ];
     for (wide, near, other) in cases {
         for lead in 0..=8 {
             for count in 0..=12 {
@@ -2579,4 +2596,85 @@ fn the_match_counts_the_input_on_every_way_a_walk_stops() {
             "{probe:?}"
         );
     }
+}
+
+#[test]
+fn the_walks_advance_to_the_character_boundary_the_scan_found() {
+    // Entries that end on two-, three- and four-byte characters after a lead
+    // of up to a word of ASCII, so the advance past an entry lands on a
+    // boundary at and across the eight-byte edges; a second entry splits
+    // after the wide run and a third inside it. The insert descent, the
+    // routing match and the per-tenant match advance by the byte offset the
+    // scan found: the matched counts, the tenants and the entries' texts read
+    // back as the character-wise advance gave them, and a re-insert of the
+    // first entry under a new tenant descends through full matches only.
+    for (wide, near) in [('é', 'è'), ('中', '丮'), ('😀', '😁')] {
+        for lead in 0..=8 {
+            for count in 1..=10 {
+                let tree = Tree::new();
+                let head: String = std::iter::repeat_n('a', lead)
+                    .chain(std::iter::repeat_n(wide, count))
+                    .collect();
+                let first = format!("{head}-first");
+                let second = format!("{head}-second");
+                let mut inside: Vec<char> = head.chars().collect();
+                *inside.last_mut().unwrap() = near;
+                let inside: String = inside.into_iter().collect();
+                tree.insert_text(&first, "t1");
+                tree.insert_text(&second, "t2");
+                tree.insert_text(&inside, "t3");
+                let head_chars = lead + count;
+                let case = format!("{wide:?} lead {lead} count {count}");
+
+                let result = tree.match_prefix_with_counts(&first);
+                assert_eq!(result.matched_char_count, head_chars + 6, "{case}");
+                assert_eq!(result.input_char_count, head_chars + 6, "{case}");
+                assert_eq!(result.tenant.as_ref(), "t1", "{case}");
+                let result = tree.match_prefix_with_counts(&format!("{head}-sec"));
+                assert_eq!(result.matched_char_count, head_chars + 4, "{case}");
+                assert_eq!(result.input_char_count, head_chars + 4, "{case}");
+                let result = tree.match_prefix_with_counts(&inside);
+                assert_eq!(result.matched_char_count, head_chars, "{case}");
+                assert_eq!(result.tenant.as_ref(), "t3", "{case}");
+                let result = tree.match_prefix_with_counts(&head);
+                assert_eq!(result.matched_char_count, head_chars, "{case}");
+                assert_eq!(result.input_char_count, head_chars, "{case}");
+
+                assert_eq!(tree.prefix_match_tenant(&second, "t2"), second, "{case}");
+                assert_eq!(tree.prefix_match_tenant(&first, "t1"), first, "{case}");
+                assert_eq!(tree.prefix_match_tenant(&inside, "t3"), inside, "{case}");
+
+                // A re-insert descends through full matches only: the common
+                // prefix (when the head has more than one character), the last
+                // wide character with the dash, and the leaf.
+                tree.insert_text(&first, "t4");
+                assert_eq!(tree.prefix_match_tenant(&first, "t4"), first, "{case}");
+
+                let mut paths: Vec<String> = tree.iter_entries().map(|(path, _)| path).collect();
+                paths.sort();
+                let common: String = head.chars().take(head_chars - 1).collect();
+                let shared = format!("{head}-");
+                let mut expected: Vec<String> =
+                    vec![String::new(), common, shared, first, second, inside];
+                expected.sort();
+                expected.dedup();
+                assert_eq!(paths, expected, "{case}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_block_scan_skips_whole_chunks_and_finds_the_byte_after_them() {
+    // Lengths at and beyond the 32- and 64-byte edges (both operands, equal and
+    // one a prefix of the other) and a difference at every byte of every such
+    // pair: the difference falls inside the first chunk, exactly on a chunk
+    // edge, after whole chunks, and in the words and the tail after the last
+    // chunk. The count is the byte-wise scan's, in both orders.
+    let text: Vec<u8> = (0..200u8).map(|i| b'a' + i % 26).collect();
+    let lengths = [
+        0, 1, 7, 8, 9, 31, 32, 33, 40, 63, 64, 65, 72, 95, 96, 97, 127, 128, 129, 136, 191, 192,
+        193, 200,
+    ];
+    assert_scan_is_byte_wise(&text, lengths.into_iter());
 }

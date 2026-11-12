@@ -244,6 +244,9 @@ message GenerateRequest {
   // Set only when the router skipped multimodal processing. Mutually
   // exclusive with mm_inputs; requires `tokenized` input.
   MediaRefs media_refs = 10;
+
+  // Effective chat-template kwargs consumed by the engine reasoning parser.
+  optional string chat_template_kwargs_json = 13;
 }
 
 // KV cache transfer parameters for Mooncake PD disaggregation

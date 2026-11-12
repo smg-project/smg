@@ -18,6 +18,8 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use llm_tokenizer::chat_template::ThinkingKeyName;
+use openai_protocol::{common::ResponseFormat, profile::ProviderProfile};
 use smg_grpc_client::FormatSetAside;
 use tracing::error;
 
@@ -29,7 +31,7 @@ use crate::routers::{
         common::stages::helpers::{self, SamplingDefaultsMask, TagForStart},
         context::{
             stage_output, AttemptStamp, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-            RequestContext,
+            RequestContext, RequestType,
         },
         proto_wrapper::{MultimodalData, ProtoGenerateRequest},
         utils,
@@ -164,6 +166,20 @@ pub(crate) fn build(
         )
     })?;
 
+    if let ProtoGenerateRequest::Vllm(request) = &mut proto_request {
+        let provider = ctx
+            .state
+            .provider
+            .unwrap_or_else(|| ProviderProfile::for_model(model));
+        let key = ctx
+            .state
+            .tokenizer
+            .as_ref()
+            .and_then(|t| t.thinking_key_name());
+        request.chat_template_kwargs_json =
+            thinking_mode_kwargs(&ctx.input.request_type, provider, key);
+    }
+
     let sampling_baseline = helpers::apply_sampling_defaults(
         &mut proto_request,
         sampling_mask,
@@ -179,6 +195,7 @@ pub(crate) fn build(
             tool_parser.as_deref(),
             first_token_tag,
             &proto_request,
+            own_format(&ctx.input.request_type, format_set_aside),
         ),
     };
     Ok((
@@ -191,4 +208,102 @@ pub(crate) fn build(
             tool_constraint,
         },
     ))
+}
+
+/// The body's own `response_format` as the builder read it: a chat body's,
+/// unless the constraint set it aside (`FormatSetAside::response_format`).
+fn own_format(request: &RequestType, set_aside: FormatSetAside) -> Option<&ResponseFormat> {
+    match request {
+        RequestType::Chat(chat) if !set_aside.response_format => chat.response_format.as_ref(),
+        _ => None,
+    }
+}
+
+/// Match the template's tri-state switch, including explicit kwargs precedence.
+/// A missing mode stays absent so the engine retains its adaptive default.
+fn thinking_mode_kwargs(
+    request: &RequestType,
+    provider: ProviderProfile,
+    key: Option<ThinkingKeyName>,
+) -> Option<String> {
+    if key != Some(ThinkingKeyName::ThinkingMode) {
+        return None;
+    }
+    let thinking = match request {
+        RequestType::Chat(request) => {
+            if let Some(mode) = request
+                .chat_template_kwargs
+                .as_ref()
+                .and_then(|k| k.get("thinking_mode"))
+            {
+                return Some(serde_json::json!({"thinking_mode": mode}).to_string());
+            }
+            request.template_thinking_for(provider)
+        }
+        RequestType::Messages(request) => request.template_thinking_for(provider),
+        _ => None,
+    }?;
+    Some(
+        serde_json::json!({"thinking_mode": if thinking { "enabled" } else { "disabled" }})
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Match the rendered tri-state mode and leave other template switches untouched.
+    #[test]
+    fn minimax_thinking_mode_matches_template_precedence() {
+        for (mut body, expected) in [
+            (json!({}), None),
+            (json!({"thinking": {"type": "adaptive"}}), None),
+            (
+                json!({"thinking": {"type": "enabled"}}),
+                Some(json!("enabled")),
+            ),
+            (
+                json!({"thinking": {"type": "disabled"}}),
+                Some(json!("disabled")),
+            ),
+            (
+                json!({"thinking": {"type": "enabled"}, "chat_template_kwargs": {"thinking_mode": "adaptive"}}),
+                Some(json!("adaptive")),
+            ),
+            (
+                json!({"thinking": {"type": "disabled"}, "chat_template_kwargs": {"thinking_mode": "enabled"}}),
+                Some(json!("enabled")),
+            ),
+            (
+                json!({"chat_template_kwargs": {"thinking_mode": null}}),
+                Some(json!(null)),
+            ),
+            (json!({"reasoning_effort": "none"}), None),
+        ] {
+            body["model"] = json!("minimax-m3");
+            body["messages"] = json!([]);
+            let request = RequestType::Chat(Arc::new(serde_json::from_value(body).unwrap()));
+            let actual = thinking_mode_kwargs(
+                &request,
+                ProviderProfile::Minimax,
+                Some(ThinkingKeyName::ThinkingMode),
+            )
+            .map(|s| serde_json::from_str::<serde_json::Value>(&s).unwrap());
+            assert_eq!(actual, expected.map(|mode| json!({"thinking_mode": mode})));
+            for key in [
+                None,
+                Some(ThinkingKeyName::EnableThinking),
+                Some(ThinkingKeyName::Thinking),
+                Some(ThinkingKeyName::ReasoningEffort),
+            ] {
+                assert_eq!(
+                    thinking_mode_kwargs(&request, ProviderProfile::Minimax, key),
+                    None
+                );
+            }
+        }
+    }
 }

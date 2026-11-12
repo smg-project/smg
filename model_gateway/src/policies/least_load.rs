@@ -6,7 +6,9 @@ use std::{
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
-use rand::{rngs::StdRng, RngExt, SeedableRng};
+#[cfg(test)]
+use rand::SeedableRng;
+use rand::{rngs::StdRng, RngExt};
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -365,14 +367,6 @@ impl LeastLoadPolicy {
         )
     }
 
-    pub fn with_kv_pressure_weight(kv_pressure_weight: f64) -> Self {
-        Self::with_params(
-            kv_pressure_weight,
-            DEFAULT_MEAN_PREFILL_TOKENS,
-            DEFAULT_THROUGHPUT,
-        )
-    }
-
     pub fn with_params(
         kv_pressure_weight: f64,
         mean_prefill_tokens: u32,
@@ -396,8 +390,10 @@ impl LeastLoadPolicy {
         }
     }
 
-    /// Draw ties from a seeded generator instead of the thread's.
-    pub fn with_tie_break_seed(mut self, seed: u64) -> Self {
+    /// Draw ties from a seeded generator instead of the thread's: the tests'
+    /// determinism. Production draws from the thread's generator.
+    #[cfg(test)]
+    pub(crate) fn with_tie_break_seed(mut self, seed: u64) -> Self {
         self.tie_rng = Some(Mutex::new(StdRng::seed_from_u64(seed)));
         self
     }
@@ -1867,7 +1863,11 @@ mod tests {
     fn empty_queue_is_not_penalized() {
         // Neither backend has a queue; the estimate must not manufacture one,
         // leaving the KV barrier to decide.
-        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_kv_pressure_weight(2.0));
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(
+            2.0,
+            DEFAULT_MEAN_PREFILL_TOKENS,
+            DEFAULT_THROUGHPUT,
+        ));
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
@@ -2011,7 +2011,11 @@ mod tests {
     #[test]
     fn kv_barrier_avoids_full_worker() {
         // No queued work; the convex KV barrier steers off the near-full worker.
-        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_kv_pressure_weight(2.0));
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(
+            2.0,
+            DEFAULT_MEAN_PREFILL_TOKENS,
+            DEFAULT_THROUGHPUT,
+        ));
         let mut loads = HashMap::new();
         loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.98, 100.0));
         loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.0, 100.0));

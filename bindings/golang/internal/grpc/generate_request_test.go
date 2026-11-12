@@ -13,8 +13,8 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/lightseek/smg/go-grpc-sdk/internal/ffi"
-	"github.com/lightseek/smg/go-grpc-sdk/internal/proto"
+	"github.com/smg-project/smg/bindings/golang/internal/ffi"
+	"github.com/smg-project/smg/bindings/golang/internal/proto"
 )
 
 // A scheduler client that keeps the generate requests it is handed and

@@ -38,7 +38,7 @@ use crate::{
                     function_call_status, generation_failure_error, resolve_function_identity,
                     response_status,
                 },
-                NotStored, ResponsesContext,
+                NotStored, ReplayInto, ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
@@ -67,7 +67,13 @@ pub(crate) async fn serve_harmony_responses(
     // Load the history the request continues, as the caller's tenant may see
     // it; `request` itself stays as it came, for the persist.
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
-    let current_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
+    let current_request = load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Harmony,
+    )
+    .await?;
 
     // Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(

@@ -863,6 +863,15 @@ pub fn register(worker: &str) {
     store().workers.insert(worker.to_string());
 }
 
+/// The workers that started in this process, by name, sorted: every listener
+/// on every wire, canned or realistic. The admin fleet list walks them and
+/// joins the engines a realistic worker spawned.
+pub fn registered() -> Vec<String> {
+    let mut names: Vec<String> = store().workers.iter().cloned().collect();
+    names.sort();
+    names
+}
+
 type LoadedTokenizer = Result<Arc<dyn Tokenizer>, String>;
 static TOKENIZERS: OnceLock<Mutex<HashMap<String, LoadedTokenizer>>> = OnceLock::new();
 

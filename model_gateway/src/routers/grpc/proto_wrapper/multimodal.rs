@@ -8,6 +8,7 @@
 use std::{collections::HashMap, time::Instant};
 
 use bytes::Bytes;
+use llm_multimodal::WireBytes;
 use rand::RngExt;
 use smg_grpc_client::{
     common_proto as common, sglang_proto as sglang, tokenspeed_proto as tokenspeed,
@@ -119,7 +120,7 @@ pub struct SglangMultimodalData {
     pub extra_batches: Vec<SglangMultimodalData>,
     pub modality: String,
     pub image_data: Vec<Vec<u8>>,
-    pub pixel_values: Vec<u8>,
+    pub pixel_values: WireBytes,
     pub pixel_values_shape: Vec<u32>,
     /// The width `pixel_values` was written in, which the receiver reads it at.
     pub pixel_values_dtype: String,
@@ -132,7 +133,7 @@ pub struct SglangMultimodalData {
 /// vLLM multimodal data: preprocessed tensors with hashing and field layout metadata.
 #[derive(Debug)]
 pub struct VllmMultimodalData {
-    pub pixel_values: Vec<u8>,
+    pub pixel_values: WireBytes,
     pub pixel_values_shape: Vec<u32>,
     /// The width `pixel_values` was written in, which the receiver reads it at.
     pub pixel_values_dtype: String,
@@ -224,15 +225,15 @@ pub struct TokenSpeedTensor {
 
 #[derive(Debug, Clone)]
 pub enum TokenSpeedTensorStorage {
-    Inline(Vec<u8>),
+    Inline(WireBytes),
     Shm(common::ShmHandle),
     Remote(common::RemoteTensorHandle),
 }
 
 impl TokenSpeedTensor {
-    pub fn inline(data: Vec<u8>, shape: Vec<u32>, dtype: String) -> Self {
+    pub fn inline(data: impl Into<WireBytes>, shape: Vec<u32>, dtype: String) -> Self {
         Self {
-            storage: TokenSpeedTensorStorage::Inline(data),
+            storage: TokenSpeedTensorStorage::Inline(data.into()),
             shape,
             dtype,
         }
@@ -317,7 +318,7 @@ impl SglangMultimodalData {
             audio_data: vec![],
             modalities: vec![self.modality],
             pixel_values: Some(sglang::TensorData {
-                data: llm_multimodal::buffer_pool::recycled_bytes(self.pixel_values),
+                data: self.pixel_values.into_payload(),
                 shape: self.pixel_values_shape,
                 dtype: self.pixel_values_dtype,
             }),
@@ -358,7 +359,7 @@ impl VllmMultimodalData {
                 // Grid tensors are a few ints and must survive the PD decode
                 // clone's inline-only retention: never route them via SHM.
                 let via_shm = shm_enabled && !VLLM_MROPE_GRID_KEYS.contains(&k.as_str());
-                let payload = vllm_tensor_payload(v.data, via_shm, shm_min_bytes, None);
+                let payload = vllm_tensor_payload(v.data.into(), via_shm, shm_min_bytes, None);
                 (
                     k,
                     vllm::TensorData {
@@ -523,7 +524,7 @@ pub(super) fn tensor_bytes_to_tokenspeed(
         shape,
         dtype,
         payload: Some(tokenspeed_tensor_payload(
-            data,
+            data.into(),
             shm_enabled,
             shm_min_bytes,
             None,
@@ -534,7 +535,7 @@ pub(super) fn tensor_bytes_to_tokenspeed(
 /// Transport decision for one multimodal tensor; each backend maps it onto its
 /// own `TensorData` oneof.
 enum MmTensorPayload {
-    Inline(Vec<u8>),
+    Inline(WireBytes),
     Shm(common::ShmHandle),
     Remote(common::RemoteTensorHandle),
 }
@@ -547,19 +548,18 @@ struct MmRdmaExport<'a> {
     slot_key: i64,
 }
 
-/// Stage `data` into the RDMA arena under `slot_key`; `Ok(handle)`, or the bytes
-/// back on failure (empty tensors are never staged).
+/// Stage an immutable tensor into the RDMA arena. Empty tensors stay inline.
 fn export_rdma_tensor(
     exporter: &RdmaExporter,
     slot_key: i64,
-    data: Vec<u8>,
-) -> Result<common::RemoteTensorHandle, Vec<u8>> {
+    data: &[u8],
+) -> Option<common::RemoteTensorHandle> {
     if data.is_empty() {
-        return Err(data);
+        return None;
     }
     let nbytes = data.len() as u64;
     exporter
-        .export(slot_key, data)
+        .export_slice(slot_key, data)
         .map(|descriptor| common::RemoteTensorHandle {
             transport: "nixl".to_string(),
             descriptor,
@@ -586,14 +586,14 @@ pub(crate) fn stage_tokenspeed_tensor_rdma(
             dtype,
         };
     };
-    match export_rdma_tensor(exporter, slot_key, data) {
-        Ok(handle) => TokenSpeedTensor::remote(handle, shape, dtype),
-        Err(data) => TokenSpeedTensor::inline(data, shape, dtype),
+    match export_rdma_tensor(exporter, slot_key, &data) {
+        Some(handle) => TokenSpeedTensor::remote(handle, shape, dtype),
+        None => TokenSpeedTensor::inline(data, shape, dtype),
     }
 }
 
 fn resolve_mm_tensor_payload(
-    data: Vec<u8>,
+    data: WireBytes,
     shm_enabled: bool,
     min_bytes: usize,
     engine: &'static str,
@@ -602,23 +602,13 @@ fn resolve_mm_tensor_payload(
     use crate::observability::metrics::Metrics;
     let log_timing = log_tokenspeed_mm_timing_enabled();
 
-    // RDMA first; on export failure the bytes are handed back so we fall through to
-    // SHM/inline rather than drop the payload.
-    let data = match rdma {
-        Some(rdma) => {
-            let nbytes = data.len();
-            match export_rdma_tensor(rdma.exporter, rdma.slot_key, data) {
-                Ok(handle) => {
-                    Metrics::record_mm_tensor(engine, "remote", nbytes);
-                    return MmTensorPayload::Remote(handle);
-                }
-                Err(data) => data,
-            }
-        }
-        None => data,
-    };
-
     let nbytes = data.len();
+    if let Some(handle) =
+        rdma.and_then(|rdma| export_rdma_tensor(rdma.exporter, rdma.slot_key, &data))
+    {
+        Metrics::record_mm_tensor(engine, "remote", nbytes);
+        return MmTensorPayload::Remote(handle);
+    }
     if !shm_enabled || nbytes < min_bytes {
         if log_timing {
             tracing::info!(
@@ -645,7 +635,7 @@ fn resolve_mm_tensor_payload(
             }
             Metrics::record_mm_tensor(engine, "shm", nbytes);
             // The segment holds the copy; the buffer goes back to the pool.
-            llm_multimodal::buffer_pool::recycle(data);
+            data.recycle();
             MmTensorPayload::Shm(handle)
         }
         Err(error) => {
@@ -663,30 +653,28 @@ fn resolve_mm_tensor_payload(
 }
 
 fn tokenspeed_tensor_payload(
-    data: Vec<u8>,
+    data: WireBytes,
     shm_enabled: bool,
     min_bytes: usize,
     rdma: Option<MmRdmaExport<'_>>,
 ) -> tokenspeed::tensor_data::Payload {
     match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "tokenspeed", rdma) {
-        MmTensorPayload::Inline(data) => tokenspeed::tensor_data::Payload::Inline(
-            llm_multimodal::buffer_pool::recycled_bytes(data),
-        ),
+        MmTensorPayload::Inline(data) => {
+            tokenspeed::tensor_data::Payload::Inline(data.into_payload())
+        }
         MmTensorPayload::Shm(handle) => tokenspeed::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => tokenspeed::tensor_data::Payload::Remote(handle),
     }
 }
 
 fn vllm_tensor_payload(
-    data: Vec<u8>,
+    data: WireBytes,
     shm_enabled: bool,
     min_bytes: usize,
     rdma: Option<MmRdmaExport<'_>>,
 ) -> vllm::tensor_data::Payload {
     match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "vllm", rdma) {
-        MmTensorPayload::Inline(data) => {
-            vllm::tensor_data::Payload::Inline(llm_multimodal::buffer_pool::recycled_bytes(data))
-        }
+        MmTensorPayload::Inline(data) => vllm::tensor_data::Payload::Inline(data.into_payload()),
         MmTensorPayload::Shm(handle) => vllm::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => vllm::tensor_data::Payload::Remote(handle),
     }

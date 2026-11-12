@@ -460,6 +460,15 @@ jobs:
           bash scripts/ci_apt_update.sh $sudo
           bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends ffmpeg
 
+      # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
+      - name: Install libjpeg-turbo
+        if: contains(matrix.needs, 'turbojpeg')
+        run: |
+          sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
+          export DEBIAN_FRONTEND=noninteractive
+          bash scripts/ci_apt_update.sh $sudo
+          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends libturbojpeg
+
       - name: Build the Rust tests
         timeout-minutes: 40
         run: |
@@ -472,6 +481,9 @@ jobs:
           # Where ffmpeg is installed, the video container agreement tests must
           # run: a missing tool or encoder fails them instead of skipping them.
           SMG_REQUIRE_VIDEO_TOOLS: ${{ contains(matrix.needs, 'ffmpeg') && '1' || '' }}
+          # Where libjpeg-turbo is installed, the TurboJPEG decode tests must
+          # run: a library that does not load fails them instead of skipping them.
+          SMG_REQUIRE_TURBOJPEG: ${{ contains(matrix.needs, 'turbojpeg') && '1' || '' }}
         run: |
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
@@ -570,7 +582,17 @@ jobs:
           rustup component add clippy
           cargo clippy -p llm-multimodal -p kv-index --all-targets -- -D warnings
 
+      # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
+      - name: Install libjpeg-turbo
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends libturbojpeg
+
       - name: Test the crates with AArch64-only code
+        env:
+          # The library is installed above: the TurboJPEG decode tests must run.
+          SMG_REQUIRE_TURBOJPEG: '1'
         run: |
           source "$HOME/.cargo/env"
           cargo test -p llm-multimodal -p kv-index
@@ -649,6 +671,89 @@ jobs:
           path: benchmark-logs/
           if-no-files-found: ignore
           retention-days: 7
+
+  # Initial advisory AMD PR performance slice: same regular HTTP/gRPC test,
+  # four TP1 workers and thresholds as NVIDIA. PD performance remains separate.
+  benchmarks-amd:
+    needs: [build-wheel, detect-changes]
+    if: >-
+      !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_ON_PRS == 'true'
+      && vars.SMG_RUN_AMD_PR_BENCHMARK == 'true'
+      && github.event_name == 'pull_request'
+      && needs.build-wheel.result == 'success'
+      && needs.detect-changes.result == 'success'
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.detect-changes.outputs.card-tier-from == ''
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
+    container:
+      image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    continue-on-error: true
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      E2E_RUNTIME: sglang
+      E2E_MIN_SELECTED: '2'
+      GENAI_BENCH_TEST_TIMEOUT: '600'
+      E2E_AMD_REQUIRE_PASSING_CALL: '1'
+      E2E_STARTUP_TIMEOUT: '900'
+      ROUTER_LOCAL_MODEL_PATH: /models
+      BENCH_ENFORCE_THRESHOLDS: '0'
+      E2E_LOG_DIR: benchmark-logs-amd
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mark owned processes
+        run: echo "E2E_JOB_MARKER=benchmark-amd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+      - name: Setup SGLang in its ROCm image
+        run: bash scripts/ci_setup_sglang_rocm_image.sh
+      - uses: ./.github/actions/download-build-artifacts
+        with:
+          wasm-fixtures: 'true'
+          client-types: 'true'
+      - name: Install wheel and test dependencies
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh
+      - name: Install genai-bench
+        run: |
+          python3 -m venv "$RUNNER_TEMP/genai-bench"
+          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install 'genai-bench==0.0.4' 'truststore<0.10.5'
+          echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
+      - name: Record runtime versions
+        run: |
+          mkdir -p benchmark-logs-amd
+          python3 -m pip freeze > benchmark-logs-amd/runtime-versions.txt
+          "$RUNNER_TEMP/genai-bench/bin/pip" freeze > benchmark-logs-amd/benchmark-versions.txt
+          printf '%s\n' "head=$GITHUB_SHA" "runner=$RUNNER_NAME" 'workers=4 protocol=http,grpc engine=sglang gpu=MI300' > benchmark-logs-amd/context.txt
+      - name: Run regular HTTP and gRPC benchmarks
+        run: |
+          SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest e2e_test/benchmarks/test_regular_perf.py -s -vv --junitxml=benchmark-logs-amd/junit.xml
+      - name: Explain measurement scope
+        if: always()
+        run: echo 'AMD initial slice measures request throughput and latency for regular HTTP/gRPC. The existing NVML utilization sampler cannot measure AMD utilization; its utilization output is not acceptance evidence. PD performance remains a separate gap.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Qualify raw AMD benchmark measurements
+        id: qualify
+        if: always()
+        run: python3 scripts/ci/validate_pr_benchmark.py --output benchmark-logs-amd/qualification.json
+      - name: Summarize AMD results
+        if: always() && steps.qualify.outcome == 'success'
+        run: python3 e2e_test/benchmarks/summarize.py
+      - name: Reap owned processes
+        if: always() && env.E2E_JOB_MARKER != ''
+        run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
+      - name: Upload AMD performance results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: genai-bench-results-amd-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark_**/
+            benchmark-logs-amd/
+          retention-days: 30
 
   detect-changes:
     runs-on: ubuntu-latest
@@ -844,6 +949,7 @@ jobs:
               - 'crates/kv_index/**'
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
+              - 'crates/policy_controller/**'
               - 'crates/radix_tree/**'
             rust-radix:
               - *rust-infra
@@ -1145,6 +1251,9 @@ jobs:
               ("crates/mock_worker/**",                          NONE),
               ("crates/gateway_perf/**",                         NONE),
               ("crates/radix_tree/**",                           NONE),
+              # the policy controller crate: linked by no binary yet (its gateway host is
+              # a later change, which moves this row to the core)
+              ("crates/policy_controller/**",                    NONE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path
@@ -1723,7 +1832,7 @@ jobs:
           # TokenSpeed prefill/decode over its Mooncake transfer, on the model
           # its disaggregation path is proven on (Qwen3.5-9B, fetched by id).
           # First run (34173426995): sequential PD passed; 32 concurrent
-          # requests deadlocked both legs because the spec's engine window was
+          # requests deadlocked both sides because the spec's engine window was
           # 4 (prefill waits for a decode that is never admitted). The window
           # now covers the suite's bursts; the over-window deadlock itself is
           # pinned by the topology suite. The prebuilt image is extracted, but
@@ -1750,7 +1859,7 @@ jobs:
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
-  # PD legs both advertise worker-side processing; the M-RoPE class takes the
+  # Both PD sides advertise worker-side processing; the M-RoPE class takes the
   # worker path and the Phi-3.5 class must stay on the router path.
   e2e-2gpu-pd-mm-worker:
     needs: [e2e-1gpu-chat-mm-worker, detect-changes]
@@ -1857,7 +1966,7 @@ jobs:
   # PD disaggregation under one 4-GPU topology (2 prefill + 2 decode) plus a
   # fleet assembled at runtime through the worker API, per engine. The full
   # topology sweep (1p1d .. 3p1d) runs in nightly-pd.yml; this lane guards
-  # every PR with the topology that exercises both legs' load balancing.
+  # every PR with the topology that exercises both pools' load balancing.
   e2e-4gpu-pd:
     name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
@@ -2056,7 +2165,7 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 539 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 542 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
@@ -2076,11 +2185,11 @@ jobs:
           # three gRPC protos the mock serves), the disaggregated
           # scheduler-wire classes (a chat and a streamed turn on a prefill
           # and a decode worker on the sglang and the vllm wires), the
-          # encode-prefill-decode scheduler-wire class (a text and an image
-          # turn on an encode, a prefill and a decode worker on the vllm
-          # wire), and the worker API classes (the list routes, IGW mode,
-          # disable-health-check, the REST semantics)
-          E2E_MIN_SELECTED: "512"
+          # encode-prefill-decode scheduler-wire classes (a text and an image
+          # turn on an encode, a prefill and a decode worker on the vllm and
+          # the tokenspeed wires), and the worker API classes (the list routes,
+          # IGW mode, disable-health-check, the REST semantics)
+          E2E_MIN_SELECTED: "515"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
           TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken

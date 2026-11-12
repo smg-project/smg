@@ -616,30 +616,21 @@ class GrpcRequestManager:
         asyncio.create_task(wait_for_result())
         return future
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(self, request_id: str, finished_reason: dict | None = None) -> bool:
         """Abort a running request.
 
-        Sends abort request to scheduler and marks local state as finished
-        to stop processing any further outputs from the scheduler.
+        Wake local consumers and dispatch an abort to the scheduler.
+
+        The return value reports dispatch success, not engine termination.
         """
         # Skip aborting health check requests (they clean themselves up)
         if request_id.startswith("HEALTH_CHECK"):
             return False
 
-        # Mark state as finished immediately to stop processing scheduler outputs
-        state = self.rid_to_state.get(request_id)
-        if state:
-            # Preserve both trace cleanup and abort metric accounting.
-            if not state.finished:
-                if self.enable_trace:
-                    state.time_stats.set_finished_time()
-                self._collect_aborted_metrics(state)
-            state.finished = True
-            state.stream_finished = True
-            logger.debug(f"Marked request {request_id} as aborted locally")
+        # A running scheduler request need not return AbortReq. Finish locally
+        # before dispatch, even if dispatch fails; the consumer owns cleanup.
+        await self._handle_abort_req(AbortReq(rid=request_id, finished_reason=finished_reason))
 
-        # Send abort to scheduler - the scheduler will send AbortReq back
-        # which will be handled by _handle_abort_req
         abort_req = AbortReq(rid=request_id)
         try:
             await self._send_to_scheduler(abort_req)
@@ -847,6 +838,21 @@ class GrpcRequestManager:
                 },
             }
 
+            # Scheduler counters are cumulative snapshots, not per-chunk deltas.
+            # Only forward actual engine counters; verify counts cannot determine
+            # proposal totals when speculative decoding uses adaptive draft sizes.
+            for key in ("spec_num_correct_drafts", "spec_num_proposed_drafts"):
+                counters = getattr(batch_out, key, None)
+                if counters is not None and i < len(counters) and counters[i] is not None:
+                    # Proto scalar defaults cannot distinguish unknown accepted from
+                    # measured zero. Proposals alone would falsely imply all rejected.
+                    if (
+                        key == "spec_num_proposed_drafts"
+                        and "spec_num_correct_drafts" not in output_data["meta_info"]
+                    ):
+                        continue
+                    output_data["meta_info"][key] = counters[i]
+
             # Accumulate logprobs (following tokenizer_manager pattern)
             # Use getattr for safe access - not all request types have return_logprob
             # (e.g., TokenizedEmbeddingReqInput)
@@ -856,15 +862,12 @@ class GrpcRequestManager:
                 except ValueError as exc:
                     # Raising out of this loop would strand the waiting client.
                     # Finish with an engine error and stop any remaining decode.
-                    output_data["error"] = str(exc)
-                    output_data["finished"] = True
-                    output_data["meta_info"]["finish_reason"] = {
-                        "type": "abort",
-                        "message": str(exc),
-                        "status_code": 500,
-                    }
+                    reason = {"type": "abort", "message": str(exc), "status_code": 500}
                     if not finished:
-                        await self.abort_request(rid)
+                        await self.abort_request(rid, finished_reason=reason)
+                    else:
+                        await self._handle_abort_req(AbortReq(rid=rid, finished_reason=reason))
+                    continue
 
             # Send input logprobs based if available
             if (
@@ -1075,6 +1078,8 @@ class GrpcRequestManager:
                 continue
 
             state = self.rid_to_state[rid]
+            if state.finished:
+                continue
 
             # Create result
             result = {
@@ -1141,8 +1146,9 @@ class GrpcRequestManager:
             return
 
         state = self.rid_to_state[recv_obj.rid]
-        if not state.finished:
-            self._collect_aborted_metrics(state)
+        if state.finished:
+            return
+        self._collect_aborted_metrics(state)
 
         # Mark as finished; a scheduler-initiated abort ends the request's
         # root span here, once (a client cancel ended it in abort_request).

@@ -34,7 +34,7 @@ import (
 	"sync"
 	"time"
 
-	grpcclient "github.com/lightseek/smg/go-grpc-sdk/internal/grpc"
+	grpcclient "github.com/smg-project/smg/bindings/golang/internal/grpc"
 )
 
 // Client is the main client for interacting with SGLang gRPC API.

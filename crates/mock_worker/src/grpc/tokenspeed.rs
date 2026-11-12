@@ -4,23 +4,34 @@
 //! each as the engine stamps them; its info, loads and KV-event subscription.
 //! `--capture` records this wire's requests (the capture file's keys are its
 //! field names).
+//! An encode worker also serves the engine's encoder service beside it
+//! ([`TokenSpeedEncoder`]): its `Encode` takes a request's media with one
+//! rendezvous room per item, and its `Generate` is refused as the wrong pool.
+//! A prefill worker checks the rooms a request's `encode_bootstrap_info`
+//! hands it against the request's media items.
 //! The admin fan-out's flush and profile RPCs are answered by the core, the
 //! same on every wire.
 
 use std::pin::Pin;
 
+use enc::token_speed_encoder_server::{TokenSpeedEncoder, TokenSpeedEncoderServer};
 use futures::{Stream, StreamExt};
-use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
+use smg_grpc_client::{
+    common_proto as common, tokenspeed_encoder_proto as enc,
+    tokenspeed_scheduler::tokenspeed_proto as ts,
+};
 use tonic::{Request, Response, Status};
 use ts::{
     generate_response::Response as GenResp,
     token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
 };
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, TokenizerStream};
-use crate::{engine::KvEventStream, script::MatchedStop};
+use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
+use crate::{config::Role, drain::InFlight, engine::KvEventStream, script::MatchedStop};
 
 pub(super) type Server = TokenSpeedSchedulerServer<MockScheduler>;
+/// The encoder service an encode worker mounts beside [`Server`].
+pub(super) type EncoderServer = TokenSpeedEncoderServer<MockScheduler>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
 
 #[tonic::async_trait]
@@ -33,6 +44,13 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        // An encode worker on this wire takes its requests on the encoder
+        // service: a `Generate` here went to the wrong pool.
+        if self.cfg.role == Some(Role::Encode) {
+            return Err(Status::failed_precondition(
+                "mock-worker: an encode worker on this wire takes Encode, not Generate",
+            ));
+        }
         let req = request.into_inner();
         // Record before anything else: the line is in the file before the
         // stream is returned, so before the gateway can read any frame.
@@ -42,8 +60,17 @@ impl TokenSpeedScheduler for MockScheduler {
                 return Err(Status::internal(format!("mock-worker capture failed: {e}")));
             }
         }
+        check_encode_bootstrap(&req)?;
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
+        let rendezvous = req
+            .kv_bootstrap_info
+            .as_ref()
+            .map_or(Rendezvous::None, |info| Rendezvous::Named {
+                host: info.bootstrap_host.clone(),
+                port: info.bootstrap_port,
+                room: info.bootstrap_room,
+            });
         let frames = self
             .generate_frames(GenerateInput {
                 request_id: req.request_id.clone(),
@@ -58,6 +85,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 // This proto carries no scores row for requested token ids.
                 score_ids: Vec::new(),
                 pin: req.data_parallel_rank,
+                rendezvous,
             })
             .await?;
         let request_id = req.request_id;
@@ -204,6 +232,103 @@ impl TokenSpeedScheduler for MockScheduler {
         // The mock has no tokenizer artifacts to serve; the gateway's
         // remote-tokenizer fallback treats Unimplemented as "not supported".
         Err(Status::unimplemented("mock-worker"))
+    }
+}
+
+/// The rendezvous a prefill side receives for an encode-prefill-decode
+/// request: one entry per media item, each naming the item, the encode
+/// worker's bootstrap server and the room the embedding travels under. The
+/// engine's prefill waits on that room and fails without it, so a request
+/// whose entries do not cover each of its items once is refused; a request
+/// without entries has no encoder (a prefill alone processes its own media).
+fn check_encode_bootstrap(req: &ts::GenerateRequest) -> Result<(), Status> {
+    let Some(info) = &req.encode_bootstrap_info else {
+        return Ok(());
+    };
+    let items = req.mm_inputs.as_ref().map_or(0, |mm| mm.items.len());
+    let mut covered = vec![false; items];
+    for entry in &info.items {
+        let slot = usize::try_from(entry.item_index)
+            .ok()
+            .and_then(|index| covered.get_mut(index))
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "mock-worker: encode bootstrap info names item {} of {items}",
+                    entry.item_index
+                ))
+            })?;
+        if std::mem::replace(slot, true) {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: encode bootstrap info names item {} twice",
+                entry.item_index
+            )));
+        }
+        if entry.bootstrap_room == 0 || entry.bootstrap_host.is_empty() || entry.bootstrap_port <= 0
+        {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: encode bootstrap info of item {} names no rendezvous \
+                 (host {:?}, port {}, room {})",
+                entry.item_index, entry.bootstrap_host, entry.bootstrap_port, entry.bootstrap_room
+            )));
+        }
+    }
+    if let Some(missing) = covered.iter().position(|seen| !seen) {
+        return Err(Status::invalid_argument(format!(
+            "mock-worker: encode bootstrap info covers {} of {items} media items \
+             (item {missing} has no room)",
+            info.items.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The engine's encoder service, served by an encode worker beside the
+/// scheduler: the gateway hands it a request's media with one rendezvous
+/// room per item and reads its acceptance. The embedding would travel to the
+/// prefill side out of band; the mock moves nothing and counts the request
+/// in the admin API's `encodes`.
+#[tonic::async_trait]
+impl TokenSpeedEncoder for MockScheduler {
+    async fn encode(
+        &self,
+        request: Request<enc::EncodeRequest>,
+    ) -> Result<Response<enc::EncodeResponse>, Status> {
+        let req = request.into_inner();
+        // The request's own checks come first, as the prefill role checks its
+        // input before the hooks: a malformed request spends no armed fault.
+        let items = req.mm_inputs.as_ref().map_or(0, |mm| mm.items.len());
+        if items == 0 || req.items.len() != items {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: an encode request carries one room per media item, got {} \
+                 room(s) for {items} item(s)",
+                req.items.len()
+            )));
+        }
+        if req.items.iter().any(|item| item.bootstrap_room == 0) {
+            return Err(Status::invalid_argument(
+                "mock-worker: an encode request's room is never 0",
+            ));
+        }
+        // The realistic engine's fault and admission hooks apply as to the
+        // prefill role, and the request counts in flight until its answer; an
+        // armed `finish=error` is the engine refusing the request.
+        let _in_flight = InFlight::enter_on(&self.in_flight);
+        let finish_error = self.admit_without_tokens(&req.request_id, None).await?;
+        self.ops.record_encode();
+        let rooms: Vec<i64> = req.items.iter().map(|item| item.bootstrap_room).collect();
+        tracing::info!(
+            "mock-worker {}: encode request {} of {items} item(s) in rooms {rooms:?} {}",
+            self.name,
+            req.request_id,
+            if finish_error {
+                "refused by the armed fault"
+            } else {
+                "accepted"
+            }
+        );
+        Ok(Response::new(enc::EncodeResponse {
+            accepted: !finish_error,
+        }))
     }
 }
 
