@@ -877,6 +877,35 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         r"a split pattern anchored to its text (\A, \z or \G) over more than decimal digits"
     );
+    // The `\z` that ends a digit-grouping lookahead is an anchor as the bare
+    // one is; and an anchored stage after a stage other than `Digits` (a gap
+    // of that stage holding digits can end at a unit's end, where the text
+    // goes on).
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(
+            r"\p{Nd}{1,2}(?=\p{Nd}{3}+\z)",
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        split(DEEPSEEK, SplitDelimiterBehavior::Isolated, false),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a first split pattern anchored to its text (\A, \z or \G)"
+    );
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(r"[a-z]+", SplitDelimiterBehavior::Isolated, false),
+        split(DIGIT_GROUP_HEAD, SplitDelimiterBehavior::Isolated, false),
+        split(DEEPSEEK, SplitDelimiterBehavior::Isolated, false),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a split pattern anchored to its text (\A, \z or \G) without a Digits split before it"
+    );
     // A post-processor of another kind, and a model that is not BPE.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_post_processor(Some(BertProcessing::new(
@@ -4093,6 +4122,10 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
         r"a split pattern anchored to its text (\A, \z or \G): \A[a-z]+|\G\d{3}|\s"
     );
     assert_eq!(
+        declined(&ranks, r"\d(?=\d{3}+\z)|[a-z]+|\s", &[]),
+        r"a split pattern anchored to its text (\A, \z or \G): \d(?=\d{3}+\z)|[a-z]+|\s"
+    );
+    assert_eq!(
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),
         "special token \"\" without content"
     );
@@ -4307,6 +4340,7 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
         .map(|pattern| Stage {
             pattern: Pattern::parse(pattern).expect("parses"),
             pieces: Pieces::MatchesAndGaps,
+            digits: false,
         })
         .collect();
     let scanner = chain::Scanner::recognize(&stages).expect("the chain takes the scanner");
@@ -4315,6 +4349,7 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
         .map(|stage| Stage {
             pattern: stage.pattern.program_only(),
             pieces: stage.pieces,
+            digits: stage.digits,
         })
         .collect();
     let fixtures = fixture_texts();

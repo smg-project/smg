@@ -727,8 +727,9 @@ impl Pattern {
         self.reads_word_boundary
     }
 
-    /// Whether the pattern holds `\A`, `\z` or `\G`: it reads the bounds of
-    /// the text it runs over, or where the search began in it, which a stage
+    /// Whether the pattern holds `\A`, `\z` or `\G` (the `\z` that ends a
+    /// digit-grouping lookahead included): it reads the bounds of the text it
+    /// runs over, or where the search began in it, which a stage
     /// meets as the piece the stage before it cut, and a unit of the thread
     /// pool would move (see `NativeEncoder::stages_from`).
     pub(super) fn anchored(&self) -> bool {
@@ -1778,11 +1779,22 @@ fn holds_end(node: &Node) -> bool {
     holds(node, &|node| matches!(node, Node::End))
 }
 
-/// Whether `node` holds `\A`, `\z` or `\G` anywhere: such a pattern reads
-/// the bounds of the text it runs over, or where the search began in it.
+/// Whether `node` holds `\A`, `\z` or `\G` anywhere, the `\z` that ends a
+/// digit-grouping lookahead included (it reads the end of the text as the
+/// bare `\z` does): such a pattern reads the bounds of the text it runs
+/// over, or where the search began in it.
 fn holds_anchor(node: &Node) -> bool {
     holds(node, &|node| {
-        matches!(node, Node::Start | Node::TextEnd | Node::SearchStart)
+        matches!(
+            node,
+            Node::Start
+                | Node::TextEnd
+                | Node::SearchStart
+                | Node::GroupsAhead {
+                    end: GroupsEnd::Text,
+                    ..
+                }
+        )
     })
 }
 
@@ -2837,6 +2849,25 @@ mod tests {
             .iter()
             .all(|first| first.may_start('\'') && !first.may_start('s')));
         assert!(matches!(parsed.program.last(), Some(Op::Match)));
+    }
+
+    /// The `\z` that ends a digit-grouping lookahead counts as an anchor, as
+    /// the bare `\A`, `\z` and `\G` do; a lookahead ending in the word
+    /// boundary does not.
+    #[test]
+    fn the_lookahead_text_end_is_an_anchor() {
+        for (pattern, anchored) in [
+            (r"\p{Nd}{1,2}(?=\p{Nd}{3}+\z)", true),
+            (r"\d(?=\d{3}+\z)|[a-z]+|\s", true),
+            (DIGIT_GROUP_HEAD, true),
+            (DIGIT_GROUPS_FROM_THE_START, true),
+            (WIDE_DIGIT_GROUPS, true),
+            (r"\d{1,3}(?=(?:\d{3})*\b)|[a-z]+|\s", false),
+            (GPT2, false),
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert_eq!(parsed.anchored(), anchored, "{pattern}");
+        }
     }
 
     #[test]
