@@ -530,7 +530,7 @@ impl LeastLoad {
 
     /// A reporting candidate's dispatch credit as token-work: the since-report
     /// tokens plus the host's in-flight requests no report or credit accounts
-    /// for, at the mean prefill. Read under the tally lock; no division here.
+    /// for, at the mean prefill. Read under one tally load; no division here.
     fn credit_work(&self, c: &Candidate, credit_tokens: u64, credit_requests: u64) -> f32 {
         let reported = c
             .load
@@ -542,7 +542,7 @@ impl LeastLoad {
     /// The expected wait of a reporting candidate once its credit work is
     /// known: the queued and running work over the drain rate, plus the convex
     /// KV-pressure barrier over the running requests' share of the cache (a
-    /// full but reclaimable prefix cache is no pressure). Runs after the lock
+    /// full but reclaimable prefix cache is no pressure). Runs after the load
     /// is gone.
     fn reported_cost(&self, r: LoadRow, credit_work: f32, nominal: f32) -> f32 {
         let mean = self.mean_prefill_tokens as f32;

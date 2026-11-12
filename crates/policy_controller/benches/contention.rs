@@ -31,21 +31,30 @@ use smg_policy_controller::{
 };
 
 /// The presets with a stateful stage (the credit tally, the rotation table)
-/// and the stateless control; `round_robin_churn` decides over a survivor
-/// set that differs per decision (one tried exclusion rotating through the
-/// pool), the rotation table's claim path.
-const PRESETS: [&str; 4] = [
+/// and the stateless control. `round_robin_hits` decides over a survivor set
+/// that differs per decision (one tried exclusion rotating through the pool):
+/// as many sets as rows, each claimed once and hit after that, so the
+/// rotation table's hit path spread over many words. `round_robin_churn`
+/// excludes three rows drawn from a mixed seed, so most decisions see a set
+/// the table has forgotten: the claim path, with its one shared count.
+const PRESETS: [&str; 5] = [
     "least_load",
     "round_robin",
+    "round_robin_hits",
     "round_robin_churn",
     "passthrough",
 ];
+
+/// A golden-ratio multiplier: a decision's three drawn exclusions are slices
+/// of its seed's one product.
+const DRAW_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 const THREADS: [usize; 2] = [1, 8];
 const SIZES: [usize; 2] = [64, 512];
 
 /// One thread's `iters` decisions from its own seed range on its own scratch,
 /// each pick booked at once; the wall time they took. The first decision
-/// fills the scratch outside the timed span.
+/// fills the scratch outside the timed span. `exclusions` rows are tried per
+/// decision: none, one rotating through the pool, or three drawn.
 fn decide_and_book(
     engine: &Engine,
     view: &[Candidate],
@@ -53,7 +62,7 @@ fn decide_and_book(
     cx: &Constraints<'_>,
     thread: u64,
     iters: u64,
-    churn: bool,
+    exclusions: usize,
 ) -> Duration {
     let mut scratch = Scratch::new();
     // Dated at the decision's clock, after every row's sample: the credit
@@ -65,13 +74,19 @@ fn decide_and_book(
     };
     let mut seed = thread << 48;
     let decide = |seed: u64, scratch: &mut Scratch| {
-        let tried = [view[(seed % view.len() as u64) as usize].id];
+        let n = view.len() as u64;
+        let z = seed.wrapping_mul(DRAW_MIX);
+        let drawn = [
+            view[(seed % n) as usize].id,
+            view[((z >> 16) % n) as usize].id,
+            view[((z >> 32) % n) as usize].id,
+        ];
         let facts = RequestFacts {
             model: "m",
             prompt_tokens: 512,
             seed,
             now_micros: 1_000_000,
-            tried: if churn { &tried } else { &[] },
+            tried: &drawn[..exclusions],
             ..RequestFacts::default()
         };
         let decision = engine.decide(&facts, pool, black_box(view), cx, scratch);
@@ -93,8 +108,17 @@ fn decide_and_book(
 fn decide_threads(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine_threads");
     for preset in PRESETS {
-        let engine = common::engine_of(preset.strip_suffix("_churn").unwrap_or(preset));
-        let churn = preset.ends_with("_churn");
+        let engine = common::engine_of(
+            preset
+                .strip_suffix("_churn")
+                .or_else(|| preset.strip_suffix("_hits"))
+                .unwrap_or(preset),
+        );
+        let exclusions = match preset {
+            "round_robin_churn" => 3,
+            "round_robin_hits" => 1,
+            _ => 0,
+        };
         for &n in &SIZES {
             let fleet = common::fleet(n);
             let mut view = Vec::with_capacity(n);
@@ -116,7 +140,9 @@ fn decide_threads(c: &mut Criterion) {
                                     .map(|t| {
                                         let (engine, view, pool, cx) = (&engine, &view, &pool, &cx);
                                         s.spawn(move || {
-                                            decide_and_book(engine, view, pool, cx, t, iters, churn)
+                                            decide_and_book(
+                                                engine, view, pool, cx, t, iters, exclusions,
+                                            )
                                         })
                                     })
                                     .collect();
