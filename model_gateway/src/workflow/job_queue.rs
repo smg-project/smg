@@ -1502,6 +1502,91 @@ mod tests {
         assert!(matches!(first_rx.await, Ok(Ok(ref message)) if message == "done"));
     }
 
+    /// A caller whose wait ended leaves the key free: a second wait under
+    /// the same key is taken, carries the next waiter id, and is answered
+    /// with its own job's outcome once the dispatcher runs; a wait cancelled
+    /// while the queue is full frees the key the same way. The dispatcher's
+    /// one permit is held until the end, so the queued jobs wait.
+    #[tokio::test]
+    async fn a_second_wait_under_a_freed_key_is_taken_and_answered_with_its_own_outcome() {
+        use crate::app_context::testing::app_context_for_tests;
+
+        let context = app_context_for_tests(
+            RouterConfig::default(),
+            Arc::new(crate::worker::WorkerRegistry::new()),
+            None,
+        );
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 1,
+                max_concurrent_jobs: 1,
+            },
+            Arc::downgrade(&context),
+        );
+        let key = "http://worker:8000".to_string();
+        let refresh = |url: &str| Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        let held = Arc::clone(&queue.concurrency_limit)
+            .acquire_owned()
+            .await
+            .expect("the dispatcher's permit");
+
+        // The first wait's job is taken off the channel and parks at the
+        // permit; the wait ends on its bound and the key is free again.
+        let first = queue
+            .submit_and_wait(refresh(&key), Duration::from_millis(20))
+            .await;
+        assert!(
+            matches!(first, Err(JobOutcomeError::TimedOut(_))),
+            "{first:?}"
+        );
+        assert!(
+            queue.outcomes.is_empty(),
+            "the first caller's waiter left with it"
+        );
+
+        // One plain submit fills the channel; a wait cancelled while it
+        // waits for a slot leaves nothing under the key either.
+        queue
+            .submit(refresh("http://other:8000"))
+            .await
+            .expect("the one slot");
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            queue.submit_and_wait(refresh(&key), Duration::from_secs(5)),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the wait for a slot outlives its bound: {cancelled:?}"
+        );
+        assert!(
+            queue.outcomes.is_empty(),
+            "the cancelled caller's waiter left with it"
+        );
+
+        // The second wait under the key is taken with the third id; once
+        // the dispatcher runs, the first job's late outcome reaches nobody
+        // and the second wait is answered by its own job.
+        let second = queue.submit_and_wait(refresh(&key), Duration::from_secs(5));
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                queue.outcomes.get(&key).map(|waiter| waiter.id),
+                Some(3),
+                "the second wait holds the key with the next id"
+            );
+            drop(held);
+        };
+        let (second, ()) = tokio::join!(second, release);
+        assert!(
+            matches!(second, Err(JobOutcomeError::Failed(ref reason)) if reason.contains("not initialized")),
+            "{second:?}"
+        );
+        assert!(queue.outcomes.is_empty());
+    }
+
     /// A finished job's outcome reaches the waiter under its key once, and
     /// the waiter is gone; a key without a waiter is a no-op.
     #[tokio::test]
