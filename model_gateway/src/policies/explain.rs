@@ -166,7 +166,7 @@ pub fn render(record: &DecisionRecord, engine: &Engine, workers: &[Arc<dyn Worke
         "pool_size": record.pool_size,
         "tried": record.tried,
         "excluded": record.excluded,
-        "seed": record.seed,
+        "seed": format!("{:016x}", record.seed),
         "generation": record.generation,
         "top": top,
         "targets": targets,
@@ -297,6 +297,11 @@ mod tests {
         let rendered = render(&record, decider.engine(), &workers);
         assert_eq!(rendered["profile"], "default");
         assert_eq!(rendered["phase"], "single");
+        assert_eq!(
+            rendered["seed"],
+            json!(format!("{:016x}", record.seed)),
+            "the seed stays exact as sixteen hex digits, never a JSON number past 2^53"
+        );
         let address = picked.map(|target| workers[target.position as usize].url().to_owned());
         assert_eq!(rendered["targets"][0]["worker"], json!(address));
         assert_eq!(rendered["top"].as_array().map(Vec::len), Some(2));

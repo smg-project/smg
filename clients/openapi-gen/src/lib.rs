@@ -1355,7 +1355,10 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                 "description": "Distinct workers earlier attempts dispatched to, not the attempt's index the trace header carries"
             },
             "excluded": {"type": "integer", "minimum": 0},
-            "seed": {"type": "integer", "minimum": 0},
+            "seed": {
+                "type": "string",
+                "description": "The decision's seed, sixteen hex digits"
+            },
             "generation": {"type": "integer", "minimum": 0},
             "top": {
                 "type": "array",
@@ -1708,6 +1711,7 @@ mod tests {
             .collect();
         assert_eq!(properties, required, "{schema}");
         assert!(required.contains("tried"), "{schema}");
+        assert_eq!(schema["properties"]["seed"]["type"], "string", "{schema}");
     }
 
     #[test]
