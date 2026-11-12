@@ -338,7 +338,8 @@ message WorkerEvent {
     StatusChanged status = 7;
     WorkerRow relabelled = 8;
     NeedsSummary needs = 9;
-    // The tail cannot resume after the requested seq: the stream ends.
+    // The tail cannot resume after the requested seq: the stream ends and the
+    // watcher reconnects with resume_seq 0.
     SnapshotRequired snapshot_required = 10;
   }
 }

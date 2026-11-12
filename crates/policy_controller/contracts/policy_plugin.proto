@@ -272,7 +272,8 @@ message RequestFacts {
 
 // What only the deciding gateway knows now. Its standing vetoes are not here:
 // the controller applies them to that gateway's candidate rows before any stage
-// runs (the vetoed worker reads breaker-open there alone).
+// runs (there alone the vetoed worker reads breaker-open for a breaker veto,
+// stalled for a liveness veto).
 message Constraints {
   // Ids this gateway just failed to connect to.
   repeated fixed64 excluded = 1 [packed = true];
@@ -335,7 +336,7 @@ message Shed {
 }
 
 // Specified in v1; no built-in issues one before the admission step, and a
-// host that meets one refuses the request as the status table says.
+// host that meets one refuses the request.
 message Queue {
   fixed64 ticket = 1;
   // Within the request's admission budget.
@@ -369,7 +370,8 @@ message Lease {
 }
 
 // Serves the routing trace header and Explain; positions into the generation's
-// spec; the record's `top` holds at most three entries.
+// spec. The record carries the first five fields (its `top` at most three
+// entries); the observability contract fills the rest, unset until then.
 message Trace {
   // Zero-based position in the spec's profile names in ascending UTF-8 order.
   uint32 profile = 1;  // u16
@@ -525,9 +527,10 @@ message Signal {
     // The worker's standing veto aggregated over every gateway: it stands
     // while any gateway holds one, the micros are the longest remaining, 0
     // only when none remains; the veto's end instant is host-only. The
-    // deciding gateway's own veto is applied before any stage runs: the worker
-    // reads breaker-open in that gateway's candidate rows alone, so a plugin
-    // never needs this signal to honour it.
+    // deciding gateway's own veto is applied before any stage runs: in that
+    // gateway's candidate rows alone the worker reads breaker-open (a breaker
+    // veto) or stalled (a liveness veto), so a plugin never needs this signal
+    // to honour it.
     uint32 gateway_veto_micros = 5;
   }
 }
