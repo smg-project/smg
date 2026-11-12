@@ -1338,8 +1338,10 @@ async fn zmq_reports_top_alternatives_with_their_ranks() {
             "logprobs": [-0.25, -0.75],
         })],
     );
-    // Rank 8 and prompts of this test's own: the store is process-wide.
-    let rank = 8;
+    // Rank 9 and prompts of this test's own: the store is process-wide and a
+    // rank's entry is keyed by its index, so two live ranks of one index would
+    // share it and the second one's start would wipe the first's.
+    let rank = 9;
     #[expect(
         clippy::disallowed_methods,
         reason = "serve loops until the test drops its handles"
