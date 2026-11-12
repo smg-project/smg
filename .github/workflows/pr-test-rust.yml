@@ -715,6 +715,7 @@ jobs:
           mkdir -p benchmark-logs-amd
           bash scripts/ci_setup_sglang_rocm_image.sh --verify-only benchmark-logs-amd/prepared-environment.json
       - name: Run regular HTTP and gRPC benchmarks
+        id: benchmark
         run: |
           SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest e2e_test/benchmarks/test_regular_perf.py -s -vv --junitxml=benchmark-logs-amd/junit.xml
       - name: Verify final SGLang environment
@@ -731,7 +732,7 @@ jobs:
         if: always()
         run: python3 scripts/ci/validate_pr_benchmark.py --output benchmark-logs-amd/qualification.json
       - name: Summarize AMD results
-        if: always() && steps.qualify.outcome == 'success' && steps.prepared.outcome == 'success' && steps.final.outcome == 'success'
+        if: always() && steps.benchmark.outcome == 'success' && steps.qualify.outcome == 'success' && steps.prepared.outcome == 'success' && steps.final.outcome == 'success'
         run: python3 e2e_test/benchmarks/summarize.py
       - name: Reap owned processes
         if: always() && env.E2E_JOB_MARKER != ''
