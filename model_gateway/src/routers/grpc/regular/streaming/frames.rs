@@ -268,7 +268,9 @@ impl EscapedText {
 /// copied around each chunk's choice, so a chunk costs the serialization of
 /// its choice only. The bytes are exactly those of a serialized
 /// [`openai_protocol::completion::CompletionStreamResponse`] without `usage`, which a chunk of this
-/// stream never carries.
+/// stream never carries, and with the `usage: null` placeholder after it when
+/// the stream asks for usage: the public API writes it on every chunk before
+/// the usage chunk, as a chat stream does.
 pub(super) struct CompletionChunkFrame {
     head: Vec<u8>,
     tail: Vec<u8>,
@@ -280,6 +282,7 @@ impl CompletionChunkFrame {
         model: &str,
         created: u64,
         system_fingerprint: Option<&str>,
+        usage_null_placeholder: bool,
     ) -> Self {
         let mut head = Vec::with_capacity(128);
         head.extend_from_slice(b"data: {\"id\":");
@@ -293,6 +296,9 @@ impl CompletionChunkFrame {
         if let Some(system_fingerprint) = system_fingerprint {
             tail.extend_from_slice(b",\"system_fingerprint\":");
             push_json(&mut tail, system_fingerprint);
+        }
+        if usage_null_placeholder {
+            tail.extend_from_slice(b",\"usage\":null");
         }
         tail.extend_from_slice(b"}\n\n");
         Self { head, tail }
