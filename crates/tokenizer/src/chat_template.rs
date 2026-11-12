@@ -105,7 +105,9 @@ pub enum ThinkingToggle {
 }
 
 /// Detect whether the chat template supports a thinking/reasoning toggle
-/// and what its default value is.
+/// and what its default value is. A `thinking` variable counts where the
+/// template's code reads it ([`mentions_thinking_variable`]), not where its
+/// prose prints the word.
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
     if template.contains("think_begin_token")
         && template.contains("no_think")
@@ -171,8 +173,13 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 /// thinking ...`, `thinking is ...`, `thinking == ...`, `set thinking ...`).
 /// The word must stand alone: `clear_thinking is defined` (GLM-5.3) or
 /// `thinking_mode`/`thinking_budget` name other variables, and a template
-/// that only reads those has no thinking switch.
+/// that only reads those has no thinking switch. Only the template's code
+/// is read ([`jinja_code`]): the MiniMax M3.1 template prints the prose
+/// "When thinking is enabled" from a string literal and branches on no
+/// variable, so it has no switch either.
 fn mentions_thinking_variable(template: &str) -> bool {
+    let code = jinja_code(template);
+    let template = code.as_str();
     template.match_indices("thinking").any(|(start, matched)| {
         let before = &template[..start];
         let after = &template[start + matched.len()..];
@@ -187,6 +194,68 @@ fn mentions_thinking_variable(template: &str) -> bool {
             || after.starts_with(" ==")
             || ((before.ends_with("if ") || before.ends_with("set ")) && after.starts_with(' '))
     })
+}
+
+/// Where a character of a Jinja template stands, for [`jinja_code`].
+#[derive(Clone, Copy)]
+enum Jinja {
+    /// The text the template prints as it is, outside every block.
+    Text,
+    /// Inside a `{# ... #}` comment.
+    Comment,
+    /// Inside a `{{ ... }}` or `{% ... %}` block, with the block's closing
+    /// delimiter.
+    Code(&'static str),
+    /// Inside a string literal of a block, with the block's closing
+    /// delimiter and the literal's quote.
+    Literal(&'static str, char),
+}
+
+/// The template's code with everything else blanked to spaces: the raw text
+/// outside the `{{ }}` and `{% %}` blocks, the `{# #}` comments, the string
+/// literals inside the blocks (an escaped character inside one stays in it)
+/// and the delimiters themselves. A word of the result is a variable, a
+/// keyword or an operator the template evaluates; the words a template
+/// prints are not in it.
+fn jinja_code(template: &str) -> String {
+    let mut code = String::with_capacity(template.len());
+    let mut state = Jinja::Text;
+    let mut skip = 0usize;
+    for (at, c) in template.char_indices() {
+        if skip > 0 {
+            skip -= 1;
+            code.push(' ');
+            continue;
+        }
+        let ahead = &template[at..];
+        let next = match state {
+            Jinja::Text if ahead.starts_with("{#") => Jinja::Comment,
+            Jinja::Text if ahead.starts_with("{{") => Jinja::Code("}}"),
+            Jinja::Text if ahead.starts_with("{%") => Jinja::Code("%}"),
+            Jinja::Comment if ahead.starts_with("#}") => Jinja::Text,
+            Jinja::Code(close) if ahead.starts_with(close) => Jinja::Text,
+            Jinja::Code(close) if c == '\'' || c == '"' => Jinja::Literal(close, c),
+            Jinja::Literal(close, quote) if c == '\\' => {
+                skip = 1;
+                Jinja::Literal(close, quote)
+            }
+            Jinja::Literal(close, quote) if c == quote => Jinja::Code(close),
+            same => same,
+        };
+        // A delimiter is two characters; the second is consumed with the first.
+        let delimiter = matches!(
+            (state, next),
+            (Jinja::Text, Jinja::Comment | Jinja::Code(_))
+                | (Jinja::Comment | Jinja::Code(_), Jinja::Text)
+        );
+        if delimiter {
+            skip = 1;
+        }
+        let is_code = matches!(next, Jinja::Code(_)) && !delimiter && c != '\'' && c != '"';
+        code.push(if is_code { c } else { ' ' });
+        state = next;
+    }
+    code
 }
 
 /// Detect the content format expected by a Jinja2 chat template

@@ -1482,6 +1482,64 @@ fn clear_thinking_is_not_a_thinking_switch() {
     }
 }
 
+/// The word `thinking` in what a template prints is not a switch: the
+/// MiniMax M3.1 template's system prose ("When thinking is enabled, wrap your
+/// reasoning in ...") stands in a string literal, and the template branches
+/// on no thinking variable, where the M3 template branched on
+/// `thinking_mode`. A comment or the raw text outside the blocks is not a
+/// switch either; the same words as code are.
+#[test]
+fn thinking_in_prose_or_a_comment_is_not_a_thinking_switch() {
+    let m31_shape = "{{- 'You have a thinking capability that allows you to reason step by step \
+                     before responding. When thinking is enabled, wrap your reasoning in ' ~ \
+                     think_begin_token ~ ' and ' ~ think_end_token }}\
+                     {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                     {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    for template in [
+        m31_shape,
+        "{{ \"When thinking is enabled, think.\" }}{% for m in messages %}{{ m.content }}{% endfor %}",
+        "{% set note = 'if thinking == true' %}{{ note }}",
+        "{# if thinking is defined #}{{ messages | length }}",
+        "When thinking is enabled, think.{% for m in messages %}{{ m.content }}{% endfor %}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::None, None),
+            "{template}"
+        );
+    }
+    let state = ChatTemplateState::new(Some(m31_shape.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+    assert_eq!(state.thinking_key_name(), None);
+    assert!(!state.prefill_opens_think_block());
+
+    // The same words as code are the switch, after a literal and after a
+    // literal with an escaped quote in it.
+    for template in [
+        "{% if thinking is defined and thinking %}<think>{% endif %}",
+        "{{ 'When thinking is enabled' }}{% if thinking %}<think>{% endif %}",
+        "{{ 'it\\'s thinking' }}{% if thinking == true %}<think>{% endif %}",
+        "{{ \"a 'quoted' word\" }}{% set thinking = thinking %}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
+            "{template}"
+        );
+    }
+    // The M3 shape keeps its tri-state switch.
+    assert_eq!(
+        detect_thinking_toggle(
+            "{{- 'When thinking is enabled, wrap your reasoning.' }}\
+             {%- if thinking_mode is defined and thinking_mode == \"enabled\" -%}<think>{%- endif -%}"
+        ),
+        (
+            ThinkingToggle::DefaultOff,
+            Some(ThinkingKeyName::ThinkingMode)
+        )
+    );
+}
+
 #[test]
 fn test_chat_template_state_invalid_template() {
     let result = ChatTemplateState::new(Some("{% invalid".to_string()));

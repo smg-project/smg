@@ -13,4 +13,5 @@ mod deepseek_v4_renderer;
 mod kimi_k25_renderer_detection;
 mod kimi_k3_renderer;
 mod kimi_tools_key_order;
+mod minimax_m31_thinking_switch;
 mod minimax_root_role_renderer;
