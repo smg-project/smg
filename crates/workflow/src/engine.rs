@@ -231,9 +231,11 @@ impl Completion {
                 signal: StepResult::Success,
                 state: None,
             },
+            // A skip in the attempt is recorded as a gate's skip is: the attempt
+            // began the step as running, and nothing else writes its end.
             Ok(StepResult::Skip) => Self {
                 signal: StepResult::Skip,
-                state: None,
+                state: Some((StepStatus::Skipped, None)),
             },
             // Cancelled between attempts: the step's record says so, where
             // its last attempt left it running or retrying. A waiter reading
