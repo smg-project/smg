@@ -243,6 +243,45 @@ fn reasoning_items_preserve_empty_summary_arrays() {
     assert_eq!(serialized, input_payload);
 }
 
+/// A Response's `conversation` is the public API's object, `{"id": ...}`: a
+/// Response carrying it parses and writes it back, and one carrying the bare
+/// id the crate wrote before still parses and writes the object.
+#[test]
+fn a_response_reads_its_conversation_as_an_object_or_a_bare_id() {
+    for conversation in [json!({"id": "conv_1"}), json!("conv_1")] {
+        let response: ResponsesResponse = serde_json::from_value(json!({
+            "id": "resp_conv",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "model": "gpt-5.4",
+            "output": [],
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "reasoning": null,
+            "store": true,
+            "temperature": 1.0,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": null,
+            "user": null,
+            "metadata": {},
+            "conversation": conversation
+        }))
+        .unwrap_or_else(|e| panic!("conversation {conversation}: {e}"));
+        assert_eq!(response.conversation.as_deref(), Some("conv_1"));
+        let written = serde_json::to_value(&response).expect("serialize the response");
+        assert_eq!(written["conversation"], json!({"id": "conv_1"}));
+    }
+}
+
 #[test]
 fn legacy_vec_string_summary_fails_to_deserialize() {
     let legacy = r#"{"type":"reasoning","id":"r_x","summary":["text"]}"#;

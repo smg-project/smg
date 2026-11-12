@@ -61,6 +61,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Response linked to a conversation writes it as the public API does, `{"id": "conv_..."}`
+  (`ResponseConversation`), where the crate wrote the bare id, and reads either shape: the crate
+  refused a Response carrying the object with ``invalid type: map, expected a string``. The field
+  keeps the id alone (`Option<String>`), so code that reads it is unchanged.
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
