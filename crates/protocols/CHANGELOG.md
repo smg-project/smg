@@ -61,6 +61,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses input file part with `detail: "auto"`, the public API's default (`FileInputDetail`),
+  parses, and a prompt's file variable keeps its `detail` when the request is written back for an
+  upstream. The crate refused the request with ``unknown variant `auto`, expected `low` or
+  `high` `` and dropped the variable's detail. Breaking: `FileDetail` gains `Auto`, now its default,
+  and `PromptVariableTyped::ResponseInputFile` gains `detail: Option<FileDetail>`.
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a

@@ -1973,6 +1973,8 @@ pub enum PromptVariableTyped {
     },
     #[serde(rename = "input_file")]
     ResponseInputFile {
+        /// The file's detail level, as an input file part takes it.
+        detail: Option<crate::responses::FileDetail>,
         file_data: Option<String>,
         file_id: Option<String>,
         file_url: Option<String>,
