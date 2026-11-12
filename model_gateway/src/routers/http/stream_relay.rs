@@ -93,7 +93,9 @@ pub(crate) struct Relay {
     pub(crate) source: RelaySource,
     /// The worker's load, released when the body is dropped.
     pub(crate) guard: WorkerLoadGuard,
-    /// The response headers, prepared by the caller.
+    /// The response headers, prepared by the caller. Under `upstream_sse` the
+    /// relay removes the upstream's `Content-Length` from them, since it may
+    /// lengthen the body.
     pub(crate) headers: HeaderMap,
     /// How each chunk is read before it is sent.
     pub(crate) mode: ChunkMode,
