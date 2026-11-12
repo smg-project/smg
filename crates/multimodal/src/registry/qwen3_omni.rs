@@ -7,6 +7,7 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     media::FrameSampling,
     registry::{
+        layouts::grid_patch_layouts_for,
         qwen_vl::{loader_frame_sampling, IMAGE_PAD_TOKEN},
         ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
@@ -240,21 +241,7 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
 
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
         match modality {
-            Modality::Image => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
-                ]),
-            ),
+            Modality::Image | Modality::Video => grid_patch_layouts_for(modality),
             Modality::Audio => EncoderFieldLayouts::new(
                 FieldLayout::Batched,
                 HashMap::from([

@@ -6,8 +6,8 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
-        MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
-        RegistryResult,
+        layouts::grid_patch_fields, MediaItemInfo, MediaPartOrder, ModelMetadata,
+        ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{
         FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId, VideoSamplingInfo,
@@ -341,17 +341,7 @@ impl ModelProcessorSpec for Glm53FlashSpec {
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
+        grid_patch_fields()
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
