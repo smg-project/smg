@@ -73,8 +73,10 @@ reader refuses a dtype outside its six, the TokenSpeed reader passes one it
 does not know; on the TokenSpeed wire an inline payload through the adapter's
 reader, an SHM handle with the servicer's checks: that byte length, a bare
 name and, for the scheduler's feature, a dtype of bfloat16, float16 or float32,
-the encoder reading its feature generically, or a remote handle as it came,
-pulled by the servicer), one SGLang batch per modality (image or
+the encoder reading its feature generically, a remote handle on a feature as
+it came, pulled by the servicer, and a remote handle on a side tensor refused
+as the servicer's generic reader refuses it), one SGLang batch per modality
+(image or
 video, an empty list reading as image) beside a primary batch, placeholder spans
 inside the prompt and disjoint across the request's items, and, when the item
 names its placeholder token id, spans that cover exactly the prompt's tokens of

@@ -604,9 +604,33 @@ impl Normalizer {
 /// One `Split` of the pre-tokenizer chain.
 struct Stage {
     pattern: Pattern,
-    /// `Isolated`: the text between matches forms pieces too. Otherwise
-    /// (`Removed` with `invert`) only the matches do.
-    keep_gaps: bool,
+    /// The spans of the stage's text that go on as pieces.
+    pieces: Pieces,
+}
+
+/// The spans of a stage's text that go on as its pieces: the reference's
+/// split behaviors the path reproduces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pieces {
+    /// `Isolated`: the matches and the text between them.
+    MatchesAndGaps,
+    /// `Removed` inverted: the matches alone.
+    Matches,
+    /// `Removed`: the text between the matches alone; a match is dropped
+    /// and the pieces on either side of it stay apart.
+    Gaps,
+}
+
+impl Pieces {
+    /// Whether the text between and around the matches goes on.
+    fn gaps(self) -> bool {
+        self != Self::Matches
+    }
+
+    /// Whether the matches go on.
+    fn matches(self) -> bool {
+        self != Self::Gaps
+    }
 }
 
 /// Added tokens by content and id, the list a matcher is built from.
@@ -1664,7 +1688,7 @@ impl NativeEncoder {
         );
         let stages = vec![Stage {
             pattern: parsed,
-            keep_gaps: false,
+            pieces: Pieces::Matches,
         }];
         let chain = chain::Scanner::recognize(&stages);
         Ok(Self {
@@ -1734,7 +1758,7 @@ impl NativeEncoder {
             stages.push(Stage {
                 pattern: Pattern::parse(BYTE_LEVEL_PATTERN)
                     .ok_or_else(|| Declined::from("the ByteLevel split pattern"))?,
-                keep_gaps: true,
+                pieces: Pieces::MatchesAndGaps,
             });
         }
         // A stage after the `ByteLevel` cuts the mapped text. It cuts the
@@ -1755,16 +1779,17 @@ impl NativeEncoder {
     }
 
     /// One `Split` as a stage: a regex or a literal the pattern engine takes,
-    /// `Isolated`, or `Removed` inverted. A `Digits` is the `Isolated` split
-    /// on numeric characters, each one a piece under `individual_digits`,
-    /// else each run: the reference splits on `char::is_numeric`, the
-    /// toolchain's numeric set ([`unicode::STD_NUMERIC`]), which is not the
-    /// engine's `\p{N}` (the regex engine's Unicode version). A `Punctuation`
-    /// is the `Isolated` split on the reference's punctuation set, one
-    /// character a piece, or one run under `Contiguous`: the reference
-    /// pre-tokenizer's own set ([`unicode::REFERENCE_PUNCTUATION`]: ASCII
-    /// punctuation, or the punctuation category of the Unicode tables it
-    /// carries), not the engine's `\p{P}`, which has moved on since.
+    /// `Isolated`, `Removed`, or `Removed` inverted. A `Digits` is the
+    /// `Isolated` split on numeric characters, each one a piece under
+    /// `individual_digits`, else each run: the reference splits on
+    /// `char::is_numeric`, the toolchain's numeric set
+    /// ([`unicode::STD_NUMERIC`]), which is not the engine's `\p{N}` (the
+    /// regex engine's Unicode version). A `Punctuation` is the `Isolated`
+    /// split on the reference's punctuation set, one character a piece, or
+    /// one run under `Contiguous`: the reference pre-tokenizer's own set
+    /// ([`unicode::REFERENCE_PUNCTUATION`]: ASCII punctuation, or the
+    /// punctuation category of the Unicode tables it carries), not the
+    /// engine's `\p{P}`, which has moved on since.
     fn split_stage(split: &Value) -> Result<Stage, Declined> {
         match type_of("pre-tokenizer stage", split)? {
             "Split" => {}
@@ -1778,7 +1803,7 @@ impl NativeEncoder {
                 return Pattern::parse(&class_pattern(unicode::STD_NUMERIC, !each))
                     .map(|pattern| Stage {
                         pattern,
-                        keep_gaps: true,
+                        pieces: Pieces::MatchesAndGaps,
                     })
                     .ok_or_else(|| Declined::from("the Digits split pattern"));
             }
@@ -1796,7 +1821,7 @@ impl NativeEncoder {
                 return Pattern::parse(&class_pattern(unicode::REFERENCE_PUNCTUATION, runs))
                     .map(|pattern| Stage {
                         pattern,
-                        keep_gaps: true,
+                        pieces: Pieces::MatchesAndGaps,
                     })
                     .ok_or_else(|| Declined::from("the Punctuation split pattern"));
             }
@@ -1821,16 +1846,17 @@ impl NativeEncoder {
             ),
             _ => return Err(Declined::from("a Split pattern neither Regex nor String")),
         };
-        let keep_gaps = match (
+        let pieces = match (
             split.get("behavior").and_then(Value::as_str),
             split.get("invert").and_then(Value::as_bool),
         ) {
-            (Some("Isolated"), Some(false)) => true,
-            (Some("Removed"), Some(true)) => false,
+            (Some("Isolated"), Some(false)) => Pieces::MatchesAndGaps,
+            (Some("Removed"), Some(false)) => Pieces::Gaps,
+            (Some("Removed"), Some(true)) => Pieces::Matches,
             (behavior, invert) => {
                 return Err(Declined::from(format!(
-                    "Split behavior {behavior:?} with invert {invert:?} (only Isolated, or \
-                     Removed inverted)"
+                    "Split behavior {behavior:?} with invert {invert:?} (only Isolated, Removed, \
+                     or Removed inverted)"
                 )))
             }
         };
@@ -1839,7 +1865,7 @@ impl NativeEncoder {
                 "a split pattern outside the supported regex subset: {regex}"
             ))
         })?;
-        Ok(Stage { pattern, keep_gaps })
+        Ok(Stage { pattern, pieces })
     }
 
     /// The ids of `text`, framed by the post-processor's special tokens when
@@ -2254,7 +2280,9 @@ impl NativeEncoder {
         // `encode_single_stage`, out of line, where the scanner's own loop
         // probes each piece in place (no recursive walk); the chain hands
         // its pieces, as offsets into the unit, to the same probe through
-        // its static callback; any other shape walks.
+        // its static callback; any other shape walks, a lone `Removed`
+        // stage among them (its matches are no pieces: the scanner loop
+        // stays the loop of a stage whose matches are).
         match (&self.chain, self.stages.as_slice()) {
             (Some(chain), _) => {
                 chain.pieces(text, &mut |start, end| {
@@ -2265,7 +2293,7 @@ impl NativeEncoder {
                     }
                 });
             }
-            (None, [stage]) => {
+            (None, [stage]) if stage.pieces.matches() => {
                 if let Err(declined) =
                     self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
                 {
@@ -2297,13 +2325,15 @@ impl NativeEncoder {
         };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.keep_gaps && cursor < start {
+            if stage.pieces.gaps() && cursor < start {
                 self.pieces(depth + 1, &text[cursor..start], f);
             }
-            self.pieces(depth + 1, &text[start..end], f);
+            if stage.pieces.matches() {
+                self.pieces(depth + 1, &text[start..end], f);
+            }
             cursor = end;
         }
-        if stage.keep_gaps && cursor < text.len() {
+        if stage.pieces.gaps() && cursor < text.len() {
             self.pieces(depth + 1, &text[cursor..], f);
         }
     }
@@ -2368,7 +2398,7 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let keep_gaps = stage.keep_gaps;
+        let gaps = stage.pieces.gaps();
         let mut cursor = 0;
         let mut fallback = None;
         // The probe compiles into the scanner's loop. As a closure of its
@@ -2382,7 +2412,7 @@ impl NativeEncoder {
             words,
             #[inline(always)]
             |start, end| {
-                if keep_gaps && cursor < start {
+                if gaps && cursor < start {
                     if let Err(declined) =
                         self.tokenize_gap(model, text, cursor..start, mapped, ids, cache)
                     {
@@ -2397,7 +2427,7 @@ impl NativeEncoder {
                 cursor = end;
             },
         );
-        if keep_gaps && cursor < text.len() {
+        if gaps && cursor < text.len() {
             if let Err(declined) =
                 self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
             {

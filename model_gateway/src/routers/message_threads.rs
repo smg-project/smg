@@ -13,11 +13,14 @@
 //! unchanged: a turn is a [`StoredResponse`] whose `input` holds the turn's
 //! request fields ([`TurnInput`]) and whose `raw_response` holds the answer,
 //! chained by `previous_response_id`, so a thread holds its conversation
-//! once, not once per turn. The store keeps the turns the operator's
-//! `memory` bounds allow, the `max_responses` and `retention_secs` of the
-//! memory history backend (unset: 10,000 turns, each for a day after it was
-//! written), the oldest evicted first, on every write; a thread is read
-//! back whole up to that count. A turn is written under its answer's id.
+//! once, not once per turn. The public API deletes a thread no more than
+//! an hour after its last use, the reference a deployment's bound is read
+//! against. The store keeps the turns the operator's `memory` bounds
+//! allow, the `max_responses` and `retention_secs` of the memory history
+//! backend (unset: 10,000 turns, each for a day after it was written; a
+//! `retention_secs` of 3,600 stays within the API's hour), the oldest
+//! evicted first, on every write; a thread is read back whole up to that
+//! count. A turn is written under its answer's id.
 //! An id that is already a stored turn's (a repeated `rid`, a backend's
 //! repeated id, a guess) would hand the client an id that continues another
 //! conversation, so the answer is reissued under a fresh id, in the answer
@@ -1142,8 +1145,8 @@ fn slot(index: u32) -> Option<usize> {
 /// blank line, in any of the three framings the relay reads), when there is
 /// one. `scanned` is where the last scan of this buffer stopped; the scan
 /// resumes a delimiter's overlap before it, since a four-byte delimiter can
-/// straddle the frame boundary the last scan ended at. An event that arrives in many
-/// frames is read once this way, not once per frame.
+/// straddle the frame boundary the last scan ended at. An event that
+/// arrives in many frames is read once this way, not once per frame.
 fn event_end(buffer: &[u8], scanned: usize) -> Option<usize> {
     let from = scanned.saturating_sub(DELIMITER_OVERLAP);
     let end = find_frame_end(buffer, from);
@@ -2150,9 +2153,10 @@ mod tests {
 
     /// A stream that ends before its `message_stop`, or that carries an error
     /// event (here one a `message_stop` still follows), leaves no turn: the
-    /// place is given back at the stream's end, while the body is still held
-    /// (the drop guard is the other path), and the continue from its id is
-    /// the 404.
+    /// place is given back by the stream's end (at the error event on the
+    /// failed path, at the end-of-stream arm on the cut one), while the body
+    /// is still held (the drop guard is the other path), and the continue
+    /// from its id is the 404.
     #[tokio::test]
     async fn a_cut_or_failed_stream_leaves_no_turn() {
         let threads = MessageThreads::new();
@@ -2184,7 +2188,7 @@ mod tests {
                 .expect("the store");
             assert!(
                 kept.is_none(),
-                "{id}: the place is given back at the stream's end, while the body is still held"
+                "{id}: the place is given back by the stream's end, while the body is still held"
             );
             drop(data);
             let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
