@@ -258,7 +258,7 @@ fn replace_logged(
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::OnceLock,
+        sync::{mpsc, OnceLock},
         task::{Context, Waker},
         time::Duration,
     };
@@ -349,51 +349,64 @@ mod tests {
     /// A client that leaves while its write is applied: the handler's future
     /// is dropped at its await of the blocking task, the task applies the
     /// revision all the same, and the applied write's log line is written
-    /// under the request's span. A dry run, read to its end, logs nothing.
+    /// under the request's span. The runtime's one blocking thread is held
+    /// until the drop, so the first poll is pending by construction, and the
+    /// line is awaited before the revision is read. A dry run, read to its
+    /// end, logs nothing.
     #[traced_test]
-    #[tokio::test]
-    async fn a_write_whose_client_leaves_still_logs_its_application() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let state = documented_state(dir.path());
-        let manager = Arc::clone(
-            state
-                .context
-                .rate_limit_manager
-                .as_ref()
-                .expect("a tenant rate limiter"),
-        );
-        let live = manager.document().expect("the start's document");
+    #[test]
+    fn a_write_whose_client_leaves_still_logs_its_application() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let state = documented_state(dir.path());
+            let manager = Arc::clone(
+                state
+                    .context
+                    .rate_limit_manager
+                    .as_ref()
+                    .expect("a tenant rate limiter"),
+            );
+            let live = manager.document().expect("the start's document");
 
-        let tried = put(
-            State(Arc::clone(&state)),
-            write("/rate-limits/tenants?dry_run=true", &live.etag, NEXT),
-        )
-        .await;
-        assert_eq!(tried.status(), StatusCode::OK);
-        assert!(!logs_contain("the tenant rate-limit policy was replaced"));
+            let tried = put(
+                State(Arc::clone(&state)),
+                write("/rate-limits/tenants?dry_run=true", &live.etag, NEXT),
+            )
+            .await;
+            assert_eq!(tried.status(), StatusCode::OK);
+            assert!(!logs_contain("the tenant rate-limit policy was replaced"));
 
-        let mut applied = Box::pin(put(
-            State(Arc::clone(&state)),
-            write("/rate-limits/tenants", &live.etag, NEXT),
-        ));
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(
-            std::future::Future::poll(applied.as_mut(), &mut cx).is_pending(),
-            "the handler yields first at its await of the replacement task"
-        );
-        drop(applied);
+            let (release, held) = mpsc::channel::<()>();
+            let _hold = tokio::task::spawn_blocking(move || held.recv());
+            let mut applied = Box::pin(put(
+                State(Arc::clone(&state)),
+                write("/rate-limits/tenants", &live.etag, NEXT),
+            ));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                std::future::Future::poll(applied.as_mut(), &mut cx).is_pending(),
+                "the handler yields at its await of the queued replacement task"
+            );
+            drop(applied);
+            release.send(()).expect("the hold waits for its release");
 
-        let in_force = tokio::time::timeout(Duration::from_secs(10), async {
-            while manager.document().map_or(0, |live| live.revision) < 2 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        assert!(
-            in_force.is_ok(),
-            "the replacement task applies the revision without its handler"
-        );
-        assert!(logs_contain("the tenant rate-limit policy was replaced"));
-        assert!(logs_contain("principal=ops"));
+            let logged = tokio::time::timeout(Duration::from_secs(10), async {
+                while !logs_contain("the tenant rate-limit policy was replaced") {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(
+                logged.is_ok(),
+                "the replacement task logs the applied write without its handler"
+            );
+            assert_eq!(manager.document().map(|live| live.revision), Some(2));
+            assert!(logs_contain("principal=ops"));
+        });
     }
 }

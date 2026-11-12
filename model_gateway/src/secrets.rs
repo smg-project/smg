@@ -559,6 +559,8 @@ async fn watch_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc as std_mpsc;
+
     use smg_auth::{ApiKeyEntry, Role};
     use tracing_test::traced_test;
 
@@ -624,51 +626,66 @@ mod tests {
     /// A caller that leaves while the keys are reloaded: the future is
     /// dropped at its await of the blocking task, the task puts the files'
     /// keys in force all the same, and the reload's log line is written under
-    /// the caller's span.
+    /// the caller's span. The runtime's one blocking thread is held until the
+    /// drop, so the first poll is pending by construction, and the line is
+    /// awaited before the keys are read.
     #[traced_test]
-    #[tokio::test]
-    async fn a_reload_whose_caller_leaves_still_logs_its_outcome() {
-        let dir = tempfile::tempdir().expect("a directory");
-        let tenants = write(dir.path(), "tenants", "acme:t-one\n");
-        let entries = [TenantApiKeyEntry {
-            tenant_id: "acme".into(),
-            key: "t-one".into(),
-        }];
-        let serving = AuthConfig::with_tenant_keys(Some("flag-key".into()), &entries);
-        let reloader = Arc::new(
-            SecretReloader::new(
-                SecretFiles {
-                    tenant_api_keys: Some(tenants),
-                    ..SecretFiles::default()
-                },
-                &sources(SecretSource::Flag, Some(SecretSource::File)),
-                Some("flag-key"),
-                &entries,
-                KeySets::serving_alone(serving.clone()),
-            )
-            .expect("a file source"),
-        );
-        write(dir.path(), "tenants", "acme:t-two\n");
+    #[test]
+    fn a_reload_whose_caller_leaves_still_logs_its_outcome() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("a directory");
+            let tenants = write(dir.path(), "tenants", "acme:t-one\n");
+            let entries = [TenantApiKeyEntry {
+                tenant_id: "acme".into(),
+                key: "t-one".into(),
+            }];
+            let serving = AuthConfig::with_tenant_keys(Some("flag-key".into()), &entries);
+            let reloader = Arc::new(
+                SecretReloader::new(
+                    SecretFiles {
+                        tenant_api_keys: Some(tenants),
+                        ..SecretFiles::default()
+                    },
+                    &sources(SecretSource::Flag, Some(SecretSource::File)),
+                    Some("flag-key"),
+                    &entries,
+                    KeySets::serving_alone(serving.clone()),
+                )
+                .expect("a file source"),
+            );
+            write(dir.path(), "tenants", "acme:t-two\n");
 
-        let mut reload = Box::pin(reload_logged(Arc::clone(&reloader), "route"));
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(
-            std::future::Future::poll(reload.as_mut(), &mut cx).is_pending(),
-            "the reload yields first at its await of the blocking task"
-        );
-        drop(reload);
+            let (release, held) = std_mpsc::channel::<()>();
+            let _hold = task::spawn_blocking(move || held.recv());
+            let mut reload = Box::pin(reload_logged(Arc::clone(&reloader), "route"));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(reload.as_mut(), &mut cx).is_pending(),
+                "the reload yields at its await of the queued blocking task"
+            );
+            drop(reload);
+            release.send(()).expect("the hold waits for its release");
 
-        let in_force = time::timeout(Duration::from_secs(10), async {
-            while !serving.contains_token("t-two") {
-                time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        assert!(
-            in_force.is_ok(),
-            "the reload task puts the rotated key in force without its caller"
-        );
-        assert!(logs_contain("the keys were reloaded from their files"));
+            let logged = time::timeout(Duration::from_secs(10), async {
+                while !logs_contain("the keys were reloaded from their files") {
+                    time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(
+                logged.is_ok(),
+                "the reload task logs its outcome without its caller"
+            );
+            assert!(
+                serving.contains_token("t-two"),
+                "the rotated key is in force"
+            );
+        });
     }
 
     #[test]
