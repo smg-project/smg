@@ -629,6 +629,12 @@ impl Assembler {
             .trim_end()
             .to_string();
         if name.is_empty() {
+            // The spelling's text after the name with no name before it (`<tool_call><tool_sep>`):
+            // no call starts, and the bytes are the nameless call's, refused with what follows
+            // them rather than dropped as the template's spacing.
+            if !text.is_empty() {
+                self.object.refuse(MalformedReason::CallWithoutName, out);
+            }
             self.stage = Stage::Between;
             return;
         }
@@ -1031,6 +1037,24 @@ mod tests {
         assert!(malformed(&events)
             .iter()
             .any(|(_, why)| *why == MalformedReason::TextWhereTheNameShouldBe));
+        // The separator with no name before it: no call starts, and every byte of the block is
+        // refused with the nameless call, the separator among them (not dropped as the
+        // template's spacing).
+        let text = "<tool_sep>\n<arg_key>s</arg_key>\n<arg_value>x</arg_value>\n";
+        let events = run_with(Tags::HY_V3, &[text], false);
+        assert_eq!(starts(&events), 0);
+        assert!(fragments(&events).is_empty());
+        // The separator leaves refused, first of the block's bytes; what the syntax drops as
+        // the template's spacing is whitespace alone.
+        assert_eq!(refused(&events).first().copied(), Some("<tool_sep>\n"));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            Event::Dropped { text, why: DropReason::Wrapper } if !text.text.trim().is_empty()
+        )));
+        assert!(malformed(&events)
+            .iter()
+            .any(|(_, why)| *why == MalformedReason::CallWithoutName));
+        assert!(malformed(&events).iter().all(|(text, _)| text.is_empty()));
     }
 
     #[test]
