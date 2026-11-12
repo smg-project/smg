@@ -2,8 +2,10 @@
 //!
 //! Owns the [`SlotPool`], per-class [`ClassQueue`]s, and the inflight
 //! registry. Construction validates that the configured reservations
-//! fit under the live backend capacity; runtime admission lives in
-//! follow-on commits.
+//! fit under the live backend capacity; [`PriorityScheduler::admit`] is
+//! the admission (a fast path, at most one preemption, then the class
+//! queue), and the dispatcher task applies capacity changes and drains
+//! the queues on every release, capacity growth and starvation tick.
 
 use std::{
     cmp::Reverse,
@@ -71,10 +73,10 @@ pub enum RejectionReason {
 /// Priority-aware admission scheduler.
 ///
 /// Construction wires up the slot pool, per-class queues, and an empty
-/// inflight registry. Admission / dispatch / capacity-watch land in
-/// follow-on commits; this commit exposes the read-only constructor
-/// plus an internal `acquire_inflight` so [`SchedulerPermit`] can be
-/// exercised against a real slot pool from tests.
+/// inflight registry; [`Self::admit`] admits, the dispatcher
+/// ([`Self::spawn_dispatcher`]) drains the queues and applies capacity
+/// changes, and [`Self::acquire_inflight`] is the fast path on its own,
+/// which the tests also exercise against a real slot pool.
 pub struct PriorityScheduler {
     slot_pool: SlotPool,
     class_queues: [Arc<dyn ClassQueue>; 4],
@@ -144,8 +146,8 @@ impl PriorityScheduler {
     /// Try to acquire a slot under `class` for the given request id.
     /// Returns `Some(permit)` on success and `None` if the slot pool
     /// refuses (e.g. capacity exhausted or reservation guard blocks the
-    /// class). The admission middleware's fast path calls this directly;
-    /// the queue / preempt paths layer on top in follow-on commits.
+    /// class). [`Self::admit`]'s fast path; its preempt and queue paths
+    /// layer on top.
     pub fn acquire_inflight(
         self: &Arc<Self>,
         class: Class,
@@ -207,10 +209,12 @@ impl PriorityScheduler {
                 // The mark is irreversible (no rollback — a CAS back to 0
                 // could race a now-arriving first byte). So a victim that
                 // doesn't unwind within the budget is still preempted: its
-                // first data frame is truncated by the edge's body wrapper. For
-                // the victim to actually unwind, its handler must honor the
-                // cancel token (wired into the long-running handlers in M4.5
-                // / #1577); until that lands the flag must stay off.
+                // first data frame is truncated by the edge's body wrapper. A
+                // victim unwinds earlier only where its handler runs its
+                // upstream work under the `PreemptionGuard` (every inference
+                // handler in `server.rs` does, whichever router serves it, as
+                // does the HTTP router's streaming relay); elsewhere the slot
+                // frees when the body ends.
                 //
                 // The freed slot is not reserved for this preemptor — the
                 // dispatcher (on the victim's release) or a concurrent
@@ -822,8 +826,8 @@ pub struct SchedulerPermit {
 }
 
 impl SchedulerPermit {
-    /// Borrow the underlying inflight handle (for TTFT marking and
-    /// preemption coordination in follow-on commits).
+    /// Borrow the underlying inflight handle (the admission layer reads
+    /// its preemptibility when it hands the permit to the response body).
     pub fn handle(&self) -> &Arc<InflightHandle> {
         &self.handle
     }
