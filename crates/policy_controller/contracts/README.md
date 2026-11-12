@@ -27,7 +27,9 @@ clock, a lease's issue instant), and each file's comments name them.
   decline. An empty filter mask is a present, empty `survivors` message and
   sheds the request; it is never a decline. `Hello` carries the protocol
   range and `Welcome` the chosen version; the controller speaks N and N-1 and
-  upgrades first. No absolute instant crosses the wire.
+  upgrades first. No absolute instant crosses the decide, session, plugin and
+  lifecycle wires (budgets, ages and vetoes are durations relative to receipt);
+  the control scope's audit records carry wall-clock instants on purpose.
 - The WIT package carries the world version. The engine accepts
   `smg:policy@1.x` within a stated range and the spec may pin `abi: 1.0`. The
   component model types a record, variant, flags or function by its exact

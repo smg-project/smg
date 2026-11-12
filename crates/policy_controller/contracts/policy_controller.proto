@@ -90,6 +90,8 @@ message Hello {
   bool resume = 11;
   // The gateway's release string, for the audit log.
   string version = 16;
+  // Never assigned; kept out of use so a later field takes a fresh number.
+  reserved 12 to 15;
 }
 
 message Locality {
@@ -98,6 +100,7 @@ message Locality {
   repeated string topology = 2;
 }
 
+// At most 64 KB a page (about 900 leases); the counts in Hello size the whole.
 message HelloPage {
   repeated LeaseAssertion leases = 1;
   repeated Pin pins = 2;
