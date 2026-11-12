@@ -2246,6 +2246,7 @@ const GROUPS: &[Group] = &[
         model: "Qwen/Qwen3-VL-8B-Instruct",
         also: &[
             "BAAI/RoboBrain2.5-4B",
+            "internlm/Visual-ERM",
             "lightonai/OriOn-Qwen",
             "lightonai/OriOn-Qwen-SR1",
             "microsoft/AesCode-32B",

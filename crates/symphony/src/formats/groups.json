@@ -159,7 +159,7 @@
   {"model": "Qwen/Qwen3-Omni-30B-A3B-Thinking", "also": [], "table": "qwen3", "opener": null, "after": null},
   {"model": "Qwen/Qwen3-VL-235B-A22B-Thinking", "also": ["Qwen3-VL-30B-A3B-Thinking"], "table": "qwen3", "opener": null, "after": null},
   {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct", "also": ["Qwen3-VL-235B-A22B-Instruct"], "table": "qwen3", "opener": null, "after": null},
-  {"model": "Qwen/Qwen3-VL-8B-Instruct", "also": ["BAAI/RoboBrain2.5-4B", "lightonai/OriOn-Qwen", "lightonai/OriOn-Qwen-SR1", "microsoft/AesCode-32B", "microsoft/AesCode-8B", "nvidia/Cosmos-Reason2-32B", "Qwen3-VL-2B-Instruct", "Qwen3-VL-32B-Instruct", "Qwen3-VL-4B-Instruct", "tencent/WeVisDoc-2B", "tencent/WeVisDoc-4B"], "table": "qwen3", "opener": null, "after": null},
+  {"model": "Qwen/Qwen3-VL-8B-Instruct", "also": ["BAAI/RoboBrain2.5-4B", "internlm/Visual-ERM", "lightonai/OriOn-Qwen", "lightonai/OriOn-Qwen-SR1", "microsoft/AesCode-32B", "microsoft/AesCode-8B", "nvidia/Cosmos-Reason2-32B", "Qwen3-VL-2B-Instruct", "Qwen3-VL-32B-Instruct", "Qwen3-VL-4B-Instruct", "tencent/WeVisDoc-2B", "tencent/WeVisDoc-4B"], "table": "qwen3", "opener": null, "after": null},
   {"model": "Qwen/Qwen3-VL-8B-Thinking", "also": ["Qwen3-VL-2B-Thinking", "Qwen3-VL-32B-Thinking", "Qwen3-VL-4B-Thinking"], "table": "qwen3", "opener": null, "after": null},
   {"model": "Qwen/Qwen3.5-27B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "Qwen/Qwen3.5-2B", "also": ["ATH-MaaS/OvisOCR2", "Qwen3.5-0.8B"], "table": "qwen3_tagged", "opener": null, "after": null},

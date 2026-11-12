@@ -567,6 +567,7 @@ mod tests {
             ("nvidia/Qwen3.8-Flash-Next-FP4-Local", Table::Qwen3Tagged),
             ("microsoft/AesCode-8B", Table::Qwen3),
             ("microsoft/AesCode-32B", Table::Qwen3),
+            ("internlm/Visual-ERM", Table::Qwen3),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");

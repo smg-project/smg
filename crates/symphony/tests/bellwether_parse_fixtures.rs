@@ -201,6 +201,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // them as members of the Visual-ERM group, whose sets replay through that table.
     ("aescode-8b", GenerationPrompt::Plain),
     ("aescode-32b", GenerationPrompt::Plain),
+    // Visual-ERM is that group's bellwether primary (the AesCode pair carries its files): its sets replay
+    // under their own slug too.
+    ("visual-erm", GenerationPrompt::Plain),
     ("qwen3-vl-30b-a3b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-32b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-235b-a22b-instruct", GenerationPrompt::Plain),
