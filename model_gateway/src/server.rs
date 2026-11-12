@@ -2560,13 +2560,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &config.secret_sources,
         config.router_config.api_key.as_deref(),
         &config.router_config.tenant_api_keys,
-        app_context.gateway_auth.clone(),
-        control_plane_auth_state
-            .as_ref()
-            .map(|state| state.keys.clone()),
-        control_plane_auth_state
-            .is_none()
-            .then(|| admin_auth_config.clone()),
+        crate::secrets::KeySets {
+            serving: app_context.gateway_auth.clone(),
+            control_plane: control_plane_auth_state
+                .as_ref()
+                .map(|state| state.keys.clone()),
+            admin_fallback: control_plane_auth_state
+                .is_none()
+                .then(|| admin_auth_config.clone()),
+        },
     )
     .map(Arc::new);
     // `--secrets-auto-reload`: the key files watched, a change reloading
