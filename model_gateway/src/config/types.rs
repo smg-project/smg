@@ -185,10 +185,12 @@ pub struct RouterConfig {
     /// a TLS handshake and upgraded connections included). A connection
     /// beyond the bound is closed at once, before any TLS handshake and
     /// without a response, and counted in
-    /// `smg_http_connections_rejected_total`. The admin listener
-    /// (`admin_port`) and the probe listener (`health_check_port`) are
-    /// outside the bound, so the control plane and the probes stay reachable
-    /// while the data plane is saturated. `0` is no bound.
+    /// `smg_http_connections_rejected_total`. Probes on the data port fall
+    /// under the bound like any connection; `health_check_port` is the
+    /// listener no bound covers. The admin listener (`admin_port`) is outside
+    /// this bound, so the control plane stays reachable while the data plane
+    /// is saturated, and inside its own, `admin_max_connections`. `0` is no
+    /// bound.
     #[serde(default)]
     pub max_connections: usize,
     /// Seconds a request may take: the read of its body overall (`408` past
