@@ -1113,19 +1113,33 @@ mod tests {
         }
     }
 
-    /// A 16x8 four-component baseline JPEG whose first component is sampled
-    /// 2x2 and the other three 1x1: the shape a CMYK file written with chroma
-    /// subsampling takes, which libjpeg-turbo 2.x's header call cannot name.
-    /// One MCU with every coefficient zero, so every sample decodes to 128.
+    /// A 16x8 baseline JPEG of one MCU with every coefficient zero, so every
+    /// sample decodes to 128, its components sampled as `sampling` says (one
+    /// packed byte per component, the horizontal factor in the high nibble).
     /// Built here rather than stored: a byte table would be test data.
-    fn unequal_sampling_cmyk_jpeg() -> Vec<u8> {
+    fn unequal_sampling_jpeg(sampling: &[u8]) -> Vec<u8> {
+        let count = sampling.len();
         let mut jpeg = vec![0xFF, 0xD8];
         // DQT: one table of ones.
         jpeg.extend([0xFF, 0xDB, 0x00, 0x43, 0x00]);
         jpeg.extend([1u8; 64]);
-        // SOF0: 8 bits, 8 rows, 16 columns, four components (2x2, 1x1, 1x1, 1x1).
-        jpeg.extend([0xFF, 0xC0, 0x00, 0x14, 0x08, 0x00, 0x08, 0x00, 0x10, 0x04]);
-        jpeg.extend([1, 0x22, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0]);
+        // SOF0: 8 bits, 8 rows, 16 columns, the components with their
+        // sampling, all on quantization table 0.
+        jpeg.extend([
+            0xFF,
+            0xC0,
+            0x00,
+            8 + 3 * count as u8,
+            0x08,
+            0x00,
+            0x08,
+            0x00,
+            0x10,
+        ]);
+        jpeg.push(count as u8);
+        for (id, &factors) in (1..).zip(sampling) {
+            jpeg.extend([id, factors, 0]);
+        }
         // DHT: a DC table and an AC table with one code each, for symbol 0 (a
         // zero difference; the end of a block).
         for class in [0x00, 0x10] {
@@ -1133,14 +1147,35 @@ mod tests {
             jpeg.extend([0u8; 15]);
             jpeg.push(0x00);
         }
-        // SOS: the four components on tables 0 and 0, the whole spectrum.
-        jpeg.extend([
-            0xFF, 0xDA, 0x00, 0x0E, 0x04, 1, 0, 2, 0, 3, 0, 4, 0, 0, 0x3F, 0,
-        ]);
-        // Seven blocks (four of the first component, one of each other), each
-        // a zero difference and an end of block: fourteen zero bits, padded.
-        jpeg.extend([0x00, 0x03, 0xFF, 0xD9]);
+        // SOS: every component on tables 0 and 0, the whole spectrum.
+        jpeg.extend([0xFF, 0xDA, 0x00, 6 + 2 * count as u8, count as u8]);
+        for id in 1..=count as u8 {
+            jpeg.extend([id, 0]);
+        }
+        jpeg.extend([0, 0x3F, 0]);
+        // One block per sampling unit of each component, each a zero
+        // difference and an end of block: two zero bits a block, padded
+        // with ones to the byte.
+        let blocks: usize = sampling
+            .iter()
+            .map(|&factors| usize::from(factors >> 4) * usize::from(factors & 0x0F))
+            .sum();
+        let bits = 2 * blocks;
+        let mut scan = vec![0u8; bits.div_ceil(8)];
+        let padding = scan.len() * 8 - bits;
+        if let Some(last) = scan.last_mut() {
+            *last = (1u8 << padding) - 1;
+        }
+        jpeg.extend(scan);
+        jpeg.extend([0xFF, 0xD9]);
         jpeg
+    }
+
+    /// The four-component file: its first component sampled 2x2 and the other
+    /// three 1x1, the shape a CMYK file written with chroma subsampling takes,
+    /// which libjpeg-turbo 2.x's header call cannot name.
+    fn unequal_sampling_cmyk_jpeg() -> Vec<u8> {
+        unequal_sampling_jpeg(&[0x22, 0x11, 0x11, 0x11])
     }
 
     /// The reader finds the frame header behind the tables, in a file written
@@ -1305,6 +1340,35 @@ mod tests {
         assert_eq!(fallback_frame(16, 8, frame(16, 8, 2)), None);
         assert_eq!(fallback_frame(16, 8, frame(16, 8, 5)), None);
         assert_eq!(fallback_frame(16, 8, None), None);
+    }
+
+    /// The three-component half of the fallback's key: a file whose second
+    /// component is sampled 2x1 and the others 1x1, a pattern the header call
+    /// names no subsampling for, decodes through the library as YCbCr to grey
+    /// 128 on every pixel (the decoder takes any whole-number sampling ratio).
+    #[test]
+    fn a_three_component_jpeg_with_unequal_sampling_decodes_through_turbojpeg() {
+        if !crate::test_support::turbojpeg_or_skip("the three-component test") {
+            return;
+        }
+        let jpeg = unequal_sampling_jpeg(&[0x11, 0x21, 0x11]);
+        assert_eq!(
+            frame_header(&jpeg),
+            Some(FrameHeader {
+                width: 16,
+                height: 8,
+                components: 3
+            }),
+            "the frame header reads the three-component frame"
+        );
+        let image = decode_jpeg_rgb(&jpeg)
+            .expect("decoded through libjpeg-turbo, the header call notwithstanding");
+        let rgb = image.to_rgb8();
+        assert_eq!((rgb.width(), rgb.height()), (16, 8));
+        assert!(
+            rgb.pixels().all(|pixel| pixel.0 == [128, 128, 128]),
+            "every sample is 128: grey"
+        );
     }
 
     /// A header the library cannot read leaves the dimensions unset, and the
