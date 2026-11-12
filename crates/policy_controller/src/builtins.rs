@@ -400,7 +400,12 @@ impl SinceReport {
         }
         let lane = &self.lanes[lane_of_this_thread()];
         let mut dispatches = lane.dispatches.lock();
-        dispatches.push_back((at_micros, tokens));
+        // At its instant's place: a dispatch that waited for a retirement
+        // on a shared lane, or one a stepped clock dated earlier, lands
+        // behind a later one, and the release and the retirement read a
+        // lane from its oldest. Instants mostly rise, so this is a push.
+        let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
+        dispatches.insert(at, (at_micros, tokens));
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
         lane.publish_oldest(&dispatches);
         // Under the lane's lock: a release, which holds every lane, never
@@ -2327,6 +2332,37 @@ mod tests {
             "a retirement below the bound retires nothing"
         );
         assert_eq!(ll.held_word_at(pool[0].id, 0), (100 * 7, 100));
+    }
+
+    #[test]
+    fn a_dispatch_landing_behind_a_later_instant_keeps_its_lane_oldest_first() {
+        // Two dispatches land on one lane in reverse instant order (a thread
+        // that waited past another's landing, or a clock that stepped): the
+        // lane holds the older one at its front, so a report's release past
+        // it takes that one and leaves the newer.
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool: Vec<Candidate> = vec![candidate(0, 0)];
+        pool[0].load = Some(report(0, 0));
+        pool[0].load_sampled_at_micros = 1_000;
+        let kept: Vec<u32> = vec![0];
+        for issued_micros in [20_000, 2_000] {
+            let lease = Lease {
+                issued_micros,
+                tokens: 7,
+                ..Lease::default()
+            };
+            ll.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+        }
+        let mut scores = vec![0.0f32; 1];
+        let mut sampled = pool.clone();
+        sampled[0].load_sampled_at_micros = 15_000;
+        ll.score(&RequestFacts::default(), &sampled, &kept, &mut scores);
+        assert_eq!(
+            ll.held(pool[0].id),
+            1,
+            "the release through the older dispatch takes it from behind the later one"
+        );
+        assert_eq!(ll.held_word_at(pool[0].id, 0), (7, 1));
     }
 
     #[test]
