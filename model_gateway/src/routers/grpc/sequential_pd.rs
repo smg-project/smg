@@ -34,7 +34,8 @@ use crate::{
             common::stages::request_execution::{
                 decode_silence_response, dispatch_prefill_within, first_prefill_response_within,
                 is_prefill_silence, pd_start_failure_response, prefill_silence_response,
-                retire_pd_side, PdSides, PrefillBound, Retirement, SideDispatch, StreamResult,
+                retire_pd_side, PdSides, PrefillBound, PrefillWait, Retirement, SideDispatch,
+                StreamResult,
             },
             context::{ClientSelection, ExecutionResult, PdTiming, WorkerSelection},
             multimodal::worker_language_model_only,
@@ -716,7 +717,10 @@ async fn sequential_prefill_side(
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
-        bound.clone(),
+        PrefillWait {
+            bound: bound.clone(),
+            encode: None,
+        },
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
         None,
@@ -737,7 +741,12 @@ async fn sequential_prefill_side(
     };
     if let Err(e) = first_prefill_response_within(
         &mut prefill_stream,
-        bound,
+        // The sequential protocol takes no encode watch: its request's
+        // encode, if any, is the parallel shape's rendezvous.
+        PrefillWait {
+            bound,
+            encode: None,
+        },
         prefill_worker,
         None,
         sides.prefill_label,

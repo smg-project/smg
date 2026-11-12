@@ -34,6 +34,7 @@ use super::{
             encode::EncodeDispatchPlan,
             helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
             pd_protocol::{EncodeHandoff, PdProtocol},
+            request_execution::EncodeWatch,
             RateLimitCell,
         },
     },
@@ -461,6 +462,13 @@ pub(crate) struct DispatchContext {
     /// prefill/decode sides against the already-running encode jobs (a push plan
     /// carrying media is not retried).
     pub encode_outputs: Option<EncodeOutputs>,
+    /// The watch on a rendezvous plan's encode dispatch, made when the first
+    /// attempt launched the encode jobs beside its pair (see
+    /// `request_execution::launch_encode_dispatch`); a replay's prefill side
+    /// waits at the same rooms on the same jobs, so it races the same watch
+    /// and a failed send ends its wait too. `None` for a push plan, a
+    /// text-only request, or a plan with nothing to encode.
+    pub encode_watch: Option<EncodeWatch>,
     pub multimodal_inflight: Option<InflightPermit>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
@@ -1234,6 +1242,7 @@ impl RequestContext {
             sticky_key: state.sticky_key,
             clients: state.clients,
             encode_outputs: state.encode_outputs,
+            encode_watch: None,
             multimodal_inflight: state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
