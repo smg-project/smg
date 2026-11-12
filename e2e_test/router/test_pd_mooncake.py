@@ -13,7 +13,7 @@ GetServerInfo, remote_bootstrap_addr from worker metadata). This test asserts:
 Runs only on the mooncake leg of e2e-2gpu-pd (E2E_VLLM_KV_BACKEND=mooncake).
 
 Usage:
-    E2E_RUNTIME=vllm E2E_VLLM_KV_BACKEND=mooncake \
+    E2E_RUNTIME=vllm E2E_ENGINE=vllm E2E_VLLM_KV_BACKEND=mooncake \
         pytest e2e_test/router/test_pd_mooncake.py -v
 """
 
