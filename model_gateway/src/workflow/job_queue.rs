@@ -2665,4 +2665,132 @@ mod tests {
             "the entry survives the dropped plain submission"
         );
     }
+
+    /// A `DELETE` whose cancel is written while the registration's registry
+    /// step runs (past the step's cancel read, before its registry write)
+    /// finds nothing registered to remove, and the step then writes its
+    /// worker: the job's end reads it from the registry and it leaves through
+    /// the removal the end queues, so the URL takes a new registration. The
+    /// window is held open by the registry step's test hold; on the base the
+    /// worker stayed under the URL, under a fresh id.
+    #[tokio::test]
+    async fn a_registration_cancelled_as_its_registry_step_writes_leaves_no_worker_under_its_url() {
+        use http::StatusCode;
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            worker::WorkerRegistry,
+            workflow::{
+                steps::{local::test_support::serve_json_routes, shared::registration_hold},
+                WorkflowEngines,
+            },
+        };
+
+        let url = serve_json_routes(vec![
+            ("/health", StatusCode::OK, serde_json::json!({})),
+            (
+                "/get_server_info",
+                StatusCode::OK,
+                serde_json::json!({"model_path": "org/model"}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "served"}]}),
+            ),
+        ])
+        .await;
+        let router_config = RouterConfig::default();
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        assert!(
+            context
+                .workflow_engines
+                .set(WorkflowEngines::new(&router_config))
+                .is_ok(),
+            "the engines are set once"
+        );
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        assert!(
+            context.worker_job_queue.set(Arc::clone(&queue)).is_ok(),
+            "the queue is set once"
+        );
+        let hold = registration_hold::place(&url);
+
+        // The POST: the id it reserves, its job, and a waiter for the job's
+        // outcome.
+        let id = registry.reserve_id_for_url(&url);
+        let mut spec = WorkerSpec::new(url.as_str());
+        spec.runtime_type = RuntimeType::Sglang;
+        let post = queue.submit_and_wait(
+            Job::AddWorker {
+                config: Box::new(spec),
+                registration_mode: WorkerRegistrationMode::CreateOnly,
+            },
+            Duration::from_secs(60),
+        );
+        // The DELETE lands in the window: the registration's cancel is
+        // written while its registry step runs, and nothing is registered to
+        // remove.
+        let delete = async {
+            tokio::time::timeout(Duration::from_secs(30), hold.reached.notified())
+                .await
+                .expect("the registration reaches its registry step");
+            assert!(
+                registry.get(&id).is_none(),
+                "the registry step wrote before its hold"
+            );
+            let deleted = context
+                .worker_service
+                .delete_worker(id.as_str())
+                .await
+                .expect("the DELETE ends a registration in flight");
+            assert!(
+                registry.get(&id).is_none(),
+                "the DELETE found a worker to remove"
+            );
+            // Whatever the DELETE set in motion is over before the step
+            // writes: a removal it queued under the URL (none on this head,
+            // where the cancel answers it) must not meet the worker's write.
+            while queue.get_status(&url).is_some_and(|status| {
+                status.job_type == "RemoveWorker"
+                    && matches!(status.status.as_str(), "pending" | "processing")
+            }) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            hold.release.notify_one();
+            deleted
+        };
+        let (outcome, deleted) = tokio::join!(post, delete);
+        assert_eq!(deleted.url, url);
+
+        // The worker the step wrote leaves through the removal the job's end
+        // queued (a job of its own), and the URL is free.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while (registry.get_by_url(&url).is_some() || queue.get_status(&url).is_some())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            registry.get_by_url(&url).is_none(),
+            "the worker stays under the URL after the DELETE: {outcome:?}"
+        );
+        assert!(
+            registry.get_url_by_id(&id).is_none(),
+            "the id still names the URL"
+        );
+        assert!(
+            queue.get_status(&url).is_none(),
+            "a job entry is left under the URL"
+        );
+        let failure = match outcome {
+            Err(JobOutcomeError::Failed(reason)) => reason,
+            other => panic!("the cancelled registration's job ended otherwise: {other:?}"),
+        };
+        assert!(
+            failure.contains("leave through a queued removal"),
+            "the outcome does not name the removal: {failure}"
+        );
+    }
 }

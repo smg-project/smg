@@ -173,6 +173,47 @@ fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> HashSe
         .collect()
 }
 
+/// A test's hold on the registry step, between the engine's cancel read for
+/// the step and the step's registry write: the window a `DELETE`'s cancel
+/// lands in while the step runs, whose worker the job's end then reads from
+/// the registry. Placed by URL for its next registration, taken once.
+#[cfg(test)]
+pub(crate) mod registration_hold {
+    use std::sync::{Arc, LazyLock};
+
+    use dashmap::DashMap;
+    use tokio::sync::Notify;
+
+    /// The hold on one URL's registry step: `reached` fires when the step is
+    /// in its window, `release` lets it write.
+    pub(crate) struct RegistrationHold {
+        pub(crate) reached: Notify,
+        pub(crate) release: Notify,
+    }
+
+    static HOLDS: LazyLock<DashMap<String, Arc<RegistrationHold>>> = LazyLock::new(DashMap::new);
+
+    /// Places a hold on the next registry step for `url`.
+    pub(crate) fn place(url: &str) -> Arc<RegistrationHold> {
+        let hold = Arc::new(RegistrationHold {
+            reached: Notify::new(),
+            release: Notify::new(),
+        });
+        HOLDS.insert(url.to_string(), Arc::clone(&hold));
+        hold
+    }
+
+    /// The step's side: under a hold placed for `url`, says the window is
+    /// reached and waits for the release; without one, returns at once.
+    pub(crate) async fn honour(url: &str) {
+        let Some((_, hold)) = HOLDS.remove(url) else {
+            return;
+        };
+        hold.reached.notify_one();
+        hold.release.notified().await;
+    }
+}
+
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
@@ -186,6 +227,14 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             .data
             .get_actual_workers()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+
+        // A test's hold on this step's window (`registration_hold`).
+        #[cfg(test)]
+        {
+            if let Some(worker) = workers.first() {
+                registration_hold::honour(worker.url()).await;
+            }
+        }
 
         let mut worker_ids = Vec::with_capacity(workers.len());
         let registration_mode = context.data.registration_mode();
