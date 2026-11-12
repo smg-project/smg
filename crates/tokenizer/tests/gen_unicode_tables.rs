@@ -8,7 +8,10 @@
 //! and replace the file with the output between the BEGIN and END markers.
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
-use tokenizers::utils::SysRegex;
+use tokenizers::{
+    pre_tokenizers::punctuation::Punctuation, utils::SysRegex, OffsetReferential, OffsetType,
+    PreTokenizedString, PreTokenizer, SplitDelimiterBehavior,
+};
 
 fn matches_whole(re: &SysRegex, text: &str) -> bool {
     re.find_iter(text)
@@ -40,6 +43,21 @@ fn ranges_of(pattern: &str) -> Vec<(u32, u32)> {
         buf.clear();
         buf.push(c);
         matches_whole(&re, &buf)
+    })
+}
+
+/// The code points the reference's `Punctuation` pre-tokenizer cuts on: the
+/// character stands alone between two letters.
+fn reference_punctuation() -> Vec<(u32, u32)> {
+    let punctuation = Punctuation::new(SplitDelimiterBehavior::Isolated);
+    ranges_where(|c| {
+        let mut text = PreTokenizedString::from(format!("a{c}a").as_str());
+        punctuation
+            .pre_tokenize(&mut text)
+            .expect("the reference pre-tokenizes");
+        text.get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .len()
+            == 3
     })
 }
 
@@ -115,6 +133,26 @@ fn print_unicode_tables() {
     println!("/// the regex engine's `\\p{{N}}` is another Unicode version.");
     println!("pub(super) const STD_NUMERIC: &[(char, char)] = &[");
     for chunk in numeric.chunks(4) {
+        let items: Vec<String> = chunk
+            .iter()
+            .map(|(a, b)| format!("('\\u{{{a:x}}}', '\\u{{{b:x}}}')"))
+            .collect();
+        println!("    {},", items.join(", "));
+    }
+    println!("];");
+    // The reference's `Punctuation` pre-tokenizer cuts on its own set (ASCII
+    // punctuation, or the punctuation category of the Unicode tables it
+    // carries), which trails `\p{P}` of its regex engine: the native stage
+    // takes the set from the pre-tokenizer itself.
+    let punctuation = reference_punctuation();
+    println!();
+    println!(
+        "/// The code points the reference's `Punctuation` pre-tokenizer cuts on ({} ranges):",
+        punctuation.len()
+    );
+    println!("/// its ASCII punctuation, or the punctuation category of the tables it carries.");
+    println!("pub(super) const REFERENCE_PUNCTUATION: &[(char, char)] = &[");
+    for chunk in punctuation.chunks(4) {
         let items: Vec<String> = chunk
             .iter()
             .map(|(a, b)| format!("('\\u{{{a:x}}}', '\\u{{{b:x}}}')"))

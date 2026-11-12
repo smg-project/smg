@@ -940,8 +940,8 @@ impl NativeEncoder {
         let pre_tokenizer = serialized("pre-tokenizer", tokenizer.get_pre_tokenizer())?;
         // A vocabulary with byte fallback and no `ByteLevel` stage is a
         // sentencepiece-style one; a byte-level vocabulary whose file sets
-        // the flag keeps the byte-level path.
-        if bpe.byte_fallback && !Self::ends_in_byte_level(&pre_tokenizer) {
+        // the flag keeps the byte-level path, wherever its `ByteLevel` sits.
+        if bpe.byte_fallback && !Self::has_byte_level(&pre_tokenizer) {
             return Self::sentencepiece_from(tokenizer, &pre_tokenizer);
         }
         let normalizer =
@@ -1055,16 +1055,16 @@ impl NativeEncoder {
         })
     }
 
-    /// Whether a pre-tokenizer (serialized) ends in a `ByteLevel` stage, the
-    /// shape of the byte-level path ([`Self::stages_from`]).
-    fn ends_in_byte_level(pre_tokenizer: &Value) -> bool {
-        let last = match pre_tokenizer.get("pretokenizers").and_then(Value::as_array) {
-            Some(items) => items.last(),
-            None => Some(pre_tokenizer),
-        };
-        last.and_then(|item| item.get("type"))
-            .and_then(Value::as_str)
-            == Some("ByteLevel")
+    /// Whether a pre-tokenizer (serialized) holds a `ByteLevel` stage, the
+    /// shape of the byte-level path ([`Self::stages_from`], which finds the
+    /// stage by position and takes stages after it).
+    fn has_byte_level(pre_tokenizer: &Value) -> bool {
+        let is_byte_level =
+            |item: &Value| item.get("type").and_then(Value::as_str) == Some("ByteLevel");
+        match pre_tokenizer.get("pretokenizers").and_then(Value::as_array) {
+            Some(items) => items.iter().any(is_byte_level),
+            None => is_byte_level(pre_tokenizer),
+        }
     }
 
     /// Where the word marker comes from on a byte-fallback vocabulary, and
@@ -1618,12 +1618,14 @@ impl NativeEncoder {
     }
 
     /// The stages of a pre-tokenizer that is zero or more `Split`s (or
-    /// `Digits`, a split on numeric characters) followed by one `ByteLevel`
-    /// without prefix space.
+    /// `Digits`, a split on numeric characters, or `Punctuation`s) around
+    /// one `ByteLevel` without prefix space: those before it as they are,
+    /// those after it when they cut the text where they cut its byte-level
+    /// image.
     fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
         if pre_tokenizer.is_null() {
             return Err(Declined::from(
-                "no pre-tokenizer (the path needs ByteLevel, after any split stages)",
+                "no pre-tokenizer (the path needs a ByteLevel without a prefix space)",
             ));
         }
         let items: Vec<&Value> = match type_of("pre-tokenizer", pre_tokenizer)? {
@@ -1635,37 +1637,52 @@ impl NativeEncoder {
                 .collect(),
             _ => vec![pre_tokenizer],
         };
-        let (byte_level, splits) = items
-            .split_last()
-            .ok_or_else(|| Declined::from("an empty pre-tokenizer sequence"))?;
-        if byte_level.get("type").and_then(Value::as_str) != Some("ByteLevel")
-            || byte_level.get("add_prefix_space").and_then(Value::as_bool) != Some(false)
-        {
-            return Err(Declined::from(
-                "the pre-tokenizer does not end in ByteLevel without a prefix space",
-            ));
-        }
-        let mut stages = Vec::with_capacity(splits.len() + 1);
-        for split in splits {
+        let at = items
+            .iter()
+            .position(|item| item.get("type").and_then(Value::as_str) == Some("ByteLevel"))
+            .filter(|&at| items[at].get("add_prefix_space").and_then(Value::as_bool) == Some(false))
+            .ok_or_else(|| {
+                Declined::from("the pre-tokenizer has no ByteLevel without a prefix space")
+            })?;
+        let mut stages = Vec::with_capacity(items.len());
+        for split in &items[..at] {
             stages.push(Self::split_stage(split)?);
         }
-        if byte_level.get("use_regex").and_then(Value::as_bool) == Some(true) {
+        if items[at].get("use_regex").and_then(Value::as_bool) == Some(true) {
             stages.push(Stage {
                 pattern: Pattern::parse(BYTE_LEVEL_PATTERN)
                     .ok_or_else(|| Declined::from("the ByteLevel split pattern"))?,
                 keep_gaps: true,
             });
         }
+        // A stage after the `ByteLevel` cuts the mapped text. It cuts the
+        // raw text at the same places when its pattern can only ever match
+        // or reject printable ASCII characters: the map leaves those in
+        // place and takes every other byte beyond ASCII. Such a stage moves
+        // before the map; any other declines.
+        for split in &items[at + 1..] {
+            let stage = Self::split_stage(split)?;
+            if !stage.pattern.within_printable_ascii() {
+                return Err(Declined::from(
+                    "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII",
+                ));
+            }
+            stages.push(stage);
+        }
         Ok(stages)
     }
 
-    /// One `Split` before the `ByteLevel` as a stage: a regex or a literal
-    /// the pattern engine takes, `Isolated`, or `Removed` inverted. A
-    /// `Digits` is the `Isolated` split on numeric characters, each one a
-    /// piece under `individual_digits`, else each run: the reference splits
-    /// on `char::is_numeric`, the toolchain's numeric set
-    /// ([`unicode::STD_NUMERIC`]), which is not the engine's `\p{N}` (the
-    /// regex engine's Unicode version).
+    /// One `Split` as a stage: a regex or a literal the pattern engine takes,
+    /// `Isolated`, or `Removed` inverted. A `Digits` is the `Isolated` split
+    /// on numeric characters, each one a piece under `individual_digits`,
+    /// else each run: the reference splits on `char::is_numeric`, the
+    /// toolchain's numeric set ([`unicode::STD_NUMERIC`]), which is not the
+    /// engine's `\p{N}` (the regex engine's Unicode version). A `Punctuation`
+    /// is the `Isolated` split on the reference's punctuation set, one
+    /// character a piece, or one run under `Contiguous`: the reference
+    /// pre-tokenizer's own set ([`unicode::REFERENCE_PUNCTUATION`]: ASCII
+    /// punctuation, or the punctuation category of the Unicode tables it
+    /// carries), not the engine's `\p{P}`, which has moved on since.
     fn split_stage(split: &Value) -> Result<Stage, Declined> {
         match type_of("pre-tokenizer stage", split)? {
             "Split" => {}
@@ -1683,9 +1700,27 @@ impl NativeEncoder {
                     })
                     .ok_or_else(|| Declined::from("the Digits split pattern"));
             }
+            "Punctuation" => {
+                // The reference reads a missing `behavior` as `Isolated`.
+                let runs = match split.get("behavior").and_then(Value::as_str) {
+                    None | Some("Isolated") => false,
+                    Some("Contiguous") => true,
+                    behavior => {
+                        return Err(Declined::from(format!(
+                            "Punctuation behavior {behavior:?} (only Isolated or Contiguous)"
+                        )))
+                    }
+                };
+                return Pattern::parse(&class_pattern(unicode::REFERENCE_PUNCTUATION, runs))
+                    .map(|pattern| Stage {
+                        pattern,
+                        keep_gaps: true,
+                    })
+                    .ok_or_else(|| Declined::from("the Punctuation split pattern"));
+            }
             other => {
                 return Err(Declined::from(format!(
-                    "pre-tokenizer {other} before the ByteLevel (only Split or Digits)"
+                    "pre-tokenizer {other} beside the ByteLevel (only Split, Digits or Punctuation)"
                 )))
             }
         }

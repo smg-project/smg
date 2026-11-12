@@ -17,6 +17,7 @@ use tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
         digits::Digits,
         metaspace::{Metaspace, PrependScheme},
+        punctuation::Punctuation,
         sequence::Sequence,
         split::{Split, SplitPattern},
         PreTokenizerWrapper,
@@ -28,7 +29,8 @@ use tokenizers::{
         template::{SpecialToken, TemplateProcessing},
         PostProcessorWrapper,
     },
-    AddedToken, AddedVocabulary, DecoderWrapper, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
+    AddedToken, AddedVocabulary, DecoderWrapper, OffsetReferential, OffsetType, PreTokenizedString,
+    PreTokenizer, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
 };
 use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
@@ -125,6 +127,15 @@ const POOL: &[char] = &[
     ')',
     '€',
     '→',
+    // Punctuation beyond ASCII, for the `Punctuation` shapes: two code
+    // points where the reference's set and the engine's category differ
+    // (U+2E43 only in the category, U+166D only in the set).
+    '¿',
+    '«',
+    '…',
+    '、',
+    '\u{2E43}',
+    '\u{166D}',
     '\u{301}',
     '\u{93E}',
     '\u{E31}',
@@ -386,6 +397,24 @@ fn shapes() -> Vec<Shape> {
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[],
         },
+        // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
+        // split on ASCII digits after the map (the reference cuts the mapped
+        // text, the native path the raw text, at the same places).
+        Shape {
+            name: "punctuation-runs-then-a-split-after-the-map",
+            nfc: false,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Punctuation(Punctuation::new(
+                    SplitDelimiterBehavior::Contiguous,
+                )),
+                split(TEKKEN, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+                split("[0-9]", SplitDelimiterBehavior::Isolated, false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
         // `Digits` in runs before a split and the `ByteLevel`.
         Shape {
             name: "digit-runs",
@@ -408,6 +437,21 @@ fn shapes() -> Vec<Shape> {
             ],
             ignore_merges: false,
             special: &["<|begin_of_text|>", "<|endoftext|>"],
+            added: &[],
+        },
+        // `Punctuation` one character at a time, then the `ByteLevel` with
+        // its own regex.
+        Shape {
+            name: "punctuation-each-then-byte-level-regex",
+            nfc: false,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Punctuation(Punctuation::new(
+                    SplitDelimiterBehavior::Isolated,
+                )),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
             added: &[],
         },
         // Added tokens with a space inside, matched after normalization
@@ -486,14 +530,12 @@ fn every_shape_gets_a_native_path() {
             .filter(|p| {
                 matches!(
                     p,
-                    PreTokenizerWrapper::Split(_) | PreTokenizerWrapper::Digits(_)
-                )
+                    PreTokenizerWrapper::Split(_)
+                        | PreTokenizerWrapper::Digits(_)
+                        | PreTokenizerWrapper::Punctuation(_)
+                ) || matches!(p, PreTokenizerWrapper::ByteLevel(byte_level) if byte_level.use_regex)
             })
-            .count()
-            + usize::from(matches!(
-                shape.pre_tokenizers.last(),
-                Some(PreTokenizerWrapper::ByteLevel(byte_level)) if byte_level.use_regex
-            ));
+            .count();
         assert_eq!(
             native.expect("native").stages.len(),
             expected_stages,
@@ -566,7 +608,7 @@ fn shapes_outside_the_path_are_declined() {
     ]))));
     assert_eq!(
         declined(&tokenizer),
-        "the pre-tokenizer does not end in ByteLevel without a prefix space"
+        "the pre-tokenizer has no ByteLevel without a prefix space"
     );
     // A normalizer other than NFC.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -584,6 +626,38 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "Split behavior Some(\"MergedWithNext\") with invert Some(false) (only Isolated, or \
              Removed inverted)"
+    );
+    // A punctuation behaviour the path does not reproduce.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        PreTokenizerWrapper::Punctuation(Punctuation::new(SplitDelimiterBehavior::Removed)),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "Punctuation behavior Some(\"Removed\") (only Isolated or Contiguous)"
+    );
+    // A split after the ByteLevel that would read the mapped text otherwise
+    // than the raw text.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        split(r"\p{N}", SplitDelimiterBehavior::Isolated, false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
+    );
+    // A `Digits` after the ByteLevel: on the mapped text it would also cut
+    // at the numeric characters the map makes of six bytes beyond ASCII.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        PreTokenizerWrapper::Digits(Digits::new(true)),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
     );
     // An added token with lstrip.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -621,7 +695,7 @@ fn shapes_outside_the_path_are_declined() {
     tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
     assert_eq!(
         declined(&tokenizer),
-        "no pre-tokenizer (the path needs ByteLevel, after any split stages)"
+        "no pre-tokenizer (the path needs a ByteLevel without a prefix space)"
     );
 }
 
@@ -691,6 +765,46 @@ fn digits_the_engine_table_lacks_are_cut_apart_before_a_merge_across_them() {
             Ok(reference.get_ids().to_vec()),
             "{text:?}"
         );
+    }
+}
+
+/// The punctuation stage holds exactly the characters the reference's
+/// `Punctuation` pre-tokenizer cuts on: every code point of the Basic
+/// Multilingual Plane, and both edges of every range of the engine's `\p{P}`
+/// table and of the reference's set beyond it (the two sets differ, and the
+/// stage follows the reference).
+#[test]
+fn the_punctuation_stage_holds_what_the_reference_cuts_on() {
+    let stage = NativeEncoder::split_stage(&serde_json::json!(
+        {"type": "Punctuation", "behavior": "Isolated"}
+    ))
+    .expect("the punctuation stage");
+    let reference = Punctuation::new(SplitDelimiterBehavior::Isolated);
+    let edges = unicode::PUNCTUATION
+        .iter()
+        .copied()
+        .chain(
+            unicode::REFERENCE_PUNCTUATION
+                .iter()
+                .map(|&(start, end)| (u32::from(start), u32::from(end))),
+        )
+        .flat_map(|(start, end)| [start.saturating_sub(1), start, end, end + 1])
+        .filter(|&code| code > 0xFFFF);
+    let mut text = String::new();
+    for code in (0..=0xFFFFu32).chain(edges) {
+        let Some(c) = char::from_u32(code) else {
+            continue;
+        };
+        text.clear();
+        text.push(c);
+        let native = stage.pattern.find_iter(&text).next() == Some((0, text.len()));
+        let mut split = PreTokenizedString::from(format!("a{c}a").as_str());
+        reference.pre_tokenize(&mut split).expect("the reference");
+        let cuts = split
+            .get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .len()
+            == 3;
+        assert_eq!(native, cuts, "U+{code:04X}");
     }
 }
 
@@ -3271,13 +3385,19 @@ fn every_sentencepiece_shape_gets_a_native_path() {
 #[test]
 fn a_byte_level_vocabulary_with_the_byte_fallback_flag_keeps_its_path() {
     let mut state = 0xB17E_1E7E_1F1A_6000u64;
-    let shape = &shapes()[0];
-    let mut tokenizer = tokenizer_of(shape, &mut state);
-    let mut model = model(&mut state, shape.ignore_merges);
-    model.byte_fallback = true;
-    tokenizer.with_model(model);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("the byte-level path");
-    assert!(native.chars.is_none() && !native.stages.is_empty());
+    for shape in shapes() {
+        let mut tokenizer = tokenizer_of(&shape, &mut state);
+        let mut model = model(&mut state, shape.ignore_merges);
+        model.byte_fallback = true;
+        tokenizer.with_model(model);
+        let native = NativeEncoder::from_tokenizer(&tokenizer)
+            .unwrap_or_else(|declined| panic!("{}: {declined}", shape.name));
+        assert!(
+            native.chars.is_none() && !native.stages.is_empty(),
+            "{}",
+            shape.name
+        );
+    }
 }
 
 #[test]
