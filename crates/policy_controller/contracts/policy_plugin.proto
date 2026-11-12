@@ -10,7 +10,8 @@
 // decodes as unset: a Decision with no outcome is a deadline miss, a
 // PluginDecision answering none of its asked stages a decline. On the decide,
 // session, plugin and lifecycle wires no absolute instant crosses: budgets,
-// ages and vetoes are durations relative to the frame's receipt.
+// ages and vetoes are durations relative to the frame's receipt; a duration
+// or age past its field's width saturates at the maximum, never wraps.
 // Widths: a `uint32` marked `u8` or `u16` holds a value of that width in the
 // record, and a reader refuses a larger one. A worker id is the 64-bit hash
 // of (registration key, incarnation), never a URL.
@@ -216,7 +217,7 @@ message Candidate {
   // Host-supplied admission bit: the decode's running window has a room
   // nobody waiting at its gate is in line for.
   bool has_room = 17;
-  uint32 admitted_age_ms = 18;  // since admission to the pool
+  uint32 admitted_age_ms = 18;  // since admission to the pool, saturating
   // Blocks the index learned about the worker since admission.
   uint32 indexed_growth = 19;
   // One-based position into `view.zones`; 0 when unzoned.
@@ -478,7 +479,7 @@ message Completed {
   uint32 ttft_micros = 6;
   uint32 tokens_in = 7;
   uint32 tokens_out = 8;
-  uint32 duration_micros = 9;
+  uint32 duration_micros = 9;  // saturating
 }
 
 message Released {
