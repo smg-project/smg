@@ -2756,9 +2756,9 @@ class RouterArgs:
             default=RouterArgs.history_memory_max_responses,
             help=(
                 "Most stored responses the memory history backend keeps; the oldest go"
-                " first, on every write (memory backend only; a stored response takes"
-                " about 12 KB). The Messages thread store keeps that many turns under"
-                " every history backend, the oldest evicted first."
+                " first, on every write (a stored response takes about 12 KB). The"
+                " Messages thread store keeps that many turns under every history"
+                " backend, the oldest evicted first."
             ),
         )
         backend_group.add_argument(
