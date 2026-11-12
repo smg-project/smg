@@ -259,7 +259,9 @@ message RequestFacts {
   Phase phase = 11;
   uint32 attempt = 12;  // u8; 0 for the first attempt
   repeated fixed64 tried = 13 [packed = true];
-  // Time left for the decision, relative to the frame's receipt.
+  // Time left for the whole decision, relative to the frame's receipt (on a
+  // PluginDecide, rebased to that frame's receipt when the controller
+  // forwards it).
   uint32 budget_micros = 14;
   repeated Header headers = 15;  // allow-listed only
   MediaCounts media = 16;
@@ -631,6 +633,10 @@ message PluginDecide {
   PoolFacts pool = 4;
   uint32 stages = 5;
   repeated float scores_in = 6 [packed = true];
+  // The plugin's own deadline for this frame, relative to its receipt (the
+  // budget REASON_BUDGET declines are measured against). The controller
+  // clamps it to at most `request.budget_micros`, so a plugin may rely on
+  // this field never exceeding the request's.
   uint32 budget_micros = 7;
 }
 
