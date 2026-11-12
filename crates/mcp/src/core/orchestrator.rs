@@ -1149,42 +1149,75 @@ impl McpOrchestrator {
                 // with side effects gets an unknown outcome whether or not
                 // the connection comes back.
                 let replayable = Self::replayable(entry);
-
-                // Acquire/Create the mutex for this server to prevent concurrent reconnects
-                let lock = self
-                    .reconnection_locks
-                    .entry(name.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                    .value()
-                    .clone();
-
-                let _guard = lock.lock().await;
-
-                // A client differing from the one that failed means another
-                // task already reconnected it. Read the verdict and drop the
-                // map guard before awaiting anything.
-                let already_reconnected =
-                    self.static_servers
-                        .get(&name)
-                        .map(|current| match &initial_client {
-                            Some(initial) => !Arc::ptr_eq(initial, &current.client),
-                            None => true,
-                        });
-
-                let recovery = match already_reconnected {
-                    Some(true) => {
-                        debug!("Server '{}' already reconnected by another task", name);
-                        Ok(())
-                    }
-                    _ => self.recover_static_server(&name).await,
-                };
-
+                let recovery = self.recover_after_disconnect(&name, initial_client).await;
                 Self::after_recovery(replayable, recovery, &name, entry.tool_name())?;
                 self.execute_tool_impl(entry, arguments, Self::remaining(deadline))
                     .await
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The recovery a dropped transport gets. A server that is not a static
+    /// one (no entry under its key when the call began and none configured)
+    /// reached the transport through the dynamic pool: its connection is the
+    /// pool's to rebuild on the next request, so the drop is answered as the
+    /// disconnect it is, and no reconnection lock is kept under a key a
+    /// client named in its request. A static server reconnects under its
+    /// lock, one task at a time; the lock's entry leaves the map with the
+    /// last task that held it, so the map's size follows the servers
+    /// recovering, not the servers that ever dropped.
+    async fn recover_after_disconnect(
+        &self,
+        name: &str,
+        initial_client: Option<Arc<McpClientWithHandler>>,
+    ) -> McpResult<()> {
+        if initial_client.is_none() && !self.config.servers.iter().any(|s| s.name == name) {
+            return Err(McpError::ServerDisconnected(name.to_string()));
+        }
+
+        // Acquire/Create the mutex for this server to prevent concurrent reconnects
+        let lock = self
+            .reconnection_locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .value()
+            .clone();
+
+        let recovery = {
+            let _guard = lock.lock().await;
+
+            // A client differing from the one that failed means another
+            // task already reconnected it. Read the verdict and drop the
+            // map guard before awaiting anything.
+            let already_reconnected =
+                self.static_servers
+                    .get(name)
+                    .map(|current| match &initial_client {
+                        Some(initial) => !Arc::ptr_eq(initial, &current.client),
+                        None => true,
+                    });
+
+            match already_reconnected {
+                Some(true) => {
+                    debug!("Server '{}' already reconnected by another task", name);
+                    Ok(())
+                }
+                _ => self.recover_static_server(name).await,
+            }
+        };
+
+        drop(lock);
+        self.release_reconnection_lock(name);
+        recovery
+    }
+
+    /// Drop a server's reconnection lock from the map once no task holds it:
+    /// a task still waiting on the lock keeps its own clone, so the entry
+    /// stays for it and leaves with the last one out.
+    fn release_reconnection_lock(&self, name: &str) {
+        self.reconnection_locks
+            .remove_if(name, |_, held| Arc::strong_count(held) == 1);
     }
 
     /// Rebuild a static server's connection. Runs under the caller's
@@ -2393,6 +2426,43 @@ mod tests {
         // Should find only 1 match (no collision)
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].1, "server1");
+    }
+
+    /// A dynamic server (no static entry, none configured) whose transport
+    /// dropped is answered as the disconnect it is, not the configured-server
+    /// lookup's "not found", and no reconnection lock is kept under its key.
+    #[tokio::test]
+    async fn a_dynamic_servers_dropped_transport_is_a_disconnect_and_leaves_no_lock() {
+        let orchestrator = McpOrchestrator::new_test();
+        let key = "https://tools.example/mcp";
+        let err = orchestrator
+            .recover_after_disconnect(key, None)
+            .await
+            .expect_err("a dynamic server has no static recovery");
+        assert!(
+            matches!(&err, McpError::ServerDisconnected(name) if name == key),
+            "{err:?}"
+        );
+        assert!(orchestrator.reconnection_locks.is_empty());
+    }
+
+    /// A static server's reconnection lock leaves the map with the last task
+    /// that held it: a task still waiting keeps the entry, the last one out
+    /// removes it, so the map's size follows the servers recovering.
+    #[tokio::test]
+    async fn a_reconnection_lock_leaves_the_map_with_its_last_holder() {
+        let orchestrator = McpOrchestrator::new_test();
+        let waiting = orchestrator
+            .reconnection_locks
+            .entry("srv".to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .value()
+            .clone();
+        orchestrator.release_reconnection_lock("srv");
+        assert!(orchestrator.reconnection_locks.contains_key("srv"));
+        drop(waiting);
+        orchestrator.release_reconnection_lock("srv");
+        assert!(orchestrator.reconnection_locks.is_empty());
     }
 
     #[test]
