@@ -4194,14 +4194,22 @@ fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
     }
 }
 
+/// A fresh id: `prefix`, an underscore and 50 lowercase hex digits (25 random
+/// bytes), written into one string sized for the whole id.
 pub fn generate_id(prefix: &str) -> String {
     use rand::Rng;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut rng = rand::rng();
-    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
     let mut bytes = [0u8; 25];
     rng.fill_bytes(&mut bytes);
-    let hex_string: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{prefix}_{hex_string}")
+    let mut id = String::with_capacity(prefix.len() + 1 + 2 * bytes.len());
+    id.push_str(prefix);
+    id.push('_');
+    for byte in bytes {
+        id.push(char::from(HEX[usize::from(byte >> 4)]));
+        id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    id
 }
 
 /// The Response object of `POST /v1/responses`.
