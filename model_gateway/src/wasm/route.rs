@@ -162,7 +162,8 @@ pub async fn remove_wasm_module(
 
 /// The status and code of a module job the queue did not finish: no queue is a
 /// 503, a wait past its bound a 504 (the job may still finish; the client
-/// re-reads `GET /wasm`), a job that ran and failed a 500.
+/// re-reads `GET /wasm`), a job that ran and failed a 500, a removal while
+/// another caller waits on one for the same module a 409.
 fn job_refusal_parts(error: &JobOutcomeError) -> (StatusCode, &'static str) {
     match error {
         JobOutcomeError::NotQueued(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
@@ -241,7 +242,8 @@ mod tests {
     use super::*;
 
     /// A removal the queue did not finish answers by what happened: no queue
-    /// 503, a wait past its bound 504, a failed job 500.
+    /// 503, a wait past its bound 504, a failed job 500, a removal while
+    /// another caller waits on one for the same module 409.
     #[test]
     fn a_removal_the_queue_did_not_finish_answers_by_what_happened() {
         let cases = [
