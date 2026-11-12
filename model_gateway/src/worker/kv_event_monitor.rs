@@ -451,13 +451,17 @@ impl KvEventMonitor {
                 );
                 // Counted under the engine's workers (the series the
                 // dashboards key on), which hold their workers. With none
-                // left on the task the log line above is the record: a
-                // write by name for a worker already gone would recreate
-                // its series.
+                // left on the task it is counted under the engine's own
+                // address, the key of its subscription: an alert on the
+                // series sees the panic either way, and no worker is looked
+                // up by name for a series the store may have retired.
                 let members = {
                     let subs = slots.lock().await;
                     Self::members_of(&subs, &task_address, id)
                 };
+                if members.is_empty() {
+                    Metrics::record_kv_event_subscription_failure(&task_address, "panic");
+                }
                 for member in &members {
                     Metrics::record_kv_event_subscription_failure(member, "panic");
                 }
