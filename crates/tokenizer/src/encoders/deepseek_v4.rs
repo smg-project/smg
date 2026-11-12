@@ -965,6 +965,49 @@ mod tests {
         }
     }
 
+    /// A system message renders its content first, then the tools block and
+    /// the response-format section it carries, each after a blank line, in
+    /// that order, before the user turn; the same in both thinking modes.
+    #[test]
+    fn a_system_message_renders_its_content_then_its_tools_then_its_response_format() {
+        let messages = [
+            json!({
+                "role": "system",
+                "content": "Use the tool.",
+                "tools": [{ "type": "function", "function": { "name": "lookup_weather",
+                    "description": "Look up", "parameters": { "type": "object",
+                    "properties": { "query": { "type": "string" } }, "required": ["query"] } } }],
+                "response_format": { "type": "json_object" },
+            }),
+            user("hello"),
+        ];
+        for (mode, thinking_token) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
+            let out = encode_messages(&messages, mode, &EncodeParams::default()).unwrap();
+            let tools = out.find("## Tools\n").expect("the tools block");
+            let format = out
+                .find("## Response Format:\n\n")
+                .expect("the response-format section");
+            assert!(
+                out.starts_with(&format!(
+                    "{BOS_TOKEN}Use the tool.\n\n## Tools\n\nYou have access"
+                )),
+                "{out}"
+            );
+            assert!(tools < format, "{out}");
+            assert!(
+                out[tools..format].contains(r#""name": "lookup_weather""#)
+                    && out.ends_with(&format!(
+                        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n\
+                         {{\"type\": \"json_object\"}}{USER_SP_TOKEN}hello{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    )),
+                "{out}"
+            );
+        }
+    }
+
     /// The reference writes the response-format section under `if
     /// response_format:`, so `null` and `{}` render no section, on a system
     /// and on a developer message (the engine's own encoder copy renders
