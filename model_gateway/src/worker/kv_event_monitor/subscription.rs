@@ -335,7 +335,7 @@ impl KvEventMonitor {
     /// Take a worker's blocks out of the index when it leaves its engine's
     /// stream, on the blocking pool and under a fleet-wide bound, and log
     /// what its stream carried that the index did not take as is.
-    async fn remove_indexer_worker(
+    pub(super) async fn remove_indexer_worker(
         indexer: Arc<KvIndex>,
         worker_id: u32,
         worker_url: &str,
@@ -515,7 +515,7 @@ impl KvEventMonitor {
     /// gets the backend client, subscribes under the deadline and drains one
     /// stream, then says what comes next; this loop is the one place that
     /// sleeps the reconnect backoff and the one place that ends the task.
-    pub(super) async fn subscription_loop(task: EngineTask) {
+    pub(super) async fn subscription_loop(task: EngineTask, state: &mut EngineStreamState) {
         let EngineTask {
             address,
             model_id,
@@ -551,8 +551,7 @@ impl KvEventMonitor {
             .dp_size()
             .filter(|_| first.dp_rank().is_some())
             .unwrap_or(1);
-        let mut state = EngineStreamState::new(&address, Vec::new());
-        Self::member_joined(&sub, &mut state, first);
+        Self::member_joined(&sub, state, first);
         // A shutdown taken inside the grace spends the receiver (a oneshot
         // polled again after it fired panics), so the end is carried past
         // the rounds to the exit path below.
@@ -567,7 +566,7 @@ impl KvEventMonitor {
                         break;
                     }
                     change = changes.recv() => match change {
-                        Some(change) => Self::apply_change(&sub, &mut state, change).await,
+                        Some(change) => Self::apply_change(&sub, state, change).await,
                         None => {
                             ended = true;
                             break;
@@ -587,7 +586,7 @@ impl KvEventMonitor {
             }
             // Changes that landed between rounds, before the next connect.
             while let Ok(change) = changes.try_recv() {
-                Self::apply_change(&sub, &mut state, change).await;
+                Self::apply_change(&sub, state, change).await;
             }
             if shutdown_rx.try_recv().is_ok() {
                 break false;
@@ -600,7 +599,7 @@ impl KvEventMonitor {
                     _ = &mut shutdown_rx => break false,
                     change = changes.recv() => match change {
                         Some(change) => {
-                            Self::apply_change(&sub, &mut state, change).await;
+                            Self::apply_change(&sub, state, change).await;
                             continue;
                         }
                         None => break false,
@@ -609,7 +608,7 @@ impl KvEventMonitor {
             }
             match Self::subscription_round(
                 &sub,
-                &mut state,
+                state,
                 &mut backoff,
                 &mut changes,
                 &mut shutdown_rx,
@@ -620,7 +619,7 @@ impl KvEventMonitor {
                 Round::Backoff => {
                     if Self::sleep_or_shutdown(
                         &sub,
-                        &mut state,
+                        state,
                         backoff.delay(),
                         &mut changes,
                         &mut shutdown_rx,
@@ -681,11 +680,11 @@ impl KvEventMonitor {
                 .await;
             }
             if let Some((id, done)) = leaves.remove(&member.url) {
-                Self::member_left(&sub, &mut state, &member.url, id, done).await;
+                Self::member_left(&sub, state, &member.url, id, done).await;
             }
         }
         for (url, (id, done)) in leaves {
-            Self::member_left(&sub, &mut state, &url, id, done).await;
+            Self::member_left(&sub, state, &url, id, done).await;
         }
     }
 
@@ -2613,32 +2612,46 @@ mod tests {
         (calls, panics)
     }
 
-    /// The engine address whose next batch panics its task, armed by the
-    /// test that reads where a panic with members on the task is counted.
-    static PANIC_ON_BATCH_AT: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+    /// The engine addresses whose batch panics its task, each with the
+    /// batches it lets through first; armed by the tests that read where a
+    /// panic with members on the task is counted and what it leaves in the
+    /// index, one entry per test so the tests run side by side.
+    static PANIC_ON_BATCH_AT: parking_lot::Mutex<Vec<(String, usize)>> =
+        parking_lot::Mutex::new(Vec::new());
 
     /// The hook `drain_stream` runs on every batch under the tests alone.
     pub(super) fn panic_if_armed(address: &str) {
-        assert_ne!(
-            PANIC_ON_BATCH_AT.lock().as_deref(),
-            Some(address),
-            "a test's panic on a batch, with members on the task"
-        );
+        let mut armed = PANIC_ON_BATCH_AT.lock();
+        let Some((_, pass)) = armed.iter_mut().find(|(at, _)| *at == address) else {
+            return;
+        };
+        if *pass > 0 {
+            *pass -= 1;
+            return;
+        }
+        drop(armed);
+        panic!("a test's panic on a batch, with members on the task");
     }
 
     /// Arms the hook for one engine address until dropped.
-    struct ArmedPanic;
+    struct ArmedPanic(String);
 
     impl ArmedPanic {
+        /// The engine's next batch panics its task.
         fn arm(address: &str) -> Self {
-            *PANIC_ON_BATCH_AT.lock() = Some(address.to_owned());
-            Self
+            Self::arm_after(address, 0)
+        }
+
+        /// The engine's task lets `batches` batches through, then panics.
+        fn arm_after(address: &str, batches: usize) -> Self {
+            PANIC_ON_BATCH_AT.lock().push((address.to_owned(), batches));
+            Self(address.to_owned())
         }
     }
 
     impl Drop for ArmedPanic {
         fn drop(&mut self) {
-            *PANIC_ON_BATCH_AT.lock() = None;
+            PANIC_ON_BATCH_AT.lock().retain(|(at, _)| at != &self.0);
         }
     }
 
@@ -2724,6 +2737,51 @@ mod tests {
             !rendered.contains("smg_kv_event_subscription_orphan_panics_total"),
             "no orphan count with members on the task:\n{rendered}"
         );
+    }
+
+    /// A panic with members on the task takes their blocks out of the index:
+    /// the hook panics the task on its third batch, after each rank of a
+    /// two-rank engine stored a block, and the model's index is empty with
+    /// both workers forgotten once the engine's entry is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panic_with_members_on_the_task_takes_their_blocks_out_of_the_index() {
+        let (addr, server) = serve(Subscribe::Counted {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            script: vec![
+                Ok(ranked_batch(0)),
+                Ok(ranked_batch(1)),
+                Ok(ranked_batch_at(0, 2)),
+            ],
+        })
+        .await;
+        let workers: Vec<Arc<dyn Worker>> = (0..2).map(|rank| rank_worker(addr, rank, 2)).collect();
+        let address = workers[0].base_url().to_string();
+        let _armed = ArmedPanic::arm_after(&address, 2);
+        let monitor = KvEventMonitor::new();
+        for worker in &workers {
+            monitor
+                .on_worker_added(worker, SubscriptionKind::Events)
+                .await;
+        }
+        wait_for_members(&monitor, &address, "the engine's entry is gone", None).await;
+        server.abort();
+        let index = monitor
+            .indexers
+            .iter()
+            .next()
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("the model's index outlives its engine's task");
+        assert!(
+            index.is_empty(),
+            "the index holds nothing after the task's panic"
+        );
+        for worker in &workers {
+            assert!(
+                index.worker_id(worker.url()).is_none(),
+                "{} is forgotten after its task's panic",
+                worker.url()
+            );
+        }
     }
 
     /// A rank worker that joins while a reconnect's subscribe call is

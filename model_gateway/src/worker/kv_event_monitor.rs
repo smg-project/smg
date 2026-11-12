@@ -41,7 +41,10 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use self::subscription::{EngineTask, MemberChange};
+use self::{
+    admission::EngineStreamState,
+    subscription::{EngineTask, MemberChange},
+};
 use super::{kv_index_backend::KvIndex, monitor::WorkerMonitor, registry::WorkerRegistry};
 use crate::{
     observability::metrics::Metrics,
@@ -513,6 +516,7 @@ impl KvEventMonitor {
             indexers: Arc::clone(&self.indexers),
         };
         let task_address = address.clone();
+        let task_indexer = task.indexer.clone();
         let slots = Arc::clone(&self.subscriptions);
 
         #[expect(
@@ -523,8 +527,12 @@ impl KvEventMonitor {
         let handle = tokio::spawn(async move {
             // Catch panics here so they surface when they happen — a bare
             // JoinError would only be observed at worker removal, leaving the
-            // index silently frozen for this engine until then.
-            let result = std::panic::AssertUnwindSafe(Self::subscription_loop(task))
+            // index silently frozen for this engine until then. The members'
+            // state lives outside the loop's future: a panic unwinds the
+            // loop and leaves the state readable, so the members' blocks
+            // leave the index below as they do at the loop's end.
+            let mut state = EngineStreamState::new(&task_address, Vec::new());
+            let result = std::panic::AssertUnwindSafe(Self::subscription_loop(task, &mut state))
                 .catch_unwind()
                 .await;
             if let Err(payload) = result {
@@ -557,6 +565,22 @@ impl KvEventMonitor {
                 }
                 for member in &members {
                     Metrics::record_kv_event_subscription_failure(member, "panic");
+                }
+                // The members' blocks leave the index under their ids: a
+                // re-add of a member's URL interns its id again and would
+                // otherwise start over an id that still held the old blocks.
+                if let Some(indexer) = &task_indexer {
+                    for member in std::mem::take(&mut state.members) {
+                        if let Some(worker_id) = member.worker_id {
+                            Self::remove_indexer_worker(
+                                Arc::clone(indexer),
+                                worker_id,
+                                &member.url,
+                                member.index,
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             Self::complete_engine_removal(&slots, &task_address, id).await;
