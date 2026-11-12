@@ -4095,12 +4095,6 @@ async fn completion_logprobs_go_out_with_the_chunks_that_scored_a_position() {
         .iter()
         .filter(|event| event["choices"][0]["logprobs"].is_object())
         .collect();
-    assert_eq!(scored.len(), 1, "{wire}");
-    assert_eq!(
-        scored[0]["choices"][0]["logprobs"]["tokens"],
-        serde_json::json!(["a", "b"]),
-        "{wire}"
-    );
     assert!(
         !events.iter().any(|event| {
             event["choices"][0]["logprobs"]["tokens"]
@@ -4108,5 +4102,11 @@ async fn completion_logprobs_go_out_with_the_chunks_that_scored_a_position() {
                 .is_some_and(Vec::is_empty)
         }),
         "an event carried empty logprobs lists: {wire}"
+    );
+    assert_eq!(scored.len(), 1, "{wire}");
+    assert_eq!(
+        scored[0]["choices"][0]["logprobs"]["tokens"],
+        serde_json::json!(["a", "b"]),
+        "{wire}"
     );
 }

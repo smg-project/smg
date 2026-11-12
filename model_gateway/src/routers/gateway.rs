@@ -2510,18 +2510,22 @@ mod tests {
         );
 
         let near = "b".repeat(ROUTING_KEY_HINT_MAX_BYTES - 6);
-        for (rid, key) in [
-            (format!("{near}_t1_t9"), format!("{near}_t1")),
-            (format!("{near}_t1_t10"), near.clone()),
+        for (rid, key, why) in [
+            (
+                format!("{near}_t1_t9"),
+                format!("{near}_t1"),
+                "a nested rid at the cap goes whole and places once stripped",
+            ),
+            (
+                format!("{near}_t1_t10"),
+                near.clone(),
+                "one byte over the cap, it moves to the coarser key",
+            ),
         ] {
             gateway
                 .route_messages(None, &meta, turn(json!(rid), true), "m")
                 .await;
-            assert_eq!(
-                placed(&seen).as_deref(),
-                Some(key.as_str()),
-                "a nested rid crossing the cap mid-thread moves to the coarser key"
-            );
+            assert_eq!(placed(&seen).as_deref(), Some(key.as_str()), "{why}");
         }
 
         let mut mine = HeaderMap::new();
