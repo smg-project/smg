@@ -199,10 +199,8 @@ pub enum ResponsesToolChoice {
     /// `"none"` | `"auto"` | `"required"`.
     Options(ToolChoiceOptions),
 
-    /// `{"type": "file_search" | "web_search" | "web_search_preview" |
-    /// "web_search_preview_2025_03_11" | "image_generation" |
-    /// "computer_use_preview" | "code_interpreter"}` — select a built-in
-    /// hosted tool by type alone (no additional payload).
+    /// `{"type": "<hosted tool>"}`, a type [`BuiltInToolChoiceType`] names:
+    /// select a built-in hosted tool by type alone (no additional payload).
     Types {
         #[serde(rename = "type")]
         tool_type: BuiltInToolChoiceType,
