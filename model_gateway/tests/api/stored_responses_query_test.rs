@@ -55,6 +55,29 @@ async fn app_with_a_stored_response() -> (AppTestContext, axum::Router) {
     (ctx, app)
 }
 
+/// `resp_legacy` stored beside it: twenty-five input messages without ids,
+/// the shape of a record from before ids were minted at store time.
+#[expect(clippy::expect_used, reason = "test helper: failures should panic")]
+async fn store_a_record_without_item_ids(ctx: &AppTestContext) {
+    let mut legacy = StoredResponse::new(None);
+    legacy.id = ResponseId::from("resp_legacy");
+    legacy.input = Value::Array(
+        (0..25)
+            .map(|i| {
+                json!({"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": format!("q{i}")}]})
+            })
+            .collect(),
+    );
+    legacy.raw_response =
+        json!({"id": "resp_legacy", "object": "response", "status": "completed", "output": []});
+    ctx.app_context
+        .response_storage
+        .store_response(legacy)
+        .await
+        .expect("the response is stored");
+}
+
 /// One GET of the app: the status, the content type and the JSON body.
 #[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]
 async fn get(app: &axum::Router, uri: &str) -> (StatusCode, String, Value) {
@@ -174,6 +197,62 @@ async fn an_input_items_page_follows_limit_order_and_after() {
                 .starts_with(param_prefix);
         assert!(names_it, "{uri}: the refusal names the parameter: {error}");
     }
+
+    ctx.shutdown().await;
+}
+
+/// A record whose items were stored without ids pages to its end: the ids the
+/// route lists for them are the same on every read, so a client that follows
+/// `after=<last_id>` sees every item once and reaches `has_more: false`, and a
+/// second walk reads the same ids.
+#[tokio::test]
+async fn a_record_without_item_ids_pages_to_its_end() {
+    let (ctx, app) = app_with_a_stored_response().await;
+    store_a_record_without_item_ids(&ctx).await;
+
+    /// One walk of the record, ten items to a page: the ids in the order read,
+    /// once the pages, the texts and the ids' shape are checked.
+    async fn walk(app: &axum::Router) -> Vec<String> {
+        let (mut ids, mut seen, mut pages): (Vec<String>, Vec<String>, usize) =
+            (Vec::new(), Vec::new(), 0);
+        let mut uri = Some("/v1/responses/resp_legacy/input_items?limit=10".to_owned());
+        while let Some(uri_now) = uri.take() {
+            let (status, _, list) = get(app, &uri_now).await;
+            assert_eq!(status, StatusCode::OK, "{list}");
+            pages += 1;
+            assert!(pages <= 4, "the walk did not end in four pages: {ids:?}");
+            let page = texts(&list);
+            assert!(page.len() <= 10, "a page of at most ten: {list}");
+            seen.extend(page);
+            ids.extend(
+                list["data"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|item| item["id"].as_str().unwrap_or_default().to_owned()),
+            );
+            if list["has_more"] == true {
+                uri = Some(format!(
+                    "/v1/responses/resp_legacy/input_items?limit=10&after={}",
+                    list["last_id"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        assert_eq!(pages, 3, "{ids:?}");
+        assert_eq!(
+            seen,
+            (0..25).rev().map(|i| format!("q{i}")).collect::<Vec<_>>()
+        );
+        assert!(ids.iter().all(|id| id.starts_with("msg_")), "{ids:?}");
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            25,
+            "{ids:?}"
+        );
+        ids
+    }
+    let ids = walk(&app).await;
+    assert_eq!(walk(&app).await, ids, "a second walk reads the same ids");
 
     ctx.shutdown().await;
 }

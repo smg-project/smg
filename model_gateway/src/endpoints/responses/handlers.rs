@@ -5,7 +5,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use openai_protocol::responses::generate_id;
 use serde_json::{json, Value};
 use smg_data_connector::{
     ResponseId, ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
@@ -205,7 +204,11 @@ pub async fn delete_response(
 /// `GET /v1/responses/{id}/input_items` for a caller of `tenant`: the page
 /// of the stored input that `query` asks for (see [`InputItemsQuery`]). An
 /// item stored without an id (a record from before ids were minted at store
-/// time) gets one for the listing, so such an item is no stable cursor.
+/// time) is listed under the id `listing_id` derives from the response id and
+/// the item's position, the same on every read, so a page's `last_id` is
+/// found by the next request whichever item it names; a cursor the list does
+/// not hold starts the page at its first item, as the conversation item list
+/// answers such a cursor.
 pub async fn list_response_input_items(
     response_storage: &Arc<dyn ResponseStorage>,
     tenant: Option<&str>,
@@ -224,10 +227,11 @@ pub async fn list_response_input_items(
 
             let items_with_ids: Vec<Value> = items
                 .into_iter()
-                .map(|mut item| {
-                    if item.get("id").is_none() {
+                .enumerate()
+                .map(|(position, mut item)| {
+                    if item.get("id").and_then(Value::as_str).is_none() {
                         if let Some(obj) = item.as_object_mut() {
-                            obj.insert("id".to_string(), json!(generate_id("msg")));
+                            obj.insert("id".to_string(), json!(listing_id(&resp_id, position)));
                         }
                     }
                     item
@@ -257,6 +261,19 @@ pub async fn list_response_input_items(
             error::storage_failure("storage_error", "Failed to retrieve input items", &e)
         }
     }
+}
+
+/// The listing id of the item at `position` of a stored response's input
+/// when the item was stored without one: the response id's body under the
+/// `msg` prefix the store mints, with the position, so every read of the
+/// record answers the same id and a page's `last_id` is found by the next
+/// request.
+fn listing_id(response_id: &ResponseId, position: usize) -> String {
+    let body = response_id
+        .0
+        .strip_prefix("resp_")
+        .unwrap_or(&response_id.0);
+    format!("msg_{body}_{position}")
 }
 
 #[cfg(test)]
@@ -601,6 +618,73 @@ mod tests {
         let list = json_of(response).await;
         assert_eq!(texts(&list), ["q4", "q3", "q2", "q1", "q0"], "{list}");
         assert_eq!(list["has_more"], false, "{list}");
+    }
+
+    /// A record whose items were stored without ids (from before ids were
+    /// minted at store time) pages like any other: the ids it lists are the
+    /// same on every read, so a walk by `after=<last_id>` reaches `has_more:
+    /// false` with every item seen once, and a second walk reads the same ids.
+    #[tokio::test]
+    async fn a_record_of_id_less_items_pages_to_its_end_under_the_same_ids() {
+        let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let mut legacy = StoredResponse::new(None);
+        legacy.id = ResponseId::from("resp_legacy");
+        legacy.input = Value::Array(
+            (0..25)
+                .map(|i| {
+                    json!({"type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": format!("q{i}")}]})
+                })
+                .collect(),
+        );
+        legacy.raw_response = json!({"id": "resp_legacy", "status": "completed", "output": []});
+        storage.store_response(legacy).await.unwrap();
+
+        /// One walk of the record, ten items to a page: the ids and the texts
+        /// in the order read, and the number of pages.
+        async fn walk(storage: &Arc<dyn ResponseStorage>) -> (Vec<String>, Vec<String>, usize) {
+            let (mut ids, mut seen, mut pages): (Vec<String>, Vec<String>, usize) =
+                (Vec::new(), Vec::new(), 0);
+            let mut query = Some("limit=10".to_owned());
+            while let Some(query_now) = query.take() {
+                let list = json_of(
+                    list_response_input_items(storage, None, "resp_legacy", Some(&query_now)).await,
+                )
+                .await;
+                pages += 1;
+                assert!(pages <= 4, "the walk did not end in four pages: {ids:?}");
+                let page = list["data"].as_array().unwrap();
+                assert!(page.len() <= 10, "a page of at most ten: {list}");
+                ids.extend(
+                    page.iter()
+                        .map(|item| item["id"].as_str().unwrap().to_owned()),
+                );
+                seen.extend(texts(&list));
+                if list["has_more"] == true {
+                    query = Some(format!(
+                        "limit=10&after={}",
+                        list["last_id"].as_str().unwrap()
+                    ));
+                }
+            }
+            (ids, seen, pages)
+        }
+        let (ids, seen, pages) = walk(&storage).await;
+        assert_eq!(pages, 3, "{ids:?}");
+        assert_eq!(
+            seen,
+            (0..25).rev().map(|i| format!("q{i}")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            25,
+            "{ids:?}"
+        );
+        assert_eq!(
+            walk(&storage).await.0,
+            ids,
+            "a second walk reads the same ids"
+        );
     }
 
     /// A query value the contract does not take is refused with the parameter
