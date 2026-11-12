@@ -1677,6 +1677,76 @@ fn a_joined_letter_run_encodes_as_the_library_does() {
     }
 }
 
+/// A letter run joined by spaces can span the pool's cut candidates, and a
+/// window started at one of its joins would read the space by another
+/// alternative (` \p{L}` at once; ` ?\p{L}+` after a comma, where the run
+/// does not restart), part from the whole text's pieces and approve a cut
+/// inside the run: the check starts its window at a space no run can span
+/// instead, and refuses a candidate without one in reach. The two patterns
+/// and the family's, on a text that is one run and on prose with a comma:
+/// the pool's units hold the whole text's pieces, and the pool's ids are the
+/// serial encode's and the library's.
+#[test]
+fn a_space_joined_run_is_never_cut_by_the_pool() {
+    let mut state = 0x4A4F_494E_4544_5203u64;
+    let one_run = format!("a{}", " b".repeat(40_000));
+    let prose = {
+        let words = "lorem ipsum dolor sit amet ".repeat(4_000);
+        format!("{words}word, then more {words}end")
+    };
+    for (index, pattern) in [
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}",
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\s+",
+        JOINED_LETTER_RUNS,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shape = Shape {
+            name: "space-joined-run",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(pattern, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &[],
+            added: &[],
+        };
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        for text in [one_run.as_str(), prose.as_str()] {
+            let whole: Vec<String> = {
+                let mut out = Vec::new();
+                native.pieces(0, text, &mut |piece| out.push(piece.to_owned()));
+                out
+            };
+            let mut chunked = Vec::new();
+            let units = native.units(text, true, true);
+            for unit in units.as_slice() {
+                let Segment::Text(chunk) = unit else {
+                    panic!("no added tokens in this text");
+                };
+                native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+            }
+            assert_eq!(chunked, whole, "pattern {index}: a cut split a piece");
+            let pooled = native
+                .encode_with(Some(tokenizer.get_model()), text, true, false)
+                .expect("pooled");
+            let serial = native
+                .encode_with(Some(tokenizer.get_model()), text, false, false)
+                .expect("serial");
+            assert_eq!(pooled, serial, "pattern {index}: the pool changed the ids");
+            let reference = tokenizer
+                .encode(text, false)
+                .expect("encode")
+                .get_ids()
+                .to_vec();
+            assert_eq!(pooled, reference, "pattern {index}: against the reference");
+        }
+    }
+}
+
 #[test]
 fn a_merged_with_next_split_glues_each_match_to_the_text_after_it() {
     // The merged-line-breaks shape on texts with line breaks between words,

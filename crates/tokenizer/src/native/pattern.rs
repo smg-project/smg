@@ -504,9 +504,11 @@ pub(super) enum Node {
     /// engine's greedy path through the run is the longest run, and the run
     /// stands at the end of its alternative ([`unit_run_misplaced`]), where
     /// nothing follows to give a character back to. Neither class holds the
-    /// space, so a space inside a run is its join and the thread pool's cut
-    /// check, run from a space before the cut, sees the run as the whole text
-    /// does (`joined_run_of`).
+    /// space (`joined_run_of`), so a space inside a run is its join, after a
+    /// letter or a mark and before a letter: the thread pool's cut check,
+    /// which runs the stages from a space before the cut, starts at a space
+    /// that is not that ([`Pattern::spans_space_between`]), where no run is
+    /// in progress.
     JoinedRun {
         join: usize,
         letter: usize,
@@ -886,6 +888,24 @@ impl Pattern {
     /// every match of it is a run of them.
     pub(super) fn decimal_digits_only(&self) -> bool {
         self.classes.iter().all(Class::decimal_digits)
+    }
+
+    /// Whether a joined letter run of the pattern ([`Op::JoinedRun`]) can
+    /// span a space between `before` and `after`: the run's join is the
+    /// space, `before` is in its letter or mark class and `after` in its
+    /// letter class. The thread pool's cut check starts its window at a
+    /// space no piece spans (`piece_starts_at`), which with such a run is
+    /// a space that is not that.
+    pub(super) fn spans_space_between(&self, before: char, after: Option<char>) -> bool {
+        self.program.iter().any(|op| match *op {
+            Op::JoinedRun { join, letter, mark } => {
+                self.classes[join].contains(' ')
+                    && (self.classes[letter].contains(before)
+                        || self.classes[mark].contains(before))
+                    && after.is_some_and(|after| self.classes[letter].contains(after))
+            }
+            _ => false,
+        })
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
@@ -2843,11 +2863,11 @@ impl Parser<'_> {
     /// which keeps the engine's greedy path through the run the longest run
     /// ([`Node::JoinedRun`]); the classes may share characters but neither
     /// holds the space: the thread pool cuts at spaces and checks a cut with
-    /// the stages run from a space before it, where a space is a run's join
-    /// (a letter follows, the run restarts on it and spans the cut as the
-    /// whole text's does), but a space in a class could be the run's mark or
-    /// letter there, read by another alternative from the window's start,
-    /// and the window's pieces would part from the text's.
+    /// the stages run from a space before it, and with the space in neither
+    /// class a space is inside a run only as its join, after a letter or a
+    /// mark and before a letter, which the check's window start avoids
+    /// ([`Pattern::spans_space_between`]); a space in a class could be a
+    /// run's mark or letter anywhere, and no start would be safe.
     fn joined_run_of(&self, nodes: &[Node]) -> Option<(usize, usize, usize)> {
         let [Node::Class(letter), Node::ClassRepeat {
             class: mark,

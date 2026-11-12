@@ -274,6 +274,10 @@ const SEED_THREADS: usize = 4;
 /// Text on each side of a candidate cut that every stage's pattern is run
 /// over to confirm a piece starts there (widened to the spaces around it).
 const CUT_CHECK_WINDOW: usize = 512;
+/// How far before a candidate cut the window's start may be looked for when
+/// the spaces nearer the candidate can be inside a piece (the joins of a
+/// letter run); a candidate without a start within this reach is refused.
+const CUT_CHECK_REACH: usize = 4 * CUT_CHECK_WINDOW;
 /// Candidates one cut search may reject before it gives up: the byte scan for
 /// a candidate is cheap, the window check on each one is not, so a text whose
 /// candidates keep failing the check costs at most this many checks per cut.
@@ -2414,7 +2418,8 @@ impl NativeEncoder {
     /// that is not whitespace, where the patterns, run over the text around
     /// it, cut cleanly ([`Self::piece_starts_at`]). No piece spans such a
     /// point (letters, digits and punctuation stop at the space, a whitespace
-    /// run cannot start before it) and the patterns read nothing before a
+    /// run cannot start before it) but a letter run joined by spaces, which
+    /// the check refuses to cut, and the patterns read nothing before a
     /// match's start (the digit-grouping lookahead's word boundary reads the
     /// character before it, one its match consumed: the parser declines the
     /// lookahead where it could lead a match), so the pieces of the two
@@ -2473,12 +2478,14 @@ impl NativeEncoder {
     /// match may span `p`; a match that starts at `p` settles it (the deeper
     /// stages see that match from `p` on either way), a gap around `p` hands
     /// the question to the next stage, and a gap at the last stage would be
-    /// split, so that is no cut.
+    /// split, so that is no cut. The window starts where the whole text's
+    /// pieces have a boundary too ([`Self::window_start`]), so that its
+    /// pieces up to `p` are the text's; a candidate without such a start is
+    /// no cut.
     fn piece_starts_at(&self, text: &str, p: usize) -> bool {
-        let mut start = p.saturating_sub(CUT_CHECK_WINDOW);
-        while start > 0 && !(text.is_char_boundary(start) && text.as_bytes()[start] == b' ') {
-            start -= 1;
-        }
+        let Some(start) = self.window_start(text, p) else {
+            return false;
+        };
         let mut end = (p + CUT_CHECK_WINDOW).min(text.len());
         while end < text.len() && !(text.is_char_boundary(end) && text.as_bytes()[end] == b' ') {
             end += 1;
@@ -2499,6 +2506,41 @@ impl NativeEncoder {
             }
         }
         false
+    }
+
+    /// Where the cut check's window for a candidate at `p` starts: the first
+    /// space at or before `p - CUT_CHECK_WINDOW`, or the text's start, that
+    /// no piece of the whole text spans, so that the text's pieces have a
+    /// boundary there as the window's do and the two agree up to `p`. A
+    /// space is inside a piece only as the join of a letter run joined by
+    /// spaces ([`Pattern::spans_space_between`]): such a run cannot start at
+    /// its join, so a window begun at one would read the space by another
+    /// alternative and its pieces would part from the text's. `None` when no
+    /// such space lies within [`CUT_CHECK_REACH`] of `p`: a stretch of words
+    /// joined by single spaces is one piece under such a pattern, and no cut
+    /// is lost there.
+    fn window_start(&self, text: &str, p: usize) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let floor = p.saturating_sub(CUT_CHECK_REACH);
+        let mut start = p.saturating_sub(CUT_CHECK_WINDOW);
+        while start > 0 {
+            if text.is_char_boundary(start) && bytes[start] == b' ' {
+                let after = text[start + 1..].chars().next();
+                let joined = text[..start].chars().next_back().is_some_and(|before| {
+                    self.stages
+                        .iter()
+                        .any(|stage| stage.pattern.spans_space_between(before, after))
+                });
+                if !joined {
+                    return Some(start);
+                }
+            }
+            if start <= floor {
+                return None;
+            }
+            start -= 1;
+        }
+        Some(0)
     }
 
     /// Appends the ids of one unit: an added token's id, or a text's pieces
