@@ -1933,9 +1933,10 @@ mod tests {
         assert_eq!(data_url_payload_bytes("https://example.com/x.png"), None);
     }
 
-    /// A fetch that ran out of its budget is the media host's fault for now,
-    /// a reference the request got wrong the request's, neither the worker's,
-    /// both fetch failures to the client; a clip over the decoded-size cap is
+    /// A fetch that ran out of its budget is the media host's fault for now
+    /// (a fetch failure to the client); a reference the request got wrong is
+    /// the request's own, refused as sent; neither is the worker's; a clip
+    /// over the decoded-size cap is
     /// the request's own under the size code; a scratch file that failed on
     /// this side and a decoder this side cannot start are the worker's own,
     /// as is a failure with no connector error in its chain.
@@ -1959,7 +1960,7 @@ mod tests {
             classify(scheme),
             WorkerMediaError::Media {
                 fault: WorkerMediaFault::Client,
-                code: MediaErrorCode::FetchFailed,
+                code: MediaErrorCode::InvalidRequest,
                 ..
             }
         ));

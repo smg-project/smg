@@ -27,7 +27,7 @@ fn branches_on_source_geometry_then_aligns_like_the_model() {
         error.to_string(),
         "image max_long_side_pixel must be positive, got 0"
     );
-    assert_eq!(error.code(), crate::MediaErrorCode::FetchFailed);
+    assert_eq!(error.code(), crate::MediaErrorCode::InvalidRequest);
 }
 
 /// Ensure planned grids bypass legacy short-side staging and area shrinking.
