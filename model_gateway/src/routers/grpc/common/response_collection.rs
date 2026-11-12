@@ -751,4 +751,50 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(completions.load(Ordering::SeqCst), 0);
     }
+
+    /// A prefill answer's prompt logprobs, scored once for the whole
+    /// request, land on every collected decode answer; a prefill that
+    /// scored nothing leaves the decode answers as the engine sent them.
+    #[test]
+    fn prefill_prompt_logprobs_land_on_every_decode_answer() {
+        let prompt_logprobs = sglang::InputLogProbs {
+            token_ids: vec![11, 12, 13],
+            token_logprobs: vec![
+                sglang::InputTokenLogProb { value: None },
+                sglang::InputTokenLogProb { value: Some(-0.25) },
+                sglang::InputTokenLogProb { value: Some(-1.5) },
+            ],
+            ..Default::default()
+        };
+        let prefill = [ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+            input_logprobs: Some(prompt_logprobs.clone()),
+            ..Default::default()
+        })];
+        let mut decodes: Vec<ProtoGenerateComplete> = (0..3)
+            .map(|_| ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default()))
+            .collect();
+
+        merge_prefill_logprobs(&prefill, &mut decodes);
+
+        for (position, decode) in decodes.iter().enumerate() {
+            assert_eq!(
+                decode.as_sglang().input_logprobs.as_ref(),
+                Some(&prompt_logprobs),
+                "decode answer {position}"
+            );
+        }
+
+        let unscored = [ProtoGenerateComplete::Sglang(
+            sglang::GenerateComplete::default(),
+        )];
+        let mut untouched: Vec<ProtoGenerateComplete> = (0..2)
+            .map(|_| ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default()))
+            .collect();
+
+        merge_prefill_logprobs(&unscored, &mut untouched);
+
+        assert!(untouched
+            .iter()
+            .all(|decode| decode.as_sglang().input_logprobs.is_none()));
+    }
 }
