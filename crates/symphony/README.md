@@ -250,8 +250,10 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-24 | [nanbeige4.3-33b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.3-33b) | Nanbeige/Nanbeige4.3-33B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-23 | [atria-dawn](https://github.com/smg-project/bellwether/tree/main/fixtures/atria-dawn) | internlm/Atria-Dawn |  | `glm` | 28 | replaying the set | none |
 | 2026-10-23 | [lfm3-1.7b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-1.7b) | LiquidAI/LFM3-1.7B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
+| 2026-10-23 | [minicpm-ocr-jev](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm-ocr-jev) | openbmb/MiniCPM-OCR-Jev |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-22 | [wevisone-vl-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/wevisone-vl-4b) | tencent/WeVisOne-VL-4B | WeVisOne-VL-2B | `qwen3` | 19 | replaying the set | none |
 | 2026-10-21 | [lfm3-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-omni-2b) | LiquidAI/LFM3-Omni-2B |  | `qwen3`, tagged calls | 19 | replaying the set | none |
+| 2026-10-21 | [minicpm-ocr-1.0](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm-ocr-1.0) | openbmb/MiniCPM-OCR-1.0 |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-19 | [lfm3-vl-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-vl-2b) | LiquidAI/LFM3-VL-2B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-17 | [sentiment-analysis-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/sentiment-analysis-7b) | microsoft/Sentiment-Analysis-7B |  | `plain` | — | awaiting fixtures | none |
 | 2026-10-16 | [nvidia-nemotron-labs-dory1.0-4b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-labs-dory1.0-4b-bf16) | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16 | NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8, NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4 | `qwen3`, tagged calls | 27 | replaying the set | none |
