@@ -1099,6 +1099,10 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
+/// The shutdown grace in seconds a start takes when none is configured: the
+/// CLI flag's default and [`ServerConfig::minimal`]'s.
+pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 180;
+
 pub struct ServerConfig {
     /// The router configuration, which carries the listener settings too:
     /// the bind host and port, the probe listener's port, the runtime's
@@ -1146,7 +1150,7 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// A server with the listener `router_config` names and nothing else: no
     /// log file, no discovery, no mesh, no metrics endpoint, no control-plane
-    /// authentication, no secret source, a five-second shutdown grace. A
+    /// authentication, no secret source, the CLI's default shutdown grace. A
     /// library caller or a test starts from it and sets what it needs by a
     /// struct update, so a field added here with its default breaks no
     /// hand-built literal.
@@ -1159,7 +1163,7 @@ impl ServerConfig {
             service_discovery_config: None,
             mesh_discovery_config: None,
             prometheus_config: None,
-            shutdown_grace_period_secs: 5,
+            shutdown_grace_period_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
             shutdown_settle_secs: None,
             control_plane_auth: None,
             mesh_server_config: None,
@@ -2975,7 +2979,10 @@ mod graceful_shutdown_tests {
             let start = tokio::time::Instant::now();
             graceful_shutdown(
                 &tracker,
-                ShutdownBudget::from_grace_secs(180, configured),
+                ShutdownBudget::from_grace_secs(
+                    crate::server::DEFAULT_SHUTDOWN_GRACE_SECS,
+                    configured,
+                ),
                 async {},
                 || panic!("a completed mesh leave must not be stopped again"),
                 |remaining| {
@@ -4120,5 +4127,17 @@ mod tests {
             error.to_string().contains("must have a non-empty key"),
             "startup refused for another reason: {error}"
         );
+    }
+
+    /// `minimal` leaves a library caller on the CLI's shutdown grace, not a
+    /// shorter one of its own: in-flight streams get the product's drain.
+    #[test]
+    fn minimal_takes_the_default_shutdown_grace() {
+        let config = ServerConfig::minimal(RouterConfig::default());
+        assert_eq!(
+            config.shutdown_grace_period_secs,
+            DEFAULT_SHUTDOWN_GRACE_SECS
+        );
+        assert_eq!(config.shutdown_grace_period_secs, 180);
     }
 }

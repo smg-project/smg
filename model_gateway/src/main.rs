@@ -1186,7 +1186,11 @@ struct ServingArgs {
     upstream_pool_idle_timeout_secs: u64,
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
-    #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
+    #[arg(
+        long,
+        default_value_t = server::DEFAULT_SHUTDOWN_GRACE_SECS,
+        help_heading = "Request Handling"
+    )]
     shutdown_grace_period_secs: u64,
 
     /// Keep accepting connections after readiness fails. Defaults to 5 seconds;
