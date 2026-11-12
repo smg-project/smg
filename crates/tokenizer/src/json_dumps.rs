@@ -5,57 +5,20 @@
 //! neither of which matches `json.dumps`. The DeepSeek V3.2/V4 prompt encoders
 //! embed tool schemas and argument values as JSON, and the engine's reference encoder
 //! uses `json.dumps`, so compact output would shift the model off its training
-//! distribution. This adds just the spacing serde_json lacks.
+//! distribution. The spacing is the chat template's `tojson` formatter with no
+//! indent, Python's default separators and `ensure_ascii = false`, so the prompt
+//! encoders and the template filter render a value the same way.
 
-use std::io;
+use serde_json::Value;
 
-use serde::Serialize;
-use serde_json::{
-    ser::{Formatter, Serializer},
-    Value,
-};
+use crate::chat_template::{serialize_with_python_json, JsonSeparators};
 
-/// `serde_json` formatter that adds Python `json.dumps` default separator spacing.
-struct PythonDefaultFormatter;
-
-impl Formatter for PythonDefaultFormatter {
-    fn begin_object_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
-        w.write_all(b": ")
-    }
-
-    fn begin_object_key<W: ?Sized + io::Write>(
-        &mut self,
-        w: &mut W,
-        first: bool,
-    ) -> io::Result<()> {
-        if first {
-            Ok(())
-        } else {
-            w.write_all(b", ")
-        }
-    }
-
-    fn begin_array_value<W: ?Sized + io::Write>(
-        &mut self,
-        w: &mut W,
-        first: bool,
-    ) -> io::Result<()> {
-        if first {
-            Ok(())
-        } else {
-            w.write_all(b", ")
-        }
-    }
-}
-
-/// Serialize `value` like `json.dumps(value, ensure_ascii=False)`.
+/// Serialize `value` like `json.dumps(value, ensure_ascii=False)`. A `Value`
+/// serializes into memory without an error; the fallback keeps the signature
+/// infallible for the prompt encoders' string builders.
 pub(crate) fn to_string(value: &Value) -> String {
-    let mut buf = Vec::new();
-    let mut ser = Serializer::with_formatter(&mut buf, PythonDefaultFormatter);
-    if value.serialize(&mut ser).is_err() {
-        return "null".to_string();
-    }
-    String::from_utf8(buf).unwrap_or_else(|_| "null".to_string())
+    serialize_with_python_json(value, None, JsonSeparators::python_default(false), false)
+        .unwrap_or_else(|_| "null".to_string())
 }
 
 #[cfg(test)]
