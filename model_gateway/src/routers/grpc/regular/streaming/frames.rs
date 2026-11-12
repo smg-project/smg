@@ -267,10 +267,11 @@ impl EscapedText {
 /// from `]` to the end of the event are serialized once per stream and
 /// copied around each chunk's choice, so a chunk costs the serialization of
 /// its choice only. The bytes are exactly those of a serialized
-/// [`openai_protocol::completion::CompletionStreamResponse`] without `usage`, which a chunk of this
-/// stream never carries, and with the `usage: null` placeholder after it when
-/// the stream asks for usage: the public API writes it on every chunk before
-/// the usage chunk, as a chat stream does.
+/// [`openai_protocol::completion::CompletionStreamResponse`] whose `usage` is
+/// `None` (a per-token chunk never carries the counts), except that a stream
+/// that asks for usage writes `"usage":null` last, where serde writes
+/// `usage`: the public API writes the placeholder on every chunk before the
+/// usage chunk, as a chat stream does.
 pub(super) struct CompletionChunkFrame {
     head: Vec<u8>,
     tail: Vec<u8>,
