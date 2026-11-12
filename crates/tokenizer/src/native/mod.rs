@@ -523,13 +523,13 @@ fn is_normalized(text: &str, form: Normalizer) -> bool {
 /// not in the form goes through the crate's normalizer (its iterator
 /// reports a byte-offset shift with each character, which this path has no
 /// use for), the other stretches are copied. A stretch is read by the NFC
-/// quick check where the caller has one (under that form: its tables place
-/// most characters; the library reads the windows they cannot), by the
-/// library's check otherwise.
+/// quick check where the form is NFC and the caller has one (its tables
+/// place most characters; the library reads the windows they cannot), by
+/// the library's check for the form otherwise.
 fn normalize<'a>(text: &'a str, form: Normalizer, quick: Option<&NfcQuick>) -> Cow<'a, str> {
-    let in_form = |stretch: &str| match quick {
-        Some(quick) => quick.is_nfc(stretch),
-        None => form.holds(stretch),
+    let in_form = |stretch: &str| match (form, quick) {
+        (Normalizer::Nfc, Some(quick)) => quick.is_nfc(stretch),
+        _ => form.holds(stretch),
     };
     let mut owned: Option<String> = None;
     for (start, stretch, settled) in stretches(text) {

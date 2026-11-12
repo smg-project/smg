@@ -409,14 +409,14 @@ fn shapes() -> Vec<Shape> {
             ],
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
-            added: &[],
+            added: &[("\u{FB01}le", true), ("<tool_call>", false)],
         },
         // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
         // split on ASCII digits after the map (the reference cuts the mapped
         // text, the native path the raw text, at the same places).
         Shape {
             name: "punctuation-runs-then-a-split-after-the-map",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 PreTokenizerWrapper::Punctuation(Punctuation::new(
                     SplitDelimiterBehavior::Contiguous,
@@ -444,7 +444,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "joined-letters",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(JOINED_LETTERS, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -457,7 +457,7 @@ fn shapes() -> Vec<Shape> {
         // its own regex.
         Shape {
             name: "punctuation-each-then-byte-level-regex",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 PreTokenizerWrapper::Punctuation(Punctuation::new(
                     SplitDelimiterBehavior::Isolated,
@@ -832,8 +832,10 @@ fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
     // forms and an ideographic space, a circled digit (a digit after
     // normalization, which the `Digits` stage then cuts), the Kelvin sign
     // and a long s with a dot above (composed again once the s spells out),
-    // beside a text in NFKC already, a mark to compose, and an added token
-    // with a ligature right after it.
+    // beside a text in NFKC already, a mark to compose, an added token with
+    // a ligature right after it, and the normalized added token in both its
+    // spellings next to the raw one (the library spells it `file` at load
+    // and matches it on `file` and on the ligature).
     let mut state = 0x4E46_4B43_0000_0001u64;
     let shape = shapes()
         .into_iter()
@@ -847,6 +849,8 @@ fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
         "plain ascii, 123 and \u{6F22}\u{5B57}",
         "e\u{301}\u{FB01}",
         "<|im_start|>\u{FB01}<|im_end|>",
+        "file \u{FB01}le <tool_call>\u{FB01}le profile",
+        "\u{FB01}LE <tool_call>file<|im_end|>",
     ] {
         let reference = tokenizer.encode(text, false).expect("encode");
         assert_eq!(
