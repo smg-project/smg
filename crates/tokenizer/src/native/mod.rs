@@ -1973,6 +1973,20 @@ impl NativeEncoder {
                 ));
             }
         }
+        // A merged-with-next stage joins each match with the text after it
+        // (see `Pieces::walk`); the walk over the image takes matches and
+        // gaps apart, so such a stage at or after the map is declined (no
+        // covered vocabulary has one there).
+        if let Some(from) = mapped_from {
+            if stages[from..]
+                .iter()
+                .any(|stage| stage.pieces == Pieces::MatchesWithNextGap)
+            {
+                return Err(Declined::from(
+                    "a merged-with-next pre-tokenizer stage over the byte-level image",
+                ));
+            }
+        }
         Ok((stages, mapped_from))
     }
 
@@ -2647,17 +2661,41 @@ impl NativeEncoder {
             return;
         }
         let stage = &self.stages[depth];
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                // As in `pieces`: each match takes the text after it up to
+                // the next match or the end; the text before the first
+                // match stands alone, and a text without a match is one
+                // piece.
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(at) => {
+                            self.pieces_mapping(depth + 1, from, &text[at..start], image, f);
+                        }
+                        None if start > 0 => {
+                            self.pieces_mapping(depth + 1, from, &text[..start], image, f);
+                        }
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                self.pieces_mapping(depth + 1, from, &text[merged.unwrap_or(0)..], image, f);
+                return;
+            }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.pieces.gaps() && cursor < start {
+            if gaps && cursor < start {
                 self.pieces_mapping(depth + 1, from, &text[cursor..start], image, f);
             }
-            if stage.pieces.matches() {
+            if matches {
                 self.pieces_mapping(depth + 1, from, &text[start..end], image, f);
             }
             cursor = end;
         }
-        if stage.pieces.gaps() && cursor < text.len() {
+        if gaps && cursor < text.len() {
             self.pieces_mapping(depth + 1, from, &text[cursor..], image, f);
         }
     }
@@ -2681,12 +2719,19 @@ impl NativeEncoder {
             f(raw);
             return;
         };
+        // `stages_from` declines a merged-with-next stage at or after the
+        // map, so the walk over the image takes the pieces apart.
+        let Walk::Apart { gaps, matches } = stage.pieces.walk() else {
+            debug_assert!(false, "a merged-with-next stage over the byte-level image");
+            f(raw);
+            return;
+        };
         let mut cursor = 0;
         let mut raw_cursor = 0;
         for (start, end) in stage.pattern.find_iter(image) {
             let raw_start = raw_cursor + image[cursor..start].chars().count();
             let raw_end = raw_start + image[start..end].chars().count();
-            if stage.pieces.gaps() && cursor < start {
+            if gaps && cursor < start {
                 self.pieces_in_alphabet(
                     depth + 1,
                     &image[cursor..start],
@@ -2694,13 +2739,13 @@ impl NativeEncoder {
                     f,
                 );
             }
-            if stage.pieces.matches() {
+            if matches {
                 self.pieces_in_alphabet(depth + 1, &image[start..end], &raw[raw_start..raw_end], f);
             }
             cursor = end;
             raw_cursor = raw_end;
         }
-        if stage.pieces.gaps() && cursor < image.len() {
+        if gaps && cursor < image.len() {
             self.pieces_in_alphabet(depth + 1, &image[cursor..], &raw[raw_cursor..], f);
         }
     }

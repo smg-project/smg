@@ -426,6 +426,28 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|fim_prefix|>"],
             added: &[],
+            stripped: &[],
+        },
+        // The same chain with a `Digits` split after the map: the
+        // merged-with-next stage walks the raw text, the digit stage the
+        // byte-level image of each piece.
+        Shape {
+            name: "merged-line-breaks-then-cl100k-then-digits-over-the-image",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(
+                    LINE_BREAK_RUNS,
+                    SplitDelimiterBehavior::MergedWithNext,
+                    false,
+                ),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|fim_prefix|>"],
+            added: &[],
+            stripped: &[],
         },
         Shape {
             name: "possessive-clitic-class",
@@ -5539,5 +5561,32 @@ fn image_stages_whose_pattern_rescans_a_run_are_declined() {
     assert!(
         NativeEncoder::from_tokenizer(&leading).is_ok(),
         "a leading run after the map"
+    );
+}
+
+#[test]
+fn a_merged_with_next_stage_over_the_image_is_declined() {
+    let mut state = 0x4D45_5247_4544_0001u64;
+    let shape_of = |pre_tokenizers: Vec<PreTokenizerWrapper>| Shape {
+        name: "merged-with-next-over-the-image",
+        normalizer: Normalizer::None,
+        pre_tokenizers,
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let stage = || split(r"\p{N}+", SplitDelimiterBehavior::MergedWithNext, false);
+    let after = tokenizer_of(&shape_of(vec![byte_level(false), stage()]), &mut state);
+    assert_eq!(
+        NativeEncoder::from_tokenizer(&after)
+            .expect_err("declined")
+            .to_string(),
+        "a merged-with-next pre-tokenizer stage over the byte-level image"
+    );
+    let before = tokenizer_of(&shape_of(vec![stage(), byte_level(false)]), &mut state);
+    assert!(
+        NativeEncoder::from_tokenizer(&before).is_ok(),
+        "a merged-with-next stage before the map"
     );
 }

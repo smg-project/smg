@@ -2097,7 +2097,11 @@ fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> boo
         | Node::ClassRepeat { .. }
         | Node::NotAhead(_)
         | Node::End
-        | Node::RunOfOne { .. } => false,
+        | Node::Start
+        | Node::TextEnd
+        | Node::SearchStart
+        | Node::RunOfOne { .. }
+        | Node::GroupsAhead { .. } => false,
     }
 }
 
