@@ -607,7 +607,12 @@ impl Gateway {
         // The header carries the client's rid itself: placement strips its
         // lineage suffixes once, as `derive_rid_key` does for a plain
         // request, so both paths key a nested rid alike. A rid over the
-        // header's byte cap goes as the derived key, which fits it.
+        // header's byte cap goes as the derived key, and placement's strip
+        // then takes a further suffix off a nested one: a key one level
+        // coarser than the plain request's, by choice, since no header would
+        // scatter the turns. A nested rid that crosses the cap mid-thread (a
+        // turn number gaining a digit, a `_r<n>` retry) moves to that coarser
+        // key at the crossing.
         let carried = if rid.len() <= ROUTING_KEY_HINT_MAX_BYTES {
             rid
         } else {
@@ -2435,9 +2440,11 @@ mod tests {
     /// Under the routing-key override a thread turn routes on its client's
     /// `rid` lineage, as a plain request does: the header carries the rid
     /// itself when the request set none, so placement's one strip gives the
-    /// plain request's key, nested suffixes included; a header the client set
-    /// wins; without the override, a client `rid` or a `thread`, nothing is
-    /// added.
+    /// plain request's key, nested suffixes included; a rid over the header's
+    /// byte cap goes as its derived key, which places one suffix coarser, and
+    /// a nested rid crossing the cap mid-thread moves to that coarser key at
+    /// the crossing; a header the client set wins; without the override, a
+    /// client `rid` or a `thread`, nothing is added.
     #[tokio::test]
     async fn a_thread_turn_carries_its_client_lineage_as_the_routing_key_under_the_override() {
         use serde_json::json;
@@ -2485,6 +2492,37 @@ mod tests {
             "a nested suffix keys as the plain request does"
         );
         assert_eq!(placed(&seen).as_deref(), Some("conv_t1"));
+
+        let base = "a".repeat(ROUTING_KEY_HINT_MAX_BYTES - 3);
+        let long = format!("{base}_t1_t2");
+        gateway
+            .route_messages(None, &meta, turn(json!(long), true), "m")
+            .await;
+        assert_eq!(
+            seen.last_routing_key().as_deref(),
+            policies.derive_rid_key(Some(&long)),
+            "a rid over the header's byte cap goes as its derived key"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some(base.as_str()),
+            "placed one suffix coarser than the plain request's key"
+        );
+
+        let near = "b".repeat(ROUTING_KEY_HINT_MAX_BYTES - 6);
+        for (rid, key) in [
+            (format!("{near}_t1_t9"), format!("{near}_t1")),
+            (format!("{near}_t1_t10"), near.clone()),
+        ] {
+            gateway
+                .route_messages(None, &meta, turn(json!(rid), true), "m")
+                .await;
+            assert_eq!(
+                placed(&seen).as_deref(),
+                Some(key.as_str()),
+                "a nested rid crossing the cap mid-thread moves to the coarser key"
+            );
+        }
 
         let mut mine = HeaderMap::new();
         mine.insert("x-smg-routing-key", "mine".parse().unwrap());
