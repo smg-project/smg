@@ -2979,10 +2979,7 @@ mod graceful_shutdown_tests {
             let start = tokio::time::Instant::now();
             graceful_shutdown(
                 &tracker,
-                ShutdownBudget::from_grace_secs(
-                    crate::server::DEFAULT_SHUTDOWN_GRACE_SECS,
-                    configured,
-                ),
+                ShutdownBudget::from_grace_secs(180, configured),
                 async {},
                 || panic!("a completed mesh leave must not be stopped again"),
                 |remaining| {

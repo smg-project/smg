@@ -30,7 +30,7 @@ use smg::{
     },
     observability::metrics::register_jemalloc_as_global_allocator,
     secrets::SecretFiles,
-    server::{self, posture::SecretSources, ServerConfig},
+    server::{self, posture::SecretSources, ServerConfig, DEFAULT_SHUTDOWN_GRACE_SECS},
     version,
 };
 
@@ -1188,7 +1188,7 @@ struct ServingArgs {
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(
         long,
-        default_value_t = server::DEFAULT_SHUTDOWN_GRACE_SECS,
+        default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS,
         help_heading = "Request Handling"
     )]
     shutdown_grace_period_secs: u64,
