@@ -809,7 +809,10 @@ impl AddedTokens {
     /// [`Self::stripped`], does not move the search, as the reference's loop
     /// does not). With prefixes, a token starts only where a prefix stands, so
     /// the first prefix at or after the last match that begins a token begins
-    /// the next one, and the longest token there is the match.
+    /// the next one, and the longest token there is the match. A match the
+    /// widening before it leaves empty (a whitespace token inside the
+    /// whitespace a stripped neighbour took) is no match: the reference drops
+    /// the empty split it makes of it.
     fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
         let mut at = 0;
         let mut taken = 0;
@@ -821,6 +824,9 @@ impl AddedTokens {
                 let index = found.pattern().as_usize();
                 let range = self.stripped(text, found.range(), index, taken);
                 taken = range.end;
+                if range.is_empty() {
+                    continue;
+                }
                 return Some((range, index));
             };
             let start = prefixes.next(text, at)?;
@@ -830,6 +836,9 @@ impl AddedTokens {
                 let index = found.pattern().as_usize();
                 let range = self.stripped(text, found.range(), index, taken);
                 taken = range.end;
+                if range.is_empty() {
+                    continue;
+                }
                 return Some((range, index));
             }
             at = start + 1;

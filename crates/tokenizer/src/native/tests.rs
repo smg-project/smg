@@ -1051,6 +1051,56 @@ fn stripped_added_tokens_take_their_whitespace_as_tokenizers_does() {
     }
 }
 
+/// A whitespace token under `lstrip` whose match a stripped neighbour's
+/// widening took whole emits no id, as the library drops the empty split it
+/// makes of it, where the same token standing on its own is one id. Its
+/// shape stands apart from the shape set: the random texts hold that
+/// character, and the library's own matcher panics on a text where a
+/// neighbour's whitespace runs past such a token (a split whose start passes
+/// its end), so there is nothing to compare against there.
+#[test]
+fn a_whitespace_token_inside_a_neighbours_whitespace_emits_no_id() {
+    let mut state = 0x57A1_57A1_0000_0002u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "stripped-sentinels")
+        .expect("the shape");
+    let shape = Shape {
+        name: "stripped-sentinels-with-a-space",
+        stripped: &[
+            ("<|user|>", false, true, false),
+            ("\u{2003}", true, false, false),
+        ],
+        ..shape
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let id = |s: &str| tokenizer.token_to_id(s).expect("an added token");
+    let ids = |s: &str| {
+        tokenizer
+            .encode(s, false)
+            .expect("tokenizers encodes")
+            .get_ids()
+            .to_vec()
+    };
+    let cases: [(&str, Vec<u32>); 2] = [
+        ("<|user|>\u{2003}", vec![id("<|user|>")]),
+        (
+            "x\u{2003}y",
+            [ids("x"), vec![id("\u{2003}")], ids("y")].concat(),
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(ids(text), expected, "the reference on {text:?}");
+        assert_eq!(
+            native.encode(Some(model), text, false),
+            Ok(expected),
+            "{text:?}"
+        );
+    }
+}
+
 #[test]
 fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
     // The NFKC shape on texts NFC leaves as they are: a ligature, fullwidth
