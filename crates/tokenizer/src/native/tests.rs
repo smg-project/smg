@@ -51,6 +51,10 @@ const DIGITS: &str = r"\p{N}{1,3}";
 /// A parse family's punctuation stage: a bracket, or a capturing group of one
 /// punctuation character read back at once (a run of it).
 const PUNCTUATION_RUNS: &str = r#"[\(\)\[\]\{\}]|([!"\#\$%\&'\*\+,\-\./:;<=>\?\\\^_`\|\~])\1*"#;
+
+/// A line-break stage: runs of `\n` or `\r\n`, each taken whole with the text
+/// after it under `MergedWithNext`.
+const LINE_BREAK_RUNS: &str = r"(?:\r?\n)+(?!\r?\n)";
 const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
 const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -403,6 +407,25 @@ fn shapes() -> Vec<Shape> {
             special: &["<|endoftext|>"],
             added: &[],
             stripped: &[],
+        },
+        // A line-break stage with `MergedWithNext` (each run of line breaks
+        // glued to the text after it), the cl100k-style regex, and the
+        // `ByteLevel` without its regex: the chain of a code family's files.
+        Shape {
+            name: "merged-line-breaks-then-cl100k",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(
+                    LINE_BREAK_RUNS,
+                    SplitDelimiterBehavior::MergedWithNext,
+                    false,
+                ),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|fim_prefix|>"],
+            added: &[],
         },
         Shape {
             name: "possessive-clitic-class",
@@ -881,13 +904,13 @@ fn shapes_outside_the_path_are_declined() {
     // A split behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-        split(QWEN35, SplitDelimiterBehavior::MergedWithNext, false),
+        split(QWEN35, SplitDelimiterBehavior::MergedWithPrevious, false),
         byte_level(false),
     ]))));
     assert_eq!(
         declined(&tokenizer),
-        "Split behavior Some(\"MergedWithNext\") with invert Some(false) (only Isolated, \
-             Removed, or Removed inverted)"
+        "Split behavior Some(\"MergedWithPrevious\") with invert Some(false) (only Isolated, \
+             Removed, Removed inverted, or MergedWithNext)"
     );
     // A punctuation behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -1558,6 +1581,37 @@ fn a_removed_split_drops_its_matches_as_the_library_does() {
         "a-1-b 22-33\n-<tool_call>-x",
         "<|endoftext|>-",
         "no match at all",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_merged_with_next_split_glues_each_match_to_the_text_after_it() {
+    // The merged-line-breaks shape on texts with line breaks between words,
+    // runs of them, a lone `\r` (no match), breaks at both ends, alone,
+    // next to digits, indentation and an added token, and absent.
+    let mut state = 0x4D45_5247_4544_4E01u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "merged-line-breaks-then-cl100k")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "one\ntwo\r\nthree\rfour",
+        "\n\nlead and trail\n",
+        "\r\n\r\n\n",
+        "\r",
+        "a\n1\r\nb 22\n\n33 <|fim_prefix|>\nx",
+        "<|endoftext|>\r\n",
+        "    indented\n\tcode\n\n",
+        "no break at all",
     ] {
         let reference = tokenizer.encode(text, false).expect("encode");
         assert_eq!(

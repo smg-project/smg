@@ -623,17 +623,22 @@ enum Pieces {
     /// `Removed`: the text between the matches alone; a match is dropped
     /// and the pieces on either side of it stay apart.
     Gaps,
+    /// `MergedWithNext`: each match with the text after it up to the next
+    /// match or the end, as one piece; the text before the first match
+    /// stands alone.
+    MatchesWithNextGap,
 }
 
 impl Pieces {
-    /// Whether the text between and around the matches goes on.
+    /// Whether the text between and around the matches goes on as pieces
+    /// of its own.
     fn gaps(self) -> bool {
-        self != Self::Matches
+        matches!(self, Self::MatchesAndGaps | Self::Gaps)
     }
 
-    /// Whether the matches go on.
+    /// Whether the matches go on as pieces of their own.
     fn matches(self) -> bool {
-        self != Self::Gaps
+        matches!(self, Self::MatchesAndGaps | Self::Matches)
     }
 }
 
@@ -1993,7 +1998,8 @@ impl NativeEncoder {
     }
 
     /// One `Split` as a stage: a regex or a literal the pattern engine takes,
-    /// `Isolated`, `Removed`, or `Removed` inverted. A `Digits` is the
+    /// `Isolated`, `Removed`, `Removed` inverted, or `MergedWithNext`. A
+    /// `Digits` is the
     /// `Isolated` split on numeric characters, each one a piece under
     /// `individual_digits`, else each run: the reference splits on
     /// `char::is_numeric`, the toolchain's numeric set
@@ -2069,10 +2075,11 @@ impl NativeEncoder {
             (Some("Isolated"), Some(false)) => Pieces::MatchesAndGaps,
             (Some("Removed"), Some(false)) => Pieces::Gaps,
             (Some("Removed"), Some(true)) => Pieces::Matches,
+            (Some("MergedWithNext"), Some(false)) => Pieces::MatchesWithNextGap,
             (behavior, invert) => {
                 return Err(Declined::from(format!(
                     "Split behavior {behavior:?} with invert {invert:?} (only Isolated, Removed, \
-                     or Removed inverted)"
+                     Removed inverted, or MergedWithNext)"
                 )))
             }
         };
@@ -2559,6 +2566,22 @@ impl NativeEncoder {
             f(text);
             return;
         };
+        if stage.pieces == Pieces::MatchesWithNextGap {
+            // Each match takes the text after it up to the next match or the
+            // end; the text before the first match stands alone, and a text
+            // without a match is one piece.
+            let mut merged = None;
+            for (start, _) in stage.pattern.find_iter(text) {
+                match merged {
+                    Some(from) => self.pieces(depth + 1, &text[from..start], f),
+                    None if start > 0 => self.pieces(depth + 1, &text[..start], f),
+                    None => {}
+                }
+                merged = Some(start);
+            }
+            self.pieces(depth + 1, &text[merged.unwrap_or(0)..], f);
+            return;
+        }
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
             if stage.pieces.gaps() && cursor < start {

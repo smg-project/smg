@@ -532,6 +532,20 @@ mod tests {
                 out.push((offset, offset + text.len()));
                 return;
             };
+            if stage.pieces == Pieces::MatchesWithNextGap {
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(from) => walk(rest, &text[from..start], offset + from, out),
+                        None if start > 0 => walk(rest, &text[..start], offset, out),
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                let from = merged.unwrap_or(0);
+                walk(rest, &text[from..], offset + from, out);
+                return;
+            }
             let mut cursor = 0;
             for (start, end) in stage.pattern.find_iter(text) {
                 if stage.pieces.gaps() && cursor < start {
