@@ -12,7 +12,9 @@
 //! end of the text, and where the search began), the digit class `\d` (or
 //! `\p{Nd}`) and the digit-grouping lookahead after a digit,
 //! `(?=(?:\d{3})*\b)`, `(?=(?>\d{510})*(?:\P{Nd}|$))` or `(?=\d{3}+\z)`,
-//! read as the count of the digit run ahead and what ends it. This module
+//! over the numbers `\p{N}` as well when a character outside them or the
+//! end of the text closes it, `(?=(?:\p{N}{3})*(?!\p{N}))`, read as the
+//! count of the run ahead and what ends it. This module
 //! parses that
 //! subset and matches it the way the engine behind `tokenizers`' `Split`
 //! does: leftmost-first alternation, greedy quantifiers that back off one
@@ -439,11 +441,13 @@ pub(super) enum Node {
 pub(super) enum GroupsEnd {
     /// `\b`: the word boundary after the run (the text ends there, or the
     /// next character is outside the word class), or at the position itself
-    /// when the run may hold no group.
+    /// when the run may hold no group. Over the decimal digits only: each is
+    /// a word character, so the boundary never falls inside the run, where
+    /// a run of the numbers (a superscript, a fraction) would hold one.
     Word(usize),
-    /// `(?:\P{Nd}|$)`: a character outside the class or the end of the
-    /// text, which is what follows the whole run by construction, so the run
-    /// alone decides.
+    /// `(?:\P{Nd}|$)` or `(?!\p{N})`, over the run's own class: a character
+    /// outside the class or the end of the text, which is what follows the
+    /// whole run by construction, so the run alone decides.
     Run,
     /// `\z`: the end of the text, which the run must reach.
     Text,
@@ -631,12 +635,12 @@ struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     classes: Vec<Class>,
     case_insensitive: bool,
-    /// The digit class of the first digit-grouping lookahead, and the word
-    /// class of the first one ending in the word boundary, reused by every
-    /// later one: the ops then read the same classes under the same indices
-    /// and share the match loop's one run memo ([`RunMemo`] is keyed by the
-    /// index).
-    groups_ahead: Option<usize>,
+    /// The run class of each category the digit-grouping lookaheads read
+    /// (the decimal digits, the numbers), and the word class of the first
+    /// one ending in the word boundary, reused by every later one: the ops
+    /// then read the same classes under the same indices and share the
+    /// match loop's one run memo ([`RunMemo`] is keyed by the index).
+    groups_ahead: Vec<(u16, usize)>,
     word: Option<usize>,
     /// Whether the pattern's capturing group has been read: `\1` names the
     /// first group wherever it stands, so a second group declines
@@ -651,7 +655,7 @@ impl Pattern {
             chars: pattern.chars().peekable(),
             classes: Vec::new(),
             case_insensitive: false,
-            groups_ahead: None,
+            groups_ahead: Vec::new(),
             captured: false,
             word: None,
         };
@@ -2171,11 +2175,14 @@ impl Parser<'_> {
     /// The digit-grouping lookahead, `(?=(?:\d{n})*\b)` and its kin: a
     /// `Split` that cuts a digit run into groups of `n` from its end puts
     /// it after `\d{1,n}`, so the first group takes the remainder. The group
-    /// is `\d` or `\p{Nd}` under `{n}`, in a plain or an atomic group (over a
-    /// body of fixed width nothing can back off, so the two are one) under
-    /// `*` or `+`, or bare under `+` (a `+` after an interval is a repeat of
-    /// the interval to the engine); what follows it is `\b`, `\z` or
-    /// `(?:\P{Nd}|$)`. Read as one op over the digit run ahead
+    /// is `\d`, `\p{Nd}` or `\p{N}` (the decimal digits, or the numbers)
+    /// under `{n}`, in a plain or an atomic group (over a body of fixed
+    /// width nothing can back off, so the two are one) under `*` or `+`, or
+    /// bare under `+` (a `+` after an interval is a repeat of the interval
+    /// to the engine); what follows it is `\z`, or `(?:\P{X}|$)` or
+    /// `(?!\p{X})` (the escape of the group's own class `X`, `\d` for the
+    /// decimal digits too), or, over the decimal digits, `\b`. Read as one
+    /// op over the run ahead
     /// ([`Node::GroupsAhead`]); any other positive lookahead is outside the
     /// subset.
     fn parse_groups_ahead(&mut self) -> Option<Node> {
@@ -2189,7 +2196,7 @@ impl Parser<'_> {
                 return None;
             }
         }
-        self.decimal_digits_escape()?;
+        let categories = self.number_escape()?;
         if self.chars.next()? != '{' {
             return None;
         }
@@ -2207,23 +2214,40 @@ impl Parser<'_> {
         };
         let end = match self.chars.next()? {
             '\\' => match self.chars.next()? {
-                'b' => GroupsEnd::Word(self.word_class()),
+                // The boundary never falls inside a run of decimal digits
+                // (each is a word character); inside a run of the numbers
+                // it would, so that pair declines.
+                'b' if categories == CAT_DIGIT => GroupsEnd::Word(self.word_class()),
                 'z' => GroupsEnd::Text,
                 _ => return None,
             },
             '(' => {
-                for expected in ['?', ':', '\\', 'P'] {
-                    if self.chars.next()? != expected {
-                        return None;
-                    }
-                }
-                if self.parse_property()? != CAT_DIGIT {
+                // `(?:\P{X}|$)` or `(?!\p{X})` (`(?!\d)` over the decimal
+                // digits) over the group's own class `X`: a character
+                // outside it, or the end of the text.
+                if self.chars.next()? != '?' {
                     return None;
                 }
-                for expected in ['|', '$', ')'] {
-                    if self.chars.next()? != expected {
-                        return None;
+                match self.chars.next()? {
+                    ':' => {
+                        if self.chars.next()? != '\\'
+                            || self.chars.next()? != 'P'
+                            || self.parse_property()? != categories
+                        {
+                            return None;
+                        }
+                        for expected in ['|', '$', ')'] {
+                            if self.chars.next()? != expected {
+                                return None;
+                            }
+                        }
                     }
+                    '!' => {
+                        if self.number_escape()? != categories || self.chars.next()? != ')' {
+                            return None;
+                        }
+                    }
+                    _ => return None,
                 }
                 GroupsEnd::Run
             }
@@ -2232,7 +2256,7 @@ impl Parser<'_> {
         if self.chars.next()? != ')' {
             return None;
         }
-        let class = self.digit_class();
+        let class = self.run_class(categories);
         Some(Node::GroupsAhead {
             class,
             size,
@@ -2241,29 +2265,33 @@ impl Parser<'_> {
         })
     }
 
-    /// `\d` or `\p{Nd}`, the decimal digits, consumed; anything else declines.
-    fn decimal_digits_escape(&mut self) -> Option<()> {
+    /// `\d` or `\p{Nd}`, the decimal digits, or `\p{N}`, the numbers,
+    /// consumed: the category of the group's run; anything else declines.
+    fn number_escape(&mut self) -> Option<u16> {
         if self.chars.next()? != '\\' {
             return None;
         }
         match self.chars.next()? {
-            'd' => Some(()),
-            'p' if self.parse_property()? == CAT_DIGIT => Some(()),
+            'd' => Some(CAT_DIGIT),
+            'p' => match self.parse_property()? {
+                categories @ (CAT_DIGIT | CAT_NUMBER) => Some(categories),
+                _ => None,
+            },
             _ => None,
         }
     }
 
-    /// The digit class every digit-grouping lookahead of the pattern reads
-    /// (see `Parser::groups_ahead`).
-    fn digit_class(&mut self) -> usize {
-        if let Some(class) = self.groups_ahead {
+    /// The run class every digit-grouping lookahead of the pattern over
+    /// `categories` reads (see `Parser::groups_ahead`).
+    fn run_class(&mut self, categories: u16) -> usize {
+        if let Some(&(_, class)) = self.groups_ahead.iter().find(|(c, _)| *c == categories) {
             return class;
         }
         let class = self.add_class(Class {
-            categories: CAT_DIGIT,
+            categories,
             ..Class::default()
         });
-        self.groups_ahead = Some(class);
+        self.groups_ahead.push((categories, class));
         class
     }
 
@@ -2596,7 +2624,7 @@ mod tests {
     /// of one punctuation character read back at once (a run of it).
     const PUNCTUATION_RUNS: &str = r#"[\(\)\[\]\{\}]|([!"\#\$%\&'\*\+,\-\./:;<=>\?\\\^_`\|\~])\1*"#;
 
-    const PATTERNS: [&str; 24] = [
+    const PATTERNS: [&str; 25] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -2621,6 +2649,7 @@ mod tests {
         WIDE_DIGIT_GROUPS,
         DIGIT_GROUP_HEAD,
         DIGIT_GROUPS_FROM_THE_START,
+        NUMBER_GROUPS,
     ];
 
     /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
@@ -2647,6 +2676,13 @@ mod tests {
     const WIDE_DIGIT_GROUPS: &str = r"\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510}";
     const DIGIT_GROUP_HEAD: &str = r"\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)";
     const DIGIT_GROUPS_FROM_THE_START: &str = r"\A\p{Nd}{3}|\G\p{Nd}{3}";
+
+    /// The cased template whose number rule cuts a run of the numbers (the
+    /// decimal digits and the other numerals) into groups of three from
+    /// its end, the lookahead closed by a negative lookahead over the
+    /// numbers, and a run of one or two beside it; its digit alternative is
+    /// no plain class, so the program matches it, not the cased scanner.
+    const NUMBER_GROUPS: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
     /// Characters that exercise every class the patterns use: ASCII of all
     /// kinds, spaces and line breaks of several scripts, letters with and
@@ -2912,8 +2948,10 @@ mod tests {
             r"\d|(?=(?:\d{3})*\b)\d",
             r"(?:(?=(?:\d{3})*\b)\d)?\d",
             // the anchors take no quantifier and stand in no case-insensitive
-            // group; the lookahead's group is `\d` or `\p{Nd}` under `{n}`,
-            // bare only under `+`, and ends in `\b`, `\z` or `(?:\P{Nd}|$)`
+            // group; the lookahead's group is `\d`, `\p{Nd}` or `\p{N}` under
+            // `{n}`, bare only under `+`, and ends in `\z`, `(?:\P{X}|$)` or
+            // `(?!\p{X})` over the group's own class, or `\b` over the
+            // decimal digits
             r"\A+\d",
             r"\d\z?",
             r"\G*\d",
@@ -2927,7 +2965,16 @@ mod tests {
             r"\d(?=(?:\d{3})*(?:\P{Nd}|\z))",
             r"\d(?=(?:\d{3})*\P{Nd})",
             r"\d(?=(?>\d{3})+)",
-            r"\d(?=\p{N}{3}+\z)",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*\b)",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\d))",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{Nd}))",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*(?:\P{Nd}|$))",
+            r"\d{1,3}(?=(?:\d{3})*(?!\p{N}))",
+            r"\d{1,3}(?=(?:\d{3})*(?!\p{L}))",
+            r"\d{1,3}(?=(?:\d{3})*(?![0-9]))",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N})",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}|$))",
+            r"\p{N}{1,3}(?=(?:\p{No}{3})*(?!\p{No}))",
             r"\d(?=(?>\d{3}+)\z)",
             r"\p{Hiragana}",
             r"a{3,1}",
@@ -3034,6 +3081,10 @@ mod tests {
             "\u{663}\u{664}\u{665}\u{666}",
             "1\u{663}4",
             "\u{969}\u{969}\u{969}",
+            "1\u{B2}3",
+            "\u{2460}\u{2461}\u{2462}\u{2463}",
+            "\u{216B}\u{BD}",
+            "12\u{2160}45\u{BC}7",
         ];
         let prefixes = ["", "x", " ", ",", "\u{663}", "_", "\u{301}"];
         let suffixes = [
@@ -3065,6 +3116,12 @@ mod tests {
             r"\d(?=(?:\d{4})*\b)",
             r"[,a](?=(?:\d{3})*\b)",
             r"\d{2}(?=(?:\d{3})*\b)|\d",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*(?:\P{N}|$))",
+            r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}",
+            r"\d{1,3}(?=(?:\d{3})*(?!\d))",
+            r"\d(?=\p{N}{3}+\z)",
+            r"\p{N}{1,2}(?=\p{N}{3}+\z)",
         ] {
             for prefix in prefixes {
                 for run in runs {
@@ -3529,6 +3586,7 @@ mod tests {
             GROUP_REQUIRED,
             CL100K,
             KIMI,
+            NUMBER_GROUPS,
         ] {
             assert!(
                 !matches!(
@@ -3760,7 +3818,7 @@ mod tests {
             chars: "a++b+".chars().peekable(),
             classes: Vec::new(),
             case_insensitive: false,
-            groups_ahead: None,
+            groups_ahead: Vec::new(),
             captured: false,
             word: None,
         };
