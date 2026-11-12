@@ -2431,14 +2431,16 @@ impl NativeEncoder {
     /// A byte offset at or past `from` where the stages' pieces can be cut
     /// without changing them: a space followed by a letter after a character
     /// that is not whitespace, where the patterns, run over the text around
-    /// it, cut cleanly ([`Self::piece_starts_at`]). No piece spans such a
-    /// point (letters, digits and punctuation stop at the space, a whitespace
-    /// run cannot start before it) but a letter run joined by spaces, which
-    /// the check refuses to cut, and the patterns read nothing before a
-    /// match's start (the digit-grouping lookahead's word boundary reads the
-    /// character before it, one its match consumed: the parser declines the
-    /// lookahead where it could lead a match), so the pieces of the two
-    /// halves are the pieces of the whole. `None` when
+    /// it, cut cleanly ([`Self::piece_starts_at`]). Under a pattern that reads
+    /// no space inside a match ([`Pattern::reads_space_inside`]) no piece spans
+    /// such a point (letters, digits and punctuation stop at the space, a
+    /// whitespace run cannot start before it); under one that does (a letter run
+    /// joined by spaces, `\p{L}+ ?`) the check refuses a cut a piece spans. The
+    /// patterns read nothing before a match's start (the digit-grouping
+    /// lookahead's word boundary reads the character before it, one its match
+    /// consumed: the parser declines the lookahead where it could lead a
+    /// match), so the pieces of the two halves are the pieces of the whole.
+    /// `None` when
     /// the text has no such point past `from`, or when
     /// [`MAX_REJECTED_CUT_CANDIDATES`] candidates past `from` failed the
     /// check: a stretch without candidates (a blob, a table of numbers) costs
