@@ -21,3 +21,16 @@ def test_startup_floor_raises_the_grpc_and_http_wait(monkeypatch):
     for mode in (ConnectionMode.GRPC, ConnectionMode.HTTP):
         assert setup._gateway_readiness_timeout(mode, MODEL, 60) == 900
         assert setup._gateway_readiness_timeout(mode, MODEL, 1200) == 1200
+
+
+def test_zmq_wait_covers_the_model_load_and_never_shrinks(monkeypatch):
+    # A ZMQ engine loads its model inside the gateway's readiness gate, so the
+    # gate takes the model's startup timeout under the env floor, and a
+    # larger gateway timeout is kept.
+    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    monkeypatch.setattr(setup, "get_model_spec", lambda _: {"startup_timeout": 900})
+    assert setup._gateway_readiness_timeout(ConnectionMode.ZMQ, MODEL, 60) == 900
+    assert setup._gateway_readiness_timeout(ConnectionMode.ZMQ, MODEL, 1200) == 1200
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "1500")
+    assert setup._gateway_readiness_timeout(ConnectionMode.ZMQ, MODEL, 60) == 1500
+    assert setup._gateway_readiness_timeout(ConnectionMode.ZMQ, MODEL, 1200) == 1500
