@@ -1110,6 +1110,11 @@ pub(crate) fn init_metrics() {
          (panic, join_error, intern_failed)"
     );
     describe_counter!(
+        "smg_kv_event_subscription_orphan_panics_total",
+        "KV event subscription tasks that panicked with no member left on them \
+         (counted under no worker; the engine's address is in the log line)"
+    );
+    describe_counter!(
         "smg_kv_event_subscriptions_total",
         "KV event streams connected, by worker; a reconnect counts again"
     );
@@ -3292,6 +3297,14 @@ impl Metrics {
             "reason" => reason
         )
         .increment(1);
+    }
+
+    /// Count a KV event subscription task's panic with no member left on
+    /// it: an orphan, counted under no worker (its engine's address is in the
+    /// log line). A series keyed by the engine's address would be a worker's
+    /// own on a plain engine and would never retire on a data-parallel one.
+    pub fn record_kv_event_subscription_orphan_panic() {
+        counter!("smg_kv_event_subscription_orphan_panics_total").increment(1);
     }
 
     /// Count a KV event stream connected: the first time and every reconnect,
