@@ -451,6 +451,8 @@ impl MockWorker {
             .route("/v1/messages", post(messages_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
+            .route("/v1/embeddings", post(embeddings_handler))
+            .route("/v1/classify", post(classify_handler))
             .route(
                 "/v1/audio/transcriptions",
                 post(audio_transcriptions_handler),
@@ -1941,6 +1943,95 @@ async fn rerank_handler(
     });
 
     (StatusCode::OK, Json(mock_results)).into_response()
+}
+
+/// The inputs of an embeddings or classify body: a string is one, an array
+/// of strings or of token id arrays one per member, a flat array of token ids
+/// one.
+fn input_count(payload: &serde_json::Value) -> usize {
+    match payload.get("input") {
+        Some(serde_json::Value::Array(members))
+            if members.first().is_some_and(|member| !member.is_number()) =>
+        {
+            members.len()
+        }
+        _ => 1,
+    }
+}
+
+/// `/v1/embeddings`: one vector per input; the request is recorded for the
+/// tests that read what the gateway relayed.
+async fn embeddings_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+    record_request(config.port, version, &payload);
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    let inputs = input_count(&payload);
+    let data: Vec<serde_json::Value> = (0..inputs)
+        .map(|index| json!({"object": "embedding", "index": index, "embedding": [0.1, 0.2, 0.3]}))
+        .collect();
+    let model = payload
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| json!("mock-model"));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "object": "list",
+            "data": data,
+            "model": model,
+            "usage": {"prompt_tokens": 3 * inputs, "total_tokens": 3 * inputs}
+        })),
+    )
+        .into_response()
+}
+
+/// `/v1/classify`: one label per input; the request is recorded as above.
+async fn classify_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+    record_request(config.port, version, &payload);
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    let inputs = input_count(&payload);
+    let data: Vec<serde_json::Value> = (0..inputs)
+        .map(|index| json!({"index": index, "label": "positive", "probs": [0.9, 0.1], "num_classes": 2}))
+        .collect();
+    let model = payload
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| json!("mock-model"));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": format!("classify-{}", config.port),
+            "object": "list",
+            "created": 0,
+            "model": model,
+            "data": data,
+            "usage": {"prompt_tokens": 2 * inputs, "total_tokens": 2 * inputs, "completion_tokens": 0}
+        })),
+    )
+        .into_response()
 }
 
 impl Default for MockWorkerConfig {
