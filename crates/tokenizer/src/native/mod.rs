@@ -1582,11 +1582,20 @@ impl NativeEncoder {
         pattern: &str,
         specials: &[(String, u32)],
     ) -> Result<Self, Declined> {
-        let pattern = Pattern::parse(pattern).ok_or_else(|| {
+        let parsed = Pattern::parse(pattern).ok_or_else(|| {
             Declined::from(format!(
                 "a split pattern outside the supported regex subset: {pattern}"
             ))
         })?;
+        // The file's own encoder reads `$` as the end of the text only, where
+        // the subset reads it as the Hugging Face engine does (before a
+        // newline too): a pattern with the anchor is declined on this path.
+        if parsed.end_anchored() {
+            return Err(Declined::from(format!(
+                "a split pattern with the end anchor, which the file's own encoder reads as the \
+                 end of the text only: {pattern}"
+            )));
+        }
         if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
             return Err(Declined::from(format!(
                 "special token {content:?} without content"
@@ -1619,7 +1628,7 @@ impl NativeEncoder {
             "the native encode path merges a tiktoken vocabulary's piece-cache misses itself"
         );
         let stages = vec![Stage {
-            pattern,
+            pattern: parsed,
             keep_gaps: false,
         }];
         let chain = chain::Scanner::recognize(&stages);
@@ -1628,7 +1637,7 @@ impl NativeEncoder {
             raw_added: AddedTokens::build(specials)?,
             normalized_added: None,
             nfc_quick: None,
-            end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
+            end_anchored: false,
             stages,
             chain,
             frame: Frame::default(),

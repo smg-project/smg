@@ -3733,6 +3733,13 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
         declined(&ranks, r"\w+|\s+", &[]),
         r"a split pattern outside the supported regex subset: \w+|\s+"
     );
+    // The end anchor parses, but the file's own encoder reads it as the end
+    // of the text only, where the subset reads it before a newline too.
+    assert_eq!(
+        declined(&ranks, r"[a-z]+|\s+$|\s", &[]),
+        r"a split pattern with the end anchor, which the file's own encoder reads as the end of the text only: [a-z]+|\s+$|\s"
+    );
+    assert!(NativeEncoder::from_ranks(&ranks, r"[a-z]+|\s", &[]).is_ok());
     assert_eq!(
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),
         "special token \"\" without content"
