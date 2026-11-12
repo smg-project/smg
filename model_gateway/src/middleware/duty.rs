@@ -32,7 +32,8 @@ pub trait Duty {
 pin_project! {
     /// A layer's future: the route's future, then the layer's duty handed
     /// the answer, taken at the answer. Dropped before the answer, the duty
-    /// is told so.
+    /// is told so before the route's future is dropped: the layer's word on
+    /// the unanswered request precedes the route's own teardown.
     pub struct DutyFuture<F, D>
     where
         D: Duty,
@@ -183,5 +184,41 @@ mod tests {
             },
         ));
         assert_eq!(*log.borrow(), ["dropped"]);
+    }
+
+    /// A route's future that never answers and writes its own drop into
+    /// the shared log.
+    struct Teardown {
+        log: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Drop for Teardown {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push("inner dropped");
+        }
+    }
+
+    impl Future for Teardown {
+        type Output = Result<Response, ()>;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    /// The order both layers rely on: the client-closed word and the
+    /// layer's count come before the route's teardown, never after it.
+    #[test]
+    fn the_duty_is_told_before_the_routes_future_drops() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        drop(DutyFuture::new(
+            Teardown {
+                log: Rc::clone(&log),
+            },
+            Logged {
+                log: Rc::clone(&log),
+            },
+        ));
+        assert_eq!(*log.borrow(), ["unanswered", "inner dropped"]);
     }
 }
