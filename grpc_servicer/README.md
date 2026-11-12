@@ -441,13 +441,13 @@ tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
 
-##### Prefill/decode over NIXL on one host: restarting a leg in place
+##### Prefill/decode over NIXL on one host: restarting a side in place
 
-A prefill and a decode leg on one host (or one NVLink domain) move KV over
+A prefill and a decode side on one host (or one NVLink domain) move KV over
 UCX's CUDA IPC: the importing side opens the peer's allocations and keeps the
 mappings in a process-wide cache that lives as long as the importer does, and
 an imported mapping keeps the exporter's allocation alive after the exporter
-died. A leg that crashes therefore cannot restart on its own GPU until its
+died. A side that crashes therefore cannot restart on its own GPU until its
 peers let go: its startup memory check sees the dead process's memory as still
 in use ("Free memory on device ... is less than desired GPU memory
 utilization") and the pod crash-loops until the peers restart too. Two of the
@@ -458,8 +458,8 @@ engine's own settings bound the hold, and they work only together:
 - `kv_connector_extra_config.engine_ttl` (seconds) in `--kv-transfer-config`:
   a peer idle longer than this is dropped the next time the connector runs
   its sweep, which it does when it handshakes a new peer and when it sends a
-  heartbeat; an hour by the connector's default. A restarted leg counts as a
-  new peer only for the peers that do not hold its memory: the leg whose
+  heartbeat; an hour by the connector's default. A restarted side counts as a
+  new peer only for the peers that do not hold its memory: the side whose
   memory a peer still holds fails its startup memory check before it
   handshakes anyone, so its own restart cannot run the sweep that would
   release it. The heartbeat goes out on a known peer's requests as well, at
@@ -468,7 +468,7 @@ engine's own settings bound the hold, and they work only together:
   every few seconds; the peer a request reads from is stamped active before
   the sweep, so a pair's own traffic never drops the pair. A single pair
   whose prefill died sends no heartbeat either; its
-  decode lets go of the dead leg's memory only when another peer turns up or
+  decode lets go of the dead side's memory only when another peer turns up or
   a live peer's requests run the sweep. Dropping the peer releases its
   transfer state, the transfers that were in flight when it died included;
   with the cache off their mappings go with them, with the cache on the
@@ -477,7 +477,7 @@ engine's own settings bound the hold, and they work only together:
 Neither is free, which is why the servicer does not set them for you. With
 the cache off, every request's transfer opens and closes each of the peer's
 allocations it touches (about one per layer, the way the engine allocates its
-KV cache). Measured on one host, two tensor-parallel-2 legs over CUDA IPC,
+KV cache). Measured on one host, two tensor-parallel-2 sides over CUDA IPC,
 prompts of about 5100 tokens, 40 sequential requests per arm: the first token
 came 2 % later at the median (885 to 903 ms) and 5 % later at the 90th
 percentile (900 to 943 ms), with one three-second outlier in forty, in the
@@ -487,28 +487,28 @@ request; when either happens, a healthy pair that had been idle longer than
 the TTL (other than the pair whose own request ran the sweep) is dropped
 with the dead ones and runs its handshake again on its next request (the
 peer's metadata plus a descriptor list over every one of its KV blocks:
-seconds on a large cache). Legs on different hosts are not
+seconds on a large cache). Sides on different hosts are not
 affected: over TCP or RDMA nothing of the peer's memory is imported, and a
 restart passes the memory check at once. The repository's end-to-end harness
 runs its NIXL pairs with the cache off and a TTL of 3 s because it restarts
-legs on purpose; a production pair on one host wants a TTL of a few minutes,
+sides on purpose; a production pair on one host wants a TTL of a few minutes,
 longer than any gap a busy pair leaves, shorter than the restart back-off a
-crashed leg would otherwise sit through.
+crashed side would otherwise sit through.
 
 ##### Prefill/decode over NIXL across hosts on TCP: the UCX segment size
 
-Legs on different hosts without an RDMA device move the KV over UCX's TCP
+Sides on different hosts without an RDMA device move the KV over UCX's TCP
 transport, and the decode side's read of a remote block list is UCX's
 software-emulated GET: the data travels as active-message fragments of the
 TCP transport's send segment, 8 KiB by UCX's default, each one staged through
 host memory on both ends. For a hybrid checkpoint the per-request pull is
 large (the linear-attention state is moved whole; a 1,300-token prompt of a
 checkpoint with 34 linear-attention and 11 full-attention layers, TP 2 per
-leg, moves about 100 MB per rank), so the fragment count, not the link, sets
+side, moves about 100 MB per rank), so the fragment count, not the link, sets
 the rate: the default moves about 2.2 Gbit/s per rank stream where a plain
 socket between the same pods moves 14 Gbit/s, pulls queue FIFO on the decode
-side, and one decode leg tops out near 2.7 requests/s with first tokens of
-30 s and more behind the queue. A 1 MiB segment on both legs removes most of
+side, and one decode side tops out near 2.7 requests/s with first tokens of
+30 s and more behind the queue. A 1 MiB segment on both sides removes most of
 the per-fragment cost and puts the stream at the single-socket rate, so the
 engine image ships it: `docker/ucx.conf`, copied to `/etc/ucx/ucx.conf` by
 the image build, holds
@@ -519,7 +519,7 @@ UCX_TCP_RX_SEG_SIZE=1m
 ```
 
 (the receive segment, 64 KiB by default, must be at least the send segment;
-UCX refuses the pair otherwise). Measured on one prefill + one decode leg over TCP, text
+UCX refuses the pair otherwise). Measured on one prefill + one decode side over TCP, text
 prompts of 1,000-1,500 tokens, 64-128 output tokens, open-loop arrivals,
 UCX 1.22 as bundled with NIXL 1.4:
 
@@ -1304,7 +1304,7 @@ refused at launch with the engine's reason: every replica reports attention-DP
 rank 0 to the engine's KV sender, which fails each request whose room's residue
 is not 0; attention DP (`--tp-size N --attn-dp-size N`) is the multi-rank
 prefill shape. The planned
-warm-up pins each of its requests to a rank (on a prefill or decode leg with a
+warm-up pins each of its requests to a rank (on a prefill or decode side with a
 stand-in room of that rank's residue), so every rank is warm before the Router
 sends anything. What the wire does not carry is reported, not emulated: an `--encoder-only` launch is refused (SGLang's entrypoint runs
 that role on its own encoder server, never on a servicer), a `--language-only`
@@ -1326,8 +1326,8 @@ above: `full` by default, `fast`, `off`, a budget in seconds or
 `--chunked-prefill-size` or `--max-prefill-tokens`, the engine's defaults
 where unset; the Python servicer runs the same plan over its own port after
 its first warm-up request and skips it on a disaggregation role; the Rust
-path plans a prefill or decode leg as a single engine, its requests carrying
-the engine's stand-in bootstrap so the leg warms up without its peer, and the
+path plans a prefill or decode side as a single engine, its requests carrying
+the engine's stand-in bootstrap so the side warms up without its peer, and the
 language side of an encode-disaggregated deployment (`--language-only`) plans
 as a single engine, so the first forward of its fresh scheduler is paid before
 SERVING rather than by its first request, as the engine's own frontend warms
@@ -1335,7 +1335,7 @@ that role on the text path, and where its
 frontend dispatches to the encoders the plan ends its shapes with one image
 through them (the prompt the model's chat template renders around the
 engine's own minimal warm-up image; a template without an image placeholder
-leaves the leg out, a leg the encoders cannot serve yet is a logged step), so
+leaves the side out, a side the encoders cannot serve yet is a logged step), so
 the scheduler's first media forward is paid before SERVING too; under
 data parallelism the servicer routes a request by load, not by rank, so each
 prefill shape warms one rank and the log says so),
