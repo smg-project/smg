@@ -11,15 +11,17 @@
 //! 1. added tokens are cut out of the text the way `AddedVocabulary` does it
 //!    (leftmost-longest, the non-normalized set on the raw text first, the
 //!    normalized set after normalization);
-//! 2. normalization is NFC or nothing, read from the tables `tokenizers`
-//!    normalizes with (the crate `unicode-normalization-alignments`, every
-//!    NFC read of this module: a newer crate's tables know marks and
-//!    compositions the library's do not and would compose other text); a
-//!    text already in NFC (its ASCII stretches are not read at all, the
-//!    quick check answers for most of the rest and normalizing settles what
-//!    it cannot, so marks-heavy scripts cost no copy) is used as it is, any
-//!    other text is normalized gap by gap between its raw added tokens, as
-//!    `tokenizers` normalizes it, and encoded from those buffers;
+//! 2. normalization is NFC, NFKC or nothing, read from the tables
+//!    `tokenizers` normalizes with (the crate
+//!    `unicode-normalization-alignments`, every normalization read of this
+//!    module: a newer crate's tables know marks and compositions the
+//!    library's do not and would compose other text); a text already in
+//!    the normalizer's form (its ASCII stretches are not read at all, the
+//!    quick check answers for most of the rest under NFC and normalizing
+//!    settles what it cannot, so marks-heavy scripts cost no copy) is used
+//!    as it is, any other text is normalized gap by gap between its raw
+//!    added tokens, as `tokenizers` normalizes it, and encoded from those
+//!    buffers;
 //! 3. each `Split` pre-tokenizer runs as a [`pattern::Pattern`] over `&str`,
 //!    with the same leftmost-first semantics and Unicode tables as the regex
 //!    engine `tokenizers` uses, producing byte ranges instead of strings (a
@@ -440,9 +442,10 @@ fn first_non_ascii(bytes: &[u8]) -> Option<usize> {
 /// characters U+4000..=U+9FFF, each a lead byte E4..=E9 and two continuation
 /// bytes in UTF-8 (E4 80 80 is U+4000, E9 BF BF is U+9FFF; the kana under E3
 /// and the Hangul syllables under EA..=ED are not in it). Every one of them
-/// has combining class 0, no canonical decomposition and no part in any
-/// canonical composition (`the_ideograph_range_is_settled_by_the_crates_own_tables`
-/// walks the range against the crate's tables), so a run of them is in NFC
+/// has combining class 0, no canonical or compatibility decomposition and
+/// no part in any canonical composition
+/// (`the_ideograph_range_is_settled_by_the_crates_own_tables` walks the
+/// range against the crate's tables), so a run of them is in NFC and NFKC
 /// and either side of it is a cut, like an ASCII stretch.
 fn ideograph_run(bytes: &[u8]) -> usize {
     let mut at = 0;
@@ -466,14 +469,15 @@ fn checked_run(bytes: &[u8]) -> usize {
 
 /// The stretches of `text` that normalization reads on their own, each with
 /// its byte offset and whether it is settled: ASCII, or CJK ideographs. An
-/// ASCII stretch is in NFC in every version of Unicode and no normalization
-/// changes it; so is a run of ideographs (see [`ideograph_run`]), and
-/// nothing composes with an ideograph on either side. A run of other
-/// non-ASCII characters goes with the ASCII character before it, the letter
-/// an accent at its start composes with; nothing else crosses a cut: no
-/// composition has an ASCII character or an ideograph as its second
-/// element, no decomposition reaches across one, and both are starters, so
-/// the canonical order of marks never spans one.
+/// ASCII stretch is in NFC and NFKC in every version of Unicode and no
+/// normalization changes it; so is a run of ideographs (see
+/// [`ideograph_run`]), and nothing composes with an ideograph on either
+/// side. A run of other non-ASCII characters goes with the ASCII character
+/// before it, the letter an accent at its start composes with; nothing else
+/// crosses a cut: no composition has an ASCII character or an ideograph as
+/// its second element, no decomposition (canonical or compatibility)
+/// reaches across one, and both are starters, so the canonical order of
+/// marks never spans one.
 fn stretches(text: &str) -> impl Iterator<Item = (usize, &str, bool)> {
     let bytes = text.as_bytes();
     let mut at = 0;
@@ -505,31 +509,31 @@ fn stretches(text: &str) -> impl Iterator<Item = (usize, &str, bool)> {
     })
 }
 
-/// Whether `text` is in NFC by the tables `tokenizers` normalizes with: the
-/// crate's check on each stretch that is not settled (the quick check
+/// Whether `text` is in `form` by the tables `tokenizers` normalizes with:
+/// the crate's check on each stretch that is not settled (the quick check
 /// answers for most text; where it cannot, marks that might compose or
 /// reorder, the stretch is normalized and compared), none on the ASCII and
 /// ideograph ones.
-fn is_nfc(text: &str) -> bool {
-    stretches(text)
-        .all(|(_, stretch, settled)| settled || unicode_normalization_alignments::is_nfc(stretch))
+fn is_normalized(text: &str, form: Normalizer) -> bool {
+    stretches(text).all(|(_, stretch, settled)| settled || form.holds(stretch))
 }
 
-/// `text` in NFC by the tables `tokenizers` normalizes with, borrowed when
-/// it is in NFC already: only a stretch that is not settled and not in NFC
-/// goes through the crate's normalizer (its iterator reports a byte-offset
-/// shift with each character, which this path has no use for), the other
-/// stretches are copied. A stretch is read by the quick check where the
-/// caller has one (its tables place most characters; the library reads the
-/// windows they cannot), by the library's check otherwise.
-fn nfc<'a>(text: &'a str, quick: Option<&NfcQuick>) -> Cow<'a, str> {
-    let in_nfc = |stretch: &str| match quick {
+/// `text` in `form` by the tables `tokenizers` normalizes with, borrowed
+/// when it is in that form already: only a stretch that is not settled and
+/// not in the form goes through the crate's normalizer (its iterator
+/// reports a byte-offset shift with each character, which this path has no
+/// use for), the other stretches are copied. A stretch is read by the NFC
+/// quick check where the caller has one (under that form: its tables place
+/// most characters; the library reads the windows they cannot), by the
+/// library's check otherwise.
+fn normalize<'a>(text: &'a str, form: Normalizer, quick: Option<&NfcQuick>) -> Cow<'a, str> {
+    let in_form = |stretch: &str| match quick {
         Some(quick) => quick.is_nfc(stretch),
-        None => unicode_normalization_alignments::is_nfc(stretch),
+        None => form.holds(stretch),
     };
     let mut owned: Option<String> = None;
     for (start, stretch, settled) in stretches(text) {
-        if settled || in_nfc(stretch) {
+        if settled || in_form(stretch) {
             if let Some(out) = &mut owned {
                 out.push_str(stretch);
             }
@@ -539,7 +543,7 @@ fn nfc<'a>(text: &'a str, quick: Option<&NfcQuick>) -> Cow<'a, str> {
                 out.push_str(&text[..start]);
                 out
             });
-            out.extend(stretch.nfc().map(|(ch, _)| ch));
+            form.normalize_into(stretch, out);
         }
     }
     owned.map_or(Cow::Borrowed(text), Cow::Owned)
@@ -564,10 +568,36 @@ fn bytes_char() -> [char; 256] {
     table
 }
 
+/// The normalizer the path applies before the cut after normalization:
+/// none, or one of the two composed Unicode forms `tokenizers` has
+/// (compatibility characters, fullwidth forms and ligatures among them,
+/// spell out under NFKC and stay as they are under NFC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Normalizer {
     None,
     Nfc,
+    Nfkc,
+}
+
+impl Normalizer {
+    /// Whether `stretch` is in this form by the library's tables (every
+    /// text is, under no normalizer).
+    fn holds(self, stretch: &str) -> bool {
+        match self {
+            Self::None => true,
+            Self::Nfc => unicode_normalization_alignments::is_nfc(stretch),
+            Self::Nfkc => unicode_normalization_alignments::is_nfkc(stretch),
+        }
+    }
+
+    /// `stretch` in this form, appended to `out`.
+    fn normalize_into(self, stretch: &str, out: &mut String) {
+        match self {
+            Self::None => out.push_str(stretch),
+            Self::Nfc => out.extend(stretch.nfc().map(|(ch, _)| ch)),
+            Self::Nfkc => out.extend(stretch.nfkc().map(|(ch, _)| ch)),
+        }
+    }
 }
 
 /// One `Split` of the pre-tokenizer chain.
@@ -810,9 +840,9 @@ impl<'t> Units<'t> {
     }
 }
 
-/// A raw added token, or a text between raw added tokens in NFC: borrowed
-/// where it was in NFC already, owned where normalizing changed it (see
-/// [`NativeEncoder::nfc_gaps`]).
+/// A raw added token, or a text between raw added tokens in the
+/// normalizer's form: borrowed where it was in that form already, owned
+/// where normalizing changed it (see [`NativeEncoder::normalized_gaps`]).
 enum Gap<'t> {
     Text(Cow<'t, str>),
     Added(u32),
@@ -841,7 +871,8 @@ struct Template {
 pub(crate) struct NativeEncoder {
     normalizer: Normalizer,
     /// The NFC quick check's tables, read when the normalizer is NFC: the
-    /// check every encode under it starts with (see [`Self::in_nfc`]).
+    /// check every encode under it starts with (see [`Self::in_form`]; the
+    /// NFKC form has no quick check and reads the library's).
     nfc_quick: Option<NfcQuick>,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
@@ -1132,13 +1163,14 @@ impl NativeEncoder {
         }
     }
 
-    /// The normalizer this path applies: none, or NFC alone.
+    /// The normalizer this path applies: none, or NFC or NFKC alone.
     fn normalizer_from(normalizer: &Value) -> Result<Normalizer, Declined> {
         if normalizer.is_null() {
             return Ok(Normalizer::None);
         }
         match type_of("normalizer", normalizer)? {
             "NFC" => Ok(Normalizer::Nfc),
+            "NFKC" => Ok(Normalizer::Nfkc),
             "Sequence" => {
                 let steps = normalizer
                     .get("normalizers")
@@ -1148,12 +1180,12 @@ impl NativeEncoder {
                     Ok(Normalizer::None)
                 } else {
                     Err(Declined::from(
-                        "a normalizer sequence with steps (only NFC alone or none)",
+                        "a normalizer sequence with steps (only NFC or NFKC alone, or none)",
                     ))
                 }
             }
             other => Err(Declined::from(format!(
-                "normalizer {other} (only NFC or none)"
+                "normalizer {other} (only NFC, NFKC or none)"
             ))),
         }
     }
@@ -1316,7 +1348,7 @@ impl NativeEncoder {
             if token.normalized {
                 let content = match normalizer {
                     Normalizer::None => token.content.clone(),
-                    Normalizer::Nfc => nfc(&token.content, None).into_owned(),
+                    form => normalize(&token.content, form, None).into_owned(),
                 };
                 normalized.push((content, id));
             } else {
@@ -1845,11 +1877,11 @@ impl NativeEncoder {
         // length (`WORD_SCAN_MIN_BYTES`): every unit of a long input takes
         // them, a short input walks its runs byte by byte.
         let words = text.len() >= WORD_SCAN_MIN_BYTES;
-        // Text not in NFC under the NFC normalizer (by the library's tables,
-        // as every NFC read here) is normalized gap by gap first; the units
-        // then borrow from those gaps.
-        let gaps = (self.normalizer == Normalizer::Nfc && !self.in_nfc(text))
-            .then(|| self.nfc_gaps(text, added));
+        // Text not in the normalizer's form (by the library's tables, as
+        // every normalization read here) is normalized gap by gap first;
+        // the units then borrow from those gaps.
+        let gaps = (self.normalizer != Normalizer::None && !self.in_form(text))
+            .then(|| self.normalized_gaps(text, added));
         let units = match &gaps {
             Some(gaps) => self.units_of(gaps, parallel, added),
             None => self.units(text, parallel, added),
@@ -1924,13 +1956,14 @@ impl NativeEncoder {
         }
     }
 
-    /// Whether `text` is in NFC by the library's tables: the quick check's
-    /// own tables first, the library's stretch-wise check where they cannot
-    /// tell (an encoder without the NFC normalizer never asks).
-    fn in_nfc(&self, text: &str) -> bool {
+    /// Whether `text` is in the normalizer's form by the library's tables:
+    /// the NFC quick check's own tables first, the library's stretch-wise
+    /// check where they cannot tell and under NFKC (an encoder without a
+    /// normalizer never asks).
+    fn in_form(&self, text: &str) -> bool {
         match &self.nfc_quick {
             Some(quick) => quick.is_nfc(text),
-            None => is_nfc(text),
+            None => is_normalized(text, self.normalizer),
         }
     }
 
@@ -1971,9 +2004,10 @@ impl NativeEncoder {
         units
     }
 
-    /// [`Self::units`] over the gaps of a text that was not in NFC
-    /// ([`Self::nfc_gaps`]): the raw cut is done and every text is in NFC,
-    /// what remains is the cut after normalization and the chunking.
+    /// [`Self::units`] over the gaps of a text that was not in the
+    /// normalizer's form ([`Self::normalized_gaps`]): the raw cut is done
+    /// and every text is in that form, what remains is the cut after
+    /// normalization and the chunking.
     fn units_of<'g>(&self, gaps: &'g [Gap<'_>], chunked: bool, added: bool) -> Units<'g> {
         let mut units = Units::new();
         for gap in gaps {
@@ -1987,16 +2021,18 @@ impl NativeEncoder {
     }
 
     /// The text cut at its raw added tokens (not at all with `added` off),
-    /// each text between them in NFC: as it is where it was, normalized
-    /// into an owned buffer where it was not. `tokenizers` normalizes each
-    /// such text on its own, after the raw cut and before the cut after
-    /// normalization: a mark right after a raw token has nothing to compose
-    /// with, and a token's spelling is never matched across what
-    /// normalization changed.
-    fn nfc_gaps<'t>(&self, text: &'t str, added: bool) -> Vec<Gap<'t>> {
+    /// each text between them in the normalizer's form: as it is where it
+    /// was, normalized into an owned buffer where it was not. `tokenizers`
+    /// normalizes each such text on its own, after the raw cut and before
+    /// the cut after normalization: a mark right after a raw token has
+    /// nothing to compose with, and a token's spelling is never matched
+    /// across what normalization changed.
+    fn normalized_gaps<'t>(&self, text: &'t str, added: bool) -> Vec<Gap<'t>> {
         let mut gaps = Vec::new();
-        let quick = self.nfc_quick.as_ref();
-        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| gaps.push(Gap::Text(nfc(text, quick)));
+        let (form, quick) = (self.normalizer, self.nfc_quick.as_ref());
+        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| {
+            gaps.push(Gap::Text(normalize(text, form, quick)));
+        };
         match self.raw_added.as_ref().filter(|_| added) {
             Some(raw) => raw.split(text, |segment| match segment {
                 Segment::Added(id) => gaps.push(Gap::Added(id)),

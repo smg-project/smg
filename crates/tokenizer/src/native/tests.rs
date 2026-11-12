@@ -10,7 +10,7 @@ use tokenizers::{
         wordlevel::WordLevel,
     },
     normalizers::{
-        unicode::{NFC, NFKC},
+        unicode::{NFC, NFD, NFKC},
         NormalizerWrapper, Prepend, Replace, Sequence as NormalizerSequence,
     },
     pre_tokenizers::{
@@ -275,7 +275,7 @@ fn byte_level(use_regex: bool) -> PreTokenizerWrapper {
 
 struct Shape {
     name: &'static str,
-    nfc: bool,
+    normalizer: Normalizer,
     pre_tokenizers: Vec<PreTokenizerWrapper>,
     ignore_merges: bool,
     special: &'static [&'static str],
@@ -286,7 +286,7 @@ fn shapes() -> Vec<Shape> {
     vec![
         Shape {
             name: "qwen3.5",
-            nfc: true,
+            normalizer: Normalizer::Nfc,
             pre_tokenizers: vec![
                 split(QWEN35, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -303,7 +303,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "cl100k-ignore-merges",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(CL100K, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -314,7 +314,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "three-splits",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(DIGITS, SplitDelimiterBehavior::Isolated, false),
                 split(CJK, SplitDelimiterBehavior::Isolated, false),
@@ -331,7 +331,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "inverted-removed",
-            nfc: true,
+            normalizer: Normalizer::Nfc,
             pre_tokenizers: vec![
                 split(CASED, SplitDelimiterBehavior::Removed, true),
                 byte_level(false),
@@ -342,7 +342,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "byte-level-regex",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![byte_level(true)],
             ignore_merges: false,
             special: &["<|endoftext|>"],
@@ -350,7 +350,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "possessive-clitic-class",
-            nfc: true,
+            normalizer: Normalizer::Nfc,
             pre_tokenizers: vec![
                 split(
                     POSSESSIVE_CLITIC_CLASS,
@@ -370,7 +370,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "clitic-class",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(CLITIC_CLASS, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -388,7 +388,21 @@ fn shapes() -> Vec<Shape> {
         // character its own piece, the rest cut by the byte-level pattern.
         Shape {
             name: "digits-then-byte-level-regex",
-            nfc: false,
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
+        // NFKC before the `Digits` stage and the `ByteLevel`: compatibility
+        // characters spell out first (a circled digit becomes a digit the
+        // stage then cuts).
+        Shape {
+            name: "nfkc-digits-then-byte-level-regex",
+            normalizer: Normalizer::Nfkc,
             pre_tokenizers: vec![
                 PreTokenizerWrapper::Digits(Digits::new(true)),
                 byte_level(true),
@@ -418,7 +432,7 @@ fn shapes() -> Vec<Shape> {
         // `Digits` in runs before a split and the `ByteLevel`.
         Shape {
             name: "digit-runs",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 PreTokenizerWrapper::Digits(Digits::new(false)),
                 split(CL100K, SplitDelimiterBehavior::Isolated, false),
@@ -459,7 +473,7 @@ fn shapes() -> Vec<Shape> {
         // the token into pieces.
         Shape {
             name: "normalized-words",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(CL100K, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -477,11 +491,12 @@ fn shapes() -> Vec<Shape> {
 
 fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
     let mut tokenizer = HfTokenizer::new(model(state, shape.ignore_merges));
-    if shape.nfc {
-        tokenizer
-            .with_normalizer(Some(NormalizerWrapper::NFC(NFC)))
-            .expect("normalizer");
-    }
+    let normalizer = match shape.normalizer {
+        Normalizer::None => None,
+        Normalizer::Nfc => Some(NormalizerWrapper::NFC(NFC)),
+        Normalizer::Nfkc => Some(NormalizerWrapper::NFKC(NFKC)),
+    };
+    tokenizer.with_normalizer(normalizer).expect("normalizer");
     let pre = if shape.pre_tokenizers.len() == 1 {
         shape.pre_tokenizers[0].clone()
     } else {
@@ -610,12 +625,15 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "the pre-tokenizer has no ByteLevel without a prefix space"
     );
-    // A normalizer other than NFC.
+    // A normalizer other than NFC or NFKC.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer
-        .with_normalizer(Some(NormalizerWrapper::NFKC(NFKC)))
+        .with_normalizer(Some(NormalizerWrapper::NFD(NFD)))
         .expect("normalizer");
-    assert_eq!(declined(&tokenizer), "normalizer NFKC (only NFC or none)");
+    assert_eq!(
+        declined(&tokenizer),
+        "normalizer NFD (only NFC, NFKC or none)"
+    );
     // A split behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
@@ -809,6 +827,37 @@ fn the_punctuation_stage_holds_what_the_reference_cuts_on() {
 }
 
 #[test]
+fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
+    // The NFKC shape on texts NFC leaves as they are: a ligature, fullwidth
+    // forms and an ideographic space, a circled digit (a digit after
+    // normalization, which the `Digits` stage then cuts), the Kelvin sign
+    // and a long s with a dot above (composed again once the s spells out),
+    // beside a text in NFKC already, a mark to compose, and an added token
+    // with a ligature right after it.
+    let mut state = 0x4E46_4B43_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "nfkc-digits-then-byte-level-regex")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "\u{FB01}ne \u{BD} \u{2460} \u{FF2B} \u{1E9B} \u{212A}",
+        "\u{FF28}\u{FF49}\u{3000}\u{FF57}\u{FF4F}\u{FF52}\u{FF4C}\u{FF44} \u{B2}\u{B3}",
+        "plain ascii, 123 and \u{6F22}\u{5B57}",
+        "e\u{301}\u{FB01}",
+        "<|im_start|>\u{FB01}<|im_end|>",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
 fn a_batch_takes_the_direct_path_input_by_input() {
     use crate::traits::{Encoder, Encoding};
     let mut state = 0x5A5A_1234_5678_9ABCu64;
@@ -818,11 +867,12 @@ fn a_batch_takes_the_direct_path_input_by_input() {
         let mut texts: Vec<String> = (0..8)
             .map(|round| random_text(&mut state, 1 + round * 5, &added))
             .collect();
-        // Under an NFC shape, one input not in NFC sits in the middle of
-        // the batch: it is normalized and encoded on the direct path like
-        // its neighbours.
-        if shape.nfc {
-            texts.insert(texts.len() / 2, "e\u{301}".to_string());
+        // Under a normalizer, one input not in its form sits in the middle
+        // of the batch (a mark to compose under either form, a ligature to
+        // spell out under NFKC): it is normalized and encoded on the direct
+        // path like its neighbours.
+        if shape.normalizer != Normalizer::None {
+            texts.insert(texts.len() / 2, "e\u{301}\u{FB01}".to_string());
         }
         let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let batch = tokenizer.encode_batch(&inputs, false).expect(shape.name);
@@ -1161,10 +1211,8 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
-        let mut text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
-        if shape.nfc {
-            text = nfc(&text, None).into_owned();
-        }
+        let text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
+        let text = normalize(&text, shape.normalizer, None).into_owned();
         let whole: Vec<String> = {
             let mut out = Vec::new();
             native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
@@ -1520,13 +1568,17 @@ fn marks_and_compositions_newer_than_the_library_tables_read_as_the_library_does
 }
 
 #[test]
-fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
+fn the_normalization_check_and_copy_read_every_stretch_as_the_library_does() {
     // The stretch-wise check and copy against the library's crate run over
     // the whole text, on texts that put non-ASCII runs at the start, at the
     // end, right after one ASCII character, across the eight-byte steps of
-    // the scan, next to each other, and nowhere.
-    use unicode_normalization_alignments::is_nfc as library_is_nfc;
+    // the scan, next to each other, and nowhere; for NFKC, compatibility
+    // characters among them (a ligature, a fullwidth letter and comma, the
+    // Kelvin sign, a long s with a dot above that composes again once the
+    // s spells out, a circled digit).
+    use unicode_normalization_alignments::{is_nfc as library_is_nfc, is_nfkc as library_is_nfkc};
     let library_nfc = |text: &str| -> String { text.nfc().map(|(ch, _)| ch).collect() };
+    let library_nfkc = |text: &str| -> String { text.nfkc().map(|(ch, _)| ch).collect() };
     let quick = NfcQuick::read();
     let pieces = [
         "a",
@@ -1556,40 +1608,68 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
         "、",
         "🙂",
         "\u{899}",
+        "\u{FB01}",
+        "\u{FF21}",
+        "\u{FF0C}",
+        "\u{212A}",
+        "\u{1E9B}",
+        "\u{2460}",
         "<|im_start|>",
         "\n",
     ];
     let mut state = 0x1357_9BDF_2468_ACE0u64;
-    let mut changed = 0;
+    let (mut changed, mut respelled) = (0, 0);
     for _ in 0..3000 {
         let len = (pseudo_random(&mut state) % 9) as usize;
         let text: String = (0..len)
             .map(|_| pieces[(pseudo_random(&mut state) % pieces.len() as u64) as usize])
             .collect();
         let expected = library_nfc(&text);
-        assert_eq!(is_nfc(&text), library_is_nfc(&text), "{text:?}");
+        assert_eq!(
+            is_normalized(&text, Normalizer::Nfc),
+            library_is_nfc(&text),
+            "{text:?}"
+        );
         assert_eq!(
             quick.is_nfc(&text),
             library_is_nfc(&text),
             "{text:?} (quick)"
         );
-        let normalized = nfc(&text, None);
-        assert_eq!(normalized.as_ref(), expected, "{text:?}");
+        let composed = normalize(&text, Normalizer::Nfc, None);
+        assert_eq!(composed.as_ref(), expected, "{text:?}");
         assert_eq!(
-            matches!(normalized, Cow::Borrowed(_)),
+            matches!(composed, Cow::Borrowed(_)),
             text == expected,
             "{text:?}: borrowed only when nothing changed"
         );
-        let with_quick = nfc(&text, Some(&quick));
+        let with_quick = normalize(&text, Normalizer::Nfc, Some(&quick));
         assert_eq!(with_quick.as_ref(), expected, "{text:?} (quick)");
         assert_eq!(
             matches!(with_quick, Cow::Borrowed(_)),
             text == expected,
             "{text:?}: borrowed only when nothing changed (quick)"
         );
+        let spelled = library_nfkc(&text);
+        assert_eq!(
+            is_normalized(&text, Normalizer::Nfkc),
+            library_is_nfkc(&text),
+            "{text:?} (NFKC)"
+        );
+        let compatible = normalize(&text, Normalizer::Nfkc, None);
+        assert_eq!(compatible.as_ref(), spelled, "{text:?} (NFKC)");
+        assert_eq!(
+            matches!(compatible, Cow::Borrowed(_)),
+            text == spelled,
+            "{text:?}: borrowed only when nothing changed (NFKC)"
+        );
         changed += usize::from(text != expected);
+        respelled += usize::from(spelled != expected);
     }
     assert!(changed > 150, "{changed} of 3000 texts changed");
+    assert!(
+        respelled > 150,
+        "{respelled} of 3000 texts spell differently under NFKC"
+    );
     // The shapes by name: ASCII alone, a run at the start, a mark after a
     // letter it composes with or not, the letter at an eight-byte step, a
     // run already in NFC next to one that is not.
@@ -1627,13 +1707,27 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
         ("漢字 and 漢字\u{323}\u{301}", true),
         ("漢字\u{301}\u{323}", false),
     ] {
-        assert_eq!(is_nfc(text), in_nfc, "{text:?}");
+        assert_eq!(is_normalized(text, Normalizer::Nfc), in_nfc, "{text:?}");
         assert_eq!(quick.is_nfc(text), in_nfc, "{text:?} (quick)");
-        assert_eq!(nfc(text, None).as_ref(), library_nfc(text), "{text:?}");
         assert_eq!(
-            nfc(text, Some(&quick)).as_ref(),
+            normalize(text, Normalizer::Nfc, None).as_ref(),
+            library_nfc(text),
+            "{text:?}"
+        );
+        assert_eq!(
+            normalize(text, Normalizer::Nfc, Some(&quick)).as_ref(),
             library_nfc(text),
             "{text:?} (quick)"
+        );
+        assert_eq!(
+            is_normalized(text, Normalizer::Nfkc),
+            library_is_nfkc(text),
+            "{text:?} (NFKC)"
+        );
+        assert_eq!(
+            normalize(text, Normalizer::Nfkc, None).as_ref(),
+            library_nfkc(text),
+            "{text:?} (NFKC)"
         );
     }
 }
@@ -2941,15 +3035,15 @@ fn the_ideograph_run_is_exact_at_its_utf8_edges() {
 #[test]
 fn the_ideograph_range_is_settled_by_the_crates_own_tables() {
     // Every code point of U+4000..=U+9FFF, read from the tables the native
-    // path normalizes with: combining class 0, no canonical decomposition,
-    // the quick check's Yes (so not the second element of any composition:
-    // those are the quick check's Maybe, by its definition), and no
-    // composition with any possible second element after it. The candidate
-    // second elements are every code point the quick check calls Maybe;
-    // three known compositions outside the range show the walk sees them;
-    // the counts are asserted at the end.
+    // path normalizes with: combining class 0, no canonical and no
+    // compatibility decomposition, the quick check's Yes (so not the second
+    // element of any composition: those are the quick check's Maybe, by its
+    // definition), and no composition with any possible second element
+    // after it. The candidate second elements are every code point the
+    // quick check calls Maybe; three known compositions outside the range
+    // show the walk sees them; the counts are asserted at the end.
     use unicode_normalization_alignments::char::{
-        canonical_combining_class, compose, decompose_canonical,
+        canonical_combining_class, compose, decompose_canonical, decompose_compatible,
     };
     let quick = |ch: char| is_nfc_quick(std::iter::once(ch));
     let seconds: Vec<char> = (0..=0x10FFFFu32)
@@ -2969,6 +3063,7 @@ fn the_ideograph_range_is_settled_by_the_crates_own_tables() {
         let mut parts = Vec::new();
         decompose_canonical(ch, |part| parts.push(part));
         assert_eq!(parts, [ch], "{ch:?}");
+        decompose_compatible(ch, |part| assert_eq!(part, ch, "{ch:?} (compatibility)"));
         assert_eq!(quick(ch), IsNormalized::Yes, "{ch:?}");
         compositions += seconds
             .iter()
@@ -3003,8 +3098,18 @@ fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
         }
     }
     assert_eq!(at, line.len());
-    assert!(is_nfc(&line));
-    assert!(matches!(nfc(&line, None), Cow::Borrowed(_)));
+    assert!(is_normalized(&line, Normalizer::Nfc));
+    assert!(matches!(
+        normalize(&line, Normalizer::Nfc, None),
+        Cow::Borrowed(_)
+    ));
+    // The full-width comma spells as "," under NFKC: the line is not in that
+    // form, and the ideograph runs around every comma are copied as they are.
+    assert!(!is_normalized(&line, Normalizer::Nfkc));
+    assert_eq!(
+        normalize(&line, Normalizer::Nfkc, None).as_ref(),
+        line.replace('，', ",")
+    );
     // The checked run ends at an ideograph, at an ASCII byte, or at the end.
     assert_eq!(checked_run("，漢".as_bytes()), 3);
     assert_eq!(checked_run("，。、漢字".as_bytes()), 9);
