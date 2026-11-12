@@ -507,8 +507,10 @@ pub(crate) fn check_placeholder_spans(
 /// The prompt's placeholder tokens against the items' spans: every prompt
 /// token equal to `id` belongs to an item's span (`covered` is the spans'
 /// total under that id, a count of distinct tokens as the spans are
-/// disjoint), so an item the gateway dropped, or a placeholder it left
-/// unexpanded, is refused rather than fed to the engine as text.
+/// disjoint), so an item the gateway dropped while another item of that
+/// id remains, or a placeholder it left unexpanded, is refused rather than
+/// fed to the engine as text (the ids come from the items that remain: a
+/// request that lost every item of an id is the engine's to refuse).
 pub(crate) fn check_placeholder_tokens(
     prompt_ids: &[u32],
     id: u32,
