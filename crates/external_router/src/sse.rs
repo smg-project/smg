@@ -4,8 +4,9 @@
 //! into a single, well-tested module. Two main components:
 //!
 //! - [`SseEncoder`]: Produces SSE-framed bytes for sending to clients.
-//!   Serializes JSON directly into a reusable `Vec<u8>` buffer via
-//!   `serde_json::to_writer`, eliminating intermediate `String` allocations.
+//!   Serializes JSON directly into a `BytesMut` block via `serde_json::to_writer`
+//!   (no intermediate `String`) and hands each frame out as the block's filled
+//!   part, split off and frozen (no copy).
 //!
 //! - [`SseDecoder`]: Consumes incoming SSE byte streams from upstream workers.
 //!   Uses cursor tracking to avoid per-frame memmove. `next_frame` / `flush`
@@ -14,10 +15,10 @@
 //!   the caller already owns the input string — no allocation for single-line
 //!   data, which is the common case.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io};
 
 use axum::body::Body;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{
     header::{HeaderValue, CACHE_CONTROL, CONNECTION, CONTENT_TYPE},
     StatusCode,
@@ -30,29 +31,79 @@ use tokio_stream::wrappers::ReceiverStream;
 // SseEncoder
 // ============================================================================
 
-/// Reusable SSE encoder. The internal `Vec<u8>` grows to high-water mark
-/// and retains its capacity across chunks via `.clear()`.
+/// The first block an encoder writes its frames into; a later block is at
+/// least as large (`BytesMut` keeps the original capacity as its floor).
+const FRAME_BLOCK: usize = 4096;
+
+/// The block as serde's sink: every write is one `extend_from_slice`, the
+/// shape a `Vec<u8>` gives serde. The `bytes` crate's `Writer` adaptor has no
+/// `write_all` of its own, so each JSON token goes through std's default
+/// `write_all` loop around a `remaining_mut` clamp (measured: more than the
+/// copy it was to save, on a stream of a hundred frames).
+struct BlockWriter<'a>(&'a mut BytesMut);
+
+impl io::Write for BlockWriter<'_> {
+    #[inline]
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(src);
+        Ok(src.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, src: &[u8]) -> io::Result<()> {
+        self.0.extend_from_slice(src);
+        Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Reusable SSE encoder. A frame is written into a `BytesMut` block and
+/// leaves as the block's filled part, split off and frozen: the bytes the
+/// channel sends are the bytes that were written, not a copy. The block's
+/// remaining capacity serves the next frames; when it runs out a fresh block
+/// is taken, or the old one reclaimed once every frame cut from it has been
+/// dropped. After a frame larger than a block (a stream's terminal events
+/// carry its whole answer; a reasoning item's or a tool list's done events
+/// come before the answer's deltas) the next frame starts in a block of that
+/// size and a block more: the frames of a terminal run each wrap the one
+/// before (`output_text.done`, then `content_part.done` around it, then the
+/// item, then the response) and are a little longer than it, so a run of
+/// large frames takes one block each with no growth copies as long as each
+/// grows by less than a block over the last, and the deltas after a large
+/// frame are cut from the tail of the block the first of them took.
 pub struct SseEncoder {
-    buf: Vec<u8>,
+    buf: BytesMut,
+    /// The length of the last frame written; the reservation the next frame
+    /// starts with when it is above a block. The last frame and not the
+    /// largest: a mark that never came down made every delta after one
+    /// large frame take a fresh block of that size while the previous frame
+    /// was still alive.
+    last_len: usize,
 }
 
 impl SseEncoder {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(4096),
+            buf: BytesMut::with_capacity(FRAME_BLOCK),
+            last_len: 0,
         }
     }
 
     /// Encode `data: {json}\n\n`.
     ///
-    /// Serializes directly into the reusable buffer via `serde_json::to_writer`
-    /// (no intermediate `String`), then copies into `Bytes` for the channel.
+    /// Serializes directly into the block via `serde_json::to_writer` over
+    /// `BlockWriter` (no intermediate `String`); the frame is split off for
+    /// the channel.
     pub fn encode_data<T: Serialize>(&mut self, value: &T) -> Result<Bytes, SseEncodeError> {
-        self.buf.clear();
+        self.begin();
         self.buf.extend_from_slice(b"data: ");
-        serde_json::to_writer(&mut self.buf, value)?;
+        serde_json::to_writer(BlockWriter(&mut self.buf), value)?;
         self.buf.extend_from_slice(b"\n\n");
-        Ok(Bytes::copy_from_slice(&self.buf))
+        Ok(self.frame())
     }
 
     /// Encode `event: {type}\ndata: {json}\n\n` (Anthropic/Responses format).
@@ -67,13 +118,53 @@ impl SseEncoder {
         if event_type.contains(['\r', '\n']) {
             return Err(SseEncodeError::InvalidEventType);
         }
-        self.buf.clear();
+        self.begin();
         self.buf.extend_from_slice(b"event: ");
         self.buf.extend_from_slice(event_type.as_bytes());
         self.buf.extend_from_slice(b"\ndata: ");
-        serde_json::to_writer(&mut self.buf, value)?;
+        serde_json::to_writer(BlockWriter(&mut self.buf), value)?;
         self.buf.extend_from_slice(b"\n\n");
-        Ok(Bytes::copy_from_slice(&self.buf))
+        Ok(self.frame())
+    }
+
+    /// The start of a frame: the block emptied of what a frame whose
+    /// serialization failed midway left in it (a split runs only on
+    /// success), and, when the last frame was larger than a block, room for
+    /// the next one before the first byte. A block nothing else holds any
+    /// more (every frame cut from it dropped) is taken back whole, for
+    /// nothing. Otherwise a frame of that size and a block more is reserved:
+    /// free while the block's tail is that long; one block of that size when
+    /// it is not, so a large frame after a large frame is written once
+    /// instead of grown and copied by doublings, and the small frames after
+    /// it share the block it took. The block more is for the growth from one
+    /// large frame to the next: a fresh block has exactly the capacity asked
+    /// for, and a frame one byte longer than the last would have doubled it
+    /// and copied the frame so far; asked of a block nothing held, short of
+    /// it by that growth, it reallocated the dead block instead of taking it
+    /// back.
+    fn begin(&mut self) {
+        self.buf.clear();
+        if self.last_len <= FRAME_BLOCK {
+            return;
+        }
+        // A block nothing else holds any more is taken back whole: it held
+        // the last frame, so it is at least that long, and a frame grown past
+        // it grows once, as a stream's first large frame does. The headroom
+        // is for a block that has to be fresh (the last frame still holds
+        // this one) or a tail long enough for the last frame but not for its
+        // growth.
+        if self.buf.capacity() < self.last_len && self.buf.try_reclaim(self.last_len) {
+            return;
+        }
+        self.buf.reserve(self.last_len + FRAME_BLOCK);
+    }
+
+    /// The frame written so far, split off the block and frozen; the block
+    /// keeps what capacity it has left for the next frame.
+    fn frame(&mut self) -> Bytes {
+        let frame = self.buf.split().freeze();
+        self.last_len = frame.len();
+        frame
     }
 
     /// `data: [DONE]\n\n` — static bytes, zero allocation.
@@ -494,10 +585,10 @@ pub const SSE_CHANNEL_BUFFER: usize = 32;
 
 /// Sender half of a bounded SSE body channel (see [`SSE_CHANNEL_BUFFER`]).
 /// `send` is async: it awaits when the buffer is full, applying backpressure.
-pub type SseSender = mpsc::Sender<Result<Bytes, std::io::Error>>;
+pub type SseSender = mpsc::Sender<Result<Bytes, io::Error>>;
 
 /// Receiver half of a bounded SSE body channel, consumed by [`build_sse_response`].
-pub type SseReceiver = mpsc::Receiver<Result<Bytes, std::io::Error>>;
+pub type SseReceiver = mpsc::Receiver<Result<Bytes, io::Error>>;
 
 /// Create a bounded SSE body channel (see [`SSE_CHANNEL_BUFFER`]).
 pub fn sse_channel() -> (SseSender, SseReceiver) {
@@ -565,16 +656,80 @@ mod tests {
         assert_eq!(&bytes[..], b"data: [DONE]\n\n");
     }
 
+    /// Twenty small frames are cut from the encoder's first block, one after
+    /// another, without a copy or a block of their own: each lies inside the
+    /// first frame's block, and a frame already handed out keeps its bytes
+    /// while the frames after it are written.
     #[test]
-    fn test_encoder_buffer_reuse() {
+    fn small_frames_are_cut_from_one_block_and_keep_their_bytes() {
         let mut enc = SseEncoder::new();
-        for i in 0..20 {
-            let val = serde_json::json!({"i": i});
-            let _ = enc.encode_data(&val).unwrap();
+        let frames: Vec<Bytes> = (0..20)
+            .map(|i| enc.encode_data(&serde_json::json!({"i": i})).unwrap())
+            .collect();
+        let block = frames[0].as_ptr() as usize;
+        for (i, frame) in frames.iter().enumerate() {
+            let start = frame.as_ptr() as usize;
+            assert!(
+                start >= block && start + frame.len() <= block + FRAME_BLOCK,
+                "frame {i} lies outside the first block"
+            );
+            assert_eq!(&frame[..], format!("data: {{\"i\":{i}}}\n\n").as_bytes());
         }
-        // Buffer should have grown to hold the largest event and stayed there.
-        // Capacity should be >= initial 4096 (never shrinks).
-        assert!(enc.buf.capacity() >= 4096);
+    }
+
+    /// A frame larger than a block is whole, middle included, and the
+    /// frames after it are written as before.
+    #[test]
+    fn a_frame_larger_than_a_block_is_whole() {
+        let mut enc = SseEncoder::new();
+        let long = "x".repeat(3 * FRAME_BLOCK);
+        let big = enc.encode_data(&serde_json::json!({"text": long})).unwrap();
+        assert_eq!(
+            &big[..],
+            format!("data: {{\"text\":\"{long}\"}}\n\n").as_bytes()
+        );
+        let next = enc.encode_data(&serde_json::json!({"i": 1})).unwrap();
+        assert_eq!(&next[..], b"data: {\"i\":1}\n\n");
+    }
+
+    /// A value whose serialization fails after it has written part of a map.
+    struct FailsMidway;
+
+    impl Serialize for FailsMidway {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::{Error, SerializeMap};
+            let mut map = serializer.serialize_map(None)?;
+            map.serialize_entry("partial", "bytes")?;
+            Err(S::Error::custom("boom"))
+        }
+    }
+
+    /// A frame whose serialization fails partway leaves nothing in the next
+    /// frame: the block is emptied at the start of every encode, and a split
+    /// runs only on success.
+    #[test]
+    fn a_failed_frame_leaves_nothing_in_the_next() {
+        let mut enc = SseEncoder::new();
+        assert!(enc.encode_data(&FailsMidway).is_err());
+        let next = enc.encode_data(&serde_json::json!({"i": 1})).unwrap();
+        assert_eq!(&next[..], b"data: {\"i\":1}\n\n");
+    }
+
+    /// A large frame sets the next frame's reservation and a small frame
+    /// clears it: a second large frame is whole, so is the small frame after
+    /// it, and after that small frame the encoder reserves nothing.
+    #[test]
+    fn a_large_frame_sets_the_next_frames_reservation() {
+        let mut enc = SseEncoder::new();
+        let long = "y".repeat(5 * FRAME_BLOCK);
+        let first = enc.encode_data(&serde_json::json!({"text": long})).unwrap();
+        assert_eq!(enc.last_len, first.len());
+        let second = enc.encode_data(&serde_json::json!({"text": long})).unwrap();
+        assert_eq!(&second[..], &first[..]);
+        let next = enc.encode_data(&serde_json::json!({"i": 2})).unwrap();
+        assert_eq!(&next[..], b"data: {\"i\":2}\n\n");
+        assert_eq!(enc.last_len, next.len());
+        assert!(enc.last_len <= FRAME_BLOCK);
     }
 
     #[test]
