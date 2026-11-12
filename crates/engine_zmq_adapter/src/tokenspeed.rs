@@ -1087,8 +1087,9 @@ pub fn wire_tensor_tokenspeed(tensor: tokenspeed_proto::TensorData) -> Result<Wi
 }
 
 /// Byte width of the wire dtypes the gateway emits; `None` for dtypes we do
-/// not recognize (passed through unvalidated rather than rejected).
-pub(crate) fn tensor_dtype_width(dtype: &str) -> Option<usize> {
+/// not recognize (passed through unvalidated rather than rejected). The mock
+/// worker reads an SHM handle's byte length with it.
+pub fn tensor_dtype_width(dtype: &str) -> Option<usize> {
     match dtype {
         "float64" | "int64" | "uint64" => Some(8),
         "float32" | "int32" | "uint32" => Some(4),

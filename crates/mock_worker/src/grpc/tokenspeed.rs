@@ -15,7 +15,7 @@
 use std::{collections::BTreeMap, pin::Pin};
 
 use enc::token_speed_encoder_server::{TokenSpeedEncoder, TokenSpeedEncoderServer};
-use engine_zmq_adapter::wire_tensor_tokenspeed;
+use engine_zmq_adapter::{tensor_dtype_width, wire_tensor_tokenspeed};
 use futures::{Stream, StreamExt};
 use smg_grpc_client::{
     common_proto as common, tokenspeed_encoder_proto as enc,
@@ -323,9 +323,10 @@ fn check_mm_inputs(req: &ts::GenerateRequest, role: Option<Role>) -> Result<(), 
     check_media_items(&mm.items, Some(prompt_ids), encoder_input)
 }
 
-/// Whether an item carries its feature, read as the wire reads a tensor (an
-/// inline payload whose bytes match the dtype and shape): a malformed one is
-/// refused on every role, as the engine's adapter refuses it.
+/// Whether an item carries its feature, read as the engine reads a tensor (an
+/// inline payload whose bytes match the dtype and shape, or an SHM handle
+/// with the servicer's checks): a malformed one is refused on every role, as
+/// the engine refuses it.
 fn check_encoder_input(item: &ts::MultimodalItem, what: &str) -> Result<bool, Status> {
     let Some(tensor) = &item.encoder_input else {
         return Ok(false);
@@ -334,12 +335,50 @@ fn check_encoder_input(item: &ts::MultimodalItem, what: &str) -> Result<bool, St
     Ok(true)
 }
 
-/// An item's tensor through the wire's own reader, so the mock refuses the
-/// tensors the engine's adapter refuses; `name` is the field in the refusal.
+/// An item's tensor read as the engine reads it: an inline payload through
+/// the wire's own reader, so the mock refuses the tensors the engine's adapter
+/// refuses, and an SHM handle with the servicer's checks (the gateway hands
+/// the gRPC wire SHM handles under its shm transport); `name` is the field in
+/// the refusal.
 fn read_tensor(tensor: &ts::TensorData, what: &str, name: &str) -> Result<(), Status> {
-    wire_tensor_tokenspeed(tensor.clone()).map_err(|error| {
-        Status::invalid_argument(format!("mock-worker: {what}'s {name}: {error}"))
-    })?;
+    let read = match &tensor.payload {
+        Some(ts::tensor_data::Payload::Shm(handle)) => read_shm_handle(tensor, handle),
+        _ => wire_tensor_tokenspeed(tensor.clone()).map(|_| ()),
+    };
+    read.map_err(|error| Status::invalid_argument(format!("mock-worker: {what}'s {name}: {error}")))
+}
+
+/// The engine servicer's reading of an SHM handle, the segment itself never
+/// opened: the offset is zero, the byte length is the dtype's width over the
+/// shape (a dtype the wire does not know passes, as the inline reader passes
+/// it), and the name is a bare segment name once a leading slash is stripped
+/// (no slash, dot entry or NUL inside).
+fn read_shm_handle(tensor: &ts::TensorData, handle: &common::ShmHandle) -> Result<(), String> {
+    if handle.offset != 0 {
+        return Err(format!("TensorData.shm offset {} is not 0", handle.offset));
+    }
+    if let Some(width) = tensor_dtype_width(&tensor.dtype) {
+        let expected = tensor
+            .shape
+            .iter()
+            .try_fold(width as u64, |bytes, &dim| {
+                bytes.checked_mul(u64::from(dim))
+            })
+            .ok_or_else(|| "multimodal tensor shape overflows".to_string())?;
+        if handle.nbytes != expected {
+            return Err(format!(
+                "TensorData.shm byte length {} does not match dtype {:?} shape {:?} (expected {expected})",
+                handle.nbytes, tensor.dtype, tensor.shape
+            ));
+        }
+    }
+    let name = handle.name.trim_start_matches('/');
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." || name.contains('\0') {
+        return Err(format!(
+            "TensorData.shm name {:?} is not a bare segment name",
+            handle.name
+        ));
+    }
     Ok(())
 }
 
@@ -832,8 +871,9 @@ mod tests {
         assert!(status.message().contains("no items"), "{status:?}");
     }
 
-    /// An item's tensors are read as the wire reads them: an inline payload
-    /// whose bytes match the dtype and shape, the encoder input and the
+    /// An item's tensors are read as the engine reads them: an inline payload
+    /// whose bytes match the dtype and shape, or an SHM handle with a zero
+    /// offset, that byte length and a bare name, the encoder input and the
     /// model-specific tensors alike.
     #[tokio::test]
     async fn a_tensor_is_read_as_the_wire_reads_it() {
@@ -852,15 +892,43 @@ mod tests {
                 && status.message().contains("byte length 15"),
             "{status:?}"
         );
-        let mut handle = image_item(1, 2);
-        handle.encoder_input.as_mut().expect("the feature").payload =
-            Some(ts::tensor_data::Payload::Shm(common::ShmHandle::default()));
-        let status = refused(
-            &service,
-            with_items(request("ts-mm-shm", &PROMPT), vec![handle]),
-        )
-        .await;
-        assert!(status.message().contains("inline"), "{status:?}");
+        let shm = |name: &str, offset: u64, nbytes: u64| {
+            let mut item = image_item(1, 2);
+            item.encoder_input.as_mut().expect("the feature").payload =
+                Some(ts::tensor_data::Payload::Shm(common::ShmHandle {
+                    name: name.to_string(),
+                    offset,
+                    nbytes,
+                    ..Default::default()
+                }));
+            item
+        };
+        let mut stream = service
+            .generate(Request::new(with_items(
+                request("ts-mm-shm", &PROMPT),
+                vec![shm("smg-mm-1", 0, 16)],
+            )))
+            .await
+            .expect("an SHM handle the servicer would accept is accepted")
+            .into_inner();
+        assert!(stream.next().await.is_some(), "the answer streams");
+        for (handle, refusal) in [
+            (shm("smg-mm-1", 0, 15), "byte length 15"),
+            (shm("smg-mm-1", 8, 16), "offset 8"),
+            (shm("../smg-mm-1", 0, 16), "name"),
+        ] {
+            let status = refused(
+                &service,
+                with_items(request("ts-mm-shm", &PROMPT), vec![handle]),
+            )
+            .await;
+            assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+            assert!(
+                status.message().contains("media item 0's encoder_input")
+                    && status.message().contains(refusal),
+                "{status:?}"
+            );
+        }
         let mut unfilled = image_item(1, 2);
         unfilled
             .encoder_input

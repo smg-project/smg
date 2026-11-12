@@ -67,9 +67,12 @@ requires before the canned answer: a known modality, the TokenSpeed item's
 content hash and, on the prefill and regular roles, its encoder input (or the
 encode room that hands the item over; a decode worker takes the gateway's
 pixel-free clone, metadata alone), the SGLang batch's pixel tensor (or its
-feature hash) and a video's placeholder token id, every tensor read through the
-wire's own reader (a dtype the wire carries and bytes matching the shape; an
-inline payload on the TokenSpeed wire), one SGLang batch per modality (image or
+feature hash) and a video's placeholder token id, every tensor read as the
+engine reads it (bytes matching the shape at the dtype's width; the SGLang
+reader refuses a dtype outside its six, the TokenSpeed reader passes one it
+does not know; on the TokenSpeed wire an inline payload through the adapter's
+reader or an SHM handle with the servicer's checks: a zero offset, that byte
+length, a bare name), one SGLang batch per modality (image or
 video, an empty list reading as image) beside a primary batch, placeholder spans
 inside the prompt and disjoint across the request's items, and, when the item
 names its placeholder token id, spans that cover exactly the prompt's tokens of
