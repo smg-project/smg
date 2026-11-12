@@ -1206,12 +1206,20 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
             );
             continue;
         }
-        let Some((source, rendered, at)) = texts
-            .iter()
-            .find_map(|(source, text)| text.find(close).map(|at| (*source, text, at)))
-        else {
+        // A close counts only when a call follows it: a template whose history call turn writes
+        // no thought (d1-Omni-2B's `<|im_start|>assistant\n<tool_call>`) leaves the generation
+        // prompt's own closed thought as the text's only close, with nothing after it, and that
+        // says nothing about the call; the next source is read instead. The first close decides:
+        // every later close's rest is a suffix of the first one's, so a tag after a later close
+        // is a tag after the first.
+        let Some((source, rendered, at)) = texts.iter().find_map(|(source, text)| {
+            text.find(close)
+                .filter(|at| text[at + close.len()..].contains('<'))
+                .map(|at| (*source, text, at))
+        }) else {
             unread(format!(
-                "no {close:?} in the rendered call turn or the recorded thinking-on call"
+                "no {close:?} followed by a call in the rendered call turn or the recorded \
+                 thinking-on call"
             ));
             continue;
         };
