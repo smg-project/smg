@@ -42,12 +42,13 @@ pub const API_VERSION: &str = "smg.policy/v1";
 
 /// Header names no allow-list may carry (design 4.6). A host adds the tenant
 /// header it is configured with through [`PolicySpec::validate_with`].
-pub const DENIED_HEADERS: [&str; 5] = [
+pub const DENIED_HEADERS: [&str; 6] = [
     "authorization",
     "proxy-authorization",
     "cookie",
     "set-cookie",
     "x-api-key",
+    "api-key",
 ];
 
 /// The most headers `view.headers` may list: a view names an allow-listed
@@ -157,10 +158,10 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 pub struct ViewSpec {
     /// The request headers a stage may read, lowercase, in the order their
     /// positions take on the wire. A name on the deny-list (`authorization`,
-    /// `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, the host's
-    /// tenant header) is refused. Every header a binding's `sessions`,
-    /// `canary` or `match.header` names must be listed here. At most 256: a
-    /// view names a header by its position in one byte.
+    /// `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`,
+    /// the host's tenant header) is refused. Every header a binding's
+    /// `sessions`, `canary` or `match.header` names must be listed here. At
+    /// most 256: a view names a header by its position in one byte.
     #[schemars(length(max = 256))]
     pub headers: Vec<String>,
     /// The token block size the host hashes prefixes by when no engine has
