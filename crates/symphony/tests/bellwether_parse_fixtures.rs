@@ -204,6 +204,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Visual-ERM is that group's bellwether primary (the AesCode pair carries its files): its sets replay
     // under their own slug too.
     ("visual-erm", GenerationPrompt::Plain),
+    // WeVisOne-VL-4B and -2B write the Qwen3-VL template over a tokenizer of their own (one group, the
+    // 4B its primary): JSON calls, no thought; bellwether records each checkpoint's own sets.
+    ("wevisone-vl-4b", GenerationPrompt::Plain),
+    ("wevisone-vl-2b", GenerationPrompt::Plain),
     ("qwen3-vl-30b-a3b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-32b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-235b-a22b-instruct", GenerationPrompt::Plain),
@@ -412,6 +416,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
     ("lfm2.5-1.2b-instruct", GenerationPrompt::ModelDecides),
+    // LFM2.5-24B-A2B's template opens the thought in the prompt whatever the request says (`<think>`
+    // after the assistant header, no newline, in both thinking settings of its render set).
+    ("lfm2.5-24b-a2b", GenerationPrompt::AlwaysOpensTheThought),
     // Llama 4's list stands bare in the turn after the content, every value between double
     // quotes; the template has no thought and ends the generation prompt with the opener and two
     // newlines, which the shared tail does not write and the replay does not need.
@@ -449,6 +456,12 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
     // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
     ("gemma-4-e4b-it", GenerationPrompt::ModelDecides),
+    // Nemotron 3.5 Bolt-E4B writes a Nemotron-modified Gemma 4 template: the prompt is the turn's opener
+    // alone, and a request that turns thinking on puts `<|think|>` in a system turn instead.
+    (
+        "nvidia-nemotron-3.5-bolt-e4b-bf16",
+        GenerationPrompt::ModelDecides,
+    ),
     // Qwen3's JSON calls under other templates (bellwether main 5bcd7b0b0): each as its own
     // template writes the thought.
     ("agentcpm-explore", GenerationPrompt::ModelWritesTheThought),
@@ -515,6 +528,29 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16",
         GenerationPrompt::OpensTheThought,
     ),
+    // The Nemotron 3.5 Super-VL and Bolt-74B, Dory and NLD-Uni templates write the Lightning prompt
+    // (`<think>\n` opened, `<think></think>` when the request turns thinking off) with their own
+    // additions elsewhere in the turn (a media macro, an effort or budget suffix on the user turn).
+    (
+        "nvidia-nemotron-3.5-super-vl-120b-a12b-bf16",
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3.5-bolt-74b-a9b-bf16",
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-labs-dory1.0-4b-bf16",
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("nld-uni", GenerationPrompt::OpensTheThought),
+    // The LFM3 line (LFM3-1.7B, LFM3-VL-2B, d1-2B) writes Qwen 3.5's tagged calls under ChatML and opens
+    // the thought in the prompt (`<think>`, no newline), closed at once (`<think></think>`) when the
+    // request turns thinking off; LFM3-Omni-2B's template opens it only when the request asks.
+    ("lfm3-1.7b", GenerationPrompt::OpensTheThought),
+    ("lfm3-vl-2b", GenerationPrompt::OpensTheThought),
+    ("d1-2b", GenerationPrompt::OpensTheThought),
+    ("lfm3-omni-2b", GenerationPrompt::OpensTheThoughtWhenAsked),
     // GLM 4.5's keyed spelling (a newline after the name, each key and each value); the model
     // writes its own `<think>`, closed in the prompt when thinking is off.
     ("glm-4.5v", GenerationPrompt::ModelWritesTheThought),
@@ -550,6 +586,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("ministral-3-8b-instruct-2512-bf16", GenerationPrompt::Plain),
     ("mistral-medium-3.5-128b", GenerationPrompt::ModelDecides),
     ("mistral-small-4-119b-2603", GenerationPrompt::ModelDecides),
+    // Mistral Large 4's template ends at `[/INST]` whatever the request says (reasoning_effort rides in
+    // its `[MODEL_SETTINGS]` block); the model writes `[THINK]` itself or not.
+    ("mistral-large-4-1t-a52b", GenerationPrompt::ModelDecides),
     // Llama Nemotron: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`. The Super
     // template has a thought the model writes itself (`/no_think` in the system prompt closes it
     // in the prompt; the request's switch changes nothing); the Nano and DLER templates have none.
@@ -986,7 +1025,8 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
 /// where it is not its table's, measured against the rendered prompts (bellwether's
 /// `render/common.jsonl`, `tools-call-arguments-object`): the NVIDIA Nemotron 3 groups and Step
 /// 3.5 Flash write `</think>\n<tool_call>` where the Qwen 3.5 template behind their table writes
-/// two newlines.
+/// two newlines; the Nemotron 3.5 Super-VL and Bolt-74B, Dory and NLD-Uni templates write the same one
+/// newline, and the LFM3 templates write the call right after the close.
 /// The registry's groups carry it as the group's `after`; the test after the next reads the
 /// rendered prompts themselves where the tree holds them.
 const MEASURED_AFTER: &[(&str, &str)] = &[
@@ -1000,7 +1040,14 @@ const MEASURED_AFTER: &[(&str, &str)] = &[
     ("nvidia-nemotron-3.5-lightning-30b-a3b-bf16", "\n"),
     ("nvidia-nemotron-labs-3-elastic-30b-a3b-bf16", "\n"),
     ("nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16", "\n"),
+    ("nvidia-nemotron-3.5-super-vl-120b-a12b-bf16", "\n"),
+    ("nvidia-nemotron-3.5-bolt-74b-a9b-bf16", "\n"),
+    ("nvidia-nemotron-labs-dory1.0-4b-bf16", "\n"),
+    ("nld-uni", "\n"),
     ("step-3.5-flash", "\n"),
+    ("lfm3-1.7b", ""),
+    ("lfm3-vl-2b", ""),
+    ("lfm3-omni-2b", ""),
 ];
 
 #[test]
@@ -1449,6 +1496,11 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     ("kimi-k2-thinking", "parse/reasoning-with-marker-text"),
     ("kimi-k2.5", "parse/reasoning-with-marker-text"),
     ("kimi-k2.6", "parse/reasoning-with-marker-text"),
+    // bellwether's reference refused every case but the thought-bearing ones for these templates:
+    // each slug's common set records the thinking-on call and the four reasoning cases, five of the
+    // sixteen, and no fence probe.
+    ("d1-2b", "parse/content-with-marker-in-code-fence"),
+    ("lfm2.5-24b-a2b", "parse/content-with-marker-in-code-fence"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
