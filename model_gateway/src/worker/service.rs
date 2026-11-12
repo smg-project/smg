@@ -600,16 +600,14 @@ impl WorkerService {
         let queue = self.get_job_queue()?;
 
         // Reserve (or retrieve) a stable ID for the 202 response; a fresh
-        // reservation is this request's to release if no 202 goes out.
+        // reservation is this request's to release if no 202 goes out, and
+        // one entry operation decides it, so two POSTs racing for the URL
+        // cannot both read it fresh and the refused one release the other's.
         // If this URL already has an active worker, reject with 409. A worker
         // its removal is draining holds the URL for the drain window; that
         // answer says so and when to retry, instead of offering a PUT or a
         // PATCH of a worker that is leaving.
-        let fresh = self
-            .worker_registry
-            .get_id_by_url_or_reservation(&worker_url)
-            .is_none();
-        let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
+        let (worker_id, fresh) = self.worker_registry.reserve_or_find_id_for_url(&worker_url);
         if let Some(existing) = self.worker_registry.get(&worker_id) {
             return Err(if existing.status() == WorkerStatus::Draining {
                 WorkerServiceError::RemovalInProgress {
