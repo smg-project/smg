@@ -479,10 +479,13 @@ mod tests {
     }
 
     /// A body error as reqwest reports one: the connect to a port nobody
-    /// listens on is refused.
+    /// listens on is refused. The client takes no proxy from the
+    /// environment, so the refusal comes from the loopback socket on every
+    /// host.
     async fn upstream_error() -> reqwest::Error {
         let refused = RefusedAddress::reserve();
         crate::server::http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{}/v1/chat/completions", refused.addr()))
