@@ -32,24 +32,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
-        // The request named an id and resolved it to this URL when it was
-        // accepted. A worker, or a data-parallel group, removed and
-        // registered again at the address since then has an id of its own,
-        // and the update accepted for the one that left does not land on it.
-        if !update_target_still_holds(
-            &app_context.worker_registry,
-            worker_url,
-            context.data.expected_id.as_deref(),
-        ) {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("find_worker_to_update"),
-                message: format!(
-                    "Worker {} was removed or replaced since the update was accepted",
-                    Endpoint::redacted_str(worker_url)
-                ),
-            });
-        }
-
         // Whether this address has expanded ranks is read from the registry,
         // not guessed from the URL, so an update selects the same group a
         // removal would.
@@ -76,18 +58,40 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
         // retried, which widens the window. A worker gone before this line
         // gets an id nothing matches.
         let registry = std::sync::Arc::clone(&app_context.worker_registry);
-        context.data.snapshot = Some(
-            workers_to_update
-                .iter()
-                .map(|worker| {
-                    let id = registry
-                        .get_id_by_url(worker.url())
-                        .unwrap_or_else(|| WorkerId::from_string(String::new()));
-                    (id, worker.revision())
-                })
-                .collect(),
-        );
+        let snapshot: Vec<(WorkerId, u64)> = workers_to_update
+            .iter()
+            .map(|worker| {
+                let id = registry
+                    .get_id_by_url(worker.url())
+                    .unwrap_or_else(|| WorkerId::from_string(String::new()));
+                (id, worker.revision())
+            })
+            .collect();
 
+        #[cfg(test)]
+        if let Some(write) = BETWEEN_SNAPSHOT_AND_CHECK.with(|hook| hook.borrow_mut().take()) {
+            write();
+        }
+
+        // The request named an id and resolved it to this URL when it was
+        // accepted. A worker, or a data-parallel group, removed and
+        // registered again at the address since then has an id of its own,
+        // and the update accepted for the one that left does not land on
+        // it. Read after the snapshot: a replacement that lands before this
+        // line stops the id resolving; one that lands after it leaves the
+        // snapshot on the registration that left, which the write-back's id
+        // and revision check refuses.
+        if !update_target_still_holds(&registry, worker_url, context.data.expected_id.as_deref()) {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("find_worker_to_update"),
+                message: format!(
+                    "Worker {} was removed or replaced since the update was accepted",
+                    Endpoint::redacted_str(worker_url)
+                ),
+            });
+        }
+
+        context.data.snapshot = Some(snapshot);
         context.data.workers_to_update = Some(workers_to_update);
 
         Ok(StepResult::Success)
@@ -96,6 +100,15 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test support: a write the step runs once between its snapshot and
+    /// its id check, the window a replacement of the registration can land
+    /// in (the test runtime runs the step on this thread).
+    static BETWEEN_SNAPSHOT_AND_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Whether the registration an update was accepted against still stands:
@@ -282,5 +295,54 @@ mod tests {
             context.data.snapshot,
             Some(vec![(recreated, found[0].revision())])
         );
+    }
+
+    /// The window between the snapshot and the id check: the registration
+    /// is removed and registered again at its address right there. The
+    /// snapshot holds the registration that left, so the check refuses the
+    /// update. Checked before the snapshot, the new registration was
+    /// snapshotted under its own ids and the write-back took the old update.
+    #[tokio::test]
+    async fn a_replacement_between_the_snapshot_and_the_check_is_refused() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "http://worker:8080";
+        let original = registry.register(worker(url, "original-model")).unwrap();
+        let app_context = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::clone(&registry),
+            None,
+        );
+        let mut data = create_worker_update_workflow_data(
+            url.to_string(),
+            WorkerUpdateRequest {
+                priority: None,
+                cost: None,
+                labels: None,
+                api_key: None,
+                health: None,
+            },
+            Arc::clone(&app_context),
+        );
+        data.expected_id = Some(original.as_str().to_string());
+        let between = Arc::clone(&registry);
+        super::BETWEEN_SNAPSHOT_AND_CHECK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(between.remove(&original).is_some());
+                between.register(worker(url, "recreated-model")).unwrap();
+            }));
+        });
+
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        let result = FindWorkerToUpdateStep.execute(&mut context).await;
+
+        assert!(
+            super::BETWEEN_SNAPSHOT_AND_CHECK.with(|hook| hook.borrow().is_none()),
+            "the step ran the seam"
+        );
+        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
+        assert!(context.data.workers_to_update.is_none());
+        assert!(context.data.snapshot.is_none());
     }
 }
