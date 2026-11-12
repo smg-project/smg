@@ -2711,6 +2711,63 @@ async fn a_harmony_responses_request_s_stop_sequences_reach_the_engine() {
     assert_eq!(seen, vec![vec!["STOP".to_string(), "\n\n".to_string()]]);
 }
 
+/// The tool loop's saving rests on one fact: when an iteration's run
+/// returns, nothing else holds the loop's request, so the loop takes it
+/// back by a move (`owned_request`). This pins that fact for the
+/// non-streamed iteration: a later holder of the request past the run
+/// fails here instead of silently restoring the per-turn deep copy.
+#[tokio::test]
+async fn a_harmony_responses_iteration_releases_its_share_of_the_request_when_it_returns() {
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+
+    let request = responses_request(false);
+    // The iteration's outcome is not the point: run or refused, the
+    // context that took a share of the request is gone when this returns.
+    let _ = ctx
+        .pipeline
+        .execute_harmony_responses(&request, &ctx, None)
+        .await;
+    assert_eq!(
+        Arc::strong_count(&request),
+        1,
+        "the iteration's context released its share when the run returned"
+    );
+}
+
+/// The streamed twin: the iteration's context let go of the request when
+/// the run returned, and nothing the result carries past it (the engine
+/// stream, the load guards, the reservation, the stop obligations) holds a
+/// share either, so once the stream is read to its end the loop moves the
+/// request as the non-streamed loop does.
+#[tokio::test]
+async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_stream_is_drained() {
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+
+    let request = responses_request(false);
+    let (execution_result, _load_guards, _reservation, _router_stops) = ctx
+        .pipeline
+        .execute_harmony_responses_streaming(&request, &ctx, None, None)
+        .await
+        .expect("the iteration dispatches");
+    match execution_result {
+        crate::routers::grpc::context::ExecutionResult::Single { mut stream, .. } => {
+            while stream.next().await.is_some() {}
+        }
+        _ => panic!("a regular worker answers with one stream"),
+    }
+    assert_eq!(
+        Arc::strong_count(&request),
+        1,
+        "the iteration's context released its share once its stream was drained"
+    );
+}
+
 /// Harmony Responses over the gRPC PD path: the same client leaves while
 /// the decode side wedged after its first token. The decode engine receives
 /// the abort at once and both sides end with their load released.
