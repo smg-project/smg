@@ -364,6 +364,14 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("webworld-32b", GenerationPrompt::ModelWritesTheThought),
     ("webworld-14b", GenerationPrompt::ModelWritesTheThought),
     ("k-exaone-236b-a23b", GenerationPrompt::OpensTheThought),
+    // Youtu-Parsing-Omni writes Qwen3's thinking switch under turn headers of its own
+    // (`<|begin_of_text|>assistant\n`, the group's opener) and declares no tools; bellwether
+    // recorded one content case of it (the rest refused), and a thought the model writes is
+    // reasoning, as the switch says.
+    (
+        "youtu-parsing-omni",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
@@ -423,14 +431,6 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("tinyllama-1.1b-chat-v1.0", GenerationPrompt::Plain),
     ("phi-4-mini-instruct", GenerationPrompt::Plain),
     ("phi-4-multimodal-instruct", GenerationPrompt::Plain),
-    // Youtu-Parsing-Omni's template writes Qwen3's thinking switch under turn headers of its own and
-    // declares no tools; bellwether recorded one content case of it (the rest refused), read with the
-    // qwen3 table under the group's own opener: a thought the model writes is reasoning, as the
-    // switch says.
-    (
-        "youtu-parsing-omni",
-        GenerationPrompt::ModelWritesTheThought,
-    ),
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
