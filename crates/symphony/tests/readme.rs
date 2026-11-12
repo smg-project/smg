@@ -1760,6 +1760,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "minimax-h3-image-pe",
+        model: "MiniMaxAI/MiniMax-H3-Image-PE",
+        also: &[],
+        released: "2026-11-08",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "minimax-m2",
         model: "MiniMaxAI/MiniMax-M2",
         also: &[],
