@@ -29,6 +29,7 @@ use crate::{
         basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
         circuit_breaker::CircuitBreakerConfig,
         endpoint::Endpoint,
+        metadata::join_base,
         overload::OverloadThresholds,
         resilience::resolve_resilience,
         BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
@@ -503,8 +504,9 @@ pub(super) fn warn_on_conflicting_parser_overrides(
 ) {
     for existing in registry.get_by_model(&card.id).iter() {
         // The worker itself (every rank of it), replaced at its address: its
-        // old card is still registered while the new one is checked.
-        if existing.base_url() == worker_url {
+        // old card is still registered while the new one is checked. The
+        // base URL carries no trailing slash; the address as given may.
+        if existing.base_url() == join_base(worker_url) {
             continue;
         }
         let Some(existing_card) = existing.metadata().spec.models.find(&card.id) else {
@@ -1144,8 +1146,37 @@ fn validate_zmq_dp(
 
 #[cfg(test)]
 mod tests {
+    use tracing_test::traced_test;
+
     use super::*;
     use crate::worker::test_support::RefusedAddress;
+
+    /// The parser-override warning skips the worker itself when it is replaced
+    /// at an address registered with a trailing slash: the registry's key keeps
+    /// the slash, the join base does not. Another address with the other
+    /// override is still warned about.
+    #[traced_test]
+    #[test]
+    fn the_parser_override_warning_skips_the_worker_replaced_at_a_slashed_address() {
+        let mut registered = ModelCard::new("m");
+        registered.tool_parser = Some("one".into());
+        let registry = WorkerRegistry::new();
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://h:8000/")
+                    .model(registered)
+                    .build(),
+            ))
+            .unwrap();
+        let mut replacement = ModelCard::new("m");
+        replacement.tool_parser = Some("two".into());
+
+        warn_on_conflicting_parser_overrides(&replacement, "http://h:8000/", &registry);
+        assert!(!logs_contain("conflicting parser"));
+
+        warn_on_conflicting_parser_overrides(&replacement, "http://other:8000", &registry);
+        assert!(logs_contain("conflicting parser"));
+    }
 
     /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
     /// classes are published at zero: the registry's table for an unlabeled worker of a model it
