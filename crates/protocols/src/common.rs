@@ -1074,7 +1074,9 @@ pub enum ToolChoice {
 
 impl<'de> Deserialize<'de> for ToolChoice {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        wire::ToolChoice::deserialize(deserializer).map(Self::from)
+        wire::ToolChoice::deserialize(deserializer)?
+            .into_choice()
+            .map_err(<D::Error as de::Error>::custom)
     }
 }
 
@@ -1182,6 +1184,17 @@ mod wire {
             mode: String,
             tools: Vec<AllowedToolReference>,
         },
+        /// The contract's named custom tool, `{"type": "custom", "custom":
+        /// {"name": ...}}`: read so that it is refused by name when its
+        /// `type` says `custom` (another `type` with this shape is a choice
+        /// missing its `function`), never chosen, and left out of the schema
+        /// this route publishes.
+        #[schemars(skip)]
+        Custom {
+            #[serde(rename = "type")]
+            tool_type: String,
+            custom: FunctionChoice,
+        },
     }
 
     /// The contract's `allowed_tools` object: the mode and the tools.
@@ -1226,14 +1239,15 @@ mod wire {
         }
     }
 
-    impl From<ToolChoice> for super::ToolChoice {
-        fn from(choice: ToolChoice) -> Self {
-            match choice {
-                ToolChoice::Value(value) => Self::Value(value),
+    impl ToolChoice {
+        /// The typed choice, or the refusal of a tool kind no engine serves.
+        pub(super) fn into_choice(self) -> Result<super::ToolChoice, String> {
+            Ok(match self {
+                ToolChoice::Value(value) => super::ToolChoice::Value(value),
                 ToolChoice::Function {
                     tool_type,
                     function,
-                } => Self::Function {
+                } => super::ToolChoice::Function {
                     tool_type,
                     function,
                 },
@@ -1245,13 +1259,43 @@ mod wire {
                     tool_type,
                     mode,
                     tools,
-                } => Self::AllowedTools {
+                } => super::ToolChoice::AllowedTools {
                     tool_type,
                     mode,
                     tools: tools.into_iter().map(Into::into).collect(),
                 },
+                ToolChoice::Custom { tool_type, custom } if tool_type == "custom" => {
+                    return Err(unsupported_tool_type(Some(&custom.name)))
+                }
+                ToolChoice::Custom { .. } => return Err("missing field `function`".to_string()),
+            })
+        }
+    }
+
+    /// The refusal of a tool kind no serving engine runs (the contract's
+    /// `custom` tool and its named choice), naming the tool when the request
+    /// did. Its opening words are the public API's `unsupported_tool_type`
+    /// code, read by the request extractor.
+    pub(super) fn unsupported_tool_type(name: Option<&str>) -> String {
+        match name {
+            Some(name) => format!(
+                "unsupported tool type `custom` of `{name}`: this server runs function tools only"
+            ),
+            None => {
+                "unsupported tool type `custom`: this server runs function tools only".to_string()
             }
         }
+    }
+
+    /// A chat tool as the wire carries it: the function tool, and the
+    /// contract's custom tool (`{"type": "custom", "custom": {"name": ...}}`),
+    /// which the typed tool refuses by name.
+    #[derive(Deserialize)]
+    pub(super) struct Tool {
+        #[serde(rename = "type")]
+        pub(super) tool_type: String,
+        pub(super) function: Option<super::Function>,
+        pub(super) custom: Option<FunctionChoice>,
     }
 
     /// A chat choice as the contract writes it, borrowed from the typed value.
@@ -1412,11 +1456,35 @@ impl ToolReference {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+/// A chat tool: the contract's function tool. Read through its wire shape,
+/// so that the contract's custom tool kind is refused by name
+/// (`unsupported_tool_type`) and a function tool without its `function` is
+/// still a missing field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct Tool {
     #[serde(rename = "type")]
     pub tool_type: String, // "function"
     pub function: Function,
+}
+
+impl<'de> Deserialize<'de> for Tool {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire::Tool {
+            tool_type,
+            function,
+            custom,
+        } = wire::Tool::deserialize(deserializer)?;
+        match (tool_type.as_str(), function, custom) {
+            (_, Some(function), _) => Ok(Self {
+                tool_type,
+                function,
+            }),
+            ("custom", None, custom) => Err(<D::Error as de::Error>::custom(
+                wire::unsupported_tool_type(custom.as_ref().map(|custom| custom.name.as_str())),
+            )),
+            (_, None, _) => Err(<D::Error as de::Error>::missing_field("function")),
+        }
+    }
 }
 
 /// The schema a function declared without `parameters` is read with wherever

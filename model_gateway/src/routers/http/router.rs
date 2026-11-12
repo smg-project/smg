@@ -2881,6 +2881,18 @@ impl RouterTrait for Router {
         .await
     }
 
+    /// A request for `model_id` goes to a worker of this router's HTTP
+    /// regular pool, which holds a provider's worker when one was registered
+    /// keyed (an external runtime: a provider named in `--worker-urls`, a
+    /// keyed `POST /workers`). The hosted features are forwarded only when
+    /// every worker of the model's pool is such a worker: the policy draws
+    /// from the whole pool, so a pool that also holds an engine may land the
+    /// request on the engine, which drops them.
+    fn forwards_to_provider(&self, model_id: &str) -> bool {
+        self.worker_registry
+            .pool_forwards_to_provider(model_id, RoutingPool::HttpRegular)
+    }
+
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -3023,6 +3035,70 @@ mod tests {
             webrtc_stun_server: None,
             rate_limit_manager: None,
         }
+    }
+
+    /// The router answers for its pool: a model an external-runtime worker of
+    /// the HTTP regular pool lists goes to a provider, which runs the hosted
+    /// features; an engine's model and a model nobody lists do not.
+    #[test]
+    fn the_http_router_forwards_to_a_provider_its_pool_holds() {
+        let router = create_test_regular_router();
+        router.worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new("http://provider.invalid")
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .model(crate::worker::ModelCard::new("gpt-4o"))
+                .health_config(no_health_check())
+                .build(),
+        ));
+        router.worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new("http://engine.invalid")
+                .worker_type(WorkerType::Regular)
+                .model(crate::worker::ModelCard::new("llama"))
+                .health_config(no_health_check())
+                .build(),
+        ));
+        assert!(
+            router.forwards_to_provider("gpt-4o"),
+            "a provider-only pool"
+        );
+        assert!(!router.forwards_to_provider("llama"), "an engine's model");
+        assert!(
+            !router.forwards_to_provider("nobody-lists-this"),
+            "an unlisted model reads the untagged engines"
+        );
+        // An engine that also lists the provider's model shares the pool: the
+        // policy may send the request to it, so the hosted features are
+        // refused for that model.
+        router.worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new("http://served-as.invalid")
+                .worker_type(WorkerType::Regular)
+                .model(crate::worker::ModelCard::new("gpt-4o"))
+                .health_config(no_health_check())
+                .build(),
+        ));
+        assert!(!router.forwards_to_provider("gpt-4o"), "a mixed pool");
+
+        // A keyless passthrough gateway: one untagged provider worker serves
+        // every model, so every model forwards.
+        let keyless = create_test_regular_router();
+        keyless.worker_registry.remove_by_url("http://worker1:8080");
+        keyless.worker_registry.remove_by_url("http://worker2:8080");
+        keyless.worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new("http://provider.invalid")
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .health_config(no_health_check())
+                .build(),
+        ));
+        assert!(
+            keyless.forwards_to_provider("gpt-4o"),
+            "the keyless gateway"
+        );
+        assert!(
+            keyless.forwards_to_provider("any-model"),
+            "the keyless gateway"
+        );
     }
 
     fn create_test_unhealthy_router() -> Router {

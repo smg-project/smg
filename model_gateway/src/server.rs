@@ -19,7 +19,6 @@ use axum::{
 use llm_tokenizer::TokenizerRegistry;
 use metrics_exporter_prometheus::PrometheusHandle;
 use openai_protocol::{
-    chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
     decisions::DecisionsRequest,
@@ -58,11 +57,13 @@ pub mod connection_timeouts;
 pub mod posture;
 mod rate_limit_document;
 pub(crate) mod tls;
+pub(crate) mod validated_chat;
 
 // The HTTP client constructors and the process crypto provider they install
 // first live beside the private-key-file check in `tls`; callers read them as
 // `server::http_client()` and its siblings.
 pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
+use validated_chat::ValidatedChat;
 
 use crate::{
     app_context::AppContext,
@@ -241,7 +242,7 @@ async fn v1_chat_completions(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedChat(body): ValidatedChat,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -3396,6 +3397,7 @@ mod tests {
 
     use axum::response::sse::{Event, Sse};
     use axum_server::accept::Accept;
+    use openai_protocol::chat::ChatCompletionRequest;
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;

@@ -348,6 +348,15 @@ pub trait RouterTrait: Send + Sync + Debug {
         )
     }
 
+    /// Whether a request for `model_id` goes to an external provider, which
+    /// may run the hosted features no serving engine does (`store`,
+    /// `web_search_options`). A provider's router answers true, an engine's
+    /// false (the default); the gateway answers for the router its selection
+    /// hands the request to.
+    fn forwards_to_provider(&self, _model_id: &str) -> bool {
+        false
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 
