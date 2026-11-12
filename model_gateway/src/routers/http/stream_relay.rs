@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_LENGTH, HeaderMap, StatusCode},
     response::Response,
 };
 use bytes::Bytes;
@@ -111,9 +111,17 @@ where
         upstream_sse,
         source,
         guard,
-        headers,
+        mut headers,
         mut mode,
     } = relay;
+    // The relay may change an SSE body's length: re-chunking re-slices it,
+    // a decode-side hook re-encodes it, and a cut after a successful head
+    // appends the error event and the stream's end. So a streamed SSE body
+    // never carries the upstream's `Content-Length`, whichever router
+    // relays it.
+    if upstream_sse {
+        headers.remove(CONTENT_LENGTH);
+    }
     // Bounded channel applies backpressure: a slow client makes the
     // relay await on `send` instead of buffering the whole response.
     let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
@@ -281,7 +289,7 @@ mod tests {
 
     use axum::{
         body::Body,
-        http::{HeaderMap, StatusCode},
+        http::{header::CONTENT_LENGTH, HeaderMap, StatusCode},
         response::Response,
     };
     use bytes::Bytes;
@@ -539,5 +547,37 @@ mod tests {
         let events = events_of(&[frame.into_data().expect("a data frame")]);
         assert_eq!(contents(&events), ["abcdef"], "{events:?}");
         drop(tx);
+    }
+
+    /// The relay owns the header rule for every caller: a sized SSE body
+    /// loses the upstream's `Content-Length` here, and a body that is not
+    /// SSE keeps the length its caller prepared.
+    #[tokio::test]
+    async fn a_sized_sse_bodys_content_length_leaves_with_the_relay_and_another_bodys_stays() {
+        for (upstream_sse, kept) in [(true, false), (false, true)] {
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("http://127.0.0.1:1").build());
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, "9".parse().unwrap());
+            let upstream = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from_static(
+                b"data: x\n\n",
+            ))]);
+            let response = relay_streaming_body(
+                upstream,
+                Relay {
+                    status: StatusCode::OK,
+                    upstream_sse,
+                    source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
+                    guard: WorkerLoadGuard::new(worker, None),
+                    headers,
+                    mode: ChunkMode::Plain,
+                },
+            );
+            assert_eq!(
+                response.headers().contains_key(CONTENT_LENGTH),
+                kept,
+                "upstream_sse {upstream_sse}: the upstream's Content-Length"
+            );
+        }
     }
 }
