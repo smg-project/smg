@@ -2551,10 +2551,12 @@ mod tests {
         Stopped,
     }
 
-    /// Adds rank 0 of a two-rank engine, ends it inside the grace by `end`,
-    /// and returns the subscribe calls made and the panics counted
-    /// (`smg_kv_event_subscription_failures_total{reason="panic"}`, summed).
-    fn engine_ended_within_the_grace(end: GraceEnd) -> (usize, f64) {
+    /// Adds `ranks` ranks of an engine one rank wider, so the first connect
+    /// waits in its grace; ends the engine inside the grace by `end`, and
+    /// returns the subscribe calls made and the panics counted
+    /// (`smg_kv_event_subscription_failures_total{reason="panic"}`, summed
+    /// over every series, the engine's own included).
+    fn engine_ended_within_the_grace(ranks: usize, end: GraceEnd) -> (usize, f64) {
         use metrics_exporter_prometheus::PrometheusBuilder;
 
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -2572,15 +2574,23 @@ mod tests {
                     script: vec![Ok(ranked_batch(0))],
                 })
                 .await;
-                let worker = rank_worker(addr, 0, 2);
-                let address = worker.base_url().to_string();
+                let workers: Vec<Arc<dyn Worker>> = (0..ranks)
+                    .map(|rank| rank_worker(addr, rank, ranks + 1))
+                    .collect();
+                let address = workers[0].base_url().to_string();
                 let monitor = KvEventMonitor::new();
-                monitor
-                    .on_worker_added(&worker, SubscriptionKind::Events)
-                    .await;
+                for worker in &workers {
+                    monitor
+                        .on_worker_added(worker, SubscriptionKind::Events)
+                        .await;
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 match end {
-                    GraceEnd::Removed => monitor.on_worker_removed(worker.url()).await,
+                    GraceEnd::Removed => {
+                        for worker in &workers {
+                            monitor.on_worker_removed(worker.url()).await;
+                        }
+                    }
                     GraceEnd::Stopped => monitor.stop().await,
                 }
                 wait_for_members(&monitor, &address, "the engine's entry is gone", None).await;
@@ -2606,7 +2616,7 @@ mod tests {
     /// caught panic counted as a failure, the exit path skipped.
     #[test]
     fn a_rank_removed_within_the_grace_ends_the_engine_without_a_panic() {
-        let (calls, panics) = engine_ended_within_the_grace(GraceEnd::Removed);
+        let (calls, panics) = engine_ended_within_the_grace(1, GraceEnd::Removed);
         assert_eq!(calls, 0, "no connect: the engine ended inside its grace");
         assert_eq!(panics, 0.0, "a removal inside the grace is no panic");
     }
@@ -2615,7 +2625,17 @@ mod tests {
     /// takes the member present, nothing is counted as a panic.
     #[test]
     fn a_stop_within_the_grace_ends_the_engine_without_a_panic() {
-        let (calls, panics) = engine_ended_within_the_grace(GraceEnd::Stopped);
+        let (calls, panics) = engine_ended_within_the_grace(1, GraceEnd::Stopped);
+        assert_eq!(calls, 0, "no connect: the engine ended inside its grace");
+        assert_eq!(panics, 0.0, "a stop inside the grace is no panic");
+    }
+
+    /// With two ranks on the task, a stop inside the grace ends it with its
+    /// members present: a panic there would be counted under each member's
+    /// series, and none is.
+    #[test]
+    fn a_stop_within_the_grace_with_two_ranks_counts_no_panic_under_a_member() {
+        let (calls, panics) = engine_ended_within_the_grace(2, GraceEnd::Stopped);
         assert_eq!(calls, 0, "no connect: the engine ended inside its grace");
         assert_eq!(panics, 0.0, "a stop inside the grace is no panic");
     }
