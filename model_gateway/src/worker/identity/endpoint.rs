@@ -216,7 +216,6 @@ impl Endpoint {
                 rank,
             ));
         }
-
         let (authority, path) = split_path(rest);
         if authority.is_empty() {
             return Err(EndpointError::Empty);
@@ -369,6 +368,13 @@ impl Endpoint {
             }
             _ => Self::redacted_str(input),
         }
+    }
+
+    /// The host alone, as the address renders it: an IPv6 literal bracketed,
+    /// a name as registered (lowercased), an IPC socket path as written. What
+    /// a bootstrap peer is named by.
+    pub fn host_string(&self) -> String {
+        render_host(&self.host)
     }
 
     /// Whether the address carries userinfo: a username, a password or a
@@ -755,6 +761,43 @@ mod tests {
     fn a_missing_port_is_not_filled_in_from_the_scheme() {
         assert_ne!(key_of("http://worker"), key_of("worker:80"));
         assert_eq!(key_of("http://worker"), "worker");
+    }
+
+    /// Every form of a malformed scheme prefix is refused and renders as the
+    /// marker, never as a host with the rest of the address in its path: a
+    /// scheme the gateway does not know, a doubled scheme, the single- and
+    /// triple-slash forms with or without a scheme in front, and an empty port
+    /// with or without a path behind it (the worker URL validator reads through
+    /// this parser and refuses the same forms at registration). The masked
+    /// neighbours keep their reading.
+    #[test]
+    fn a_malformed_scheme_prefix_is_refused_and_redacted_to_the_marker() {
+        for input in [
+            "http:/user:secret@worker:3000",
+            "http:///user:secret@worker:3000",
+            "http://http://user:secret@host:8000",
+            "http://http:/user:secret@host:8000",
+            "http://ws://user:secret@host:8000",
+            "HTTP://http://user:secret@host:8000",
+            "ws://user:secret@host:8000",
+            "http://prefill:/v1",
+            "http://prefill:/",
+            "http://prefill:",
+            "http://[fd00::1]:",
+            "prefill:",
+        ] {
+            assert!(Endpoint::parse(input).is_err(), "{input}");
+            assert_eq!(
+                Endpoint::redacted_str(input),
+                "<unparsable address>",
+                "{input}"
+            );
+        }
+        for input in ["user:secret@host/x://y", "http://user:secret@host:8000"] {
+            let masked = Endpoint::redacted_str(input);
+            assert!(!masked.contains("secret"), "{input}: {masked}");
+            assert!(masked.contains("***@host"), "{input}: {masked}");
+        }
     }
 
     #[test]

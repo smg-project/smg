@@ -465,48 +465,20 @@ impl BasicWorkerBuilder {
     }
 }
 
-/// Parse bootstrap hostname from a URL, falling back to "localhost".
-///
-/// Handles DP-aware URLs like `http://host:8080@3` by stripping the `@rank`
-/// suffix before parsing, since `@` is otherwise interpreted as a userinfo
-/// delimiter per RFC 3986.
+/// The bootstrap host of a worker URL: its host as [`Endpoint`] reads it (the
+/// workflow's `@rank` suffix and any userinfo set aside, an IPv6 literal
+/// bracketed), or "localhost" with a warning for an address the parser
+/// refuses.
 fn parse_bootstrap_host(url: &str) -> String {
-    // Strip DP rank suffix (e.g., "http://host:8080@3" -> "http://host:8080")
-    let clean_url = match url.rfind('@') {
-        Some(at_pos)
-            if !url[at_pos + 1..].is_empty()
-                && url[at_pos + 1..].chars().all(|c| c.is_ascii_digit()) =>
-        {
-            &url[..at_pos]
-        }
-        _ => url,
-    };
-
-    // Try parsing as-is first. If the URL lacks a scheme (e.g., "worker1:8080"),
-    // Url::parse may treat the host as a scheme — detect this via missing host_str()
-    // and fall back to prefixing "http://".
-    let try_parse = |u: &str| -> Option<String> {
-        url::Url::parse(u)
-            .ok()
-            .and_then(|p| p.host_str().map(|h| h.to_string()))
-    };
-
-    if let Some(host) = try_parse(clean_url) {
-        host
-    } else if !clean_url.contains("://") {
-        try_parse(&format!("http://{clean_url}")).unwrap_or_else(|| {
+    match Endpoint::parse_with_rank(url) {
+        Ok((endpoint, _)) => endpoint.host_string(),
+        Err(error) => {
             tracing::warn!(
-                "Failed to parse URL '{}', defaulting to localhost",
+                "Failed to parse URL '{}' ({error}), defaulting to localhost",
                 Endpoint::redacted_str(url)
             );
             "localhost".to_string()
-        })
-    } else {
-        tracing::warn!(
-            "Failed to parse URL '{}', defaulting to localhost",
-            Endpoint::redacted_str(url)
-        );
-        "localhost".to_string()
+        }
     }
 }
 
@@ -863,6 +835,25 @@ mod tests {
     fn test_parse_bootstrap_host_bare_host() {
         assert_eq!(parse_bootstrap_host("worker1:8080"), "worker1");
         assert_eq!(parse_bootstrap_host("localhost"), "localhost");
+    }
+
+    /// What the shared parser reads that the builder's own parse never pinned: an IPv6
+    /// literal bracketed, userinfo set aside and the name lowercased, a refused address
+    /// (an empty port, port 0) the localhost fallback.
+    #[test]
+    fn test_parse_bootstrap_host_through_the_endpoint_parser() {
+        assert_eq!(parse_bootstrap_host("http://[fd00::1]:8080@2"), "[fd00::1]");
+        assert_eq!(
+            parse_bootstrap_host("http://user:secret@Prefill1:8080"),
+            "prefill1"
+        );
+        // An empty port is refused by the parser, as it is at registration (the
+        // worker URL validator reads through it), so the fallback is unreachable
+        // from a registered worker, like port 0.
+        assert_eq!(parse_bootstrap_host("http://prefill:/"), "localhost");
+        assert_eq!(parse_bootstrap_host("http://prefill:"), "localhost");
+        assert_eq!(parse_bootstrap_host("http://prefill:/v1"), "localhost");
+        assert_eq!(parse_bootstrap_host("http://prefill1:0"), "localhost");
     }
 
     #[test]
