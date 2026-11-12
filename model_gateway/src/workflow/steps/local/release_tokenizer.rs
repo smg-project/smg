@@ -3,6 +3,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
+use llm_tokenizer::{registry::TokenizerEntry, LoadOutcome};
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -131,26 +132,15 @@ impl ReleaseTokenizerStep {
     /// Removes the model's entry and the multimodal config keyed by it, unless
     /// a worker of the model appeared since the candidates were read (its
     /// registration's tokenizer job read the entry as already loaded): then
-    /// the entry goes back as it was, under its own id, and the config stays.
+    /// the entry goes back as it was, under its own id, and the config stays
+    /// (see [`Self::put_back`] for the job that loaded afresh instead).
     /// Whether the entry left.
     async fn release(app_context: &AppContext, model_id: &str) -> bool {
         let Some(entry) = app_context.tokenizer_registry.remove(model_id) else {
             return false;
         };
         if app_context.worker_registry.contains_model(model_id) {
-            let tokenizer = Arc::clone(&entry.tokenizer);
-            if let Err(error) = app_context
-                .tokenizer_registry
-                .load(&entry.id, &entry.name, &entry.source, || async {
-                    Ok(tokenizer)
-                })
-                .await
-            {
-                warn!(
-                    model = %model_id,
-                    "A model registered again under the release of its tokenizer could not take it back: {error}"
-                );
-            }
+            Self::put_back(app_context, entry).await;
             return false;
         }
         app_context.multimodal_config_registry.remove(&entry.id);
@@ -162,12 +152,41 @@ impl ReleaseTokenizerStep {
         );
         true
     }
+
+    /// Gives a removed entry back, under its own id, to a model a worker
+    /// serves again. When the registration's tokenizer job ran between the
+    /// remove and this (the name was free, so it loaded a fresh entry under
+    /// its own id), that entry stays and the removed one's multimodal config,
+    /// keyed by an id no entry has any more, goes with the removed entry.
+    async fn put_back(app_context: &AppContext, entry: TokenizerEntry) {
+        let tokenizer = Arc::clone(&entry.tokenizer);
+        match app_context
+            .tokenizer_registry
+            .load(&entry.id, &entry.name, &entry.source, || async {
+                Ok(tokenizer)
+            })
+            .await
+        {
+            Ok(LoadOutcome::Loaded { .. }) => {}
+            Ok(LoadOutcome::AlreadyExists { id }) if id == entry.id => {}
+            Ok(LoadOutcome::AlreadyExists { .. }) => {
+                app_context.multimodal_config_registry.remove(&entry.id);
+            }
+            Err(error) => {
+                warn!(
+                    model = %entry.name,
+                    "A model registered again under the release of its tokenizer could not take it back: {error}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use llm_multimodal::PreProcessorConfig;
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, TokenizerRegistry};
     use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
@@ -175,6 +194,7 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
+        routers::grpc::multimodal::MultimodalModelConfig,
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry},
         workflow::{
             data::WorkerRemovalWorkflowData,
@@ -378,5 +398,46 @@ mod tests {
         assert!(!ReleaseTokenizerStep::release(&app_context, "m").await);
         let entry = app_context.tokenizer_registry.get_by_name("m").unwrap();
         assert_eq!(entry.id, id, "the entry went back as it was");
+    }
+
+    /// A registration whose tokenizer job runs between the release's remove
+    /// and its put-back: the name is free, so the job loads a fresh entry
+    /// under its own id; the put-back leaves that entry and takes the
+    /// removed entry's multimodal config with the removed entry.
+    #[tokio::test]
+    async fn a_fresh_load_under_the_put_back_drops_the_removed_entry_config() {
+        let app_context = app_context();
+        let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
+        tokenizer(&app_context, "m", "/tok/m").await;
+        let old = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
+        app_context.multimodal_config_registry.insert(
+            old.clone(),
+            Arc::new(MultimodalModelConfig::new(
+                serde_json::json!({}),
+                PreProcessorConfig::default(),
+                None,
+            )),
+        );
+        remove_from_registries(&app_context, Arc::clone(&first)).await;
+        assert_eq!(
+            ReleaseTokenizerStep::candidates(&app_context, &[&first]),
+            vec!["m".to_string()]
+        );
+
+        // The release's remove; the registration that lands now (its worker,
+        // then its tokenizer job, which finds the name free); the put-back.
+        let removed = app_context.tokenizer_registry.remove("m").unwrap();
+        worker(&app_context, "http://w2:8000", "m", "/tok/m");
+        tokenizer(&app_context, "m", "/tok/m").await;
+        let fresh = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
+        assert_ne!(fresh, old);
+        ReleaseTokenizerStep::put_back(&app_context, removed).await;
+
+        let entry = app_context.tokenizer_registry.get_by_name("m").unwrap();
+        assert_eq!(entry.id, fresh, "the fresh entry stays");
+        assert!(
+            app_context.multimodal_config_registry.get(&old).is_none(),
+            "the removed entry's config went with it"
+        );
     }
 }
