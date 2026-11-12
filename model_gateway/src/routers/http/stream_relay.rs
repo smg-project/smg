@@ -453,10 +453,13 @@ mod tests {
         frames
     }
 
-    /// The events of `frames`, blank-line separated.
+    /// The events of `frames`, blank-line separated; a final fragment without
+    /// its terminator is a failure, since a client cannot dispatch it.
     fn events_of(frames: &[Bytes]) -> Vec<String> {
-        String::from_utf8(frames.concat())
-            .expect("UTF-8 SSE")
+        let text = String::from_utf8(frames.concat()).expect("UTF-8 SSE");
+        let (events, rest) = text.rsplit_once("\n\n").unwrap_or(("", text.as_str()));
+        assert!(rest.is_empty(), "an unterminated event: {rest:?}");
+        events
             .split("\n\n")
             .filter(|event| !event.is_empty())
             .map(str::to_owned)
@@ -478,10 +481,13 @@ mod tests {
     }
 
     /// A body error as reqwest reports one: the connect to a port nobody
-    /// listens on is refused.
+    /// listens on is refused. The client takes no proxy from the
+    /// environment, so the refusal comes from the loopback socket on every
+    /// host.
     async fn upstream_error() -> reqwest::Error {
         let refused = RefusedAddress::reserve();
         crate::server::http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{}/v1/chat/completions", refused.addr()))
@@ -512,8 +518,14 @@ mod tests {
         let [.., error_event, done] = events.as_slice() else {
             panic!("{events:?}");
         };
+        let error: serde_json::Value =
+            serde_json::from_str(error_event.strip_prefix("data: ").unwrap())
+                .expect("the error event is JSON");
+        assert_eq!(error["error"]["type"], "stream_error", "{error_event}");
         assert!(
-            error_event.starts_with("data: {\"error\":"),
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Stream error: ")),
             "{error_event}"
         );
         assert_eq!(done, "data: [DONE]");
