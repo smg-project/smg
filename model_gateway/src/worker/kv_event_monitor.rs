@@ -696,6 +696,45 @@ impl KvEventMonitor {
             .collect()
     }
 
+    /// A worker that streams nothing, in place of one that did: the
+    /// membership a former object has under the URL ends here, as
+    /// `on_worker_added` restarts it for an object with a kind. Nothing else
+    /// on the replace path stops it, and its records would keep reaching the
+    /// replaced object. The checks are the restart's, under the slot lock: a
+    /// worker the registry no longer holds changes nothing (the URL's
+    /// membership is the business of whatever holds the URL), and a
+    /// membership started for this object stays, as it does for an add with
+    /// another kind. The wait runs outside the lock and only the removal's
+    /// own reservation is left, so an add that follows starts afresh.
+    pub async fn on_worker_added_without_stream(&self, worker: &Arc<dyn Worker>) {
+        let url = worker.url();
+        let mut done = {
+            let mut subs = self.subscriptions.lock().await;
+            if !self.still_held(worker) {
+                debug!(worker_url = %Endpoint::redacted_str(url), "no KV event stream to end for a worker the registry no longer holds");
+                return;
+            }
+            let another_object = matches!(
+                subs.workers.get(url),
+                Some(Slot::Member { started_for, .. })
+                    if !std::ptr::addr_eq(started_for.as_ptr(), Arc::as_ptr(worker))
+            );
+            if !another_object {
+                return;
+            }
+            let begun =
+                Self::begin_member_removal(&mut subs, &self.indexers, &self.block_sizes, url);
+            match begun {
+                Some(done) => done,
+                None => return,
+            }
+        };
+        info!(worker_url = %Endpoint::redacted_str(url), "Ending the KV event subscription of a replaced worker: its successor streams nothing");
+        // As `on_worker_removed` waits: the caller has the old object out of
+        // the index on return; the channel closes at that end.
+        let _ = done.changed().await;
+    }
+
     /// The end of an engine's task: its entry leaves the map if it is still
     /// this task's (a later subscription under the address has its own).
     async fn complete_engine_removal(slots: &Mutex<Subscriptions>, address: &str, id: u64) {
@@ -1465,6 +1504,120 @@ mod tests {
             || after.worker_id(&url).is_some(),
         )
         .await;
+        monitor.stop().await;
+    }
+
+    /// A replacement that streams nothing (its policy reads no index and
+    /// the worker monitor wants no loads) ends the stream the object it
+    /// replaced had under the URL: the records on that stream would keep
+    /// reaching an object the registry no longer holds, and nothing else on
+    /// the replace path stops it.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_that_streams_nothing_ends_the_stream_of_the_object_it_replaced() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let first = refusing_grpc_worker();
+        let url = first.url().to_string();
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Loads)
+            .await;
+        let old = Arc::downgrade(&first);
+        drop(first);
+
+        let second = refusing_grpc_worker();
+        monitor.on_worker_added_without_stream(&second).await;
+        assert!(logs_contain(
+            "Ending the KV event subscription of a replaced worker"
+        ));
+        assert!(
+            old.upgrade().is_none(),
+            "the old stream's task has ended and released the old object"
+        );
+        assert_eq!(
+            monitor.slot_ids(&url).await,
+            (None, None),
+            "the URL's slot is empty: nothing streams and nothing is reserved"
+        );
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains("Starting KV event subscription"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!("{n} starts: the replacement streams nothing")),
+            }
+        });
+        monitor.stop().await;
+    }
+
+    /// The registry replaced the worker again before its call ran, and the
+    /// add for the object it holds now has restarted the stream: the call
+    /// for the object nobody holds leaves that stream alone. A removal by
+    /// URL here would take it.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_that_streams_nothing_leaves_the_stream_the_registry_holds() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let registry = Arc::new(WorkerRegistry::new());
+        monitor.set_worker_registry(&registry);
+        let url = REPLACED_URL;
+        let first = refusing_grpc_worker_at(url);
+        registry
+            .register(Arc::clone(&first))
+            .expect("the first registration under the address");
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Loads)
+            .await;
+        drop(first);
+
+        let second = refusing_grpc_worker_at(url);
+        registry.register_or_replace(Arc::clone(&second));
+        let third = refusing_grpc_worker_at(url);
+        registry.register_or_replace(Arc::clone(&third));
+        monitor
+            .on_worker_added(&third, SubscriptionKind::Loads)
+            .await;
+        let (active, removing) = monitor.slot_ids(url).await;
+        let held = active.expect("the add of the third restarted the stream");
+        assert_eq!(removing, None);
+
+        monitor.on_worker_added_without_stream(&second).await;
+        assert_eq!(
+            monitor.slot_ids(url).await,
+            (Some(held), None),
+            "the stream of the object the registry holds stays"
+        );
+        assert!(logs_contain(
+            "no KV event stream to end for a worker the registry no longer holds"
+        ));
+        monitor.stop().await;
+    }
+
+    /// A worker that streams nothing now, with the stream its add under a
+    /// kind started: that stream stays. The monitor never ends or restarts a
+    /// stream for the object it was started for; an add with another kind
+    /// leaves it too.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_that_streams_nothing_keeps_the_stream_started_for_it() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let worker = refusing_grpc_worker();
+        let url = worker.url().to_string();
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        let (active, removing) = monitor.slot_ids(&url).await;
+        let started = active.expect("the add started a stream");
+        assert_eq!(removing, None);
+
+        monitor.on_worker_added_without_stream(&worker).await;
+        assert_eq!(
+            monitor.slot_ids(&url).await,
+            (Some(started), None),
+            "the stream started for the object stays"
+        );
+        assert!(!logs_contain("Ending the KV event subscription"));
         monitor.stop().await;
     }
 
