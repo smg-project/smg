@@ -378,6 +378,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         Shape {
             name: "byte-level-regex",
@@ -493,6 +494,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[],
+            stripped: &[],
         },
         // The digit-grouping split before the cased template and a
         // `ByteLevel` without its regex: a digit run is cut into groups of
@@ -509,6 +511,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         // A literal split with `Removed` first (the first stage of a parse
         // family's chain): its matches are dropped, the pieces on either
@@ -533,6 +536,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[("<tool_call>", false)],
+            stripped: &[],
         },
         // A punctuation stage written as a capturing group read back at once
         // (a run of one repeated character), before `Digits` and the
@@ -549,6 +553,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         // `Digits` in runs before a split and the `ByteLevel`.
         Shape {
@@ -1057,7 +1062,9 @@ fn stripped_added_tokens_take_their_whitespace_as_tokenizers_does() {
 /// shape stands apart from the shape set: the random texts hold that
 /// character, and the library's own matcher panics on a text where a
 /// neighbour's whitespace runs past such a token (a split whose start passes
-/// its end), so there is nothing to compare against there.
+/// its end), so there is nothing to compare against there; the native path
+/// answers, the empty range leaving the matcher's clamp where it was, so a
+/// later token's widening reaches into no earlier range.
 #[test]
 fn a_whitespace_token_inside_a_neighbours_whitespace_emits_no_id() {
     let mut state = 0x57A1_57A1_0000_0002u64;
@@ -1099,6 +1106,13 @@ fn a_whitespace_token_inside_a_neighbours_whitespace_emits_no_id() {
             "{text:?}"
         );
     }
+    // The first token's `rstrip` takes all the whitespace, past both em
+    // spaces; the library's matcher panics on this text, the native path
+    // emits the token and the text after the whitespace.
+    assert_eq!(
+        native.encode(Some(model), "<|user|>\u{2003} \u{2003}x", false),
+        Ok([vec![id("<|user|>")], ids("x")].concat())
+    );
 }
 
 #[test]

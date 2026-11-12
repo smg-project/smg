@@ -812,7 +812,9 @@ impl AddedTokens {
     /// the next one, and the longest token there is the match. A match the
     /// widening before it leaves empty (a whitespace token inside the
     /// whitespace a stripped neighbour took) is no match: the reference drops
-    /// the empty split it makes of it.
+    /// the empty split it makes of it; it leaves the end of the last match
+    /// where it was, so that no later widening reaches into an earlier range
+    /// (the reference's own loop fails on such a text).
     fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
         let mut at = 0;
         let mut taken = 0;
@@ -823,10 +825,10 @@ impl AddedTokens {
                 at = found.end();
                 let index = found.pattern().as_usize();
                 let range = self.stripped(text, found.range(), index, taken);
-                taken = range.end;
                 if range.is_empty() {
                     continue;
                 }
+                taken = range.end;
                 return Some((range, index));
             };
             let start = prefixes.next(text, at)?;
@@ -835,10 +837,10 @@ impl AddedTokens {
                 at = found.end();
                 let index = found.pattern().as_usize();
                 let range = self.stripped(text, found.range(), index, taken);
-                taken = range.end;
                 if range.is_empty() {
                     continue;
                 }
+                taken = range.end;
                 return Some((range, index));
             }
             at = start + 1;
