@@ -1058,6 +1058,14 @@ mod tests {
         let borrowed = resize.preprocess_video_rgb(&borrowed, &clip).unwrap();
         assert_eq!(dynamic.encoder_input, borrowed.encoder_input);
         assert_eq!(grid(&dynamic, "video_grid_thw"), vec![2, 2, 4]);
+        // The entry's video layout slices the clip by `patches_per_image`, the
+        // legacy map's one sizes key, so the video output carries that count
+        // beside `patches_per_video`.
+        assert_eq!(
+            grid(&dynamic, "patches_per_image"),
+            grid(&dynamic, "patches_per_video")
+        );
+        assert_eq!(grid(&dynamic, "patches_per_image").len(), 1);
         assert!(matches!(
             dynamic.model_specific.get("video_second_per_grid"),
             Some(ModelSpecificValue::Tensor { data, .. }) if data == &[1.0]
