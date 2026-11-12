@@ -5380,7 +5380,7 @@ mod tests {
         );
     }
 
-    /// The relay's own read of a proxied GET's body, cut short by the
+    /// The relay's own read of the body of a proxied GET, cut short by the
     /// worker: the upstream's failure under the code it had.
     #[tokio::test]
     async fn a_proxied_get_whose_body_is_cut_short_is_an_upstream_failure() {
