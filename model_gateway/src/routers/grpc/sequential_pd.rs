@@ -33,9 +33,8 @@ use crate::{
             backend_client::BackendClient,
             common::stages::request_execution::{
                 decode_silence_response, dispatch_prefill_within, first_prefill_response_within,
-                is_prefill_silence, prefill_silence_response, retire_pd_side,
-                start_failure_response, PdSides, PrefillBound, Retirement, SideDispatch,
-                StreamResult,
+                is_prefill_silence, pd_start_failure_response, prefill_silence_response,
+                retire_pd_side, PdSides, PrefillBound, Retirement, SideDispatch, StreamResult,
             },
             context::{ClientSelection, ExecutionResult, PdTiming, WorkerSelection},
             multimodal::worker_language_model_only,
@@ -276,11 +275,11 @@ fn sequential_decode_failure(
     }
     UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, connection, e);
     account_pd_side_failure(metrics_labels::WORKER_DECODE, e);
-    start_failure_response(
+    pd_start_failure_response(
+        PdSide::Decode,
+        workers.decode_worker(),
         e,
         "execute_sequential_pd",
-        PdSide::Decode.description(SidePhase::Start),
-        PdSide::Decode.code(SidePhase::Start),
     )
 }
 
@@ -303,11 +302,11 @@ fn sequential_prefill_failure(
     }
     UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_PREFILL, connection, e);
     account_pd_side_failure(metrics_labels::WORKER_PREFILL, e);
-    start_failure_response(
+    pd_start_failure_response(
+        PdSide::Prefill,
+        workers.prefill_worker(),
         e,
         "execute_sequential_pd",
-        PdSide::Prefill.description(SidePhase::Start),
-        PdSide::Prefill.code(SidePhase::Start),
     )
 }
 
