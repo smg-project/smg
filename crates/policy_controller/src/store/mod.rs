@@ -79,8 +79,8 @@ pub use memory::MemoryStore;
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use workers::{
-    identity, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability, Signals,
-    WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
+    Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 
 /// The verified identity of a gateway: the fingerprint of the subject its

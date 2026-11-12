@@ -386,34 +386,6 @@ fn run_profile(
     })
 }
 
-impl Profile {
-    /// Decide over `candidates` with this profile alone (the `single` plan).
-    pub fn decide(
-        &self,
-        index: u16,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        cx: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> Decision {
-        run_profile(
-            self,
-            index,
-            facts,
-            pool,
-            Set {
-                candidates,
-                class: None,
-                partnered: None,
-                encode: false,
-            },
-            cx,
-            &mut scratch.single,
-        )
-    }
-}
-
 /// The plan: the sequence of profiles a request runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Plan {

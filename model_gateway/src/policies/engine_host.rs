@@ -52,7 +52,7 @@ use smg_policy_controller::{
         BindingSpec, LeastLoadParams, PlanName, ProfileSpec, ScoreSpec, ScoreStage,
         MANUAL_SESSION_HEADER,
     },
-    store::identity,
+    store::{identity, identity_of},
     Assignment, Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId,
     LeaseKind, Lifecycle, LoadRow, MediaCounts, Membership, Needs, PairPools, Phase, PolicySpec,
     PoolFacts, Recovery, RequestFacts, Role, Scratch, SessionVerdict, SessionsSpec, Side,
@@ -330,15 +330,13 @@ pub fn worker_id(worker: &dyn Worker) -> WorkerId {
 }
 
 /// The id of a worker handle and the worker's stable key for placement
-/// ([`Candidate::key`]): the id under the store's identity rule, the key
-/// one fingerprint of the registration key taken as it is, so a ring
-/// positions the worker alike across its handles and across gateway
+/// ([`Candidate::key`]), both from one pass over the registration key: the
+/// id under the store's identity rule, the key the fingerprint itself, so a
+/// ring positions the worker alike across its handles and across gateway
 /// replicas while the lifecycle still prunes by handle.
 pub fn worker_identity(worker: &dyn Worker) -> (WorkerId, u32) {
-    (
-        worker_id(worker),
-        fingerprint(worker.url().as_bytes()) as u32,
-    )
+    let stable = fingerprint(worker.url().as_bytes());
+    (identity_of(stable, incarnation(worker)), stable as u32)
 }
 
 /// Whether stages with `needs` read the request body: its text, or the
@@ -3100,5 +3098,14 @@ mod tests {
             preset_name(&PolicyConfig::ConsistentHashing).is_none(),
             "the regular path's keyed form waits for a later step"
         );
+    }
+
+    #[test]
+    fn a_candidate_s_id_and_key_come_from_one_pass_over_the_url() {
+        let workers = pool(1);
+        let worker = workers[0].as_ref();
+        let (id, key) = worker_identity(worker);
+        assert_eq!(id, worker_id(worker), "the id under the store's rule");
+        assert_eq!(key, fingerprint(worker.url().as_bytes()) as u32);
     }
 }
