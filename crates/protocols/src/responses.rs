@@ -2352,6 +2352,10 @@ pub enum ResponseOutputItem {
         id: String,
         #[serde(default)]
         summary: Vec<SummaryTextContent>,
+        /// The reasoning text. The public API does not require the key and
+        /// often leaves it out, so an item written without it reads as
+        /// having none.
+        #[serde(default)]
         content: Vec<ResponseReasoningContent>,
         /// Encrypted reasoning payload for gpt-5 / o-series round-trip.
         /// Opaque to SMG; preserved verbatim.

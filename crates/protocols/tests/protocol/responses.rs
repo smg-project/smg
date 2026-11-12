@@ -243,6 +243,54 @@ fn reasoning_items_preserve_empty_summary_arrays() {
     assert_eq!(serialized, input_payload);
 }
 
+/// The public API writes a reasoning item as `{id, type, summary,
+/// encrypted_content}`, often with no `content`, which it does not require:
+/// such an item parses with no content, alone and in a Response's output, and
+/// is written back with an empty `content`, as the gateway writes its own.
+#[test]
+fn a_reasoning_output_item_without_content_parses() {
+    let hosted = json!({
+        "type": "reasoning",
+        "id": "rs_hosted",
+        "summary": [{"type": "summary_text", "text": "Weighing the options."}],
+        "encrypted_content": "gAAAAB-opaque"
+    });
+    let item: ResponseOutputItem =
+        serde_json::from_value(hosted.clone()).expect("a reasoning item without content parses");
+    let written = serde_json::to_value(&item).expect("serialize the reasoning item");
+    assert_eq!(written["content"], json!([]), "{written}");
+    assert_eq!(written["summary"], hosted["summary"], "{written}");
+    assert_eq!(written["encrypted_content"], hosted["encrypted_content"]);
+
+    let response: ResponsesResponse = serde_json::from_value(json!({
+        "id": "resp_reasoning",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-5.4",
+        "output": [hosted],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": true,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": null,
+        "user": null,
+        "metadata": {}
+    }))
+    .expect("a Response carrying a reasoning item without content parses");
+    assert_eq!(response.output.len(), 1);
+}
+
 #[test]
 fn legacy_vec_string_summary_fails_to_deserialize() {
     let legacy = r#"{"type":"reasoning","id":"r_x","summary":["text"]}"#;
