@@ -1663,9 +1663,7 @@ where
                     middleware::trace_context_on_response,
                 ))
                 .layer(middleware::MessagesErrorEnvelopeLayer)
-                .layer(axum::middleware::from_fn(
-                    middleware::refuse_encoded_request_body,
-                ))
+                .layer(middleware::RequestCodingLayer)
                 .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
                 .layer(axum::extract::DefaultBodyLimit::max(max_payload_size)),
         )

@@ -40,7 +40,7 @@ pub use messages_errors::{
     MessagesErrorEnvelopeLayer,
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
-pub use request_coding::refuse_encoded_request_body;
+pub use request_coding::{RequestCoding, RequestCodingLayer};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use request_start::RequestStarted;
 pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};

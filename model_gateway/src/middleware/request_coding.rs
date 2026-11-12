@@ -13,15 +13,24 @@
 //! said. Decoding the coding instead (a decompression layer, the body limit
 //! inside it) is a design the owner may take later; this check is the
 //! boundary either way.
+//!
+//! The layer is the gateway's own, in the shape of the body limit next to
+//! it: a request with no coding gets the inner service's own future, nothing
+//! cloned or boxed on its way (an `axum::middleware::from_fn` form would
+//! clone and box the inner service and box its own future on every request
+//! of every route, the cost measured and removed from this stack before).
+
+use std::task::{Context, Poll};
 
 use axum::{
     extract::Request,
     http::{header::CONTENT_ENCODING, HeaderMap, StatusCode},
-    middleware::Next,
-    response::{IntoResponse, Json, Response},
+    response::Response,
 };
-use openai_protocol::validated::RejectionCode;
-use serde_json::json;
+use futures_util::future::{ready, Either, Ready};
+use tower::{Layer, Service};
+
+use crate::routers::error::create_error;
 
 /// The envelope's code: the JSON extractor's header-level code, the one a
 /// request without `Content-Type: application/json` gets.
@@ -51,38 +60,56 @@ fn undecoded_coding(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// The refusal: `415` in the gateway's envelope, the coding named and the
-/// remedy said; the code rides on the response for the metrics layer's
-/// `error_code` label, as the extractor's own refusals do.
+/// The refusal: `415` in the gateway's envelope, built as every other
+/// gateway-minted refusal is (the error-code header and the extension the
+/// metrics layer reads), the coding named and the remedy said.
 fn refusal(coding: &str) -> Response {
     let named: String = coding.chars().take(NAMED_AT_MOST).collect();
-    let mut response = (
+    create_error(
         StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        Json(json!({
-            "error": {
-                "message": format!(
-                    "Unsupported Content-Encoding '{named}': this gateway does not decode request bodies; send the body unencoded (identity)."
-                ),
-                "type": "invalid_request_error",
-                "param": null,
-                "code": CODE,
-            }
-        })),
+        CODE,
+        format!(
+            "Unsupported Content-Encoding '{named}': this gateway does not decode request bodies; send the body unencoded (identity)."
+        ),
     )
-        .into_response();
-    response
-        .extensions_mut()
-        .insert(RejectionCode(CODE.to_string()));
-    response
 }
 
-/// The edge check: a request whose body arrives under a content coding the
-/// gateway does not decode is refused by name before any layer inside reads
-/// it; every other request passes untouched.
-pub async fn refuse_encoded_request_body(request: Request, next: Next) -> Response {
-    match undecoded_coding(request.headers()) {
-        Some(coding) => refusal(&coding),
-        None => next.run(request).await,
+/// Refuses, by name, a request body under a content coding the gateway does
+/// not decode: see the module docs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestCodingLayer;
+
+impl<S> Layer<S> for RequestCodingLayer {
+    type Service = RequestCoding<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestCoding { inner }
+    }
+}
+
+/// The service [`RequestCodingLayer`] wraps `S` in.
+#[derive(Clone, Debug)]
+pub struct RequestCoding<S> {
+    inner: S,
+}
+
+impl<S> Service<Request> for RequestCoding<S>
+where
+    S: Service<Request, Response = Response>,
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = Either<Ready<Result<Response, S::Error>>, S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        match undecoded_coding(request.headers()) {
+            Some(coding) => Either::Left(ready(Ok(refusal(&coding)))),
+            None => Either::Right(self.inner.call(request)),
+        }
     }
 }
 
@@ -97,15 +124,19 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::{
+        middleware::test_support::json_of,
+        routers::error::{extract_error_code_from_response, HEADER_X_SMG_ERROR_CODE},
+    };
 
-    /// `/read` answers the length of the body it read, behind the check.
+    /// `/read` answers the length of the body it read, behind the layer.
     fn app() -> Router {
         Router::new()
             .route(
                 "/read",
                 post(|body: Bytes| async move { body.len().to_string() }),
             )
-            .layer(axum::middleware::from_fn(refuse_encoded_request_body))
+            .layer(RequestCodingLayer)
     }
 
     fn request(codings: &[HeaderValue]) -> Request {
@@ -124,11 +155,6 @@ mod tests {
             .iter()
             .map(|coding| HeaderValue::from_str(coding).unwrap())
             .collect()
-    }
-
-    async fn envelope(response: Response) -> serde_json::Value {
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]
@@ -152,11 +178,19 @@ mod tests {
                 "{codings:?}"
             );
             assert_eq!(
-                response.extensions().get::<RejectionCode>(),
-                Some(&RejectionCode(CODE.to_string())),
+                extract_error_code_from_response(&response),
+                CODE,
                 "{codings:?}"
             );
-            let json = envelope(response).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_SMG_ERROR_CODE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(CODE),
+                "{codings:?}"
+            );
+            let json = json_of(response).await;
             assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
             assert_eq!(json["error"]["code"], CODE, "{json}");
             assert_eq!(json["error"]["param"], serde_json::Value::Null, "{json}");
@@ -179,8 +213,13 @@ mod tests {
         ] {
             let response = app().oneshot(request(&codings)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{codings:?}");
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "",
+                "{codings:?}"
+            );
             assert!(
-                response.extensions().get::<RejectionCode>().is_none(),
+                response.headers().get(HEADER_X_SMG_ERROR_CODE).is_none(),
                 "{codings:?}"
             );
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -193,10 +232,11 @@ mod tests {
         let long = "x".repeat(10 * NAMED_AT_MOST);
         let response = app().oneshot(request(&values(&[&long]))).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        let json = envelope(response).await;
+        let json = json_of(response).await;
         let message = json["error"]["message"].as_str().unwrap();
         assert!(
-            message.contains(&"x".repeat(NAMED_AT_MOST)) && !message.contains(&"x".repeat(NAMED_AT_MOST + 1)),
+            message.contains(&"x".repeat(NAMED_AT_MOST))
+                && !message.contains(&"x".repeat(NAMED_AT_MOST + 1)),
             "{message}"
         );
     }
