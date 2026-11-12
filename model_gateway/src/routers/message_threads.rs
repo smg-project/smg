@@ -2150,9 +2150,10 @@ mod tests {
 
     /// A stream that ends before its `message_stop`, or that carries an error
     /// event (here one a `message_stop` still follows), leaves no turn: the
-    /// place is given back at the stream's end, while the body is still held
-    /// (the drop guard is the other path), and the continue from its id is
-    /// the 404.
+    /// place is given back by the stream's end (at the error event on the
+    /// failed path, at the end-of-stream arm on the cut one), while the body
+    /// is still held (the drop guard is the other path), and the continue
+    /// from its id is the 404.
     #[tokio::test]
     async fn a_cut_or_failed_stream_leaves_no_turn() {
         let threads = MessageThreads::new();
@@ -2184,7 +2185,7 @@ mod tests {
                 .expect("the store");
             assert!(
                 kept.is_none(),
-                "{id}: the place is given back at the stream's end, while the body is still held"
+                "{id}: the place is given back by the stream's end, while the body is still held"
             );
             drop(data);
             let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
