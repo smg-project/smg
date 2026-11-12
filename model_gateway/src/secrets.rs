@@ -458,16 +458,45 @@ pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::
     Ok(handle)
 }
 
-/// The start's refusal for a key directory that cannot be watched. The watch
-/// crate's own error names no path for the likely causes, the inotify
-/// limits, so this one names the flag and the directory.
+/// The start's refusal for a key directory that cannot be watched: the flag,
+/// the directory as an absolute path, the cause, and the inotify limit behind
+/// the cause when one is known. The watch crate reports the watch limit as
+/// its own kind (its reading of `ENOSPC` from `add_watch`, the directory
+/// attached) and the instance limit as the `EMFILE` that refused the inotify
+/// handle (nothing attached); neither names the flag or the limit to raise.
 fn watch_refused(dir: &Path, error: notify::Error) -> notify::Error {
+    let limit = inotify_limit(&error.kind);
     // The kind alone: a path the error carries is the directory itself.
     let cause = notify::Error::new(error.kind);
+    let shown = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     notify::Error::generic(&format!(
-        "--secrets-auto-reload: cannot watch {}: {cause}",
-        dir.display()
+        "--secrets-auto-reload: cannot watch {}: {cause}{limit}",
+        shown.display()
     ))
+}
+
+/// The limit to raise for an error kind an inotify limit surfaces as, or
+/// nothing: the watch limit is the crate's own kind; the instance limit is
+/// `EMFILE` ("too many open files"), which a process at its open-file limit
+/// gets as well, so both are named. The errno is Linux's, and only Linux has
+/// an inotify limit to raise: another target carries no hint.
+fn inotify_limit(kind: &notify::ErrorKind) -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        const EMFILE: i32 = 24;
+        match kind {
+            notify::ErrorKind::MaxFilesWatch => " (raise fs.inotify.max_user_watches)",
+            notify::ErrorKind::Io(error) if error.raw_os_error() == Some(EMFILE) => {
+                " (raise fs.inotify.max_user_instances, or the process's open-file limit)"
+            }
+            _ => "",
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = kind;
+        ""
+    }
 }
 
 /// One watched directory of key files; `watch` is `None` while the directory
@@ -1095,6 +1124,42 @@ mod tests {
             "the directory once: {text}"
         );
         assert!(text.ends_with("not a directory"), "{text}");
+    }
+
+    /// The refusal names the directory as an absolute path and, for the two
+    /// kinds the inotify limits surface as, the limit to raise: `EMFILE` names
+    /// the instance limit and the open-file limit, the crate's watch-limit
+    /// kind the watch limit. Any other cause, `ENOSPC` as an io error among
+    /// them (the crate never passes it through), carries no hint.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_watch_refusal_names_the_absolute_directory_and_the_inotify_limit() {
+        let instances = notify::Error::io(std::io::Error::from_raw_os_error(24));
+        let text = watch_refused(Path::new("keys"), instances).to_string();
+        let absolute = std::path::absolute("keys").expect("an absolute path");
+        let prefix = format!(
+            "--secrets-auto-reload: cannot watch {}: ",
+            absolute.display()
+        );
+        assert!(text.starts_with(&prefix), "{text}");
+        assert!(
+            text.ends_with(
+                "(raise fs.inotify.max_user_instances, or the process's open-file limit)"
+            ),
+            "{text}"
+        );
+        let watches = notify::Error::new(notify::ErrorKind::MaxFilesWatch);
+        let text = watch_refused(Path::new("."), watches).to_string();
+        assert!(
+            text.ends_with("(raise fs.inotify.max_user_watches)"),
+            "{text}"
+        );
+        assert!(!text.contains("cannot watch .:"), "{text}");
+        for other in [20, 28] {
+            let other = notify::Error::io(std::io::Error::from_raw_os_error(other));
+            let text = watch_refused(Path::new("keys"), other).to_string();
+            assert!(!text.contains("fs.inotify"), "{text}");
+        }
     }
 
     /// The admin routes' fallback, in force when no control-plane keys are
