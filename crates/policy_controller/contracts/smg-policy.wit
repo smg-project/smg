@@ -194,8 +194,9 @@ interface types {
   /// transition, or the worker's standing veto for the given microseconds,
   /// aggregated over every gateway (it stands while any gateway holds one, the
   /// microseconds are the longest remaining, 0 only when none remains). The
-  /// deciding gateway's own veto is applied before any stage runs: the worker
-  /// reads breaker-open in that gateway's candidate rows alone.
+  /// deciding gateway's own veto is applied before any stage runs: in that
+  /// gateway's candidate rows alone the worker reads breaker-open (a breaker
+  /// veto) or stalled (a liveness veto).
   variant signal {
     load(tuple<u64, u16, load>),
     health(tuple<u64, health>),
