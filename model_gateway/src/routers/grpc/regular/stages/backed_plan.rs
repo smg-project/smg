@@ -259,7 +259,8 @@ mod tests {
 
     use super::*;
 
-    /// Match the rendered tri-state mode and leave other template switches untouched.
+    /// Match the rendered tri-state mode (the typed toggle, else the profile's
+    /// reading of `reasoning_effort`) and leave other template switches untouched.
     #[test]
     fn minimax_thinking_mode_matches_template_precedence() {
         for (mut body, expected) in [
@@ -285,7 +286,12 @@ mod tests {
                 json!({"chat_template_kwargs": {"thinking_mode": null}}),
                 Some(json!(null)),
             ),
-            (json!({"reasoning_effort": "none"}), None),
+            // The profile's reading of the effort: `none` is thinking off under
+            // MiniMax; `minimal` is its lowest level, thinking on, so the
+            // template's default mode stands.
+            (json!({"reasoning_effort": "none"}), Some(json!("disabled"))),
+            (json!({"reasoning_effort": "minimal"}), None),
+            (json!({"reasoning_effort": "high"}), None),
         ] {
             body["model"] = json!("minimax-m3");
             body["messages"] = json!([]);

@@ -304,7 +304,7 @@ mod tests {
         };
         let mut response = build_sse_response_driven(Box::pin(reading), rx, ());
         let mut duties = BodyDuties::take(&mut response);
-        let failure = duties.failure.take().expect("the failure handed over");
+        let failure = duties.take_failure().expect("the failure handed over");
         assert!(!failure.told(), "nothing told before the body is read");
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await

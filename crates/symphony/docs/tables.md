@@ -359,6 +359,10 @@ What this table says beyond the DSML one:
   the empty one, both dropped; later in the content both are text. With `thinking_mode` set,
   the generation prompt ends with `<mm:think>` (`enabled`) or `</mm:think>` (`disabled`) after
   the turn opener `]~b]ai\n`, and the replay puts the output inside the thought or in content.
+- **MiniMax-M3.1-Flash reads with the table.** The same tokenizer, special tokens, think tags,
+  separator and XML call tree. Its template writes an effort tag in the system block and has
+  no `thinking_mode` branch, so its generation prompt adds nothing and the output starts in
+  `start`, as in the primary's adaptive default.
 - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
   has it; the recorded outputs close the thought first.
 - **A forced call admits the thought first, and the separator.** The structural tag for a forced

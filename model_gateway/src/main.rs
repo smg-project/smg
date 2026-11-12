@@ -30,7 +30,7 @@ use smg::{
     },
     observability::metrics::register_jemalloc_as_global_allocator,
     secrets::SecretFiles,
-    server::{self, posture::SecretSources, ServerConfig},
+    server::{self, posture::SecretSources, ServerConfig, DEFAULT_SHUTDOWN_GRACE_SECS},
     version,
 };
 
@@ -1186,7 +1186,11 @@ struct ServingArgs {
     upstream_pool_idle_timeout_secs: u64,
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
-    #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS,
+        help_heading = "Request Handling"
+    )]
     shutdown_grace_period_secs: u64,
 
     /// Keep accepting connections after readiness fails. Defaults to 5 seconds;
@@ -1549,8 +1553,9 @@ struct ModelArgs {
     history_backend: String,
 
     /// Most stored responses the memory history backend keeps; the oldest go
-    /// first, on every write (memory backend only; a stored response takes
-    /// about 12 KB).
+    /// first, on every write (a stored response takes about 12 KB). The
+    /// Messages thread store keeps that many turns under every history
+    /// backend, the oldest evicted first.
     #[arg(long, default_value_t = 10_000, help_heading = "Backend")]
     history_memory_max_responses: usize,
 
@@ -1564,7 +1569,8 @@ struct ModelArgs {
     /// on every write; 0 keeps a record until a count bound drops it. A
     /// conversation is kept that long after its last use (created, read or
     /// updated); a background response still running is not dropped by a
-    /// count bound.
+    /// count bound. The Messages thread store keeps a turn that long after it
+    /// was written, under every history backend.
     #[arg(long, default_value_t = 86_400, help_heading = "Backend")]
     history_memory_retention_secs: u64,
 

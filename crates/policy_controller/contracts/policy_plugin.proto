@@ -382,11 +382,15 @@ message Trace {
   repeated Scored top = 3;
   fixed64 seed = 4;
   uint64 generation = 5;
-  // Zero-based: the plan among the spec's plan names and the picker among
-  // the schema's picker names, each in the order the schema declares them;
-  // 0 until the observability contract fills them.
+  // One-based position into the schema's `PlanName` order (`single`,
+  // `pd-pair`, `epd`), counted as `Candidate.engine_kind`, `connector` and
+  // `zone` are; 0 means not filled (the observability contract fills it),
+  // never the first plan.
   uint32 plan = 6;
   repeated FilterDrop drops = 7;
+  // One-based position into spec.rs's `PICKERS` (`best` first,
+  // `best-with-temperature` ninth, which the schema lists apart from the
+  // bare names); 0 means not filled, never the first picker.
   uint32 picker = 8;
   // The shadow profile's pick when one ran, 0 when none.
   fixed64 shadow_pick = 9;
