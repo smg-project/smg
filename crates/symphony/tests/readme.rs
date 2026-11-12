@@ -2028,7 +2028,10 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-labs-dory1.0-4b-bf16",
         model: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
-        also: &["NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8", "NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4"],
+        also: &[
+            "NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8",
+            "NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
+        ],
         released: "2026-10-16",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
