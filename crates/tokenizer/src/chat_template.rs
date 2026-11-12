@@ -1180,6 +1180,29 @@ impl<'a> PythonJsonFormatter<'a> {
             ensure_ascii,
         }
     }
+
+    /// One more array item or object key: with an indent, a line break after
+    /// the item separator (none before the first item) and the indentation;
+    /// without one, the item separator before every item but the first.
+    /// Python's `json.dumps` begins the two the same way.
+    fn begin_item<W>(&self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if let Some(indent) = self.indent {
+            if first {
+                writer.write_all(b"\n")?;
+            } else {
+                writer.write_all(&self.separators.item)?;
+                writer.write_all(b"\n")?;
+            }
+            write_indent(writer, self.current_indent, indent)
+        } else if first {
+            Ok(())
+        } else {
+            writer.write_all(&self.separators.item)
+        }
+    }
 }
 
 fn write_indent<W>(writer: &mut W, count: usize, indent: &[u8]) -> io::Result<()>
@@ -1266,19 +1289,7 @@ impl Formatter for PythonJsonFormatter<'_> {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent {
-            if first {
-                writer.write_all(b"\n")?;
-            } else {
-                writer.write_all(&self.separators.item)?;
-                writer.write_all(b"\n")?;
-            }
-            write_indent(writer, self.current_indent, indent)
-        } else if first {
-            Ok(())
-        } else {
-            writer.write_all(&self.separators.item)
-        }
+        self.begin_item(writer, first)
     }
 
     fn end_array_value<W>(&mut self, _writer: &mut W) -> io::Result<()>
@@ -1318,19 +1329,7 @@ impl Formatter for PythonJsonFormatter<'_> {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent {
-            if first {
-                writer.write_all(b"\n")?;
-            } else {
-                writer.write_all(&self.separators.item)?;
-                writer.write_all(b"\n")?;
-            }
-            write_indent(writer, self.current_indent, indent)
-        } else if first {
-            Ok(())
-        } else {
-            writer.write_all(&self.separators.item)
-        }
+        self.begin_item(writer, first)
     }
 
     fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
