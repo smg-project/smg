@@ -127,7 +127,7 @@ pub(crate) fn scans_for_tool_calls_for(
     request: &ChatCompletionRequest,
     provider: ProviderProfile,
 ) -> bool {
-    request.declares_tools() || provider.parses_tool_calls_without_tools()
+    request.declares_tools_for(provider) || provider.parses_tool_calls_without_tools()
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -152,7 +152,8 @@ impl ChatResponseSpec {
             // (`ChatCompletionRequest::declares_tools`, the one answer every
             // gate reads) and the provider does not parse tool calls without
             // them (`scans_for_tool_calls_for`).
-            tools: scans_for_tool_calls_for(request, provider).then(|| request.shared_tool_list()),
+            tools: scans_for_tool_calls_for(request, provider)
+                .then(|| request.shared_tool_list_for(provider)),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),

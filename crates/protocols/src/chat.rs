@@ -921,7 +921,14 @@ impl ChatCompletionRequest {
     /// request's provider profile defines them (Kimi K3 dynamic tools on
     /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
     pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
-        ProviderProfile::for_model(&self.model).dynamic_tools(self)
+        self.dynamic_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::dynamic_tools`] under `provider`, the model's profile the
+    /// caller derived already (the gateway's preparation derives it once per
+    /// request, and the stages after it read that one).
+    pub fn dynamic_tools_for(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
+        provider.dynamic_tools(self)
     }
 
     /// Whether the request offers the model any tool: a request-level `tools`
@@ -937,6 +944,12 @@ impl ChatCompletionRequest {
     /// [`Self::callable_tools`].
     pub fn declares_tools(&self) -> bool {
         self.tools.is_some() || self.dynamic_tools().next().is_some()
+    }
+
+    /// [`Self::declares_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn declares_tools_for(&self, provider: ProviderProfile) -> bool {
+        self.tools.is_some() || self.dynamic_tools_for(provider).next().is_some()
     }
 
     /// Every tool the model will see: the request-level `tools` followed by
@@ -957,7 +970,13 @@ impl ChatCompletionRequest {
     /// request (the constraint, the response spec, the table that reads the
     /// calls), so where nothing narrows it, nothing copies it.
     pub fn effective_tool_list(&self) -> Cow<'_, [Tool]> {
-        let mut dynamic = self.dynamic_tools().peekable();
+        self.effective_tool_list_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tool_list`] under `provider`, the model's profile
+    /// the caller derived already.
+    pub fn effective_tool_list_for(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let mut dynamic = self.dynamic_tools_for(provider).peekable();
         if dynamic.peek().is_none() {
             return Cow::Borrowed(self.tools.as_deref().unwrap_or(&[]));
         }
@@ -978,7 +997,13 @@ impl ChatCompletionRequest {
     /// shared, when no message declares a tool; a list that chains both
     /// otherwise; an empty list when the request declares none.
     pub fn shared_tool_list(&self) -> Arc<[Tool]> {
-        let mut dynamic = self.dynamic_tools().peekable();
+        self.shared_tool_list_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::shared_tool_list`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn shared_tool_list_for(&self, provider: ProviderProfile) -> Arc<[Tool]> {
+        let mut dynamic = self.dynamic_tools_for(provider).peekable();
         match (&self.tools, dynamic.peek()) {
             (Some(tools), None) => Arc::clone(tools),
             (None, None) => Arc::default(),
@@ -999,7 +1024,13 @@ impl ChatCompletionRequest {
     /// alone, a forced call could only ever land on a request-level tool. The
     /// list is borrowed from the request where the choice narrows nothing.
     pub fn callable_tools(&self) -> Cow<'_, [Tool]> {
-        let tools = self.effective_tool_list();
+        self.callable_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::callable_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn callable_tools_for(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let tools = self.effective_tool_list_for(provider);
         match self
             .tool_choice
             .as_ref()

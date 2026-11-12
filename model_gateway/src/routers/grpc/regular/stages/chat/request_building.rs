@@ -180,7 +180,7 @@ impl ChatRequestBuildingStage {
         } = reading::decide(
             ctx,
             symphony::Asks::Chat(&chat_request),
-            &chat_request.effective_tool_list(),
+            &chat_request.effective_tool_list_for(provider),
             &processed_messages.text,
             tool_constraints,
             |ctx| {
