@@ -977,7 +977,15 @@ mod tests {
             video_urls: vec!["https://example.test/a.mp4".to_string()],
             ..Default::default()
         };
-        for (id, batch) in [("sg-mm-ref-image", image), ("sg-mm-ref-video", video)] {
+        let audio = sg::MultimodalInputs {
+            audio_urls: vec!["https://example.test/a.wav".to_string()],
+            ..Default::default()
+        };
+        for (id, batch) in [
+            ("sg-mm-ref-image", image),
+            ("sg-mm-ref-video", video),
+            ("sg-mm-ref-audio", audio),
+        ] {
             let frames = read_frames(&service, with_batch(request(id, &[1, 2], true), batch)).await;
             assert!(!frames.is_empty(), "{id}: the answer streams");
         }
@@ -1228,8 +1236,9 @@ mod tests {
         );
     }
 
-    /// The reference form is the primary batch's alone: the adapter refuses
-    /// extra batches beside it, and a reference batch on the tensor path.
+    /// The reference form is the primary batch's alone, whichever of its
+    /// three URL kinds names it: the adapter refuses extra batches beside it,
+    /// and a reference batch on the tensor path.
     #[tokio::test]
     async fn the_reference_form_travels_alone_as_the_primary_batch() {
         let (service, _stop) = media_service(65_364);
@@ -1237,18 +1246,24 @@ mod tests {
             image_urls: vec!["https://example.test/a.png".to_string()],
             ..Default::default()
         };
-        let mut req = with_batch(
-            request("sg-mm-ref-extra", &[1, 9, 9, 2], true),
-            reference.clone(),
-        );
-        req.extra_mm_inputs.push(image_batch(1, 2));
-        let status = refused_batch(&service, req).await;
-        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
-        assert!(
-            status.message().contains("media references")
-                && status.message().contains("1 extra tensor batch"),
-            "{status:?}"
-        );
+        let audio = sg::MultimodalInputs {
+            audio_urls: vec!["https://example.test/a.wav".to_string()],
+            ..Default::default()
+        };
+        for (id, primary) in [
+            ("sg-mm-ref-extra", reference.clone()),
+            ("sg-mm-ref-audio-extra", audio),
+        ] {
+            let mut req = with_batch(request(id, &[1, 9, 9, 2], true), primary);
+            req.extra_mm_inputs.push(image_batch(1, 2));
+            let status = refused_batch(&service, req).await;
+            assert_eq!(status.code(), Code::InvalidArgument, "{id}: {status:?}");
+            assert!(
+                status.message().contains("media references")
+                    && status.message().contains("1 extra tensor batch"),
+                "{id}: {status:?}"
+            );
+        }
         let mut req = with_batch(
             request("sg-mm-extra-ref", &[1, 9, 9, 2], true),
             image_batch(1, 2),
