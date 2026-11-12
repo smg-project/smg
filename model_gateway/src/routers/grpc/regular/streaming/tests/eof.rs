@@ -4071,3 +4071,42 @@ async fn the_response_reads_the_parser_names_the_spec_carries() {
         }
     }
 }
+
+/// A `logprobs` completion whose second chunk carries a logprobs message of
+/// zero positions and no token (a wire may send it empty): the chunk that
+/// scored two positions goes out with them, and no event carries empty lists.
+#[tokio::test]
+async fn completion_logprobs_go_out_with_the_chunks_that_scored_a_position() {
+    let mut unscored = chunk_of_ids(0, Vec::new());
+    if let Some(GenerationEvent::Chunk(chunk)) = &mut unscored.response {
+        chunk.output_logprobs = Some(proto::OutputLogProbs::default());
+    }
+    let (wire, events) = completion_events(
+        vec![chunk_with_logprobs(0, "ab"), unscored, complete(0, "stop")],
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+            "max_tokens":4, "logprobs":2}),
+    )
+    .await;
+    assert!(
+        !events.iter().any(|event| event.get("error").is_some()),
+        "{wire}"
+    );
+    let scored: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0]["logprobs"].is_object())
+        .collect();
+    assert_eq!(scored.len(), 1, "{wire}");
+    assert_eq!(
+        scored[0]["choices"][0]["logprobs"]["tokens"],
+        serde_json::json!(["a", "b"]),
+        "{wire}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["choices"][0]["logprobs"]["tokens"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        }),
+        "an event carried empty logprobs lists: {wire}"
+    );
+}
