@@ -968,7 +968,7 @@ async fn execute_tool_loop_streaming_internal(
             Err(e) => {
                 let message = format!("Failed to convert request: {e}");
                 if startup.is_some() {
-                    let response = error::bad_request("convert_request_failed", message.clone());
+                    let response = error::bad_request(e.code(), message.clone());
                     let _ = signal_stream_startup(&mut startup, Err(response));
                     return Ok(());
                 }

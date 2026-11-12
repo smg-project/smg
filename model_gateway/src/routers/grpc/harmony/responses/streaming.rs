@@ -29,7 +29,7 @@ use crate::{
                 await_stream_startup, ensure_mcp_connection, load_history,
                 persist_response_if_needed, stream_startup_channel,
                 streaming::{ResponseStreamEventEmitter, StreamStartupSender},
-                tool_call_limit, BackgroundStream, ResponsesContext,
+                tool_call_limit, BackgroundStream, ReplayInto, ResponsesContext,
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
@@ -53,11 +53,17 @@ pub(crate) async fn serve_harmony_responses_stream(
     // Load the history the request continues, as the caller's tenant may see
     // it; `request` itself stays as it came, for the persist.
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
-    let current_request =
-        match load_history(ctx.history_stores(), &request, tenant.as_deref()).await {
-            Ok(req) => req,
-            Err(err_response) => return err_response,
-        };
+    let current_request = match load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Harmony,
+    )
+    .await
+    {
+        Ok(req) => req,
+        Err(err_response) => return err_response,
+    };
 
     // Check MCP connection BEFORE starting stream and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(

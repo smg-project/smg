@@ -36,7 +36,8 @@ use crate::{
         common::json_response,
         error,
         grpc::common::responses::{
-            ensure_mcp_connection, load_history, naming_parser, BackgroundStream, ResponsesContext,
+            ensure_mcp_connection, load_history, naming_parser, BackgroundStream, ReplayInto,
+            ResponsesContext,
         },
     },
 };
@@ -148,11 +149,17 @@ async fn route_responses_streaming(
 ) -> Response {
     // 1. Load conversation history, as the caller's tenant may see it
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
-    let modified_request =
-        match load_history(ctx.history_stores(), &request, tenant.as_deref()).await {
-            Ok(req) => req,
-            Err(response) => return response, // Already a Response with proper status code
-        };
+    let modified_request = match load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Chat,
+    )
+    .await
+    {
+        Ok(req) => req,
+        Err(response) => return response, // Already a Response with proper status code
+    };
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
@@ -184,10 +191,7 @@ async fn route_responses_streaming(
     let chat_request = match conversions::responses_to_chat(&modified_request) {
         Ok(req) => Arc::new(req),
         Err(e) => {
-            return error::bad_request(
-                "convert_request_failed",
-                format!("Failed to convert request: {e}"),
-            );
+            return error::bad_request(e.code(), format!("Failed to convert request: {e}"));
         }
     };
 
