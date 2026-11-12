@@ -429,6 +429,26 @@ fn shapes() -> Vec<Shape> {
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[],
         },
+        // Five `Split` stages before `Digits` and a `ByteLevel` without its
+        // regex, the fourth anchored at the end (`\s+$`, a whitespace run
+        // that ends its piece): the pieces are cut stage by stage and the
+        // anchor reads each piece's end.
+        Shape {
+            name: "end-anchored-splits",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(r"[\r\n]", SplitDelimiterBehavior::Isolated, false),
+                split(r"\s?[A-Za-z]+", SplitDelimiterBehavior::Isolated, false),
+                split(r"\s?[!-/:-~]+", SplitDelimiterBehavior::Isolated, false),
+                split(r"\s+$", SplitDelimiterBehavior::Isolated, false),
+                split(CJK, SplitDelimiterBehavior::Isolated, false),
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
         // `Digits` in runs before a split and the `ByteLevel`.
         Shape {
             name: "digit-runs",
@@ -666,6 +686,17 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
     );
+    // A split after the ByteLevel with the end anchor: on the raw text the
+    // anchor holds before a `\n`, which the map has moved beyond ASCII.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        split(r"[a-z]+$", SplitDelimiterBehavior::Isolated, false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
+    );
     // A `Digits` after the ByteLevel: on the mapped text it would also cut
     // at the numeric characters the map makes of six bytes beyond ASCII.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -857,6 +888,32 @@ fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
             native.encode(Some(tokenizer.get_model()), text, false),
             Ok(reference.get_ids().to_vec()),
             "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn an_end_anchored_chain_keeps_a_long_text_whole() {
+    // `\s+$` reads the end of the text it runs over: a cut for the thread
+    // pool would put a false end inside the text, so an end-anchored chain
+    // takes no stable cut and a long text is one unit, with the ids of the
+    // whole however the caller asks for it.
+    let mut state = 0xE4DA_4C40_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "end-anchored-splits")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    assert!(native.end_anchored);
+    let text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES) + "the end   ";
+    assert_eq!(native.stable_cut(&text, PARALLEL_CHUNK_BYTES), None);
+    let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+    for parallel in [false, true] {
+        assert_eq!(
+            native.encode_with(Some(tokenizer.get_model()), &text, parallel, false),
+            Ok(reference.get_ids().to_vec()),
+            "parallel {parallel}"
         );
     }
 }
@@ -1225,6 +1282,12 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
         let mut chunked = Vec::new();
         let units = native.units(&text, true, true);
         let units = units.as_slice();
+        // An end-anchored chain takes no cut: the text stays one unit (see
+        // `an_end_anchored_chain_keeps_a_long_text_whole`).
+        if native.end_anchored {
+            assert_eq!(units.len(), 1, "{}: a cut under the end anchor", shape.name);
+            continue;
+        }
         assert!(
             units.len() >= 2,
             "{}: no cut in {} bytes",
@@ -3709,6 +3772,13 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
         declined(&ranks, r"\w+|\s+", &[]),
         r"a split pattern outside the supported regex subset: \w+|\s+"
     );
+    // The end anchor parses, but the file's own encoder reads it as the end
+    // of the text only, where the subset reads it before a newline too.
+    assert_eq!(
+        declined(&ranks, r"[a-z]+|\s+$|\s", &[]),
+        r"a split pattern with the end anchor, which the file's own encoder reads as the end of the text only: [a-z]+|\s+$|\s"
+    );
+    assert!(NativeEncoder::from_ranks(&ranks, r"[a-z]+|\s", &[]).is_ok());
     assert_eq!(
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),
         "special token \"\" without content"
