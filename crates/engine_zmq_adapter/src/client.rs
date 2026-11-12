@@ -2283,8 +2283,8 @@ mod tests {
     /// connect is raced against the engine's dial: a bind that finds the port
     /// taken ends that attempt at once, its engine dial abandoned with it,
     /// and the next attempt starts on a fresh probe. The panic after the last
-    /// attempt carries the last bind error, so a bind failing for a reason of
-    /// the code under test is not read as a run of neighbours.
+    /// attempt carries the last bind error and the address it failed on, the
+    /// bind's own words rather than the neighbour sentence alone.
     async fn connect_tcp_worker(mut probe: impl FnMut() -> u16) -> (ZmqEngineClient, MockEngine) {
         const ATTEMPTS: usize = 8;
         let mut last_bind_error = String::new();
@@ -2310,7 +2310,7 @@ mod tests {
             };
             match first {
                 First::Worker(Err(error)) if error.contains("Address already in use") => {
-                    last_bind_error = error;
+                    last_bind_error = format!("{base_url}: {error}");
                     continue;
                 }
                 First::Worker(worker) => {
@@ -2327,7 +2327,7 @@ mod tests {
         }
         panic!(
             "{ATTEMPTS} probed ports were taken before the worker could bind them; \
-             the last bind error: {last_bind_error}"
+             the last bind: {last_bind_error}"
         );
     }
 
