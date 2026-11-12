@@ -53,7 +53,7 @@
 //! or orchestrator stops routing new connections during the
 //! endpoint-propagation window without restarting the process.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use axum::{
@@ -227,8 +227,12 @@ impl ModelReadiness {
 /// Cached readiness evaluation for one pipeline role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReadinessRoleSnapshot {
+    /// Healthy engines of the role: a data-parallel engine counts once and is
+    /// healthy only while every one of its rank rows is.
     #[serde(rename = "healthy")]
     pub healthy_workers: usize,
+    /// Registered engines of the role: a data-parallel engine counts once
+    /// whatever its width.
     #[serde(rename = "registered")]
     pub registered_workers: usize,
     #[serde(rename = "expected", skip_serializing_if = "Option::is_none")]
@@ -324,14 +328,19 @@ impl ProbeState {
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
         let role_snapshot = |worker_type: WorkerType, threshold: ReadinessRoleConfig| {
-            let registered_workers = workers
+            // The thresholds name engines. A data-parallel engine registers one
+            // row per rank under one base URL, so its rows count once, and it
+            // is healthy when every one of its rows is.
+            let mut engines: HashMap<&str, bool> = HashMap::new();
+            for worker in workers
                 .iter()
                 .filter(|worker| *worker.worker_type() == worker_type)
-                .count();
-            let healthy_count = healthy_workers
-                .iter()
-                .filter(|worker| *worker.worker_type() == worker_type)
-                .count();
+            {
+                let healthy = engines.entry(worker.base_url()).or_insert(true);
+                *healthy = *healthy && worker.is_healthy();
+            }
+            let registered_workers = engines.len();
+            let healthy_count = engines.values().filter(|healthy| **healthy).count();
             let required_workers = threshold.required_workers();
             ReadinessRoleSnapshot {
                 healthy_workers: healthy_count,
@@ -758,6 +767,29 @@ mod tests {
         Arc::new(worker)
     }
 
+    /// One rank row of a data-parallel engine at `base_url`: the row's URL is
+    /// `{base_url}@{rank}` and its base URL is the engine's.
+    fn rank_worker(
+        base_url: &str,
+        rank: usize,
+        size: usize,
+        worker_type: WorkerType,
+        status: WorkerStatus,
+    ) -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(base_url)
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Http)
+            .model(ModelCard::new("llama-3"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .status(status)
+            .dp_config(rank, size)
+            .build();
+        Arc::new(worker)
+    }
+
     fn http_worker(url: &str, status: WorkerStatus) -> Arc<dyn Worker> {
         worker(
             url,
@@ -878,6 +910,79 @@ mod tests {
         // Losing the prefill side flips readiness back off.
         registry.transition_status(&prefill_id, WorkerStatus::NotReady);
         recompute(&state, &registry, &router_config);
+        assert!(!state.readiness().workers_ready);
+    }
+
+    /// A data-parallel engine registers one row per rank under one base URL;
+    /// the thresholds count engines, so a four-rank engine is one engine of
+    /// the four expected, and it is healthy only while every rank row is.
+    #[test]
+    fn pd_readiness_counts_a_data_parallel_engine_once() {
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = RouterConfig {
+            pd_readiness: Some(PdReadinessConfig {
+                prefill: ReadinessRoleConfig {
+                    expected_workers: Some(4),
+                    min_healthy_workers: 4,
+                    min_healthy_percent: Some(100),
+                },
+                decode: ReadinessRoleConfig::default(),
+            }),
+            ..config(RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            })
+        };
+        fn prefill_counts(state: &ProbeState) -> (usize, usize) {
+            let snapshot = state.readiness();
+            let prefill = &snapshot
+                .roles
+                .as_ref()
+                .expect("PD mode reports roles")
+                .prefill;
+            (prefill.registered_workers, prefill.healthy_workers)
+        }
+
+        let ranks: Vec<_> = (0..4)
+            .map(|rank| {
+                registry
+                    .register(rank_worker(
+                        "http://engine:8080",
+                        rank,
+                        4,
+                        WorkerType::Prefill,
+                        WorkerStatus::Ready,
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        registry
+            .register(worker(
+                "http://d1:8080",
+                "llama-3",
+                WorkerType::Decode,
+                ConnectionMode::Http,
+                WorkerStatus::Ready,
+            ))
+            .unwrap();
+        recompute(&state, &registry, &router_config);
+        assert_eq!(
+            prefill_counts(&state),
+            (1, 1),
+            "four rank rows are one engine, not four"
+        );
+        assert!(
+            !state.readiness().workers_ready,
+            "one engine of the four expected must not be ready"
+        );
+
+        // One rank down: the engine is not healthy, the count says so.
+        registry.transition_status(&ranks[1], WorkerStatus::NotReady);
+        recompute(&state, &registry, &router_config);
+        assert_eq!(prefill_counts(&state), (1, 0));
         assert!(!state.readiness().workers_ready);
     }
 
