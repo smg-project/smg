@@ -630,16 +630,37 @@ enum Pieces {
 }
 
 impl Pieces {
-    /// Whether the text between and around the matches goes on as pieces
-    /// of its own.
-    fn gaps(self) -> bool {
-        matches!(self, Self::MatchesAndGaps | Self::Gaps)
+    /// How a walk cuts a text under this kind: the cursor loop over the
+    /// matches with its two switches, or the merged loop. Every walker asks
+    /// this first, so a kind the cursor loop does not know never falls
+    /// through its switches silently.
+    fn walk(self) -> Walk {
+        match self {
+            Self::MatchesAndGaps => Walk::Apart {
+                gaps: true,
+                matches: true,
+            },
+            Self::Matches => Walk::Apart {
+                gaps: false,
+                matches: true,
+            },
+            Self::Gaps => Walk::Apart {
+                gaps: true,
+                matches: false,
+            },
+            Self::MatchesWithNextGap => Walk::Merged,
+        }
     }
+}
 
-    /// Whether the matches go on as pieces of their own.
-    fn matches(self) -> bool {
-        matches!(self, Self::MatchesAndGaps | Self::Matches)
-    }
+/// The loop a walk runs under a [`Pieces`] kind (see [`Pieces::walk`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Walk {
+    /// Each match and each gap on its own: `gaps` says the text between and
+    /// around the matches goes on as pieces, `matches` says the matches do.
+    Apart { gaps: bool, matches: bool },
+    /// Each match with the text after it up to the next match or the end.
+    Merged,
 }
 
 /// An added token the path cuts out: its content and id, and whether the
@@ -1999,9 +2020,8 @@ impl NativeEncoder {
 
     /// One `Split` as a stage: a regex or a literal the pattern engine takes,
     /// `Isolated`, `Removed`, `Removed` inverted, or `MergedWithNext`. A
-    /// `Digits` is the
-    /// `Isolated` split on numeric characters, each one a piece under
-    /// `individual_digits`, else each run: the reference splits on
+    /// `Digits` is the `Isolated` split on numeric characters, each one a
+    /// piece under `individual_digits`, else each run: the reference splits on
     /// `char::is_numeric`, the toolchain's numeric set
     /// ([`unicode::STD_NUMERIC`]), which is not the engine's `\p{N}` (the
     /// regex engine's Unicode version). A `Punctuation` is the `Isolated`
@@ -2534,7 +2554,9 @@ impl NativeEncoder {
                     }
                 });
             }
-            (None, [stage], None) if stage.pieces.matches() => {
+            (None, [stage], None)
+                if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
+            {
                 if let Err(declined) =
                     self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
                 {
@@ -2566,33 +2588,36 @@ impl NativeEncoder {
             f(text);
             return;
         };
-        if stage.pieces == Pieces::MatchesWithNextGap {
-            // Each match takes the text after it up to the next match or the
-            // end; the text before the first match stands alone, and a text
-            // without a match is one piece.
-            let mut merged = None;
-            for (start, _) in stage.pattern.find_iter(text) {
-                match merged {
-                    Some(from) => self.pieces(depth + 1, &text[from..start], f),
-                    None if start > 0 => self.pieces(depth + 1, &text[..start], f),
-                    None => {}
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                // Each match takes the text after it up to the next match or
+                // the end; the text before the first match stands alone, and
+                // a text without a match is one piece.
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(from) => self.pieces(depth + 1, &text[from..start], f),
+                        None if start > 0 => self.pieces(depth + 1, &text[..start], f),
+                        None => {}
+                    }
+                    merged = Some(start);
                 }
-                merged = Some(start);
+                self.pieces(depth + 1, &text[merged.unwrap_or(0)..], f);
+                return;
             }
-            self.pieces(depth + 1, &text[merged.unwrap_or(0)..], f);
-            return;
-        }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.pieces.gaps() && cursor < start {
+            if gaps && cursor < start {
                 self.pieces(depth + 1, &text[cursor..start], f);
             }
-            if stage.pieces.matches() {
+            if matches {
                 self.pieces(depth + 1, &text[start..end], f);
             }
             cursor = end;
         }
-        if stage.pieces.gaps() && cursor < text.len() {
+        if gaps && cursor < text.len() {
             self.pieces(depth + 1, &text[cursor..], f);
         }
     }
@@ -2740,7 +2765,7 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let gaps = stage.pieces.gaps();
+        let gaps = matches!(stage.pieces.walk(), Walk::Apart { gaps: true, .. });
         let mut cursor = 0;
         let mut fallback = None;
         // The probe compiles into the scanner's loop. As a closure of its

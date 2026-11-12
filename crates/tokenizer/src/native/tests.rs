@@ -1005,6 +1005,21 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         r"a split pattern anchored to its text (\A, \z or \G) without a Digits split before it"
     );
+    // A two-character lookahead after a class run: it would read past the
+    // end of a pool unit where the whole text reads on.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(
+            r"[a]+(?![ ][b])| [a-z]+",
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a split pattern outside the supported regex subset: [a]+(?![ ][b])| [a-z]+"
+    );
     // A post-processor of another kind, and a model that is not BPE.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_post_processor(Some(BertProcessing::new(
@@ -4838,17 +4853,34 @@ fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
             out.push((offset, offset + text.len()));
             return;
         };
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(from) => walk(rest, &text[from..start], offset + from, out),
+                        None if start > 0 => walk(rest, &text[..start], offset, out),
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                let from = merged.unwrap_or(0);
+                walk(rest, &text[from..], offset + from, out);
+                return;
+            }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.pieces.gaps() && cursor < start {
+            if gaps && cursor < start {
                 walk(rest, &text[cursor..start], offset + cursor, out);
             }
-            if stage.pieces.matches() {
+            if matches {
                 walk(rest, &text[start..end], offset + start, out);
             }
             cursor = end;
         }
-        if stage.pieces.gaps() && cursor < text.len() {
+        if gaps && cursor < text.len() {
             walk(rest, &text[cursor..], offset + cursor, out);
         }
     }
