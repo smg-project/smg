@@ -837,10 +837,31 @@ mod pending_registration_tests {
         let (status, body) = send(&app, "GET", &format!("/workers/{id}"), None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["status"], json!("pending"), "{body}");
+        // The registration is polled or ended, not edited: a PATCH of its id
+        // is told to poll it and queues no update job (one would have taken
+        // the registration's entry in the job queue, and a second POST the
+        // same id).
+        let (status, body) = send(
+            &app,
+            "PATCH",
+            &format!("/workers/{id}"),
+            Some(json!({"labels": {"tier": "a"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("WORKER_CREATE_IN_PROGRESS"), "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains(&id),
+            "the PATCH is told which id to poll: {body}"
+        );
         // The URL is held by the poll: a second registration is told to poll it.
         let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], json!("WORKER_CREATE_IN_PROGRESS"), "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains(&id),
+            "the second POST is told which id to poll: {body}"
+        );
 
         let (status, body) = send(&app, "DELETE", &format!("/workers/{id}"), None).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");

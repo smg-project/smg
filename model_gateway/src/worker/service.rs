@@ -907,6 +907,17 @@ impl WorkerService {
         if let (Some(labels), Some(worker)) = (&update.labels, &worker) {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
+        // An id with no worker behind it is a registration in flight: it is
+        // polled (GET) or ended (DELETE), not edited. An update job for it
+        // would write its status over the registration's entry in the job
+        // queue, and with it the claim that keeps a second POST of the URL
+        // off the same id.
+        if worker.is_none() {
+            return Err(WorkerServiceError::CreateInProgress {
+                url,
+                worker_id: Some(worker_id),
+            });
+        }
 
         let job = Job::UpdateWorker {
             url: url.clone(),
@@ -1178,6 +1189,54 @@ mod tests {
             .expect("a leftover reservation is no registration in flight");
         assert_eq!(admitted.worker_id, reserved, "the 202 names the adopted id");
         assert_eq!(registry.get_id_by_url_or_reservation(url), Some(reserved));
+    }
+
+    /// An id with no worker behind it is a registration in flight: a PATCH
+    /// of it is told to poll the id and submits nothing, so the registration's
+    /// entry in the job queue, and with it the claim that keeps a second POST
+    /// off its id, stay its own. Before this, the update job's status took
+    /// the entry and the second POST was admitted under the same id; a DELETE
+    /// then cancelled the first registration alone, whose end released the
+    /// shared reservation, and the second registered under a fresh id.
+    #[tokio::test]
+    async fn a_patch_of_a_registration_in_flight_is_told_to_poll_it_and_leaves_its_claim() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.5:8000";
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        // A queue that accepts jobs and never runs one: no slot to run one in.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+        let id = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect("the first POST is admitted")
+            .worker_id;
+        let patch: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"tier": "a"}})).expect("an update");
+        let err = service
+            .update_worker(id.as_str(), patch)
+            .await
+            .expect_err("the registration is in flight");
+        assert!(
+            matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
+            "{err:?}"
+        );
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("the registration still holds the URL");
+        assert!(
+            matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
+            "a second POST was admitted beside the registration: {err:?}"
+        );
     }
 
     /// The status, the body and the Retry-After header of an error's answer.
