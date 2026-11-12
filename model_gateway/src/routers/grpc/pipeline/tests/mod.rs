@@ -2714,22 +2714,44 @@ async fn a_harmony_responses_request_s_stop_sequences_reach_the_engine() {
 /// The tool loop's saving rests on one fact: when an iteration's run
 /// returns, nothing else holds the loop's request, so the loop takes it
 /// back by a move (`owned_request`). This pins that fact for the
-/// non-streamed iteration: a later holder of the request past the run
-/// fails here instead of silently restoring the per-turn deep copy.
+/// non-streamed iteration: the iteration runs to its result over the stub,
+/// so the build stage's spec did hold a share of the request, and a later
+/// holder of the request past the run fails here instead of silently
+/// restoring the per-turn deep copy.
 #[tokio::test]
 async fn a_harmony_responses_iteration_releases_its_share_of_the_request_when_it_returns() {
-    let port = spawn_stub(GatedScheduler::default()).await;
+    let scheduler = GatedScheduler::default();
+    let port = spawn_stub(scheduler.clone()).await;
     let worker_registry = Arc::new(WorkerRegistry::new());
     let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
     let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
 
-    let request = responses_request(false);
-    // The iteration's outcome is not the point: run or refused, the
-    // context that took a share of the request is gone when this returns.
-    let _ = ctx
+    let request: Arc<ResponsesRequest> = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "input": "hi",
+            "stream": false,
+        }))
+        .expect("responses request"),
+    );
+    // The iteration must have been built and dispatched: only then did the
+    // build stage's spec hold a share of the request for this test to see
+    // released. The result stays alive through the count, as the loop's
+    // does when it takes the request back.
+    let _result = ctx
         .pipeline
         .execute_harmony_responses(&request, &ctx, None)
-        .await;
+        .await
+        .expect("the non-streamed iteration runs to its result");
+    assert_eq!(
+        scheduler
+            .seen_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1,
+        "the iteration reached the engine"
+    );
     assert_eq!(
         Arc::strong_count(&request),
         1,
