@@ -1782,7 +1782,10 @@ async fn grpc_serves_an_answer_filed_under_a_text_to_the_prompt_that_holds_it() 
         state["marked"], 0,
         "each filed answer was served once: {state}"
     );
-    assert_eq!(state["hits"], 2, "{state}");
+    assert_eq!(
+        state["hits"], 2,
+        "the two prompts that hold a filed text, not the miss: {state}"
+    );
     assert_eq!(state["misses"], 1, "{state}");
 }
 
