@@ -602,6 +602,21 @@ impl ChatCompletionRequest {
             .or_else(|| provider.thinking_from_reasoning_effort(self.effective_reasoning_effort()))
     }
 
+    /// The `reasoning_effort` the prompt is rendered with: the effective
+    /// effort as the model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    /// The gateway's kwargs merge adds the template's own switch sent in
+    /// `chat_template_kwargs` where the template reads that key
+    /// ([`ProviderProfile::thinking_from_template_kwargs`] under the detected
+    /// thinking key, which this crate cannot know).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.effective_reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
+    }
+
     /// Whether `continue_final_message` applies: it is set and the request
     /// ends with an assistant message.
     pub fn continues_final_assistant(&self) -> bool {
@@ -1401,7 +1416,10 @@ mod tests {
         ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
         ThinkingParam, ThinkingType,
     };
-    use crate::common::{FunctionCallDelta, ToolCallDelta};
+    use crate::{
+        common::{FunctionCallDelta, ToolCallDelta},
+        profile::ProviderProfile,
+    };
 
     /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
     /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
@@ -1625,13 +1643,14 @@ mod tests {
         assert!(!back.stream_reasoning);
     }
 
-    /// The MiniMax contract reads `reasoning_effort` by its own rule: `none`
-    /// (the default depth) and `minimal` (`low`) keep thinking on; every
-    /// other profile keeps the OpenAI reading. An explicit `thinking.type:
-    /// disabled` wins over any effort under every profile, as an explicit
-    /// toggle wins over the effort in the engine's own server.
+    /// `none` switches thinking off under every profile (under MiniMax the
+    /// contract's reading: the request answers as `thinking.type: disabled`
+    /// does); `minimal` does under the OpenAI reading and is MiniMax's lowest
+    /// level, thinking on; a level leaves the template's default. An explicit
+    /// `thinking.type` wins over any effort under every profile, as an
+    /// explicit toggle wins over the effort in the engine's own server.
     #[test]
-    fn minimax_profile_keeps_thinking_on_for_every_effort() {
+    fn none_switches_thinking_off_under_every_profile_and_minimal_is_minimax_low() {
         let request = |model: &str, fields: Value| -> ChatCompletionRequest {
             let mut value = json!({"model": model, "messages": []});
             value
@@ -1640,56 +1659,160 @@ mod tests {
                 .extend(fields.as_object().cloned().unwrap_or_default());
             serde_json::from_value(value).unwrap()
         };
-        for effort in ["none", "minimal", "low", "high", "max"] {
+        for model in [
+            "MiniMax-M3",
+            "self-hosted-model",
+            "kimi-k3",
+            "deepseek-v4.1",
+        ] {
             assert_eq!(
-                request("MiniMax-M3", json!({"reasoning_effort": effort})).template_thinking(),
-                None,
-                "MiniMax {effort}: the template's default, thinking on"
+                request(model, json!({"reasoning_effort": "minimal"})).template_thinking(),
+                if model == "MiniMax-M3" {
+                    None
+                } else {
+                    Some(false)
+                },
+                "{model} minimal"
             );
-            assert_eq!(
-                request(
-                    "MiniMax-M3",
-                    json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
-                )
-                .template_thinking(),
-                Some(false),
-                "MiniMax {effort}: thinking.disabled wins"
-            );
-        }
-        assert_eq!(
-            request("MiniMax-M3", json!({"thinking": {"type": "disabled"}})).template_thinking(),
-            Some(false),
-            "thinking.disabled alone switches thinking off"
-        );
-        assert_eq!(
-            request(
-                "MiniMax-M3",
-                json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}})
-            )
-            .template_thinking(),
-            Some(true)
-        );
-        for model in ["self-hosted-model", "kimi-k3", "deepseek-v4.1"] {
             assert_eq!(
                 request(model, json!({"reasoning_effort": "none"})).template_thinking(),
                 Some(false),
-                "{model}: the OpenAI reading, none switches thinking off"
+                "{model} none: thinking off"
             );
             assert_eq!(
                 request(
                     model,
-                    json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}})
+                    json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}})
                 )
                 .template_thinking(),
-                Some(false),
-                "{model}: thinking.disabled wins"
+                Some(true),
+                "{model} none: thinking.enabled wins"
             );
+            for effort in ["low", "high", "max"] {
+                assert_eq!(
+                    request(model, json!({"reasoning_effort": effort})).template_thinking(),
+                    None,
+                    "{model} {effort}: the template's default"
+                );
+                assert_eq!(
+                    request(
+                        model,
+                        json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
+                    )
+                    .template_thinking(),
+                    Some(false),
+                    "{model} {effort}: thinking.disabled wins"
+                );
+            }
             assert_eq!(
-                request(model, json!({"reasoning_effort": "high"})).template_thinking(),
-                None,
-                "{model}"
+                request(model, json!({"thinking": {"type": "disabled"}})).template_thinking(),
+                Some(false),
+                "{model}: thinking.disabled alone switches thinking off"
             );
         }
+    }
+
+    /// The effort the template renders is the profile's second reading of
+    /// the field: the value as sent under the default profile; under MiniMax
+    /// a level the contract names only (`minimal` as `low`), and none while
+    /// thinking is off (the typed toggle or the effort; the template's own
+    /// switch sent as a kwarg is the gateway's to apply, see
+    /// [`thinking_from_template_kwargs_reads_the_minimax_switch`]).
+    #[test]
+    fn template_reasoning_effort_follows_the_profile() {
+        let request = |fields: Value| -> ChatCompletionRequest {
+            let mut value = json!({"model": "m", "messages": []});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(value).unwrap()
+        };
+        for (fields, minimax, generic) in [
+            (
+                json!({"reasoning_effort": "high"}),
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"reasoning_effort": "xhigh"}),
+                Some("xhigh"),
+                Some("xhigh"),
+            ),
+            (
+                json!({"thinking": {"type": "enabled", "effort": "low"}, "reasoning_effort": "max"}),
+                Some("low"),
+                Some("low"),
+            ),
+            (json!({"reasoning_effort": "none"}), None, Some("none")),
+            (
+                json!({"reasoning_effort": "minimal"}),
+                Some("low"),
+                Some("minimal"),
+            ),
+            (
+                json!({"reasoning_effort": "ultra_super_max_xyz"}),
+                None,
+                Some("ultra_super_max_xyz"),
+            ),
+            (
+                json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}}),
+                None,
+                Some("high"),
+            ),
+            (
+                json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}}),
+                None,
+                Some("none"),
+            ),
+            // A kwarg switch is not this method's to read: the gateway applies
+            // it where the template reads that key.
+            (
+                json!({"reasoning_effort": "high", "chat_template_kwargs": {"thinking_mode": "disabled"}}),
+                Some("high"),
+                Some("high"),
+            ),
+            (json!({}), None, None),
+        ] {
+            assert_eq!(
+                request(fields.clone()).template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax,
+                "MiniMax {fields}"
+            );
+            assert_eq!(
+                request(fields.clone()).template_reasoning_effort_for(ProviderProfile::Generic),
+                generic,
+                "generic {fields}"
+            );
+        }
+    }
+
+    /// The template's own `thinking_mode` switch sent as a kwarg, read by the
+    /// profile that knows its templates' key; the gateway applies it where the
+    /// template reads that key.
+    #[test]
+    fn thinking_from_template_kwargs_reads_the_minimax_switch() {
+        let kwargs = |mode: &str| {
+            std::collections::HashMap::from([("thinking_mode".to_string(), json!(mode))])
+        };
+        let minimax = ProviderProfile::Minimax;
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("enabled"))),
+            Some(true)
+        );
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("disabled"))),
+            Some(false)
+        );
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("adaptive"))),
+            None
+        );
+        assert_eq!(minimax.thinking_from_template_kwargs(None), None);
+        assert_eq!(
+            ProviderProfile::Generic.thinking_from_template_kwargs(Some(&kwargs("disabled"))),
+            None
+        );
     }
 
     #[test]

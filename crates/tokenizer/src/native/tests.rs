@@ -344,6 +344,30 @@ fn shapes() -> Vec<Shape> {
             special: &["<|im_start|>", "<|im_end|>", "[e~[", "]~b]"],
             added: &[],
         },
+        // A lone `Removed` split before a `ByteLevel` without its regex: the
+        // gaps alone, under the generic walk (the single-stage loop takes a
+        // stage whose pieces are its matches). The literal is the space: the
+        // stage matches at every space, so the chunking sweeps find their
+        // cuts there (a lone stage that never matches at a space leaves a
+        // long text one unit).
+        Shape {
+            name: "removed-literal",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Split(
+                    Split::new(
+                        SplitPattern::String(" ".to_owned()),
+                        SplitDelimiterBehavior::Removed,
+                        false,
+                    )
+                    .expect("split"),
+                ),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+        },
         Shape {
             name: "byte-level-regex",
             normalizer: Normalizer::None,
@@ -468,6 +492,30 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+        },
+        // A literal split with `Removed` first (the first stage of a parse
+        // family's chain): its matches are dropped, the pieces on either
+        // side of one stay apart through the later stages and the model,
+        // and two adjacent matches leave no piece between them. The dash is
+        // in the random texts' pool, so the sweeps cut at it.
+        Shape {
+            name: "removed-literal-then-digits-then-byte-level-regex",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Split(
+                    Split::new(
+                        SplitPattern::String("-".to_owned()),
+                        SplitDelimiterBehavior::Removed,
+                        false,
+                    )
+                    .expect("split"),
+                ),
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[("<tool_call>", false)],
         },
         // `Digits` in runs before a split and the `ByteLevel`.
         Shape {
@@ -682,8 +730,8 @@ fn shapes_outside_the_path_are_declined() {
     ]))));
     assert_eq!(
         declined(&tokenizer),
-        "Split behavior Some(\"MergedWithNext\") with invert Some(false) (only Isolated, or \
-             Removed inverted)"
+        "Split behavior Some(\"MergedWithNext\") with invert Some(false) (only Isolated, \
+             Removed, or Removed inverted)"
     );
     // A punctuation behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -987,6 +1035,35 @@ fn digit_groups_are_cut_from_the_end_of_a_run_as_the_library_does() {
                 "{text:?} parallel {parallel}"
             );
         }
+    }
+}
+
+#[test]
+fn a_removed_split_drops_its_matches_as_the_library_does() {
+    // The removed-literal shape on texts with the literal between words,
+    // twice in a row, at both ends, alone, next to a digit, a line break
+    // and an added token, and absent.
+    let mut state = 0x5245_4D4F_5645_4401u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "removed-literal-then-digits-then-byte-level-regex")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "the-final--countdown",
+        "-lead and trail-",
+        "---",
+        "a-1-b 22-33\n-<tool_call>-x",
+        "<|endoftext|>-",
+        "no match at all",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
     }
 }
 
@@ -4004,13 +4081,15 @@ fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
         };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.keep_gaps && cursor < start {
+            if stage.pieces.gaps() && cursor < start {
                 walk(rest, &text[cursor..start], offset + cursor, out);
             }
-            walk(rest, &text[start..end], offset + start, out);
+            if stage.pieces.matches() {
+                walk(rest, &text[start..end], offset + start, out);
+            }
             cursor = end;
         }
-        if stage.keep_gaps && cursor < text.len() {
+        if stage.pieces.gaps() && cursor < text.len() {
             walk(rest, &text[cursor..], offset + cursor, out);
         }
     }
@@ -4070,7 +4149,7 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
         .iter()
         .map(|pattern| Stage {
             pattern: Pattern::parse(pattern).expect("parses"),
-            keep_gaps: true,
+            pieces: Pieces::MatchesAndGaps,
         })
         .collect();
     let scanner = chain::Scanner::recognize(&stages).expect("the chain takes the scanner");
@@ -4078,7 +4157,7 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
         .iter()
         .map(|stage| Stage {
             pattern: stage.pattern.program_only(),
-            keep_gaps: stage.keep_gaps,
+            pieces: stage.pieces,
         })
         .collect();
     let fixtures = fixture_texts();
