@@ -266,7 +266,9 @@ message RequestFacts {
   bytes prompt_text = 18;
 }
 
-// What only the deciding gateway knows now.
+// What only the deciding gateway knows now. Its standing vetoes are not here:
+// the controller applies them to that gateway's candidate rows before any stage
+// runs (the vetoed worker reads breaker-open there alone).
 message Constraints {
   // Ids this gateway just failed to connect to.
   repeated fixed64 excluded = 1 [packed = true];
@@ -512,7 +514,10 @@ message Signal {
     uint32 health = 4;
     // The worker's standing veto aggregated over every gateway: it stands
     // while any gateway holds one, the micros are the longest remaining, 0
-    // only when none remains; the veto's end instant is host-only.
+    // only when none remains; the veto's end instant is host-only. The
+    // deciding gateway's own veto is applied before any stage runs: the worker
+    // reads breaker-open in that gateway's candidate rows alone, so a plugin
+    // never needs this signal to honour it.
     uint32 gateway_veto_micros = 5;
   }
 }
