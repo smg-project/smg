@@ -876,4 +876,31 @@ mod tests {
         // bootstrap_host should be "prefill1", not "3"
         assert_eq!(worker.metadata().spec.bootstrap_host, "prefill1");
     }
+
+    /// A URL registered with a trailing slash keeps it as the registry's key
+    /// (`url()`), and every join reads one slash: the base URL carries none,
+    /// for the worker and for a data-parallel rank of it.
+    #[test]
+    fn a_trailing_slash_on_the_registered_url_is_not_in_the_join_base() {
+        let worker = BasicWorkerBuilder::new("http://h:8000/").build();
+        assert_eq!(worker.url(), "http://h:8000/");
+        assert_eq!(worker.base_url(), "http://h:8000");
+        assert_eq!(
+            worker.endpoint_url("/get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+        assert_eq!(
+            format!("{}/{}", worker.base_url(), "get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+
+        let rank = BasicWorkerBuilder::new("http://h:8000/")
+            .dp_config(3, 8)
+            .build();
+        assert_eq!(rank.base_url(), "http://h:8000");
+        assert_eq!(
+            rank.endpoint_url("/get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+    }
 }

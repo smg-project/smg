@@ -126,12 +126,16 @@ impl WorkerMetadata {
         self.spec.bootstrap_port
     }
 
-    /// Get the base URL without any DP rank suffix.
+    /// The base URL without any DP rank suffix and without a trailing
+    /// slash: every route joins to it with one slash, however the URL was
+    /// registered. The worker's `url()` keeps the registered form, the registry's key.
     pub fn base_url(&self) -> &str {
-        self.spec
-            .dp_base_url
-            .as_deref()
-            .unwrap_or(self.spec.url.as_str())
+        join_base(
+            self.spec
+                .dp_base_url
+                .as_deref()
+                .unwrap_or(self.spec.url.as_str()),
+        )
     }
 
     /// Compose an endpoint URL for a specific route.
@@ -271,4 +275,11 @@ impl WorkerMetadata {
     pub fn is_wildcard(&self) -> bool {
         self.spec.models.is_wildcard()
     }
+}
+
+/// The form of a URL a route is joined to: no trailing slash, so both joins
+/// in use, `{base}/{route}` and `{base}{route}`, read one slash whether the
+/// URL was registered as `http://h:8000` or `http://h:8000/`.
+pub(crate) fn join_base(url: &str) -> &str {
+    url.trim_end_matches('/')
 }
