@@ -305,7 +305,7 @@ enum BodyRead {
 /// client left only when the body next yields, and the engine request behind
 /// the body would run on as long. Here every read races the body against the
 /// client's leaving, looked at first so a busy body cannot outrun it; on
-/// [`BodyRead::ClientLeft`] the caller returns, the body is dropped with it,
+/// [`BodyRead::ClientLeft`] the caller ends its read and drops the body,
 /// and the chat layer ends the engine request the way it does for its own
 /// clients. A background response's `tx` is the sender of its relay, which
 /// closes with the work and not with the client: its reads are the body's
@@ -316,6 +316,63 @@ async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
         () = tx.closed() => BodyRead::ClientLeft,
         frame = stream.next() => frame.map_or(BodyRead::End, BodyRead::Frame),
     }
+}
+
+/// The record of a stored foreground stream whose client left mid-stream, as
+/// the `response.created` it announced promised: the items streamed so far
+/// (the open ones closed, in progress), status `cancelled` when no finish had
+/// been read (a finish the stream had read stands, with its own statuses), the
+/// status the background cancel path writes for a response stopped before its end; the
+/// GET and a `previous_response_id` chain answer from it. The emitter is
+/// abandoned first: its item events are built into the object and sent to
+/// nobody. An unstored stream records nothing, as before; a background one
+/// never meets the departure (its relay outlives the client). The chat body
+/// has gone with the frame loop, which ended the generation on the engine.
+/// The answer is the departure, as before.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the record takes the storage handles of the transform it ends"
+)]
+async fn record_departure(
+    mut event_emitter: ResponseStreamEventEmitter,
+    usage: Option<Usage>,
+    original_request: &ResponsesRequest,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
+    request_context: Option<StorageRequestContext>,
+    tx: &SseSender,
+) -> Result<(), String> {
+    if stored_foreground(original_request) {
+        event_emitter.abandon();
+        // A finish the stream had already read stands (a `length` finish
+        // keeps its `incomplete_details`); only a generation cut before its
+        // finish is recorded as cancelled.
+        if event_emitter.finish_reason().is_none() {
+            event_emitter.set_finish_reason(Some("cancelled"));
+        }
+        event_emitter.close_items(tx).await?;
+        let final_response = event_emitter.finalize(usage);
+        if let Err(e) = persist_response_if_needed(
+            conversation_storage,
+            conversation_item_storage,
+            response_storage,
+            &final_response,
+            original_request,
+            tenant,
+            request_context,
+        )
+        .await
+        {
+            debug!(
+                response_id = %final_response.id,
+                error = %e.message,
+                "The record of a stream its client left could not be written"
+            );
+        }
+    }
+    Err("Client disconnected".to_string())
 }
 
 /// Process chat SSE stream and transform to responses format
@@ -371,6 +428,9 @@ async fn process_and_transform_sse_stream(
     let mut stream = body.into_data_stream();
 
     let mut terminal_error = None;
+    // The client left: met by the body read, by an event it no longer takes,
+    // or by the emitter's send. The loop ends there.
+    let mut client_left = false;
     // Process the stream frame by frame; a frame holds one or more SSE events.
     'frames: loop {
         let chunk = match next_frame(&mut stream, &tx).await {
@@ -380,10 +440,10 @@ async fn process_and_transform_sse_stream(
                 break;
             }
             BodyRead::End => break,
-            // The chat body goes with this return, which ends the generation
-            // on the engine; the stream ends as it does when the client's
-            // leaving is met at the next frame, and nothing of it is stored.
-            BodyRead::ClientLeft => return Err("Client disconnected".to_string()),
+            BodyRead::ClientLeft => {
+                client_left = true;
+                break;
+            }
         };
 
         let frame = frame_text(&chunk);
@@ -394,7 +454,13 @@ async fn process_and_transform_sse_stream(
                     if let Some(chunk_usage) = &chat_chunk.usage {
                         usage = Some(chunk_usage.clone());
                     }
-                    event_emitter.process_chunk(&chat_chunk, &tx).await?;
+                    if let Err(error) = event_emitter.process_chunk(&chat_chunk, &tx).await {
+                        if tx.is_closed() {
+                            client_left = true;
+                            break 'frames;
+                        }
+                        return Err(error);
+                    }
                 }
                 ChatSseEvent::UpstreamError(error) => {
                     terminal_error = Some(error);
@@ -408,11 +474,32 @@ async fn process_and_transform_sse_stream(
                         .await
                         .is_err()
                     {
-                        return Err("Client disconnected".to_string());
+                        client_left = true;
+                        break 'frames;
                     }
                 }
             }
         }
+    }
+
+    // The chat body goes here, which ends the generation on the engine (on
+    // the client's leaving as the early return did; on every other end the
+    // body is spent). A stored foreground stream its client left is still
+    // recorded, under the id it announced; the answer is the departure.
+    drop(stream);
+    if client_left {
+        return record_departure(
+            event_emitter,
+            usage,
+            &original_request,
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            tenant.as_deref(),
+            request_context,
+            &tx,
+        )
+        .await;
     }
 
     // The final object is the emitter's own: the items its events announced,
@@ -1757,6 +1844,291 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection reset"));
+    }
+
+    /// A stored foreground stream whose client leaves mid-stream keeps the
+    /// promise `response.created` made: its record is written with the items
+    /// streamed so far (closed in progress) and status `cancelled`, while the
+    /// chat body is dropped with the read, as before; an unstored one records
+    /// nothing. The transform answers the departure either way.
+    #[tokio::test]
+    async fn a_stored_stream_whose_client_leaves_is_recorded_as_cancelled() {
+        for store in [true, false] {
+            let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let body = Body::from_stream(ReceiverStream::new(body_rx));
+            let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+            let (tx, mut rx) = mpsc::channel(64);
+            let transform = process_and_transform_sse_stream(
+                body,
+                ResponsesRequest {
+                    store: Some(store),
+                    ..Default::default()
+                },
+                None,
+                storage.clone(),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                None,
+                tx,
+            );
+            let client = async move {
+                body_tx
+                    .send(Ok(Bytes::from(chat_event(
+                        json!({"content":"Hello"}),
+                        None,
+                    ))))
+                    .await
+                    .unwrap();
+                // The client reads up to the text it was streamed, then leaves.
+                let mut id = None;
+                'read: while let Some(Ok(bytes)) = rx.recv().await {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                        let event: Value = serde_json::from_str(data).unwrap();
+                        if event["type"] == "response.created" {
+                            id = event["response"]["id"].as_str().map(str::to_string);
+                        }
+                        if event["type"] == "response.output_text.delta" {
+                            break 'read;
+                        }
+                    }
+                }
+                drop(rx);
+                (id.expect("response.created names the id"), body_tx)
+            };
+            // The joined futures are large; boxed, they stay off the test's stack.
+            let (outcome, (id, body_tx)) = Box::pin(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                async { tokio::join!(transform, client) },
+            ))
+            .await
+            .expect("the body never ends; the client's leaving ends the read");
+            assert_eq!(outcome.unwrap_err(), "Client disconnected");
+            assert!(
+                body_tx.is_closed(),
+                "the chat body is dropped with the read"
+            );
+            let record = storage
+                .get_response(&smg_data_connector::ResponseId::from(id.as_str()))
+                .await
+                .unwrap();
+            if !store {
+                assert!(record.is_none(), "an unstored response records nothing");
+                continue;
+            }
+            let stored = record.expect("the stored stream's record").raw_response;
+            assert_eq!(stored["status"], "cancelled", "{stored}");
+            assert!(stored["error"].is_null(), "{stored}");
+            assert!(stored["incomplete_details"].is_null(), "{stored}");
+            assert_eq!(stored["output"][0]["type"], "message", "{stored}");
+            assert_eq!(stored["output"][0]["status"], "in_progress", "{stored}");
+            assert_eq!(stored["output"][0]["content"][0]["text"], "Hello");
+            assert!(
+                stored["output"][0]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("msg_")),
+                "{stored}"
+            );
+        }
+    }
+
+    /// Reads the client's SSE frames up to the first event of `event_type`
+    /// and returns the id `response.created` announced.
+    async fn read_until<E>(rx: &mut mpsc::Receiver<Result<Bytes, E>>, event_type: &str) -> String {
+        let mut id = None;
+        'read: while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                let event: Value = serde_json::from_str(data).unwrap();
+                if event["type"] == "response.created" {
+                    id = event["response"]["id"].as_str().map(str::to_string);
+                }
+                if event["type"] == event_type {
+                    break 'read;
+                }
+            }
+        }
+        id.expect("response.created names the id")
+    }
+
+    /// The stored object of the response `id`.
+    async fn stored_record(storage: &smg_data_connector::MemoryResponseStorage, id: &str) -> Value {
+        storage
+            .get_response(&smg_data_connector::ResponseId::from(id))
+            .await
+            .unwrap()
+            .expect("the stored stream's record")
+            .raw_response
+    }
+
+    /// The client leaves while the message's closing events are being sent
+    /// (an SSE channel of one slot: the client reads up to the text delta and
+    /// leaves, so the first closing event's send meets the dead client). The
+    /// item was stored before that send, and the finish had been read: the
+    /// record keeps the message, completed, under the stream's own finish.
+    #[tokio::test]
+    async fn a_client_that_leaves_during_the_closing_events_keeps_the_streamed_message() {
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        let transform = process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(true),
+                ..Default::default()
+            },
+            None,
+            storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        );
+        let client = async move {
+            for frame in [
+                chat_event(json!({"content":"Hello"}), None),
+                chat_event(json!({}), Some("stop")),
+            ] {
+                body_tx.send(Ok(Bytes::from(frame))).await.unwrap();
+            }
+            let id = read_until(&mut rx, "response.output_text.delta").await;
+            drop(rx);
+            (id, body_tx)
+        };
+        let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(transform, client) },
+        ))
+        .await
+        .expect("the client's leaving ends the read");
+        assert_eq!(outcome.unwrap_err(), "Client disconnected");
+        let stored = stored_record(&storage, &id).await;
+        assert_eq!(stored["status"], "completed", "{stored}");
+        assert_eq!(stored["output"][0]["type"], "message", "{stored}");
+        assert_eq!(stored["output"][0]["status"], "completed", "{stored}");
+        assert_eq!(
+            stored["output"][0]["content"][0]["text"], "Hello",
+            "{stored}"
+        );
+    }
+
+    /// A finish the stream had already read stands when the client leaves
+    /// before the body ends: a `length` finish is recorded `incomplete` with
+    /// its `incomplete_details`, not `cancelled`, and the message it closed
+    /// keeps its text.
+    #[tokio::test]
+    async fn a_client_that_leaves_after_the_finish_keeps_the_finish() {
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(64);
+        let transform = process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(true),
+                ..Default::default()
+            },
+            None,
+            storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        );
+        let client = async move {
+            for frame in [
+                chat_event(json!({"content":"Hello"}), None),
+                chat_event(json!({}), Some("length")),
+            ] {
+                body_tx.send(Ok(Bytes::from(frame))).await.unwrap();
+            }
+            // The message closed under the finish; the client leaves before
+            // the body ends (no usage chunk, no `[DONE]` yet).
+            let id = read_until(&mut rx, "response.output_item.done").await;
+            drop(rx);
+            (id, body_tx)
+        };
+        let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(transform, client) },
+        ))
+        .await
+        .expect("the client's leaving ends the read");
+        assert_eq!(outcome.unwrap_err(), "Client disconnected");
+        let stored = stored_record(&storage, &id).await;
+        assert_eq!(stored["status"], "incomplete", "{stored}");
+        assert_eq!(
+            stored["incomplete_details"]["reason"], "max_output_tokens",
+            "{stored}"
+        );
+        assert_eq!(
+            stored["output"][0]["content"][0]["text"], "Hello",
+            "{stored}"
+        );
+        assert_ne!(stored["output"][0]["status"], "in_progress", "{stored}");
+    }
+
+    /// Under `cancelled` every item still open when the client left reads
+    /// `in_progress`: a reasoning item, a function call with partial
+    /// arguments, as the message does.
+    #[tokio::test]
+    async fn a_cancelled_record_closes_the_open_reasoning_and_call_items_in_progress() {
+        for (delta, leave_at, item_type) in [
+            (
+                json!({"reasoning_content":"think"}),
+                "response.reasoning_text.delta",
+                "reasoning",
+            ),
+            (
+                json!({"tool_calls":[{"index":0,"id":"call_open","type":"function",
+                    "function":{"name":"lookup","arguments":"{\"q\":"}}]}),
+                "response.function_call_arguments.delta",
+                "function_call",
+            ),
+        ] {
+            let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let body = Body::from_stream(ReceiverStream::new(body_rx));
+            let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+            let (tx, mut rx) = mpsc::channel(64);
+            let transform = process_and_transform_sse_stream(
+                body,
+                ResponsesRequest {
+                    store: Some(true),
+                    ..Default::default()
+                },
+                None,
+                storage.clone(),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                None,
+                tx,
+            );
+            let client = async move {
+                body_tx
+                    .send(Ok(Bytes::from(chat_event(delta, None))))
+                    .await
+                    .unwrap();
+                let id = read_until(&mut rx, leave_at).await;
+                drop(rx);
+                (id, body_tx)
+            };
+            let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                async { tokio::join!(transform, client) },
+            ))
+            .await
+            .expect("the client's leaving ends the read");
+            assert_eq!(outcome.unwrap_err(), "Client disconnected");
+            let stored = stored_record(&storage, &id).await;
+            assert_eq!(stored["status"], "cancelled", "{item_type}: {stored}");
+            assert_eq!(stored["output"][0]["type"], item_type, "{stored}");
+            assert_eq!(stored["output"][0]["status"], "in_progress", "{stored}");
+        }
     }
 
     /// The reader parked on a chat body that stalled (nothing more on it)
