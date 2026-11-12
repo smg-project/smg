@@ -61,6 +61,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A web search call parses as the public API writes it: a `find_in_page` action (the crate named
+  it `find`, which still reads and is now written `find_in_page`), an `open_page` action without
+  a URL or with a null one, and the `incomplete` status. The crate refused each as an unknown
+  variant or a missing field. Breaking: `WebSearchCallStatus` gains `Incomplete`, and
+  `WebSearchAction::OpenPage.url` is `Option<String>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

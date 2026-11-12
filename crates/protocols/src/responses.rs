@@ -2650,7 +2650,7 @@ pub enum ResponseOutputItem {
 // Built-in Tool Call Types
 // ============================================================================
 
-/// Status for web search tool calls.
+/// Status for web search tool calls (`WebSearchCallStatus` in the spec).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebSearchCallStatus {
@@ -2658,6 +2658,7 @@ pub enum WebSearchCallStatus {
     Searching,
     Completed,
     Failed,
+    Incomplete,
 }
 
 /// Action performed during a web search.
@@ -2672,13 +2673,16 @@ pub enum WebSearchAction {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sources: Vec<WebSearchSource>,
     },
+    /// The page the model opened. The public API does not require the URL,
+    /// and may write it as `null`.
     OpenPage {
-        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
-    Find {
-        url: String,
-        pattern: String,
-    },
+    /// A search for a pattern in a page. The public API names the action
+    /// `find_in_page`; `find`, the name this crate wrote before, still reads.
+    #[serde(rename = "find_in_page", alias = "find")]
+    Find { url: String, pattern: String },
 }
 
 /// A source returned from web search.
