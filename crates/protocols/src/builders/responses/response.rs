@@ -585,6 +585,9 @@ mod tests {
             reasoning: Some(ResponseReasoningParam {
                 effort: Some(ReasoningEffort::High),
                 summary: Some(ReasoningSummary::Concise),
+                mode: None,
+                context: None,
+                generate_summary: None,
             }),
             service_tier: Some(ServiceTier::Flex),
             truncation: Some(Truncation::Auto),
