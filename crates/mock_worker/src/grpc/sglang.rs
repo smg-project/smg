@@ -1246,12 +1246,17 @@ mod tests {
             image_urls: vec!["https://example.test/a.png".to_string()],
             ..Default::default()
         };
+        let video = sg::MultimodalInputs {
+            video_urls: vec!["https://example.test/a.mp4".to_string()],
+            ..Default::default()
+        };
         let audio = sg::MultimodalInputs {
             audio_urls: vec!["https://example.test/a.wav".to_string()],
             ..Default::default()
         };
         for (id, primary) in [
             ("sg-mm-ref-extra", reference.clone()),
+            ("sg-mm-ref-video-extra", video),
             ("sg-mm-ref-audio-extra", audio),
         ] {
             let mut req = with_batch(request(id, &[1, 9, 9, 2], true), primary);
