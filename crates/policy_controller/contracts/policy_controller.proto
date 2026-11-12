@@ -610,6 +610,8 @@ message SnapshotRequest {
 }
 
 message Snapshot {
+  // The leader's term at the snapshot (the fencing floor), not the write term
+  // of any position: that is `replication_term`.
   uint64 term = 1;
   uint64 generation = 2;
   string controller_id = 3;
@@ -625,8 +627,9 @@ message Snapshot {
   repeated GatewayRow gateways = 13;
   bool truncated = 14;
   // The log position the snapshot is consistent with (a standby rejoins with
-  // `last_applied_seq` here); non-zero only on a complete, unredacted snapshot
-  // of the replication scope, zero on a partial or redacted one.
+  // `last_applied_seq` here and `last_applied_term` = `replication_term`);
+  // non-zero only on a complete, unredacted snapshot of the replication scope,
+  // zero on a partial or redacted one.
   uint64 replication_seq = 15;
   // The interned-id table at that position.
   IdAssignment ids = 16;
@@ -635,6 +638,9 @@ message Snapshot {
   // answers GetPolicySpec alike from either path; present with
   // `replication_seq`.
   repeated GenerationEvent documents = 17;
+  // The term the event at `replication_seq` was written under; present with
+  // it, zero with it.
+  uint64 replication_term = 18;
 }
 
 // The health precedence's inputs.
@@ -907,9 +913,18 @@ message ReplicaFrame {
 message ReplicaHello {
   string replica_id = 1;
   uint64 last_applied_seq = 2;
+  // The highest term seen: the fencing floor, not the term of any position.
   uint64 term_seen = 3;
   // Events the standby can hold unacknowledged; the leader cuts a slower one.
   uint32 max_backlog = 4;
+  // The term the event at `last_applied_seq` was written under. A leader whose
+  // log holds that position under another term answers a resync_required
+  // batch, never a continuation: two replicas that agree on a position and its
+  // term share the prefix before it, and a WatchWorkers resume relies on that.
+  // A standby seeds both from a snapshot's `replication_seq` and
+  // `replication_term`; a non-zero `last_applied_seq` with a zero term is
+  // answered resync_required as well.
+  uint64 last_applied_term = 5;
 }
 
 message ReplicationAck {
@@ -918,9 +933,14 @@ message ReplicationAck {
 
 message ReplicationBatch {
   uint64 first_seq = 1;
+  // The term every event of the batch was written under, never the sender's
+  // current term: a catch-up batch splits at a term boundary, so a standby
+  // records each position under its write term.
   uint64 term = 2;
   repeated ReplicationEvent events = 3;
-  // The standby's backlog was cut: re-sync from GetSnapshot, then rejoin.
+  // The standby's backlog was cut, or its `last_applied_seq` is held under
+  // another term: re-sync from GetSnapshot (its `replication_seq` and
+  // `replication_term` seed the next hello), then rejoin.
   bool resync_required = 4;
 }
 
