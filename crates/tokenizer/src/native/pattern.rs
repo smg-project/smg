@@ -258,6 +258,35 @@ fn in_categories(categories: u16, code: u32) -> bool {
 }
 
 impl Class {
+    /// The class's one code point, when it is exactly one (no category, no
+    /// exclusion, one range of one code point, not negated).
+    fn single_code_point(&self) -> Option<char> {
+        match (
+            self.negated,
+            self.categories,
+            self.without,
+            self.ranges.as_slice(),
+        ) {
+            (false, 0, 0, [(start, end)]) if start == end => char::from_u32(*start),
+            _ => None,
+        }
+    }
+
+    /// Whether the two classes are categories with none in common and
+    /// nothing else (no range, no exclusion, no negation): no character is in
+    /// both.
+    fn categories_apart(&self, other: &Self) -> bool {
+        !self.negated
+            && !other.negated
+            && self.without == 0
+            && other.without == 0
+            && self.ranges.is_empty()
+            && other.ranges.is_empty()
+            && self.categories != 0
+            && other.categories != 0
+            && self.categories & other.categories == 0
+    }
+
     /// Whether two finished classes are the same set: the same categories,
     /// exclusions, negation and (sorted, merged) ranges.
     fn same_set(&self, other: &Self) -> bool {
@@ -469,6 +498,29 @@ pub(super) enum Node {
         second: usize,
         min: u32,
     },
+    /// `(?:XYZ*)*` as the parser first meets it: the tail of a
+    /// [`Node::JoinedRun`], folded into the run with the `YZ*` before it
+    /// under the outer `+`; one left anywhere else declines the pattern
+    /// ([`joined_tail_loose`]).
+    JoinedTail {
+        join: usize,
+        letter: usize,
+        mark: usize,
+    },
+    /// `(?:YZ*(?:XYZ*)*)+`: a run of `letter`s each with its `mark`s, the
+    /// runs joined one `join` character at a time (a letter run with its
+    /// combining marks, words joined by single spaces, as one family's split
+    /// pattern writes it): one letter and its marks, then letters, marks and
+    /// join-then-letter while they come, taken whole. The join is one code
+    /// point in neither class and the two classes are categories apart, so
+    /// the engine's greedy path through the run is the longest run, and the
+    /// run stands at the end of its alternative ([`unit_run_misplaced`]),
+    /// where nothing follows to give a character back to.
+    JoinedRun {
+        join: usize,
+        letter: usize,
+        mark: usize,
+    },
 }
 
 /// What ends the group run of a digit-grouping lookahead
@@ -625,6 +677,13 @@ enum Op {
         second: usize,
         min: u32,
     },
+    /// A joined letter run: one `letter`, then `mark`s, `letter`s and
+    /// `join`-then-`letter` while they come; taken whole, no choice left.
+    JoinedRun {
+        join: usize,
+        letter: usize,
+        mark: usize,
+    },
     /// A choice: the ops that follow are tried first; `next` is where to go
     /// when they fail (the following alternative's `Split`, the op after an
     /// optional group, or [`NO_NEXT`] for the last alternative). `first`
@@ -743,6 +802,7 @@ impl Pattern {
             || groups_ahead_leads(&root, true)
             || misplaced_run(&root, true)
             || unit_run_misplaced(&root, &parser.classes, Follow::Nothing)
+            || joined_tail_loose(&root)
         {
             return None;
         }
@@ -1186,6 +1246,34 @@ impl Pattern {
                         pos = p;
                         pc += 1;
                         false
+                    }
+                }
+                Op::JoinedRun { join, letter, mark } => {
+                    let letter = &self.classes[letter];
+                    let mark = &self.classes[mark];
+                    let join = &self.classes[join];
+                    match next_char(text, pos) {
+                        Some((c, len)) if letter.contains(c) => {
+                            let mut p = pos + len;
+                            loop {
+                                match next_char(text, p) {
+                                    Some((c, len)) if mark.contains(c) || letter.contains(c) => {
+                                        p += len;
+                                    }
+                                    Some((c, len)) if join.contains(c) => {
+                                        match next_char(text, p + len) {
+                                            Some((d, n)) if letter.contains(d) => p += len + n,
+                                            _ => break,
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            pos = p;
+                            pc += 1;
+                            false
+                        }
+                        _ => true,
                     }
                 }
                 Op::Split { next, first } => {
@@ -1766,6 +1854,14 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             second: *second,
             min: *min,
         }),
+        Node::JoinedRun { join, letter, mark } => program.push(Op::JoinedRun {
+            join: *join,
+            letter: *letter,
+            mark: *mark,
+        }),
+        // A loose tail declines at parse (`joined_tail_loose`); a folded one
+        // is part of its run.
+        Node::JoinedTail { .. } => {}
     }
 }
 
@@ -1782,6 +1878,8 @@ fn choices(node: &Node) -> usize {
         | Node::GroupsAhead { .. }
         | Node::NotAheadSeq { .. }
         | Node::UnitRun { .. }
+        | Node::JoinedTail { .. }
+        | Node::JoinedRun { .. }
         | Node::RunOfOne { .. } => 0,
         Node::ClassRepeat { possessive, .. } => usize::from(!*possessive),
         Node::Repeat { node, max, .. } => {
@@ -1903,9 +2001,31 @@ fn can_match_empty(node: &Node) -> bool {
         | Node::TextEnd
         | Node::SearchStart
         | Node::NotAheadSeq { .. }
+        | Node::JoinedTail { .. }
         | Node::GroupsAhead { .. } => true,
         Node::UnitRun { min, .. } => *min == 0,
         Node::RunOfOne { .. } => false,
+        Node::JoinedRun { .. } => false,
+    }
+}
+
+/// Whether a [`Node::JoinedTail`] stands anywhere under `node` other than
+/// inside the run it belongs to (`quantified` folds that one into a
+/// [`Node::JoinedRun`]): the tail alone is a repeated group the engine runs
+/// with its choice stack, so such a pattern declines.
+fn joined_tail_loose(node: &Node) -> bool {
+    match node {
+        Node::JoinedTail { .. } => true,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::NotAheadSeq { .. }
+        | Node::UnitRun { .. }
+        | Node::JoinedRun { .. }
+        | Node::RunOfOne { .. } => false,
+        Node::Repeat { node, .. } => joined_tail_loose(node),
+        Node::Concat(nodes) => nodes.iter().any(joined_tail_loose),
+        Node::Alt { alternatives, .. } => alternatives.iter().any(joined_tail_loose),
     }
 }
 
@@ -2074,6 +2194,7 @@ fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> boo
             }
             Follow::Lookahead(_) | Follow::Other => true,
         },
+        Node::JoinedRun { .. } => !matches!(follow, Follow::Nothing),
         Node::Concat(nodes) => nodes.iter().enumerate().any(|(i, node)| {
             // The run before a sequence lookahead answers for it.
             if matches!(node, Node::NotAheadSeq { .. })
@@ -2104,7 +2225,8 @@ fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> boo
         | Node::TextEnd
         | Node::SearchStart
         | Node::RunOfOne { .. }
-        | Node::GroupsAhead { .. } => false,
+        | Node::GroupsAhead { .. }
+        | Node::JoinedTail { .. } => false,
     }
 }
 
@@ -2167,6 +2289,11 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
             ..classes[*first].first().or(classes[*second].first())
         },
         Node::RunOfOne { class, .. } => classes[*class].first(),
+        Node::JoinedTail { join, .. } => First {
+            nullable: true,
+            ..classes[*join].first()
+        },
+        Node::JoinedRun { letter, .. } => classes[*letter].first(),
     }
 }
 
@@ -2336,6 +2463,8 @@ impl Parser<'_> {
             | Node::GroupsAhead { .. }
             | Node::NotAheadSeq { .. }
             | Node::UnitRun { .. }
+            | Node::JoinedTail { .. }
+            | Node::JoinedRun { .. }
             | Node::RunOfOne { .. } => return None,
             // A possessive group would need the engine's rule for the choices
             // inside it (an atomic group): declined.
@@ -2343,10 +2472,24 @@ impl Parser<'_> {
             // `(?:X?Y)+` (`{n,}` too): a run of units taken whole, accepted at
             // the end of its alternative or before the lookahead over its own
             // unit (see `unit_run_misplaced`).
-            Node::Concat(ref nodes) if min >= 1 && max == u32::MAX => match Self::unit_of(nodes) {
-                Some((first, second)) => Node::UnitRun { first, second, min },
-                None => return None,
-            },
+            Node::Concat(ref nodes) if min >= 1 && max == u32::MAX => {
+                match (Self::unit_of(nodes), self.joined_run_of(nodes)) {
+                    (Some((first, second)), _) => Node::UnitRun { first, second, min },
+                    // `(?:YZ*(?:XYZ*)*)+`: the joined letter run, under `+` alone.
+                    (None, Some((join, letter, mark))) if min == 1 => {
+                        Node::JoinedRun { join, letter, mark }
+                    }
+                    _ => return None,
+                }
+            }
+            // `(?:XYZ*)*`: the tail of a joined letter run, folded into the
+            // run by the group around it or declined (`joined_tail_loose`).
+            Node::Concat(ref nodes) if min == 0 && max == u32::MAX => {
+                match Self::joined_tail_of(nodes) {
+                    Some((join, letter, mark)) => Node::JoinedTail { join, letter, mark },
+                    None => return None,
+                }
+            }
             // A group that repeats would need the engine's rule for an empty
             // iteration and an unbounded choice stack: only the optional form
             // is accepted, longer runs stay with `tokenizers`.
@@ -2689,6 +2832,54 @@ impl Parser<'_> {
         }
     }
 
+    /// The classes of a joined run's tail `XYZ*` (a class, a class, a run of
+    /// a class), when `nodes` are exactly that.
+    fn joined_tail_of(nodes: &[Node]) -> Option<(usize, usize, usize)> {
+        match nodes {
+            [Node::Class(join), Node::Class(letter), Node::ClassRepeat {
+                class: mark,
+                min: 0,
+                max: u32::MAX,
+                possessive: false,
+            }] => Some((*join, *letter, *mark)),
+            _ => None,
+        }
+    }
+
+    /// The classes of a joined letter run `YZ*(?:XYZ*)*`, when `nodes` are
+    /// exactly that (a class, a run of a second, the tail over the same two
+    /// classes and a join) and the classes keep the engine's greedy path the
+    /// longest run: the join is one code point in neither class, and the two
+    /// classes are categories apart from each other.
+    fn joined_run_of(&self, nodes: &[Node]) -> Option<(usize, usize, usize)> {
+        let [Node::Class(letter), Node::ClassRepeat {
+            class: mark,
+            min: 0,
+            max: u32::MAX,
+            possessive: false,
+        }, Node::JoinedTail {
+            join,
+            letter: tail_letter,
+            mark: tail_mark,
+        }] = nodes
+        else {
+            return None;
+        };
+        let (letter, mark, join) = (*letter, *mark, *join);
+        let (letters, marks, joins) = (
+            &self.classes[letter],
+            &self.classes[mark],
+            &self.classes[join],
+        );
+        let same = self.classes[*tail_letter].same_set(letters)
+            && self.classes[*tail_mark].same_set(marks);
+        let apart = letters.categories_apart(marks);
+        let joined_by_one = joins
+            .single_code_point()
+            .is_some_and(|c| !letters.contains(c) && !marks.contains(c));
+        (same && apart && joined_by_one).then_some((join, letter, mark))
+    }
+
     /// A group whose alternatives are each one character of a class
     /// (`(?:\p{L}|\p{M}|\u200C|\u200D)`) is the class of their union: the
     /// engine matches one character of whichever alternative, as it matches
@@ -2974,7 +3165,11 @@ mod tests {
     /// lookahead holding at the run's end as the engine finds it.
     const LINE_BREAK_RUNS: &str = r"(?:\r?\n)+(?!\r?\n)";
 
-    const PATTERNS: [&str; 26] = [
+    /// Three files' split pattern: a letter run with its marks, words joined
+    /// by single spaces, as one piece (`(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+`).
+    const JOINED_LETTER_RUNS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
+
+    const PATTERNS: [&str; 27] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -3001,6 +3196,7 @@ mod tests {
         DIGIT_GROUPS_FROM_THE_START,
         LINE_BREAK_RUNS,
         NUMBER_GROUPS,
+        JOINED_LETTER_RUNS,
     ];
 
     /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
@@ -3395,6 +3591,23 @@ mod tests {
             r"a(?!\r\n\n)",
             r"a(?!ab)",
             r"a(?!\r?\n)+",
+            // a joined letter run outside its one shape: something after it, a
+            // loose tail, not under `+` alone, a join that is a class or in a
+            // class, classes with ranges or in common, the tail over other classes
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+x",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+(?!\S)",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)*",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*){2,}",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)++",
+            r"\p{L}\p{M}*(?: \p{L}\p{M}*)*",
+            r"(?: \p{L}\p{M}*)+",
+            r"(?: \p{L}\p{M}*)*x",
+            r"(?:\p{L}\p{M}*(?:\p{M}\p{L}\p{M}*)*)+",
+            r"(?:\p{L}\p{M}*(?:\p{L}\p{L}\p{M}*)*)+",
+            r"(?:\p{L}\p{L}*(?: \p{L}\p{L}*)*)+",
+            r"(?:[a-z]\p{M}*(?: [a-z]\p{M}*)*)+",
+            r"(?:\p{L}\p{M}*(?: \p{N}\p{M}*)*)+",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{N}*)*)+",
             // a run of units with something after it that is not the lookahead
             // over its own unit (the engine may give a unit back to it)
             r"(?:\r?\n)+a",
@@ -3663,6 +3876,52 @@ mod tests {
                     oracle_matches(pattern, &text),
                     "{pattern} on {text:?}"
                 );
+            }
+        }
+    }
+
+    /// A joined letter run cut as the engine cuts it: words joined by single
+    /// spaces as one piece, two spaces or a mark after the space ending it,
+    /// marks after letters inside it, digits and punctuation outside it, the
+    /// run under the file's whole pattern and alone, and with a hyphen and
+    /// numbers for the join and the marks.
+    #[test]
+    fn a_joined_letter_run_is_cut_as_the_engine_cuts_it() {
+        for pattern in [
+            JOINED_LETTER_RUNS,
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+",
+            r"(?:\p{L}\p{N}*(?:-\p{L}\p{N}*)*)+",
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(
+                parsed
+                    .program
+                    .iter()
+                    .any(|op| matches!(op, Op::JoinedRun { .. })),
+                "{pattern}"
+            );
+            for text in [
+                "hello world",
+                "hello  world",
+                "h\u{e9}llo w\u{f6}rld",
+                "a b c d e",
+                "a b  c",
+                "ab\u{301} c\u{301}d",
+                "a \u{301}b",
+                "\u{301}a b",
+                "x1 y2 z",
+                "abc def!",
+                " lead and trail ",
+                "a-b-c d",
+                "one two\nthree four",
+                "\u{f1}and\u{fa} \u{fc}ber \u{e7}\u{e0}",
+                "it's a dog's life",
+                "a1b 2c d3",
+                "",
+                " ",
+            ] {
+                let ours: Vec<(usize, usize)> = parsed.find_iter(text).collect();
+                assert_eq!(ours, oracle_matches(pattern, text), "{pattern} on {text:?}");
             }
         }
     }
@@ -4484,7 +4743,7 @@ mod tests {
                     assert!(Pattern::parse(pattern).is_none(), "{pattern}");
                 }
                 let text = "\r\n".repeat(50_000) + &" x".repeat(50_000) + &"'s".repeat(5_000);
-                for pattern in [GPT2, QWEN35, CASED, LINE_BREAK_RUNS] {
+                for pattern in [GPT2, QWEN35, CASED, LINE_BREAK_RUNS, JOINED_LETTER_RUNS] {
                     let parsed = Pattern::parse(pattern).expect("parses");
                     let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
                     assert_eq!(ours, oracle_matches(pattern, &text), "{pattern}");

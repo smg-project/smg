@@ -46,6 +46,9 @@ use crate::{
 };
 
 const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Three files' split pattern: a letter run with its marks, words joined by
+/// single spaces, as one piece.
+const JOINED_LETTER_RUNS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
 const CL100K: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const DIGITS: &str = r"\p{N}{1,3}";
 /// A parse family's punctuation stage: a bracket, or a capturing group of one
@@ -407,6 +410,20 @@ fn shapes() -> Vec<Shape> {
             special: &["<|endoftext|>"],
             added: &[],
             stripped: &[],
+        },
+        // The NFC normalizer, the split whose second alternative is the joined
+        // letter run (words joined by single spaces as one piece), and the
+        // `ByteLevel` without its regex: the chain of a family's files.
+        Shape {
+            name: "nfc-then-joined-letter-runs",
+            normalizer: Normalizer::Nfc,
+            pre_tokenizers: vec![
+                split(JOINED_LETTER_RUNS, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["[|endofturn|]", "[|tool|]"],
+            added: &[],
         },
         // A line-break stage with `MergedWithNext` (each run of line breaks
         // glued to the text after it), the cl100k-style regex, and the
@@ -1618,6 +1635,38 @@ fn a_removed_split_drops_its_matches_as_the_library_does() {
         "a-1-b 22-33\n-<tool_call>-x",
         "<|endoftext|>-",
         "no match at all",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_joined_letter_run_encodes_as_the_library_does() {
+    // The joined-letter-run shape on texts with words joined by single
+    // spaces, two spaces, marks after letters and after a space, digits and
+    // punctuation between words, a line break, and an added token.
+    let mut state = 0x4A4F_494E_4544_5201u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "nfc-then-joined-letter-runs")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "hello world",
+        "hello  world",
+        "h\u{e9}llo w\u{f6}rld, c\u{327}a va",
+        "ab\u{301} c\u{301}d a \u{301}b",
+        "x1 y2 z 33 words",
+        "one two\nthree four",
+        "[|endofturn|] a b [|tool|]c d",
+        "it's a dog's life",
+        "no",
     ] {
         let reference = tokenizer.encode(text, false).expect("encode");
         assert_eq!(
