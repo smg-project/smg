@@ -320,67 +320,89 @@ fn check_mm_inputs(req: &ts::GenerateRequest, role: Option<Role>) -> Result<(), 
     } else {
         EncoderInput::Required { roomed: &roomed }
     };
-    check_media_items(&mm.items, Some(prompt_ids), encoder_input)
+    check_media_items(
+        &mm.items,
+        Some(prompt_ids),
+        encoder_input,
+        ServicerReading::SchedulerFeature,
+    )
 }
 
 /// Whether an item carries its feature, read as the engine reads a tensor (an
-/// inline payload whose bytes match the dtype and shape, or an SHM handle
-/// with the servicer's checks): a malformed one is refused on every role, as
-/// the engine refuses it.
-fn check_encoder_input(item: &ts::MultimodalItem, what: &str) -> Result<bool, Status> {
+/// inline payload whose bytes match the dtype and shape, an SHM handle with
+/// the servicer's checks, a remote handle as it came): a malformed one is
+/// refused on every role, as the engine refuses it. `feature` is the reading
+/// the RPC's servicer gives the feature.
+fn check_encoder_input(
+    item: &ts::MultimodalItem,
+    what: &str,
+    feature: ServicerReading,
+) -> Result<bool, Status> {
     let Some(tensor) = &item.encoder_input else {
         return Ok(false);
     };
-    read_tensor(tensor, TensorRole::Feature, what, "encoder_input")?;
+    read_tensor(tensor, feature, what, "encoder_input")?;
     Ok(true)
 }
 
-/// What an item's tensor is to the engine servicer, which reads an SHM
-/// feature with a dtype rule of its own and a side tensor through its
-/// generic path.
+/// The reading the engine servicer gives a tensor, which decides the checks
+/// on an SHM handle: the scheduler reads a request's feature through
+/// `_feature_from_proto` (tokenspeed/servicer.py, a dtype rule of its own)
+/// and every other tensor through the generic `_tensor_from_proto` (the side
+/// tensors of a request, and every tensor of an `Encode`, which the encoder
+/// servicer reads generically in tokenspeed/encoder_servicer.py).
 #[derive(Clone, Copy)]
-enum TensorRole {
-    /// The item's encoder input.
-    Feature,
-    /// A model-specific tensor beside it.
-    Side,
+enum ServicerReading {
+    /// The scheduler's feature path.
+    SchedulerFeature,
+    /// The generic tensor path.
+    Generic,
 }
 
 /// An item's tensor read as the engine reads it: an inline payload through
 /// the wire's own reader, so the mock refuses the tensors the engine's adapter
-/// refuses, and an SHM handle with the servicer's checks (the gateway hands
-/// the gRPC wire SHM handles under its shm transport); `name` is the field in
-/// the refusal.
+/// refuses; an SHM handle with the servicer's checks (the gateway hands the
+/// gRPC wire SHM handles under its shm transport); a remote handle as it
+/// came, since the servicer pulls it over its remote transport
+/// (`feature_from_remote` in tokenspeed/servicer.py), which the mock cannot
+/// reach. `name` is the field in the refusal.
 fn read_tensor(
     tensor: &ts::TensorData,
-    role: TensorRole,
+    reading: ServicerReading,
     what: &str,
     name: &str,
 ) -> Result<(), Status> {
     let read = match &tensor.payload {
-        Some(ts::tensor_data::Payload::Shm(handle)) => read_shm_handle(tensor, role, handle),
+        Some(ts::tensor_data::Payload::Shm(handle)) => read_shm_handle(tensor, reading, handle),
+        Some(ts::tensor_data::Payload::Remote(_)) => Ok(()),
         _ => wire_tensor_tokenspeed(tensor.clone()).map(|_| ()),
     };
     read.map_err(|error| Status::invalid_argument(format!("mock-worker: {what}'s {name}: {error}")))
 }
 
-/// The dtypes the engine servicer takes for an SHM feature; any other is
-/// refused before the handle is read.
+/// The dtypes the scheduler's feature path takes for an SHM handle
+/// (`_torch_dtype_from_proto` in tokenspeed/servicer.py); any other is
+/// refused there before the handle is read.
 const SHM_FEATURE_DTYPES: [&str; 3] = ["bfloat16", "float16", "float32"];
 
-/// The engine servicer's reading of an SHM handle, the segment itself never
-/// opened: a feature's dtype is one of [`SHM_FEATURE_DTYPES`] (a side tensor
-/// keeps its wire dtype, one the wire does not know passing as the inline
-/// reader passes it), the byte length is the dtype's width over the shape,
-/// and the name is a bare segment name once a leading slash is stripped (no
-/// slash, dot entry or NUL inside). The offset is free: the servicer reads a
-/// handle with one through its generic tensor path.
+/// The engine servicer's checks on an SHM handle, the segment itself never
+/// opened. On the scheduler's feature path the dtype is one of
+/// [`SHM_FEATURE_DTYPES`]; on the generic path the tensor keeps its wire
+/// dtype, one the wire does not know passing as the inline reader passes it.
+/// On both the byte length is the dtype's width over the shape
+/// (`_feature_from_proto` and `_tensor_from_proto` in tokenspeed/servicer.py)
+/// and the name is a bare segment name once a leading slash is stripped, no
+/// slash, dot entry or NUL inside (`validated_shm_name` in mm_shm.py). The
+/// offset is free: the servicer reads a handle with one through its generic
+/// path.
 fn read_shm_handle(
     tensor: &ts::TensorData,
-    role: TensorRole,
+    reading: ServicerReading,
     handle: &common::ShmHandle,
 ) -> Result<(), String> {
-    if matches!(role, TensorRole::Feature) && !SHM_FEATURE_DTYPES.contains(&tensor.dtype.as_str()) {
+    if matches!(reading, ServicerReading::SchedulerFeature)
+        && !SHM_FEATURE_DTYPES.contains(&tensor.dtype.as_str())
+    {
         return Err(format!(
             "unsupported TensorData dtype for an SHM feature: {:?} (one of {SHM_FEATURE_DTYPES:?})",
             tensor.dtype
@@ -424,11 +446,14 @@ enum EncoderInput<'a> {
 
 /// The item checks shared by `Generate` (with its prompt and the role's
 /// expectation of the encoder input) and `Encode` (no prompt, and the feature
-/// required on every item: the encoder runs the tower on it).
+/// required on every item: the encoder runs the tower on it). `feature` is
+/// the reading the RPC's servicer gives the encoder input: the scheduler's
+/// feature path for `Generate`, the generic path for `Encode`.
 fn check_media_items(
     items: &[ts::MultimodalItem],
     prompt_ids: Option<&[u32]>,
     encoder_input: EncoderInput<'_>,
+    feature: ServicerReading,
 ) -> Result<(), Status> {
     let mut covered: BTreeMap<u32, usize> = BTreeMap::new();
     let mut claimed = Vec::new();
@@ -445,7 +470,7 @@ fn check_media_items(
                  from it)"
             )));
         }
-        let has_feature = check_encoder_input(item, &what)?;
+        let has_feature = check_encoder_input(item, &what, feature)?;
         if let EncoderInput::Required { roomed } = encoder_input {
             let has_room = roomed.contains(&u32::try_from(index).unwrap_or(u32::MAX));
             if !has_feature && !has_room {
@@ -455,7 +480,7 @@ fn check_media_items(
             }
         }
         for (key, tensor) in &item.model_specific_tensors {
-            read_tensor(tensor, TensorRole::Side, &what, key)?;
+            read_tensor(tensor, ServicerReading::Generic, &what, key)?;
         }
         let spans = item
             .placeholders
@@ -517,7 +542,12 @@ impl TokenSpeedEncoder for MockScheduler {
             ));
         }
         if let Some(mm) = &req.mm_inputs {
-            check_media_items(&mm.items, None, EncoderInput::Required { roomed: &[] })?;
+            check_media_items(
+                &mm.items,
+                None,
+                EncoderInput::Required { roomed: &[] },
+                ServicerReading::Generic,
+            )?;
         }
         // The realistic engine's fault and admission hooks apply as to the
         // prefill role, and the request counts in flight until its answer; an
@@ -901,10 +931,10 @@ mod tests {
     }
 
     /// An item's tensors are read as the engine reads them: an inline payload
-    /// whose bytes match the dtype and shape, or an SHM handle with that byte
-    /// length, a bare name and, for the feature, one of the servicer's three
-    /// dtypes (an offset is free), the encoder input and the model-specific
-    /// tensors alike.
+    /// whose bytes match the dtype and shape, an SHM handle with that byte
+    /// length, a bare name and, for the scheduler's feature, one of the
+    /// servicer's three dtypes (an offset is free), or a remote handle as it
+    /// came, the encoder input and the model-specific tensors alike.
     #[tokio::test]
     async fn a_tensor_is_read_as_the_wire_reads_it() {
         let (service, _stop) = service(65_367);
@@ -948,6 +978,23 @@ mod tests {
                 .into_inner();
             assert!(stream.next().await.is_some(), "the answer streams");
         }
+        let mut remote = image_item(1, 2);
+        remote.encoder_input.as_mut().expect("the feature").payload = Some(
+            ts::tensor_data::Payload::Remote(common::RemoteTensorHandle {
+                transport: "nixl".to_string(),
+                nbytes: 16,
+                ..Default::default()
+            }),
+        );
+        let mut stream = service
+            .generate(Request::new(with_items(
+                request("ts-mm-remote", &PROMPT),
+                vec![remote],
+            )))
+            .await
+            .expect("a remote handle passes as the servicer pulls it")
+            .into_inner();
+        assert!(stream.next().await.is_some(), "the answer streams");
         for (handle, refusal) in [
             (shm("smg-mm-1", 0, 15, "float32"), "byte length 15"),
             (shm("../smg-mm-1", 0, 16, "float32"), "name"),

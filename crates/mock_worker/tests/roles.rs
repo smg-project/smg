@@ -1331,6 +1331,55 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
     );
 }
 
+/// The encoder servicer reads its feature through the generic tensor reader,
+/// not the scheduler's feature path: an SHM handle in a dtype the scheduler
+/// refuses for its feature is accepted here, with the byte length the
+/// generic reader checks.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_reads_an_shm_feature_as_the_encoder_servicer_does() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let before = encodes_served(&http, &fault, &name).await;
+    let mut shm = tokenspeed_encode_request("ts-shm", 1, &[45]);
+    shm.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float64".to_string(),
+        payload: Some(ts::tensor_data::Payload::Shm(
+            smg_grpc_client::common_proto::ShmHandle {
+                name: "smg-mm-enc".to_string(),
+                nbytes: 32,
+                ..Default::default()
+            },
+        )),
+    });
+    let answer = encoder
+        .encode(shm)
+        .await
+        .expect("a float64 SHM feature on the encoder")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    let mut short = tokenspeed_encode_request("ts-shm-short", 1, &[46]);
+    short.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float64".to_string(),
+        payload: Some(ts::tensor_data::Payload::Shm(
+            smg_grpc_client::common_proto::ShmHandle {
+                name: "smg-mm-enc".to_string(),
+                nbytes: 16,
+                ..Default::default()
+            },
+        )),
+    });
+    let refused = encoder
+        .encode(short)
+        .await
+        .expect_err("a byte length short of the shape");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(refused.message().contains("byte length 16"), "{refused:?}");
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+}
+
 /// The engine's encoder takes exactly one media item under one room per
 /// request, named by a request id: the mock refuses the rest as the engine's
 /// adapter does, so a gateway that batched items into one `Encode` or dropped
