@@ -100,7 +100,6 @@ struct VersionResponse {
 // HTTP fetchers
 // ---------------------------------------------------------------------------
 
-/// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
 /// Why a metadata endpoint gave no answer: the engine does not offer it (a
 /// 404 on every spelling), or the read failed (transport, timeout, a non-2xx
 /// other than 404, an unparsable body). Registration tolerates both; a strict
@@ -138,61 +137,18 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
     endpoint: &str,
     api_key: Option<&str>,
 ) -> Result<T, MetadataError> {
-    let url = format!("{base_url}/{endpoint}");
-    // The addresses as every failure below names them: a userinfo in them
-    // masked (the texts end in the step's failure message and its lines).
-    let shown = Endpoint::redacted_str(&url);
-    let mut req = client.get(&url).timeout(METADATA_TIMEOUT);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
-
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        // Fallback to deprecated /get_<endpoint> prefix
-        warn!("'/{endpoint}' returned 404, falling back to deprecated '/get_{endpoint}'");
-        let old_url = format!("{base_url}/get_{endpoint}");
-        let shown_old = Endpoint::redacted_str(&old_url);
-        let mut req = client.get(&old_url).timeout(METADATA_TIMEOUT);
-        if let Some(key) = api_key {
-            req = req.bearer_auth(key);
+    match http_get_json_classified(client, &format!("{base_url}/{endpoint}"), api_key).await {
+        Err(MetadataError::NotOffered) => {
+            // Fallback to deprecated /get_<endpoint> prefix
+            warn!("'/{endpoint}' returned 404, falling back to deprecated '/get_{endpoint}'");
+            http_get_json_classified(client, &format!("{base_url}/get_{endpoint}"), api_key).await
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown_old}: {e}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(MetadataError::NotOffered);
-        }
-        if !resp.status().is_success() {
-            return Err(MetadataError::Failed(format!(
-                "status {} from {shown_old}",
-                resp.status()
-            )));
-        }
-        return resp
-            .json::<T>()
-            .await
-            .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown_old}: {e}")));
+        read => read,
     }
-
-    if !response.status().is_success() {
-        return Err(MetadataError::Failed(format!(
-            "status {} from {shown}",
-            response.status()
-        )));
-    }
-
-    response
-        .json::<T>()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
+/// GET JSON with optional bearer auth under the metadata timeout: a 404 is
+/// `NotOffered`, any other failure `Failed`, each text naming the address masked.
 async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     client: &Client,
     url: &str,
