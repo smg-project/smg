@@ -15,6 +15,12 @@ use crate::{
 pub(super) const EFFORT_LEVELS: [&str; 5] = [EFFORT_LOW, "medium", "high", "xhigh", "max"];
 pub(super) const EFFORT_LOW: &str = "low";
 pub(super) const EFFORT_MINIMAL: &str = "minimal";
+/// The MiniMax templates' own thinking switch, sent as a template kwarg: the
+/// tri-state key and the two values that decide the mode (`adaptive`, or any
+/// other value, leaves the template's default).
+pub(super) const THINKING_MODE_KEY: &str = "thinking_mode";
+pub(super) const THINKING_MODE_ENABLED: &str = "enabled";
+pub(super) const THINKING_MODE_DISABLED: &str = "disabled";
 
 /// Tool-protocol strictness for conversation history (MPV tests 16_08, 16_09,
 /// 16_12): tool messages must answer a pending tool_call id, every tool_call

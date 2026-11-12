@@ -230,6 +230,28 @@ impl ProviderProfile {
         }
     }
 
+    /// The thinking preference an explicit template switch in the request's
+    /// `chat_template_kwargs` states, read by the profile that knows its
+    /// templates' key: under MiniMax `thinking_mode` `enabled` / `disabled`
+    /// (the templates' own tri-state switch; `adaptive` or any other value
+    /// leaves the default); `None` under every other profile, whose
+    /// templates' switches the gateway reads from the template text instead.
+    /// The render and the parser's arming let this explicit switch rank
+    /// above the typed toggle and the effort, as the template does.
+    pub fn thinking_from_template_kwargs(
+        self,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Option<bool> {
+        match self {
+            ProviderProfile::Minimax => match kwargs?.get(minimax::THINKING_MODE_KEY)?.as_str()? {
+                minimax::THINKING_MODE_ENABLED => Some(true),
+                minimax::THINKING_MODE_DISABLED => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Record the configured model aliases (`alias -> served model id`).
     ///
     /// A served model id whose own name selects no vendor contract takes the

@@ -67,7 +67,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   rendered with, as the profile hands it to the template given the thinking preference the prompt
   renders with. Every other profile hands the value over as sent; MiniMax hands over the levels
   the contract names (`low`, `medium`, `high`, `xhigh`, `max`), `minimal` as `low`, and nothing
-  for any other value or while thinking is off.
+  for any other value or while thinking is off, whether the typed toggle, the effort or the
+  template's own `thinking_mode` switch sent in `chat_template_kwargs` says so (the template lets
+  that explicit switch win, and so does the effort rendering:
+  `ProviderProfile::thinking_from_template_kwargs`).
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a

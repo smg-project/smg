@@ -380,7 +380,8 @@ pub(crate) fn extract_thinking_from_kwargs(
 /// for one of its off words (which short-circuits the generic
 /// `reasoning_effort` fallback in `resolve_thinking_pref`), `None` otherwise.
 /// Mirrors the template-kwargs merge: the request-level `reasoning_effort`
-/// is written over an explicit kwargs entry.
+/// is written over an explicit kwargs entry, as sent
+/// ([`reasoning_effort_as_rendered`] names where the MiniMax render differs).
 fn extract_template_effort_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -395,11 +396,13 @@ fn extract_template_effort_thinking(
     native_effort_thinking(effort, tokenizer)
 }
 
-/// The `reasoning_effort` the template sees: the request-level field
-/// (`thinking.effort`, else the top-level field), written over a
-/// `chat_template_kwargs` entry as the engine's own server renders it, else
-/// the entry (`build_chat_template_kwargs` in `chat_utils` merges them the
-/// same way).
+/// The `reasoning_effort` a renderer with its own effort words sees: the
+/// request-level field (`thinking.effort`, else the top-level field), written
+/// over a `chat_template_kwargs` entry as the engine's own server renders it,
+/// else the entry. The render's merge (`build_chat_template_kwargs` in
+/// `chat_utils`) writes the same under every profile but MiniMax, where it
+/// writes the profile's reading of the field instead; no MiniMax template
+/// declares effort words, so the arming reads the same there.
 fn reasoning_effort_as_rendered<'a>(
     kwargs: Option<&'a std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&'a str>,
@@ -728,6 +731,7 @@ pub fn resolve_user_thinking(
         reasoning_effort,
         thinking.or(effort_thinking),
         tokenizer,
+        provider,
     ) {
         return Some(mode);
     }
@@ -742,29 +746,41 @@ pub fn resolve_user_thinking(
 /// The mode a renderer with its own thinking rule renders for the request,
 /// asked with the inputs the render receives (`build_chat_template_kwargs`
 /// and `resolve_template_thinking` in `chat_utils` build the same for the
-/// render): the request's template kwargs with the effective `reasoning_effort`
-/// written over their entry under that key, whatever its type (the render's
-/// merge writes the request-level field over any kwargs entry), the kwargs as
-/// they are when the request carries no field, and `template_thinking`: the
-/// typed toggle or the profile's reading of the effort, as the render
-/// resolves it. `None` for every other renderer.
+/// render): the request's template kwargs with the `reasoning_effort` entry
+/// as the request's provider profile hands it to the template
+/// (`ProviderProfile::template_reasoning_effort`, written over any entry
+/// under that key whatever its type, the entry removed when the profile hands
+/// none, given the thinking preference the render resolves: the template's
+/// own switch among the kwargs, else `template_thinking`), the kwargs as they
+/// are when the request carries no field, and `template_thinking`: the typed
+/// toggle or the profile's reading of the effort. `None` for every other
+/// renderer.
 fn rendered_thinking_mode(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
     template_thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
+    provider: ProviderProfile,
 ) -> Option<bool> {
-    match reasoning_effort {
+    if reasoning_effort.is_none() {
+        return tokenizer.native_thinking_mode(kwargs, template_thinking);
+    }
+    let mut as_rendered = kwargs.cloned().unwrap_or_default();
+    let thinking = provider
+        .thinking_from_template_kwargs(kwargs)
+        .or(template_thinking);
+    match provider.template_reasoning_effort(reasoning_effort, thinking) {
         Some(effort) => {
-            let mut as_rendered = kwargs.cloned().unwrap_or_default();
             as_rendered.insert(
                 "reasoning_effort".to_string(),
                 Value::String(effort.to_string()),
             );
-            tokenizer.native_thinking_mode(Some(&as_rendered), template_thinking)
         }
-        None => tokenizer.native_thinking_mode(kwargs, template_thinking),
+        None => {
+            as_rendered.remove("reasoning_effort");
+        }
     }
+    tokenizer.native_thinking_mode(Some(&as_rendered), template_thinking)
 }
 
 /// Check if a reasoning parser is available for the given model

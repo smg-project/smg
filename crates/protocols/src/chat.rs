@@ -605,12 +605,14 @@ impl ChatCompletionRequest {
     /// The `reasoning_effort` the prompt is rendered with: the effective
     /// effort as the model's provider profile hands it to the template
     /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
-    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    /// preference the prompt renders with: the template's own switch sent in
+    /// `chat_template_kwargs` ([`ProviderProfile::thinking_from_template_kwargs`],
+    /// which the template lets win), else [`Self::template_thinking_for`].
     pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
-        provider.template_reasoning_effort(
-            self.effective_reasoning_effort(),
-            self.template_thinking_for(provider),
-        )
+        let thinking = provider
+            .thinking_from_template_kwargs(self.chat_template_kwargs.as_ref())
+            .or_else(|| self.template_thinking_for(provider));
+        provider.template_reasoning_effort(self.effective_reasoning_effort(), thinking)
     }
 
     /// Whether `continue_final_message` applies: it is set and the request
@@ -1674,7 +1676,8 @@ mod tests {
     /// The effort the template renders is the profile's second reading of
     /// the field: the value as sent under the default profile; under MiniMax
     /// a level the contract names only (`minimal` as `low`), and none while
-    /// thinking is off.
+    /// thinking is off, whether the typed toggle, the effort or the template's
+    /// own `thinking_mode` switch sent as a kwarg says so.
     #[test]
     fn template_reasoning_effort_follows_the_profile() {
         let request = |fields: Value| -> ChatCompletionRequest {
@@ -1721,6 +1724,28 @@ mod tests {
                 json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}}),
                 None,
                 Some("none"),
+            ),
+            // The template's own switch sent as a kwarg ranks above the typed
+            // toggle and the effort, as the template renders it.
+            (
+                json!({"reasoning_effort": "high", "chat_template_kwargs": {"thinking_mode": "disabled"}}),
+                None,
+                Some("high"),
+            ),
+            (
+                json!({"reasoning_effort": "minimal", "chat_template_kwargs": {"thinking_mode": "enabled"}}),
+                Some("low"),
+                Some("minimal"),
+            ),
+            (
+                json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}, "chat_template_kwargs": {"thinking_mode": "enabled"}}),
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"reasoning_effort": "high", "chat_template_kwargs": {"thinking_mode": "adaptive"}}),
+                Some("high"),
+                Some("high"),
             ),
             (json!({}), None, None),
         ] {

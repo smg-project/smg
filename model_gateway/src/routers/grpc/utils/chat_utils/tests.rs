@@ -1302,6 +1302,27 @@ fn minimax_effort_none_switches_thinking_off_and_renders_no_effort() {
         kwargs_for(&request).get(REASONING_EFFORT_KEY),
         Some(&json!("high"))
     );
+
+    // The template's own switch sent as a kwarg ranks above the typed toggle
+    // and the effort, as the template renders it: no effort tag beside its
+    // disabled branch, the level beside its enabled one.
+    let mut request = minimax(None, Some("high"));
+    request.chat_template_kwargs = Some(HashMap::from([(
+        "thinking_mode".to_string(),
+        json!("disabled"),
+    )]));
+    let kwargs = kwargs_for(&request);
+    assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
+    assert_eq!(kwargs.get("thinking_mode"), Some(&json!("disabled")));
+    let mut request = minimax(Some(json!({"type": "disabled"})), Some("minimal"));
+    request.chat_template_kwargs = Some(HashMap::from([(
+        "thinking_mode".to_string(),
+        json!("enabled"),
+    )]));
+    assert_eq!(
+        kwargs_for(&request).get(REASONING_EFFORT_KEY),
+        Some(&json!("low"))
+    );
 }
 
 #[test]
