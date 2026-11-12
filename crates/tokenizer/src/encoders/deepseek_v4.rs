@@ -25,8 +25,8 @@ use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
         find_last_user_index, merge_tool_messages, push_tools_and_response_format,
-        render_v4_tools_template, sort_tool_results_by_call_order, task_sp_token, to_json,
-        tool_schemas, DsmlTags, IncomingBlocks, Turn,
+        render_system_message, render_v4_tools_template, sort_tool_results_by_call_order,
+        task_sp_token, to_json, tool_schemas, DsmlTags, IncomingBlocks, Turn,
     },
     RendererProfile,
 };
@@ -167,7 +167,7 @@ fn render_message(
     }
 
     match turn.role {
-        "system" => render_system(&mut prompt, &turn),
+        "system" => render_system_message(&mut prompt, &turn, render_tools),
         "developer" => render_developer(&mut prompt, &turn)?,
         "user" => render_user(&mut prompt, turn.msg, turn.content),
         "latest_reminder" => {
@@ -207,18 +207,6 @@ fn render_message(
         last_user_idx,
     )?;
     Ok(prompt)
-}
-
-/// A system message: its content, then the tools and the response format
-/// it carries.
-fn render_system(prompt: &mut String, turn: &Turn<'_>) {
-    prompt.push_str(turn.content);
-    push_tools_and_response_format(
-        prompt,
-        turn.tools.as_deref(),
-        turn.response_format,
-        render_tools,
-    );
 }
 
 /// A developer message: the user token, its content, then the tools and
