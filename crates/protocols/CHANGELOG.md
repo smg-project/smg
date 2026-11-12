@@ -61,6 +61,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
+  writes it, parses, with no completion tokens. The crate refused the whole answer with
+  ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
+  read the same way; a usage the gateway writes is unchanged.
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
