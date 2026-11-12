@@ -1214,13 +1214,13 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         read.push(*slug);
     }
     eprintln!(
-        "{} recorded models' rendered call turns read: {}",
+        "{} recorded models' text after the close read: {}",
         read.len(),
         read.join(", ")
     );
     assert!(
         !read.is_empty(),
-        "no rendered call turn read under {}: is it the fixtures/ directory?",
+        "no text after the close read under {}: is it the fixtures/ directory?",
         root.display()
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
