@@ -1,0 +1,46 @@
+{
+  "files": {
+    "Dockerfile.rocm": {
+      "bytes": 34200,
+      "sha256": "46afee050d39a25e462136494b054297e47515cfac87857863b2e6c0afe6336a"
+    },
+    "README.md": {
+      "bytes": 4232,
+      "sha256": "79ad74ce2a01a5248079b820b84e12ff44a52632123d921bdc49f92ff14a0e55"
+    },
+    "bake.hcl": {
+      "bytes": 1791,
+      "sha256": "37add8015d2d66bdeab74b958219628e81982af4d20eeff0129a004d102f369d"
+    },
+    "receipts/runtime.json": {
+      "bytes": 182169,
+      "sha256": "fef5e02153956cdd5781eabb1a3a8a57625c41637b34bcf313da26684ea46daa"
+    },
+    "receipts/scm.json": {
+      "bytes": 1304,
+      "sha256": "1cddda426ce659eff6cee2daf27c36c86dc9f5ebeb2aa1e6bda577c011e3f772"
+    },
+    "receipts/stack.json": {
+      "bytes": 162531,
+      "sha256": "cdb36b3b7c3ee3721d85128bd88dc2edc11dc44195abf6047306671365c44946"
+    },
+    "receipts/testdeps.json": {
+      "bytes": 204725,
+      "sha256": "1c53a8fa5b7cd3a0da3c49f883cad498bd95945b316d4100acabb59a4fba9176"
+    },
+    "receipts/validation.json": {
+      "bytes": 2525,
+      "sha256": "cce35fc5542de1ab68be4f77896d86df28cf69efc41795220ffd709314a55368"
+    },
+    "source.git_archival.txt": {
+      "bytes": 156,
+      "sha256": "27feefb2855b7896963c1bf6bab54ad55960bf1f63925c62464906687f78aeff"
+    },
+    "upstream-bake.hcl": {
+      "bytes": 7426,
+      "sha256": "79c205269b06b10e0e6d7126bf74e396e7675f23daa10612da4ea42b31f56849"
+    }
+  },
+  "schema": 1,
+  "scope": "Portable actual A11 build recipe and compact observed receipts; no public image or bit-reproducibility claim."
+}

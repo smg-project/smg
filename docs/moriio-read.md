@@ -14,17 +14,16 @@ has ACK handling, but ignores `read_ack_fenced_hold` and can release expired
 deferred producer sends after 60 seconds. Passing that flag cannot enable the
 reviewed ACK-fenced producer hold in this older engine.
 
-The expected sources come from unpublished local commit
-`f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9` prepared for
-[vllm-project/vllm](https://github.com/vllm-project/vllm), based on upstream commit
-`595b1514e837ba38df7ae51c411807783e227b78`. The local patch adds the ACK-fenced
-hold to the adapted heterogeneous READ changes from
+The expected sources are publicly retrievable at
+[chunfangamd/vllm@f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9](https://github.com/chunfangamd/vllm/commit/f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9),
+based on upstream `595b1514e837ba38df7ae51c411807783e227b78`.
+This adds the ACK-fenced hold to adapted heterogeneous READ changes from
 [vllm-project/vllm#62457](https://github.com/vllm-project/vllm/pull/62457).
-The local commit has not been published upstream; there is no public commit URL
-for those exact source bytes yet. Providing a publicly retrievable source
-reference remains a publication gap, separate from image qualification.
+Public fork source does not mean upstream merge or published image.
+The portable successful build recipe and compact observed material/SCM receipts
+are in [docker/moriio-read](../docker/moriio-read/README.md).
 
-In a source checkout containing that local commit, reproduce the two hashes
+In a source checkout containing that commit, reproduce the two hashes
 from the Git blobs without changing the working tree:
 
 ```bash
@@ -50,3 +49,16 @@ image requires actual admission, ROCm/driver/native MoRI/RDMA validation, the
 original full topology suite and cleanup evidence. READ remains manual with no
 filter and explicit RDMA device declarations. No test, model, assertion, timeout
 or shared-node lease/window contract is reduced by this preflight.
+
+The locally built engine and separately pinned harness passed the original four
+native cases: **4 passed, 0 skipped, 517.756 seconds, 17 warnings**. This used
+Qwen3-32B architecture with four layers and wide **DUMMY weights**, two MI300X
+GPUs on one node over xGMI, original graph settings/logit tolerance and both
+corruption negative controls. The receipt retains the warnings; this is not a
+runtime-cleanliness or performance claim. It does not qualify full real weights,
+RDMA, heterogeneous TP, physical MR lifetime, SMG router PD or normal CI.
+
+No public registry image reference is provided yet. Local config/OCI manifest
+identifiers in the receipts must not be used as registry pull references.
+Publishing a pullable image and executing the original SMG READ PD suite under
+its existing admission/RDMA contract remain separate delivery steps.

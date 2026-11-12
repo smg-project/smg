@@ -11,10 +11,11 @@ import os
 import re
 from pathlib import Path
 
-# Unpublished local vllm-project/vllm patch: f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9.
+# Reviewed engine source: https://github.com/chunfangamd/vllm/commit/
+# f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9 (public fork, not upstream merged).
 # Upstream baseline: 595b1514e837ba38df7ae51c411807783e227b78.
-# Repository: https://github.com/vllm-project/vllm (not a public URL for this local commit).
-# ACK-fenced producer hold; hash reproduction and publication gap: docs/moriio-read.md.
+# Source/material receipts and bounded native validation: docker/moriio-read/.
+# These hashes identify source bytes, not native ABI or SMG PD qualification.
 _SOURCE_DIR = "distributed/kv_transfer/kv_connector/v1/moriio"
 SOURCE_SHA256 = {
     f"{_SOURCE_DIR}/moriio_common.py": "61754babd34a560810106f1cdccde4e538f7bb4ab65e2c9c45937c75d414fdf9",
