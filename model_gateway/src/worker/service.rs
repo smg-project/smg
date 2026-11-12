@@ -264,7 +264,12 @@ pub enum WorkerServiceError {
         drain_secs: u64,
     },
     /// A create for this URL is still in flight (concurrent POST)
-    CreateInProgress { url: String, worker_id: WorkerId },
+    /// `worker_id` is the reservation of the `POST` in flight, or `None` when
+    /// the registration in flight is a startup or discovery one (no id to poll).
+    CreateInProgress {
+        url: String,
+        worker_id: Option<WorkerId>,
+    },
     /// A discovery provider owns the worker (a PUT, or a PATCH of labels, of a
     /// discovered worker)
     DiscoveryOwned { url: String, provider: String },
@@ -346,7 +351,10 @@ impl std::fmt::Display for WorkerServiceError {
                     GET /workers/{id} answers 404."
                 )
             }
-            Self::CreateInProgress { url, worker_id } => {
+            Self::CreateInProgress {
+                url,
+                worker_id: Some(worker_id),
+            } => {
                 let id = worker_id.as_str();
                 write!(
                     f,
@@ -354,6 +362,14 @@ impl std::fmt::Display for WorkerServiceError {
                     Poll GET /workers/{id}."
                 )
             }
+            Self::CreateInProgress {
+                url,
+                worker_id: None,
+            } => write!(
+                f,
+                "Worker registration already in progress for URL '{url}' by a startup or \
+                discovery pass, with no id to poll. Retry once it has ended."
+            ),
             Self::DiscoveryOwned { url, provider } => write!(
                 f,
                 "Worker '{url}' is owned by the '{provider}' discovery provider. \
@@ -583,11 +599,16 @@ impl WorkerService {
         let worker_url = config.url.clone();
         let queue = self.get_job_queue()?;
 
-        // Reserve (or retrieve) a stable ID for the 202 response.
+        // Reserve (or retrieve) a stable ID for the 202 response; a fresh
+        // reservation is this request's to release if no 202 goes out.
         // If this URL already has an active worker, reject with 409. A worker
         // its removal is draining holds the URL for the drain window; that
         // answer says so and when to retry, instead of offering a PUT or a
         // PATCH of a worker that is leaving.
+        let fresh = self
+            .worker_registry
+            .get_id_by_url_or_reservation(&worker_url)
+            .is_none();
         let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
         if let Some(existing) = self.worker_registry.get(&worker_id) {
             return Err(if existing.status() == WorkerStatus::Draining {
@@ -619,9 +640,16 @@ impl WorkerService {
             WorkerServiceError::QueueSubmitFailed { message: e }
         })?;
         if !submitted {
+            // The registration in flight is a POST's, whose reservation this
+            // id is, or a startup or discovery one, which reserved nothing: a
+            // reservation made here alone would outlive the refusal, and a
+            // DELETE of it could mark a registration that is not a POST's.
+            if fresh {
+                self.worker_registry.release_reservation(&worker_url);
+            }
             return Err(WorkerServiceError::CreateInProgress {
                 url: worker_url,
-                worker_id,
+                worker_id: (!fresh).then_some(worker_id),
             });
         }
 
@@ -814,13 +842,31 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
+        let job_queue = self.get_job_queue()?;
+
+        // An id with no worker behind it is a POST's registration still in
+        // flight: queued, or polling an engine unreachable or still starting
+        // for the startup timeout. Its removal is that poll's cancellation; the
+        // cancelled job releases the id and the URL when it ends, and nothing
+        // is registered to drain or remove. A registration that reached the
+        // registry meanwhile is removed below as any worker. A startup or
+        // discovery registration reserves no id, and a POST refused for one
+        // in flight releases the reservation it made, so no DELETE reaches
+        // this path for such a registration before its worker exists.
+        if self.worker_registry.get(&worker_id).is_none() {
+            let cancelled = job_queue
+                .cancel_registration(&url, &worker_id)
+                .await
+                .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
+            if cancelled > 0 && self.worker_registry.get(&worker_id).is_none() {
+                return Ok(DeleteWorkerResult { worker_id, url });
+            }
+        }
 
         let job = Job::RemoveWorker {
             url: url.clone(),
             expected_revisions: None,
         };
-
-        let job_queue = self.get_job_queue()?;
         job_queue
             .submit(job)
             .await
@@ -996,6 +1042,45 @@ mod tests {
             .expect_err("queue is uninitialized in the test harness");
 
         assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
+    }
+
+    /// A POST refused for a registration in flight that is not a POST's (a
+    /// startup or discovery one, which reserves nothing) releases the fresh
+    /// reservation it made: no id outlives the refusal for a DELETE to find.
+    #[tokio::test]
+    async fn a_post_refused_for_a_registration_of_another_kind_leaves_no_reservation() {
+        let registry = Arc::new(WorkerRegistry::new());
+        // A queue with no dispatch permit keeps every job queued: the
+        // discovery registration stays in flight.
+        let held = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            std::sync::Weak::new(),
+        );
+        held.submit(Job::AddWorker {
+            config: Box::new(worker_spec("grpc://10.0.0.5:8000")),
+            registration_mode: WorkerRegistrationMode::Upsert,
+        })
+        .await
+        .unwrap();
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue.set(held).ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let err = service
+            .create_worker(worker_spec("grpc://10.0.0.5:8000"))
+            .await
+            .expect_err("the discovery registration is in flight");
+        let WorkerServiceError::CreateInProgress { worker_id, .. } = err else {
+            panic!("expected CreateInProgress, got {err:?}");
+        };
+        assert_eq!(worker_id, None, "no id of a POST's is in flight to poll");
+        assert_eq!(
+            registry.get_id_by_url_or_reservation("grpc://10.0.0.5:8000"),
+            None,
+            "the refused POST's reservation outlived the refusal"
+        );
     }
 
     #[tokio::test]

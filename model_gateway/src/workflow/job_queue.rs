@@ -12,19 +12,19 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
-use wfaas::WorkflowId;
+use wfaas::{StateStore, WorkflowError, WorkflowId, WorkflowStatus};
 
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    worker::endpoint::Endpoint,
+    worker::{endpoint::Endpoint, registry::WorkerId},
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -177,6 +177,13 @@ pub struct JobQueue {
     /// One job per URL, kept while another holds the URL
     /// (`submit_or_defer`) and run by that job's completion (`run_kept`).
     kept: Arc<DashMap<String, Job>>,
+    /// The ids (the ones their `POST /workers` reserved) whose registration a
+    /// `DELETE` ended before the job had saved a workflow state
+    /// (`cancel_registration`): the `POST`'s job reads its own id here before
+    /// and right after it starts the workflow, and clears it when it ends;
+    /// no other kind of registration job owns a mark (`own_mark_id`), so a
+    /// `PUT`'s or a discovery job of the same URL neither takes nor erases it.
+    cancelled_before_start: Arc<DashSet<WorkerId>>,
 }
 
 /// A job handed to the dispatcher with the id of the waiter for its outcome,
@@ -269,6 +276,7 @@ impl JobQueue {
         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let outcomes: Outcomes = Arc::new(DashMap::new());
         let kept: Arc<DashMap<String, Job>> = Arc::new(DashMap::new());
+        let cancelled_before_start = Arc::new(DashSet::new());
 
         let queue = Arc::new(Self {
             tx,
@@ -278,6 +286,7 @@ impl JobQueue {
             outcomes: outcomes.clone(),
             next_waiter_id: AtomicU64::new(1),
             kept: kept.clone(),
+            cancelled_before_start: cancelled_before_start.clone(),
         });
 
         // Single dispatcher task
@@ -285,6 +294,7 @@ impl JobQueue {
         let status = status_map.clone();
         let sem = concurrency_limit.clone();
         let waiters = outcomes.clone();
+        let marks = cancelled_before_start.clone();
 
         #[expect(
             clippy::disallowed_methods,
@@ -302,6 +312,7 @@ impl JobQueue {
                 let status_clone = status.clone();
                 let waiters_clone = waiters.clone();
                 let kept_clone = kept.clone();
+                let marks_clone = marks.clone();
 
                 #[expect(
                     clippy::disallowed_methods,
@@ -314,6 +325,7 @@ impl JobQueue {
                         status_clone,
                         waiters_clone,
                         kept_clone,
+                        marks_clone,
                         permit,
                     )
                     .await;
@@ -455,6 +467,7 @@ impl JobQueue {
         context: &Arc<AppContext>,
         status_map: &Arc<DashMap<String, JobStatus>>,
         kept: &DashMap<String, Job>,
+        cancelled_before_start: &DashSet<WorkerId>,
     ) {
         while let Some((_, job)) = kept.remove(worker_url) {
             let job_type = job.job_type();
@@ -477,8 +490,28 @@ impl JobQueue {
                 Some(JobStatus::processing(job_type, worker_url)),
             );
             let start = std::time::Instant::now();
-            let result = Self::execute_job(&job, context).await;
+            // A kept registration's cancel mark and reservation go as on the
+            // dispatcher's path (`process_job`): the job reads and clears its
+            // own mark, and a failed `POST`'s job releases its reservation
+            // before its status turns terminal.
+            let own_id = Self::own_mark_id(&job, &context.worker_registry);
+            let result =
+                Self::execute_job(&job, context, cancelled_before_start, own_id.as_ref()).await;
+            if result.is_err()
+                && matches!(
+                    job,
+                    Job::AddWorker {
+                        registration_mode: WorkerRegistrationMode::CreateOnly,
+                        ..
+                    }
+                )
+            {
+                context.worker_registry.release_reservation(worker_url);
+            }
             Self::record_job_completion(job_type, worker_url, start.elapsed(), &result, status_map);
+            if let Some(id) = own_id {
+                cancelled_before_start.remove(&id);
+            }
         }
     }
 
@@ -646,6 +679,128 @@ impl JobQueue {
         self.status_map.remove(worker_url);
     }
 
+    /// Cancels the `POST /workers` registration in flight for `worker_url`,
+    /// the one `worker_id` was reserved for, and says how many a `DELETE`
+    /// ends. A workflow the store holds is cancelled (one an earlier `DELETE`
+    /// cancelled, its job not ended yet, counts without a second cancel, so a
+    /// repeated `DELETE` queues no removal); a job that has not saved its
+    /// state yet is marked under `worker_id`, and ends when it reads the mark
+    /// (`execute_job`).
+    /// The cancelled job's end releases the URL's reservation and records its
+    /// status as for any registration that failed (`process_job`). A startup
+    /// or discovery registration of the same URL (`Upsert`) is not the API's
+    /// to end and runs on: none is cancelled, and no mark is set while one
+    /// runs (a `DELETE` then goes to the removal job as before).
+    pub async fn cancel_registration(
+        &self,
+        worker_url: &str,
+        worker_id: &WorkerId,
+    ) -> Result<usize, String> {
+        let Some(context) = self.context.upgrade() else {
+            return Err("Job queue shutting down: AppContext dropped".to_string());
+        };
+        let (cancelled, upsert_running) =
+            Self::cancel_registration_states(&context, worker_url).await?;
+        if cancelled > 0 || upsert_running || !self.add_worker_in_flight(worker_url) {
+            return Ok(cancelled);
+        }
+        // The job is queued, or started and has not saved its state yet. It
+        // may have saved it since the listing above: a second listing catches
+        // that, and the job's own read after its save catches the rest. A job
+        // that ended meanwhile, or an id that no longer names the URL (its
+        // registration over, a new one admitted), takes the mark back.
+        self.cancelled_before_start.insert(worker_id.clone());
+        let (cancelled, upsert_running) =
+            match Self::cancel_registration_states(&context, worker_url).await {
+                Ok(found) => found,
+                Err(message) => {
+                    self.cancelled_before_start.remove(worker_id);
+                    return Err(message);
+                }
+            };
+        if cancelled > 0
+            || upsert_running
+            || !self.add_worker_in_flight(worker_url)
+            || context.worker_registry.get_url_by_id(worker_id).as_deref() != Some(worker_url)
+        {
+            self.cancelled_before_start.remove(worker_id);
+            return Ok(cancelled);
+        }
+        Ok(1)
+    }
+
+    /// Whether the status entry under `url` is a registration job that has
+    /// not ended: queued, or running (the type name of [`Job::job_type`]).
+    fn add_worker_in_flight(&self, url: &str) -> bool {
+        self.status_map.get(url).is_some_and(|status| {
+            status.job_type == "AddWorker"
+                && matches!(status.status.as_str(), "pending" | "processing")
+        })
+    }
+
+    /// Cancels the `POST /workers` registration workflows the store holds for
+    /// `worker_url`: the active ones are cancelled, a cancelled one counts, one
+    /// that ended between the listing and the cancel is skipped. Says how many
+    /// it ended and whether a startup or discovery registration (`Upsert`) of
+    /// the URL is running, which is not the API's to end.
+    async fn cancel_registration_states(
+        context: &AppContext,
+        worker_url: &str,
+    ) -> Result<(usize, bool), String> {
+        let engine = &context
+            .workflow_engines
+            .get()
+            .ok_or_else(|| "Workflow engines not initialized".to_string())?
+            .worker_registration;
+        let states = engine
+            .state_store()
+            .list_all()
+            .await
+            .map_err(|e| format!("Failed to list registration workflows: {e:?}"))?;
+        let mut cancelled = 0;
+        let mut upsert_running = false;
+        for state in states {
+            if state.context.data.config.url != worker_url {
+                continue;
+            }
+            if !matches!(
+                state.context.data.registration_mode,
+                WorkerRegistrationMode::CreateOnly
+            ) {
+                // A `PUT`'s registration (`ReplaceById`) owns no id without a
+                // worker behind it, so it blocks no mark.
+                upsert_running |= matches!(
+                    state.context.data.registration_mode,
+                    WorkerRegistrationMode::Upsert
+                ) && matches!(
+                    state.status,
+                    WorkflowStatus::Pending | WorkflowStatus::Running
+                );
+                continue;
+            }
+            match state.status {
+                WorkflowStatus::Pending | WorkflowStatus::Running => {
+                    match engine.cancel_workflow(state.instance_id).await {
+                        Ok(()) => cancelled += 1,
+                        // Ended between the listing and the cancel: its job's
+                        // end path runs as for any registration that ended.
+                        Err(WorkflowError::NotFound(_)) => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "Failed to cancel registration workflow {}: {e:?}",
+                                state.instance_id
+                            ));
+                        }
+                    }
+                }
+                // Cancelled by an earlier DELETE; its job has not ended yet.
+                WorkflowStatus::Cancelled => cancelled += 1,
+                WorkflowStatus::Paused | WorkflowStatus::Completed | WorkflowStatus::Failed => {}
+            }
+        }
+        Ok((cancelled, upsert_running))
+    }
+
     /// Process a single job with status tracking and error handling
     async fn process_job(
         queued: Queued,
@@ -653,6 +808,7 @@ impl JobQueue {
         status_map: Arc<DashMap<String, JobStatus>>,
         outcomes: Outcomes,
         kept: Arc<DashMap<String, Job>>,
+        cancelled_before_start: Arc<DashSet<WorkerId>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let Queued { job, waiter } = queued;
@@ -684,7 +840,12 @@ impl JobQueue {
         // Execute job
         match context.upgrade() {
             Some(ctx) => {
-                let result = Self::execute_job(&job, &ctx).await;
+                // The id whose cancel mark this job owns (`own_mark_id`), read
+                // before the end path can release the reservation: the mark
+                // the job reads and clears is its own alone.
+                let own_id = Self::own_mark_id(&job, &ctx.worker_registry);
+                let result =
+                    Self::execute_job(&job, &ctx, &cancelled_before_start, own_id.as_ref()).await;
                 let duration = start.elapsed();
                 // Only `POST /workers` (CreateOnly) reserves an id for its 202; a failed
                 // upsert from discovery or startup owns no reservation to drop. Release
@@ -702,8 +863,19 @@ impl JobQueue {
                     ctx.worker_registry.release_reservation(&worker_url);
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
+                // A mark set for this job after its reads is over with it.
+                if let Some(id) = own_id {
+                    cancelled_before_start.remove(&id);
+                }
                 Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
-                Self::run_kept(&worker_url, &ctx, &status_map, &kept).await;
+                Self::run_kept(
+                    &worker_url,
+                    &ctx,
+                    &status_map,
+                    &kept,
+                    &cancelled_before_start,
+                )
+                .await;
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
@@ -721,13 +893,50 @@ impl JobQueue {
         }
     }
 
+    /// The id whose cancel mark a registration job owns: a `POST`'s job
+    /// (`CreateOnly`) owns the id its `POST` reserved, read from the URL's
+    /// mapping itself since the reservation has no worker behind it yet. A
+    /// `PUT`'s job and a startup or discovery registration own none: the mark
+    /// is a `DELETE` of a `POST`'s registration, and a job of another kind
+    /// started under that reservation (a `PUT` queued before the `POST`, a
+    /// discovery pass over the same URL) leaves it for the `POST`'s job.
+    fn own_mark_id(job: &Job, registry: &crate::worker::WorkerRegistry) -> Option<WorkerId> {
+        match job {
+            Job::AddWorker {
+                config,
+                registration_mode: WorkerRegistrationMode::CreateOnly,
+            } => registry.get_id_by_url_or_reservation(&config.url),
+            _ => None,
+        }
+    }
+
+    /// Takes the mark under `own_id`, if there is one: true when a `DELETE`
+    /// ended this registration before its job had saved a workflow state.
+    fn take_mark(marks: &DashSet<WorkerId>, own_id: Option<&WorkerId>) -> bool {
+        own_id.is_some_and(|id| marks.remove(id).is_some())
+    }
+
     /// Execute a specific job
-    async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
+    async fn execute_job(
+        job: &Job,
+        context: &Arc<AppContext>,
+        cancelled_before_start: &DashSet<WorkerId>,
+        own_id: Option<&WorkerId>,
+    ) -> Result<String, String> {
         match job {
             Job::AddWorker {
                 config,
                 registration_mode,
             } => {
+                // A DELETE that came before this job started ended the
+                // registration (`cancel_registration`): the job ends as a
+                // failed one, and its end path releases the URL. Only a POST's
+                // job owns a mark (`own_mark_id`): a PUT's job and a startup
+                // or discovery registration of the same URL read none, so no
+                // other kind can consume a mark meant for the POST's job.
+                if Self::take_mark(cancelled_before_start, own_id) {
+                    return Err("Registration cancelled before it started".to_string());
+                }
                 let engines = context
                     .workflow_engines
                     .get()
@@ -746,6 +955,18 @@ impl JobQueue {
                     .start_workflow(WorkflowId::new("worker_registration"), workflow_data)
                     .await
                     .map_err(|e| format!("Failed to start worker registration workflow: {e:?}"))?;
+                // A DELETE between the read above and the state's save found
+                // no state to cancel and left its mark: the workflow just
+                // started is cancelled here, and the wait below ends with it.
+                if Self::take_mark(cancelled_before_start, own_id) {
+                    engines
+                        .worker_registration
+                        .cancel_workflow(instance_id)
+                        .await
+                        .map_err(|e| {
+                            format!("Failed to cancel worker registration workflow: {e:?}")
+                        })?;
+                }
 
                 debug!(
                     "Started worker registration workflow for {} (instance: {})",
@@ -1825,7 +2046,14 @@ mod tests {
             &Ok("done".to_string()),
             &queue.status_map,
         );
-        JobQueue::run_kept(url, &context, &queue.status_map, &queue.kept).await;
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
         assert!(!queue.kept_for(url));
         let status = queue.get_status(url).expect("the kept job's own status");
         assert_eq!(status.job_type, "RemoveWorker");
@@ -1879,6 +2107,40 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A same-URL registration job of another kind started under a cancelled
+    /// `POST`'s reservation (a `PUT` queued before the `POST`, a discovery
+    /// pass over the URL) owns no mark and leaves the `POST`'s for the
+    /// `POST`'s own job, which takes it.
+    #[test]
+    fn a_put_or_discovery_job_under_a_cancelled_posts_reservation_leaves_its_mark() {
+        let registry = crate::worker::WorkerRegistry::new();
+        let url = "http://w:8000";
+        let reserved = registry.reserve_id_for_url(url);
+        let marks: DashSet<WorkerId> = DashSet::new();
+        marks.insert(reserved.clone());
+        let job = |mode| Job::AddWorker {
+            config: Box::new(WorkerSpec::new(url)),
+            registration_mode: mode,
+        };
+        for (kind, mode) in [
+            ("a PUT's", WorkerRegistrationMode::ReplaceById),
+            ("a discovery", WorkerRegistrationMode::Upsert),
+        ] {
+            let own = JobQueue::own_mark_id(&job(mode), &registry);
+            assert_eq!(own, None, "{kind} job owns no mark");
+            assert!(!JobQueue::take_mark(&marks, own.as_ref()));
+            assert!(marks.contains(&reserved), "{kind} job took the POST's mark");
+        }
+        let own = JobQueue::own_mark_id(&job(WorkerRegistrationMode::CreateOnly), &registry);
+        assert_eq!(
+            own.as_ref(),
+            Some(&reserved),
+            "the POST's job owns its reserved id"
+        );
+        assert!(JobQueue::take_mark(&marks, own.as_ref()));
+        assert!(marks.is_empty());
     }
 
     /// A submission that fails must not leave its claim behind, or the next
