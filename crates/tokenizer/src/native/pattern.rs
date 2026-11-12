@@ -535,6 +535,33 @@ struct Choice {
     count: u32,
 }
 
+/// The run of a class the digit-grouping lookahead measured last
+/// ([`Op::GroupsAhead`]): the position it measured from, the run's end and
+/// the count of the class's characters between. The end is the same for
+/// every position inside the run, so an evaluation nearby (a back-off of the
+/// digit run before the lookahead moves at most a few characters, the scanner
+/// moves forward one) reuses it with the count moved by the characters
+/// between, and a long digit run costs one scan instead of one per position.
+#[derive(Clone, Copy)]
+struct RunMemo {
+    class: usize,
+    from: usize,
+    end: usize,
+    count: u32,
+}
+
+impl Default for RunMemo {
+    /// No run measured: a class index no pattern has, and an empty span.
+    fn default() -> Self {
+        Self {
+            class: usize::MAX,
+            from: 1,
+            end: 0,
+            count: 0,
+        }
+    }
+}
+
 /// Choices a match can hold at once: one per alternation and per run on the
 /// deepest path of the tree (four for the GPT-2 and Qwen patterns, six for the
 /// largest in use). A pattern that needs more is declined.
@@ -647,6 +674,7 @@ impl Pattern {
             text,
             pos: 0,
             choices: [Choice::default(); MAX_CHOICES],
+            memo: RunMemo::default(),
         }
     }
 
@@ -682,6 +710,76 @@ impl Pattern {
         }
     }
 
+    /// The run of `class` characters from `pos`: its end and their count,
+    /// through `memo` (see [`RunMemo`]). A position inside the run measured
+    /// last reuses that run's end, the count moved by the characters between
+    /// the two positions (forward, every character between is in the run;
+    /// backward, each is checked); any other position scans the run.
+    fn class_run(&self, text: &str, pos: usize, class: usize, memo: &mut RunMemo) -> (usize, u32) {
+        let set = &self.classes[class];
+        if memo.class == class && memo.from <= pos && pos <= memo.end {
+            let mut p = memo.from;
+            let mut between = 0u32;
+            while p < pos {
+                match next_char(text, p) {
+                    Some((_, len)) => {
+                        p += len;
+                        between += 1;
+                    }
+                    None => break,
+                }
+            }
+            if p == pos {
+                let count = memo.count - between;
+                *memo = RunMemo {
+                    class,
+                    from: pos,
+                    end: memo.end,
+                    count,
+                };
+                return (memo.end, count);
+            }
+        } else if memo.class == class && pos < memo.from && memo.from <= memo.end {
+            let mut p = pos;
+            let mut between = 0u32;
+            while p < memo.from {
+                match next_char(text, p) {
+                    Some((c, len)) if set.contains(c) => {
+                        p += len;
+                        between += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if p == memo.from {
+                let count = memo.count + between;
+                *memo = RunMemo {
+                    class,
+                    from: pos,
+                    end: memo.end,
+                    count,
+                };
+                return (memo.end, count);
+            }
+        }
+        let mut count = 0u32;
+        let mut end = pos;
+        while let Some((c, len)) = next_char(text, end) {
+            if !set.contains(c) {
+                break;
+            }
+            end += len;
+            count += 1;
+        }
+        *memo = RunMemo {
+            class,
+            from: pos,
+            end,
+            count,
+        };
+        (end, count)
+    }
+
     /// The end of the match that starts exactly at `pos`, if any: the program
     /// run from its first op, alternatives in order and runs longest first,
     /// the first path that reaches `Match` winning, as the engine does it.
@@ -690,6 +788,7 @@ impl Pattern {
         text: &str,
         pos: usize,
         choices: &mut [Choice; MAX_CHOICES],
+        memo: &mut RunMemo,
     ) -> Option<usize> {
         let mut depth = 0usize;
         let mut pc = 0usize;
@@ -758,18 +857,10 @@ impl Pattern {
                     // `size` characters and ends the text or meets a
                     // character outside the word class, or at the position
                     // itself, between the character before it and the one
-                    // at it.
-                    let class = &self.classes[class];
+                    // at it. The run is measured once per run, not once per
+                    // position (see [`RunMemo`]).
+                    let (end, run) = self.class_run(text, pos, class, memo);
                     let word = &self.classes[word];
-                    let mut run = 0u32;
-                    let mut end = pos;
-                    while let Some((c, len)) = next_char(text, end) {
-                        if !class.contains(c) {
-                            break;
-                        }
-                        end += len;
-                        run += 1;
-                    }
                     let word_at =
                         |p: usize| next_char(text, p).is_some_and(|(c, _)| word.contains(c));
                     let word_before = text[..pos]
@@ -1363,6 +1454,8 @@ pub(crate) struct Matches<'p, 't> {
     pos: usize,
     /// The matcher's stack, held here so that one text's matches share it.
     choices: [Choice; MAX_CHOICES],
+    /// The digit run measured last, shared by one text's matches the same way.
+    memo: RunMemo,
 }
 
 impl Iterator for Matches<'_, '_> {
@@ -1378,7 +1471,10 @@ impl Iterator for Matches<'_, '_> {
                 Matcher::Cased(scanner) => {
                     scanner.match_at::<false>(&self.pattern.classes, self.text, start)
                 }
-                Matcher::Program => self.pattern.match_at(self.text, start, &mut self.choices),
+                Matcher::Program => {
+                    self.pattern
+                        .match_at(self.text, start, &mut self.choices, &mut self.memo)
+                }
             };
             match end {
                 Some(end) if end > start => {
@@ -3195,6 +3291,39 @@ mod tests {
         // The clitic groups in use fold letter by letter and stay accepted.
         for pattern in [QWEN2, QWEN35, CL100K, CASED] {
             assert!(Pattern::parse(pattern).is_some(), "{pattern}");
+        }
+    }
+
+    /// A long digit run costs one scan whatever follows it (the memo of the
+    /// run's end moves with the match loop through back-offs and starts), and
+    /// cuts as the engine cuts it: a run that meets a letter (the boundary
+    /// fails after the run, every start backs off three times), a run that
+    /// ends the text, one that meets a space, runs of a multiple of three,
+    /// and digits of another script (two bytes each, the memo counts
+    /// characters).
+    #[test]
+    fn a_long_digit_run_is_measured_once_whatever_follows() {
+        let run = "1".repeat(4096);
+        let arabic = "\u{663}".repeat(301);
+        for pattern in [DIGIT_GROUPS, r"\d{2}(?=(?:\d{3})*\b)|\d|[a-z]+"] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            for text in [
+                format!("{run}a"),
+                run.clone(),
+                format!("{run} x"),
+                format!("{}a", &run[..3999]),
+                format!("{arabic}a {arabic}"),
+                format!("{run}a{}", &run[..300]),
+                "12 123 1234a 12345 123456 1234567a 1,234,567.89x".to_owned(),
+            ] {
+                let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+                assert_eq!(
+                    ours,
+                    oracle_matches(pattern, &text),
+                    "{pattern} on {} bytes",
+                    text.len()
+                );
+            }
         }
     }
 
