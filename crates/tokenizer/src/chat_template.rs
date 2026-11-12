@@ -1138,7 +1138,7 @@ const TOJSON_BUFFER_BYTES: usize = 1024;
 /// JSON separator pair passed through HuggingFace's `tojson` filter. The
 /// defaults are the static bytes; only a `separators` argument owns its own.
 #[derive(Debug, Clone)]
-struct JsonSeparators {
+pub(crate) struct JsonSeparators {
     item: Cow<'static, [u8]>,
     key: Cow<'static, [u8]>,
 }
@@ -1147,7 +1147,7 @@ impl JsonSeparators {
     /// Python's defaults: `(', ', ': ')` for compact output and `(',', ': ')`
     /// when an indent was given (`pretty`), whatever the indent is: an empty
     /// one still puts every item on its own line.
-    fn python_default(pretty: bool) -> Self {
+    pub(crate) fn python_default(pretty: bool) -> Self {
         let item: &'static [u8] = if pretty { b"," } else { b", " };
         Self {
             item: Cow::Borrowed(item),
@@ -1423,7 +1423,10 @@ fn parse_separators(
     })
 }
 
-fn serialize_with_python_json<T: Serialize>(
+/// Python's `json.dumps` of `value` through the formatter the `tojson` filter
+/// and the prompt encoders share: `indent`, `separators` and `ensure_ascii` as
+/// the filter reads them.
+pub(crate) fn serialize_with_python_json<T: Serialize>(
     value: &T,
     indent: Option<&[u8]>,
     separators: JsonSeparators,
@@ -1446,12 +1449,6 @@ fn serialize_with_python_json<T: Serialize>(
             format!("Invalid UTF-8 in JSON output: {e}"),
         )
     })
-}
-
-/// Compact JSON spelling shared by the Jinja filter and native renderers.
-pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
-    serialize_with_python_json(value, None, JsonSeparators::python_default(false), false)
-        .map_err(Into::into)
 }
 
 /// Whether a filter call passed no keyword argument at all. `Kwargs::args`

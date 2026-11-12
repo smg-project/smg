@@ -15,7 +15,10 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::truthy;
-use crate::chat_template::{self, ChatTemplateParams};
+use crate::{
+    chat_template::{self, ChatTemplateParams},
+    json_dumps,
+};
 
 /// The current official templates identify the supported renderer revision.
 /// Other templates retain MiniJinja; checkpoint metadata alone cannot identify 5.3.
@@ -146,7 +149,7 @@ fn tool_definition(tool: &Value) -> Result<String> {
         if out.len() > 1 {
             out.push_str(", ");
         }
-        let _ = write!(out, "\"{key}\": {}", json(value)?);
+        let _ = write!(out, "\"{key}\": {}", json_dumps::to_string(value));
     }
     out.push('}');
     Ok(out)
@@ -297,7 +300,7 @@ fn tool_call(out: &mut String, call: &Value) -> Result<()> {
         if let Some(value) = value.as_str() {
             out.push_str(value);
         } else {
-            out.push_str(&json(value)?);
+            out.push_str(&json_dumps::to_string(value));
         }
         out.push_str(ARG_VALUE_CLOSE);
     }
@@ -436,10 +439,6 @@ fn render_inner(
         out.push_str(THINK_OPEN);
     }
     Ok(out)
-}
-
-fn json(value: &Value) -> Result<String> {
-    chat_template::compact_python_json(value)
 }
 
 #[cfg(test)]
