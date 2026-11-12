@@ -1296,7 +1296,7 @@ mod tests {
             assert!(
                 !STAGES_OVER_RDMA,
                 "the default build carries the no-op exporter"
-            )
+            );
         };
         assert!(
             !rdma_lane_stages(),
