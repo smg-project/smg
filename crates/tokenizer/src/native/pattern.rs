@@ -272,21 +272,6 @@ impl Class {
         }
     }
 
-    /// Whether the two classes are categories with none in common and
-    /// nothing else (no range, no exclusion, no negation): no character is in
-    /// both.
-    fn categories_apart(&self, other: &Self) -> bool {
-        !self.negated
-            && !other.negated
-            && self.without == 0
-            && other.without == 0
-            && self.ranges.is_empty()
-            && other.ranges.is_empty()
-            && self.categories != 0
-            && other.categories != 0
-            && self.categories & other.categories == 0
-    }
-
     /// Whether two finished classes are the same set: the same categories,
     /// exclusions, negation and (sorted, merged) ranges.
     fn same_set(&self, other: &Self) -> bool {
@@ -511,11 +496,14 @@ pub(super) enum Node {
     /// runs joined one `join` character at a time (a letter run with its
     /// combining marks, words joined by single spaces, as one family's split
     /// pattern writes it): one letter and its marks, then letters, marks and
-    /// join-then-letter while they come, taken whole. The join is one code
-    /// point in neither class and the two classes are categories apart, so
-    /// the engine's greedy path through the run is the longest run, and the
-    /// run stands at the end of its alternative ([`unit_run_misplaced`]),
-    /// where nothing follows to give a character back to.
+    /// join-then-letter while they come, taken whole. Each step is one
+    /// character of either class or the join's one code point and a letter,
+    /// so whichever class the engine reads a character as it moves to the
+    /// same position (the classes may share characters), and with the join
+    /// in neither class one step applies at any position or none: the
+    /// engine's greedy path through the run is the longest run, and the run
+    /// stands at the end of its alternative ([`unit_run_misplaced`]), where
+    /// nothing follows to give a character back to.
     JoinedRun {
         join: usize,
         letter: usize,
@@ -2848,9 +2836,9 @@ impl Parser<'_> {
 
     /// The classes of a joined letter run `YZ*(?:XYZ*)*`, when `nodes` are
     /// exactly that (a class, a run of a second, the tail over the same two
-    /// classes and a join) and the classes keep the engine's greedy path the
-    /// longest run: the join is one code point in neither class, and the two
-    /// classes are categories apart from each other.
+    /// classes and a join) and the join is one code point in neither class,
+    /// which keeps the engine's greedy path through the run the longest run
+    /// ([`Node::JoinedRun`]); the classes may share characters.
     fn joined_run_of(&self, nodes: &[Node]) -> Option<(usize, usize, usize)> {
         let [Node::Class(letter), Node::ClassRepeat {
             class: mark,
@@ -2873,11 +2861,10 @@ impl Parser<'_> {
         );
         let same = self.classes[*tail_letter].same_set(letters)
             && self.classes[*tail_mark].same_set(marks);
-        let apart = letters.categories_apart(marks);
         let joined_by_one = joins
             .single_code_point()
             .is_some_and(|c| !letters.contains(c) && !marks.contains(c));
-        (same && apart && joined_by_one).then_some((join, letter, mark))
+        (same && joined_by_one).then_some((join, letter, mark))
     }
 
     /// A group whose alternatives are each one character of a class
@@ -3169,7 +3156,13 @@ mod tests {
     /// by single spaces, as one piece (`(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+`).
     const JOINED_LETTER_RUNS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 27] = [
+    /// Joined runs over classes that share characters, for the sweeps:
+    /// letters with upper-case letters as the marks, numbers with Han
+    /// characters as the marks (the Han numerals are in both).
+    const OVERLAPPING_JOINED_RUNS: &str =
+        r"(?:\p{L}\p{Lu}*(?: \p{L}\p{Lu}*)*)+|(?:\p{N}\p{Han}*(?:-\p{N}\p{Han}*)*)+|\s+";
+
+    const PATTERNS: [&str; 28] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -3197,6 +3190,7 @@ mod tests {
         LINE_BREAK_RUNS,
         NUMBER_GROUPS,
         JOINED_LETTER_RUNS,
+        OVERLAPPING_JOINED_RUNS,
     ];
 
     /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
@@ -3593,7 +3587,7 @@ mod tests {
             r"a(?!\r?\n)+",
             // a joined letter run outside its one shape: something after it, a
             // loose tail, not under `+` alone, a join that is a class or in a
-            // class, classes with ranges or in common, the tail over other classes
+            // class, the tail over other classes
             r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+x",
             r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+(?!\S)",
             r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)*",
@@ -3604,8 +3598,6 @@ mod tests {
             r"(?: \p{L}\p{M}*)*x",
             r"(?:\p{L}\p{M}*(?:\p{M}\p{L}\p{M}*)*)+",
             r"(?:\p{L}\p{M}*(?:\p{L}\p{L}\p{M}*)*)+",
-            r"(?:\p{L}\p{L}*(?: \p{L}\p{L}*)*)+",
-            r"(?:[a-z]\p{M}*(?: [a-z]\p{M}*)*)+",
             r"(?:\p{L}\p{M}*(?: \p{N}\p{M}*)*)+",
             r"(?:\p{L}\p{M}*(?: \p{L}\p{N}*)*)+",
             // a run of units with something after it that is not the lookahead
@@ -3884,13 +3876,21 @@ mod tests {
     /// spaces as one piece, two spaces or a mark after the space ending it,
     /// marks after letters inside it, digits and punctuation outside it, the
     /// run under the file's whole pattern and alone, and with a hyphen and
-    /// numbers for the join and the marks.
+    /// numbers for the join and the marks, and over classes that share
+    /// characters (one inside the other either way round, meeting in part,
+    /// the same class twice, a range class and a negated one).
     #[test]
     fn a_joined_letter_run_is_cut_as_the_engine_cuts_it() {
         for pattern in [
             JOINED_LETTER_RUNS,
             r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+",
             r"(?:\p{L}\p{N}*(?:-\p{L}\p{N}*)*)+",
+            r"(?:\p{L}\p{Lu}*(?: \p{L}\p{Lu}*)*)+",
+            r"(?:\p{Lu}\p{L}*(?: \p{Lu}\p{L}*)*)+",
+            r"(?:\p{N}\p{Han}*(?: \p{N}\p{Han}*)*)+",
+            r"(?:\p{L}\p{L}*(?: \p{L}\p{L}*)*)+",
+            r"(?:[a-z]\p{M}*(?: [a-z]\p{M}*)*)+",
+            r"(?:[^\s\p{N}][0-9]*(?: [^\s\p{N}][0-9]*)*)+",
         ] {
             let parsed = Pattern::parse(pattern).expect("parses");
             assert!(
@@ -3917,6 +3917,11 @@ mod tests {
                 "\u{f1}and\u{fa} \u{fc}ber \u{e7}\u{e0}",
                 "it's a dog's life",
                 "a1b 2c d3",
+                "Ab cD eF Gh",
+                "ABC def GHI jkl",
+                "\u{3007}\u{3021} \u{3007}x \u{3021}-\u{3007}",
+                "a1 b2 c3 4 d",
+                "Zo\u{eb} \u{3a9}mega \u{1c5}x",
                 "",
                 " ",
             ] {
