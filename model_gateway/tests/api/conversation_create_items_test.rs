@@ -55,7 +55,8 @@ async fn call(app: &axum::Router, method: Method, uri: &str, body: Value) -> (St
 /// A conversation created with `items` and `metadata` answers the conversation
 /// object and lists the items, in the order given, with the shape the add-items
 /// route stores; a create whose items the add-items route would refuse is the
-/// same 400 and creates no conversation.
+/// same refusal and creates no conversation, also when the refused item comes
+/// after one the store would take.
 #[tokio::test]
 async fn a_conversation_created_with_items_lists_them() {
     let (ctx, app) = app_over_no_workers().await;
@@ -99,17 +100,34 @@ async fn a_conversation_created_with_items_lists_them() {
         "{listed}"
     );
 
-    for body in [
-        json!({"items": [{"type": "bogus"}]}),
-        json!({"items": "first"}),
-        json!({"items": [{"type": "message", "content": "no role"}]}),
+    for (body, expected, code) in [
+        (
+            json!({"items": [{"type": "bogus"}]}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json!({"items": "first"}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json!({"items": [{"type": "message", "content": "no role"}]}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json!({"items": [
+                {"type": "message", "role": "user", "content": "kept?"},
+                {"type": "item_reference", "id": "msg_nowhere"}
+            ]}),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
     ] {
         let (status, refused) = call(&app, Method::POST, "/v1/conversations", body.clone()).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {refused}");
-        assert_eq!(
-            refused["error"]["type"], "invalid_request_error",
-            "{body}: {refused}"
-        );
+        assert_eq!(status, expected, "{body}: {refused}");
+        assert_eq!(refused["error"]["code"], code, "{body}: {refused}");
         assert!(
             refused.get("id").is_none(),
             "{body}: no conversation is created: {refused}"

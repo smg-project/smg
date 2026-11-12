@@ -1,13 +1,16 @@
 //! Conversation CRUD handlers for the /v1/conversations API - shared across routers
 
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    sync::Arc,
+};
 
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::Utc;
 use serde_json::{json, Value};
 use smg_data_connector::{
     AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
@@ -189,14 +192,14 @@ fn apply_metadata_patches(
 // ============================================================================
 
 /// `POST /v1/conversations`: the conversation is scoped to the caller's
-/// `tenant`. Its `items`, when the request carries any, are stored and linked
-/// through the path of `POST /v1/conversations/{id}/items` (the same bounds,
-/// refusals and `warnings`), so a conversation created with items and one
-/// created empty and given the same items list the same. An item refused
-/// before any store is asked (the bounds, an unsupported type, a message
-/// without a role) leaves no conversation behind; one the stores refuse (an
-/// unknown reference, an id of another tenant) deletes the conversation just
-/// created, so a refused create creates nothing.
+/// `tenant`. Its `items`, when the request carries any, are prepared, stored
+/// and linked through the path of `POST /v1/conversations/{id}/items` (the
+/// same bounds, refusals and `warnings`), so a conversation created with items
+/// and one created empty and given the same items list the same. The whole
+/// batch is checked before the conversation exists (`prepare_items`: the
+/// bounds, an unsupported type, a message without a role, an unknown
+/// reference, an id of another tenant), so a refused create creates nothing;
+/// a store fault during the writes deletes the conversation just created.
 pub async fn create_conversation(
     storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
@@ -211,16 +214,12 @@ pub async fn create_conversation(
         Ok(items) => items,
         Err(response) => return response,
     };
-    // What the item parser refuses it refuses without a store: say so before
-    // the conversation exists (an `item_reference` is resolved by the store).
-    for item in items
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) != Some("item_reference"))
-    {
-        if let Err(message) = parse_item_from_value(item, tenant) {
-            return bad_request(message);
-        }
-    }
+    // The whole batch is checked against the stores before the conversation
+    // exists, so a refused batch leaves nothing behind.
+    let prepared = match prepare_items(item_storage, None, items, tenant).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
 
     let new_conv = NewConversation {
         id: None,
@@ -234,8 +233,8 @@ pub async fn create_conversation(
     };
     info!(conversation_id = %conversation.id.0, "Created conversation");
     let mut answer = conversation_to_json(&conversation);
-    if !items.is_empty() {
-        match store_items(item_storage, &conversation.id, items, tenant).await {
+    if !prepared.is_empty() {
+        match store_items(item_storage, &conversation.id, prepared).await {
             Ok((_, warnings)) => {
                 if !warnings.is_empty() {
                     if let Some(obj) = answer.as_object_mut() {
@@ -244,6 +243,8 @@ pub async fn create_conversation(
                 }
             }
             Err(response) => {
+                // Only a store fault reaches here: every refusal was found
+                // before the conversation was created.
                 if let Err(e) = storage.delete_conversation(&conversation.id).await {
                     warn!(
                         conversation_id = %conversation.id.0,
@@ -411,8 +412,12 @@ pub async fn create_conversation_items(
         Ok(items) => items,
         Err(response) => return response,
     };
+    let prepared = match prepare_items(item_storage, Some(&conversation_id), items, tenant).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
     let (created_items, warnings) =
-        match store_items(item_storage, &conversation_id, items, tenant).await {
+        match store_items(item_storage, &conversation_id, prepared).await {
             Ok(stored) => stored,
             Err(response) => return response,
         };
@@ -463,17 +468,148 @@ fn items_of(body: &Value, required: bool) -> Result<&[Value], Response> {
     Ok(items_array)
 }
 
-/// The items of one request stored and linked into `conversation_id` in the
-/// order given: each item as the public API lists it, and the warnings of the
-/// item types accepted but not implemented. A refused item ends the batch with
-/// its refusal.
+/// One item of a request batch once the stores have been asked and before
+/// anything is written: an item that exists already and is taken as it is (an
+/// `item_reference`, an item arriving under an id the caller may see), a new
+/// item to write with the warning of a type accepted but not implemented, or a
+/// repeat of an earlier item of the same batch (the same client-supplied id
+/// twice, a reference to an item the batch itself adds).
+enum PreparedItem {
+    Existing(ConversationItem),
+    New(NewConversationItem, Option<String>),
+    SameAs(usize),
+}
+
+/// The whole batch checked against the stores before any write, in the order
+/// given: every refusal the routes give (the parser's, an unknown reference, an
+/// id of another tenant, an item the conversation already has) is found here,
+/// so a refused batch stores nothing on either route. `conversation_id` is
+/// `None` while the conversation does not exist yet (the create route):
+/// nothing can be linked to it.
+async fn prepare_items(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: Option<&ConversationId>,
+    items: &[Value],
+    tenant: Option<&str>,
+) -> Result<Vec<PreparedItem>, Response> {
+    let mut prepared = Vec::with_capacity(items.len());
+    // The ids this batch brings itself (a new item under its own id): a later
+    // item of the batch that names one is a repeat, not a lookup the store
+    // cannot answer before the write.
+    let mut batch_ids: HashMap<&str, usize> = HashMap::new();
+    for item_val in items {
+        let item_type = item_val
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message");
+        let id = item_val.get("id").and_then(Value::as_str);
+        if let Some(index) = id.and_then(|id| batch_ids.get(id)) {
+            prepared.push(PreparedItem::SameAs(*index));
+            continue;
+        }
+        let item = if item_type == "item_reference" {
+            prepare_item_reference(item_storage, conversation_id, id, tenant).await?
+        } else if let Some(id_str) = id {
+            prepare_item_with_id(item_storage, conversation_id, item_val, id_str, tenant).await?
+        } else {
+            let (new_item, warning) =
+                parse_item_from_value(item_val, tenant).map_err(bad_request)?;
+            PreparedItem::New(new_item, warning)
+        };
+        if let (Some(id_str), PreparedItem::New(..)) = (id, &item) {
+            batch_ids.insert(id_str, prepared.len());
+        }
+        prepared.push(item);
+    }
+    Ok(prepared)
+}
+
+/// An `item_reference`: the existing item it names, as the caller's `tenant`
+/// may see it. A reference to an item the conversation already has is refused,
+/// as an item arriving under such an id is: the public API does not re-add an
+/// item a conversation has (the stores would move it to the new position).
+async fn prepare_item_reference(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: Option<&ConversationId>,
+    id: Option<&str>,
+    tenant: Option<&str>,
+) -> Result<PreparedItem, Response> {
+    let ref_id = id.ok_or_else(|| bad_request("item_reference requires 'id' field"))?;
+    let item_id = ConversationItemId::from(ref_id);
+    refuse_an_item_the_conversation_has(item_storage, conversation_id, &item_id).await?;
+
+    // An item of another tenant is as unknown as a missing one.
+    match item_storage.get_item(&item_id).await {
+        Ok(Some(item)) if item.is_visible_to(tenant) => Ok(PreparedItem::Existing(item)),
+        Ok(_) => Err(not_found(format!("Referenced item '{ref_id}' not found"))),
+        Err(e) => Err(store_error("Failed to get referenced item", &e)),
+    }
+}
+
+/// An item arriving under its own id: the caller's own (or an untenanted one)
+/// is taken as it is, another tenant's is neither served nor overwritten, an
+/// id the store does not hold is parsed as a new item under that id.
+async fn prepare_item_with_id(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: Option<&ConversationId>,
+    item_val: &Value,
+    id_str: &str,
+    tenant: Option<&str>,
+) -> Result<PreparedItem, Response> {
+    // Bounded before any store is asked: the stores' id columns are this wide,
+    // and an id over the bound must be the same 400 on every backend.
+    if id_str.len() > MAX_ITEM_ID_LENGTH {
+        return Err(item_id_above_max_length(id_str));
+    }
+    let item_id = ConversationItemId::from(id_str);
+    refuse_an_item_the_conversation_has(item_storage, conversation_id, &item_id).await?;
+
+    match item_storage.get_item(&item_id).await {
+        Ok(Some(existing)) if existing.is_visible_to(tenant) => {
+            Ok(PreparedItem::Existing(existing))
+        }
+        Ok(Some(_)) => Err(bad_request(format!("Item id '{id_str}' cannot be used"))),
+        Ok(None) => {
+            let (mut new_item, warning) =
+                parse_item_from_value(item_val, tenant).map_err(bad_request)?;
+            new_item.id = Some(item_id);
+            Ok(PreparedItem::New(new_item, warning))
+        }
+        Err(e) => Err(store_error("Failed to check item existence", &e)),
+    }
+}
+
+/// The refusal of an item the conversation already has; nothing is linked to a
+/// conversation that does not exist yet.
+async fn refuse_an_item_the_conversation_has(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: Option<&ConversationId>,
+    item_id: &ConversationItemId,
+) -> Result<(), Response> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(());
+    };
+    let is_linked = item_storage
+        .is_item_linked(conversation_id, item_id)
+        .await
+        .map_err(|e| store_error("Failed to check item link", &e))?;
+    if is_linked {
+        return Err(item_already_in_conversation());
+    }
+    Ok(())
+}
+
+/// The prepared items of one request written and linked into `conversation_id`
+/// in the order given: each item as the public API lists it, and the warnings
+/// of the item types accepted but not implemented. Every refusal was found by
+/// `prepare_items`; what ends the batch here is a store fault.
 async fn store_items(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
-    items: &[Value],
-    tenant: Option<&str>,
+    items: Vec<PreparedItem>,
 ) -> Result<(Vec<Value>, Vec<String>), Response> {
-    let mut created_items = Vec::new();
+    let mut created_items: Vec<Value> = Vec::with_capacity(items.len());
+    let mut item_ids: Vec<ConversationItemId> = Vec::with_capacity(items.len());
     let mut warnings = Vec::new();
     let mut link_pairs = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -481,14 +617,30 @@ async fn store_items(
     // items by `added_at`, so the items of this call list in the order the request gave them.
     let mut stamps = AddedAtSequence::new();
 
-    for item_val in items {
+    for prepared in items {
         let added_at = stamps.next_added_at();
-        let (item_json, item_id, warning) =
-            process_item(item_storage, conversation_id, item_val, added_at, tenant).await?;
+        let (item_json, item_id, warning) = match prepared {
+            PreparedItem::Existing(item) => {
+                let id = item.id.clone();
+                (item_to_json(item), id, None)
+            }
+            PreparedItem::New(new_item, warning) => {
+                let created = item_storage
+                    .create_item(new_item)
+                    .await
+                    .map_err(|e| store_error("Failed to create item", &e))?;
+                let id = created.id.clone();
+                (item_to_json(created), id, warning)
+            }
+            PreparedItem::SameAs(index) => {
+                (created_items[index].clone(), item_ids[index].clone(), None)
+            }
+        };
         if seen_ids.insert(item_id.0.clone()) {
-            link_pairs.push((item_id, added_at));
+            link_pairs.push((item_id.clone(), added_at));
         }
         created_items.push(item_json);
+        item_ids.push(item_id);
         if let Some(w) = warning {
             warnings.push(w);
         }
@@ -500,141 +652,6 @@ async fn store_items(
         .await
         .map_err(|e| store_error("Failed to link items to conversation", &e))?;
     Ok((created_items, warnings))
-}
-
-/// Process a single item for creation. Returns (json, item_id, warning).
-/// Linking is deferred to the caller for batch operation. An item that exists
-/// already (an `item_reference`, an item arriving under its own id) is taken
-/// only when the caller's `tenant` may see it; a new item is scoped to it.
-async fn process_item(
-    item_storage: &Arc<dyn ConversationItemStorage>,
-    conversation_id: &ConversationId,
-    item_val: &Value,
-    added_at: chrono::DateTime<Utc>,
-    tenant: Option<&str>,
-) -> Result<(Value, ConversationItemId, Option<String>), Response> {
-    let item_type = item_val
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("message");
-
-    // Handle item_reference specially - just resolve existing item
-    if item_type == "item_reference" {
-        return process_item_reference(item_storage, conversation_id, item_val, added_at, tenant)
-            .await;
-    }
-
-    let user_provided_id = item_val.get("id").and_then(|v| v.as_str());
-
-    let (item, warning) = if let Some(id_str) = user_provided_id {
-        process_item_with_id(item_storage, conversation_id, item_val, id_str, tenant).await?
-    } else {
-        process_new_item(item_storage, item_val, tenant).await?
-    };
-
-    let item_id = item.id.clone();
-    Ok((item_to_json(item), item_id, warning))
-}
-
-/// Process an item_reference - resolve an existing item for linking.
-/// Linking is deferred to the caller for batch operation. A reference to an item the
-/// conversation already has is refused, as an item arriving under such an id is: the
-/// public API does not re-add an item a conversation has (the stores would move it to the
-/// new position).
-async fn process_item_reference(
-    item_storage: &Arc<dyn ConversationItemStorage>,
-    conversation_id: &ConversationId,
-    item_val: &Value,
-    _added_at: chrono::DateTime<Utc>,
-    tenant: Option<&str>,
-) -> Result<(Value, ConversationItemId, Option<String>), Response> {
-    let ref_id = item_val
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| bad_request("item_reference requires 'id' field"))?;
-
-    let item_id = ConversationItemId::from(ref_id);
-
-    let is_linked = item_storage
-        .is_item_linked(conversation_id, &item_id)
-        .await
-        .map_err(|e| store_error("Failed to check item link", &e))?;
-    if is_linked {
-        return Err(item_already_in_conversation());
-    }
-
-    // An item of another tenant is as unknown as a missing one.
-    let existing_item = match item_storage.get_item(&item_id).await {
-        Ok(Some(item)) if item.is_visible_to(tenant) => item,
-        Ok(_) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
-        Err(e) => return Err(store_error("Failed to get referenced item", &e)),
-    };
-
-    let item_id = existing_item.id.clone();
-    Ok((item_to_json(existing_item), item_id, None))
-}
-
-/// Process an item with a user-provided ID
-async fn process_item_with_id(
-    item_storage: &Arc<dyn ConversationItemStorage>,
-    conversation_id: &ConversationId,
-    item_val: &Value,
-    id_str: &str,
-    tenant: Option<&str>,
-) -> Result<(ConversationItem, Option<String>), Response> {
-    // Bounded before any store is asked: the stores' id columns are this wide,
-    // and an id over the bound must be the same 400 on every backend.
-    if id_str.len() > MAX_ITEM_ID_LENGTH {
-        return Err(item_id_above_max_length(id_str));
-    }
-    let item_id = ConversationItemId::from(id_str);
-
-    // Check if already linked
-    let is_linked = item_storage
-        .is_item_linked(conversation_id, &item_id)
-        .await
-        .map_err(|e| store_error("Failed to check item link", &e))?;
-
-    if is_linked {
-        return Err(item_already_in_conversation());
-    }
-
-    // Check if item exists globally: the caller's own (or an untenanted one)
-    // is taken as it is; another tenant's is neither served nor overwritten.
-    match item_storage.get_item(&item_id).await {
-        Ok(Some(existing)) if existing.is_visible_to(tenant) => Ok((existing, None)),
-        Ok(Some(_)) => Err(bad_request(format!("Item id '{id_str}' cannot be used"))),
-        Ok(None) => {
-            // Create new item with the provided ID
-            let (mut new_item, warning) =
-                parse_item_from_value(item_val, tenant).map_err(bad_request)?;
-            new_item.id = Some(item_id);
-
-            let created = item_storage
-                .create_item(new_item)
-                .await
-                .map_err(|e| store_error("Failed to create item", &e))?;
-
-            Ok((created, warning))
-        }
-        Err(e) => Err(store_error("Failed to check item existence", &e)),
-    }
-}
-
-/// Process a new item without a user-provided ID
-async fn process_new_item(
-    item_storage: &Arc<dyn ConversationItemStorage>,
-    item_val: &Value,
-    tenant: Option<&str>,
-) -> Result<(ConversationItem, Option<String>), Response> {
-    let (new_item, warning) = parse_item_from_value(item_val, tenant).map_err(bad_request)?;
-
-    let created = item_storage
-        .create_item(new_item)
-        .await
-        .map_err(|e| store_error("Failed to create item", &e))?;
-
-    Ok((created, warning))
 }
 
 /// The `include` values a conversation item GET accepts (the public API's
@@ -1086,6 +1103,7 @@ mod tests {
         );
 
         let before = conversations.stored_record_count();
+        let items_before = items.stored_record_count();
         let too_many: Vec<Value> = (0..=MAX_ITEMS_PER_REQUEST)
             .map(|i| json!({"type": "message", "role": "user", "content": format!("m{i}")}))
             .collect();
@@ -1112,7 +1130,93 @@ mod tests {
                 before,
                 "a refused create creates nothing: {body}"
             );
+            assert_eq!(
+                items.stored_record_count(),
+                items_before,
+                "a refused create stores no item: {body}"
+            );
         }
+
+        // An id the caller already holds is adopted without a parse, as the
+        // add-items route adopts it: no role is asked of it.
+        let held = listed["data"][0]["id"].as_str().unwrap().to_string();
+        let adopted = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"items": [{"id": held}]}),
+        )
+        .await;
+        assert_eq!(adopted.status(), StatusCode::OK);
+    }
+
+    /// A batch refused after its first item (an unknown reference, an
+    /// unsupported type) stores nothing on either route: the whole batch is
+    /// prepared before the first write, so a corrected retry under the same id
+    /// is a fresh write with the retry's content.
+    #[tokio::test]
+    async fn a_refused_batch_stores_nothing_on_either_route() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let empty =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let conversation = empty["id"].as_str().unwrap().to_string();
+        let conversations_before = conversations.stored_record_count();
+        let items_before = items.stored_record_count();
+        let first = json!({"id": "msg_first", "type": "message", "role": "user", "content": "A"});
+
+        for (second, status) in [
+            (
+                json!({"type": "item_reference", "id": "msg_nowhere"}),
+                StatusCode::NOT_FOUND,
+            ),
+            (json!({"type": "bogus"}), StatusCode::BAD_REQUEST),
+        ] {
+            let body = json!({"items": [first, second]});
+            let on_create = create_conversation(&conversations, &items, None, body.clone()).await;
+            assert_eq!(on_create.status(), status, "{body}");
+            let on_add = create_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &conversation,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(on_add.status(), status, "{body}");
+            assert_eq!(
+                conversations.stored_record_count(),
+                conversations_before,
+                "no conversation: {body}"
+            );
+            assert_eq!(items.stored_record_count(), items_before, "no item: {body}");
+        }
+
+        let retried = create_conversation_items(
+            &conversations,
+            &items,
+            None,
+            &conversation,
+            json!({"items": [{"id": "msg_first", "type": "message", "role": "user", "content": "B"}]}),
+        )
+        .await;
+        assert_eq!(retried.status(), StatusCode::OK);
+        let listed = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &conversation,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed["data"][0]["content"][0]["text"], "B", "{listed}");
     }
 
     const A: Option<&str> = Some("header:tenant-a");
