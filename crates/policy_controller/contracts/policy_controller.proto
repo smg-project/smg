@@ -3,6 +3,10 @@
 // vocabulary is in policy_plugin.proto; the relay frames carry the engine
 // wire's own messages (smg.grpc.common) unchanged.
 //
+// Versioning: design appendix A (additive within v1). The package is
+// pre-release until the first shipped release that carries it; the rule
+// binds from then on.
+//
 // Scopes and principals: design 5.2. Four credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
 // metadata, never a field a peer fills in. Gateway: Session, Decide,
@@ -10,30 +14,33 @@
 // subject is refused with UNAUTHENTICATED and the stream closes. Ingestion:
 // PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
 // Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
-// WatchRegime), `admin` writes the rest. Replication: Replicate, and
-// GetSnapshot as the re-sync base; ReplicaHello.replica_id must equal the
-// subject. Leader is served to every scope; a standby serves Leader,
-// WatchWorkers, GetSnapshot and GetPolicySpec and answers Session and Decide
-// with NotLeader / Busy { NOT_LEADER }.
+// WatchRegime), `admin` writes the rest; every call writes an audit event.
+// Replication: Replicate, and GetSnapshot as the re-sync base;
+// ReplicaHello.replica_id must equal the subject. Leader is served to every
+// scope; a standby serves Leader, WatchWorkers, GetSnapshot and GetPolicySpec
+// and answers Session and Decide with NotLeader / Busy { NOT_LEADER }.
 // Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
 // leader's term, every GatewayFrame the gateway's term floor. A gateway
 // raises its floor from Leader and rejects frames below it; the controller
 // refuses a floor above its own term with FAILED_PRECONDITION; a leader past
 // its renew deadline sends NotLeader with an empty address and releases
 // nothing.
-// Flow: design 5.2. Budgets are relative to receipt; credits ride the Decide
-// stream as deltas (Credit) and are never taken back; with no credit the
-// gateway decides locally; a Decide whose budget is gone on arrival is
-// answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease.
+// Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
+// ride the Decide stream as deltas (Credit) and are never taken back; with
+// no credit the gateway decides locally; a Decide whose budget is gone on
+// arrival is answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease; a
+// Decision that arrives after a fallback is answered with Released.
 // Errors (gRPC status): UNAUTHENTICATED no verified principal, or Hello's
 // id is not the subject (the stream closes); PERMISSION_DENIED the scope or
-// role does not cover the RPC; FAILED_PRECONDITION not the leader, a floor
-// above the term, a revision or digest guard; INVALID_ARGUMENT a spec or
-// registration rejected; RESOURCE_EXHAUSTED a relay or standby over budget;
-// UNAVAILABLE a standby not yet synced; ABORTED fenced mid-stream, reconnect
-// through Leader; OUT_OF_RANGE and DATA_LOSS never raised, forwarded as
-// RelayResync. In-band within a stream: Busy, NotLeader, SpecAck
-// { accepted: false }, Decline.
+// role does not cover the RPC; FAILED_PRECONDITION not the leader (a
+// NotLeader in the status details), a floor above the term, a revision or
+// digest guard; INVALID_ARGUMENT a spec or registration rejected (the field
+// path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
+// relay over its per-subscriber budget or a standby over its backlog (a
+// resync_required batch precedes it); UNAVAILABLE a standby not yet synced;
+// ABORTED fenced mid-stream, reconnect through Leader; OUT_OF_RANGE and
+// DATA_LOSS never raised, forwarded as RelayResync. In-band within a stream:
+// Busy, NotLeader, SpecAck { accepted: false }, Decline.
 
 syntax = "proto3";
 package smg.policy.v1;
@@ -314,7 +321,8 @@ message WatchWorkersRequest {
   repeated string models = 1;
   // 0: a snapshot first, then the tail; otherwise the tail after this seq,
   // exclusive; when the buffer no longer holds seq + 1 the server answers one
-  // SnapshotRequired and ends the stream. membership_epoch is no resume point.
+  // SnapshotRequired and ends the stream. membership_epoch moves only on a
+  // membership change and is no resume point.
   uint64 resume_seq = 2;
   bool with_needs = 3;
 }
@@ -530,7 +538,7 @@ message WorkerSpec {
   OverloadThresholds overload = 8;
   uint32 kv_block_size = 9;
   PairingDescriptor pairing = 10;
-  // 0: discover the data-parallel width.
+  // 0: discover the data-parallel width (always on).
   uint32 dp_size = 11;
   Signals signals = 12;
   repeated string topology = 13;
@@ -548,7 +556,8 @@ message PatchWorkerRequest {
 message DeregisterWorkerRequest {
   fixed64 worker_id = 1;
   uint64 revision = 2;
-  // Drain (Removed after the last Completed) instead of releasing its leases.
+  // Drain (no new leases, Removed after the last Completed) instead of an
+  // immediate removal that releases its leases.
   bool drain = 3;
 }
 
@@ -748,7 +757,8 @@ message ApplyRequest {
   // `yaml` or `json`.
   string format = 2;
   ApplyMode mode = 3;
-  // The generation the caller edited; FAILED_PRECONDITION when another landed.
+  // The digest of the generation the caller edited; FAILED_PRECONDITION when
+  // another apply landed first.
   string expected_digest = 4;
 }
 

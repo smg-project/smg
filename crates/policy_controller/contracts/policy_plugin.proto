@@ -213,14 +213,16 @@ message Candidate {
   uint32 pair_class = 15;
   // Host-supplied admission bit: the prefill capacity window has a slot.
   bool has_capacity = 16;
-  // Host-supplied admission bit: the decode's running window has a free room.
+  // Host-supplied admission bit: the decode's running window has a room
+  // nobody waiting at its gate is in line for.
   bool has_room = 17;
   uint32 admitted_age_ms = 18;  // since admission to the pool
   // Blocks the index learned about the worker since admission.
   uint32 indexed_growth = 19;
   // One-based position into `view.zones`; 0 when unzoned.
   uint32 zone = 20;  // u16
-  // Bits over the spec's declared label list (at most 64).
+  // Bits over the spec's declared label list (at most 64; validation refuses
+  // a longer list).
   fixed64 labels = 21;
   // Encode-side compatibility for an encode-prefill-decode dispatch.
   bool ec_compatible = 22;
@@ -242,7 +244,8 @@ message RequestFacts {
   // The cache namespace folded into the block-hash seed.
   fixed64 namespace_seed = 2;
   Identity tenant = 3;
-  // A signed band (system 200, interactive 100, 0, bulk -100); negative sheds.
+  // A signed band (system 200, interactive 100, default 0, bulk -100); 0
+  // without a scheduler; negative is sheddable.
   sint32 priority = 4;
   bool streaming = 5;
   uint32 max_output_tokens = 6;
@@ -276,7 +279,8 @@ message Constraints {
   uint32 wire_modes = 2;  // WireMode bits the gateway speaks
   // The overload veto does not apply to this decision.
   bool overload_lifted = 3;
-  // At most this many candidates; absent for no hint, a present 0 for none.
+  // At most this many candidates; absent for no hint, a present 0 a decision
+  // over no candidates.
   optional uint32 subset_hint = 4;
 }
 
@@ -330,7 +334,8 @@ message Shed {
   bool wait_allowed = 4;
 }
 
-// Specified in v1; no built-in issues one before the admission step.
+// Specified in v1; no built-in issues one before the admission step, and a
+// host that meets one refuses the request as the status table says.
 message Queue {
   fixed64 ticket = 1;
   // Within the request's admission budget.
@@ -343,8 +348,8 @@ message Queue {
 message Lease {
   // Bit 63 set on a gateway-minted (LOCAL) id, clear on a controller-minted
   // one (LeaseOrigin, whose bounds keep it unique and never 0). On the plugin
-  // wire a re-minted fallback lease
-  // carries the controller's id with origin LOCAL.
+  // wire a re-minted fallback lease carries the controller's id with origin
+  // LOCAL.
   fixed64 id = 1;
   LeaseKind kind = 2;
   // Single outside a pair.
@@ -363,7 +368,8 @@ message Lease {
   LeaseOrigin origin = 10;
 }
 
-// Serves the routing trace header and Explain; positions into the spec.
+// Serves the routing trace header and Explain; positions into the generation's
+// spec; the record's `top` holds at most three entries.
 message Trace {
   // Zero-based position in the spec's profile names in ascending UTF-8 order.
   uint32 profile = 1;  // u16
@@ -373,7 +379,9 @@ message Trace {
   repeated Scored top = 3;
   fixed64 seed = 4;
   uint64 generation = 5;
-  // Zero-based like `profile`; 0 until the observability contract fills them.
+  // Zero-based: the plan among the spec's plan names and the picker among
+  // the schema's picker names, each in the order the schema declares them;
+  // 0 until the observability contract fills them.
   uint32 plan = 6;
   repeated FilterDrop drops = 7;
   uint32 picker = 8;
@@ -400,7 +408,8 @@ message Scored {
 }
 
 // The controller will not reach this decide in budget: the gateway decides
-// locally at once. Never a decision: no lease, no trace.
+// locally at once. Never a decision: no lease, no trace; never seen in the
+// embedded mode.
 message Busy {
   enum Reason {
     REASON_UNSPECIFIED = 0;
@@ -612,11 +621,12 @@ message Decline {
 }
 
 // Validity rules (design appendix B): surviving positions unique and in
-// range, `scores` finite in [0, 1] and one per candidate, `pick` within the
-// surviving set; a violation is a trap (fallback, the breaker counts it), a
-// `decline` the stage's fallback alone. Each asked stage answers with its own
-// field: `survivors` present and empty sheds; `pick` unset after a PICK ask
-// declines; a stage asked for and left unanswered is declined.
+// range, `scores` finite and one per candidate (the host clamps them to
+// [0, 1]), `pick` within the surviving set; a violation is a trap (fallback,
+// the breaker counts it), a `decline` the stage's fallback alone. Each asked
+// stage answers with its own field: `survivors` present and empty sheds,
+// never a fallback; `pick` unset after a PICK ask declines; a stage asked
+// for and left unanswered is declined.
 message PluginDecision {
   fixed64 decision_id = 1;
   Survivors survivors = 2;

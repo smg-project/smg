@@ -38,6 +38,8 @@ clock, a lease's issue instant), and each file's comments name them.
   extra exports are ignored, and a changed shape is a new type or the next
   major. The loader's error names the module's version and the accepted
   range.
+- Both are pre-release until the first shipped release that carries them; the
+  rules above bind from then on.
 - `tests/contracts.rs` pins the names: the RPC list of each service with its
   streaming shape, the cases of every `oneof`, the worlds, the interfaces and
   their functions, and the package names and versions. An additive change

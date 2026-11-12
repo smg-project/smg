@@ -14,8 +14,10 @@
 /// on. The loader's error names the module's version and the accepted range.
 ///
 /// Sandbox (design 4.5): no WASI, the only imports are `host` below. One
-/// instance per module per shard thread, created at apply and kept; a trap or
-/// an exhausted budget re-instantiates it, a decline keeps it.
+/// instance per module per shard thread, created at apply and kept; the call
+/// runs under fuel metering with a memory cap. A trap, an exhausted budget or
+/// a decline falls back to the configured stage; a trap or an exhausted
+/// budget re-instantiates the instance, a decline keeps it.
 
 package smg:policy@1.0.0;
 
@@ -63,7 +65,8 @@ interface types {
   /// positions. `zone`, `engine-kind` and `connector` are one-based positions
   /// into the spec's declared lists (0 is unzoned, unspecified or none;
   /// `zone-capacity.zone` is never 0); `labels` are bits over the declared
-  /// label list (at most 64). `load` is absent when the host has no report.
+  /// label list (at most 64; validation refuses a longer list). `load` is
+  /// absent when the host has no report.
   record candidate {
     id: u64,
     role: role,
@@ -140,8 +143,8 @@ interface types {
   /// id is the host's and unique within its lifecycle stream: the controller
   /// mints the ids a plugin sees (unique across gateways and terms: the
   /// minting term in the high bits, under the bounds LeaseOrigin states in the
-  /// proto) and re-mints a gateway-minted fallback id
-  /// before it reaches a plugin.
+  /// proto) and re-mints a gateway-minted fallback id before it reaches a
+  /// plugin.
   record lease {
     id: u64,
     kind: lease-kind,
