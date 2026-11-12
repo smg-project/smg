@@ -247,6 +247,11 @@ struct SinceReport {
     /// dispatch lowers it under its lane's lock; a release recomputes it
     /// under every lane's lock, so it never reads above any lane's front.
     oldest_micros: AtomicU64,
+    /// Held by the one retirement in progress: of the dispatches that read
+    /// the bound together, the first retires and the rest land while the row
+    /// is within a batch above the bound; past that a deciding thread lands
+    /// one and waits for the retirement.
+    retiring: Mutex<()>,
     lanes: [DispatchLane; DISPATCH_LANES],
 }
 
@@ -269,8 +274,12 @@ const DISPATCH_LANES: usize = 8;
 
 /// Dispatches kept per rank row between reports, over its lanes: a dispatch
 /// past the bound retires the row's oldest batch, by instant across the
-/// lanes, so the row holds within a batch below the bound and a lane count
-/// above it, and the newest credits stay.
+/// lanes, so the row holds within a batch below the bound and the newest
+/// credits stay. The row holds at most the bound, a batch and one dispatch
+/// per deciding thread: one retirement runs at a time, a dispatch that finds
+/// one running lands only while the row is within a batch above the bound
+/// and waits for it past that, so the request count's [`REQUEST_BITS`] bits
+/// never fill.
 const SINCE_REPORT_KEPT: u64 = 8_192;
 
 /// Dispatches an overflow retires, by instant across the lanes under every
@@ -336,6 +345,7 @@ impl Default for SinceReport {
         Self {
             held: AtomicU64::new(0),
             oldest_micros: AtomicU64::new(u64::MAX),
+            retiring: Mutex::new(()),
             lanes: Default::default(),
         }
     }
@@ -381,12 +391,38 @@ impl SinceReport {
     }
 
     /// Retires [`RETIRE_BATCH`] of the row's oldest dispatches by instant
-    /// across the lanes, under every lane's lock as the release path holds
-    /// them: one lock per lane and one subtraction from the held word per
-    /// batch. The row's oldest instant stays where it was: a value too low
-    /// costs a release walk, never a missed one.
+    /// across the lanes, one retirement at a time and under every lane's
+    /// lock as the release path holds them: one lock per lane and one
+    /// subtraction from the held word per batch. A row a release took below
+    /// the bound in the meantime keeps its dispatches. The row's oldest
+    /// instant stays where it was: a value too low costs a release walk,
+    /// never a missed one.
     fn retire_oldest_batch(&self) {
+        // One retirement at a time: a dispatch that finds one in progress
+        // lands while the row is within a batch above the bound, and past
+        // that waits for the retirement and runs its own, so the row never
+        // holds more than the bound, a batch and one dispatch per deciding
+        // thread.
+        let _retiring = match self.retiring.try_lock() {
+            Some(retiring) => retiring,
+            None if self.held.load(Ordering::Relaxed) & REQUEST_MASK
+                < SINCE_REPORT_KEPT + RETIRE_BATCH as u64 =>
+            {
+                return;
+            }
+            None => {
+                #[cfg(test)]
+                tests::RETIRE_WAITS.fetch_add(1, Ordering::Relaxed);
+                self.retiring.lock()
+            }
+        };
         let mut held_lanes = self.lock_lanes();
+        // The bound read again under the locks: a release between the
+        // record path's read and these locks may have taken the row below
+        // it, and then the newer credits stay.
+        if self.held.load(Ordering::Relaxed) & REQUEST_MASK < SINCE_REPORT_KEPT {
+            return;
+        }
         let mut retired = 0;
         for _ in 0..RETIRE_BATCH {
             // The lane whose front is the oldest; none when every lane is
@@ -521,6 +557,25 @@ impl LeastLoad {
                 let held = since.held.load(Ordering::Relaxed);
                 (held >> REQUEST_BITS, held & REQUEST_MASK)
             })
+    }
+
+    /// A retirement for the rank row, as a dispatch that read the bound
+    /// runs it.
+    #[cfg(test)]
+    fn retire_oldest_batch_of(&self, worker: WorkerId, dp_rank: u16) {
+        if let Some(since) = self.tally.load().get(&(worker, dp_rank)) {
+            since.retire_oldest_batch();
+        }
+    }
+
+    /// The rank row, for a test that holds its retire lock.
+    #[cfg(test)]
+    fn row(&self, worker: WorkerId, dp_rank: u16) -> Arc<SinceReport> {
+        self.tally
+            .load()
+            .get(&(worker, dp_rank))
+            .cloned()
+            .expect("a rank row")
     }
 
     /// The tally without the ranks `gone` names: the map replaced whole, as a
@@ -1268,6 +1323,10 @@ impl Picker for RoundRobin {
 
 #[cfg(test)]
 mod tests {
+    /// The dispatches that waited for a retirement in progress; the retire
+    /// path counts them under test alone.
+    pub(super) static RETIRE_WAITS: AtomicUsize = AtomicUsize::new(0);
+
     use super::*;
     use crate::view::{Health, LoadRow};
 
@@ -2150,13 +2209,13 @@ mod tests {
 
     #[test]
     fn an_overflow_retires_the_rows_oldest_by_instant_across_interleaved_lanes() {
-        // One lane holds one old dispatch and 63 recent ones, a second the
-        // rest of the bound between them; a third lane's dispatch overflows
-        // the row. The batch is the row's 64 oldest by instant, the old one
-        // and 63 of the second lane's, so a sample past the second lane
-        // leaves the 63 recent credits and the overflowing dispatch. The
-        // first lane drained whole would have left the overflowing dispatch
-        // alone.
+        // One lane holds one old dispatch and a batch less one of recent
+        // ones, a second the rest of the bound between them; a third lane's
+        // dispatch overflows the row. The batch is the row's oldest by
+        // instant, the old one and the rest from the second lane, so a
+        // sample past the second lane leaves the recent credits and the
+        // overflowing dispatch. The first lane drained whole would have left
+        // the overflowing dispatch alone.
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
         let mut pool: Vec<Candidate> = vec![candidate(0, 0)];
         pool[0].load = Some(report(0, 0));
@@ -2193,6 +2252,115 @@ mod tests {
             "the recent credits and the overflowing dispatch"
         );
         assert_eq!(ll.held_word_at(pool[0].id, 0), (left * 7, left));
+    }
+
+    #[test]
+    fn a_release_past_the_overflow_check_leaves_the_newer_credits() {
+        // A dispatch reads the bound, a load report's release then takes the
+        // row's older dispatches, and the retirement runs after it: the row
+        // is below the bound, so the newer credits stay.
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool: Vec<Candidate> = vec![candidate(0, 0)];
+        pool[0].load = Some(report(0, 0));
+        pool[0].load_sampled_at_micros = 1_000;
+        let kept: Vec<u32> = vec![0];
+        let book = |lane: usize, from: u64, count: u64| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    take_lane(lane);
+                    for n in 0..count {
+                        let lease = Lease {
+                            issued_micros: from + n,
+                            tokens: 7,
+                            ..Lease::default()
+                        };
+                        ll.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+                    }
+                });
+            });
+        };
+        book(0, 2_000, SINCE_REPORT_KEPT - 1);
+        book(1, 20_000, 100);
+        let mut scores = vec![0.0f32; 1];
+        let mut sampled = pool.clone();
+        sampled[0].load_sampled_at_micros = 15_000;
+        ll.score(&RequestFacts::default(), &sampled, &kept, &mut scores);
+        assert_eq!(ll.held(pool[0].id), 100, "the release past the older lane");
+        ll.retire_oldest_batch_of(pool[0].id, 0);
+        assert_eq!(
+            ll.held(pool[0].id),
+            100,
+            "a retirement below the bound retires nothing"
+        );
+        assert_eq!(ll.held_word_at(pool[0].id, 0), (100 * 7, 100));
+    }
+
+    #[test]
+    fn a_retirement_in_progress_lets_a_batch_land_above_the_bound_and_no_more() {
+        // A retirement holds the row's retire lock (here the test does):
+        // the dispatches crossing the bound meanwhile land, up to a batch
+        // above it, and the next one waits for the retirement, then retires
+        // and lands.
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool: Vec<Candidate> = vec![candidate(0, 0)];
+        pool[0].load = Some(report(0, 0));
+        pool[0].load_sampled_at_micros = 1_000;
+        let book = |lane: usize, from: u64, count: u64| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    take_lane(lane);
+                    for n in 0..count {
+                        let lease = Lease {
+                            issued_micros: from + n,
+                            tokens: 7,
+                            ..Lease::default()
+                        };
+                        ll.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+                    }
+                });
+            });
+        };
+        let bound = SINCE_REPORT_KEPT as usize;
+        book(0, 2_000, SINCE_REPORT_KEPT);
+        let row = ll.row(pool[0].id, 0);
+        let in_progress = row.retiring.lock();
+        book(1, 20_000, RETIRE_BATCH as u64);
+        assert_eq!(
+            ll.held(pool[0].id),
+            bound + RETIRE_BATCH,
+            "a batch lands above the bound"
+        );
+        let waits = RETIRE_WAITS.load(Ordering::Relaxed);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                take_lane(2);
+                let lease = Lease {
+                    issued_micros: 30_000,
+                    tokens: 7,
+                    ..Lease::default()
+                };
+                ll.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+            });
+            let started = std::time::Instant::now();
+            while RETIRE_WAITS.load(Ordering::Relaxed) == waits {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "the dispatch past a batch above the bound did not wait"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                ll.held(pool[0].id),
+                bound + RETIRE_BATCH,
+                "nothing lands past a batch above the bound"
+            );
+            drop(in_progress);
+        });
+        assert_eq!(
+            ll.held(pool[0].id),
+            bound + 1,
+            "the waiting dispatch retired a batch and landed"
+        );
     }
 
     #[test]
