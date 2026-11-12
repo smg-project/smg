@@ -26,7 +26,7 @@ use crate::{
         spec::{
             apply_modify_action_to_headers, build_wasm_headers_from_axum_headers,
             smg::gateway::middleware_types::{
-                Action, Request as WasmRequest, Response as WasmResponse,
+                Action, ModifyAction, Request as WasmRequest, Response as WasmResponse,
             },
         },
         types::WasmComponentInput,
@@ -160,11 +160,7 @@ async fn run_request_hook(
                 );
             }
             Action::Modify(modify) => {
-                apply_modify_action_to_headers(&mut headers, &modify);
-                if let Some(new_body) = modify.body_replace {
-                    body_bytes = new_body;
-                    body_replaced = true;
-                }
+                body_replaced |= apply_modify(&mut headers, &mut body_bytes, modify);
             }
         }
     }
@@ -277,11 +273,7 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
                 if let Some(new_status) = modify.status {
                     status = StatusCode::from_u16(new_status).unwrap_or(status);
                 }
-                apply_modify_action_to_headers(&mut headers, &modify);
-                if let Some(new_body) = modify.body_replace {
-                    body_bytes = new_body;
-                    body_replaced = true;
-                }
+                body_replaced |= apply_modify(&mut headers, &mut body_bytes, modify);
             }
         }
     }
@@ -334,22 +326,37 @@ fn rebuild_response(
     Response::from_parts(parts, Body::from(body))
 }
 
+/// Apply a module's `Modify` to the headers and body in hand, and say whether
+/// the body was replaced. A replacement first drops the content encoding
+/// declared for the body it replaces, then the module's own header edits
+/// apply, so a module that encodes its replacement and says so keeps its
+/// word; a body left in place keeps its encoding.
+fn apply_modify(headers: &mut HeaderMap, body: &mut Vec<u8>, modify: ModifyAction) -> bool {
+    if modify.body_replace.is_some() {
+        headers.remove(header::CONTENT_ENCODING);
+    }
+    apply_modify_action_to_headers(headers, &modify);
+    match modify.body_replace {
+        Some(new_body) => {
+            *body = new_body;
+            true
+        }
+        None => false,
+    }
+}
+
 /// The framing of a body the hook forwards whole: its length is the body's
-/// (an upstream's declaration described the body it replaced), a transfer
-/// encoding no longer applies to a body held in memory, and a content
-/// encoding declared for the body a module replaced does not describe the
-/// replacement; one a module left in place keeps its encoding. An empty
-/// body no module touched keeps the length it came with: a HEAD answer or a
-/// 304 declares the entity it stands for, and a bodiless request declares
-/// nothing.
+/// (an upstream's declaration described the body it replaced), and a
+/// transfer encoding no longer applies to a body held in memory; the
+/// content encoding is the body's own, settled when a module's `Modify` was
+/// applied. An empty body no module touched keeps the length it came with:
+/// a HEAD answer or a 304 declares the entity it stands for, and a bodiless
+/// request declares nothing.
 fn frame_body(headers: &mut HeaderMap, len: usize, body_replaced: bool) {
     if body_replaced || len > 0 {
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
     }
     headers.remove(header::TRANSFER_ENCODING);
-    if body_replaced {
-        headers.remove(header::CONTENT_ENCODING);
-    }
 }
 
 /// The wall clock in milliseconds since the epoch, as the modules read it.
@@ -374,10 +381,14 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use uuid::Uuid;
 
-    use super::{frame_body, is_streaming, run_request_hook, run_response_hook, RequestHook};
+    use super::{
+        apply_modify, frame_body, is_streaming, rebuild_response, run_request_hook,
+        run_response_hook, RequestHook,
+    };
     use crate::wasm::{
         module::{MiddlewareAttachPoint, WasmModule, WasmModuleAttachPoint, WasmModuleMeta},
         module_manager::WasmModuleManager,
+        spec::smg::gateway::middleware_types::{Header, ModifyAction},
         WasmRuntimeConfig,
     };
 
@@ -658,18 +669,15 @@ mod tests {
     /// A body the hook forwards is framed as it is now: the length is the
     /// body's, not the one the upstream declared for the body a module
     /// replaced; a transfer encoding no longer applies to a body held whole;
-    /// a content encoding goes with the body it described and stays with one
-    /// left in place.
+    /// the content encoding is not the framing's to touch.
     #[test]
     fn a_forwarded_body_is_framed_as_it_is_now() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_LENGTH, "5".parse().unwrap());
         headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
-        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
         frame_body(&mut headers, 12, true);
         assert_eq!(headers[header::CONTENT_LENGTH], "12");
         assert!(headers.get(header::TRANSFER_ENCODING).is_none());
-        assert!(headers.get(header::CONTENT_ENCODING).is_none());
 
         let mut kept = HeaderMap::new();
         kept.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
@@ -698,13 +706,91 @@ mod tests {
         );
     }
 
+    fn modify(body: Option<&[u8]>, set: &[(&str, &str)]) -> ModifyAction {
+        ModifyAction {
+            status: None,
+            headers_set: set
+                .iter()
+                .map(|(name, value)| Header {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+            headers_add: vec![],
+            headers_remove: vec![],
+            body_replace: body.map(<[u8]>::to_vec),
+        }
+    }
+
+    /// A module's replacement carries its own encoding: the one declared for
+    /// the body it replaces goes, a declaration the module makes alongside
+    /// its replacement stays, and a body left in place keeps its encoding.
+    #[test]
+    fn a_modules_replacement_carries_its_own_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let mut body = b"gzipped upstream".to_vec();
+        assert!(apply_modify(
+            &mut headers,
+            &mut body,
+            modify(Some(b"plain".as_slice()), &[])
+        ));
+        assert!(headers.get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(body, b"plain");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "br".parse().unwrap());
+        let mut body = b"brotli upstream".to_vec();
+        let encoded = modify(
+            Some(b"\x1f\x8b gzipped by the module".as_slice()),
+            &[("content-encoding", "gzip")],
+        );
+        assert!(apply_modify(&mut headers, &mut body, encoded));
+        assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(body, b"\x1f\x8b gzipped by the module");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let mut body = b"left in place".to_vec();
+        assert!(!apply_modify(
+            &mut headers,
+            &mut body,
+            modify(None, &[("x-seen", "1")])
+        ));
+        assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(headers["x-seen"], "1");
+        assert_eq!(body, b"left in place");
+    }
+
+    /// A rejection is rebuilt from the response's parts too: the status is
+    /// the module's, the body is framed, and the extensions stay.
+    #[test]
+    fn a_rejection_keeps_the_responses_extensions() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, "40")
+            .body(Body::empty())
+            .expect("a response");
+        response.extensions_mut().insert(Marker("permit"));
+        let (parts, _) = response.into_parts();
+        let headers = parts.headers.clone();
+        let rejected =
+            rebuild_response(parts, StatusCode::FORBIDDEN, headers, b"no".to_vec(), true);
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert_eq!(rejected.headers()[header::CONTENT_LENGTH], "2");
+        assert_eq!(
+            rejected.extensions().get::<Marker>(),
+            Some(&Marker("permit"))
+        );
+    }
+
     /// The response the hook rebuilds declares the body it carries, whatever
     /// the upstream declared for the body before the modules ran, and keeps
     /// the extensions the layers inside handed the edge.
     #[tokio::test]
     async fn the_response_hook_frames_the_body_it_forwards_and_keeps_the_extensions() {
         let manager = manager_with_an_inert_module();
-        let payload = b"a body of nineteen b".to_vec();
+        let payload = b"twenty bytes of body".to_vec();
         let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
