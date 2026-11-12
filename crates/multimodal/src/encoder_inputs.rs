@@ -20,7 +20,12 @@ use std::{
 use anyhow::{Context, Result as AnyhowResult};
 use ndarray::{Array, ArrayD, ArrayViewD, Axis, Dimension, IxDyn, Slice};
 
-use crate::{buffer_pool, pixel_convert, types::FieldLayout, vision::execution, WireBytes};
+use crate::{
+    buffer_pool, pixel_convert,
+    types::FieldLayout,
+    vision::{execution, scratch},
+    WireBytes,
+};
 
 /// The dtypes an encoder input is written in for the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,7 +346,8 @@ impl EncoderInput {
     /// The input as little-endian bytes of `dtype`, consuming it: bytes
     /// already in `dtype` move out; anything else is written as
     /// [`EncoderInputView::try_write_as`] writes it, with its errors, and
-    /// the written-out bytes or patches go back to the buffer pool.
+    /// the written-out bytes or patches go back to the buffer pool, a
+    /// written-out float tensor's storage to the thread's scratch pool.
     pub fn into_bytes_as(self, dtype: EncoderDtype) -> Result<Vec<u8>, String> {
         match self {
             Self::Wire {
@@ -366,7 +372,16 @@ impl EncoderInput {
                     Self::U8 { patches, .. } => {
                         buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
                     }
-                    Self::F32(_) | Self::SharedWire { .. } => {}
+                    // The processors take their float tensors from the
+                    // thread's scratch pool and give back what they consume
+                    // on the way; the tensor they hand out comes back here,
+                    // so the next image's take on this thread is warm
+                    // instead of a fresh allocation faulted in page by page.
+                    // On a thread that never takes (one that only writes
+                    // tensors made elsewhere) the pool keeps nothing, so the
+                    // give costs that thread no residency.
+                    Self::F32(array) => scratch::give_f32(array.into_raw_vec_and_offset().0),
+                    Self::SharedWire { .. } => {}
                 }
                 written
             }
@@ -1642,6 +1657,33 @@ mod tests {
     use ndarray::Array4;
 
     use super::*;
+
+    /// A float tensor written out as wire bytes returns its storage to the
+    /// thread's scratch pool: the next float take of that size on the thread
+    /// is the same allocation, and the bytes written are the view's.
+    #[test]
+    fn a_float_tensor_written_out_returns_its_storage_to_the_scratch_pool() {
+        let len = 3 * 4 * 4;
+        let mut storage = scratch::take_f32(len);
+        for (i, value) in storage.iter_mut().enumerate() {
+            *value = i as f32 / 8.0 - 2.0;
+        }
+        let ptr = storage.as_ptr();
+        let input = EncoderInput::F32(
+            ArrayD::from_shape_vec(IxDyn(&[1, 3, 4, 4]), storage).expect("shape matches"),
+        );
+        let expected = input.view().write_as(EncoderDtype::BFloat16);
+        let bytes = input
+            .into_bytes_as(EncoderDtype::BFloat16)
+            .expect("floats narrow to bfloat16");
+        assert_eq!(bytes, expected);
+        let again = scratch::take_f32(len);
+        assert_eq!(
+            again.as_ptr(),
+            ptr,
+            "the written-out tensor's storage is the thread's next take"
+        );
+    }
 
     #[test]
     fn encoder_input_accessors_are_modality_neutral() {
