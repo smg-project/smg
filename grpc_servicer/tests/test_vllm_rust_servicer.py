@@ -2267,12 +2267,15 @@ def test_model_info_advertises_the_encoder_cache_connector():
 
 @pytest.mark.parametrize("policy", ["", "requested", "always"])
 def test_vllm_binding_advertises_decoding_policy(tmp_path, policy):
-    """The Python constructor carries the engine declaration onto the real Rust RPC."""
+    """Carry the engine declaration onto the real Rust RPC.
+
+    Skipped where the ``smg`` wheel is not installed.
+    """
     import grpc
-    from smg.servicer import VllmGrpcServer
     from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 
-    started = VllmGrpcServer(
+    servicer = pytest.importorskip("smg.servicer")
+    started = servicer.VllmGrpcServer(
         "127.0.0.1:0",
         f"ipc://{tmp_path}/engine",
         f"ipc://{tmp_path}/handshake",
