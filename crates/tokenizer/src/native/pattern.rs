@@ -503,7 +503,10 @@ pub(super) enum Node {
     /// in neither class one step applies at any position or none: the
     /// engine's greedy path through the run is the longest run, and the run
     /// stands at the end of its alternative ([`unit_run_misplaced`]), where
-    /// nothing follows to give a character back to.
+    /// nothing follows to give a character back to. Neither class holds the
+    /// space, so a space inside a run is its join and the thread pool's cut
+    /// check, run from a space before the cut, sees the run as the whole text
+    /// does (`joined_run_of`).
     JoinedRun {
         join: usize,
         letter: usize,
@@ -2838,7 +2841,13 @@ impl Parser<'_> {
     /// exactly that (a class, a run of a second, the tail over the same two
     /// classes and a join) and the join is one code point in neither class,
     /// which keeps the engine's greedy path through the run the longest run
-    /// ([`Node::JoinedRun`]); the classes may share characters.
+    /// ([`Node::JoinedRun`]); the classes may share characters but neither
+    /// holds the space: the thread pool cuts at spaces and checks a cut with
+    /// the stages run from a space before it, where a space is a run's join
+    /// (a letter follows, the run restarts on it and spans the cut as the
+    /// whole text's does), but a space in a class could be the run's mark or
+    /// letter there, read by another alternative from the window's start,
+    /// and the window's pieces would part from the text's.
     fn joined_run_of(&self, nodes: &[Node]) -> Option<(usize, usize, usize)> {
         let [Node::Class(letter), Node::ClassRepeat {
             class: mark,
@@ -2864,7 +2873,8 @@ impl Parser<'_> {
         let joined_by_one = joins
             .single_code_point()
             .is_some_and(|c| !letters.contains(c) && !marks.contains(c));
-        (same && joined_by_one).then_some((join, letter, mark))
+        let no_space = !letters.contains(' ') && !marks.contains(' ');
+        (same && joined_by_one && no_space).then_some((join, letter, mark))
     }
 
     /// A group whose alternatives are each one character of a class
@@ -3587,7 +3597,10 @@ mod tests {
             r"a(?!\r?\n)+",
             // a joined letter run outside its one shape: something after it, a
             // loose tail, not under `+` alone, a join that is a class or in a
-            // class, the tail over other classes
+            // class, the tail over other classes, a class holding the space
+            // (the thread pool's cut check runs from a space)
+            r"(?:a[ x]*(?:-a[ x]*)*)+| [a-z]+",
+            r"(?:[ a][x]*(?:-[ a][x]*)*)+",
             r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+x",
             r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+(?!\S)",
             r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)*",
