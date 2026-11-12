@@ -25,7 +25,6 @@ pub(crate) fn create_test_app_context() -> Arc<AppContext> {
     app_context_for_tests(
         router_config,
         Arc::new(crate::worker::WorkerRegistry::new()),
-        None,
     )
 }
 

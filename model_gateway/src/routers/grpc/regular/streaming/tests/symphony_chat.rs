@@ -10,7 +10,7 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionRequest},
-    common::{ChatLogProbs, StringOrArray},
+    common::{ChatLogProbs, StringOrArray, Tool},
 };
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
@@ -22,25 +22,22 @@ use symphony::{
 use super::{
     super::*,
     eof::{
-        chat_spec, chat_text, chunk, chunk_with_logprobs, collect_events, complete, dispatch,
-        logprob_carriers, processor, scripted_stream, CharacterTokenizer,
+        assignment_of, chat_spec, chat_text, chunk, chunk_with_logprobs, collect_events, complete,
+        dispatch, logprob_carriers, processor, scripted_stream, CharacterTokenizer,
     },
 };
-use crate::{
-    config::ParserChoice,
-    routers::grpc::{
-        proto_wrapper::ProtoGenerateComplete,
-        regular::{
-            processor::ResponseProcessor,
-            symphony::{
-                assign, telemetry,
-                template::Templates,
-                testing::{tools, Refusing},
-                Asks, Assignment,
-            },
+use crate::routers::grpc::{
+    proto_wrapper::ProtoGenerateComplete,
+    regular::{
+        processor::{ResponseProcessor, NO_TABLE},
+        symphony::{
+            assign, telemetry,
+            template::Templates,
+            testing::{tools, Refusing},
+            Asks,
         },
-        utils::ModelNames,
     },
+    utils::ModelNames,
 };
 
 /// The spec with Symphony assigned `format`, replaying `prompt`.
@@ -49,14 +46,7 @@ pub(super) fn assigned(
     format: Format,
     prompt: &str,
 ) -> ChatResponseSpec {
-    spec.symphony = Some(Assignment {
-        format: Arc::new(format),
-        prompt: prompt.to_string(),
-        forbids_calls: false,
-        past_the_end: false,
-        span: Span::none(),
-        marked: Arc::default(),
-    });
+    spec.symphony = Some(assignment_of(format, prompt));
     spec
 }
 
@@ -66,28 +56,20 @@ const QWEN3_OUTPUT: &str = "<think>plan</think>Hello <tool_call>\n\
 
 async fn stream_events(
     responses: Vec<proto::GenerateResponse>,
-    with_tools: bool,
     spec: ChatResponseSpec,
 ) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
-    stream_events_through(
-        Arc::new(CharacterTokenizer::default()),
-        responses,
-        with_tools,
-        spec,
-    )
-    .await
+    stream_events_through(Arc::new(CharacterTokenizer::default()), responses, spec).await
 }
 
 /// [`stream_events`] decoding through `tokenizer`.
 async fn stream_events_through(
     tokenizer: Arc<dyn Tokenizer>,
     responses: Vec<proto::GenerateResponse>,
-    with_tools: bool,
     spec: ChatResponseSpec,
 ) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, "0").await;
     let (tx, rx) = sse_channel();
-    let result = processor(with_tools)
+    let result = processor()
         .process_streaming_chunks(
             stream,
             dispatch(),
@@ -128,7 +110,7 @@ async fn symphony_streams_reasoning_content_and_a_tool_call_from_a_qwen3_output(
         chunk(0, &QWEN3_OUTPUT[32..]),
         complete(0, "stop"),
     ];
-    let (result, events) = stream_events(responses, true, spec).await;
+    let (result, events) = stream_events(responses, spec).await;
     assert!(result.is_ok(), "{result:?}");
 
     assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
@@ -177,7 +159,7 @@ async fn symphony_streams_every_chunks_logprobs_once() {
         chunk_with_logprobs(0, &QWEN3_OUTPUT[25..]),
         complete(0, "stop"),
     ];
-    let (result, events) = stream_events(responses, true, spec).await;
+    let (result, events) = stream_events(responses, spec).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
     assert_eq!(
@@ -246,15 +228,13 @@ async fn a_call_the_conversation_established_is_a_call_without_a_tool_inventory(
     // the block the model writes for the retry comes back as a call, not as content.
     let request = retry_request();
     let assignment = assign(
-        ParserChoice::Symphony,
         &ModelNames::default(),
         Asks::Chat(&request),
         None,
         RETRY_PROMPT,
         &Templates::new(Arc::new(TokenizerRegistry::new())),
     )
-    .expect("no template named")
-    .expect("the registry's table");
+    .expect("no template named");
     assert_eq!(
         assignment.prompt, "]~b]ai\n",
         "the replay starts at the turn opener"
@@ -272,7 +252,7 @@ async fn a_call_the_conversation_established_is_a_call_without_a_tool_inventory(
         chunk(0, &output[30..]),
         complete(0, "stop"),
     ];
-    let (result, events) = stream_events(responses, false, spec).await;
+    let (result, events) = stream_events(responses, spec).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(
         chat_text(&events, 0, "reasoning_content"),
@@ -308,7 +288,7 @@ async fn stream_events_stopping(
     let (stream, server) = scripted_stream(responses, "0").await;
     let (tx, rx) = sse_channel();
     let stop = Some(StringOrArray::String(stop.to_string()));
-    let result = processor(true)
+    let result = processor()
         .process_streaming_chunks(
             stream,
             dispatch(),
@@ -356,7 +336,7 @@ async fn a_stop_the_decoder_matches_without_a_complete_frame_still_ends_with_too
         "<|im_start|>assistant\n",
     );
     let responses = vec![chunk(0, QWEN3_OUTPUT)];
-    let (result, events) = stream_events(responses, true, spec).await;
+    let (result, events) = stream_events(responses, spec).await;
     assert!(result.is_ok(), "{result:?}");
     assert!(!tool_call_deltas(&events).is_empty(), "{events:#?}");
     assert!(events
@@ -372,7 +352,7 @@ async fn the_prompts_open_thought_is_replayed_so_the_output_starts_inside_it() {
         "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n",
     );
     let responses = vec![chunk(0, "plan</think>Hi"), complete(0, "stop")];
-    let (result, events) = stream_events(responses, false, spec).await;
+    let (result, events) = stream_events(responses, spec).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
     assert_eq!(chat_text(&events, 0, "content").trim(), "Hi");
@@ -384,34 +364,39 @@ async fn the_prompts_open_thought_is_replayed_so_the_output_starts_inside_it() {
 }
 
 #[tokio::test]
-async fn without_an_assignment_the_older_parsers_read_the_stream() {
+async fn the_plain_table_reads_the_thought_as_content_and_no_table_is_an_internal_failure() {
     let responses = || vec![chunk(0, "<think>plan</think>Hi"), complete(0, "stop")];
     // Assigned the plain table, Symphony reads the thought as content.
     let spec = assigned(chat_spec(false), plain(), "");
-    let (result, events) = stream_events(responses(), false, spec).await;
+    let (result, events) = stream_events(responses(), spec).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(chat_text(&events, 0, "content"), "<think>plan</think>Hi");
     assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
-    // With no assignment, the configured reasoning parser takes it, as before.
-    let (result, events) = stream_events(responses(), false, chat_spec(false)).await;
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
-    assert_eq!(chat_text(&events, 0, "content"), "Hi");
+    // A spec no table was assigned to is request building's mistake, not a reading: the stream
+    // fails before its first frame, naming it, and nothing reaches the client.
+    let mut unassigned = chat_spec(false);
+    unassigned.symphony = None;
+    let (result, events) = stream_events(responses(), unassigned).await;
+    assert!(
+        matches!(&result, Err(utils::StreamFailure::Internal(why)) if why == NO_TABLE),
+        "{result:?}"
+    );
+    assert!(events.is_empty(), "{events:#?}");
 }
 
 /// A whole `output` read by the non-streaming driver with the Qwen3 table, one logprob per
 /// character token: the choice and its reasoning token count.
-async fn fold(output: &str) -> (ChatChoice, u32) {
-    fold_with(output, qwen3(CallSyntax::Json), "<|im_start|>assistant\n").await
+fn fold(output: &str) -> (ChatChoice, u32) {
+    fold_with(output, qwen3(CallSyntax::Json), "<|im_start|>assistant\n")
 }
 
 /// [`fold`] over `format` after `prompt`.
-async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u32) {
-    fold_finished(output, format, prompt, "stop").await
+fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u32) {
+    fold_finished(output, format, prompt, "stop")
 }
 
 /// [`fold_with`] with the engine's finish reason chosen.
-async fn fold_finished(
+fn fold_finished(
     output: &str,
     format: Format,
     prompt: &str,
@@ -424,12 +409,11 @@ async fn fold_finished(
         prompt,
         finish_reason,
     )
-    .await
     .expect("a choice")
 }
 
 /// [`fold_finished`] decoding through `tokenizer`, with the unary path's own verdict.
-async fn fold_through(
+fn fold_through(
     tokenizer: Arc<dyn Tokenizer>,
     output: &str,
     format: Format,
@@ -450,27 +434,15 @@ async fn fold_through(
     let mut decoder =
         StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
     let spec = assigned(chat_spec(true), format, prompt);
-    let processor = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    );
-    processor
-        .process_single_choice(
-            "test-request",
-            &complete,
-            0,
-            &spec,
-            "Qwen/Qwen3-8B",
-            &tokenizer,
-            &mut decoder,
-            0,
-            false,
-            false,
-            None,
-            None,
-        )
-        .await
+    ResponseProcessor::process_single_choice(
+        "test-request",
+        &complete,
+        0,
+        &spec,
+        "Qwen/Qwen3-8B",
+        &tokenizer,
+        &mut decoder,
+    )
 }
 
 /// The tokens whose logprobs the choice kept, joined.
@@ -488,7 +460,7 @@ fn kept_logprob_tokens(choice: &ChatChoice) -> String {
 #[tokio::test]
 async fn symphony_folds_a_whole_output_into_the_message() {
     // One logprob per output token: the choice keeps every one of them, as the older path does.
-    let (choice, reasoning_tokens) = fold(QWEN3_OUTPUT).await;
+    let (choice, reasoning_tokens) = fold(QWEN3_OUTPUT);
     assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
     assert_eq!(
         choice.message.content.as_deref().map(str::trim),
@@ -540,7 +512,7 @@ async fn streamed_cut_call_keeps_its_bytes(
     output: &str,
     arguments: &str,
 ) -> String {
-    let (result, events) = stream_events(responses, true, spec).await;
+    let (result, events) = stream_events(responses, spec).await;
     assert!(result.is_ok(), "{output:?}: {result:?}");
     let calls = tool_call_deltas(&events);
     assert_eq!(
@@ -568,13 +540,8 @@ async fn streamed_cut_call_keeps_its_bytes(
 /// A whole call the token limit cut, folded over `format` after `prompt`: the choice finishes
 /// `length` with the call's name and `arguments`, its bytes as the model wrote them, and nothing
 /// of the call as content.
-async fn whole_cut_call_keeps_its_bytes(
-    output: &str,
-    arguments: &str,
-    format: Format,
-    prompt: &str,
-) {
-    let (choice, _) = fold_finished(output, format, prompt, "length").await;
+fn whole_cut_call_keeps_its_bytes(output: &str, arguments: &str, format: Format, prompt: &str) {
+    let (choice, _) = fold_finished(output, format, prompt, "length");
     let calls = choice.message.tool_calls.as_ref().expect("the call");
     assert_eq!(calls.len(), 1, "{output:?}");
     assert_eq!(calls[0].function.name, "lookup");
@@ -616,7 +583,7 @@ async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_fin
 async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (tail, arguments) in CUT_CALL_TAILS {
         let output = format!("{CUT_CALL_PREFIX}{tail}");
-        whole_cut_call_keeps_its_bytes(&output, arguments, deepseek_v4_1(), "<think>").await;
+        whole_cut_call_keeps_its_bytes(&output, arguments, deepseek_v4_1(), "<think>");
     }
 }
 
@@ -630,7 +597,7 @@ async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finish
 async fn a_block_the_token_limit_cut_before_a_call_was_named_is_released_whole_as_content() {
     let invoke = "<｜DSML｜ invoke name=\"f<｜DSML｜ parameter name=\"s\" string=\"true\">x\n";
     let output = format!("</think>\n\n<｜DSML｜ calls>\n{invoke}");
-    let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length").await;
+    let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length");
     assert!(choice.message.tool_calls.is_none(), "{choice:?}");
     assert_eq!(
         choice.message.content.as_deref(),
@@ -651,7 +618,7 @@ async fn a_refused_block_released_as_the_answer_keeps_every_tokens_logprobs() {
     // whole list, the thought's tokens and the block's alike. Two closed blocks with the
     // template's newline between them the same.
     let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
-    let (choice, reasoning_tokens) = fold_with(output, glm(), "<|assistant|><think>").await;
+    let (choice, reasoning_tokens) = fold_with(output, glm(), "<|assistant|><think>");
     let released = "<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
     assert_eq!(choice.message.content.as_deref(), Some(released));
     assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
@@ -660,14 +627,14 @@ async fn a_refused_block_released_as_the_answer_keeps_every_tokens_logprobs() {
     assert_eq!(reasoning_tokens, 4);
     assert_eq!(kept_logprob_tokens(&choice), output);
     let output = "plan</think><tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
-    let (choice, _) = fold_with(output, glm(), "<|assistant|><think>").await;
+    let (choice, _) = fold_with(output, glm(), "<|assistant|><think>");
     let released = "<tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
     assert_eq!(choice.message.content.as_deref(), Some(released));
     assert!(choice.message.tool_calls.is_none());
     assert_eq!(kept_logprob_tokens(&choice), output);
     // The answer's text, then the block: the whole list all the same.
     let output = "plan</think>Let me look:<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
-    let (choice, _) = fold_with(output, glm(), "<|assistant|><think>").await;
+    let (choice, _) = fold_with(output, glm(), "<|assistant|><think>");
     let content = "Let me look:<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
     assert_eq!(choice.message.content.as_deref(), Some(content));
     assert!(choice.message.tool_calls.is_none());
@@ -684,7 +651,7 @@ async fn a_message_without_content_keeps_every_tokens_logprobs() {
         "<think>plan</think>\n\n<tool_call>\n",
         "{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>"
     );
-    let (choice, _) = fold(output).await;
+    let (choice, _) = fold(output);
     assert_eq!(choice.message.content, None);
     assert_eq!(choice.message.tool_calls.as_ref().map(Vec::len), Some(1));
     assert_eq!(kept_logprob_tokens(&choice), output);
@@ -695,7 +662,7 @@ async fn malformed_call_text_is_content_and_keeps_its_logprobs() {
     // A call region that never forms a call comes back malformed and reaches the client as
     // content; the logprobs are the engine's whole list, its tokens among them.
     let output = "<think>plan</think>Hello <tool_call>\nnot a call\n</tool_call>";
-    let (choice, _) = fold(output).await;
+    let (choice, _) = fold(output);
     let content = choice.message.content.clone().expect("content");
     assert!(content.contains("not a call"), "{content}");
     assert!(choice.message.tool_calls.is_none());
@@ -716,19 +683,9 @@ pub(super) fn assigned_message(
         thinking_requested: thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: true,
-        history_tool_calls_count: 0,
         chat_tools: tools().into(),
         stop_sequences: None,
-        symphony: Some(Assignment {
-            format: Arc::new(format),
-            prompt: prompt.to_string(),
-            forbids_calls: false,
-            past_the_end: false,
-            span: Span::none(),
-            marked: Arc::default(),
-        }),
+        symphony: Some(assignment_of(format, prompt)),
         parser_names: None,
     }
 }
@@ -757,7 +714,7 @@ async fn message_events_through(
     let (stream, server) = scripted_stream(responses, "0").await;
     let (tx, rx) = sse_channel();
     let stop = stop.map(|stop| StringOrArray::String(stop.to_string()));
-    let result = processor(true)
+    let result = processor()
         .process_messages_streaming_chunks(
             stream,
             dispatch(),
@@ -1032,7 +989,7 @@ async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_th
         chunk(0, call),
         complete(0, "stop"),
     ];
-    let (result, events) = stream_events(responses, true, spec).await;
+    let (result, events) = stream_events(responses, spec).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(
         chat_text(&events, 0, "reasoning_content"),
@@ -1061,19 +1018,13 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
     let (result, scrape) = scraped(
-        ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        )
-        .process_non_streaming_messages_response(
+        ResponseProcessor::new().process_non_streaming_messages_response(
             context::ExecutionResult::Single {
                 stream,
                 dispatch_start: Instant::now(),
             },
             spec(),
             dispatch(),
-            tokenizer,
             &mut decoder,
         ),
     )
@@ -1155,19 +1106,13 @@ async fn a_message_whose_tool_use_input_is_a_string_carries_an_empty_object() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
     let (result, scrape) = scraped(
-        ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        )
-        .process_non_streaming_messages_response(
+        ResponseProcessor::new().process_non_streaming_messages_response(
             context::ExecutionResult::Single {
                 stream,
                 dispatch_start: Instant::now(),
             },
             spec(),
             dispatch(),
-            tokenizer,
             &mut decoder,
         ),
     )
@@ -1221,7 +1166,8 @@ pub(super) fn series_line<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> O
 async fn a_malformed_region_in_a_whole_output_is_counted_and_written_once() {
     // A call region that never forms a call: the content keeps its bytes, the counters say
     // which table gave up and why, and one line names the request, the choice and the model.
-    let ((choice, _), scrape) = scraped(fold("Hello <tool_call>\nnot a call\n</tool_call>")).await;
+    let ((choice, _), scrape) =
+        scraped(async { fold("Hello <tool_call>\nnot a call\n</tool_call>") }).await;
     let content = choice.message.content.expect("content");
     assert!(content.contains("not a call"), "{content}");
     let outputs = series_line(
@@ -1267,7 +1213,7 @@ async fn a_malformed_region_in_a_whole_output_is_counted_and_written_once() {
 async fn arguments_that_are_not_json_reach_the_client_whole_and_are_counted() {
     let output =
         "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2.0 * Math.PI}}\n</tool_call>";
-    let ((choice, _), scrape) = scraped(fold(output)).await;
+    let ((choice, _), scrape) = scraped(async { fold(output) }).await;
     let calls = choice.message.tool_calls.as_ref().expect("tool calls");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].function.name, "lookup");
@@ -1321,7 +1267,6 @@ async fn arguments_that_are_not_json_reach_the_client_whole_and_are_counted() {
             chunk(0, "th.PI}}\n</tool_call>"),
             complete(0, "stop"),
         ],
-        true,
         spec,
     ))
     .await;
@@ -1367,19 +1312,13 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
     let (result, scrape) = scraped(
-        ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        )
-        .process_non_streaming_messages_response(
+        ResponseProcessor::new().process_non_streaming_messages_response(
             context::ExecutionResult::Single {
                 stream,
                 dispatch_start: Instant::now(),
             },
             spec(),
             dispatch(),
-            tokenizer,
             &mut decoder,
         ),
     )
@@ -1459,7 +1398,7 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
 
     // The chat path carries the arguments as the model wrote them, a string that begins with the
     // prefix the Messages paths close.
-    let (choice, _) = fold(output).await;
+    let (choice, _) = fold(output);
     let arguments = choice
         .message
         .tool_calls
@@ -1489,7 +1428,7 @@ async fn scraped_takes_its_lines_from_series_of_its_own() {
     };
     scraped(async {
         for _ in 0..flow {
-            fold("Hello <tool_call>\nnot a call\n</tool_call>").await;
+            fold("Hello <tool_call>\nnot a call\n</tool_call>");
         }
     })
     .await;
@@ -1505,7 +1444,7 @@ async fn scraped_takes_its_lines_from_series_of_its_own() {
             ))
         }
     });
-    scraped(fold("Hello <tool_call>\nnot a call\n</tool_call>")).await;
+    scraped(async { fold("Hello <tool_call>\nnot a call\n</tool_call>") }).await;
     logs_assert(|lines: &[&str]| {
         let count = written(lines);
         let last = lines
@@ -1531,7 +1470,7 @@ async fn scraped_takes_its_lines_from_series_of_its_own() {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_clean_whole_output_is_counted_and_writes_nothing() {
-    let ((choice, _), scrape) = scraped(fold("Hello there")).await;
+    let ((choice, _), scrape) = scraped(async { fold("Hello there") }).await;
     assert_eq!(choice.message.content.as_deref(), Some("Hello there"));
     let outputs = series_line(
         &scrape,
@@ -1558,7 +1497,6 @@ async fn a_malformed_region_in_a_stream_is_counted_and_written_once() {
             chunk(0, "</tool_call>"),
             complete(0, "stop"),
         ],
-        true,
         spec,
     ))
     .await;
@@ -1597,7 +1535,6 @@ async fn a_marker_in_a_stream_run_past_the_models_end_is_content_and_counts_as_n
             chunk(0, "OK</think> OK"),
             complete(0, "length"),
         ],
-        true,
         spec,
     ))
     .await;
@@ -1648,7 +1585,7 @@ async fn a_streamed_call_to_an_undeclared_function_goes_out_as_written_and_is_co
         chunk(0, &output[32..]),
         complete(0, "stop"),
     ];
-    let ((result, events), scrape) = scraped(stream_events(responses, true, spec)).await;
+    let ((result, events), scrape) = scraped(stream_events(responses, spec)).await;
     assert!(result.is_ok(), "{result:?}");
     let calls = tool_call_deltas(&events);
     assert_eq!(calls[0]["function"]["name"], "lookup_v2", "{calls:#?}");
@@ -1702,7 +1639,7 @@ async fn a_streamed_call_to_an_undeclared_function_goes_out_as_written_and_is_co
 #[tokio::test]
 async fn a_whole_output_calling_an_undeclared_function_keeps_the_call_and_is_counted() {
     let output = QWEN3_OUTPUT.replace("\"lookup\"", "\"lookup_v2\"");
-    let ((choice, _), scrape) = scraped(fold(&output)).await;
+    let ((choice, _), scrape) = scraped(async { fold(&output) }).await;
     assert_eq!(
         choice.message.content.as_deref().map(str::trim),
         Some("Hello")
@@ -1742,7 +1679,7 @@ async fn a_stream_of_whitespace_alone_carries_it_as_one_delta_and_is_recorded_em
         .map(|piece| chunk(0, piece))
         .collect();
     responses.push(complete(0, "length"));
-    let ((result, events), scrape) = scraped(stream_events(responses, false, spec)).await;
+    let ((result, events), scrape) = scraped(stream_events(responses, spec)).await;
     result.expect("the stream ends well");
     // The opening chunk, one content delta of the whole answer, the finish chunk: the opening
     // chunk's empty content is the public API's shape, not a delta.
@@ -1786,8 +1723,7 @@ async fn a_stream_of_no_tokens_is_recorded_empty_too() {
         qwen3(CallSyntax::Json),
         "<|im_start|>assistant\n",
     );
-    let ((result, events), scrape) =
-        scraped(stream_events(vec![complete(0, "stop")], false, spec)).await;
+    let ((result, events), scrape) = scraped(stream_events(vec![complete(0, "stop")], spec)).await;
     result.expect("the stream ends well");
     let chunks: Vec<&Value> = events
         .iter()
@@ -1828,7 +1764,6 @@ async fn a_stream_whose_only_answer_is_a_python_call_in_the_tag_carries_it_as_co
             chunk(0, &output[40..]),
             complete(0, "stop"),
         ],
-        true,
         spec,
     ))
     .await;
@@ -1891,7 +1826,6 @@ async fn a_stream_of_two_refused_blocks_carries_the_bytes_between_them_before_th
             chunk(0, &output[47..]),
             complete(0, "stop"),
         ],
-        true,
         spec,
     ))
     .await;
@@ -1952,7 +1886,6 @@ async fn a_stream_whose_text_ends_in_a_python_call_in_the_tag_carries_the_block_
             chunk(0, "\"downtown\")</tool_call>"),
             complete(0, "stop"),
         ],
-        true,
         spec,
     ))
     .await;
@@ -2040,13 +1973,15 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_chat_paths
     let format = || qwen3(CallSyntax::Json);
     let prompt = "<|im_start|>assistant\n";
     // The whole response: the request's error names the decoder's end.
-    let (result, scrape) = scraped(fold_through(
-        Arc::new(Refusing::the_end()),
-        "Hello",
-        format(),
-        prompt,
-        "stop",
-    ))
+    let (result, scrape) = scraped(async {
+        fold_through(
+            Arc::new(Refusing::the_end()),
+            "Hello",
+            format(),
+            prompt,
+            "stop",
+        )
+    })
     .await;
     let error = result.expect_err("the decoder's end");
     assert!(
@@ -2059,7 +1994,6 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_chat_paths
         let ((result, _), scrape) = scraped(stream_events_through(
             Arc::new(Refusing::the_end()),
             frames,
-            true,
             assigned(chat_spec(true), format(), prompt),
         ))
         .await;
@@ -2082,19 +2016,13 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_messages_p
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::the_end());
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
     let (result, scrape) = scraped(
-        ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        )
-        .process_non_streaming_messages_response(
+        ResponseProcessor::new().process_non_streaming_messages_response(
             context::ExecutionResult::Single {
                 stream,
                 dispatch_start: Instant::now(),
             },
             spec(),
             dispatch(),
-            tokenizer,
             &mut decoder,
         ),
     )
@@ -2169,7 +2097,7 @@ async fn a_streamed_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_cal
 async fn a_whole_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length()
 {
     for (output, arguments) in PYTHONIC_CUT_CALLS {
-        whole_cut_call_keeps_its_bytes(output, arguments, llama4(), PYTHONIC_PROMPT).await;
+        whole_cut_call_keeps_its_bytes(output, arguments, llama4(), PYTHONIC_PROMPT);
     }
 }
 
@@ -2214,7 +2142,7 @@ async fn a_streamed_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_a
 #[tokio::test]
 async fn a_whole_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (output, arguments) in GEMMA_CUT_CALLS {
-        whole_cut_call_keeps_its_bytes(output, arguments, gemma4(), GEMMA_PROMPT).await;
+        whole_cut_call_keeps_its_bytes(output, arguments, gemma4(), GEMMA_PROMPT);
     }
 }
 
@@ -2258,7 +2186,7 @@ async fn a_streamed_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_a
 #[tokio::test]
 async fn a_whole_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (output, arguments) in KEYED_CUT_CALLS {
-        whole_cut_call_keeps_its_bytes(output, arguments, glm4(), KEYED_PROMPT).await;
+        whole_cut_call_keeps_its_bytes(output, arguments, glm4(), KEYED_PROMPT);
     }
 }
 
@@ -2315,7 +2243,7 @@ async fn a_kimi_k3_thought_closed_by_the_answers_closer_reaches_the_client_once_
     // The chat stream: the reply once, as the thought it was streamed as; no content, and the
     // closer never in the text.
     let spec = assigned(chat_spec(false), kimi_k3(), KIMI_K3_THINKING_PROMPT);
-    let (result, events) = stream_events(frames(), false, spec).await;
+    let (result, events) = stream_events(frames(), spec).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(
         chat_text(&events, 0, "reasoning_content"),
@@ -2329,7 +2257,7 @@ async fn a_kimi_k3_thought_closed_by_the_answers_closer_reaches_the_client_once_
     );
 
     // The whole chat message: the same reading.
-    let (choice, _) = fold_with(&output, kimi_k3(), KIMI_K3_THINKING_PROMPT).await;
+    let (choice, _) = fold_with(&output, kimi_k3(), KIMI_K3_THINKING_PROMPT);
     assert_eq!(
         choice.message.reasoning_content.as_deref(),
         Some("The answer is 42."),
@@ -2361,22 +2289,17 @@ async fn a_kimi_k3_thought_closed_by_the_answers_closer_reaches_the_client_once_
     let (stream, server) = scripted_stream(vec![frame], "0").await;
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
-    let result = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    )
-    .process_non_streaming_messages_response(
-        context::ExecutionResult::Single {
-            stream,
-            dispatch_start: Instant::now(),
-        },
-        spec(),
-        dispatch(),
-        tokenizer,
-        &mut decoder,
-    )
-    .await;
+    let result = ResponseProcessor::new()
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
+            spec(),
+            dispatch(),
+            &mut decoder,
+        )
+        .await;
     server.abort();
     let (message, _) = match result {
         Ok(message) => message,

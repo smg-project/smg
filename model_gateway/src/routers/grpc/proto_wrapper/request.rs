@@ -613,19 +613,6 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Whether the request says its grammar starts at the first generated
-    /// token ([`Self::set_grammar_from_first_token`]); what the tests read.
-    #[cfg(test)]
-    pub(crate) fn grammar_from_first_token(&self) -> bool {
-        match self {
-            Self::Vllm(req) => req
-                .sampling_params
-                .as_ref()
-                .is_some_and(|params| params.grammar_from_first_token),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => false,
-        }
-    }
-
     /// Replace the structural tag the request's constraint carries; a request
     /// whose constraint is anything else, or none, is left as it is.
     pub fn set_structural_tag(&mut self, tag: String) {

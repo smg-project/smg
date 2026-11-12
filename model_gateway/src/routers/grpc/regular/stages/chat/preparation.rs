@@ -61,13 +61,6 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
-        // Which parser reads this response: the request's X-SMG-Parser header
-        // when it carries one, else the gateway's --parser flag (see
-        // `regular::symphony`). Decided once here; the constraint below and
-        // request building read the same choice.
-        let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
-            .map_err(|why| error::bad_request("invalid_parser_header", why))?;
-        ctx.state.parser = Some(parser);
         let (token_ids, processed_messages, tool_constraints) =
             prepare_chat_like(ctx, request, self.wire_pools).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {
@@ -169,19 +162,18 @@ pub(crate) async fn prepare_chat_like(
         .await?;
 
         // Step 4: Build tool constraints if needed
-        // The tool parser registry handles both structural tag (for native format
-        // parsers like Mistral, KimiK2) and generic JSON schema fallback. When
-        // the prompt ends inside the model's thinking block, a parser with a
-        // reasoning prefix gets its tag wrapped so a forced call follows the
-        // reasoning instead of preempting it. The constraint covers every tool
-        // the choice lets the model call, dynamic tools declared on messages
-        // included (see `ChatCompletionRequest::callable_tools`).
+        // The table that reads the response shapes the constraint: a structural
+        // tag for the calls the request allows or forces (wrapped behind the
+        // thought where the prompt ends inside the model's thinking block, so a
+        // forced call follows the reasoning instead of preempting it), or the
+        // JSON schema of a forced call where the table has no tag for it. The
+        // constraint covers every tool the choice lets the model call, dynamic
+        // tools declared on messages included (see
+        // `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools_for(provider);
         // All of it, and whether the decoder keeps the special tokens the
         // reader needs, is decided as for a Messages request
-        // (`reading::prepare`). Only the chat stage chooses a parser:
-        // transcription, which shares this preparation, keeps the legacy
-        // parsers.
+        // (`reading::prepare`).
         let reading::Prepared {
             constraint: tool_call_constraint,
             json_schema: json_schema_constraint,

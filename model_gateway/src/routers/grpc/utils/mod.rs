@@ -13,15 +13,13 @@ pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
-pub use aliases::{answering_to, ALIASES, UNANSWERED};
+pub use aliases::{answering_to, ALIASES, NOTED, UNANSWERED};
 pub(crate) use chat_utils::{
     completion_finish_reason, decode_ids_blocking, encode_blocking, encode_blocking_in_batch,
     encode_prompt_blocking, encode_texts_blocking, filter_chat_request_by_tool_choice,
-    filter_tools_by_tool_choice, generate_tool_call_id, keep_first_tool_call,
-    keep_first_tool_call_items, missing_tokenizer_response, parse_finish_reason,
-    parse_json_schema_response, process_chat_messages_with_placeholders, resolve_tokenizer,
-    send_error_sse, validate_chat_content_parts, validate_chat_template_content_parts,
-    InPlaceBudget,
+    filter_tools_by_tool_choice, missing_tokenizer_response, parse_finish_reason,
+    process_chat_messages_with_placeholders, resolve_tokenizer, send_error_sse,
+    validate_chat_content_parts, validate_chat_template_content_parts, InPlaceBudget,
 };
 pub use chat_utils::{
     create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,
@@ -40,20 +38,17 @@ pub(crate) use metrics::{
 };
 #[cfg(test)]
 pub(crate) use parsers::messages_reasoning_starts_in_prefill;
-/// The parser-name resolver, public for its allocation pin
-/// (`tests/parser_read_allocation_pins.rs`): a single read's one String.
-pub use parsers::ParserResolver;
+pub(crate) use parsers::{
+    card_names_with, chat_reasoning_starts_in_rendered_prefill_for,
+    messages_reasoning_starts_in_prefill_for, TagVocabulary, WorkerDecoding,
+};
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
 // predicates instead of duplicating them: the rendered one where they render,
 // the request-based guess where they do not.
 pub use parsers::{chat_reasoning_starts_in_prefill, chat_reasoning_starts_in_rendered_prefill};
-pub(crate) use parsers::{
-    chat_reasoning_starts_in_rendered_prefill_for, check_reasoning_parser_availability,
-    check_tool_parser_availability, create_reasoning_parser, create_tool_parser, get_tool_parser,
-    messages_reasoning_starts_in_prefill_for, reasoning_parser_requires_special_tokens,
-    rendered_prompt_reasoning_in_prefill, tool_constraints_for_worker, ModelNames, Names,
-    TagVocabulary, WorkerDecoding,
-};
+/// The parser-name resolver and the names it reads, public for their allocation
+/// pins (`tests/parser_read_allocation_pins.rs`): a read's two Strings.
+pub use parsers::{ModelNames, Names, ParserResolver};
 pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
 pub(crate) use stream_failure::{choice_mut, send_stream_failure, StreamFailure, StreamSource};
 

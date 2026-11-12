@@ -69,7 +69,6 @@ fn counted_chunk(index: u32, text: &str, prompt_tokens: u32) -> vllm::GenerateRe
 /// A single-choice chat spec that asks for the usage chunk.
 fn single_choice_spec() -> ChatResponseSpec {
     let mut spec = chat_spec(false);
-    spec.separate_reasoning = false;
     spec.expected_choices = 1;
     spec.stream_options =
         Some(serde_json::from_value(json!({"include_usage": true})).expect("stream options"));
@@ -133,7 +132,7 @@ async fn a_local_stop_ends_the_chat_read_and_the_engine_request() {
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(5),
-        processor(false).process_streaming_chunks(
+        processor().process_streaming_chunks(
             stream,
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
@@ -195,7 +194,7 @@ async fn a_batched_request_is_aborted_only_when_every_choice_has_closed() {
     spec.expected_choices = 2;
     let result = timeout(
         Duration::from_secs(5),
-        processor(false).process_streaming_chunks(
+        processor().process_streaming_chunks(
             stream,
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
@@ -243,7 +242,7 @@ async fn a_choice_index_past_the_expected_choices_is_a_decoding_failure() {
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(5),
-        processor(false).process_streaming_chunks(
+        processor().process_streaming_chunks(
             stream,
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
@@ -277,7 +276,7 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
     let (tx, rx) = sse_channel();
     let outcome = timeout(
         Duration::from_secs(5),
-        processor(false).process_completion_streaming_chunks(
+        processor().process_completion_streaming_chunks(
             stream,
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
@@ -322,7 +321,7 @@ async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
     spec.prompt_tokens = 7;
     let result = timeout(
         Duration::from_secs(5),
-        processor(false).process_messages_streaming_chunks(
+        processor().process_messages_streaming_chunks(
             stream,
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
@@ -464,7 +463,7 @@ async fn the_engine_is_aborted_at_the_local_stop_over_grpc() {
     let started = Instant::now();
     let result = timeout(
         Duration::from_secs(30),
-        processor(false).process_streaming_chunks(
+        processor().process_streaming_chunks(
             ProtoStream::TokenSpeed(stream),
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
@@ -623,7 +622,7 @@ async fn the_engine_is_aborted_at_the_local_stop_over_the_zmq_link() {
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(10),
-        processor(false).process_streaming_chunks(
+        processor().process_streaming_chunks(
             ProtoStream::Zmq(stream),
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
@@ -683,7 +682,7 @@ async fn a_stop_the_engine_ends_the_chat_choice_on_is_read_to_the_engines_end() 
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(5),
-        processor(false).process_streaming_chunks(
+        processor().process_streaming_chunks(
             stream,
             dispatch(),
             Arc::new(CharacterTokenizer::with_eos(vec![u32::from('$')])),
@@ -723,7 +722,7 @@ async fn a_stop_the_engine_ends_the_completion_choice_on_is_read_to_the_engines_
     let (tx, rx) = sse_channel();
     let outcome = timeout(
         Duration::from_secs(5),
-        processor(false).process_completion_streaming_chunks(
+        processor().process_completion_streaming_chunks(
             stream,
             dispatch(),
             Arc::new(CharacterTokenizer::with_eos(vec![u32::from('$')])),
@@ -764,7 +763,7 @@ async fn a_stop_the_engine_ends_the_message_on_is_read_to_the_engines_end() {
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(5),
-        processor(false).process_messages_streaming_chunks(
+        processor().process_messages_streaming_chunks(
             stream,
             dispatch(),
             Arc::new(CharacterTokenizer::with_eos(vec![u32::from('$')])),
@@ -874,7 +873,7 @@ async fn the_zmq_link_sends_no_abort_for_a_stop_the_engine_ends_the_request_on()
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(10),
-        processor(false).process_streaming_chunks(
+        processor().process_streaming_chunks(
             ProtoStream::Zmq(stream),
             dispatch(),
             Arc::new(CharacterTokenizer::default()),

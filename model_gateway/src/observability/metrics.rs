@@ -852,10 +852,6 @@ pub(crate) fn init_metrics() {
         "Tool calls a Symphony table read under tool_choice: none and the gateway dropped, by table"
     );
     describe_counter!(
-        symphony_telemetry::FALLBACK,
-        "Requests Symphony was configured for (the --parser flag or the request's X-SMG-Parser header) that the legacy parsers read instead of a table, by reason (no_table: the registry has no table for the model and nothing names one; reasoning_name_only: a reasoning parser name alone that no table answers to; legacy_tool_name: a legacy tool-call parser name no table answers to; passthrough; forced_call_without_tag: the table has no structural tag for the request's forced or required call, so the older registry's JSON schema constrains the output) and table (the table that had no tag; none where no table reads the model)"
-    );
-    describe_counter!(
         symphony_telemetry::REFUSED,
         "Whole Messages responses a Symphony table read that the gateway refused (HTTP 500), by table and reason (tool_use_input: a tool_use block cannot carry the arguments the model wrote); the output stays counted under smg_symphony_outputs_total by its own outcome"
     );

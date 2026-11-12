@@ -298,7 +298,6 @@ mod tests {
         let mut context = AppContext::clone(&app_context_for_tests(
             config,
             Arc::new(WorkerRegistry::new()),
-            None,
         ));
         let monitor = Arc::new(KvEventMonitor::new());
         context
@@ -320,7 +319,6 @@ mod tests {
         let mut context = AppContext::clone(&app_context_for_tests(
             config,
             Arc::new(WorkerRegistry::new()),
-            None,
         ));
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin).with_decider(decider);
         let monitor = Arc::new(KvEventMonitor::new());

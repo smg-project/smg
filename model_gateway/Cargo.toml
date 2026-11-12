@@ -89,8 +89,6 @@ uuid = { workspace = true, features = ["serde", "fast-rng"] }
 
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
-reasoning-parser.workspace = true
-tool-parser.workspace = true
 smg-symphony.workspace = true
 smg-response-template = { workspace = true, features = ["symphony"] }
 wfaas.workspace = true
@@ -224,11 +222,6 @@ harness = false
 name = "tokenizer_benchmark"
 harness = false
 path = "benches/tokenizer_benchmark.rs"
-
-[[bench]]
-name = "tool_parser_benchmark"
-harness = false
-path = "benches/tool_parser_benchmark.rs"
 
 [[bench]]
 name = "manual_policy_benchmark"

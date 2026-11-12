@@ -1,5 +1,5 @@
 //! A model read through the table its tokenizer's `response_template` compiles into, end to end
-//! through the gRPC router and a scripted worker: the parser name `hf` under `--parser symphony`.
+//! through the gRPC router and a scripted worker: the parser name `hf`.
 //! The tokenizer ships transformers' `serve` template for Qwen 3.5 and the Qwen3.5-9B chat
 //! template, so the table has a layout and writes structural tags. Every `<|...|>` chunk is a
 //! special token and `<|im_end|>` is the EOS token, which the stop decoder removes.
@@ -24,7 +24,7 @@ use scripted_tokenizer::ScriptedTokenizer;
 use serde_json::{json, Value};
 use smg::{
     app_context::AppContext,
-    config::{AccessLogField, ParserChoice, RouterConfig, RoutingMode},
+    config::{AccessLogField, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
     observability::log_format::{JsonLine, SpanFields},
     routers::{RouterFactory, RouterTrait},
@@ -86,7 +86,6 @@ struct Setup {
     prompt_tail: &'static str,
     output: &'static str,
     finish: &'static str,
-    parser: ParserChoice,
     reasoning_parser: Option<&'static str>,
     tool_parser: Option<&'static str>,
     /// The worker's constrained-decoding policy, set on its spec.
@@ -111,7 +110,6 @@ impl Default for Setup {
             prompt_tail: THINKING,
             output: OUTPUT,
             finish: "stop",
-            parser: ParserChoice::Symphony,
             reasoning_parser: Some("hf"),
             tool_parser: Some("hf"),
             constrained_decoding: None,
@@ -248,7 +246,6 @@ async fn serve_engines(setup: Setup, engines: Vec<Engine>) -> Gateway {
         .max_payload_size(1024 * 1024)
         .build_unchecked();
     config.health_check.disable_health_check = true;
-    config.parser = setup.parser;
     config.reasoning_parser = setup.reasoning_parser.map(str::to_string);
     config.tool_call_parser = setup.tool_parser.map(str::to_string);
     config.access_log_fields = setup.access_log_fields;
@@ -1138,28 +1135,6 @@ async fn hf_reads_messages_and_responses_through_the_templates_table() {
     }
 }
 
-#[tokio::test]
-async fn the_legacy_parser_refuses_hf_at_startup() {
-    // Under --parser legacy the hf name is no parser: the gateway refuses it when it starts.
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::Regular {
-            worker_urls: vec![],
-        })
-        .grpc_connection()
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
-        .build_unchecked();
-    config.health_check.disable_health_check = true;
-    config.parser = ParserChoice::Legacy;
-    config.tool_call_parser = Some("hf".to_string());
-    let why = AppContext::from_config(config, 30, None, None)
-        .await
-        .expect_err("refused");
-    assert!(why.contains("--parser symphony"), "{why}");
-}
-
 /// A response template whose calls spell a whole turn (Beam's shape): a call's header names the
 /// tool, its parameters are tags around raw text, and a row out of a call goes on to the next or
 /// stops; `<|eos|>` is its end-of-sequence token.
@@ -1380,9 +1355,10 @@ async fn a_structural_tag_response_format_is_the_engines_constraint_as_sent() {
     assert_eq!(sent_tag(&gateway), tag);
 }
 
-/// A `structural_tag` response format beside a forced call under the legacy parsers (no table sets
-/// the format aside), on an engine whose builder lets the body's format outrank the forced call's
-/// grammar (TokenSpeed's, as TensorRT-LLM's and SGLang's; vLLM's lets the call win): every worker
+/// A `structural_tag` response format beside a forced call on a table with no tag for it (the
+/// `plain` table, which sets no format aside), on an engine whose builder lets the body's format
+/// outrank the forced call's grammar (TokenSpeed's, as TensorRT-LLM's and SGLang's; vLLM's lets the
+/// call win): every worker
 /// receives the client's tag, on the first attempt and on the retries alike, never the grammar the
 /// builder dropped. Each worker refuses its first `Generate`, so the request crosses to the other
 /// worker and back: three attempts.
@@ -1397,9 +1373,8 @@ async fn a_retry_keeps_the_clients_structural_tag_over_the_forced_calls() {
         Setup {
             template: None,
             chat_template: false,
-            parser: ParserChoice::Legacy,
             reasoning_parser: None,
-            tool_parser: Some("kimik2"),
+            tool_parser: Some("passthrough"),
             round_robin: true,
             ..Setup::default()
         },

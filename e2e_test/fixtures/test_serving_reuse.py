@@ -33,7 +33,7 @@ class _Item:
 def test_collection_groups_complete_config_and_preserves_items(monkeypatch):
     monkeypatch.setenv("E2E_CONNECTION_MODE", "zmq")
     first = _Item("A", parser="llama")
-    different = _Item("B", parser="pythonic")
+    different = _Item("B", parser="qwen3")
     matching = _Item("C", parser="llama")
     topology = _Item("D", parser="llama", gpus=1)
     items = [first, different, matching, topology]
@@ -44,7 +44,7 @@ def test_collection_groups_complete_config_and_preserves_items(monkeypatch):
 
 def test_non_zmq_order_is_unchanged(monkeypatch):
     monkeypatch.delenv("E2E_CONNECTION_MODE", raising=False)
-    first = _Item("A", parser="pythonic")
+    first = _Item("A", parser="qwen3")
     second = _Item("B", parser="llama")
     assert sorted([second, first], key=hooks._pool_sort_key) == [first, second]
 

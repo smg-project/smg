@@ -63,7 +63,7 @@ async fn stream_cut_at_length(spec: MessagesResponseSpec, prompt_tokens: u32) ->
     )
     .await;
     let (tx, rx) = sse_channel();
-    let result = processor(false)
+    let result = processor()
         .process_messages_streaming_chunks(
             stream,
             dispatch(),
@@ -95,7 +95,6 @@ async fn whole_answer_cut_at_length(spec: MessagesResponseSpec, prompt_tokens: u
             },
             spec,
             dispatch(),
-            tokenizer,
             &mut decoder,
         )
         .await

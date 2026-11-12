@@ -71,7 +71,7 @@ fn epd_restamp_remints_pd_room_and_keeps_encode_rooms() {
         tool_constraint: None,
     };
     let retry_pair = tokenspeed_pd_pair("grpc://retry-prefill:30000", "grpc://decode:30000");
-    restamp_plan_for_attempt(&mut plan, &stamp, &retry_pair, &ToolParserFactory::new()).unwrap();
+    restamp_plan_for_attempt(&mut plan, &stamp, &retry_pair).unwrap();
 
     let ExecutionPlan::EncodePrefillDecode { request } = &plan else {
         panic!("expected an EPD plan")

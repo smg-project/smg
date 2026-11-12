@@ -36,7 +36,6 @@ use std::{
 use llm_tokenizer::{mock::MockTokenizer, registry::TokenizerRegistry, traits::Tokenizer};
 use mock_worker::{MockWorker, MockWorkerConfig};
 use openai_protocol::common::{Function, Tool};
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
 use smg::{
     app_context::AppContext,
@@ -55,7 +54,6 @@ use smg_data_connector::{
 };
 #[allow(unused_imports)]
 pub use test_config::{TestRouterConfig, TestWorkerConfig};
-use tool_parser::ParserFactory as ToolParserFactory;
 
 /// Test context for directly testing mock workers without full router setup.
 pub struct WorkerTestContext {
@@ -434,8 +432,8 @@ impl AppTestContext {
 /// family below: registries, storage backends, worker monitor, job queue,
 /// workflow engines, OpenAI-mode external worker registration, and MCP
 /// orchestrator startup are identical across all of them. Only the
-/// tokenizer registry, parser factories, rate-limit manager, and MCP config
-/// vary by caller, so those are the only parameters.
+/// tokenizer registry, rate-limit manager, and MCP config vary by caller, so
+/// those are the only parameters.
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -444,8 +442,6 @@ impl AppTestContext {
 async fn build_test_app_context(
     config: RouterConfig,
     tokenizer_registry: Arc<TokenizerRegistry>,
-    reasoning_parser_factory: Option<ReasoningParserFactory>,
-    tool_parser_factory: Option<ToolParserFactory>,
     rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
     mcp_config: smg_mcp::McpConfig,
     storages: Option<StorageBundle>,
@@ -522,8 +518,6 @@ async fn build_test_app_context(
             .rate_limiter(rate_limiter)
             .rate_limit_manager(rate_limit_manager)
             .tokenizer_registry(tokenizer_registry)
-            .reasoning_parser_factory(reasoning_parser_factory)
-            .tool_parser_factory(tool_parser_factory)
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
             .response_storage(response_storage)
@@ -618,10 +612,9 @@ pub fn create_test_context(
 }
 
 /// Same as [`create_test_context`], but with a caller-supplied tokenizer
-/// registry instead of an always-empty one, and real (not `None`) parser
-/// factories -- `GrpcRouter::new` requires both to be `Some`. For tests that
-/// build a real gRPC router (e.g. against a gRPC mock worker, which has no
-/// tokenizer artifacts of its own to autoload from).
+/// registry instead of an always-empty one. For tests that build a real gRPC
+/// router (e.g. against a gRPC mock worker, which has no tokenizer artifacts
+/// of its own to autoload from).
 #[expect(
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
@@ -654,8 +647,6 @@ pub fn create_test_context_with_rate_limiter(
         build_test_app_context(
             config,
             tokenizer_registry,
-            Some(ReasoningParserFactory::new()),
-            Some(ToolParserFactory::new()),
             rate_limit_manager,
             empty_mcp_config(),
             None,
@@ -727,29 +718,12 @@ pub fn create_test_context_with_storages(
         build_test_app_context(
             config,
             tokenizer_registry,
-            Some(ReasoningParserFactory::new()),
-            Some(ToolParserFactory::new()),
             tenant_rate_limit_manager,
             empty_mcp_config(),
             Some(storages),
         )
         .await
     })
-}
-
-/// Helper function to create AppContext for tests with parser factories initialized
-pub fn create_test_context_with_parsers(
-    config: RouterConfig,
-) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
-    Box::pin(build_test_app_context(
-        config,
-        Arc::new(TokenizerRegistry::new()),
-        Some(ReasoningParserFactory::new()),
-        Some(ToolParserFactory::new()),
-        None,
-        empty_mcp_config(),
-        None,
-    ))
 }
 
 /// Helper function to create AppContext for tests with MCP config from file
@@ -769,8 +743,6 @@ pub fn create_test_context_with_mcp_config(
         build_test_app_context(
             config,
             Arc::new(TokenizerRegistry::new()),
-            None,
-            None,
             None,
             mcp_config,
             None,

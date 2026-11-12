@@ -2049,51 +2049,46 @@ class TestControlPlaneApiKeyEntryErrors:
 
 
 class TestParserFlag:
-    """--parser picks the gateway's chat parser: symphony by default, or legacy."""
+    """--parser keeps its one value, symphony, for one release: a launcher that set it keeps
+    starting, and any other value is refused."""
 
-    def test_defaults_to_symphony_and_takes_legacy(self):
+    def test_takes_symphony_alone(self):
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
         assert RouterArgs().parser == "symphony"
         assert RouterArgs.from_cli_args(parser.parse_args([])).parser == "symphony"
-        chosen = RouterArgs.from_cli_args(parser.parse_args(["--parser", "legacy"]))
-        assert chosen.parser == "legacy"
         chosen = RouterArgs.from_cli_args(parser.parse_args(["--parser", "symphony"]))
         assert chosen.parser == "symphony"
-
-    def test_refuses_an_unknown_parser(self):
-        parser = argparse.ArgumentParser()
-        RouterArgs.add_cli_args(parser)
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--parser", "fast"])
+        for value in ("legacy", "fast"):
+            with pytest.raises(SystemExit):
+                parser.parse_args(["--parser", value])
 
 
 class TestParserNames:
-    """--tool-call-parser and --reasoning-parser take the legacy parsers' names, Symphony's tables'
-    names, and a name a table answers to that no legacy parser has, which a launcher passes for a
-    model family whose table has no older parser."""
+    """--tool-call-parser and --reasoning-parser take one list: Symphony's tables' names, the
+    names a table answers to (an older parser's whose format a table reads, a launcher's) and
+    hf; a name no table answers to is no choice."""
 
-    def test_a_tables_name_without_a_legacy_parser_is_a_choice_of_both_flags(self):
-        for choices in (get_available_tool_call_parsers(), get_available_reasoning_parsers()):
-            assert choices == sorted(set(choices))
-            assert "muse" in choices
-            assert "muse_spark" in choices
-            assert "hf" in choices
-        # A legacy parser's name stays a choice of its own flag only.
-        assert "qwen_xml" in get_available_tool_call_parsers()
-        assert "qwen_xml" not in get_available_reasoning_parsers()
+    def test_both_flags_take_the_tables_and_the_names_a_table_answers_to(self):
+        choices = get_available_tool_call_parsers()
+        reasoning = get_available_reasoning_parsers()
+        assert choices == sorted(set(choices))
+        assert reasoning == sorted(set(reasoning))
+        assert set(choices) <= set(reasoning)
+        for name in ("qwen3", "qwen", "qwen_xml", "muse", "muse_spark", "passthrough", "hf"):
+            assert name in choices, name
+        assert "deepseek_r1" in choices
+        for name in ("pythonic", "qwen3_thinking", "step3"):
+            assert name not in choices, name
+        # The older reasoning names a launch script carries pass; the gateway sets them aside.
+        for name in ("glm45", "qwen3_thinking", "nano_v3"):
+            assert name in reasoning, name
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
         args = RouterArgs.from_cli_args(
-            parser.parse_args(
-                ["--parser", "symphony", "--reasoning-parser", "muse", "--tool-call-parser", "muse"]
-            )
+            parser.parse_args(["--reasoning-parser", "muse", "--tool-call-parser", "qwen_xml"])
         )
-        assert (args.parser, args.tool_call_parser, args.reasoning_parser) == (
-            "symphony",
-            "muse",
-            "muse",
-        )
+        assert (args.tool_call_parser, args.reasoning_parser) == ("qwen_xml", "muse")
 
 
 class TestDrainSettleSecs:

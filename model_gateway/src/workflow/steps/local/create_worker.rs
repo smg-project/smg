@@ -13,16 +13,17 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
-    config::ParserChoice,
     routers::grpc::{
+        is_harmony_card,
         multimodal::{
             mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
             SUPPORTS_VISION_LABEL,
         },
         regular::symphony::{
-            check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
+            check_names, labels_select_nothing, nothing_names_a_table, set_aside_by_the_registry,
+            table_label_read, unanswered_reasoning,
         },
-        utils::{ModelNames, Names},
+        utils::{card_names_with, ModelNames, Names},
         zmq_client::zmq_handshake_address,
     },
     worker::{
@@ -112,19 +113,14 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &app_context.router_config.model_aliases,
         );
 
-        // A parser override naming an unknown parser would silently ship
-        // unparsed output at serve time — fail registration loudly instead
-        // (mirrors the fail-fast AppContext applies to the global CLI names).
-        validate_parser_overrides(
-            &model_card,
-            &config.url,
-            app_context.router_config.parser,
-            app_context.tool_parser_factory.as_ref(),
-            app_context.reasoning_parser_factory.as_ref(),
-        )
-        .map_err(|message| WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message,
+        // A parser override naming a parser the gateway cannot read with would
+        // silently ship unparsed output at serve time: fail registration loudly
+        // instead (mirrors the fail-fast AppContext applies to the global CLI names).
+        validate_parser_overrides(&model_card, &config.url).map_err(|message| {
+            WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message,
+            }
         })?;
 
         // Mixed overrides across same-model workers are a misconfiguration
@@ -137,9 +133,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &app_context.worker_registry,
         );
 
-        // Under Symphony the registry's table reads a model it knows for a
-        // worker whose labels select no reader, whatever the gateway's flags
-        // name (`regular::symphony::names::reads`): the model's first such worker
+        // The registry's table reads a model it knows for a worker whose labels
+        // select no reader, whatever the gateway's flags name
+        // (`regular::symphony::names::reads`): the model's first such worker
         // says so.
         let flags = Names {
             tool: app_context.router_config.tool_call_parser.clone(),
@@ -148,7 +144,27 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         if let Some(message) = registry_reads_over_the_flags(
             &model_card,
             &config.url,
-            app_context.router_config.parser,
+            &flags,
+            &app_context.worker_registry,
+        ) {
+            warn!(model = %model_card.id, worker = %Endpoint::redacted_str(&config.url), "{message}");
+        }
+        // A `reasoning_parser` label that is an older name no table answers to
+        // passed the override check and selects nothing: the model's first
+        // such worker says so, as startup does for the flags.
+        if let Some(message) =
+            unanswered_reasoning_label(&model_card, &config.url, &app_context.worker_registry)
+        {
+            warn!(model = %model_card.id, worker = %Endpoint::redacted_str(&config.url), "{message}");
+        }
+        // Nothing names a table for the model (no label, no entry of the
+        // registry, no flag): `plain` reads it, where the older parsers
+        // matched such an id by name. The model's first gRPC or ZMQ worker
+        // says so.
+        if let Some(message) = plain_reads_a_model_nothing_names(
+            &model_card,
+            &config.url,
+            *connection_mode,
             &flags,
             &app_context.worker_registry,
         ) {
@@ -267,19 +283,14 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             vec![None] // single worker, no DP
         };
 
-        // Under Symphony the failure classes of the table that reads the model
-        // exist at zero from the registration of a worker the pipeline reads
-        // with, so a dashboard finds `failed` and `malformed` before the first
-        // such output. The table is resolved here, where the card and the
+        // The failure classes of the table that reads the model exist at zero
+        // from the registration of a worker the pipeline reads with, so a
+        // dashboard finds `failed` and `malformed` before the first such
+        // output. The table is resolved here, where the card and the
         // names are, and published by the registration step once the worker
         // is in the registry, so a registration refused there leaves no
         // series behind.
-        context.data.symphony_table = symphony_table_of(
-            &model_card,
-            app_context.router_config.parser,
-            *connection_mode,
-            &flags,
-        );
+        context.data.symphony_table = symphony_table_of(&model_card, *connection_mode, &flags);
 
         // The worker keeps the spec it was registered with, so every field
         // the API accepted rides along: provider, kv_block_size, the
@@ -540,27 +551,14 @@ pub(super) fn warn_on_conflicting_parser_overrides(
     }
 }
 
-/// Reject parser-override names the registries don't know: the legacy parsers', and, under
-/// `--parser symphony`, Symphony's tables (`regular::symphony::check_names`). A name whose
-/// factory is absent is not checked (parsers unused in that configuration).
-pub(super) fn validate_parser_overrides(
-    card: &ModelCard,
-    worker_url: &str,
-    parser: ParserChoice,
-    tool_parser_factory: Option<&tool_parser::ParserFactory>,
-    reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
-) -> Result<(), String> {
+/// Reject parser-override names the gateway cannot read with: a name that is no Symphony table's,
+/// none a table answers to, and not the response template's (`regular::symphony::check_names`).
+pub(super) fn validate_parser_overrides(card: &ModelCard, worker_url: &str) -> Result<(), String> {
     let names = Names {
         tool: card.tool_parser.clone(),
         reasoning: card.reasoning_parser.clone(),
     };
-    check_names(
-        parser,
-        &names,
-        tool_parser_factory,
-        reasoning_parser_factory,
-    )
-    .map_err(|why| {
+    check_names(&names).map_err(|why| {
         format!(
             "worker {} declares a parser override for model '{}' the gateway cannot \
              read with: {why}",
@@ -570,44 +568,67 @@ pub(super) fn validate_parser_overrides(
     })
 }
 
-/// Under `--parser symphony`, the table whose failure classes the registration step publishes at
-/// zero for a gRPC or ZMQ worker of `card`'s model, as this worker's labels and the gateway's flags
-/// select it, so `failed`, `malformed` and the rest exist before the first such output
+/// The table whose failure classes the registration step publishes at zero for a gRPC or ZMQ
+/// worker of `card`'s model, as this worker's labels and the gateway's flags select it, so
+/// `failed`, `malformed` and the rest exist before the first such output
 /// (`regular::symphony::telemetry::init_table_series`, called once the worker is in the registry).
 /// Every worker of a model resolves one (a later worker whose labels select another table brings
 /// that table's series; publishing a table again sets nothing). An HTTP worker resolves none: only
-/// the gRPC and ZMQ pipeline reads with Symphony. The legacy parser choice and a model the legacy
-/// parsers read resolve none either (the fallback series of such a model, under `none`, exist from
-/// start-up).
+/// the gRPC and ZMQ pipeline reads with Symphony.
 fn symphony_table_of(
     card: &ModelCard,
-    parser: ParserChoice,
     connection_mode: ConnectionMode,
     flags: &Names,
 ) -> Option<&'static str> {
-    if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
+    if connection_mode == ConnectionMode::Http {
         return None;
     }
     let labels = Names {
         tool: card.tool_parser.clone(),
         reasoning: card.reasoning_parser.clone(),
     };
-    table_label_read(&ModelNames { labels, flags }, &card.id)
+    Some(table_label_read(&ModelNames { labels, flags }, &card.id))
 }
 
-/// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
-/// labels select no reader (none, or a reasoning name alone that no table answers to), whatever the
-/// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::names::reads`). When
+/// The word for a worker whose `reasoning_parser` label is an older parser's name no table
+/// answers to (`regular::symphony::unanswered_reasoning`): the label passed the override check and
+/// selects nothing, so the tool-call label's table, the registry's table or `plain` reads the
+/// model. `Some(message)` for the model's first worker, naming the worker, the model, the name and
+/// the reason; `None` for the model's later workers and for any other label.
+fn unanswered_reasoning_label(
+    card: &ModelCard,
+    worker_url: &str,
+    registry: &WorkerRegistry,
+) -> Option<String> {
+    if !registry.get_by_model(&card.id).is_empty() {
+        return None;
+    }
+    let labels = Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    };
+    let (name, reason) = unanswered_reasoning(&labels)?;
+    Some(format!(
+        "worker {} labels model '{}' with the reasoning parser name '{name}', an older \
+         parser's that no Symphony table answers to, so it reads nothing ({reason}); the tool-call \
+         label's table, the registry's table or plain reads the model",
+        Endpoint::redacted_str(worker_url),
+        card.id
+    ))
+}
+
+/// The registry's table reads a model it knows for every worker whose labels select no reader
+/// (none, or a reasoning name alone that no table answers to), whatever the gateway's
+/// `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::names::reads`). When
 /// they name another reader, the registration of the model's first worker says so: `Some(message)`
 /// while no worker of the model is registered, naming the model, both readers and the one used;
 /// `None` for the model's later workers, a worker whose labels select a reader, a model the
-/// registry does not know, flags that select nothing or the registry's own table, and the legacy
-/// parser choice. Workers of one model registering at the same moment may each say it, as the
-/// override check above may: the registry gains the worker a step later.
+/// registry does not know, and flags that select nothing or the registry's own table. Workers of
+/// one model registering at the same moment may each say it, as the override check above may: the
+/// registry gains the worker a step later.
 fn registry_reads_over_the_flags(
     card: &ModelCard,
     worker_url: &str,
-    parser: ParserChoice,
     flags: &Names,
     registry: &WorkerRegistry,
 ) -> Option<String> {
@@ -615,10 +636,7 @@ fn registry_reads_over_the_flags(
         tool: card.tool_parser.clone(),
         reasoning: card.reasoning_parser.clone(),
     };
-    if parser != ParserChoice::Symphony
-        || !labels_select_nothing(&labels)
-        || !registry.get_by_model(&card.id).is_empty()
-    {
+    if !labels_select_nothing(&labels) || !registry.get_by_model(&card.id).is_empty() {
         return None;
     }
     let (table, named) = set_aside_by_the_registry(flags, &card.id)?;
@@ -633,6 +651,53 @@ fn registry_reads_over_the_flags(
         Endpoint::redacted_str(worker_url),
         spell(flags.tool.as_deref()),
         spell(flags.reasoning.as_deref()),
+    ))
+}
+
+/// `plain` reads a model nothing names a table for (`regular::symphony::nothing_names_a_table`:
+/// its labels select none, the registry does not list its id, the gateway's flags select none),
+/// so its tool calls and its thought reach the client as content. The older parsers matched such
+/// an id by name (a quantized or renamed checkpoint of a family they read), so the registration
+/// of the model's first gRPC or ZMQ worker says so: `Some(message)` while no gRPC or ZMQ worker of
+/// the model is registered (an HTTP worker of it is no earlier reader), naming the model, the
+/// worker and what selects a table; `None` for the model's later gRPC and ZMQ workers, a model a
+/// label, the registry or a flag gives a table, and an HTTP worker, whose engine parses its own
+/// output; a label is one any card of the model carries, an HTTP worker's too, as a request
+/// reads them ([`card_names_with`]). `None` as well for a model no table reads: a Harmony
+/// model ([`is_harmony_card`]), whose family has no table and stays on the Harmony pipeline, and
+/// a model that is no LLM (an embedding or a rerank model), which generates no text.
+fn plain_reads_a_model_nothing_names(
+    card: &ModelCard,
+    worker_url: &str,
+    connection_mode: ConnectionMode,
+    flags: &Names,
+    registry: &WorkerRegistry,
+) -> Option<String> {
+    let no_table_reads_it = connection_mode == ConnectionMode::Http
+        || !card.is_llm()
+        || is_harmony_card(&card.architectures, card.hf_model_type.as_deref(), &card.id);
+    // An HTTP worker's engine parses its own output: only a gRPC or ZMQ worker of the model is
+    // an earlier worker a table read.
+    let workers = registry.get_by_model(&card.id);
+    let read_before = workers
+        .iter()
+        .any(|worker| *worker.connection_mode() != ConnectionMode::Http);
+    if no_table_reads_it || read_before {
+        return None;
+    }
+    // A request reads the names among every card of the model, an HTTP worker's too
+    // (`ParserResolver::names_among`): so does the word, with this worker's card among them.
+    let labels = card_names_with(&workers, card);
+    if !nothing_names_a_table(&ModelNames { labels, flags }, &card.id) {
+        return None;
+    }
+    Some(format!(
+        "no Symphony table is named for model '{}': the registry does not list the id, and \
+         neither the labels of worker {} nor --tool-call-parser / --reasoning-parser name one, so \
+         its output is read as plain content, tool calls and reasoning included; a tool_parser or \
+         reasoning_parser label on the model's workers, or the two flags, select its table",
+        card.id,
+        Endpoint::redacted_str(worker_url),
     ))
 }
 
@@ -1187,43 +1252,32 @@ mod tests {
         assert!(logs_contain("conflicting parser"));
     }
 
-    /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
-    /// classes are published at zero: the registry's table for an unlabeled worker of a model it
-    /// knows, and another table for a worker whose labels name one. The legacy parser choice and
-    /// an HTTP worker (the pipeline that reads with Symphony never serves it) resolve none.
+    /// A gRPC worker's registration resolves the table whose failure classes are published at
+    /// zero: the registry's table for an unlabeled worker of a model it knows, and another table
+    /// for a worker whose labels name one. An HTTP worker (the pipeline that reads with Symphony
+    /// never serves it) resolves none.
     #[test]
     fn a_workers_registration_resolves_the_table_whose_failure_classes_are_published() {
         let known = ModelCard::new("Qwen/Qwen3-8B");
-        let table = |card: &ModelCard, parser, connection_mode| {
-            symphony_table_of(card, parser, connection_mode, &Names::default())
+        let table = |card: &ModelCard, connection_mode| {
+            symphony_table_of(card, connection_mode, &Names::default())
         };
         assert_eq!(
-            table(&known, ParserChoice::Legacy, ConnectionMode::Grpc),
-            None,
-            "the legacy parsers publish no table"
-        );
-        assert_eq!(
-            table(&known, ParserChoice::Symphony, ConnectionMode::Http),
+            table(&known, ConnectionMode::Http),
             None,
             "an HTTP worker publishes no table"
         );
-        assert_eq!(
-            table(&known, ParserChoice::Symphony, ConnectionMode::Grpc),
-            Some("qwen3")
-        );
+        assert_eq!(table(&known, ConnectionMode::Grpc), Some("qwen3"));
         // A later worker of the model whose labels name another table brings
         // that table's series: requests count under it from then on.
         let mut labeled = known.clone();
         labeled.tool_parser = Some("kimi_k2".to_string());
-        assert_eq!(
-            table(&labeled, ParserChoice::Symphony, ConnectionMode::Zmq),
-            Some("kimi_k2")
-        );
+        assert_eq!(table(&labeled, ConnectionMode::Zmq), Some("kimi_k2"));
     }
 
     /// The table a worker's registration resolves is published by the registration step, once the
-    /// worker is in the registry: under `--parser symphony` a gRPC worker of a model the registry
-    /// knows resolves the registry's table in the create step, a registration the registration
+    /// worker is in the registry: a gRPC worker of a model the registry knows resolves the
+    /// registry's table in the create step, a registration the registration
     /// step refuses leaves no series behind, and an accepted one leaves the table's failure classes
     /// at zero.
     #[tokio::test]
@@ -1237,7 +1291,6 @@ mod tests {
             app_context_with(
                 crate::config::RouterConfig::builder()
                     .worker_startup_timeout_secs(1)
-                    .parser(ParserChoice::Symphony)
                     .build_unchecked(),
             )
         };
@@ -1303,11 +1356,59 @@ mod tests {
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
 
-    /// Under `--parser symphony`, the registration of a model's first worker whose labels select
-    /// no reader (none, or a reasoning name no table answers to) says that the registry's table
-    /// reads the model, not what the gateway's flags name, naming both; the model's next worker,
-    /// a worker whose labels select a reader, a model the registry does not know, flags that name
-    /// the registry's own table or nothing, and the legacy parser choice, say nothing.
+    /// The registration of a model's first worker whose `reasoning_parser` label is an older
+    /// name no table answers to says that the label reads nothing, with its reason; the model's
+    /// next worker, a label a table answers to, and no label say nothing.
+    #[test]
+    fn an_older_reasoning_label_no_table_answers_to_is_said_once_per_model_at_registration() {
+        let mut labeled = ModelCard::new("acme/thinker");
+        labeled.reasoning_parser = Some("qwen3_thinking".to_string());
+        let registry = WorkerRegistry::new();
+        // The worker is named through the mask: a credential in its address
+        // is in no message (the helper masks, so no caller can forget).
+        let said = unanswered_reasoning_label(&labeled, "grpc://user:secret@a:1", &registry)
+            .expect("the model's first worker says so");
+        assert!(
+            said.contains("'acme/thinker'")
+                && said.contains("'qwen3_thinking'")
+                && said.contains("***@a:1")
+                && !said.contains("secret")
+                && said.contains("reads nothing"),
+            "{said}"
+        );
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://a:1")
+                    .model(labeled.clone())
+                    .build(),
+            ))
+            .expect("register");
+        assert_eq!(
+            unanswered_reasoning_label(&labeled, "grpc://b:1", &registry),
+            None,
+            "the model's second worker"
+        );
+
+        let fresh = WorkerRegistry::new();
+        let mut answered = ModelCard::new("acme/thinker");
+        answered.reasoning_parser = Some("qwen3".to_string());
+        assert_eq!(
+            unanswered_reasoning_label(&answered, "grpc://a:1", &fresh),
+            None,
+            "a label a table answers to"
+        );
+        assert_eq!(
+            unanswered_reasoning_label(&ModelCard::new("acme/thinker"), "grpc://a:1", &fresh),
+            None,
+            "no label"
+        );
+    }
+
+    /// The registration of a model's first worker whose labels select no reader (none, or a
+    /// reasoning name no table answers to) says that the registry's table reads the model, not
+    /// what the gateway's flags name, naming both; the model's next worker, a worker whose labels
+    /// select a reader, a model the registry does not know, and flags that name the registry's
+    /// own table or nothing, say nothing.
     #[test]
     fn the_registrys_table_over_the_flags_is_said_once_per_model_at_registration() {
         let flags = Names {
@@ -1316,21 +1417,14 @@ mod tests {
         };
         let known = ModelCard::new("Qwen/Qwen3-8B");
         let registry = WorkerRegistry::new();
-        let said =
-            |card: &ModelCard, url: &str, parser, flags: &Names, registry: &WorkerRegistry| {
-                registry_reads_over_the_flags(card, url, parser, flags, registry)
-            };
+        let said = |card: &ModelCard, url: &str, flags: &Names, registry: &WorkerRegistry| {
+            registry_reads_over_the_flags(card, url, flags, registry)
+        };
 
         // The worker is named through the mask: a credential in its address
         // is in no message (the helper masks, so no caller can forget).
-        let first = said(
-            &known,
-            "grpc://user:secret@a:1",
-            ParserChoice::Symphony,
-            &flags,
-            &registry,
-        )
-        .expect("the model's first worker says so");
+        let first = said(&known, "grpc://user:secret@a:1", &flags, &registry)
+            .expect("the model's first worker says so");
         assert!(
             first.contains("'Qwen/Qwen3-8B'")
                 && first.contains("'qwen3'")
@@ -1347,13 +1441,7 @@ mod tests {
             ))
             .expect("register");
         assert_eq!(
-            said(
-                &known,
-                "grpc://b:1",
-                ParserChoice::Symphony,
-                &flags,
-                &registry
-            ),
+            said(&known, "grpc://b:1", &flags, &registry),
             None,
             "the model's second worker"
         );
@@ -1362,13 +1450,7 @@ mod tests {
         let mut labeled = known.clone();
         labeled.reasoning_parser = Some("qwen3".to_string());
         assert_eq!(
-            said(
-                &labeled,
-                "grpc://a:1",
-                ParserChoice::Symphony,
-                &flags,
-                &fresh
-            ),
+            said(&labeled, "grpc://a:1", &flags, &fresh),
             None,
             "a worker whose labels select a reader"
         );
@@ -1376,7 +1458,6 @@ mod tests {
             said(
                 &ModelCard::new("acme/ministral-3-14b-instruct-w4a16"),
                 "grpc://a:1",
-                ParserChoice::Symphony,
                 &flags,
                 &fresh
             ),
@@ -1388,42 +1469,222 @@ mod tests {
             reasoning: None,
         };
         assert_eq!(
-            said(&known, "grpc://a:1", ParserChoice::Symphony, &own, &fresh),
+            said(&known, "grpc://a:1", &own, &fresh),
             None,
             "the registry's own table"
         );
         // A label that selects nothing (a reasoning name no table answers to) falls through to
         // the registry as no label does, so the worker says it too.
         let mut idle_label = known.clone();
-        idle_label.reasoning_parser = Some("deepseek_r1".to_string());
+        idle_label.reasoning_parser = Some("qwen3_thinking".to_string());
         assert!(
-            said(
-                &idle_label,
-                "grpc://a:1",
-                ParserChoice::Symphony,
-                &flags,
-                &fresh
-            )
-            .is_some_and(|message| {
+            said(&idle_label, "grpc://a:1", &flags, &fresh).is_some_and(|message| {
                 message.contains("'qwen3'") && message.contains("whose labels select no reader")
             }),
             "a label that selects nothing"
         );
         assert_eq!(
-            said(
-                &known,
-                "grpc://a:1",
-                ParserChoice::Symphony,
-                &Names::default(),
-                &fresh
-            ),
+            said(&known, "grpc://a:1", &Names::default(), &fresh),
             None,
             "no flags"
         );
+    }
+
+    /// The registration of the first gRPC or ZMQ worker of a model nothing names a table for (no
+    /// label, no entry of the registry, no flag) says that `plain` reads the model, naming the
+    /// model, the worker through the mask and what selects a table, and the create step warns
+    /// with it. The model's next worker, an HTTP worker, a worker whose label names a table, a
+    /// flag that names one and a model the registry lists say nothing, and neither does a model
+    /// no table reads: a Harmony model, an embedding model or a rerank model.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_model_nothing_names_a_table_for_is_said_once_per_model_at_registration() {
+        let unlisted = ModelCard::new("acme/ministral-3-14b-instruct-w4a16");
+        let none = Names::default();
+        let registry = WorkerRegistry::new();
+        let said = |card: &ModelCard,
+                    mode: ConnectionMode,
+                    flags: &Names,
+                    registry: &WorkerRegistry| {
+            plain_reads_a_model_nothing_names(card, "grpc://user:secret@a:1", mode, flags, registry)
+        };
+
+        let first = said(&unlisted, ConnectionMode::Grpc, &none, &registry)
+            .expect("the model's first worker says so");
+        assert!(
+            first.contains("'acme/ministral-3-14b-instruct-w4a16'")
+                && first.contains("plain content")
+                && first.contains("tool_parser")
+                && first.contains("--tool-call-parser")
+                && first.contains("***@a:1")
+                && !first.contains("secret"),
+            "{first}"
+        );
+        assert!(said(&unlisted, ConnectionMode::Zmq, &none, &registry).is_some());
         assert_eq!(
-            said(&known, "grpc://a:1", ParserChoice::Legacy, &flags, &fresh),
+            said(&unlisted, ConnectionMode::Http, &none, &registry),
             None,
-            "the legacy parsers"
+            "an HTTP worker's engine parses its own output"
+        );
+        let mut labeled = unlisted.clone();
+        labeled.tool_parser = Some("mistral_v13".to_string());
+        assert_eq!(
+            said(&labeled, ConnectionMode::Grpc, &none, &registry),
+            None,
+            "a label names a table"
+        );
+        let flags = Names {
+            tool: Some("mistral_v13".to_string()),
+            reasoning: None,
+        };
+        assert_eq!(
+            said(&unlisted, ConnectionMode::Grpc, &flags, &registry),
+            None,
+            "a flag names a table"
+        );
+        let listed = ModelCard::new("Qwen/Qwen3-8B");
+        assert_eq!(
+            said(&listed, ConnectionMode::Grpc, &none, &registry),
+            None,
+            "a model the registry lists"
+        );
+        // No table reads these, so nothing is said for them: a Harmony model stays on the
+        // Harmony pipeline, and an embedding or a rerank model generates no text.
+        let unread = [
+            ("a Harmony id", ModelCard::new("acme/gpt-oss-20b-w4a16")),
+            (
+                "a Harmony architecture",
+                unlisted
+                    .clone()
+                    .with_architectures(vec!["GptOssForCausalLM".to_string()]),
+            ),
+            (
+                "an embedding model",
+                unlisted.clone().with_model_type(ModelType::EMBEDDINGS),
+            ),
+            (
+                "a rerank model",
+                unlisted.clone().with_model_type(ModelType::RERANK),
+            ),
+        ];
+        let told: Vec<&str> = unread
+            .iter()
+            .filter(|(_, card)| said(card, ConnectionMode::Grpc, &none, &registry).is_some())
+            .map(|(which, _)| *which)
+            .collect();
+        assert!(told.is_empty(), "said for {told:?}, which no table reads");
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://a:1")
+                    .model(unlisted.clone())
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            ))
+            .expect("register");
+        assert_eq!(
+            said(&unlisted, ConnectionMode::Grpc, &none, &registry),
+            None,
+            "the model's second worker"
+        );
+
+        // The create step warns with it for the first gRPC worker of such a model, and says
+        // nothing for a model the registry lists.
+        let symphony = || {
+            app_context_with(
+                crate::config::RouterConfig::builder()
+                    .worker_startup_timeout_secs(1)
+                    .build_unchecked(),
+            )
+        };
+        let mut ctx = grpc_worker_context(&listed.id, WorkerRegistrationMode::Upsert, symphony());
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert!(!logs_contain("no Symphony table is named"));
+        let mut ctx = grpc_worker_context(&unlisted.id, WorkerRegistrationMode::Upsert, symphony());
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(ctx.data.symphony_table, Some("plain"));
+        assert!(logs_contain(
+            "no Symphony table is named for model 'acme/ministral-3-14b-instruct-w4a16'"
+        ));
+    }
+
+    /// A model whose first worker is an HTTP worker is told at its first gRPC or ZMQ worker: an
+    /// HTTP worker's engine parses its own output, so no table read the model before, and a
+    /// model that moves from HTTP to gRPC while its HTTP workers still serve gets the word.
+    #[test]
+    fn a_model_whose_first_worker_is_http_is_told_at_its_first_grpc_worker() {
+        let unlisted = ModelCard::new("acme/ministral-3-14b-instruct-w4a16");
+        let none = Names::default();
+        let registry = WorkerRegistry::new();
+        let said = |mode: ConnectionMode| {
+            plain_reads_a_model_nothing_names(&unlisted, "grpc://b:1", mode, &none, &registry)
+        };
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://a:1")
+                    .model(unlisted.clone())
+                    .connection_mode(ConnectionMode::Http)
+                    .build(),
+            ))
+            .expect("register");
+        assert!(
+            said(ConnectionMode::Grpc).is_some(),
+            "an HTTP worker of the model is no earlier reader"
+        );
+        assert!(said(ConnectionMode::Zmq).is_some());
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://b:1")
+                    .model(unlisted.clone())
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            ))
+            .expect("register");
+        assert_eq!(
+            said(ConnectionMode::Grpc),
+            None,
+            "the model's second gRPC worker"
+        );
+        assert_eq!(
+            said(ConnectionMode::Zmq),
+            None,
+            "a ZMQ worker after the model's gRPC worker"
+        );
+    }
+
+    /// A request reads the parser names among every card of the model, whatever its worker's
+    /// wire, so a table an HTTP worker's label names is the model's: nothing is said for the
+    /// model's unlabelled first gRPC worker, which the label's table reads.
+    #[test]
+    fn a_table_an_http_workers_label_names_is_the_models_at_its_first_grpc_worker() {
+        let none = Names::default();
+        let registry = WorkerRegistry::new();
+        let labelled = ModelCard::new("acme/ministral-3-8b-instruct-w4a16");
+        let mut http_card = labelled.clone();
+        http_card.tool_parser = Some("mistral_v13".to_string());
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://c:1")
+                    .model(http_card)
+                    .connection_mode(ConnectionMode::Http)
+                    .build(),
+            ))
+            .expect("register");
+        assert_eq!(
+            plain_reads_a_model_nothing_names(
+                &labelled,
+                "grpc://d:1",
+                ConnectionMode::Grpc,
+                &none,
+                &registry
+            ),
+            None,
+            "the HTTP worker's label names the model's table"
         );
     }
 
@@ -1440,7 +1701,7 @@ mod tests {
     ) -> Arc<crate::app_context::AppContext> {
         use crate::app_context::testing::app_context_for_tests;
 
-        app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
+        app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()))
     }
 
     /// A worker registered through the API keeps every spec field the
@@ -2449,12 +2710,10 @@ mod tests {
     /// carries no override, and its grammar start reads as advertised.
     #[test]
     fn an_engines_advertised_reasoning_parser_is_not_a_parser_override() {
-        use tool_parser::GrammarStart;
+        use openai_protocol::worker::GrammarStart;
 
         use crate::routers::grpc::client::ServerInfo;
 
-        let tool_factory = tool_parser::ParserFactory::default();
-        let reasoning_factory = reasoning_parser::ParserFactory::default();
         let spec = WorkerSpec::new("grpc://engine:50051");
         for name in ["openai_gptoss", "kimi_k2", "qwen3", "glm45"] {
             let info = ServerInfo::Vllm(Box::new(
@@ -2475,14 +2734,8 @@ mod tests {
                 "{name}: no override from the engine's fact"
             );
             assert_eq!(card.tool_parser, None);
-            validate_parser_overrides(
-                &card,
-                "grpc://engine:50051",
-                ParserChoice::Legacy,
-                Some(&tool_factory),
-                Some(&reasoning_factory),
-            )
-            .unwrap_or_else(|e| panic!("{name}: the worker must register: {e}"));
+            validate_parser_overrides(&card, "grpc://engine:50051")
+                .unwrap_or_else(|e| panic!("{name}: the worker must register: {e}"));
             assert_eq!(
                 GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str)),
                 GrammarStart::AfterReasoning,
@@ -2491,103 +2744,62 @@ mod tests {
         }
     }
 
+    /// A parser override is a name the gateway reads with: a table's own name, a name a table
+    /// answers to (an older parser's whose format a table reads, a launcher's), or `hf`; the two
+    /// names may select different tables (the tool-call name's reads, and startup says so once).
     #[test]
-    fn a_symphony_table_is_a_parser_override_under_parser_symphony_alone() {
-        let tool_factory = tool_parser::ParserFactory::default();
-        let reasoning_factory = reasoning_parser::ParserFactory::default();
+    fn a_tables_name_is_a_parser_override_and_an_older_name_a_table_answers_to_passes() {
         let mut card = ModelCard::new("m");
         card.tool_parser = Some("ling".to_string());
         card.reasoning_parser = Some("ling".to_string());
-        let check = |card: &ModelCard, parser| {
-            validate_parser_overrides(
-                card,
-                "http://w:1",
-                parser,
-                Some(&tool_factory),
-                Some(&reasoning_factory),
-            )
-        };
-        assert!(check(&card, ParserChoice::Symphony).is_ok());
-        let err = check(&card, ParserChoice::Legacy).expect_err("a table is no legacy parser");
-        assert!(
-            err.contains("'ling'") && err.contains("--parser symphony"),
-            "{err}"
-        );
-        // A table no legacy parser shares binds the other override to the same table.
+        let check = |card: &ModelCard| validate_parser_overrides(card, "http://w:1");
+        assert!(check(&card).is_ok());
         card.reasoning_parser = Some("qwen3".to_string());
-        let err = check(&card, ParserChoice::Symphony).expect_err("bound to the table");
-        assert!(err.contains("same table"), "{err}");
-        // A name both registries have passes under either parser.
-        card.tool_parser = Some("kimi_k3".to_string());
+        assert!(check(&card).is_ok());
+        card.tool_parser = Some("kimik2".to_string());
         card.reasoning_parser = Some("kimi_k3".to_string());
-        assert!(check(&card, ParserChoice::Symphony).is_ok());
-        assert!(check(&card, ParserChoice::Legacy).is_ok());
+        assert!(check(&card).is_ok());
+        card.tool_parser = Some("hf".to_string());
+        card.reasoning_parser = None;
+        assert!(check(&card).is_ok());
+        // `hf` binds the other name to itself or to nothing.
+        card.reasoning_parser = Some("qwen3".to_string());
+        let err = check(&card).expect_err("bound to the template");
+        assert!(err.contains("'hf'") && err.contains("'qwen3'"), "{err}");
     }
 
     #[test]
     fn unknown_parser_override_fails_validation() {
-        let tool_factory = tool_parser::ParserFactory::default();
-        let reasoning_factory = reasoning_parser::ParserFactory::default();
+        let check = |card: &ModelCard| validate_parser_overrides(card, "http://user:secret@w:1");
 
-        // No overrides → nothing to validate.
-        let card = ModelCard::new("m");
-        assert!(validate_parser_overrides(
-            &card,
-            "http://w:1",
-            ParserChoice::Legacy,
-            Some(&tool_factory),
-            Some(&reasoning_factory)
-        )
-        .is_ok());
+        // No overrides: nothing to validate.
+        assert!(check(&ModelCard::new("m")).is_ok());
 
-        // Known tool parser passes; unknown names fail loudly.
-        let card = ModelCard::new("m").with_tool_parser("json");
-        assert!(validate_parser_overrides(
-            &card,
-            "http://w:1",
-            ParserChoice::Legacy,
-            Some(&tool_factory),
-            None
-        )
-        .is_ok());
-
-        // The refusal names the worker through the mask: a credential in its
-        // address is in no refusal (the helper masks, so no caller can forget).
-        let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
-        let err = validate_parser_overrides(
-            &card,
-            "http://user:secret@w:1",
-            ParserChoice::Legacy,
-            Some(&tool_factory),
-            None,
-        )
-        .expect_err("unknown tool parser must fail registration");
+        // A known name passes; unknown names fail loudly, naming the worker, the model and the
+        // name. The refusal names the worker through the mask: a credential in its address is in
+        // no refusal (the helper masks, so no caller can forget).
+        assert!(check(&ModelCard::new("m").with_tool_parser("json")).is_ok());
+        let err = check(&ModelCard::new("m").with_tool_parser("definitely-not-a-parser"))
+            .expect_err("unknown tool parser must fail registration");
+        assert!(err.contains("definitely-not-a-parser"), "{err}");
+        assert!(
+            err.contains("http://***@w:1") && !err.contains("secret") && err.contains("'m'"),
+            "{err}"
+        );
+        let err = check(&ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser"))
+            .expect_err("unknown reasoning parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
         assert!(
             err.contains("http://***@w:1") && !err.contains("secret"),
             "{err}"
         );
 
-        let card = ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser");
-        let err = validate_parser_overrides(
-            &card,
-            "http://user:secret@w:1",
-            ParserChoice::Legacy,
-            None,
-            Some(&reasoning_factory),
-        )
-        .expect_err("unknown reasoning parser must fail registration");
-        assert!(err.contains("definitely-not-a-parser"), "{err}");
+        // An older parser's name no table answers to is refused with its reason.
+        let err = check(&ModelCard::new("m").with_tool_parser("pythonic"))
+            .expect_err("an older name no table answers to");
         assert!(
-            err.contains("http://***@w:1") && !err.contains("secret"),
+            err.contains("'pythonic'") && err.contains("llama4_pythonic"),
             "{err}"
-        );
-
-        // Absent factories skip validation (parsers unused in that config).
-        let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
-        assert!(
-            validate_parser_overrides(&card, "http://w:1", ParserChoice::Legacy, None, None)
-                .is_ok()
         );
     }
 }

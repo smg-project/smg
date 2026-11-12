@@ -36,15 +36,12 @@ use crate::{
 };
 
 fn make_app_context(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
-    make_app_context_with(workers, None)
+    make_app_context_with(workers)
 }
 
-/// With the tool parsers the gateway reads with, when given: a parser
-/// override is validated against them.
-fn make_app_context_with(
-    workers: &[Arc<dyn Worker>],
-    tool_parser_factory: Option<tool_parser::ParserFactory>,
-) -> Arc<AppContext> {
+/// An app context over `workers`, registered: a parser override a label
+/// update brings in is checked against the names the gateway reads with.
+fn make_app_context_with(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
     use crate::{
         app_context::testing::app_context_for_tests, config::RouterConfig, worker::WorkerRegistry,
     };
@@ -56,7 +53,7 @@ fn make_app_context_with(
     for w in workers {
         registry.register(Arc::clone(w)).unwrap();
     }
-    app_context_for_tests(router_config, registry, tool_parser_factory)
+    app_context_for_tests(router_config, registry)
 }
 
 /// Each worker's id and revision, as the find step captures them.
@@ -1549,10 +1546,7 @@ async fn a_parser_override_from_a_label_update_must_be_known() {
         WorkerSpec::new("http://w:8000"),
         labels_of(&[("served_model_name", "m")]),
     );
-    let app_ctx = make_app_context_with(
-        std::slice::from_ref(&worker),
-        Some(tool_parser::ParserFactory::default()),
-    );
+    let app_ctx = make_app_context_with(std::slice::from_ref(&worker));
     let mut unknown = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
@@ -1642,14 +1636,11 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
         WorkerSpec::new("http://w:8000"),
         labels_of(&[("served_model_name", "m"), ("tool_parser", "json")]),
     );
-    let app_ctx = make_app_context_with(
-        &[Arc::clone(&peer), Arc::clone(&worker)],
-        Some(tool_parser::ParserFactory::default()),
-    );
+    let app_ctx = make_app_context_with(&[Arc::clone(&peer), Arc::clone(&worker)]);
     let mut ctx = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels_of(&[("tool_parser", "pythonic")]),
+        labels_of(&[("tool_parser", "qwen")]),
     );
     step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
     assert!(logs_contain("conflicting parser overrides"));
@@ -1661,6 +1652,6 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
         .expect("worker stays registered");
     assert_eq!(
         updated.models().remove(0).tool_parser.as_deref(),
-        Some("pythonic")
+        Some("qwen")
     );
 }

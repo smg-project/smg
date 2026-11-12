@@ -28,9 +28,7 @@ use openai_protocol::{
     generate::{GenerateRequest, GenerateResponse},
     messages::CreateMessageRequest,
 };
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
-use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
 use super::{
@@ -67,14 +65,13 @@ use super::{
             ChatGenerateResponseProcessingStage, TranscriptionPreparationStage,
             TranscriptionRequestBuildingStage, TranscriptionResponseProcessingStage,
         },
-        streaming, symphony,
+        streaming,
     },
     spec::ResponseSpec,
-    utils,
     utils::{error_reason_for_response, error_type_for_response},
 };
 use crate::{
-    config::{types::RetryConfig, GroupedDpSticky, ParserChoice},
+    config::{types::RetryConfig, GroupedDpSticky},
     middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
@@ -109,19 +106,11 @@ pub(crate) enum Endpoint {
 }
 
 /// Construction dependencies shared by every endpoint pipeline.
-///
-/// The parser factories/overrides are consumed only by the chat/messages/harmony
-/// processors; completion builds its own default-factory processors and
-/// embeddings/classify build none.
 #[derive(Clone)]
 pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     prefill_admission: Option<Arc<PrefillAdmission>>,
-    tool_parser_factory: ToolParserFactory,
-    reasoning_parser_factory: ReasoningParserFactory,
-    configured_tool_parser: Option<String>,
-    configured_reasoning_parser: Option<String>,
     /// `None` when tenant rate limiting is disabled; read by the
     /// `RateLimitReserveStage` of every endpoint.
     rate_limit_manager: Option<Arc<RateLimitManager>>,
@@ -138,20 +127,12 @@ pub(crate) struct PipelineDeps {
 }
 
 impl PipelineDeps {
-    /// Full deps for the chat/messages/harmony endpoints, which consume the
-    /// configured parser factories/overrides.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "pipeline construction wires the endpoint dependency bundle"
-    )]
+    /// The deps of every endpoint's pipeline, with no attempt deadline
+    /// ([`Self::with_request_timeout`] sets one).
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         prefill_admission: Option<Arc<PrefillAdmission>>,
-        tool_parser_factory: ToolParserFactory,
-        reasoning_parser_factory: ReasoningParserFactory,
-        configured_tool_parser: Option<String>,
-        configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
         queue_timeout: Duration,
     ) -> Self {
@@ -159,34 +140,6 @@ impl PipelineDeps {
             worker_registry,
             policy_registry,
             prefill_admission,
-            tool_parser_factory,
-            reasoning_parser_factory,
-            configured_tool_parser,
-            configured_reasoning_parser,
-            rate_limit_manager,
-            queue_timeout,
-            request_timeout: None,
-            grouped_dp_sticky: GroupedDpSticky::Off,
-        }
-    }
-
-    /// Deps for endpoints (embeddings/classify/completion) with no configured
-    /// parsers; the parser fields are placeholders those endpoints never read.
-    pub(crate) fn pair(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-        prefill_admission: Option<Arc<PrefillAdmission>>,
-        rate_limit_manager: Option<Arc<RateLimitManager>>,
-        queue_timeout: Duration,
-    ) -> Self {
-        Self {
-            worker_registry,
-            policy_registry,
-            prefill_admission,
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            configured_tool_parser: None,
-            configured_reasoning_parser: None,
             rate_limit_manager,
             queue_timeout,
             request_timeout: None,
@@ -211,57 +164,17 @@ impl PipelineDeps {
         self
     }
 
-    /// Build the chat/messages response processor pair from the configured
-    /// parser factories, labeled with `backend`.
-    fn configured_processors(
-        &self,
+    /// Build the response processor pair, labeled with `backend`: every
+    /// endpoint's, since the processors read with the table request
+    /// building assigned and resolve nothing themselves.
+    fn processors(
         backend: &'static str,
     ) -> (
         processor::ResponseProcessor,
         Arc<streaming::StreamingProcessor>,
     ) {
-        let parser_resolver = utils::ParserResolver::new(
-            self.worker_registry.clone(),
-            self.configured_tool_parser.clone(),
-            self.configured_reasoning_parser.clone(),
-            &self.tool_parser_factory,
-            &self.reasoning_parser_factory,
-        );
-        let processor = processor::ResponseProcessor::new(
-            self.tool_parser_factory.clone(),
-            self.reasoning_parser_factory.clone(),
-            parser_resolver.clone(),
-        )
-        .with_backend(backend);
-        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
-            self.tool_parser_factory.clone(),
-            self.reasoning_parser_factory.clone(),
-            parser_resolver,
-            backend,
-        ));
-        (processor, streaming_processor)
-    }
-
-    /// Build the completion response processor pair from default parser
-    /// factories (completion does not use configured parsers), labeled `backend`.
-    fn default_processors(
-        backend: &'static str,
-    ) -> (
-        processor::ResponseProcessor,
-        Arc<streaming::StreamingProcessor>,
-    ) {
-        let processor = processor::ResponseProcessor::new(
-            ToolParserFactory::default(),
-            ReasoningParserFactory::default(),
-            utils::ParserResolver::disabled(),
-        )
-        .with_backend(backend);
-        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
-            ToolParserFactory::default(),
-            ReasoningParserFactory::default(),
-            utils::ParserResolver::disabled(),
-            backend,
-        ));
+        let processor = processor::ResponseProcessor::new().with_backend(backend);
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(backend));
         (processor, streaming_processor)
     }
 
@@ -272,10 +185,6 @@ impl PipelineDeps {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             prefill_admission: None,
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            configured_tool_parser: None,
-            configured_reasoning_parser: None,
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
             request_timeout: None,
@@ -309,8 +218,6 @@ pub(crate) struct RequestPipeline {
     mode: Mode,
     /// The registry, read at dispatch for `--worker-overload-shed`.
     worker_registry: Arc<WorkerRegistry>,
-    /// Shapes a forced tool call's constraint for each attempt's worker.
-    tool_parser_factory: ToolParserFactory,
     /// The deadline of each attempt's dispatch and streams, when set.
     request_timeout: Option<Duration>,
     /// How each attempt pins a sticky request to an engine of a grouped
@@ -371,7 +278,7 @@ impl RequestPipeline {
                 }
             }
             Endpoint::Chat => {
-                let (processor, streaming_processor) = deps.configured_processors(backend);
+                let (processor, streaming_processor) = PipelineDeps::processors(backend);
                 PipelineStages {
                     preparation: Box::new(ChatGeneratePreparationStage::new(
                         mode.multimodal_wire_pools(),
@@ -389,7 +296,7 @@ impl RequestPipeline {
                 }
             }
             Endpoint::Messages => {
-                let (processor, streaming_processor) = deps.configured_processors(backend);
+                let (processor, streaming_processor) = PipelineDeps::processors(backend);
                 PipelineStages {
                     preparation: Box::new(MessagePreparationStage::new(
                         mode.multimodal_wire_pools(),
@@ -405,8 +312,7 @@ impl RequestPipeline {
                 }
             }
             Endpoint::Completion => {
-                // Completion uses default parser factories, not the configured ones.
-                let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
+                let (processor, streaming_processor) = PipelineDeps::processors(backend);
                 PipelineStages {
                     preparation: Box::new(CompletionPreparationStage),
                     rate_limit,
@@ -470,8 +376,7 @@ impl RequestPipeline {
                 if !matches!(mode, Mode::Regular) {
                     return None;
                 }
-                // Plain text decode: no configured parsers needed.
-                let (processor, _streaming) = PipelineDeps::default_processors(backend);
+                let (processor, _streaming) = PipelineDeps::processors(backend);
                 PipelineStages {
                     preparation: Box::new(TranscriptionPreparationStage),
                     rate_limit,
@@ -491,7 +396,6 @@ impl RequestPipeline {
             backend_type: backend,
             mode,
             worker_registry: deps.worker_registry.clone(),
-            tool_parser_factory: deps.tool_parser_factory.clone(),
             request_timeout: deps.request_timeout,
             grouped_dp_sticky: deps.grouped_dp_sticky,
         })
@@ -620,7 +524,7 @@ impl RequestPipeline {
                 .await?,
             );
             let retained = plan.as_mut().ok_or_else(consumed)?;
-            helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
+            helpers::restamp_plan_for_attempt(retained, stamp, workers)?;
             // The new workers' window, for the stop reason of a `length` finish.
             if let Some(ResponseSpec::Messages(messages)) = spec.as_mut() {
                 messages.context_window = selection_context_length(workers, &dctx.model_id);
@@ -890,13 +794,6 @@ impl RequestPipeline {
                 response.headers_mut().insert("x-smg-cache-trace", value);
             }
         }
-        // Which parser read a chat completion, so a client comparing the two can tell.
-        if let Some(parser) = ctx.parser {
-            response.headers_mut().insert(
-                symphony::HEADER,
-                http::HeaderValue::from_static(parser.name()),
-            );
-        }
         if let Some(workers) = ctx.workers.as_ref() {
             let worker = match workers {
                 WorkerSelection::Single { worker } => worker,
@@ -1126,18 +1023,7 @@ impl RequestPipeline {
             // either message.
             match outcome {
                 Ok(outcome) => {
-                    // The parser that read the answer, as the Responses stream's
-                    // own answer names it: a stream answers early, its header
-                    // set by `routed_response`.
-                    let parser = match &outcome {
-                        RunOutcome::Early(response) => {
-                            response.headers().get(symphony::HEADER).cloned()
-                        }
-                        RunOutcome::Final(dctx, _) => dctx
-                            .parser
-                            .map(|parser| http::HeaderValue::from_static(parser.name())),
-                    };
-                    let _ = startup.send(Ok(parser));
+                    let _ = startup.send(Ok(()));
                     Ok(outcome)
                 }
                 Err(failure) => {
@@ -1550,8 +1436,7 @@ impl RequestPipeline {
     /// each takes the reservation a chat request takes (reserved at ingress
     /// under a charge id of its own, settled with the engine's counts, closed
     /// unsettled when the iteration fails). Two differences:
-    /// 1. Returns the completion with the parser that read it (what the chat
-    ///    route answers in `x-smg-parser`), as a Result for tool_loop composition
+    /// 1. Returns the completion as a Result for tool_loop composition
     /// 2. Disallows streaming (responses endpoint uses different SSE format)
     pub async fn execute_chat_for_responses(
         &self,
@@ -1560,7 +1445,7 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
-    ) -> Result<(ChatCompletionResponse, Option<ParserChoice>), Response> {
+    ) -> Result<ChatCompletionResponse, Response> {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
@@ -1587,7 +1472,7 @@ impl RequestPipeline {
                     rate_limit_cell
                         .settle(Self::recorded_settlement(&dctx.response))
                         .await;
-                    Ok((response, dctx.parser))
+                    Ok(response)
                 }
                 Some(_) => {
                     error!(

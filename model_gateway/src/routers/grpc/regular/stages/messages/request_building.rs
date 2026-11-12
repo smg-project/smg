@@ -205,7 +205,7 @@ impl BuildStage for MessageRequestBuildingStage {
             .workers
             .as_ref()
             .and_then(|workers| selection_context_length(workers, &ctx.input.model_id));
-        spec.symphony = assignment;
+        spec.symphony = Some(assignment);
         spec.parser_names.clone_from(&ctx.state.parser_names);
         Ok(BuildOutput {
             plan,

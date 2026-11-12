@@ -527,9 +527,8 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     overlap_decay: float = 0.0
     overload_token_usage_threshold: float = 1.0
-    # Which parser reads a chat completion's reasoning and tool calls: Symphony ("symphony",
-    # the default) for the models its registry knows, or the per-model parsers ("legacy"); a
-    # request's X-SMG-Parser header overrides it
+    # The gateway's --parser flag, kept for one release with its one value, symphony, so a
+    # launcher that set it keeps starting; the flag is removed in 1.17
     parser: str = "symphony"
     # Seconds a PD dispatch waits for a slot in the decode engine's running
     # window before shedding; 0 sheds immediately
@@ -2614,20 +2613,13 @@ class RouterArgs:
             help="Disable automatic tokenizer loading at startup. "
             "Use this when tokenizers are not needed (e.g., pure load balancing).",
         )
+        # The flag keeps its one value for one release and is removed in 1.17: hidden from --help.
         tokenizer_group.add_argument(
             f"--{prefix}parser",
             type=str,
             default=RouterArgs.parser,
-            choices=["legacy", "symphony"],
-            help="Which parser reads a chat completion's reasoning and tool calls: Symphony "
-            "(symphony, the default) or the per-model parsers (legacy). With Symphony, a model's "
-            "worker labels decide, "
-            "else Symphony's registry for a model it knows, else --tool-call-parser and --reasoning-parser: "
-            "a Symphony table's name reads with that table, and so does a legacy parser's name whose format "
-            "a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so existing flags "
-            "keep a working parser); any other legacy parser's name keeps the legacy parsers (the Symphony "
-            "crate lists each with the reason, passthrough among them), and no name leaves the legacy parsers "
-            "to detect. A request's X-SMG-Parser header overrides the flag for that request.",
+            choices=["symphony"],
+            help=argparse.SUPPRESS,
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l0",
@@ -2667,12 +2659,11 @@ class RouterArgs:
             type=str,
             default=None,
             choices=reasoning_parser_choices,
-            help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3). Under --parser symphony, "
-            "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
-            "flag for the models the registry does not know: a Symphony table's name here (and in "
-            "--tool-call-parser, or here alone) reads them with that table, and so does a legacy parser's "
-            "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
-            "the legacy parsers for them",
+            help="Specify the parser for reasoning models (e.g., deepseek, qwen3): a Symphony table's "
+            "name, or a name a table answers to (an older parser's whose format a table reads, a "
+            "launcher's). A worker's labels decide for its model, else Symphony's registry for a model "
+            "it knows, else this flag (with --tool-call-parser, or alone) for the models the registry "
+            "does not know; a model nothing names is read as plain text",
         )
         tool_call_parser_choices = get_available_tool_call_parsers()
         parser_group.add_argument(
@@ -2680,12 +2671,11 @@ class RouterArgs:
             type=str,
             default=None,
             choices=tool_call_parser_choices,
-            help="Specify the parser for tool-call interactions (e.g., json, qwen). Under --parser symphony, "
-            "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
-            "flag for the models the registry does not know: a Symphony table's name here (and in "
-            "--reasoning-parser, or here alone) reads them with that table, and so does a legacy parser's "
-            "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
-            "the legacy parsers for them",
+            help="Specify the parser for tool-call interactions (e.g., json, qwen): a Symphony table's "
+            "name, or a name a table answers to (an older parser's whose format a table reads, a "
+            "launcher's). A worker's labels decide for its model, else Symphony's registry for a model "
+            "it knows, else this flag (with --reasoning-parser, or alone) for the models the registry "
+            "does not know; a model nothing names is read as plain text",
         )
         parser_group.add_argument(
             f"--{prefix}mcp-config-path",

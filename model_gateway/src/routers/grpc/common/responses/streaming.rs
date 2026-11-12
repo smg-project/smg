@@ -38,7 +38,7 @@ use crate::{
             sse::{SseEncodeError, SseEncoder, SseReceiver, SseSender},
         },
         error,
-        grpc::{context::LoadGuards, harmony::responses::ToolResult, regular::symphony},
+        grpc::{context::LoadGuards, harmony::responses::ToolResult},
     },
 };
 
@@ -1845,17 +1845,10 @@ impl ResponseStreamEventEmitter {
     }
 }
 
-/// The `x-smg-parser` value of the chat answer a Responses stream relays,
-/// which the stream's own answer carries; `None` where no parser read it
-/// (the Harmony path).
-pub(crate) type StreamParser = Option<HeaderValue>;
-
 /// One-shot signal used by streaming `/v1/responses` handlers to avoid
 /// returning HTTP 200 until the first backend request has actually started.
-/// A start brings the [`StreamParser`] of the chat answer that opened the
-/// stream, so the Responses answer built at the barrier names its reader.
-pub(crate) type StreamStartupSender = oneshot::Sender<Result<StreamParser, Response>>;
-pub(crate) type StreamStartupReceiver = oneshot::Receiver<Result<StreamParser, Response>>;
+pub(crate) type StreamStartupSender = oneshot::Sender<Result<(), Response>>;
+pub(crate) type StreamStartupReceiver = oneshot::Receiver<Result<(), Response>>;
 
 pub(crate) fn stream_startup_channel() -> (StreamStartupSender, StreamStartupReceiver) {
     oneshot::channel()
@@ -1864,7 +1857,7 @@ pub(crate) fn stream_startup_channel() -> (StreamStartupSender, StreamStartupRec
 #[must_use]
 pub(crate) fn signal_stream_startup(
     startup: &mut Option<StreamStartupSender>,
-    result: Result<StreamParser, Response>,
+    result: Result<(), Response>,
 ) -> bool {
     let Some(startup) = startup.take() else {
         return true;
@@ -1878,23 +1871,13 @@ pub(crate) async fn await_stream_startup(
     rx: SseReceiver,
 ) -> Response {
     match startup.await {
-        Ok(Ok(parser)) => naming_parser(build_sse_response(rx), parser),
+        Ok(Ok(())) => build_sse_response(rx),
         Ok(Err(response)) => response,
         Err(_) => error::internal_error(
             "responses_stream_startup_failed",
             "Streaming response failed before backend request startup",
         ),
     }
-}
-
-/// `response` naming the parser that read the chat answer it relays, as the
-/// chat route names it in `x-smg-parser`: a client reading a Responses turn
-/// tells the two readers apart as it does on chat. Unchanged where none did.
-pub(crate) fn naming_parser(mut response: Response, parser: StreamParser) -> Response {
-    if let Some(parser) = parser {
-        response.headers_mut().insert(symphony::HEADER, parser);
-    }
-    response
 }
 
 /// Build a Server-Sent Events (SSE) response
@@ -2262,7 +2245,7 @@ mod tests {
         let (_sse_tx, sse_rx) = sse_channel();
         let mut startup = Some(startup_tx);
 
-        assert!(signal_stream_startup(&mut startup, Ok(None)));
+        assert!(signal_stream_startup(&mut startup, Ok(())));
         assert!(startup.is_none());
 
         let response = await_stream_startup(startup_rx, sse_rx).await;
@@ -2273,23 +2256,6 @@ mod tests {
                 "text/event-stream; charset=utf-8"
             ))
         );
-    }
-
-    /// A started stream's answer names the parser the barrier brought, as the
-    /// chat answer it relays does; a start without one names none.
-    #[tokio::test]
-    async fn a_started_stream_names_the_parser_the_barrier_brought() {
-        for parser in [Some(HeaderValue::from_static("symphony")), None] {
-            let (startup_tx, startup_rx) = stream_startup_channel();
-            let (_sse_tx, sse_rx) = sse_channel();
-            let mut startup = Some(startup_tx);
-
-            assert!(signal_stream_startup(&mut startup, Ok(parser.clone())));
-
-            let response = await_stream_startup(startup_rx, sse_rx).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers().get(symphony::HEADER), parser.as_ref());
-        }
     }
 }
 

@@ -16,18 +16,15 @@ use llm_tokenizer::{
     traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
     MockTokenizer,
 };
-use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::{json, Value};
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
-use tool_parser::{ParserFactory as ToolParserFactory, ToolConstraint};
 
 use crate::{
     app_context::AppContext,
-    config::{ParserChoice, PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
+    config::{PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
     policies::PolicyRegistry,
     routers::grpc::context::WorkerSelection,
     worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
@@ -36,19 +33,17 @@ use crate::{
 /// Minimal `AppContext` for constructing a gRPC router in `mode`. Regular and
 /// PD both serve /v1/responses, so the MCP orchestrator must be initialized.
 pub(crate) async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
-    grpc_ctx_with_parsers(mode, ParserChoice::default(), None).await
+    grpc_ctx_with_parsers(mode, None).await
 }
 
-/// [`grpc_ctx`] with the gateway's `--parser` choice and its
-/// `--tool-call-parser` name, which under Symphony pins the table that
-/// answers to it for every model the registry does not know.
+/// [`grpc_ctx`] with the gateway's `--tool-call-parser` name, which pins the
+/// table that answers to it for every model the registry does not know.
 pub(crate) async fn grpc_ctx_with_parsers(
     mode: RoutingMode,
-    parser: ParserChoice,
     tool_parser: Option<&str>,
 ) -> Arc<AppContext> {
     let mcp_orchestrator = mcp_orchestrator().await;
-    let mut builder = grpc_config(mode).parser(parser);
+    let mut builder = grpc_config(mode);
     if let Some(name) = tool_parser {
         builder = builder.tool_call_parser(name);
     }
@@ -98,8 +93,6 @@ pub(crate) fn grpc_ctx_from(
             .router_config(config.clone())
             .client(crate::server::http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
-            .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
-            .tool_parser_factory(Some(ToolParserFactory::new()))
             .worker_registry(Arc::new(WorkerRegistry::new()))
             .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
             .response_storage(Arc::new(MemoryResponseStorage::new()))
@@ -123,29 +116,6 @@ pub(crate) fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
     }
     WorkerSelection::Single {
         worker: Arc::new(builder.build()),
-    }
-}
-
-/// The forced call a thinking prompt takes under `parser`: the constraint's
-/// kind and the structural tag the registry builds for one `get_weather` tool
-/// under `tool_choice: required`, with the reasoning prefix armed.
-pub(crate) fn forced_call_on_a_thinking_prompt(
-    factory: &ToolParserFactory,
-    parser: &str,
-) -> (String, String) {
-    let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
-        "type": "function",
-        "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
-    }]))
-    .unwrap();
-    let required = ToolChoice::Value(ToolChoiceValue::Required);
-    match factory
-        .registry()
-        .generate_tool_constraint(Some(parser), &tools, &required, true)
-        .unwrap()
-    {
-        Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
-        other => panic!("expected a structural tag, got {other:?}"),
     }
 }
 

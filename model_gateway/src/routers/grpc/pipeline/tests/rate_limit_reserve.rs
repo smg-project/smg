@@ -41,13 +41,10 @@ async fn test_components() -> Arc<SharedComponents> {
         templates: Arc::new(Templates::new(tokenizer_registry.clone())),
         tokenizer_registry,
         worker_registry,
-        tool_parser_factory: ToolParserFactory::default(),
-        reasoning_parser_factory: ReasoningParserFactory::default(),
         parser_resolver: utils::ParserResolver::disabled(),
         multimodal: None,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: ParserChoice::Legacy,
     })
 }
 

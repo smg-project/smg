@@ -239,8 +239,6 @@ mod tests {
                 .client(crate::server::http_client())
                 .rate_limiter(None)
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
-                .reasoning_parser_factory(None)
-                .tool_parser_factory(None)
                 .worker_registry(Arc::new(WorkerRegistry::new()))
                 .policy_registry(Arc::new(PolicyRegistry::new(router_config.policy.clone())))
                 .router_config(router_config)

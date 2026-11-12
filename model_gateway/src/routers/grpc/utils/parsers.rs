@@ -1,4 +1,5 @@
-//! Reasoning and tool parser helpers.
+//! Reasoning and tool parser helpers: the parser names set for a model, apart by who set them,
+//! the worker-side decoding facts the constraint reads, and the thinking switch.
 
 use std::sync::Arc;
 
@@ -13,140 +14,57 @@ use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
     profile::ProviderProfile,
-    worker::ConstrainedDecoding,
+    worker::{ConstrainedDecoding, GrammarStart},
 };
-use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
-use tool_parser::{
-    GrammarStart, ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
-};
-use tracing::warn;
 
 use crate::{
     routers::grpc::context::WorkerSelection,
     worker::{Worker, WorkerRegistry, WorkerType},
 };
 
-/// Per-request parser-name resolution.
+/// Per-request parser-name resolution: the names set for a model, apart by who set them, the
+/// model's cards (`tool_parser` / `reasoning_parser`, populated from worker labels or an explicit
+/// `WorkerSpec` card) and the gateway's `--tool-call-parser` and `--reasoning-parser`. Symphony
+/// reads them in that order with its registry between (`regular::symphony::names::reads`).
 ///
-/// For the legacy parsers, each kind's name is the model's `ModelCard`
-/// override (`tool_parser` / `reasoning_parser`, populated from worker labels
-/// or an explicit `WorkerSpec` card) → the process-wide configured name
-/// (`--tool-call-parser` / `--reasoning-parser`), when a legacy parser of the
-/// kind has it ([`Self::new`] asks the two registries once: under `--parser
-/// symphony` a flag may name a Symphony table or the response template, which
-/// no legacy parser reads) → `None`, which lets the factory helpers fall back
-/// to their name-based auto-detection, unchanged. Symphony takes the two
-/// sources apart (`names_among`), the flags as set, with its registry
-/// between them (`regular::symphony::names::reads`).
-///
-/// Lookups borrow straight from worker metadata (no card clones); only the
-/// resolved name is cloned.
+/// Lookups borrow straight from worker metadata (no card clones); only the resolved name is
+/// cloned.
 #[derive(Clone)]
 pub struct ParserResolver {
     /// `None` disables card lookups (parser-free endpoints, tests).
     worker_registry: Option<Arc<WorkerRegistry>>,
     /// The gateway's `--tool-call-parser` and `--reasoning-parser`.
     flags: Names,
-    /// The flags as the legacy parsers take them: each kind's when a legacy
-    /// parser of the kind has the name ([`Self::new`]); the flags themselves
-    /// for the tests' `with_flags`.
-    legacy_flags: Names,
 }
 
 impl ParserResolver {
-    /// The gateway's resolver: `worker_registry` for the cards, the configured
-    /// names, and the two legacy registries, asked once which of the
-    /// configured names they have. Under `--parser symphony` a flag may name a
-    /// Symphony table or the response template, which select for Symphony and
-    /// are nothing to the legacy parsers; handed such a name (by a request
-    /// Symphony leaves to them: a worker labeled `passthrough` alone, or the
-    /// `X-SMG-Parser: legacy` header), the legacy tool side would not parse at
-    /// all, since its availability check asks the registry for the exact name
-    /// and never falls back to the model (the calls come back as content), and
-    /// the reasoning side would warn on every request and detect from the
-    /// model anyway. So such a name is dropped here, once, and the legacy
-    /// parsers' own detection reads the model. Under `--parser legacy` the
-    /// startup check refuses such a flag, so the flags pass whole.
+    /// The gateway's resolver: `worker_registry` for the cards, and the configured names.
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
-        tools: &ToolParserFactory,
-        reasoning: &ReasoningParserFactory,
     ) -> Self {
-        let flags = Names {
-            tool: configured_tool_parser,
-            reasoning: configured_reasoning_parser,
-        };
-        let legacy_flags = Names {
-            tool: flags.tool.clone().filter(|name| tools.has_parser(name)),
-            reasoning: flags
-                .reasoning
-                .clone()
-                .filter(|name| reasoning.registry().has_parser(name)),
-        };
         Self {
             worker_registry: Some(worker_registry),
-            flags,
-            legacy_flags,
+            flags: Names {
+                tool: configured_tool_parser,
+                reasoning: configured_reasoning_parser,
+            },
         }
     }
 
-    /// A resolver whose configured names pass to the legacy parsers whole, the
-    /// registries unasked: for tests, whose names are the legacy parsers' own,
-    /// or which assert Symphony's view of the flags ([`Self::names`]).
+    /// A resolver over no registry and no flags, for the tests' components: it reads no card
+    /// and names nothing, so every model is read as the registry decides.
     #[cfg(test)]
-    pub(crate) fn with_flags(
-        worker_registry: Arc<WorkerRegistry>,
-        configured_tool_parser: Option<String>,
-        configured_reasoning_parser: Option<String>,
-    ) -> Self {
-        let flags = Names {
-            tool: configured_tool_parser,
-            reasoning: configured_reasoning_parser,
-        };
-        Self {
-            worker_registry: Some(worker_registry),
-            legacy_flags: flags.clone(),
-            flags,
-        }
-    }
-
-    /// Resolver that never consults model cards and carries no configured
-    /// names — preserves the parser-free endpoints' behavior.
     pub(crate) fn disabled() -> Self {
         Self {
             worker_registry: None,
             flags: Names::default(),
-            legacy_flags: Names::default(),
         }
     }
 
-    /// Effective tool-parser name for `model`, if any.
-    pub fn tool_parser(&self, model: &str) -> Option<String> {
-        self.card_name(model, ParserKind::Tool)
-            .or_else(|| self.legacy_flags.tool.clone())
-    }
-
-    /// Effective reasoning-parser name for `model`, if any.
-    pub fn reasoning_parser(&self, model: &str) -> Option<String> {
-        self.card_name(model, ParserKind::Reasoning)
-            .or_else(|| self.legacy_flags.reasoning.clone())
-    }
-
-    /// The tool-call parser's name as the legacy parsers take it for a request
-    /// whose names are `names`: the labels', else the flags' when a legacy
-    /// parser has it ([`Self::tool_parser`] without another card lookup).
-    pub(crate) fn legacy_tool<'a>(&'a self, names: &'a ModelNames<'_>) -> Option<&'a str> {
-        names
-            .labels
-            .tool
-            .as_deref()
-            .or(self.legacy_flags.tool.as_deref())
-    }
-
-    /// [`Self::names_among`] over this resolver's own registry walk, for the
+    /// `names_among` over this resolver's own registry walk, for the
     /// tests: a request's readers take the names its preparation resolved
     /// ([`Self::names_for`]) or read them among the workers the stage holds.
     #[cfg(test)]
@@ -161,10 +79,7 @@ impl ParserResolver {
     /// (its workers' labels), read among `workers`, the model's workers a
     /// stage already holds, with no registry walk of this resolver's own; and
     /// the gateway's flags as set. Symphony reads them in that order with its
-    /// registry between (`regular::symphony::names::reads`); the legacy
-    /// parsers take each kind's first, from the flags only a name they read
-    /// ([`Self::tool_parser`], [`Self::reasoning_parser`],
-    /// [`Self::legacy_tool`]).
+    /// registry between (`regular::symphony::names::reads`).
     pub(crate) fn names_among(&self, workers: &[Arc<dyn Worker>], model: &str) -> ModelNames<'_> {
         ModelNames {
             labels: if self.worker_registry.is_some() {
@@ -176,41 +91,13 @@ impl ParserResolver {
         }
     }
 
-    /// [`Self::names_among`] for a request whose preparation resolved the card names once
+    /// `names_among` for a request whose preparation resolved the card names once
     /// (`ProcessingState::parser_names`): `resolved` as they were then, with the flags, and no
     /// second walk over the model's workers; `None` resolves them now, over the registry's walk.
-    pub(crate) fn names_for(&self, resolved: Option<&Names>, model: &str) -> ModelNames<'_> {
+    pub fn names_for(&self, resolved: Option<&Names>, model: &str) -> ModelNames<'_> {
         ModelNames {
             labels: resolved.map_or_else(|| self.card_names(model), Names::clone),
             flags: &self.flags,
-        }
-    }
-
-    /// [`Self::tool_parser`] for a request whose card names were resolved once
-    /// ([`Self::names_for`]).
-    pub(crate) fn tool_parser_for(&self, resolved: Option<&Names>, model: &str) -> Option<String> {
-        match resolved {
-            Some(names) => names
-                .tool
-                .clone()
-                .or_else(|| self.legacy_flags.tool.clone()),
-            None => self.tool_parser(model),
-        }
-    }
-
-    /// [`Self::reasoning_parser`] for a request whose card names were resolved once
-    /// ([`Self::names_for`]).
-    pub(crate) fn reasoning_parser_for(
-        &self,
-        resolved: Option<&Names>,
-        model: &str,
-    ) -> Option<String> {
-        match resolved {
-            Some(names) => names
-                .reasoning
-                .clone()
-                .or_else(|| self.legacy_flags.reasoning.clone()),
-            None => self.reasoning_parser(model),
         }
     }
 
@@ -222,15 +109,6 @@ impl ParserResolver {
             .map_or_else(Names::default, |registry| {
                 Self::card_names_among(&registry.get_by_model(model), model)
             })
-    }
-
-    /// One kind's name among `model`'s cards, for a reader that asks for one
-    /// kind: the same walk and the same conflict rule as [`Self::card_names`],
-    /// cloning only the name asked for.
-    fn card_name(&self, model: &str, kind: ParserKind) -> Option<String> {
-        self.worker_registry
-            .as_ref()
-            .and_then(|registry| Self::card_name_among(&registry.get_by_model(model), model, kind))
     }
 
     /// Both names `model`'s cards set among `workers`, in one walk. Cards
@@ -254,22 +132,26 @@ impl ParserResolver {
             reasoning: reasoning.chosen(model, ParserKind::Reasoning.label()),
         }
     }
+}
 
-    /// [`Self::card_names_among`] for one kind: the one pick over the same
-    /// walk, so a single reader clones nothing it did not ask for.
-    fn card_name_among(
-        workers: &[Arc<dyn Worker>],
-        model: &str,
-        kind: ParserKind,
-    ) -> Option<String> {
-        let mut pick = CardPick::default();
-        for worker in workers {
-            let Some(card) = worker.metadata().spec.models.find(model) else {
-                continue;
-            };
-            pick.offer(kind.of(card));
-        }
-        pick.chosen(model, kind.label())
+/// The names the cards of `card`'s model set once the worker that carries `card` has joined
+/// `workers`, the model's registered workers: what a request of the model then reads, since it
+/// reads the names among every worker of the model, whatever its wire
+/// ([`ParserResolver::names_among`], by the same pick). For the registration step, which speaks
+/// before the worker is in the registry.
+pub(crate) fn card_names_with(workers: &[Arc<dyn Worker>], card: &ModelCard) -> Names {
+    let mut tool = CardPick::default();
+    let mut reasoning = CardPick::default();
+    let registered = workers
+        .iter()
+        .filter_map(|worker| worker.metadata().spec.models.find(&card.id));
+    for card in registered.chain(std::iter::once(card)) {
+        tool.offer(ParserKind::Tool.of(card));
+        reasoning.offer(ParserKind::Reasoning.of(card));
+    }
+    Names {
+        tool: tool.chosen(&card.id, ParserKind::Tool.label()),
+        reasoning: reasoning.chosen(&card.id, ParserKind::Reasoning.label()),
     }
 }
 
@@ -342,7 +224,7 @@ impl<'a> CardPick<'a> {
 /// or the operator's card for it) or the gateway's `--tool-call-parser` and `--reasoning-parser`
 /// flags, which every model shares; [`ModelNames`] holds a model's two.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Names {
+pub struct Names {
     pub tool: Option<String>,
     pub reasoning: Option<String>,
 }
@@ -353,15 +235,14 @@ static NO_NAMES: Names = Names {
     reasoning: None,
 };
 
-/// The parser names set for one model, apart by who set them ([`ParserResolver::names_among`]): the
+/// The parser names set for one model, apart by who set them (`ParserResolver::names_among`): the
 /// names of its card, which its workers' labels (or the operator's card) set for the one model,
 /// and the gateway's flags, which every model shares. Symphony reads the two in that order with
 /// its registry between them (`regular::symphony::names::reads`): the card's names when they select
-/// anything, else the registry's table for a model it knows, else the flags; the legacy parsers
-/// take each kind's first name, from the flags only one a legacy parser of the kind has
-/// ([`ParserResolver::tool_parser`], [`ParserResolver::legacy_tool`]).
+/// anything, else the registry's table for a model it knows, else the flags, else the `plain`
+/// table.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModelNames<'a> {
+pub struct ModelNames<'a> {
     pub labels: Names,
     pub flags: &'a Names,
 }
@@ -688,12 +569,6 @@ pub fn messages_reasoning_starts_in_prefill_for(
     )
 }
 
-/// Where the selected worker's engine starts a request's grammar on a prompt
-/// that ends inside the model's thinking block ([`WorkerDecoding::start`]).
-pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
-    WorkerDecoding::of(workers).start
-}
-
 /// The selected worker's constrained decoding; under PD the decode worker's,
 /// whose engine generates the tokens the grammar constrains. Request building
 /// decides a request's constraint on it (`regular::symphony::worker_constraint`).
@@ -762,41 +637,6 @@ impl WorkerDecoding {
             && other.takes_the_whole_turn() == self.takes_the_whole_turn()
             && (!self.takes_the_whole_turn() || other.vocabulary == self.vocabulary)
     }
-}
-
-/// The request's tool constraint, shaped for the worker that will run it. A
-/// forced call's structural tag built on a thinking prompt opens with free
-/// text that fits either kind of engine (`ParserRegistry::generate_tool_constraint`);
-/// once the worker is known it takes the one shape its engine needs
-/// (`ParserRegistry::structural_tag_for_grammar_start`): the bare calls for an
-/// engine that starts the grammar after its reasoning parser's gate, so the
-/// call is forced right there as the engine's own server does, the thought
-/// block and then the calls for an engine that starts it at the first token.
-/// A worker that does not say, a JSON-schema constraint and a tag without the
-/// prefix pass through unchanged. The flag beside the constraint says the
-/// shaping led the tag with the thought block for an engine that starts the
-/// grammar at the first token: the engine's request then says the grammar
-/// starts there whatever reasoning parser the engine runs
-/// (`ProtoGenerateRequest::set_grammar_from_first_token`); a constraint that
-/// passed through unchanged starts where the engine does.
-pub fn tool_constraints_for_worker(
-    tool_parser_factory: &ToolParserFactory,
-    configured_parser: Option<&str>,
-    tool_constraints: Option<(String, String)>,
-    workers: Option<&WorkerSelection>,
-) -> Result<(Option<(String, String)>, bool), String> {
-    let Some((kind, value)) = tool_constraints else {
-        return Ok((None, false));
-    };
-    if kind != "structural_tag" {
-        return Ok((Some((kind, value)), false));
-    }
-    let start = grammar_start_for(workers);
-    let shaped = tool_parser_factory
-        .registry()
-        .structural_tag_for_grammar_start(configured_parser, &value, start)?;
-    let first_token = shaped.is_some() && start == GrammarStart::FirstToken;
-    Ok((Some((kind, shaped.unwrap_or(value))), first_token))
 }
 
 /// Resolve the user's effective thinking preference: the answer of a
@@ -881,135 +721,6 @@ fn rendered_thinking_mode(
     tokenizer.native_thinking_mode(Some(&as_rendered), template_thinking)
 }
 
-/// Check if a reasoning parser is available for the given model
-pub(crate) fn check_reasoning_parser_availability(
-    reasoning_parser_factory: &ReasoningParserFactory,
-    configured_parser: Option<&str>,
-    model: &str,
-) -> bool {
-    create_reasoning_parser(reasoning_parser_factory, configured_parser, model).is_some()
-}
-
-/// Check if a tool parser is available for the given model
-pub(crate) fn check_tool_parser_availability(
-    tool_parser_factory: &ToolParserFactory,
-    configured_parser: Option<&str>,
-    model: &str,
-) -> bool {
-    if let Some(parser_name) = configured_parser {
-        tool_parser_factory.registry().has_parser(parser_name)
-    } else {
-        tool_parser_factory.registry().has_parser_for_model(model)
-    }
-}
-
-/// Create a fresh reasoning parser instance.
-///
-/// Used for both streaming (state isolation across chunks) and non-streaming
-/// (avoids serializing on the shared pooled parser mutex).
-pub(crate) fn create_reasoning_parser(
-    reasoning_parser_factory: &ReasoningParserFactory,
-    configured_parser: Option<&str>,
-    model: &str,
-) -> Option<Box<dyn ReasoningParser>> {
-    if let Some(parser_name) = configured_parser {
-        // Use configured parser if specified
-        reasoning_parser_factory
-            .registry()
-            .create_parser(parser_name)
-            .or_else(|| {
-                warn!(
-                    "Configured reasoning parser '{}' not found, falling back to model-based selection",
-                    parser_name
-                );
-                reasoning_parser_factory.registry().create_for_model(model)
-            })
-    } else {
-        // Auto-detect based on model
-        reasoning_parser_factory.registry().create_for_model(model)
-    }
-}
-
-/// Native Gemma4 channels derive their initial state from the rendered prompt,
-/// using the same explicit, automatic or fallback parser selection as responses.
-pub(crate) fn rendered_prompt_reasoning_in_prefill(
-    reasoning_parser_factory: &ReasoningParserFactory,
-    configured_parser: Option<&str>,
-    model: &str,
-    prompt: &str,
-) -> Option<bool> {
-    create_reasoning_parser(reasoning_parser_factory, configured_parser, model)
-        .filter(|parser| parser.model_type() == "gemma4")
-        .map(|_| reasoning_parser::parsers::Gemma4Parser::prompt_ends_in_reasoning(prompt))
-}
-
-/// Whether the selected reasoning parser needs tokenizer special tokens to be
-/// preserved in decoded output.
-pub(crate) fn reasoning_parser_requires_special_tokens(
-    reasoning_parser_factory: &ReasoningParserFactory,
-    configured_parser: Option<&str>,
-    model: &str,
-) -> bool {
-    create_reasoning_parser(reasoning_parser_factory, configured_parser, model).is_some_and(
-        |parser| {
-            let parser_ref: &dyn ReasoningParser = parser.as_ref();
-            parser_ref.requires_special_tokens()
-        },
-    )
-}
-
-/// Get the appropriate tool parser for a model
-///
-/// If a parser name is explicitly configured, use that parser.
-/// Otherwise, auto-detect based on the model name.
-/// Get a pooled tool parser (for non-streaming where state doesn't matter)
-pub(crate) fn get_tool_parser(
-    tool_parser_factory: &ToolParserFactory,
-    configured_parser: Option<&str>,
-    model: &str,
-) -> ToolPooledParser {
-    if let Some(parser_name) = configured_parser {
-        // Use configured parser if specified
-        tool_parser_factory
-            .registry()
-            .get_pooled_parser(parser_name)
-            .unwrap_or_else(|| {
-                warn!(
-                    "Configured tool parser '{}' not found, falling back to model-based selection",
-                    parser_name
-                );
-                tool_parser_factory.get_pooled(model)
-            })
-    } else {
-        // Auto-detect based on model
-        tool_parser_factory.get_pooled(model)
-    }
-}
-
-/// Create a fresh tool parser instance (for streaming where state isolation is needed)
-pub(crate) fn create_tool_parser(
-    tool_parser_factory: &ToolParserFactory,
-    configured_parser: Option<&str>,
-    model: &str,
-) -> Option<Box<dyn ToolParser>> {
-    if let Some(parser_name) = configured_parser {
-        // Use configured parser if specified
-        tool_parser_factory
-            .registry()
-            .create_parser(parser_name)
-            .or_else(|| {
-                warn!(
-                    "Configured tool parser '{}' not found, falling back to model-based selection",
-                    parser_name
-                );
-                tool_parser_factory.registry().create_for_model(model)
-            })
-    } else {
-        // Auto-detect based on model
-        tool_parser_factory.registry().create_for_model(model)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1019,15 +730,11 @@ mod tests {
     use super::*;
     use crate::{
         routers::grpc::{
-            testing::{forced_call_on_a_thinking_prompt, worker},
+            testing::worker,
             utils::{chat_utils, message_utils},
         },
         worker::{BasicWorkerBuilder, WorkerType},
     };
-
-    /// A parser that registers a reasoning prefix, so a forced call on a
-    /// thinking prompt takes the shape the worker's engine needs.
-    const PARSER: &str = "glm47_moe";
 
     /// The worker's constrained-decoding policy comes off its spec first, then
     /// its `constrained_decoding` label; the decode worker's under PD; a
@@ -1171,114 +878,6 @@ mod tests {
             }))
             .vocabulary,
             TagVocabulary::Current
-        );
-    }
-
-    /// The worker's `constrained_decoding_start` label names where its engine
-    /// starts the grammar; no selection, no label or another value is unknown.
-    #[test]
-    fn grammar_start_comes_from_the_workers_label() {
-        assert_eq!(grammar_start_for(None), GrammarStart::Unknown);
-        assert_eq!(grammar_start_for(Some(&worker(&[]))), GrammarStart::Unknown);
-        assert_eq!(
-            grammar_start_for(Some(&worker(&[(
-                "constrained_decoding_start",
-                "after_reasoning"
-            )]))),
-            GrammarStart::AfterReasoning
-        );
-        assert_eq!(
-            grammar_start_for(Some(&worker(&[(
-                "constrained_decoding_start",
-                "first_token"
-            )]))),
-            GrammarStart::FirstToken
-        );
-        assert_eq!(
-            grammar_start_for(Some(&worker(&[("constrained_decoding_start", "later")]))),
-            GrammarStart::Unknown
-        );
-    }
-
-    /// A forced call's tag on a thinking prompt takes the shape the selected
-    /// worker's engine needs: the bare calls behind a reasoning parser's gate,
-    /// the thought block then the calls from the first token, and the
-    /// free-text prefix it was built with where the worker does not say.
-    #[test]
-    fn tool_constraints_take_the_shape_the_workers_engine_needs() {
-        let factory = ToolParserFactory::new();
-        let parser = Some(PARSER);
-        let built = forced_call_on_a_thinking_prompt(&factory, PARSER);
-        let built_tag: Value = serde_json::from_str(&built.1).unwrap();
-        assert_eq!(built_tag["format"]["type"], "sequence");
-
-        let shape = |labels: &[(&str, &str)]| -> (Value, bool) {
-            let (shaped, first_token) = tool_constraints_for_worker(
-                &factory,
-                parser,
-                Some(built.clone()),
-                Some(&worker(labels)),
-            )
-            .unwrap();
-            let (kind, value) = shaped.expect("the constraint stays");
-            assert_eq!(kind, "structural_tag");
-            (serde_json::from_str(&value).unwrap(), first_token)
-        };
-        let (deferred, led) = shape(&[("constrained_decoding_start", "after_reasoning")]);
-        assert!(!led, "nothing led the bare calls");
-        assert_eq!(
-            deferred["format"]["type"], "triggered_tags",
-            "nothing precedes the calls: {deferred}"
-        );
-        assert_eq!(deferred["format"]["at_least_one"], true);
-        let (first_token, led) = shape(&[("constrained_decoding_start", "first_token")]);
-        assert!(led, "the thought block led the calls for the first token");
-        assert_eq!(first_token["format"]["type"], "sequence");
-        assert_eq!(first_token["format"]["elements"][0]["type"], "tag");
-        assert_eq!(first_token["format"]["elements"][0]["end"], "</think>");
-        assert_eq!(
-            first_token["format"]["elements"][1],
-            built_tag["format"]["elements"][1]
-        );
-        assert_eq!(
-            shape(&[]),
-            (built_tag, false),
-            "a worker that does not say keeps the shape that fits both"
-        );
-
-        // A parser without a reasoning prefix leaves the tag as built, on any
-        // start: nothing led it, so it starts where the engine does.
-        assert_eq!(
-            tool_constraints_for_worker(
-                &factory,
-                Some("mistral"),
-                Some(built.clone()),
-                Some(&worker(&[("constrained_decoding_start", "first_token")]))
-            )
-            .unwrap(),
-            (Some(built.clone()), false),
-            "a parser without a prefix leads nothing"
-        );
-        // Nothing else is touched: no selection, a JSON-schema constraint, no constraint.
-        assert_eq!(
-            tool_constraints_for_worker(&factory, parser, Some(built.clone()), None).unwrap(),
-            (Some(built.clone()), false)
-        );
-        let schema = ("json_schema".to_string(), "{}".to_string());
-        assert_eq!(
-            tool_constraints_for_worker(
-                &factory,
-                parser,
-                Some(schema.clone()),
-                Some(&worker(&[("constrained_decoding_start", "first_token")]))
-            )
-            .unwrap(),
-            (Some(schema), false),
-            "a schema is not led: it starts where the engine does"
-        );
-        assert_eq!(
-            tool_constraints_for_worker(&factory, parser, None, Some(&worker(&[]))).unwrap(),
-            (None, false)
         );
     }
 
@@ -1719,25 +1318,10 @@ mod tests {
         tokenizer
     }
 
-    /// The reasoning and the answer a fresh qwen3 parser, armed or not, finds
-    /// in a completion that closes its reasoning and then answers.
-    fn reasoning_and_answer(armed: bool) -> (String, String) {
-        let factory = ReasoningParserFactory::new();
-        let mut parser =
-            create_reasoning_parser(&factory, Some("qwen3"), "m").expect("qwen3 parser");
-        if armed {
-            parser.mark_reasoning_started();
-        }
-        let parsed = parser
-            .detect_and_parse_reasoning(" check.</think>Done")
-            .expect("parsed");
-        (parsed.reasoning_text, parsed.normal_text)
-    }
-
     /// Where the template cannot continue a Messages prefill, the prompt ends
-    /// inside the `<think>` its generation prompt opens. The parser is armed
+    /// inside the `<think>` its generation prompt opens. The reader is armed
     /// from the rendered prompt, not from the request asking to continue, so
-    /// the completion's reasoning is parsed as reasoning.
+    /// the completion's reasoning is read as reasoning.
     #[test]
     fn messages_continuation_after_a_thinking_generation_prompt_arms() {
         let tokenizer = thinking_prompt_tokenizer();
@@ -1767,10 +1351,7 @@ mod tests {
             processed.continued_final_message,
             &tokenizer,
         );
-        assert_eq!(
-            reasoning_and_answer(armed),
-            (" check.".to_string(), "Done".to_string())
-        );
+        assert!(armed, "the prompt's open thought arms the reader");
     }
 
     /// The same for a chat `continue_final_message`.
@@ -1802,10 +1383,7 @@ mod tests {
             processed.continued_final_message,
             &tokenizer,
         );
-        assert_eq!(
-            reasoning_and_answer(armed),
-            (" check.".to_string(), "Done".to_string())
-        );
+        assert!(armed, "the prompt's open thought arms the reader");
     }
 
     /// Typed toggle: below an explicit kwargs toggle and a native effort, above the OpenAI mapping.
@@ -2211,108 +1789,6 @@ mod tests {
         );
         assert_eq!(extract_thinking_from_kwargs(None, None, &tok), None);
     }
-
-    #[test]
-    fn create_reasoning_parser_returns_independent_instances() {
-        let factory = ReasoningParserFactory::new();
-
-        // qwen3 starts with in_reasoning=false (explicit <think> required).
-        let mut a =
-            create_reasoning_parser(&factory, None, "qwen3").expect("qwen3 has a reasoning parser");
-        let mut b =
-            create_reasoning_parser(&factory, None, "qwen3").expect("qwen3 has a reasoning parser");
-
-        // Each call returns an independent instance: state mutated on one parser
-        // must not leak into the other (the shared pooled parser the non-streaming
-        // path used to take would have violated this).
-        a.mark_reasoning_started();
-        assert!(a.is_in_reasoning());
-        assert!(!b.is_in_reasoning());
-
-        // The untouched instance still parses a full document correctly.
-        let rb = b
-            .detect_and_parse_reasoning("<think>reasoning</think>answer")
-            .unwrap();
-        assert_eq!(rb.normal_text, "answer");
-        assert_eq!(rb.reasoning_text, "reasoning");
-    }
-
-    #[test]
-    fn create_reasoning_parser_honors_configured_parser() {
-        let factory = ReasoningParserFactory::new();
-
-        let parser = create_reasoning_parser(&factory, Some("qwen3"), "unknown-model")
-            .expect("configured qwen3 parser exists");
-        assert_eq!(parser.model_type(), "qwen3");
-        assert!(check_reasoning_parser_availability(
-            &factory,
-            Some("qwen3"),
-            "unknown-model",
-        ));
-        for configured in [None, Some("unknown-parser")] {
-            assert!(!check_reasoning_parser_availability(
-                &factory,
-                configured,
-                "unknown-model",
-            ));
-        }
-    }
-
-    #[test]
-    fn gemma4_rendered_prompt_state_follows_actual_parser_selection() {
-        let factory = ReasoningParserFactory::new();
-        for configured in [Some("gemma4"), None, Some("unknown-parser")] {
-            assert!(check_reasoning_parser_availability(
-                &factory,
-                configured,
-                "google/gemma-4-serve",
-            ));
-            for (prompt, expected) in [
-                ("<|im_start|>model\n", false),
-                ("<|im_start|>model<|channel>thought\n", true),
-                ("<|im_start|>model<|channel>thought\nplan<channel|>", false),
-            ] {
-                assert_eq!(
-                    rendered_prompt_reasoning_in_prefill(
-                        &factory,
-                        configured,
-                        "google/gemma-4-serve",
-                        prompt,
-                    ),
-                    Some(expected),
-                    "configured={configured:?}, prompt={prompt:?}"
-                );
-            }
-        }
-        // A valid override wins over the model; other models keep their defaults.
-        for (configured, model) in [(Some("qwen3"), "gemma-4"), (None, "qwen3")] {
-            assert_eq!(
-                rendered_prompt_reasoning_in_prefill(
-                    &factory,
-                    configured,
-                    model,
-                    "<|channel>thought\n",
-                ),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn inkling_parser_requires_special_tokens() {
-        let factory = ReasoningParserFactory::new();
-
-        assert!(reasoning_parser_requires_special_tokens(
-            &factory,
-            Some("inkling"),
-            "served-model"
-        ));
-        assert!(!reasoning_parser_requires_special_tokens(
-            &factory,
-            Some("qwen3"),
-            "served-model"
-        ));
-    }
 }
 
 #[cfg(test)]
@@ -2333,14 +1809,13 @@ mod parser_resolver_tests {
     }
 
     /// A request's card names, resolved once in preparation, are what the later reads take: the
-    /// names as resolved then with the legacy flags behind them, and no second walk over the
-    /// model's workers (a card registered after the resolution does not move them); a read with
-    /// nothing resolved walks the cards as before.
+    /// names as resolved then with the flags beside them, and no second walk over the model's
+    /// workers (a card registered after the resolution does not move them); a read with nothing
+    /// resolved walks the cards as before.
     #[test]
     fn names_resolved_once_are_read_in_place_of_the_cards() {
         let registry = registry_with_card(ModelCard::new("m").with_tool_parser("json"));
-        let resolver =
-            ParserResolver::with_flags(Arc::clone(&registry), None, Some("qwen3".to_string()));
+        let resolver = ParserResolver::new(Arc::clone(&registry), None, Some("qwen3".to_string()));
         let resolved = resolver.names("m").labels;
         assert_eq!(resolved.tool.as_deref(), Some("json"));
         let later = BasicWorkerBuilder::new("http://w2:8000")
@@ -2352,75 +1827,49 @@ mod parser_resolver_tests {
         assert_eq!(read.labels, resolved);
         assert_eq!(read.flags, &resolver.flags);
         assert_eq!(
-            resolver.tool_parser_for(Some(&resolved), "m").as_deref(),
-            Some("json")
-        );
-        assert_eq!(
-            resolver
-                .reasoning_parser_for(Some(&resolved), "m")
-                .as_deref(),
-            Some("qwen3")
-        );
-        assert_eq!(
             resolver.names_for(None, "m").labels.tool.as_deref(),
             Some("alpha")
         );
-        assert_eq!(
-            resolver.tool_parser_for(None, "m").as_deref(),
-            Some("alpha")
-        );
-        assert_eq!(
-            resolver.reasoning_parser_for(None, "m").as_deref(),
-            Some("qwen3")
-        );
     }
 
+    /// The names a model's cards set are its labels, each kind on its own, and the flags stand
+    /// beside them as given, for a model with a card and for one without; a resolver over no
+    /// registry reads no card.
     #[test]
-    fn card_override_wins_over_configured() {
+    fn the_cards_names_are_the_labels_and_the_flags_stand_beside_them() {
         let registry = registry_with_card(
             ModelCard::new("m")
                 .with_tool_parser("json")
                 .with_reasoning_parser("basic"),
         );
-        let resolver = ParserResolver::with_flags(
+        let resolver = ParserResolver::new(
             registry,
             Some("mistral".to_string()),
-            Some("deepseek_r1".to_string()),
+            Some("deepseek".to_string()),
         );
-        assert_eq!(resolver.tool_parser("m").as_deref(), Some("json"));
-        assert_eq!(resolver.reasoning_parser("m").as_deref(), Some("basic"));
-    }
-
-    #[test]
-    fn falls_back_to_configured_without_card_override() {
-        let registry = registry_with_card(ModelCard::new("m"));
-        let resolver = ParserResolver::with_flags(
-            registry,
-            Some("mistral".to_string()),
-            Some("deepseek_r1".to_string()),
-        );
-        assert_eq!(resolver.tool_parser("m").as_deref(), Some("mistral"));
+        let names = resolver.names("m");
         assert_eq!(
-            resolver.reasoning_parser("m").as_deref(),
-            Some("deepseek_r1")
+            names.labels,
+            Names {
+                tool: Some("json".to_string()),
+                reasoning: Some("basic".to_string()),
+            }
         );
-        // Unknown model: no card, same configured fallback.
-        assert_eq!(resolver.tool_parser("other").as_deref(), Some("mistral"));
-    }
-
-    #[test]
-    fn no_override_and_no_configured_resolves_none() {
-        let registry = registry_with_card(ModelCard::new("m"));
-        let resolver = ParserResolver::with_flags(registry, None, None);
-        assert_eq!(resolver.tool_parser("m"), None);
-        assert_eq!(resolver.reasoning_parser("m"), None);
-    }
-
-    #[test]
-    fn disabled_resolver_never_resolves() {
-        let resolver = ParserResolver::disabled();
-        assert_eq!(resolver.tool_parser("m"), None);
-        assert_eq!(resolver.reasoning_parser("m"), None);
+        assert_eq!(
+            names.flags,
+            &Names {
+                tool: Some("mistral".to_string()),
+                reasoning: Some("deepseek".to_string()),
+            }
+        );
+        // No card for the model: no labels, the same flags.
+        let other = resolver.names("other");
+        assert_eq!(other.labels, Names::default());
+        assert_eq!(other.flags, names.flags);
+        // A card that sets one kind leaves the other unset.
+        let one = ParserResolver::new(registry_with_card(ModelCard::new("m")), None, None);
+        assert_eq!(one.names("m"), ModelNames::default());
+        assert_eq!(ParserResolver::disabled().names("m"), ModelNames::default());
     }
 
     /// The reading stage holds the model's workers already: the names read among them are the
@@ -2446,8 +1895,7 @@ mod parser_resolver_tests {
                 .build();
             registry.register(Arc::new(worker));
         }
-        let resolver =
-            ParserResolver::with_flags(Arc::clone(&registry), None, Some("flag".to_string()));
+        let resolver = ParserResolver::new(Arc::clone(&registry), None, Some("flag".to_string()));
         let workers = registry.get_by_model("m");
         let among = resolver.names_among(&workers, "m");
         assert_eq!(among, resolver.names("m"));
@@ -2484,7 +1932,7 @@ mod parser_resolver_tests {
     #[test]
     fn conflicting_overrides_resolve_deterministically() {
         // Two same-model workers with different overrides: resolution must
-        // not depend on registration/iteration order — the lexicographically
+        // not depend on registration/iteration order: the lexicographically
         // smallest name wins either way.
         for (first, second) in [("zebra", "alpha"), ("alpha", "zebra")] {
             let registry = Arc::new(WorkerRegistry::new());
@@ -2495,62 +1943,9 @@ mod parser_resolver_tests {
                     .build();
                 registry.register(Arc::new(worker));
             }
-            let resolver = ParserResolver::with_flags(registry, None, None);
-            assert_eq!(resolver.tool_parser("m").as_deref(), Some("alpha"));
+            let resolver = ParserResolver::new(registry, None, None);
+            assert_eq!(resolver.names("m").labels.tool.as_deref(), Some("alpha"));
         }
-    }
-
-    /// The legacy parsers take from the flags only the names they read: under `--parser symphony`
-    /// a flag may name a Symphony table or the response template, which the labels' choice of the
-    /// legacy parsers for one model (`passthrough` alone, a legacy tool-call name) must not hand
-    /// them, else the tool side parses nothing (its availability check asks for the exact name)
-    /// and the reasoning side warns on every request. Symphony's view of the flags
-    /// ([`ParserResolver::names`]) keeps them whole.
-    #[test]
-    fn the_legacy_parsers_take_from_the_flags_only_the_names_they_read() {
-        let tools = ToolParserFactory::new();
-        let reasoning = ReasoningParserFactory::new();
-        assert!(!tools.has_parser("mistral_v13") && !reasoning.registry().has_parser("ling"));
-        let passthrough =
-            registry_with_card(ModelCard::new("m").with_reasoning_parser("passthrough"));
-        let resolver = ParserResolver::new(
-            Arc::clone(&passthrough),
-            Some("mistral_v13".to_string()),
-            Some("ling".to_string()),
-            &tools,
-            &reasoning,
-        );
-        // The flags reach the legacy parsers for no model: their own detection reads it.
-        assert_eq!(resolver.tool_parser("m"), None);
-        assert_eq!(resolver.tool_parser("other"), None);
-        assert_eq!(resolver.reasoning_parser("other"), None);
-        // The labels' names reach them as before.
-        assert_eq!(
-            resolver.reasoning_parser("m").as_deref(),
-            Some("passthrough")
-        );
-        let names = resolver.names("m");
-        assert_eq!(resolver.legacy_tool(&names), None);
-        // Symphony sees the flags as set, beside the labels.
-        assert_eq!(names.flags.tool.as_deref(), Some("mistral_v13"));
-        assert_eq!(names.flags.reasoning.as_deref(), Some("ling"));
-        assert_eq!(names.labels.reasoning.as_deref(), Some("passthrough"));
-        // A flag the legacy parsers read passes whole; a legacy name among the labels first.
-        let resolver = ParserResolver::new(
-            registry_with_card(ModelCard::new("m").with_tool_parser("llama")),
-            Some("qwen".to_string()),
-            Some("qwen3".to_string()),
-            &tools,
-            &reasoning,
-        );
-        assert_eq!(resolver.tool_parser("m").as_deref(), Some("llama"));
-        assert_eq!(resolver.tool_parser("other").as_deref(), Some("qwen"));
-        assert_eq!(resolver.reasoning_parser("other").as_deref(), Some("qwen3"));
-        assert_eq!(resolver.legacy_tool(&resolver.names("m")), Some("llama"));
-        assert_eq!(resolver.legacy_tool(&resolver.names("other")), Some("qwen"));
-        // The tests' constructor passes the flags whole, the registries unasked.
-        let plain = ParserResolver::with_flags(passthrough, Some("mistral_v13".to_string()), None);
-        assert_eq!(plain.tool_parser("other").as_deref(), Some("mistral_v13"));
     }
 }
 

@@ -7,9 +7,11 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use openai_protocol::{
     model_card::ModelCard,
     model_type::{Endpoint, ModelType},
-    worker::{ConstrainedDecoding, HealthCheckConfig, ProviderType, TagVocabulary, WorkerSpec},
+    worker::{
+        ConstrainedDecoding, GrammarStart, HealthCheckConfig, ProviderType, TagVocabulary,
+        WorkerSpec,
+    },
 };
-use tool_parser::GrammarStart;
 
 use super::{
     overload::OverloadThresholds, pd_pairing::PdPairing, WorkerError, WorkerResult,

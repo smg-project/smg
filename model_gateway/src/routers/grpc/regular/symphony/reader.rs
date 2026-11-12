@@ -4,10 +4,15 @@
 use std::sync::{atomic::AtomicBool, Arc, LazyLock};
 
 use llm_tokenizer::stop::StopSequenceDecoder;
-use openai_protocol::{common::Tool, profile::ProviderProfile};
+use openai_protocol::{
+    common::{Tool, ToolChoice},
+    profile::ProviderProfile,
+    worker::ToolConstraint,
+};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use symphony::{
+    formats::{forced, Table},
     Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
     TokenSpan,
 };
@@ -15,7 +20,7 @@ use tracing::{debug, Span};
 
 use super::{
     constraint::Asks,
-    names::{Fallback, Reading},
+    names::Reading,
     telemetry::{self, Tally, Who},
     SymphonyError,
 };
@@ -23,7 +28,7 @@ use super::{
 use super::{names::reading, template::Templates};
 use crate::routers::grpc::utils::isolation;
 #[cfg(test)]
-use crate::{config::ParserChoice, routers::grpc::utils::ModelNames};
+use crate::routers::grpc::utils::ModelNames;
 
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
 /// ([`assign_for`]), and the part of the rendered prompt the engine replays.
@@ -41,6 +46,10 @@ pub(crate) struct Assignment {
     /// the reader reads and delivers like the rest, and a marker of the table kept as text in it
     /// is no failure of the table's reading ([`Tally::new`]).
     pub past_the_end: bool,
+    /// The function the request forces (`tool_choice` naming it) where the output is its arguments
+    /// alone under the gateway's JSON-schema constraint: the `forced` table reads it, and the
+    /// reader names its one call so ([`assign_for`]).
+    pub forcing: Option<String>,
     /// The request's span, current where the assignment is made ([`assignment`]), for the record
     /// a reading that was not clean leaves on it ([`Reader::end`], [`Reader::failed`]). A streamed
     /// response's reading runs outside the span (the response body drives it), so the span
@@ -67,6 +76,7 @@ pub(super) fn assignment(
     prompt: &str,
     forbids_calls: bool,
     past_the_end: bool,
+    forcing: Option<String>,
 ) -> Assignment {
     debug!(model, table = format.name(), "Symphony reads the response");
     let prompt = format.replay(prompt).to_string();
@@ -75,16 +85,16 @@ pub(super) fn assignment(
         prompt,
         forbids_calls,
         past_the_end,
+        forcing,
         span: Span::current(),
         marked: Arc::default(),
     }
 }
 
-/// The table as the request's asks make it: without its calls when the legacy path would run no
-/// tool parser (the response is not scanned for calls:
-/// [`scans_for_tool_calls_for`](crate::routers::grpc::spec::scans_for_tool_calls_for)), so a table that reads calls from the output's first byte (`json`,
-/// `xlam`) is content from it; without its thought when the request keeps the reasoning in the
-/// content, as the legacy path runs no reasoning parser then. A variant is a copy of the shared
+/// The table as the request's asks make it: without its calls when the response is not scanned
+/// for calls ([`scans_for_tool_calls_for`](crate::routers::grpc::spec::scans_for_tool_calls_for)),
+/// so a table that reads calls from the output's first byte (`json`, `xlam`) is content from it;
+/// without its thought when the request keeps the reasoning in the content. A variant is a copy of the shared
 /// table; a request that asks for neither reads with the shared table itself. A `tool_choice` of
 /// `none` asks for no variant: the table keeps its calls and the reader drops them
 /// ([`Assignment::forbids_calls`]).
@@ -173,15 +183,14 @@ struct AskedVariant {
 /// from the model, as the tests ask it.
 #[cfg(test)]
 pub(crate) fn assign(
-    parser: ParserChoice,
     names: &ModelNames<'_>,
     asks: Asks<'_>,
     constraint: Option<&(String, String)>,
     prompt: &str,
     templates: &Templates,
-) -> Result<Option<Assignment>, SymphonyError> {
+) -> Result<Assignment, SymphonyError> {
     Ok(assign_for(
-        reading(parser, names, asks.model(), templates)?,
+        reading(names, asks.model(), templates)?,
         asks,
         constraint,
         prompt,
@@ -189,50 +198,59 @@ pub(crate) fn assign(
     ))
 }
 
-/// Symphony's assignment to a request, if a table reads the response (`read`, the table decision:
-/// preparation reads it once per request, [`reading`](super::names::reading), and request building
-/// passes it, `ProcessingState::reading`) and the constraint is not a JSON schema: the older
-/// path's forced call, whose output has no markers for a table to read, which the older registry
-/// writes where the table has no tag. The table goes without its calls where the legacy path would
-/// run no tool parser, without its thought where it would run no reasoning parser
-/// ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call the conversation
-/// established without a tool inventory comes back as a call under either parser. `None` where
-/// the legacy parsers read the response, which the response's header then says; a request
-/// Symphony was configured for is counted once here, by the reason
-/// ([`telemetry::record_fallback`]): request building asks once per request, and nothing else
-/// decides the reader. `provider` is the model's provider profile as the preparation stage derived
-/// it once per request; request building passes it. The tests ask through `assign`, which reads
-/// the decision and derives the profile first.
+/// The `forced` format ([`forced`]), built once and shared by every request whose forced call the
+/// gateway's JSON schema constrains, as the registry shares its tables; the one format no operator
+/// names, so the registry has no row for it.
+static FORCED: LazyLock<Arc<Format>> = LazyLock::new(|| Arc::new(forced()));
+
+/// Symphony's assignment to a request: the table that reads the response (`read`, the table
+/// decision: preparation reads it once per request, [`reading`](super::names::reading), and
+/// request building passes it, `ProcessingState::reading`) as the request's asks make it, without
+/// its calls where the response is not scanned for calls, without its thought where the request
+/// keeps the reasoning in the content ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]).
+/// A call the conversation established without a tool inventory comes back as a call. Under a
+/// JSON-schema constraint (the gateway's, where the table has no tag for the request's call or
+/// answer; or the request's own answer schema) the output is the JSON alone, with no markers for
+/// the model's table to read, so the format comes from the request: `forced` for the function the
+/// request names, which reads its arguments alone; `json` for a required call, which reads the
+/// list of calls; `plain` for an answer, which is content. Request building asks once per request,
+/// and nothing else decides the reader. `provider` is the model's provider profile as the
+/// preparation stage derived it once per request; request building passes it. The tests ask
+/// through `assign`, which reads the decision and derives the profile first.
 pub(crate) fn assign_for(
     read: Reading,
     asks: Asks<'_>,
     constraint: Option<&(String, String)>,
     prompt: &str,
     provider: ProviderProfile,
-) -> Option<Assignment> {
-    let format = match read {
-        Reading::Table(format, _) => format,
-        Reading::Legacy => return None,
-        Reading::Fallback(why) => {
-            telemetry::record_fallback(why, None);
-            return None;
+) -> Assignment {
+    let schema_alone = constraint.is_some_and(|(kind, _)| kind == ToolConstraint::JSON_SCHEMA);
+    let (format, forcing) = if schema_alone {
+        match asks.choice().as_deref() {
+            Some(ToolChoice::Function { function, .. }) => {
+                (Arc::clone(&FORCED), Some(function.name.clone()))
+            }
+            Some(choice) if choice.forces_call() => (Table::Json.shared(), None),
+            _ => (Table::Plain.shared(), None),
         }
+    } else {
+        (
+            asked(
+                read.format,
+                asks.no_calls_for(provider),
+                asks.no_reasoning(),
+            ),
+            None,
+        )
     };
-    if constraint.is_some_and(|(kind, _)| kind == "json_schema") {
-        telemetry::record_fallback(
-            Fallback::ForcedCallWithoutTag,
-            Some(telemetry::table_label(format.name())),
-        );
-        return None;
-    }
-    let format = asked(format, asks.no_calls_for(provider), asks.no_reasoning());
-    Some(assignment(
+    assignment(
         format,
         asks.model(),
         prompt,
         asks.forbids_calls_for(provider),
         asks.past_the_end(),
-    ))
+        forcing,
+    )
 }
 
 /// The engine's finish reason as Symphony takes it.
@@ -365,9 +383,13 @@ impl Reader {
         tools: Arc<[Tool]>,
         out: &mut Events<'_>,
     ) -> Result<Self, SymphonyError> {
+        let declared = match &assignment.forcing {
+            Some(name) => Declared::shared(tools).forcing(name.clone()),
+            None => Declared::shared(tools),
+        };
         let mut reader = Self {
             table: assignment.table(),
-            engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
+            engine: Engine::shared(Arc::clone(&assignment.format), declared),
             tally: Tally::new(assignment.past_the_end),
             last_token: None,
             read: 0,
@@ -771,7 +793,7 @@ mod tests {
 
     #[test]
     fn a_shared_tables_asked_variant_is_kept_and_read_with_by_the_next_request() {
-        let shared = symphony::formats::Table::Qwen3.shared();
+        let shared = Table::Qwen3.shared();
         let first = asked(Arc::clone(&shared), true, false);
         let second = asked(Arc::clone(&shared), true, false);
         assert!(
@@ -820,6 +842,7 @@ mod tests {
             prompt: prompt.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -1528,40 +1551,23 @@ mod tests {
     #[test]
     fn a_request_without_tools_is_read_by_every_table_and_its_calls_are_content() {
         // `json` and `xlam` read a bare JSON answer as a call: without tools the request asked
-        // for none, so the table goes without its calls and the answer is the text it was, as
-        // the legacy parsers leave it when they run no tool parser; a table with call markers
-        // goes the same way.
+        // for none, so the table goes without its calls and the answer is the text it was; a
+        // table with call markers goes the same way.
         let json = names(Some("json"), None);
         let without = request(json!({}));
-        let assigned =
-            assign(ParserChoice::Symphony, &json, &without, None, PROMPT).expect("assigned");
+        let assigned = assign(&json, &without, None, PROMPT);
         assert_eq!(assigned.format.name(), "json");
         assert_eq!(assigned.format.call_syntax(), None);
         let declared = serde_json::to_value(tools()).expect("tools");
         let with = request(json!({"tools": declared}));
-        let assigned =
-            assign(ParserChoice::Symphony, &json, &with, None, PROMPT).expect("assigned");
+        let assigned = assign(&json, &with, None, PROMPT);
         assert!(assigned.format.call_syntax().is_some());
         let xlam = request(json!({"model": "Salesforce/Llama-xLAM-2-8b-fc-r"}));
-        let by_registry = assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &xlam,
-            None,
-            PROMPT,
-        )
-        .expect("assigned");
+        let by_registry = assign(&ModelNames::default(), &xlam, None, PROMPT);
         assert_eq!(by_registry.format.name(), "xlam");
         assert_eq!(by_registry.format.call_syntax(), None);
         for named in ["inkling", "llama_nemotron"] {
-            let assigned = assign(
-                ParserChoice::Symphony,
-                &names(Some(named), None),
-                &without,
-                None,
-                PROMPT,
-            )
-            .expect("assigned");
+            let assigned = assign(&names(Some(named), None), &without, None, PROMPT);
             assert_eq!(assigned.format.name(), named);
             assert_eq!(assigned.format.call_syntax(), None);
         }
@@ -1569,89 +1575,44 @@ mod tests {
 
     #[test]
     fn explicit_names_win_over_the_registry() {
-        // A table named for a model the registry does not know reads it; a legacy name reads
-        // with its alias, or with no alias leaves a model the registry knows to the legacy
-        // parsers; a table named for a model the registry reads with another wins, and replays
-        // from its own opener.
+        // A table named for a model the registry does not know reads it; an older parser's name
+        // reads with the table that answers to it; a table named for a model the registry reads
+        // with another wins, and replays from its own opener.
         let unknown = request(json!({"model": "unknown"}));
         let ling = names(Some("ling"), Some("ling"));
-        let assigned = assign(ParserChoice::Symphony, &ling, &unknown, None, PROMPT);
-        assert_eq!(assigned.expect("assigned").format.name(), "ling");
+        assert_eq!(assign(&ling, &unknown, None, PROMPT).format.name(), "ling");
         let aliased = names(Some("qwen"), Some("qwen3"));
-        let assigned = assign(
-            ParserChoice::Symphony,
-            &aliased,
-            &request(json!({})),
-            None,
-            PROMPT,
+        assert_eq!(
+            assign(&aliased, &request(json!({})), None, PROMPT)
+                .format
+                .name(),
+            "qwen3"
         );
-        assert_eq!(assigned.expect("assigned").format.name(), "qwen3");
-        let legacy = names(Some("pythonic"), Some("deepseek_r1"));
-        assert!(assign(
-            ParserChoice::Symphony,
-            &legacy,
-            &request(json!({})),
-            None,
-            PROMPT
-        )
-        .is_none());
-        // A reasoning name alone that selects no table leaves the choice to the registry: a
-        // known model takes its table and the table's tag, an unknown one the legacy parsers.
+        // No name anywhere: the registry's table for a model it knows, with the table's tag;
+        // the `plain` table for a model it does not know, which has no tag and reads the whole
+        // output as content.
         let required = request(json!({"tool_choice": "required"}));
-        let reasoning_only = names(None, Some("deepseek_r1"));
-        assert!(constraint(
-            ParserChoice::Symphony,
-            &reasoning_only,
-            &required,
-            &tools(),
-            false
-        )
-        .is_some());
-        let assigned = assign(
-            ParserChoice::Symphony,
-            &reasoning_only,
-            &request(json!({})),
-            None,
-            PROMPT,
+        let none = ModelNames::default();
+        assert!(constraint(&none, &required, &tools(), false).is_some());
+        assert_eq!(
+            assign(&none, &request(json!({})), None, PROMPT)
+                .format
+                .name(),
+            "qwen3"
         );
-        assert_eq!(assigned.expect("assigned").format.name(), "qwen3");
         let unknown_required = request(json!({"model": "unknown", "tool_choice": "required"}));
-        assert!(constraint(
-            ParserChoice::Symphony,
-            &reasoning_only,
-            &unknown_required,
-            &tools(),
-            false
-        )
-        .is_none());
-        assert!(assign(
-            ParserChoice::Symphony,
-            &reasoning_only,
-            &unknown,
-            None,
-            PROMPT
-        )
-        .is_none());
-        // `passthrough` alone is the choice to leave the thought as written: the legacy
-        // parsers keep a known model too.
+        assert!(constraint(&none, &unknown_required, &tools(), false).is_none());
+        assert_eq!(assign(&none, &unknown, None, PROMPT).format.name(), "plain");
+        // `passthrough` names the `plain` table: the output as written, for a known model too.
         let passthrough_only = names(None, Some("passthrough"));
-        assert!(assign(
-            ParserChoice::Symphony,
-            &passthrough_only,
-            &request(json!({})),
-            None,
-            PROMPT
-        )
-        .is_none());
-        let kimi = names(Some("kimi_k3"), None);
-        let assigned = assign(
-            ParserChoice::Symphony,
-            &kimi,
-            &request(json!({})),
-            None,
-            PROMPT,
+        assert_eq!(
+            assign(&passthrough_only, &request(json!({})), None, PROMPT)
+                .format
+                .name(),
+            "plain"
         );
-        let assigned = assigned.expect("assigned");
+        let kimi = names(Some("kimi_k3"), None);
+        let assigned = assign(&kimi, &request(json!({})), None, PROMPT);
         assert_eq!(assigned.format.name(), "kimi_k3");
         assert_eq!(
             assigned.prompt, PROMPT,
@@ -1661,49 +1622,24 @@ mod tests {
         let exaone = request(json!({"model": "LGAI-EXAONE/K-EXAONE-236B-A23B"}));
         let prompt = "<|user|>hi<|endofturn|><|assistant|>\n<think>\n";
         let qwen3 = names(Some("qwen3"), Some("qwen3"));
-        let by_name = assign(ParserChoice::Symphony, &qwen3, &exaone, None, prompt);
-        let by_registry = assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &exaone,
-            None,
-            prompt,
-        );
         assert_eq!(
-            by_name.expect("assigned").prompt,
+            assign(&qwen3, &exaone, None, prompt).prompt,
             "<|assistant|>\n<think>\n"
         );
         assert_eq!(
-            by_registry.expect("assigned").prompt,
+            assign(&none, &exaone, None, prompt).prompt,
             "<|assistant|>\n<think>\n"
         );
-        // Under legacy the names change nothing.
-        assert!(assign(ParserChoice::Legacy, &ling, &unknown, None, PROMPT).is_none());
     }
 
     /// The table Symphony reads `request`'s model with, under the default names and no templates.
     fn table_of(request: &ChatCompletionRequest) -> Arc<Format> {
-        reads(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &request.model,
-            &templates(),
-        )
-        .expect("read")
-        .expect("a table")
+        reads(&ModelNames::default(), &request.model, &templates()).expect("read")
     }
 
     /// The table assigned to `request`'s response, under the default names and no templates.
     fn assigned_format(request: &ChatCompletionRequest) -> Arc<Format> {
-        assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            request,
-            None,
-            PROMPT,
-        )
-        .expect("assigned")
-        .format
+        assign(&ModelNames::default(), request, None, PROMPT).format
     }
 
     #[test]
@@ -1718,27 +1654,13 @@ mod tests {
             *assigned_format(&kept),
             Arc::unwrap_or_clone(table_of(&kept)).without_reasoning()
         );
-        assert!(constraint(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &kept,
-            &tools(),
-            false
-        )
-        .is_some());
+        assert!(constraint(&ModelNames::default(), &kept, &tools(), false).is_some());
         let no_calls = request(json!({"tool_choice": "none"}));
         assert_eq!(
             *assigned_format(&no_calls),
             Arc::unwrap_or_clone(table_of(&no_calls)).without_calls()
         );
-        assert!(constraint(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &no_calls,
-            &tools(),
-            false
-        )
-        .is_none());
+        assert!(constraint(&ModelNames::default(), &no_calls, &tools(), false).is_none());
         let neither = request(json!({"separate_reasoning": false}));
         assert_eq!(
             *assigned_format(&neither),
@@ -1751,11 +1673,12 @@ mod tests {
     }
 
     #[test]
-    fn the_calls_stay_wherever_the_legacy_path_runs_a_tool_parser() {
-        // The legacy path scans a response for calls when the request declares tools, an empty
-        // list included, or when the model's provider reads calls without any; the table keeps
-        // its calls exactly then, so a call the conversation established comes back as a call
-        // under either parser, and a `tool_choice` of `none` keeps them for the reader to drop.
+    fn the_calls_stay_wherever_the_response_is_scanned_for_calls() {
+        // A response is scanned for calls when the request declares tools, an empty list
+        // included, or when the model's provider reads calls without any
+        // (`scans_for_tool_calls_for`); the table keeps its calls exactly then, so a call the
+        // conversation established comes back as a call, and a `tool_choice` of `none` keeps
+        // them for the reader to drop.
         let retry = request(json!({"model": "MiniMax-M3", "messages": retry_messages()}));
         assert!(scans_for_tool_calls_for(
             &retry,
@@ -1769,14 +1692,7 @@ mod tests {
         let refused = request(json!({
             "model": "MiniMax-M3", "messages": retry_messages(), "tool_choice": "none"
         }));
-        let forbidden = assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &refused,
-            None,
-            PROMPT,
-        )
-        .expect("assigned");
+        let forbidden = assign(&ModelNames::default(), &refused, None, PROMPT);
         assert_eq!(
             forbidden.format,
             table_of(&refused),
@@ -1804,10 +1720,9 @@ mod tests {
             "a provider that reads calls only with tools"
         );
         // A Messages request: declared tools, an empty list included, keep the calls; none
-        // declared drops them, as the legacy path runs its tool parser on `tools` alone.
+        // declared drops them, as the scan reads `tools` alone.
         let messages = |extra: Value| {
             super::assign(
-                ParserChoice::Symphony,
                 &ModelNames::default(),
                 Asks::Messages {
                     request: &message_request(extra),
@@ -1818,7 +1733,6 @@ mod tests {
                 &templates(),
             )
             .expect("read")
-            .expect("assigned")
             .format
         };
         assert!(messages(json!({"tools": []})).call_syntax().is_some());
@@ -1831,26 +1745,16 @@ mod tests {
     #[test]
     fn a_request_that_ignores_the_end_assigns_a_reader_that_knows_it() {
         let forced = assign(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             &request(json!({"ignore_eos": true})),
             None,
             PROMPT,
-        )
-        .expect("assigned");
+        );
         assert!(forced.past_the_end);
         assert_eq!(forced.format.name(), "qwen3");
-        let plain = assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &request(json!({})),
-            None,
-            PROMPT,
-        )
-        .expect("assigned");
+        let plain = assign(&ModelNames::default(), &request(json!({})), None, PROMPT);
         assert!(!plain.past_the_end);
         let messages = super::assign(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             Asks::Messages {
                 request: &message_request(json!({})),
@@ -1860,53 +1764,47 @@ mod tests {
             PROMPT,
             &templates(),
         )
-        .expect("read")
-        .expect("assigned");
+        .expect("read");
         assert!(!messages.past_the_end);
     }
 
     #[test]
     fn a_known_model_is_assigned_its_table_and_the_prompts_replay() {
-        let assignment = assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &request(json!({})),
-            None,
-            PROMPT,
-        )
-        .expect("assigned");
+        let assignment = assign(&ModelNames::default(), &request(json!({})), None, PROMPT);
         assert_eq!(assignment.format.name(), "qwen3");
         assert_eq!(assignment.prompt, "<|im_start|>assistant\n<think>\n");
     }
 
     #[test]
-    fn an_unknown_model_and_a_json_schema_constraint_are_not_assigned() {
-        assert!(assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &request(json!({"model": "unknown"})),
-            None,
-            PROMPT
-        )
-        .is_none());
+    fn an_unknown_model_reads_plain_and_a_json_schema_constraint_assigns_the_requests_table() {
+        // A model the registry does not know, with no names, reads with `plain`. Under the
+        // gateway's JSON-schema constraint the output is the JSON alone, so the request's own
+        // table reads it: `forced` for the function it names, `json` for a required call,
+        // `plain` for an answer; a structural tag leaves the model's table in place.
+        let none = ModelNames::default();
+        let unknown = assign(&none, &request(json!({"model": "unknown"})), None, PROMPT);
+        assert_eq!(unknown.format.name(), "plain");
         let schema = ("json_schema".to_string(), "{}".to_string());
-        assert!(assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &request(json!({})),
-            Some(&schema),
-            PROMPT
-        )
-        .is_none());
+        let answer = assign(&none, &request(json!({})), Some(&schema), PROMPT);
+        assert_eq!(answer.format.name(), "plain");
+        assert_eq!(answer.forcing, None);
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let named = request(json!({
+            "tools": declared,
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }));
+        let forced = assign(&none, &named, Some(&schema), PROMPT);
+        assert_eq!(forced.format.name(), "forced");
+        assert_eq!(forced.forcing.as_deref(), Some("lookup"));
+        let required = request(json!({
+            "tools": serde_json::to_value(tools()).expect("tools"), "tool_choice": "required"
+        }));
+        let listed = assign(&none, &required, Some(&schema), PROMPT);
+        assert_eq!(listed.format.name(), "json");
+        assert_eq!(listed.forcing, None);
         let tag = ("structural_tag".to_string(), "{}".to_string());
-        assert!(assign(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &request(json!({})),
-            Some(&tag),
-            PROMPT
-        )
-        .is_some());
+        let tagged = assign(&none, &request(json!({})), Some(&tag), PROMPT);
+        assert_eq!(tagged.format.name(), "qwen3");
     }
 
     #[test]
@@ -1934,6 +1832,7 @@ mod tests {
             prompt: "<|message_model|>".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2008,6 +1907,7 @@ mod tests {
             prompt: GLM4_PROMPT.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2067,6 +1967,7 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2097,6 +1998,7 @@ mod tests {
                     PROMPT,
                     false,
                     false,
+                    None,
                 )
             });
             assert_eq!(assignment.span.id(), span.id());
@@ -2148,6 +2050,7 @@ mod tests {
                     "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
                     false,
                     false,
+                    None,
                 )
             });
             span.in_scope(
@@ -2206,6 +2109,7 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2260,36 +2164,21 @@ mod tests {
         .await;
         let hf = names(Some("hf"), Some(" HF "));
         let read = |names: &ModelNames<'_>, request: &ChatCompletionRequest| {
-            reads(ParserChoice::Symphony, names, &request.model, &templates)
+            reads(names, &request.model, &templates)
         };
         // The template's table reads the model the registry knows with another table, named
         // on both sides or on either alone.
         for names in [&hf, &names(Some("hf"), None), &names(None, Some("hf"))] {
-            let format = read(names, &request(json!({})))
-                .expect("read")
-                .expect("a table");
+            let format = read(names, &request(json!({}))).expect("read");
             assert_eq!(format.name(), "response_template");
         }
-        assert!(
-            reads(ParserChoice::Legacy, &hf, "Qwen/Qwen3-8B", &templates)
-                .expect("read")
-                .is_none()
-        );
         // What the request asks of the channels takes a variant of the templates' table.
         let kept = request(json!({"separate_reasoning": false}));
-        let assigned = super::assign(
-            ParserChoice::Symphony,
-            &hf,
-            Asks::Chat(&kept),
-            None,
-            PROMPT,
-            &templates,
-        )
-        .expect("read")
-        .expect("assigned");
+        let assigned =
+            super::assign(&hf, Asks::Chat(&kept), None, PROMPT, &templates).expect("read");
         assert_eq!(
             *assigned.format,
-            Arc::unwrap_or_clone(read(&hf, &kept).expect("read").expect("a table"))
+            Arc::unwrap_or_clone(read(&hf, &kept).expect("read"))
                 .without_calls()
                 .without_reasoning()
         );
@@ -2299,25 +2188,15 @@ mod tests {
             read(&hf, &unknown).expect_err("refused"),
             SymphonyError::Template("no tokenizer is registered for model 'unknown'".to_string())
         );
-        assert!(super::assign(
-            ParserChoice::Symphony,
-            &hf,
-            Asks::Chat(&unknown),
-            None,
-            PROMPT,
-            &templates
-        )
-        .is_err());
+        assert!(super::assign(&hf, Asks::Chat(&unknown), None, PROMPT, &templates).is_err());
         let assigned = super::assign(
-            ParserChoice::Symphony,
             &hf,
             Asks::Chat(&request(json!({}))),
             None,
             PROMPT,
             &templates,
         )
-        .expect("read")
-        .expect("assigned");
+        .expect("read");
         assert_eq!(assigned.format.name(), "response_template");
         assert_eq!(assigned.prompt, "<|im_start|>assistant\n<think>\n");
     }
@@ -2333,6 +2212,7 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2366,6 +2246,7 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2416,6 +2297,7 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2452,6 +2334,7 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: true,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2504,6 +2387,7 @@ mod tests {
         let allowed = Assignment {
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
             span: Span::none(),
             marked: Arc::default(),
             ..assignment
@@ -2569,127 +2453,6 @@ mod tests {
         assert_eq!(*reasoning_tokens, 0);
     }
 
-    /// A request Symphony was configured for that the legacy parsers read is counted once, under
-    /// the reason the seam names and the table that had no tag for it, or `none`; a table's
-    /// assignment, and the gateway's own choice of the legacy parsers, count nothing.
-    #[test]
-    fn a_request_the_legacy_parsers_read_under_symphony_is_counted_once_by_reason() {
-        let unknown = request(json!({"model": "acme/ministral-3-14b-instruct-w4a16"}));
-        let known = request(json!({}));
-        let counted = |names: &ModelNames<'_>,
-                       request: &ChatCompletionRequest,
-                       constraint: Option<&(String, String)>| {
-            let scrape = rendered(|| {
-                assert!(
-                    assign(ParserChoice::Symphony, names, request, constraint, PROMPT).is_none()
-                );
-            });
-            let lines: Vec<&str> = scrape
-                .lines()
-                .filter(|line| line.starts_with(telemetry::FALLBACK))
-                .collect();
-            assert_eq!(lines.len(), 1, "{scrape}");
-            assert!(lines[0].ends_with(" 1"), "{}", lines[0]);
-            lines[0].to_string()
-        };
-        let labelled = |line: &str, reason: &str, table: &str| {
-            assert!(line.contains(&format!("reason=\"{reason}\"")), "{line}");
-            assert!(line.contains(&format!("table=\"{table}\"")), "{line}");
-        };
-        labelled(
-            &counted(&ModelNames::default(), &unknown, None),
-            "no_table",
-            "none",
-        );
-        labelled(
-            &counted(&names(None, Some("deepseek_r1")), &unknown, None),
-            "reasoning_name_only",
-            "none",
-        );
-        labelled(
-            &counted(&names(Some("pythonic"), Some("deepseek_r1")), &known, None),
-            "legacy_tool_name",
-            "none",
-        );
-        labelled(
-            &counted(&names(None, Some("passthrough")), &known, None),
-            "passthrough",
-            "none",
-        );
-
-        // The shape a table without a tag for a forced call hands over: the seam's constraint is
-        // nothing, the older registry writes its JSON schema for the named tool, request building
-        // passes it here, and the table that reads the model is the one counted.
-        let forced = request(json!({
-            "tools": serde_json::to_value(tools()).expect("tools"),
-            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
-        }));
-        let schema = tool_parser::ParserFactory::new()
-            .registry()
-            .generate_tool_constraint(
-                None,
-                &tools(),
-                forced.tool_choice.as_ref().expect("a choice"),
-                false,
-            )
-            .expect("a constraint")
-            .expect("the older registry's schema")
-            .to_tuple();
-        assert_eq!(schema.0, "json_schema");
-        labelled(
-            &counted(&ModelNames::default(), &forced, Some(&schema)),
-            "forced_call_without_tag",
-            "qwen3",
-        );
-        // A message the same way.
-        let message = message_request(json!({}));
-        let scrape = rendered(|| {
-            let assigned = super::assign(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                Asks::Messages {
-                    request: &message,
-                    continues: false,
-                },
-                Some(&schema),
-                PROMPT,
-                &templates(),
-            )
-            .expect("no hf");
-            assert!(assigned.is_none());
-        });
-        labelled(
-            line_with(&scrape, telemetry::FALLBACK, &[]).expect("counted"),
-            "forced_call_without_tag",
-            "qwen3",
-        );
-
-        // Nothing counted where a table reads, under a structural tag too, nor under `legacy`.
-        let tag = ("structural_tag".to_string(), "{}".to_string());
-        let scrape = rendered(|| {
-            let default = ModelNames::default();
-            assert!(assign(ParserChoice::Symphony, &default, &known, None, PROMPT).is_some());
-            assert!(assign(
-                ParserChoice::Symphony,
-                &default,
-                &forced,
-                Some(&tag),
-                PROMPT
-            )
-            .is_some());
-            assert!(assign(ParserChoice::Legacy, &default, &unknown, None, PROMPT).is_none());
-            assert!(assign(
-                ParserChoice::Legacy,
-                &default,
-                &known,
-                Some(&schema),
-                PROMPT
-            )
-            .is_none());
-        });
-        assert!(!scrape.contains(telemetry::FALLBACK), "{scrape}");
-    }
-
     /// The events of `output` read whole by `format` after `prompt`, with the request's one
     /// declared tool, under a recorder of their own: the events and the scrape.
     fn read_scraped(format: Format, prompt: &str, output: &str) -> (Vec<Event<'static>>, String) {
@@ -2700,6 +2463,7 @@ mod tests {
                 prompt: prompt.to_string(),
                 forbids_calls: false,
                 past_the_end: false,
+                forcing: None,
                 span: Span::none(),
                 marked: Arc::default(),
             };
@@ -2862,13 +2626,11 @@ mod tests {
         }));
         let tag = ("structural_tag".to_string(), "{}".to_string());
         let assigned = assign(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             &forced,
             Some(&tag),
             "<|im_start|>assistant\n",
-        )
-        .expect("assigned");
+        );
         assert_eq!(assigned.format.name(), "qwen3");
         let (events, scrape) = read_scraped(
             Arc::unwrap_or_clone(assigned.format),

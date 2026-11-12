@@ -1,21 +1,18 @@
 //! Test support of the regular stages: the shared components of a gateway
-//! with no parser names (with `--parser symphony` and no worker, or over given
-//! registries and parser), and a builder client on a mock engine.
+//! with no parser names (no worker, or over given registries), and a builder
+//! client on a mock engine.
 
 use std::sync::Arc;
 
 use llm_tokenizer::TokenizerRegistry;
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::{vllm_proto, VllmEngineClient};
 use tokio::task::JoinHandle;
-use tool_parser::ParserFactory as ToolParserFactory;
 
 use crate::{
-    config::ParserChoice,
     routers::grpc::{
         backend_client::BackendClient,
         client::GrpcClient,
-        common::stages::helpers::{IdStamp, SamplingBaseline, ToolConstraintStamp},
+        common::stages::helpers::{IdStamp, SamplingBaseline},
         context::{AttemptStamp, ExecutionPlan, SharedComponents},
         proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
         regular::symphony::template::Templates,
@@ -25,34 +22,28 @@ use crate::{
     worker::WorkerRegistry,
 };
 
-/// The gateway's shared components over `tokenizer_registry` and `worker_registry`,
-/// reading with `parser`: no parser names, no multimodal components, the tokenizer
-/// autoload on.
+/// The gateway's shared components over `tokenizer_registry` and `worker_registry`:
+/// no parser names, no multimodal components, the tokenizer autoload on.
 pub(crate) fn components_over(
     tokenizer_registry: Arc<TokenizerRegistry>,
     worker_registry: Arc<WorkerRegistry>,
-    parser: ParserChoice,
 ) -> Arc<SharedComponents> {
     Arc::new(SharedComponents {
         templates: Arc::new(Templates::new(Arc::clone(&tokenizer_registry))),
         tokenizer_registry,
         worker_registry,
-        tool_parser_factory: ToolParserFactory::default(),
-        reasoning_parser_factory: ReasoningParserFactory::default(),
         parser_resolver: ParserResolver::disabled(),
         multimodal: None,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser,
     })
 }
 
-/// The gateway with `--parser symphony`, no parser names and no worker.
+/// The gateway with no parser names and no worker.
 pub(crate) fn components() -> Arc<SharedComponents> {
     components_over(
         Arc::new(TokenizerRegistry::new()),
         Arc::new(WorkerRegistry::new()),
-        ParserChoice::Symphony,
     )
 }
 
@@ -66,9 +57,9 @@ pub(crate) async fn mock_backend_client(model_id: &str) -> (BackendClient, JoinH
     (BackendClient::Grpc(GrpcClient::Vllm(client)), engine)
 }
 
-/// A forced call's structural tag as preparation spells one. With no worker
-/// selected the shaping leaves it as it is, so the engine's request carries
-/// it unchanged and the attempt stamp carries it unshaped.
+/// A forced call's structural tag as preparation spells one, built for the
+/// start the model's workers name together: the engine's request carries it
+/// as built, and the attempt stamp derives nothing for a retry's worker.
 pub(crate) const FORCED_CALL_TAG: &str = r#"{"type":"structural_tag","format":{"type":"triggered_tags","triggers":["<tool_call>"],"tags":[]}}"#;
 
 /// What the sequence the chat and Messages builders share makes of a fixed
@@ -78,8 +69,7 @@ pub(crate) const FORCED_CALL_TAG: &str = r#"{"type":"structural_tag","format":{"
 /// minted under `prefix`, the ids as the prompt with no text beside them, the
 /// client's sampling knobs and the tag as the request carried it; the attempt
 /// stamp carries the minted id, the mask of the knobs the client left unset,
-/// the pre-default baseline and the unshaped constraint with no parser and no
-/// first-token lead.
+/// the pre-default baseline and no tag derivation (the tag rides as built).
 pub(crate) fn assert_fixed_request_plan(
     plan: &ExecutionPlan,
     stamp: &AttemptStamp,
@@ -122,18 +112,8 @@ pub(crate) fn assert_fixed_request_plan(
         Some(SamplingBaseline::Vllm(_))
     ));
     assert!(!stamp.inject_pd_metadata);
-    let Some(ToolConstraintStamp::Registry {
-        constraint,
-        parser,
-        first_token,
-    }) = &stamp.tool_constraint
-    else {
-        panic!("the unshaped constraint on the stamp")
-    };
-    assert_eq!(
-        *constraint,
-        ("structural_tag".to_string(), FORCED_CALL_TAG.to_string())
+    assert!(
+        stamp.tool_constraint.is_none(),
+        "a tag built for the pool's start rides as the request carries it"
     );
-    assert_eq!(*parser, None);
-    assert!(!first_token);
 }

@@ -133,7 +133,7 @@ mod tests {
         let config = RouterConfig::builder()
             .policy(PolicyConfig::RoundRobin)
             .build_unchecked();
-        let app_context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
+        let app_context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()));
         app_context
             .policy_registry
             .on_worker_added(MODEL, Some("cache_aware"));
@@ -224,7 +224,6 @@ mod tests {
         let mut context = AppContext::clone(&app_context_for_tests(
             config,
             Arc::new(WorkerRegistry::new()),
-            None,
         ));
         let monitor = Arc::new(KvEventMonitor::new());
         context

@@ -19,7 +19,7 @@
             "prefix_hash"
           ]
         },
-        "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
+        "parser": { "type": "string", "enum": ["", "symphony"] },
         "mmTurbojpeg": {
           "type": "string",
           "enum": ["prefer", "require"],

@@ -190,8 +190,8 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // workers' model exist at zero from here, once every worker of the
         // batch is in the registry: a registration refused above leaves no
         // series behind. The table was resolved where the model card and the
-        // names are (none for an HTTP worker, the legacy parsers or a model
-        // no table reads).
+        // names are (none for an HTTP worker, whose engine reads its own
+        // output).
         if let Some(table) = context.data.symphony_table() {
             telemetry::init_table_series(table);
         }

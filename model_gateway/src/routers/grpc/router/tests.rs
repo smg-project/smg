@@ -8,7 +8,7 @@ use std::{
 };
 
 use axum::{http::StatusCode, response::IntoResponse};
-use http::header::{HeaderValue, RETRY_AFTER};
+use http::header::RETRY_AFTER;
 use llm_tokenizer::factory;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::json;
@@ -21,7 +21,7 @@ use super::*;
 use crate::{
     config::{
         test_support::{epd_routing_mode, pd_routing_mode, regular_routing_mode},
-        GroupedDpSticky, ParserChoice, RoutingMode,
+        GroupedDpSticky, RoutingMode,
     },
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
@@ -1388,13 +1388,13 @@ async fn register_tokenizer_for(
 }
 
 /// One chat completion for `model` through `router` under `headers`, with
-/// the thought asked apart and one `lookup` tool declared: the status, the
-/// `x-smg-parser` response header, and the body.
+/// the thought asked apart and one `lookup` tool declared: the status and
+/// the body.
 async fn chat(
     router: &GrpcRouter,
     model: &str,
     headers: &HeaderMap,
-) -> (StatusCode, Option<String>, serde_json::Value) {
+) -> (StatusCode, serde_json::Value) {
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let body: ChatCompletionRequest = serde_json::from_value(json!({
         "model": model, "separate_reasoning": true,
@@ -1409,47 +1409,12 @@ async fn chat(
         .route_chat(Some(headers), &tenant_meta, body, model)
         .await;
     let status = response.status();
-    let parser = response
-        .headers()
-        .get("x-smg-parser")
-        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
     let body = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)}));
-    (status, parser, body)
-}
-
-/// One Responses turn for `model` through `router` under `headers`, with
-/// one `lookup` tool declared, streamed or not: the status, the
-/// `x-smg-parser` response header, and the body (a stream's frames as one
-/// text).
-async fn responses(
-    router: &GrpcRouter,
-    model: &str,
-    headers: &HeaderMap,
-    stream: bool,
-) -> (StatusCode, Option<String>, String) {
-    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
-    let body: ResponsesRequest = serde_json::from_value(json!({
-        "model": model, "input": "hi", "stream": stream,
-        "tools": [{"type": "function", "name": "lookup",
-            "parameters": {"type": "object", "properties": {"q": {"type": "integer"}}}}]
-    }))
-    .expect("responses request");
-    let response = router
-        .route_responses(Some(headers), &tenant_meta, body, model)
-        .await;
-    let status = response.status();
-    let parser = response
-        .headers()
-        .get("x-smg-parser")
-        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    (status, parser, String::from_utf8_lossy(&bytes).into_owned())
+    (status, body)
 }
 
 /// The served models of the mixed-fleet test: one the registry knows, whose
@@ -1480,12 +1445,7 @@ async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_f
     );
     assert_eq!(::symphony::formats::table_for(UNKNOWN_MODEL), None);
     for mode in [Mode::Regular, Mode::PrefillDecode] {
-        let ctx = grpc_ctx_with_parsers(
-            routing_mode(mode),
-            ParserChoice::Symphony,
-            Some("mistral_v13"),
-        )
-        .await;
+        let ctx = grpc_ctx_with_parsers(routing_mode(mode), Some("mistral_v13")).await;
         register_tokenizer_for(
             &ctx,
             KNOWN_MODEL,
@@ -1516,13 +1476,8 @@ async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_f
         }
         let router = GrpcRouter::new(&ctx, mode).expect("router");
         for model in [KNOWN_MODEL, UNKNOWN_MODEL] {
-            let (status, parser, answer) = chat(&router, model, &HeaderMap::new()).await;
+            let (status, answer) = chat(&router, model, &HeaderMap::new()).await;
             assert_eq!(status, StatusCode::OK, "{mode:?} {model}: {answer}");
-            assert_eq!(
-                parser.as_deref(),
-                Some("symphony"),
-                "{mode:?} {model}: {answer}"
-            );
             let message = &answer["choices"][0]["message"];
             assert_eq!(
                 message["reasoning_content"], "plan",
@@ -1543,135 +1498,6 @@ async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_f
                 answer["choices"][0]["finish_reason"], "tool_calls",
                 "{mode:?} {model}: {answer}"
             );
-        }
-    }
-}
-
-/// One gateway under `--parser symphony` with no parser names: the model the registry does
-/// not know is read by the legacy parsers, its answer says so, and the request is counted
-/// once, under `no_table` and no table; a second request counts a second; the model the
-/// registry knows is read by its table and counts nothing. The count is the pipeline's one
-/// per request, where request building decides the reader.
-#[tokio::test]
-async fn a_request_the_legacy_parsers_read_under_symphony_is_counted_once_through_the_pipeline() {
-    let ctx =
-        grpc_ctx_with_parsers(routing_mode(Mode::Regular), ParserChoice::Symphony, None).await;
-    register_tokenizer_for(
-        &ctx,
-        KNOWN_MODEL,
-        CHAT_TEMPLATE,
-        (TABLE_OUTPUT, TABLE_OUTPUT_ID),
-    )
-    .await;
-    register_tokenizer_for(
-        &ctx,
-        UNKNOWN_MODEL,
-        V13_CHAT_TEMPLATE,
-        (V13_OUTPUT, V13_OUTPUT_ID),
-    )
-    .await;
-    for (model, output_id) in [
-        (KNOWN_MODEL, TABLE_OUTPUT_ID),
-        (UNKNOWN_MODEL, V13_OUTPUT_ID),
-    ] {
-        let port = spawn_engine(vec![output_id]).await;
-        register_worker(
-            &ctx,
-            &format!("grpc://127.0.0.1:{port}"),
-            WorkerType::Regular,
-            ModelCard::new(model),
-        );
-    }
-    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("router");
-    // A recorder of this test's own: the runtime is single-threaded, so it sees every
-    // record of the requests below.
-    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    let guard = metrics::set_default_local_recorder(&recorder);
-    let fallback_lines = |scrape: &str| -> Vec<String> {
-        scrape
-            .lines()
-            .filter(|line| line.starts_with("smg_symphony_fallback_total"))
-            .map(str::to_string)
-            .collect()
-    };
-    for count in [" 1", " 2"] {
-        let (status, parser, answer) = chat(&router, UNKNOWN_MODEL, &HeaderMap::new()).await;
-        assert_eq!(status, StatusCode::OK, "{answer}");
-        assert_eq!(parser.as_deref(), Some("legacy"), "{answer}");
-        let lines = fallback_lines(&handle.render());
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            lines[0].contains("reason=\"no_table\"")
-                && lines[0].contains("table=\"none\"")
-                && lines[0].ends_with(count),
-            "{}",
-            lines[0]
-        );
-    }
-    let (status, parser, answer) = chat(&router, KNOWN_MODEL, &HeaderMap::new()).await;
-    assert_eq!(status, StatusCode::OK, "{answer}");
-    assert_eq!(parser.as_deref(), Some("symphony"), "{answer}");
-    let lines = fallback_lines(&handle.render());
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].ends_with(" 2"), "{}", lines[0]);
-    drop(guard);
-}
-
-/// A Responses turn names the parser that read it as the chat route does,
-/// on its JSON answer and on its SSE answer, in both modes: Symphony under
-/// the default (the registry's table for the model), the legacy parsers
-/// under the request's `X-SMG-Parser: legacy`; the chat answer of the same
-/// request says the same.
-#[tokio::test]
-async fn a_responses_answer_names_the_parser_the_chat_route_names() {
-    for mode in [Mode::Regular, Mode::PrefillDecode] {
-        let ctx = grpc_ctx_with_parsers(routing_mode(mode), ParserChoice::Symphony, None).await;
-        register_tokenizer_for(
-            &ctx,
-            KNOWN_MODEL,
-            CHAT_TEMPLATE,
-            (TABLE_OUTPUT, TABLE_OUTPUT_ID),
-        )
-        .await;
-        for worker_type in roles(mode) {
-            let port = spawn_engine(vec![TABLE_OUTPUT_ID]).await;
-            register_worker(
-                &ctx,
-                &format!("grpc://127.0.0.1:{port}"),
-                *worker_type,
-                ModelCard::new(KNOWN_MODEL),
-            );
-        }
-        let router = GrpcRouter::new(&ctx, mode).expect("router");
-        let mut legacy = HeaderMap::new();
-        legacy.insert("x-smg-parser", HeaderValue::from_static("legacy"));
-        for (headers, reader) in [(HeaderMap::new(), "symphony"), (legacy, "legacy")] {
-            let (status, parser, answer) = chat(&router, KNOWN_MODEL, &headers).await;
-            assert_eq!(status, StatusCode::OK, "{mode:?} {reader}: {answer}");
-            assert_eq!(
-                parser.as_deref(),
-                Some(reader),
-                "{mode:?} chat under {reader}: {answer}"
-            );
-            for stream in [false, true] {
-                let (status, parser, answer) =
-                    responses(&router, KNOWN_MODEL, &headers, stream).await;
-                assert_eq!(
-                    status,
-                    StatusCode::OK,
-                    "{mode:?} {reader}, stream {stream}: {answer}"
-                );
-                assert_eq!(
-                    parser.as_deref(),
-                    Some(reader),
-                    "{mode:?} responses under {reader}, stream {stream}: {answer}"
-                );
-                assert!(
-                    answer.contains("lookup"),
-                    "{mode:?} {reader}, stream {stream}: {answer}"
-                );
-            }
         }
     }
 }

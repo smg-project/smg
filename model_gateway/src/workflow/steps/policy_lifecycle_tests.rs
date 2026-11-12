@@ -37,7 +37,6 @@ fn app_context() -> Arc<AppContext> {
             .round_robin_policy()
             .build_unchecked(),
         Arc::new(WorkerRegistry::new()),
-        None,
     )
 }
 
@@ -401,7 +400,6 @@ async fn a_removal_prunes_the_engines_rows_of_the_worker_a_replacement_put_in_it
             .policy_engine(PolicyEngineMode::Engine)
             .build_unchecked(),
         Arc::new(WorkerRegistry::new()),
-        None,
     );
     // A registration of the same URL for another model replaces the handle
     // (a registration for the same model is the same worker).
@@ -515,7 +513,6 @@ impl BookedPair {
                 .policy_engine(PolicyEngineMode::Engine)
                 .build_unchecked(),
             Arc::new(WorkerRegistry::new()),
-            None,
         );
         let found = worker("http://w1:8000", "llama");
         register(&app_context, Arc::clone(&found), "least_load").await;

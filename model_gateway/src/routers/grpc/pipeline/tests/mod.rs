@@ -64,7 +64,7 @@ use crate::{
                 symphony::template::Templates,
             },
             test_engine::serve_on_loopback,
-            tokenizer_cache,
+            tokenizer_cache, utils,
             utils::tonic_ext::TonicStatusExt,
         },
     },
@@ -550,8 +550,8 @@ async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponent
     components_with_multimodal(worker_registry, false).await
 }
 
-/// Components over `tokenizer_registry` and `worker_registry` with the
-/// legacy parser choice; `with_multimodal` adds the multimodal bundle
+/// Components over `tokenizer_registry` and `worker_registry` with no
+/// parser names; `with_multimodal` adds the multimodal bundle
 /// (default settings) so media reaches the multimodal path instead of the
 /// "not available" refusal. The bundle's model config is read from the
 /// tokenizer's source, so the caller's tokenizer decides whether there is
@@ -576,13 +576,10 @@ fn shared_components(
         templates: Arc::new(Templates::new(tokenizer_registry.clone())),
         tokenizer_registry,
         worker_registry,
-        tool_parser_factory: ToolParserFactory::default(),
-        reasoning_parser_factory: ReasoningParserFactory::default(),
         parser_resolver: utils::ParserResolver::disabled(),
         multimodal,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: ParserChoice::Legacy,
     })
 }
 
@@ -744,7 +741,7 @@ async fn chat_pipeline_over(
     .await;
     let worker_registry = Arc::new(WorkerRegistry::new());
     register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, labels);
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,
@@ -891,7 +888,7 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
         .await;
         let worker_registry = Arc::new(WorkerRegistry::new());
         register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, &[]);
-        let deps = PipelineDeps::pair(
+        let deps = PipelineDeps::new(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             None,
@@ -962,7 +959,7 @@ fn completion_pipeline_with_admission(
     mode: Mode,
     prefill_admission: Option<Arc<PrefillAdmission>>,
 ) -> RequestPipeline {
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         prefill_admission,
@@ -976,7 +973,7 @@ fn completion_pipeline_with_policy(
     worker_registry: &Arc<WorkerRegistry>,
     policy: PolicyConfig,
 ) -> RequestPipeline {
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         Arc::new(PolicyRegistry::new(policy)),
         None,
@@ -2408,7 +2405,7 @@ async fn responses_context_over(
     worker_registry: &Arc<WorkerRegistry>,
     background_slots: usize,
 ) -> ResponsesContext {
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,
@@ -3149,7 +3146,7 @@ async fn v41_run_chat_on(
     .await;
     let worker_registry = Arc::new(WorkerRegistry::new());
     register_worker_with_labels(&worker_registry, port, WorkerType::Regular, worker_labels);
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,
@@ -3674,13 +3671,10 @@ async fn a_404_from_the_preparation_stage_is_reported_once_and_marked() {
         templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
         tokenizer_registry: Arc::new(TokenizerRegistry::new()),
         worker_registry,
-        tool_parser_factory: ToolParserFactory::default(),
-        reasoning_parser_factory: ReasoningParserFactory::default(),
         parser_resolver: utils::ParserResolver::disabled(),
         multimodal: None,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: ParserChoice::Legacy,
     });
 
     let response = pipeline
@@ -3847,7 +3841,7 @@ async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
     let port = spawn_stub(scheduler).await;
     let worker_registry = Arc::new(WorkerRegistry::new());
     let worker = register_worker(&worker_registry, port, WorkerType::Regular);
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,
@@ -3926,7 +3920,7 @@ async fn silent_worker_pipeline(
     let port = spawn_stub(scheduler.clone()).await;
     let worker_registry = Arc::new(WorkerRegistry::new());
     let worker = register_worker(&worker_registry, port, WorkerType::Regular);
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,

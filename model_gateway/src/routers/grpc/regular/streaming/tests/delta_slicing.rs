@@ -10,11 +10,14 @@ use std::time::Duration;
 use axum::{body::Body, http::StatusCode};
 use http_body_util::BodyExt;
 use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};
+use symphony::{formats::qwen3, CallSyntax};
 use tokio::{sync::oneshot, time::timeout};
 
 use super::{
     super::*,
-    eof::{chunk, complete, gated_stream, processor, CharacterTokenizer},
+    eof::{
+        chunk, complete, gated_stream, processor, read_by, CharacterTokenizer, ASSISTANT_PROMPT,
+    },
 };
 
 /// Chunks per stream: two-character deltas, so a re-slicer holds all of them
@@ -41,7 +44,11 @@ fn spec_for(model: &str) -> ChatResponseSpec {
         "model": model, "messages": [], "stream": true
     }))
     .expect("chat request");
-    ChatResponseSpec::from(&request)
+    read_by(
+        ChatResponseSpec::from(&request),
+        qwen3(CallSyntax::Json),
+        ASSISTANT_PROMPT,
+    )
 }
 
 /// The next non-empty content delta of the SSE body, `None` at its end.
@@ -85,7 +92,7 @@ async fn content_deltas_around_the_park(model: &str) -> (Vec<String>, Vec<String
         weight_version: None,
     };
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
-    let response = Arc::new(processor(false))
+    let response = Arc::new(processor())
         .process_streaming_response(
             context::ExecutionResult::Single {
                 stream,

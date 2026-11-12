@@ -9,10 +9,10 @@ pub(super) use std::sync::{
 pub(super) use llm_tokenizer::{registry::TokenizerRegistry, traits::Tokenizer};
 pub(super) use openai_protocol::{
     chat::ChatCompletionRequest, common::Tool, messages::CreateMessageRequest,
+    worker::ToolConstraint,
 };
 pub(super) use serde_json::{json, Value};
 pub(super) use symphony::{formats::qwen3, CallSyntax, EngineFinish, Event, Events, Format};
-pub(super) use tool_parser::ToolConstraint;
 
 pub(super) use super::{
     constraint::*, names::*, reader::*, telemetry::Who, template::Templates, *,
@@ -71,44 +71,30 @@ pub(super) fn templates() -> Templates {
     Templates::new(Arc::new(TokenizerRegistry::new()))
 }
 
-/// [`super::check_names`] of the labels, against the legacy registries as the gateway builds
-/// them.
-pub(super) fn check(parser: ParserChoice, names: &ModelNames<'_>) -> Result<(), String> {
-    let tools = tool_parser::ParserFactory::new();
-    let reasoning = reasoning_parser::ParserFactory::new();
-    check_names(parser, &names.labels, Some(&tools), Some(&reasoning)).map_err(String::from)
+/// [`super::check_names`] of the labels, as the text the startup check reports.
+pub(super) fn check(names: &ModelNames<'_>) -> Result<(), String> {
+    check_names(&names.labels).map_err(String::from)
 }
 
 /// [`super::assign`] with no templates: the names never say `hf`, so nothing is refused.
 pub(super) fn assign(
-    parser: ParserChoice,
     names: &ModelNames<'_>,
     request: &ChatCompletionRequest,
     constraint: Option<&(String, String)>,
     prompt: &str,
-) -> Option<Assignment> {
-    super::assign(
-        parser,
-        names,
-        Asks::Chat(request),
-        constraint,
-        prompt,
-        &templates(),
-    )
-    .expect("no hf")
+) -> Assignment {
+    super::assign(names, Asks::Chat(request), constraint, prompt, &templates()).expect("no hf")
 }
 
 /// [`super::constraint`](fn@super::constraint) with no templates, as [`assign`]; a JSON answer's
 /// tag as a worker that does not say where it starts the grammar takes it.
 pub(super) fn constraint(
-    parser: ParserChoice,
     names: &ModelNames<'_>,
     request: &ChatCompletionRequest,
     tools: &[Tool],
     reasoning_open: bool,
 ) -> Option<ToolConstraint> {
     super::constraint(
-        parser,
         names,
         Asks::Chat(request),
         tools,
@@ -277,6 +263,7 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
         prompt: "<|im_start|>assistant\n".to_string(),
         forbids_calls: false,
         past_the_end: false,
+        forcing: None,
         span: tracing::Span::none(),
         marked: Arc::default(),
     };

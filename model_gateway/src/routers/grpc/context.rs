@@ -21,9 +21,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::RequestDeadline;
-use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
 use super::{
@@ -53,7 +51,6 @@ use super::{
     utils::{Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
-    config::ParserChoice,
     middleware::TenantRequestMeta,
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
@@ -204,10 +201,8 @@ impl std::fmt::Display for FinalResponse {
 pub(crate) struct SharedComponents {
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub worker_registry: Arc<WorkerRegistry>,
-    pub tool_parser_factory: ToolParserFactory,
-    pub reasoning_parser_factory: ReasoningParserFactory,
-    /// Per-request parser-name resolution (model-card override → configured
-    /// CLI `--tool-call-parser`/`--reasoning-parser` names).
+    /// Per-request parser-name resolution: the model's cards (its workers' labels) and the
+    /// gateway's `--tool-call-parser` and `--reasoning-parser` names, apart.
     pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
@@ -221,9 +216,6 @@ pub(crate) struct SharedComponents {
     /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
     /// of the not-ready 503 of a load in flight.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
-    /// Which parser reads a chat completion's or a message's output unless the request's
-    /// `X-SMG-Parser` header says otherwise (see `regular::symphony`).
-    pub parser: ParserChoice,
     /// The tables the registered tokenizers' response templates compile into, which the parser
     /// name `hf` selects (see `regular::symphony::template`).
     pub templates: Arc<Templates>,
@@ -235,13 +227,6 @@ pub(crate) struct SharedComponents {
 pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
-
-    /// The parser for this chat completion or message. Preparation sets the request's choice,
-    /// from its `X-SMG-Parser` header or the configured default; request building then sets the
-    /// parser that reads the response, Symphony when a table takes the request and legacy
-    /// otherwise, which the response reports as `x-smg-parser`. `None` on the other endpoints,
-    /// which keep the legacy parsers.
-    pub parser: Option<ParserChoice>,
 
     /// The parser names the request's model's cards set (its workers' labels), resolved once
     /// in preparation (`reading::prepare`: one resolution, a walk over the model's workers per
@@ -264,8 +249,8 @@ pub(crate) struct ProcessingState {
     /// did not replay (the request's thinking switch armed the reasoning, or the endpoint's
     /// preparation reads no prompt); a decision then replays itself.
     pub prompt_thought: Option<PromptReplay>,
-    /// The table decision for the request's model under its parser (`regular::symphony::reading`:
-    /// the table that reads the response, or why the legacy parsers do), as the chat and Messages
+    /// The table decision for the request's model (`regular::symphony::reading`: the table that
+    /// reads the response), as the chat and Messages
     /// preparations made it once for the replay, the constraint and the decoder's special tokens
     /// (`reading::prepare`): request building's assignment reads it in its place
     /// (`reading::decide`), so those four share one decision. The whole turn's grammar and the
@@ -412,8 +397,6 @@ pub(crate) struct DispatchContext {
     /// unlike `root_request_id`, which cache tracing alone fills.
     pub request_id: Option<String>,
     pub cache_trace: Option<String>,
-    /// The parser that read a chat completion, for the response's `x-smg-parser` header.
-    pub parser: Option<ParserChoice>,
     pub attempt: u32,
     /// The request's bookkeeping across attempts: circuit-breaker charges
     /// and the workers whose answer was definitive.
@@ -1166,7 +1149,6 @@ impl RequestContext {
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
-        let parser = state.parser;
         drop(components);
         let routing = state.routing_snapshot.ok_or_else(|| {
             error!(
@@ -1200,7 +1182,6 @@ impl RequestContext {
             },
             request_id,
             cache_trace: None,
-            parser,
             attempt: 0,
             ledger: AttemptLedger::default(),
             tried: Vec::new(),

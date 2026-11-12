@@ -14,7 +14,7 @@ use smg::{
         validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
         ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
         HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
-        MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
+        MetricsConfig, OracleConfig, PdPairingMode, PdReadinessConfig, PolicyConfig,
         PolicyEngineMode, PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig,
         RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
         TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
@@ -1268,7 +1268,6 @@ impl CliArgs {
                 l1_max_memory: self.model.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.model.disable_tokenizer_autoload)
-            .parser(ParserChoice::parse(&self.model.parser).unwrap_or_default())
             .history_backend(history_backend)
             .memory_config(MemoryConfig {
                 max_responses: self.model.history_memory_max_responses,

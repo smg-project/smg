@@ -9,7 +9,6 @@ use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
 use openai_protocol::completion::CompletionRequest;
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg::{
     app_context::AppContext,
     config::{PolicyConfig, RouterConfig, RoutingMode},
@@ -23,7 +22,6 @@ use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
-use tool_parser::ParserFactory as ToolParserFactory;
 
 use crate::common::mock_tokenizer_registry;
 
@@ -90,8 +88,6 @@ async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
             .router_config(config.clone())
             .client(smg::server::http_client())
             .tokenizer_registry(tokenizer_registry)
-            .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
-            .tool_parser_factory(Some(ToolParserFactory::new()))
             .worker_registry(Arc::new(WorkerRegistry::new()))
             .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
             .response_storage(Arc::new(MemoryResponseStorage::new()))

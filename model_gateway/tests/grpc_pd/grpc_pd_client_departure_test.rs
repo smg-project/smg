@@ -15,17 +15,14 @@
 //! a chosen time and records when the abort for the request reaches it.
 
 use std::{
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
 use common::{
     decode_stream::{chunk, complete, complete_with},
     engine_answers::{
-        TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
+        Aborts, TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
     },
     grpc_harness::{
         build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine,
@@ -70,33 +67,6 @@ enum Answer {
     WholeAnswerLate,
     /// The first token after [`FIRST_TOKEN_AFTER`], the rest at once.
     FirstTokenLate,
-}
-
-/// The instants the engine was asked to abort a request, and its calls.
-#[derive(Clone, Default)]
-struct Aborts {
-    at: Arc<Mutex<Vec<Instant>>>,
-    calls: Arc<AtomicUsize>,
-}
-
-impl Aborts {
-    #[expect(clippy::expect_used, reason = "test helper")]
-    fn note(&self) {
-        self.at.lock().expect("aborts lock").push(Instant::now());
-    }
-
-    /// The first abort's instant, waited for up to `within`.
-    #[expect(clippy::expect_used, reason = "test helper")]
-    async fn first_within(&self, within: Duration) -> Option<Instant> {
-        let started = Instant::now();
-        while started.elapsed() < within {
-            if let Some(at) = self.at.lock().expect("aborts lock").first().copied() {
-                return Some(at);
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        None
-    }
 }
 
 /// A parallel-shape decode engine (the TokenSpeed proto).

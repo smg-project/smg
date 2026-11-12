@@ -144,7 +144,7 @@ for fam in "${families[@]}"; do
       run_family tenants MODEL=mock-model "GW_ARGS=--trust-tenant-header --tenant-rate-limit-enabled --tenant-rate-limit-config $GS_DIR/tenants.yaml" -- \
         "t200=--mode chat --rate 1000 --tenants 200 --prompt-tokens 64 --max-tokens 8 ${common[*]}" ;;
     tools)
-      run_family tools MODEL=mock-model "GW_ARGS=--parser symphony --tool-call-parser qwen --reasoning-parser qwen3" -- \
+      run_family tools MODEL=mock-model "GW_ARGS=--tool-call-parser qwen --reasoning-parser qwen3" -- \
         "tools500=--mode tools --rate 500 --turns 10 --tools 8 --max-tokens 8 ${common[*]}" \
         "tools500s=--mode tools --stream --rate 500 --turns 10 --tools 8 --max-tokens 64 ${common[*]}" ;;
     responses)

@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 # The text the trap springs on: no model's answer carries it by chance.
 MARKER = "TRAP-7f3a-READER"
 ANSWER = f"The forecast is {MARKER} and sunny."
-SYMPHONY = {"x-smg-parser": "symphony"}
 
 
 def _request(model: str, stream: bool) -> dict:
@@ -80,11 +79,9 @@ class TestReaderPanicIsolation:
             "POST",
             f"{gateway.base_url}/v1/chat/completions",
             json=_request(model, stream=True),
-            headers=SYMPHONY,
             timeout=60.0,
         ) as resp:
             assert resp.status_code == 200, resp.read()
-            assert resp.headers.get("x-smg-parser") == "symphony", dict(resp.headers)
             payloads = [
                 line[len("data: ") :] for line in resp.iter_lines() if line.startswith("data: ")
             ]
@@ -108,7 +105,6 @@ class TestReaderPanicIsolation:
         resp = httpx.post(
             f"{gateway.base_url}/v1/chat/completions",
             json=_request(model, stream=False),
-            headers=SYMPHONY,
             timeout=60.0,
         )
         logger.info("non-streamed response: %s %s", resp.status_code, resp.text)
@@ -130,7 +126,6 @@ class TestReaderPanicIsolation:
         resp = httpx.post(
             f"{gateway.base_url}/v1/chat/completions",
             json=_request(model, stream=False),
-            headers=SYMPHONY,
             timeout=60.0,
         )
 

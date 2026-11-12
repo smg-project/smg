@@ -36,8 +36,7 @@ use crate::{
         common::json_response,
         error,
         grpc::common::responses::{
-            ensure_mcp_connection, load_history, naming_parser, BackgroundStream, ReplayInto,
-            ResponsesContext,
+            ensure_mcp_connection, load_history, BackgroundStream, ReplayInto, ResponsesContext,
         },
     },
 };
@@ -76,8 +75,7 @@ pub(crate) async fn route_responses(
 /// The work of a background response (`background: true` without a stream):
 /// the sync path under the id its `queued` record was stored under; the
 /// terminal object is persisted under that id by the path itself. Its client
-/// has the `queued` object before any read, so the parser that read the
-/// answer has no header to ride on here (the background stream names it).
+/// has the `queued` object before any read.
 pub(crate) async fn route_responses_background(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
@@ -92,9 +90,7 @@ pub(crate) async fn route_responses_background(
         response_id: Some(response_id),
         tenant_request_meta,
     };
-    non_streaming::route_responses_internal(ctx, request, params)
-        .await
-        .map(|(responses_response, _parser)| responses_response)
+    non_streaming::route_responses_internal(ctx, request, params).await
 }
 
 /// A background response the client streams: the stream runs under the id
@@ -120,18 +116,14 @@ pub(crate) async fn route_responses_background_stream(
 // Synchronous Entry Point
 // ============================================================================
 
-/// Execute synchronous responses request; the answer names the parser that
-/// read it, as the chat route does.
+/// Execute synchronous responses request
 async fn route_responses_sync(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     params: ResponsesCallContext,
 ) -> Response {
     match non_streaming::route_responses_internal(ctx, request, params).await {
-        Ok((responses_response, parser)) => naming_parser(
-            json_response(&responses_response),
-            parser.map(|parser| http::HeaderValue::from_static(parser.name())),
-        ),
+        Ok(responses_response) => json_response(&responses_response),
         Err(response) => response, // Already a Response with proper status code
     }
 }
