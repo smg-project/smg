@@ -3792,6 +3792,21 @@ fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), Validation
     validate_metadata_pairs(metadata.iter())
 }
 
+/// The public API's bound on the number of `metadata` pairs (16) for a count
+/// read on its own (a stored object once a patch is merged into it):
+/// `object_above_max_properties` above it.
+pub fn validate_metadata_pair_count(count: usize) -> Result<(), ValidationError> {
+    if count > MAX_METADATA_PAIRS {
+        return Err(invalid(
+            "object_above_max_properties",
+            format!(
+                "Invalid 'metadata': too many properties. The object has {count} properties, but the maximum is {MAX_METADATA_PAIRS}."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The public API's bounds on a `metadata` object, for any map of its pairs:
 /// at most 16 pairs (`object_above_max_properties`), keys of at most 64
 /// characters and string values of at most 512 (`string_above_max_length`),
@@ -3801,15 +3816,7 @@ fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), Validation
 pub fn validate_metadata_pairs<'a>(
     pairs: impl ExactSizeIterator<Item = (&'a String, &'a Value)>,
 ) -> Result<(), ValidationError> {
-    if pairs.len() > MAX_METADATA_PAIRS {
-        return Err(invalid(
-            "object_above_max_properties",
-            format!(
-                "Invalid 'metadata': too many properties. The object has {} properties, but the maximum is {MAX_METADATA_PAIRS}.",
-                pairs.len()
-            ),
-        ));
-    }
+    validate_metadata_pair_count(pairs.len())?;
     for (key, value) in pairs {
         if key.chars().count() > MAX_METADATA_KEY_CHARS {
             return Err(invalid(

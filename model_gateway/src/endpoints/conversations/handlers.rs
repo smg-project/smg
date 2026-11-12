@@ -13,7 +13,10 @@ use axum::{
 };
 use openai_protocol::{
     common::json_type_name,
-    responses::{validate_input_message_role, validate_metadata_pairs, ResponseContentPart},
+    responses::{
+        validate_input_message_role, validate_metadata_pair_count, validate_metadata_pairs,
+        ResponseContentPart,
+    },
 };
 use serde_json::{json, Value};
 use smg_data_connector::{
@@ -197,8 +200,10 @@ fn validate_metadata(value: &Value) -> Result<Option<serde_json::Map<String, Val
 }
 
 /// `current` with the `metadata` patch of an update body applied (a null
-/// value removes its key), under the same bounds as a create's metadata; a
-/// patch that crosses them changes nothing.
+/// value removes its key). The key and value rules are read on the patch's
+/// own pairs, so a pair stored before these rules held does not block an
+/// unrelated patch; the 16-pair bound is the stored object's and is read on
+/// the merged result. A patch that crosses either changes nothing.
 fn apply_metadata_patches(
     current: Option<serde_json::Map<String, Value>>,
     body: &Value,
@@ -209,6 +214,13 @@ fn apply_metadata_patches(
         None => return Ok(current),
     };
 
+    // A null value removes its key and is not a value under the rules.
+    let patched: Vec<(&String, &Value)> = patch_map
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .collect();
+    validate_metadata_pairs(patched.iter().copied())
+        .map_err(|error| metadata_refused(&error.code, error.message.as_deref()))?;
     let mut result = current.unwrap_or_default();
     for (k, v) in patch_map {
         if v.is_null() {
@@ -217,7 +229,7 @@ fn apply_metadata_patches(
             result.insert(k.clone(), v.clone());
         }
     }
-    validate_metadata_pairs(result.iter())
+    validate_metadata_pair_count(result.len())
         .map_err(|error| metadata_refused(&error.code, error.message.as_deref()))?;
 
     Ok(if result.is_empty() {
@@ -1071,7 +1083,7 @@ fn validate_message_fields(item_val: &Value) -> Result<(), Response> {
         Some(Value::Array(parts)) => {
             for (index, part) in parts.iter().enumerate() {
                 if let Err(error) = serde_json::from_value::<ResponseContentPart>(part.clone()) {
-                    return Err(part_refused(index, &error.to_string()));
+                    return Err(part_refused(index, part, &error.to_string()));
                 }
             }
             Ok(())
@@ -1088,30 +1100,59 @@ fn validate_message_fields(item_val: &Value) -> Result<(), Response> {
 }
 
 /// The refusal of a message content part the typed part does not read, under
-/// the public API's code for serde's reason: an unknown `type` is
-/// `invalid_value` on the part's type, a missing field
-/// `missing_required_parameter` on that field, any other shape `invalid_type`
-/// on the part.
-fn part_refused(index: usize, reason: &str) -> Response {
-    let (param, code) = if reason.starts_with("unknown variant") {
-        (format!("items[].content[{index}].type"), "invalid_value")
-    } else if let Some(field) = reason
+/// the public API's code for serde's reason, on the field the reason names
+/// without a guess: a part that is not an object is `invalid_type`; one
+/// without a `type` is `missing_required_parameter` on its type, one whose
+/// `type` is not a string `invalid_type` on it, one whose `type` is outside
+/// the part set `invalid_value` on it; a missing field of a part that holds
+/// nothing nested is `missing_required_parameter` on that field. serde names
+/// a missing field or an unknown variant without its path, so an error that
+/// may come from inside a nested value (an annotation's field, a `detail`
+/// outside its set) names the part itself, under the code of its kind.
+fn part_refused(index: usize, part: &Value, reason: &str) -> Response {
+    let part_param = format!("items[].content[{index}]");
+    let missing_field = reason
         .strip_prefix("missing field `")
         .and_then(|rest| rest.split_once('`'))
-        .map(|(field, _)| field)
-    {
-        (
-            format!("items[].content[{index}].{field}"),
-            "missing_required_parameter",
-        )
-    } else {
-        (format!("items[].content[{index}]"), "invalid_type")
+        .map(|(field, _)| field);
+    let (param, code) = match part.get("type") {
+        _ if !part.is_object() => (part_param.clone(), "invalid_type"),
+        None | Some(Value::Null) => (format!("{part_param}.type"), "missing_required_parameter"),
+        Some(Value::String(own)) if unknown_variant_is(reason, own) => {
+            (format!("{part_param}.type"), "invalid_value")
+        }
+        Some(Value::String(_)) => {
+            let nested = part
+                .as_object()
+                .is_some_and(|fields| fields.values().any(|v| v.is_object() || v.is_array()));
+            match missing_field {
+                Some(field) if !nested => (
+                    format!("{part_param}.{field}"),
+                    "missing_required_parameter",
+                ),
+                Some(_) => (part_param.clone(), "missing_required_parameter"),
+                None if reason.starts_with("unknown variant") => {
+                    (part_param.clone(), "invalid_value")
+                }
+                None => (part_param.clone(), "invalid_type"),
+            }
+        }
+        Some(_) => (format!("{part_param}.type"), "invalid_type"),
     };
     refused(
         Some(&param),
         code,
-        &format!("Invalid 'items[].content[{index}]': {reason}"),
+        &format!("Invalid '{part_param}': {reason}"),
     )
+}
+
+/// Whether serde's reason is the unknown-variant refusal of `name` itself
+/// (``unknown variant `name`, expected ...``), not of a value nested in it.
+fn unknown_variant_is(reason: &str, name: &str) -> bool {
+    reason
+        .strip_prefix("unknown variant `")
+        .and_then(|rest| rest.strip_prefix(name))
+        .is_some_and(|rest| rest.starts_with('`'))
 }
 
 /// The content of a message item as it is stored and listed: a plain string
@@ -1602,6 +1643,43 @@ mod tests {
             Some(15),
             "{updated}"
         );
+
+        // A pair stored before these rules held (a number) does not block an
+        // unrelated patch: the key and value rules are read on the patch's own
+        // pairs, the pair count on the merged object.
+        let stored = conversations
+            .create_conversation(NewConversation {
+                id: None,
+                metadata: json!({"n": 5}).as_object().cloned(),
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let response = update_conversation(
+            &conversations,
+            None,
+            &stored.id.0,
+            json!({"metadata": {"a": "b"}}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let patched = json_of(response).await;
+        assert_eq!(patched["metadata"], json!({"n": 5, "a": "b"}), "{patched}");
+        let sixteen_more: serde_json::Map<String, Value> =
+            (0..16).map(|i| (format!("k{i}"), json!("v"))).collect();
+        let response = update_conversation(
+            &conversations,
+            None,
+            &stored.id.0,
+            json!({"metadata": Value::Object(sixteen_more)}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_of(response).await["error"]["code"],
+            "object_above_max_properties",
+            "the pair count is the merged object's"
+        );
     }
 
     /// A message item's `role`, `status` and content parts are refused outside
@@ -1667,6 +1745,39 @@ mod tests {
                 "items[].content[0]",
             ),
             (
+                message(json!({"content": [{"type": 7}]})),
+                "invalid_type",
+                "items[].content[0].type",
+            ),
+            (
+                message(json!({"content": ["a bare string"]})),
+                "invalid_type",
+                "items[].content[0]",
+            ),
+            // An error inside a nested value names the part, never a field of it
+            // that is fine or that it does not have.
+            (
+                message(json!({"content": [
+                    {"type": "input_image", "image_url": "https://example.com/a.png", "detail": "ultra"}
+                ]})),
+                "invalid_value",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": [
+                    {"type": "output_text", "text": "x", "annotations": [{"type": "url_citation", "url": "u"}]}
+                ]})),
+                "missing_required_parameter",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": [
+                    {"type": "output_text", "text": "x", "annotations": [{"type": "bogus"}]}
+                ]})),
+                "invalid_value",
+                "items[].content[0]",
+            ),
+            (
                 message(json!({"content": {"text": "x"}})),
                 "invalid_type",
                 "items[].content",
@@ -1701,6 +1812,22 @@ mod tests {
             create_conversation_items(&conversations, &items, None, &conv_id, json!([])).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_of(response).await["error"]["code"], "invalid_type");
+
+        // A batch refused at its second item under these rules stores nothing
+        // of its first: the whole batch is prepared before any write.
+        let items_before = items.stored_record_count();
+        let mixed = json!({"items": [
+            {"id": "msg_first", "type": "message", "role": "user", "content": "ok"},
+            {"type": "message", "role": "user", "content": "x", "status": "flying"}
+        ]});
+        let response =
+            create_conversation_items(&conversations, &items, None, &conv_id, mixed).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            items.stored_record_count(),
+            items_before,
+            "nothing of a refused batch is stored"
+        );
         let listed = json_of(
             list_conversation_items(&conversations, &items, None, &conv_id, None, None, None).await,
         )

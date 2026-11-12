@@ -187,6 +187,21 @@ async fn message_items_outside_the_public_sets_are_refused_and_not_stored() {
             "invalid_value",
             "items[].status",
         ),
+        (
+            json!([{"type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": "https://example.com/a.png", "detail": "ultra"}
+            ]}]),
+            "invalid_value",
+            "items[].content[0]",
+        ),
+        (
+            json!([
+                {"type": "message", "role": "user", "content": "ok"},
+                {"type": "message", "role": "user", "content": "x", "status": "flying"}
+            ]),
+            "invalid_value",
+            "items[].status",
+        ),
     ] {
         let (status, body) = call(&app, Method::POST, &items_uri, json!({"items": items})).await;
         assert_eq!(

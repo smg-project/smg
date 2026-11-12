@@ -7,8 +7,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 ### Added
 
 - `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
-  map of its pairs), `responses::validate_input_message_role` (an input message's role in the
-  public set) and `common::json_type_name` are public: a route that reads a metadata object or
+  map of its pairs), `responses::validate_metadata_pair_count` (its 16-pair bound alone, for a
+  count read on its own), `responses::validate_input_message_role` (an input message's role in
+  the public set) and `common::json_type_name` are public: a route that reads a metadata object or
   stores message items of its own (the gateway's Conversations routes) validates them with the
   rules the Responses request already validates with, in the same words and under the same codes.
 - `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
