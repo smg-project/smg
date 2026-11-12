@@ -621,7 +621,8 @@ impl Config {
             return Err(
                 "--worker-type gives the role to the HTTP workers alone or to the gRPC workers \
                  and ZMQ ranks together: pass --http-count or --grpc-count/--zmq-count, not \
-                 both (an HTTP worker i and a gRPC worker i would bind the same bootstrap port)"
+                 both (an HTTP worker i and a gRPC worker i would bind the same bootstrap port; \
+                 the ZMQ ranks bind after the gRPC workers)"
                     .to_string(),
             );
         }
@@ -1445,10 +1446,15 @@ mod tests {
         assert!(parse(&[&zmq[..], &["--worker-type", "encode"]].concat())
             .expect_err("the ZMQ ranks have no encode role")
             .contains("not encode"));
-        assert!(
+        let http_with_ranks =
             parse(&[&zmq[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
-                .expect_err("the HTTP workers alone or the gRPC workers and ZMQ ranks together take the role")
-                .contains("not both")
+                .expect_err(
+                "the HTTP workers alone or the gRPC workers and ZMQ ranks together take the role",
+            );
+        assert!(http_with_ranks.contains("not both"));
+        assert!(
+            http_with_ranks.contains("the ZMQ ranks bind after the gRPC workers"),
+            "with no gRPC worker the refusal names the rank that binds the HTTP worker's port: {http_with_ranks}"
         );
         assert!(parse(
             &[
