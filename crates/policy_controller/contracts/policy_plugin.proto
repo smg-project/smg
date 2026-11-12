@@ -310,6 +310,8 @@ message Candidate {
   // Reachable from one gateway only (a host-local wire); the id is in the
   // worker row, the view carries the bit.
   bool host_local = 24;
+  // Session keys with a request in flight on this worker; u16.
+  uint32 active_sessions = 25;
 }
 
 // One request as a decision sees it (design 4.1 `RequestFacts`). The

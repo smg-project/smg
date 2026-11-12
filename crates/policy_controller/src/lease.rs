@@ -10,6 +10,7 @@
 
 use crate::{
     decision::{Decision, Target},
+    sessions::SessionVerdict,
     view::{Health, LoadRow, WorkerId},
 };
 
@@ -51,6 +52,9 @@ pub struct Lease {
     /// The fingerprint of the session key, so a sticky in-flight cap counts
     /// per key per worker from leases; `0` when none.
     pub session_key: u64,
+    /// What the decision did with the session key, copied from its pick, so
+    /// the commit moves the key's pins by its own decision alone.
+    pub session: SessionVerdict,
     /// The host's clock at issue, microseconds since its origin. In-process
     /// only; the wire carries the dispatch deadline as a duration.
     pub issued_micros: u64,

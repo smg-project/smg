@@ -179,6 +179,7 @@
           "enum": [
             "least-load",
             "least-requests",
+            "fewest-sessions",
             "session-affinity",
             "prefix-affinity",
             "kv-pressure",
@@ -216,6 +217,18 @@
           },
           "required": [
             "least-requests"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "fewest-sessions": {
+              "$ref": "#/$defs/Weight"
+            }
+          },
+          "required": [
+            "fewest-sessions"
           ],
           "additionalProperties": false
         },
@@ -1107,14 +1120,14 @@
           }
         },
         "ttl_s": {
-          "description": "How long an idle key stays pinned, in seconds; above zero (default\n14400).",
+          "description": "How long an idle key stays pinned, in seconds; above zero (default\n14400), `4294967295` for ever.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 14400
         },
         "sweep_s": {
-          "description": "The sweep cadence of idle keys, in seconds; above zero (default 120).",
+          "description": "The sweep cadence of idle keys, in seconds; above zero (default 120),\n`4294967295` for never, allowed under a `ttl_s` for ever alone.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
@@ -1126,7 +1139,7 @@
           "default": "delegate"
         },
         "inflight_cap": {
-          "description": "How many requests of one key a worker carries before the next steps\naside; above zero (default 2).",
+          "description": "How many requests of one key a worker carries before the next steps\naside; above zero (default 2), `65535` for no cap.",
           "type": "integer",
           "format": "uint16",
           "minimum": 1,
@@ -1134,9 +1147,14 @@
           "default": 2
         },
         "issue_session_id": {
-          "description": "Issue a session id to a request that carries none (default false:\nthe host issues none).",
+          "description": "Issue a session id to a request that carries none (default false;\nnot in this build: set, it is refused by name).",
           "type": "boolean",
           "default": false
+        },
+        "recovery": {
+          "description": "Which pin leads once both of a key's pins are routable (default\n`original`).",
+          "$ref": "#/$defs/Recovery",
+          "default": "original"
         }
       },
       "additionalProperties": false,
@@ -1167,6 +1185,14 @@
           "type": "string",
           "const": "delegate"
         }
+      ]
+    },
+    "Recovery": {
+      "description": "Which of a key's two pins leads once both are routable again: the first\nworker the key was placed on (the manual policy's order) or the latest\none it was dispatched to (the sticky override's under `delegate`).",
+      "type": "string",
+      "enum": [
+        "original",
+        "latest"
       ]
     },
     "CanarySpec": {

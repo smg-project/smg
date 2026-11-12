@@ -201,6 +201,9 @@ pub struct PolicyRegistry {
     /// `routing_key_override.headers`; the first header present with a valid
     /// value wins.
     routing_key_headers: Arc<Vec<HeaderName>>,
+    /// The sticky routing-key override as configured: the policy engine's
+    /// default binding takes its sessions rule from it.
+    routing_key_override: RoutingKeyOverrideConfig,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
     /// The policy engine, when `--policy-engine engine` selected it: the one
@@ -213,8 +216,9 @@ pub struct PolicyRegistry {
 /// A sticky key with this many of its own requests already in flight on its
 /// pinned worker (router-local, counted per replica) is bypassed and the
 /// request reassigned. Guards one conversation stacking onto its pin; total
-/// worker load is not a respill trigger.
-const STICKY_INFLIGHT_CAP: usize = 2;
+/// worker load is not a respill trigger. The policy engine's override rule
+/// carries the same cap.
+pub(crate) const STICKY_INFLIGHT_CAP: u16 = 2;
 
 /// `conv_t2_r1` -> `conv`: strip one trailing `_r<n>` retry suffix, then one
 /// trailing `_t<n>` turn suffix. A bare retry suffix is stripped too: a retry
@@ -288,6 +292,7 @@ impl PolicyRegistry {
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
+            routing_key_override,
             pd_pairing_mode: PdPairingMode::default(),
             decider: None,
         }
@@ -319,7 +324,12 @@ impl PolicyRegistry {
         decode: &PolicyConfig,
     ) -> Self {
         if mode == PolicyEngineMode::Engine {
-            match Decider::from_configs(&self.default_policy_config, prefill, decode) {
+            match Decider::from_configs(
+                &self.default_policy_config,
+                prefill,
+                decode,
+                &self.routing_key_override,
+            ) {
                 Ok(decider) => self.host(decider),
                 Err(error) => {
                     error!(%error, "The policy engine refused a configuration the validator did not see; the legacy policies decide");
@@ -377,17 +387,12 @@ impl PolicyRegistry {
     /// The engine is built from the default policy and serves it by name: a
     /// model whose registration hint named another policy keeps that policy's
     /// legacy instance, and a hint naming the default's own preset shares the
-    /// engine's one instance of it. A request the sticky routing-key override
-    /// places keeps the keyed path, whose pin moves behind the engine's view
-    /// in a later step.
-    pub(crate) fn engine_for(
-        &self,
-        policy: &dyn LoadBalancingPolicy,
-        info: &SelectWorkerInfo<'_>,
-    ) -> Option<&Arc<Decider>> {
+    /// engine's one instance of it. A keyed request under the default policy
+    /// is the engine's too: its binding carries the sticky routing-key
+    /// override's sessions rule, or the manual policy's own.
+    pub(crate) fn engine_for(&self, policy: &dyn LoadBalancingPolicy) -> Option<&Arc<Decider>> {
         let decider = self.decider.as_ref()?;
-        let served = policy.name() == self.default_policy.name();
-        (served && self.sticky_for(policy, info).is_none()).then_some(decider)
+        (policy.name() == self.default_policy.name()).then_some(decider)
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and
@@ -555,8 +560,9 @@ impl PolicyRegistry {
         let namespaced = format!("{}:{model}:{role}:{key}", model.len());
         let key = namespaced.as_str();
 
-        let over_cap =
-            |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
+        let over_cap = |idx: usize| {
+            workers[idx].routing_key_inflight(load_key) >= usize::from(STICKY_INFLIGHT_CAP)
+        };
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
             cache_trace::selection(policy.name(), branch.as_str(), workers, result);
             Metrics::record_worker_manual_policy_branch(branch.as_str());
@@ -2227,7 +2233,10 @@ mod tests {
                 Some(("conversation", "header"))
             );
             let selected = reg.select_worker(&policy, &workers, &info).unwrap();
-            assert_eq!(selected, usize::from(guards.len() == STICKY_INFLIGHT_CAP));
+            assert_eq!(
+                selected,
+                usize::from(guards.len() == usize::from(STICKY_INFLIGHT_CAP))
+            );
             guards.push(WorkerLoadGuard::with_key(
                 workers[selected].clone(),
                 reg.sticky_key(Some(&headers), info.rid_key),
@@ -3273,12 +3282,14 @@ mod tests {
         );
     }
 
-    /// The engine decides the default policy's regular placements only: a
-    /// model whose hint named another policy, and a request the sticky
-    /// routing-key override places, keep the legacy path; without the
-    /// override a key is only a fact in the view.
+    /// The engine decides the default policy's regular placements, keyed or
+    /// not: under the sticky routing-key override the default binding pins
+    /// sessions; without it a key is only a fact in the view. A model whose
+    /// hint named another policy keeps the legacy path.
     #[test]
-    fn the_engine_decides_the_default_policy_outside_the_sticky_override() {
+    fn the_engine_decides_the_default_policy_keyed_or_not() {
+        use smg_policy_controller::Phase;
+
         let round_robin = PolicyConfig::RoundRobin;
         let policies = PolicyRegistry::with_override(
             round_robin.clone(),
@@ -3289,34 +3300,33 @@ mod tests {
         )
         .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
         let default = policies.get_default_policy();
-        let unkeyed = SelectWorkerInfo::default();
-        assert!(policies.engine_for(default.as_ref(), &unkeyed).is_some());
+        let pins = |policies: &PolicyRegistry| {
+            let decider = policies
+                .engine_for(policies.get_default_policy().as_ref())
+                .expect("the engine serves the default policy");
+            decider
+                .engine()
+                .binding("m", Phase::Single)
+                .is_some_and(|binding| binding.sessions.is_some())
+        };
+        assert!(
+            pins(&policies),
+            "the override is the default binding's rule"
+        );
 
         let hinted = policies.on_worker_added("hinted", Some("random"));
         assert_eq!(hinted.name(), "random");
         assert!(
-            policies.engine_for(hinted.as_ref(), &unkeyed).is_none(),
+            policies.engine_for(hinted.as_ref()).is_none(),
             "a hinted policy keeps its legacy instance"
         );
-
-        let headers = headers_with_routing_key("session-7");
-        let keyed = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..SelectWorkerInfo::default()
-        };
-        assert!(policies.engine_for(default.as_ref(), &keyed).is_none());
-        let by_rid = SelectWorkerInfo {
-            rid_key: Some("session-7"),
-            ..SelectWorkerInfo::default()
-        };
-        assert!(policies.engine_for(default.as_ref(), &by_rid).is_none());
+        assert!(policies.engine_for(default.as_ref()).is_some());
 
         let no_override = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
             PolicyEngineMode::Engine,
             &round_robin,
             &round_robin,
         );
-        let default = no_override.get_default_policy();
-        assert!(no_override.engine_for(default.as_ref(), &keyed).is_some());
+        assert!(!pins(&no_override), "without the override a key is a fact");
     }
 }

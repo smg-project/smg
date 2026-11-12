@@ -222,6 +222,20 @@ impl<'a> Identity<'a> {
         Self { hash, plain: None }
     }
 
+    /// A key within a scope (a model and a phase, fingerprinted by the host):
+    /// the fingerprint mixes the scope in, so one key names one session per
+    /// scope, and the plain form is kept. Never `0` for a present key.
+    pub fn scoped(key: &'a str, scope: u64) -> Self {
+        let mut h = fingerprint(key.as_bytes()) ^ scope.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        Self {
+            hash: if h == 0 { 1 } else { h },
+            plain: Some(key),
+        }
+    }
+
     pub const fn is_none(&self) -> bool {
         self.hash == 0
     }
@@ -306,6 +320,10 @@ pub struct Candidate {
     pub vision: bool,
     /// Reachable from one gateway only (a host-local wire).
     pub host_local: bool,
+    /// Session keys with a request in flight on this worker. Last because the
+    /// wire numbers its fields in the record's order and this one came after
+    /// the contract's first cut.
+    pub active_sessions: u16,
 }
 
 /// Media on the request: counts and bytes, for workers that take media.
