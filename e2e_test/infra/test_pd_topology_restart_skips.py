@@ -157,3 +157,39 @@ def test_original_two_asymmetric_geometry_and_ids_remain(monkeypatch):
         "2p1d-ptp1-dtp2": (("pd_grpc", (2, 1, 1, 2)),),
     }
     assert all(p.marks[0].name == "skipif" for p in rows.values())
+
+
+@pytest.mark.parametrize("verified", [True, False], ids=["reviewed-source", "legacy-source"])
+def test_both_original_asymmetric_param_markers_require_verified_read_source(monkeypatch, verified):
+    from importlib.machinery import ModuleSpec
+
+    sweep = _sweep(monkeypatch, "vllm", "moriio", "amd")
+    monkeypatch.setenv(constants.ENV_VLLM_MORIIO_MODE, "read")
+    monkeypatch.setenv(constants.ENV_VLLM_MORIIO_BACKEND, "rdma")
+    original_spec = sweep.importlib.util.spec_from_file_location
+
+    class SourceVerifierLoader:
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            def verify_installed():
+                if not verified:
+                    raise ValueError("installed source does not match the reviewed cohort")
+
+            module.verify_installed = verify_installed
+
+    def verifier_spec(name, path, *args, **kwargs):
+        if name == "_pd_moriio_read_image":
+            return ModuleSpec(name, SourceVerifierLoader())
+        return original_spec(name, path, *args, **kwargs)
+
+    # Install the verifier boundary before the real module constructs its
+    # parameter marks. Checking the helper alone would miss a blanket skip.
+    monkeypatch.setattr(sweep.importlib.util, "spec_from_file_location", verifier_spec)
+    sweep = importlib.reload(sweep)
+    rows = {p.id: p for p in sweep._TOPOLOGIES if "-ptp" in p.id}
+    assert set(rows) == {"1p2d-ptp2-dtp1", "2p1d-ptp1-dtp2"}
+    for row in rows.values():
+        assert row.marks[0].name == "skipif"
+        assert row.marks[0].args == (not verified,)
