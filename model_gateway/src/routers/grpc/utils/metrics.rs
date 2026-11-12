@@ -404,7 +404,7 @@ mod tests {
             // it was whole is the connection's fault, one over the limit the
             // answer's.
             (
-                error::internal_error("read_response_body_failed", "cut"),
+                error::bad_gateway("read_response_body_failed", "cut"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             (
