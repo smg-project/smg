@@ -13,12 +13,13 @@ allocate and copy" for eight traffic shapes.
 
 | file | what |
 |---|---|
-| `bed.sh up\|down\|status` | the fleet (12 realistic gRPC engines with KV events, an admin API) and the gateway, registered and probed; the gateway can be pinned to a cpu list and runs in its own transient systemd user scope when available, so its cgroup memory can be sampled |
+| `bed.sh up\|down\|status` | the fleet (12 realistic gRPC engines with KV events, an admin API) and the gateway, registered and probed; with `FLEET=prefill-decode` a prefill fleet (`PREFILL_WORKERS`, bootstrap ports, a 1 ms prompt-side answer) and a decode fleet (`WORKERS`, `--max-running` and the `max_running_requests` label at `DECODE_WINDOW`) registered with their roles, the gateway's prefill in-flight bound at `PREFILL_WINDOW`; with `FLEET=http` the same fleet on the mock's HTTP wire behind the gateway's HTTP regular path; the gateway can be pinned to a cpu list and runs in its own transient systemd user scope when available, so its cgroup memory can be sampled |
 | `stress_load` (bin of `crates/mock_worker`) | the open-loop client: `--mode chat\|tools\|responses\|image\|messages\|embeddings`, `--json-schema`, `--stream`, `--rate`, deterministic prompts with shared heads, tenants, tool-heavy conversations, `previous_response_id` chains, inline images; TTFB/TTFT/e2e percentiles, frames and inter-frame gaps, status and error counts |
 | `cell.sh <name> -- <client args>` | one cell: the sampler on the gateway, the client pinned elsewhere, optional `perf record -g` and heap-profile windows inside the sampled window, the metrics before and after |
 | `sample.py` | once a second: the gateway's CPU time, RSS (anon/file), threads, fds, cgroup `memory.current`/anon, and every 5 s the allocator gauges and request counters from `/metrics` |
 | `run_all.sh [family ...]` | the matrix below, each family on a bed of its own, cells interleaved and repeated |
-| `report.py <run dir>` | the tables: CPU ms/request, CPU us/frame, cores, latency percentiles, anon RSS start/end and slope (MB/min), peak RSS, jemalloc live bytes, shed counts; and the mean over repeats |
+| `report.py <run dir> [--bounds bounds.toml]` | the tables: CPU ms/request, CPU us/frame, cores, latency percentiles, anon RSS start/end with its slope over the window and over the window's second half (MB/min; the second half's is the steady-state slope the verdict judges, past the warm-up growth), peak RSS, jemalloc live bytes, shed counts; the mean over repeats; and, with bounds, the verdict: a cell outside its bounds, or not reporting a bounded figure, is named with the figure and the bound, and the report exits 3 (2 when the bounds file names a figure the report does not judge) |
+| `bounds.toml` | the nightly's bounds per cell (failed and shed counts, the steady-state anon RSS slope, CPU ms/request, TTFT and e2e p99, peak RSS), set from the recorded nights under the nightly's configuration, as the file's header says; `run_all.sh` judges a run against it when `BOUNDS` names the file, as the nightly workflow does, so the nightly is red on a leak, a slower path or new shedding, not only on a bed that failed to run |
 | `perf_sites.py` | folds `perf script` output into top self symbols, the share of cycles in the allocator / memcpy / `Clone` impls, and the sites behind them (first frame outside the allocator or libc, with its caller) |
 | `heap_sites.py` | diffs two jemalloc heap profiles (`POST /heap_profile` at the window's start and end, `prof_accum:true`) into allocation sites by bytes and by objects, unbiased for the sampling interval, symbolized with `addr2line` |
 | `gen_images.py`, `gen_tenants.py` | the 4 MB noise PNGs of the image family and the 200-tenant rate-limit YAML |
@@ -60,4 +61,7 @@ with the same pinning; compare a change against `main` by running both
 binaries through the same cells, interleaved.
 
 Ports: gateway 29600, metrics 29601, admin 29609, workers 29610 and up
-(override with `GW_PORT`, `PROM_PORT`, `ADMIN_PORT`, `MOCK_BASE`).
+(override with `GW_PORT`, `PROM_PORT`, `ADMIN_PORT`, `MOCK_BASE`); the prefill-decode
+fleet adds the prefill engines after the decode engines, their bootstrap ports after
+those, and the prefill fleet's admin API at 29608 (`PREFILL_BASE`, `BOOTSTRAP_BASE`,
+`PREFILL_ADMIN_PORT`).

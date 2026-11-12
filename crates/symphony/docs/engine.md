@@ -53,7 +53,9 @@ What the engine decides for every format, and what it leaves open:
   fragments it sent and a `Malformed` event of no bytes, with the region's reason, before its
   end: a cut call is never handed over as a whole one without a word (`json::assembler`), and
   neither is a shaped call whose value never began, the cut or the close right after its header
-  (`json::Arguments::finish`). A tagged
+  (`json::Arguments::finish`), and neither is a shaped call whose tagged parameters the stream cut: its
+  arguments' object closes over the parameters that finished and the cut is said once before the
+  call's end, the bytes of a parameter the cut left open as the marker's text (`shape::Call::finish`). A tagged
   call the end of the stream cut ends the same way whatever stage the cut found, since the object
   the assembler writes closes only at the call's own end, and so does one whose close cut a streamed
   string, in every tag-based syntax (`tagged::end_cut_call`): no closing quote and no closing brace
@@ -198,8 +200,15 @@ loop {
   that starts a marker, the common content or reasoning delta) costs no copy. A run the engine
   held (a content stay's lead, a trimmed stay's tail, a shaped call's header), a run merged with
   an earlier one in the same buffer, and the events an assembler builds carry their text owned
-  (`Cow::Owned`): an arguments delta takes the whole-text path too, which saves it the scan and
-  the piece, but its bytes go to the assembler, whose events own their text and their JSON.
+  (`Cow::Owned`). An arguments delta takes the whole-text path too, which saves it the scan and
+  the piece, and its bytes go to the assembler: a JSON syntax (an object, a list of objects, a
+  forced call's value) passes the model's own bytes on as the call's fragments, so a fragment that
+  arrived in one delta borrows it, `json` and `source` alike (`Event::ToolCallArguments`), and
+  the engine fills one buffer of its own for the assembler's piece and keeps it between pieces;
+  a fragment that reaches back into an earlier delta (bytes the judge held, a word being spelled),
+  and the JSON a syntax writes for values given as text between tags, stay owned. The assembler's
+  own copy of the call's bytes still grows by doubling as the value lengthens: the one allocation
+  an arguments delta can still cost, now and then, with nothing per fragment.
 - The buffer's lifetime is the step's: `Events<'d>` cannot outlive the delta it borrows, so a
   delta's text lives with the caller, next to the buffer, and a caller that keeps events past the
   step takes them with `Event::into_owned` (or the whole buffer with `Events::into_owned`). A

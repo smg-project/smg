@@ -28,9 +28,14 @@
 //!   HTTP and gRPC families used to each carry a copy of
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
+//! - `test_support` (test builds only) — the fast retry policy the HTTP
+//!   and gRPC routers' tests retry under
 //! - `attempt_ledger` — one request's bookkeeping across its retry
 //!   attempts: the circuit breaker charged once per request per worker,
 //!   and a worker's definitive answer never replayed on it
+//! - `rate_limit_cell` — one logical request's tenant rate-limit
+//!   reservation: reserved once before any dispatch, then settled, handed
+//!   to a streaming body, or closed unsettled
 //! - [`request_lease`] — dispatch-phase owner of a request's parsed
 //!   body, routing derivatives and serialized upstream bytes, with a
 //!   retry-aware release point
@@ -54,6 +59,7 @@ pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
+pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
 pub mod request_lease;
 pub(crate) use smg_external_router::sglang_fields;
@@ -73,7 +79,7 @@ pub(crate) const STREAM_UPSTREAM_BODY_OVER: usize = 1 << 20;
 /// Buffer capacity for reserializing a parsed request of `raw_len` incoming
 /// bytes: the round trip stays close to raw size, and the 1/16 + 512B slack
 /// absorbs injected fields (bootstrap, kv_transfer_params, dp ranks).
-pub(crate) fn serialized_capacity(raw_len: usize) -> usize {
+fn serialized_capacity(raw_len: usize) -> usize {
     raw_len + raw_len / 16 + 512
 }
 
@@ -86,6 +92,79 @@ pub(crate) fn serialize_json_sized<T: serde::Serialize>(
     let mut buf = Vec::with_capacity(raw_len.map_or(128, serialized_capacity));
     serde_json::to_writer(&mut buf, value)?;
     Ok(buf)
+}
+
+/// The capacity a thread's JSON answer buffer keeps between answers: a chat
+/// completion, a Messages answer or a JSON-schema answer of a few hundred
+/// bytes fits it many times over; the buffer a larger answer grew goes with
+/// that answer.
+const JSON_ANSWER_RETAINED: usize = 64 * 1024;
+
+thread_local! {
+    /// The buffer a thread's typed JSON answers are serialized into.
+    static JSON_ANSWER_BUFFER: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A typed answer as a JSON response: serialized once into the thread's
+/// buffer (serde's own sink, one `extend_from_slice` per write) and copied
+/// once into a body of exactly its size, with the `application/json`
+/// content type. That is one allocation per answer: a buffer sized per
+/// answer and handed to the body by refcount cost two, the buffer and the
+/// shared header `Bytes::from` boxes for a buffer with spare capacity, and
+/// grew again for a body past its size. `axum::Json` writes the same bytes
+/// through `BytesMut::with_capacity(128).writer()`: the `bytes` writer
+/// adapter slices every write to the buffer's remaining room before it
+/// appends, which prices the one-byte JSON tokens (2.5 % of a chat
+/// request's user instructions on the mock bed), and the 128-byte start
+/// reallocates and copies a 700-byte body three times. A value that does
+/// not serialize answers as axum does: a 500 with the error's text.
+pub fn json_response<T: serde::Serialize>(value: &T) -> axum::response::Response {
+    JSON_ANSWER_BUFFER.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buffer) => {
+            buffer.clear();
+            let result = serde_json::to_writer(&mut *buffer, value);
+            let response = json_answer(&buffer, result);
+            if buffer.capacity() > JSON_ANSWER_RETAINED {
+                *buffer = Vec::new();
+            }
+            response
+        }
+        // A serializer that answers while this thread's buffer is borrowed
+        // (none does today): a buffer of this answer's own.
+        Err(_) => {
+            let mut buffer = Vec::new();
+            let result = serde_json::to_writer(&mut buffer, value);
+            json_answer(&buffer, result)
+        }
+    })
+}
+
+/// The response of a serialized answer, compiled once for every `T`.
+fn json_answer(body: &[u8], result: serde_json::Result<()>) -> axum::response::Response {
+    use axum::{
+        http::{header, HeaderValue, StatusCode},
+        response::IntoResponse,
+    };
+    match result {
+        Ok(()) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            bytes::Bytes::copy_from_slice(body),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            error.to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// A typed request as a `Value`, for the forwarding paths that edit it:
@@ -125,6 +204,25 @@ pub(crate) fn attach_sized_body(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    //! What the HTTP and gRPC routers' tests share.
+
+    use crate::config::types::RetryConfig;
+
+    /// `max_retries` attempts with one to two milliseconds between them and
+    /// no jitter: a retrying test's whole schedule fits in its own bound.
+    pub(crate) fn fast_retry_config(max_retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -142,6 +240,39 @@ mod tests {
         assert_eq!(body.len(), raw.len());
         assert_eq!(body.capacity(), serialized_capacity(raw.len()));
         assert!(body.capacity() <= body.len() + body.len() / 8 + 1024);
+    }
+
+    #[test]
+    fn a_json_answer_is_the_serializer_bytes_under_the_json_content_type() {
+        use axum::http::{header, StatusCode};
+        let value = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "x".repeat(600)}}],
+        });
+        let response = json_response(&value);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+        assert_eq!(body, serde_json::to_vec(&value).unwrap());
+    }
+
+    #[test]
+    fn a_json_answer_that_does_not_serialize_is_a_plain_text_500() {
+        use axum::http::{header, StatusCode};
+        // A map keyed by a tuple has no JSON key: the serializer refuses it.
+        let value: std::collections::BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+        let response = json_response(&value);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
     }
 
     #[test]

@@ -238,11 +238,11 @@ pub(crate) async fn admit_decode(
     if rooms > window {
         Metrics::record_pd_admission_shed();
         debug!(
-            worker = decode.url(),
+            worker = decode.redacted_url(),
             model_id, window, rooms, "PD admission shed: more rooms than the decode window holds"
         );
         return Err(overload::shed_pd_admission(
-            decode.url(),
+            decode.redacted_url(),
             model_id,
             window,
             rooms,
@@ -271,7 +271,7 @@ pub(crate) async fn admit_decode(
         Claim::Waited => {
             Metrics::record_pd_admission_wait();
             debug!(
-                worker = decode.url(),
+                worker = decode.redacted_url(),
                 model_id, window, rooms, "PD admission waited for decode rooms"
             );
             Ok(Some(PdAdmissionGuard {
@@ -282,7 +282,7 @@ pub(crate) async fn admit_decode(
         Claim::Refused => {
             Metrics::record_pd_admission_shed();
             debug!(
-                worker = decode.url(),
+                worker = decode.redacted_url(),
                 model_id,
                 window,
                 rooms,
@@ -291,13 +291,28 @@ pub(crate) async fn admit_decode(
                 "PD admission shed: no decode rooms freed"
             );
             Err(overload::shed_pd_admission(
-                decode.url(),
+                decode.redacted_url(),
                 model_id,
                 window,
                 rooms,
             ))
         }
     }
+}
+
+/// Whether `decode`'s gate would seat one more room now: its running window
+/// has a room that none of the places already waiting at the gate is in line
+/// for. A worker that reports no window always would, as the gate abstains
+/// there. Two atomic reads, so a selection can ask it of every partner of a
+/// pick.
+///
+/// A wider place ahead (a batched plan) counts every room it needs, though
+/// the gate itself lets a narrower newcomer pass it: the answer is "no" more
+/// often than the gate waits, never "yes" where it would.
+pub(crate) fn has_free_room(decode: &dyn Worker) -> bool {
+    decode
+        .max_running_requests()
+        .is_none_or(|window| decode.pd_admitted() + decode.pd_waiting_rooms() < usize::from(window))
 }
 
 /// Announce a decode worker's admission bound as it registers.
@@ -317,11 +332,11 @@ pub(crate) fn announce_decode_window(worker: &dyn Worker) {
     Metrics::set_pd_admission_window(worker.url(), window);
     match window {
         Some(window) => debug!(
-            worker = worker.url(),
+            worker = worker.redacted_url(),
             window, "PD admission bounds dispatch to this decode worker by its running window"
         ),
         None => warn!(
-            worker = worker.url(),
+            worker = worker.redacted_url(),
             "PD admission is off for this decode worker: it reports no running window (no \
              `max_num_seqs` or `max_running_requests` label), so a burst wider than its \
              scheduler runs at once queues at the engine instead of waiting at the gateway"
@@ -360,6 +375,66 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    /// The selection's read of the gate: a worker without a window always
+    /// has a room (the gate abstains there); with one, the rooms claimed and
+    /// the rooms the waiting places need both take from it.
+    #[tokio::test]
+    async fn a_free_room_is_one_no_claim_and_no_waiting_place_has_taken() {
+        assert!(has_free_room(
+            decode_worker("grpc://127.0.0.1:9910", None).as_ref()
+        ));
+        let decode = decode_worker("grpc://127.0.0.1:9911", Some(2));
+        assert!(has_free_room(decode.as_ref()));
+        let first = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+        assert!(has_free_room(decode.as_ref()), "one of two rooms is free");
+        let place = decode.pd_enqueue(1);
+        assert!(
+            !has_free_room(decode.as_ref()),
+            "the free room is spoken for by the waiting place"
+        );
+        decode.pd_dequeue(place);
+        assert!(has_free_room(decode.as_ref()), "the place gave it back");
+        let second = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+        assert!(!has_free_room(decode.as_ref()), "the window is full");
+        drop(first);
+        assert!(
+            has_free_room(decode.as_ref()),
+            "a released room is free again"
+        );
+        drop(second);
+    }
+
+    /// A wide place ahead counts every room it needs: the gate itself would
+    /// let a narrower newcomer pass it, the selection answers no, and the
+    /// request goes to a sibling with a room when there is one.
+    #[test]
+    fn a_waiting_batch_counts_every_room_it_needs() {
+        let decode = decode_worker("grpc://127.0.0.1:9912", Some(4));
+        let batch = decode.pd_enqueue(3);
+        assert_eq!(decode.pd_waiting_rooms(), 3);
+        assert!(
+            has_free_room(decode.as_ref()),
+            "one room beyond the batch's three"
+        );
+        let behind = decode.pd_enqueue(2);
+        assert!(!has_free_room(decode.as_ref()));
+        decode.pd_dequeue(behind);
+        decode.pd_dequeue(batch);
+        decode.pd_dequeue(batch);
+        assert_eq!(
+            decode.pd_waiting_rooms(),
+            0,
+            "a place given back twice counts once"
+        );
+        assert!(has_free_room(decode.as_ref()));
     }
 
     /// An engine that reports no window keeps the pre-gate behavior: dispatch,

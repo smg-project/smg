@@ -60,6 +60,8 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           SUFFIX="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          # The `-slurm` variant (the router image with the Slurm clients) takes
+          # every tag with `-slurm` appended.
           if [ "$EXPRESS" = "true" ]; then
             # amd64-only: the floating :nightly stays multi-arch by not
             # retagging it here; consumers pin the suffixed tag.
@@ -67,6 +69,9 @@ jobs:
             {
               echo "list<<EOF"
               echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}"
+              echo "EOF"
+              echo "slurm_list<<EOF"
+              echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-slurm"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else
@@ -76,6 +81,10 @@ jobs:
               echo "ghcr.io/${OWNER}/smg:nightly"
               echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}"
               echo "EOF"
+              echo "slurm_list<<EOF"
+              echo "ghcr.io/${OWNER}/smg:nightly-slurm"
+              echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-slurm"
+              echo "EOF"
             } >> "$GITHUB_OUTPUT"
           fi
 
@@ -84,8 +93,22 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
+          target: router-image
           push: true
           tags: ${{ steps.tags.outputs.list }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: ${{ steps.tags.outputs.platforms }}
+
+      # The same build plus one apt layer: every other layer is a cache hit from the step above.
+      - name: Build and push the variant with the Slurm clients
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: router-slurm-image
+          push: true
+          tags: ${{ steps.tags.outputs.slurm_list }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: ${{ steps.tags.outputs.platforms }}

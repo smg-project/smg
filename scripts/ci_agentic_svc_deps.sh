@@ -36,6 +36,44 @@ check_port() {
     return 1
 }
 
+# An MCP server whose process is up but whose tool list is empty passes the
+# port check and then fails every MCP case of the e2e rows twenty minutes
+# later, with no line that names the service. So the Brave check also does
+# the MCP handshake (initialize, notifications/initialized, tools/list) and
+# fails here, naming the tool count, when the expected tool is not listed.
+# Same retry shape as check_port: a pod mid-restart gets its chances, a
+# server that stays empty-handed fails the step.
+check_mcp_tools() {
+    local name="$1" url="$2" expected="$3"
+    local attempts="${CHECK_PORT_RETRIES:-6}" delay="${CHECK_PORT_RETRY_DELAY:-5}"
+    local probe
+    probe="$(dirname "${BASH_SOURCE[0]}")/ci_mcp_list_tools.py"
+    local i
+    for ((i = 1; i <= attempts; i++)); do
+        echo "Listing $name tools at $url (attempt $i/$attempts)..."
+        # The probe bounds the whole handshake itself (--deadline 30 s, a
+        # process timer that interrupts whatever call is blocking, since a
+        # socket timeout alone never trips on a peer that keeps sending).
+        # The outer timeout sits well beyond it as the backstop for anything
+        # else that could hang an attempt; its exit 124 is a failed attempt
+        # like any other.
+        if timeout 60 python3 "$probe" "$url" --expect "$expected" --timeout 10 --deadline 30; then
+            return 0
+        fi
+        if [ "$i" -lt "$attempts" ]; then
+            sleep "$delay"
+        fi
+    done
+    echo "FAILED: $name at $url does not list '$expected' after $attempts attempts (the service's own tool registration, not the tests)"
+    return 1
+}
+
+check_brave() {
+    local host="$1"
+    check_port "Brave Search MCP" "$host" 8080 || return 1
+    check_mcp_tools "Brave Search MCP" "http://$host:8080/mcp" "brave_web_search"
+}
+
 ci_oracle_username() {
     local prefix="$1"
     local random="${CI_ORACLE_NAME_RANDOM:-$(openssl rand -hex 3)}"
@@ -105,9 +143,9 @@ cmd_check() {
                 fi ;;
             --brave)
                 if [[ -n "${2:-}" && "$2" != --* ]]; then
-                    check_port "Brave Search MCP" "$2" 8080 || failed=1; shift 2
+                    check_brave "$2" || failed=1; shift 2
                 else
-                    check_port "Brave Search MCP" "brave-search" 8080 || failed=1; shift
+                    check_brave "brave-search" || failed=1; shift
                 fi ;;
             *)  echo "Unknown service: $1"; exit 1 ;;
         esac

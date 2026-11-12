@@ -15,8 +15,12 @@ only. The Router cannot tell the two implementations apart.
 
 What the wire does not carry, the Rust path refuses by name rather than
 drops: beam search, the logits-returning flags, KV-cache retention, prompt
-tuning and lookahead configs. ``Embed`` and ``SubscribeKvEvents`` answer
-UNIMPLEMENTED, as the engine's Python servicer answers them.
+tuning and lookahead configs. ``Embed`` answers UNIMPLEMENTED, as the engine's
+Python servicer answers it. A ``loads_only`` ``SubscribeKvEvents`` streams the
+servicer's own load records; a full one answers UNIMPLEMENTED with the reason,
+since the server relays KV events only when handed a publisher endpoint (the
+``kv_events_endpoint`` fact) and this launcher hands none: the wire has no
+publisher yet.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from smg_grpc_servicer.constrained_decoding import structural_tag_vocabulary
 from smg_grpc_servicer.metrics_flag import add_metrics_arguments as _add_metrics_arguments
 
 # The lifecycle's defaults and the switch's flag and choices, re-exported:
@@ -128,8 +133,9 @@ def servicer_impl_source(
 ) -> tuple[str, str]:
     """:func:`resolve_servicer_impl`'s answer with where it came from
     (``flag``, ``env`` or ``default``: the shared
-    :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`)."""
-    return servicer_switch(SERVICER_IMPL_ENV, args, environ)
+    :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`, with the
+    engine's own Python servicer as this launcher's default)."""
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ, default="python")
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +223,11 @@ def server_facts(args: ServeArgs) -> dict[str, Any]:
     """``TrtllmGrpcServer`` keyword arguments for ``GetServerInfo`` and the
     engine's policies: the backend and version, the parallel sizes, the
     guided-decoding backend the arguments resolve to (``none`` when unset:
-    the engine enforces no grammar then), the admission window."""
+    the engine enforces no grammar then) and the vocabulary of structural-tag
+    nodes its xgrammar takes, the admission window."""
     llm_args = args.llm_args
     backend = llm_args.get("guided_decoding_backend")
+    guided_decoding_backend = str(backend).strip().lower() if backend else "none"
     return {
         "backend": str(llm_args.get("backend") or "pytorch"),
         "trtllm_version": _engine_version(),
@@ -229,7 +237,11 @@ def server_facts(args: ServeArgs) -> dict[str, Any]:
         # One shim per engine process; the engine's own parallelism sits
         # behind it.
         "data_parallel_size": 1,
-        "guided_decoding_backend": str(backend).strip().lower() if backend else "none",
+        "guided_decoding_backend": guided_decoding_backend,
+        # The vocabulary of structural-tag nodes that backend takes, when the
+        # xgrammar installed beside the engine predates the current one: the
+        # Router spells such a worker's structural tags in the older vocabulary.
+        "structural_tag_vocabulary": structural_tag_vocabulary(guided_decoding_backend),
         "max_running_requests": _llm_int(llm_args, "max_batch_size"),
     }
 

@@ -10,7 +10,11 @@ use std::{
     time::Duration,
 };
 
-use axum::{body::to_bytes, http::StatusCode, response::Response};
+use axum::{
+    body::{to_bytes, Body},
+    http::{header::CONTENT_TYPE, Request, StatusCode},
+    response::Response,
+};
 use llm_tokenizer::{chat_template::ChatTemplateParams, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     model_card::ModelCard,
@@ -19,15 +23,20 @@ use openai_protocol::{
 use scripted_tokenizer::ScriptedTokenizer;
 use serde_json::{json, Value};
 use smg::{
-    config::{ParserChoice, RouterConfig, RoutingMode},
+    app_context::AppContext,
+    config::{AccessLogField, ParserChoice, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
+    observability::log_format::{JsonLine, SpanFields},
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+use tower::ServiceExt;
+use tracing_subscriber::{layer::SubscriberExt, Layer};
 
+use super::{events, read, tokens};
 use crate::{common, scripted_tokenizer, scripted_worker};
 
 const MODEL: &str = "response-template-model";
@@ -68,25 +77,6 @@ fn qwen3_5_chat_template() -> String {
         .to_string()
 }
 
-/// Model output as tokens: each `<|...|>` alone, other text four characters at a time.
-fn tokens(output: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut rest = output;
-    while !rest.is_empty() {
-        let len = if rest.starts_with("<|") {
-            rest.find("|>").map_or(rest.len(), |end| end + 2)
-        } else {
-            let special = rest.find("<|").unwrap_or(rest.len());
-            rest.char_indices()
-                .nth(4)
-                .map_or(special, |(at, _)| at.min(special))
-        };
-        tokens.push(rest[..len].to_string());
-        rest = &rest[len..];
-    }
-    tokens
-}
-
 struct Setup {
     /// The tokenizer config's `response_template`, if it ships one.
     template: Option<Value>,
@@ -109,6 +99,8 @@ struct Setup {
     think_in_prefill: bool,
     /// Selection takes the workers in turn (round robin) instead of at random.
     round_robin: bool,
+    /// The optional fields of the access-log record (`access_log_fields`).
+    access_log_fields: Vec<AccessLogField>,
 }
 
 impl Default for Setup {
@@ -127,6 +119,7 @@ impl Default for Setup {
             eos: EOS,
             think_in_prefill: false,
             round_robin: false,
+            access_log_fields: Vec::new(),
         }
     }
 }
@@ -141,6 +134,8 @@ struct Engine {
 
 struct Gateway {
     router: Box<dyn RouterTrait>,
+    /// The context the router was built from, for a test that runs the production app over it.
+    context: Arc<AppContext>,
     workers: Vec<JoinHandle<()>>,
     /// Every request each worker received, one log per worker in the order they were served.
     requests: Vec<Arc<Mutex<Vec<ts::GenerateRequest>>>>,
@@ -256,6 +251,7 @@ async fn serve_engines(setup: Setup, engines: Vec<Engine>) -> Gateway {
     config.parser = setup.parser;
     config.reasoning_parser = setup.reasoning_parser.map(str::to_string);
     config.tool_call_parser = setup.tool_parser.map(str::to_string);
+    config.access_log_fields = setup.access_log_fields;
     // The chat template renders the generation prompt itself; the mock's own rendering gets
     // the tail the template would write.
     let mut tokenizer = ScriptedTokenizer::from_chunks(chunks).with_special_tokens(setup.eos);
@@ -303,6 +299,7 @@ async fn serve_engines(setup: Setup, engines: Vec<Engine>) -> Gateway {
     let router = RouterFactory::create_router(&context).await.unwrap();
     Gateway {
         router,
+        context,
         workers,
         requests: logs,
     }
@@ -310,18 +307,6 @@ async fn serve_engines(setup: Setup, engines: Vec<Engine>) -> Gateway {
 
 fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("test-tenant"))
-}
-
-#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test helper")]
-async fn read(response: impl std::future::Future<Output = Response>) -> String {
-    let response = timeout(Duration::from_secs(30), response)
-        .await
-        .expect("request should finish");
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    let body = String::from_utf8(bytes.to_vec()).unwrap();
-    assert_eq!(status, StatusCode::OK, "{body}");
-    body
 }
 
 /// The status and `error` object of a response the gateway refuses.
@@ -334,16 +319,6 @@ async fn refusal(response: impl std::future::Future<Output = Response>) -> (Stat
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     (status, body["error"].clone())
-}
-
-/// JSON payloads of an SSE body.
-#[expect(clippy::unwrap_used, reason = "test helper")]
-fn events(body: &str) -> Vec<Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(|data| serde_json::from_str(data).unwrap())
-        .collect()
 }
 
 fn tools() -> Value {
@@ -568,6 +543,119 @@ async fn hf_reads_chat_through_the_templates_table_whole_and_streamed() {
     assert!(chat.content.contains("<tool_call>"), "{chat:?}");
     assert_eq!(chat.finish, "stop");
     assert_eq!(gateway.last_constraint(), None);
+}
+
+/// A Qwen 3.5 output that calls a tool the request never declared.
+const UNDECLARED_CALL: &str = concat!(
+    "plan the call\n</think>\n\nChecking.\n",
+    "<tool_call>\n<function=get_wind>\n<parameter=city>\nParis\n</parameter>\n",
+    "</function>\n</tool_call><|im_end|>",
+);
+
+/// The bytes a test's log layer wrote.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    #[expect(clippy::unwrap_used, reason = "test helper")]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+
+    fn make_writer(&'a self) -> Capture {
+        self.clone()
+    }
+}
+
+/// The lines the gateway's own JSON line format wrote into `capture`, each parsed.
+#[expect(clippy::unwrap_used, reason = "test helper")]
+fn json_lines(capture: &Capture) -> Vec<Value> {
+    let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The access log of a streamed request through the production app. The finish line goes out
+/// with the headers, before the reader has read the output, so it never carries the reading.
+/// The stream's end line, written where `access_log_fields` names `response_bytes`, is written
+/// after the output ended and carries the reading's `symphony.*` fields; a clean output leaves
+/// none on it.
+#[tokio::test]
+async fn a_streamed_outputs_reading_is_on_the_streams_end_line() {
+    for (output, outcome) in [(OUTPUT, None), (UNDECLARED_CALL, Some("unknown_tool"))] {
+        let gateway = serve(Setup {
+            output,
+            access_log_fields: vec![AccessLogField::ResponseBytes],
+            ..Default::default()
+        })
+        .await;
+        let router: Arc<dyn RouterTrait> = Arc::from(
+            RouterFactory::create_router(&gateway.context)
+                .await
+                .unwrap(),
+        );
+        let app = common::test_app::create_test_app_with_context(router, gateway.context.clone());
+        let capture = Capture::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .fmt_fields(SpanFields)
+            .event_format(JsonLine::new())
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        let request = json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "max_tokens": 64,
+            "stream": true,
+            "tools": tools(),
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+            .unwrap();
+        let response = timeout(Duration::from_secs(30), app.oneshot(request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        drop(guard);
+
+        let lines = json_lines(&capture);
+        let line = |message: &str| {
+            lines
+                .iter()
+                .find(|line| line["message"] == message)
+                .unwrap_or_else(|| panic!("no '{message}' line among {lines:#?}"))
+        };
+        let head = line("finished processing request");
+        assert!(head["span"].get("symphony.outcome").is_none(), "{head}");
+        assert!(head["span"].get("response_bytes").is_none(), "{head}");
+        let end = line("finished streaming the response");
+        assert_eq!(end["span"]["response_bytes"], body.len(), "{end}");
+        match outcome {
+            None => assert!(end["span"].get("symphony.outcome").is_none(), "{end}"),
+            Some(outcome) => {
+                assert_eq!(end["span"]["symphony.outcome"], outcome, "{end}");
+                assert_eq!(end["span"]["symphony.reason"], "unknown_tool", "{end}");
+                assert_eq!(end["span"]["symphony.choice"], 0, "{end}");
+                assert!(end["span"]["symphony.table"].is_string(), "{end}");
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -1059,7 +1147,7 @@ async fn the_legacy_parser_refuses_hf_at_startup() {
     config.health_check.disable_health_check = true;
     config.parser = ParserChoice::Legacy;
     config.tool_call_parser = Some("hf".to_string());
-    let why = smg::app_context::AppContext::from_config(config, 30, None, None)
+    let why = AppContext::from_config(config, 30, None, None)
         .await
         .expect_err("refused");
     assert!(why.contains("--parser symphony"), "{why}");
@@ -1233,4 +1321,110 @@ async fn the_selected_workers_policy_decides_and_what_no_grammar_holds_is_refuse
         }
     }
     assert!(wrong.is_empty(), "not refused as expected: {wrong:#?}");
+}
+
+/// A `structural_tag` response format is a grammar of the request's own: the table shapes nothing
+/// over it (no answer's tag, no `auto` tag over the tools under `always`, no whole turn from the
+/// first token), and the engine receives the client's object as its structural tag, key for key.
+#[tokio::test]
+async fn a_structural_tag_response_format_is_the_engines_constraint_as_sent() {
+    let tag = json!({
+        "type": "structural_tag",
+        "structures": [{
+            "begin": "<w>",
+            "schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "end": "</w>"
+        }],
+        "triggers": ["<w>"]
+    });
+    let sent_tag = |gateway: &Gateway| -> Value {
+        let (kind, text) = gateway.last_constraint().expect("the request's own tag");
+        assert_eq!(kind, "structural_tag");
+        serde_json::from_str(&text).expect("the tag as JSON")
+    };
+    // The registry table, requested and always: without and with tools.
+    for policy in [None, Some(ConstrainedDecoding::Always)] {
+        let gateway = serve(Setup {
+            constrained_decoding: policy,
+            ..Setup::default()
+        })
+        .await;
+        for extra in [
+            json!({"response_format": tag}),
+            json!({"tools": tools(), "response_format": tag}),
+        ] {
+            chat(&gateway, extra.clone()).await;
+            assert_eq!(sent_tag(&gateway), tag, "{policy:?} {extra}");
+        }
+    }
+    // A table whose calls spell a whole turn, on a worker that takes it from the first token.
+    let gateway = serve(Setup {
+        template: Some(turn_template()),
+        chat_template: false,
+        prompt_tail: "<|head|>assistant",
+        output: "<|via|>notes<|body|>plan<|stop|><|head|>assistant<|via|>reply<|body|>Hello<|eos|>",
+        eos: "<|eos|>",
+        constrained_decoding: Some(ConstrainedDecoding::Always),
+        labels: vec![("constrained_decoding_start", "first_token")],
+        ..Setup::default()
+    })
+    .await;
+    chat(&gateway, json!({"tools": tools(), "response_format": tag})).await;
+    assert_eq!(sent_tag(&gateway), tag);
+}
+
+/// A `structural_tag` response format beside a forced call under the legacy parsers (no table sets
+/// the format aside), on an engine whose builder lets the body's format outrank the forced call's
+/// grammar (TokenSpeed's, as TensorRT-LLM's and SGLang's; vLLM's lets the call win): every worker
+/// receives the client's tag, on the first attempt and on the retries alike, never the grammar the
+/// builder dropped. Each worker refuses its first `Generate`, so the request crosses to the other
+/// worker and back: three attempts.
+#[tokio::test]
+async fn a_retry_keeps_the_clients_structural_tag_over_the_forced_calls() {
+    let tag = json!({
+        "type": "structural_tag",
+        "structures": [{"begin": "<w>", "schema": {"type": "object"}, "end": "</w>"}],
+        "triggers": ["<w>"]
+    });
+    let gateway = serve_engines(
+        Setup {
+            template: None,
+            chat_template: false,
+            parser: ParserChoice::Legacy,
+            reasoning_parser: None,
+            tool_parser: Some("kimik2"),
+            round_robin: true,
+            ..Setup::default()
+        },
+        vec![
+            Engine {
+                labels: vec![],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+            Engine {
+                labels: vec![],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+        ],
+    )
+    .await;
+    chat(
+        &gateway,
+        json!({"tools": tools(), "tool_choice": "required", "response_format": tag}),
+    )
+    .await;
+    let received: Vec<Value> = gateway
+        .requests
+        .iter()
+        .flat_map(|log| {
+            let log = log.lock().expect("the worker's log");
+            log.iter().map(constraint_of).collect::<Vec<_>>()
+        })
+        .map(|constraint| {
+            let (kind, text) = constraint.expect("a constraint");
+            assert_eq!(kind, "structural_tag");
+            serde_json::from_str(&text).expect("the tag as JSON")
+        })
+        .collect();
+    assert_eq!(received, vec![tag.clone(), tag.clone(), tag]);
 }

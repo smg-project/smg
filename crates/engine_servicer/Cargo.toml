@@ -1,6 +1,6 @@
 [package]
 name = "engine-servicer"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
 description = "Rust gRPC servicers for inference engines: the engine's own proto, served over the same-host ZMQ wire"
 license = "Apache-2.0"
@@ -53,6 +53,8 @@ kv-index.workspace = true
 rmpv.workspace = true
 portpicker = "0.1"
 tempfile = "3"
+# Paused time for the load-record stream's cadence tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "kv_relay_apply"

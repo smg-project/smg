@@ -39,12 +39,24 @@ pub(crate) struct ContextRequirements {
 }
 
 impl ContextRequirements {
-    /// Capture exact preparation counts and the provider's output-budget rule.
+    /// [`Self::new_for`] with the provider profile derived here, as the tests ask it.
+    #[cfg(test)]
     pub(crate) fn new(prep: &PreparationOutput, request: &RequestType) -> Self {
+        Self::new_for(prep, request, None)
+    }
+
+    /// Capture exact preparation counts and the provider's output-budget rule,
+    /// with the chat model's provider profile as the request's preparation
+    /// derived it (`None` derives it here).
+    pub(crate) fn new_for(
+        prep: &PreparationOutput,
+        request: &RequestType,
+        provider: Option<ProviderProfile>,
+    ) -> Self {
         Self {
             input_tokens: prep.max_input_token_count(),
             scoring_position: matches!(prep, PreparationOutput::Decisions { .. }),
-            output_tokens: output_budget(request),
+            output_tokens: output_budget(request, provider),
         }
     }
 
@@ -165,13 +177,16 @@ pub(crate) fn enforce_decisions_context_length(
 /// SGLang clamps), as the input check above leaves `input + max_tokens`
 /// to the engine. As above, only a known window is enforced, and like the
 /// input check this runs on the gRPC pipeline only: the HTTP router forwards
-/// the body and leaves the budget to the engine.
+/// the body and leaves the budget to the engine. `provider` is the chat
+/// model's profile as the request's preparation derived it (`None` derives
+/// it here).
 pub(crate) fn enforce_output_budget(
     request_type: &RequestType,
     workers: &WorkerSelection,
     model_id: &str,
+    provider: Option<ProviderProfile>,
 ) -> Result<(), Response> {
-    let Some(max_tokens) = output_budget(request_type) else {
+    let Some(max_tokens) = output_budget(request_type, provider) else {
         return Ok(());
     };
     let Some(limit) = selection_context_length(workers, model_id) else {
@@ -180,12 +195,16 @@ pub(crate) fn enforce_output_budget(
     enforce_output(Some(max_tokens), limit, model_id)
 }
 
-/// Only the z.ai chat profile imposes an engine-independent output bound.
-fn output_budget(request_type: &RequestType) -> Option<u32> {
+/// Only the z.ai chat profile imposes an engine-independent output bound;
+/// `provider` is the chat model's profile as the request's preparation
+/// derived it (`None` derives it here).
+fn output_budget(request_type: &RequestType, provider: Option<ProviderProfile>) -> Option<u32> {
     let RequestType::Chat(request) = request_type else {
         return None;
     };
-    if ProviderProfile::for_model(&request.model) != ProviderProfile::Zai {
+    if provider.unwrap_or_else(|| ProviderProfile::for_model(&request.model))
+        != ProviderProfile::Zai
+    {
         return None;
     }
     #[expect(deprecated, reason = "the request may predate normalization")]
@@ -222,7 +241,7 @@ fn enforce_output(max_tokens: Option<u32>, limit: u32, model_id: &str) -> Result
 /// advertises one. A disaggregated prompt must fit both the prefill and the
 /// decode engine, so the smaller window governs. Encode workers process media,
 /// not the token prompt, and are not consulted.
-fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u32> {
+pub(crate) fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u32> {
     match workers {
         WorkerSelection::Single { worker } => worker.context_length(model_id),
         WorkerSelection::Disaggregated {
@@ -358,11 +377,13 @@ mod tests {
             &chat("glm-5.3-flash", Some(10_000_000)),
             &single(Some(131_072)),
             MODEL,
+            None,
         ));
         assert_rejected(enforce_output_budget(
             &chat("zai-org/GLM-5.3-Flash", Some(131_073)),
             &pd(Some(1_000_000), Some(131_072)),
             MODEL,
+            None,
         ));
     }
 
@@ -371,17 +392,22 @@ mod tests {
         assert!(enforce_output_budget(
             &chat("glm-5.3-flash", Some(131_072)),
             &single(Some(131_072)),
-            MODEL
+            MODEL,
+            None
         )
         .is_ok());
-        assert!(
-            enforce_output_budget(&chat("glm-5.3-flash", None), &single(Some(131_072)), MODEL)
-                .is_ok()
-        );
+        assert!(enforce_output_budget(
+            &chat("glm-5.3-flash", None),
+            &single(Some(131_072)),
+            MODEL,
+            None
+        )
+        .is_ok());
         assert!(enforce_output_budget(
             &chat("glm-5.3-flash", Some(10_000_000)),
             &single(None),
-            MODEL
+            MODEL,
+            None
         )
         .is_ok());
     }
@@ -393,7 +419,8 @@ mod tests {
                 enforce_output_budget(
                     &chat(model, Some(10_000_000)),
                     &single(Some(131_072)),
-                    MODEL
+                    MODEL,
+                    None
                 )
                 .is_ok(),
                 "{model}"

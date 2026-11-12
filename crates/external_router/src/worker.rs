@@ -15,6 +15,11 @@ pub type LoadHold = Box<dyn Any + Send + Sync>;
 /// One worker as an external router may use it.
 pub trait ExternalWorker: Send + Sync + Debug {
     fn url(&self) -> &str;
+    /// The URL as a response header or an event line shows it: the
+    /// registered URL byte for byte when it has no userinfo, query or
+    /// fragment, otherwise the gateway's masked rendering (the userinfo
+    /// masked whole, a query or fragment cut at the path).
+    fn redacted_url(&self) -> &str;
     fn api_key(&self) -> Option<&String>;
     fn model_id(&self) -> &str;
     fn is_healthy(&self) -> bool;
@@ -96,12 +101,12 @@ pub trait WorkerSource: Send + Sync + Debug {
 /// since a token is often the username (`https://token@host`,
 /// `https://token:x-oauth-basic@host`); a query or a fragment is no part of
 /// the address and may carry a token. The gateway renders a worker's own URL
-/// the same way through its worker type; until that rendering is reachable
-/// from a worker held here, every site writes through this rule, which then
-/// stays for the strings that are not a worker's rendering: an MCP server
-/// URL, a request URL composed from a worker's address and a path. It works
-/// on the string alone: nothing is parsed, and an `@` before the first `/` of
-/// a schemeless string counts as userinfo as well.
+/// the same way, and an external router reads it through
+/// [`ExternalWorker::redacted_url`]; this rule is for the strings that are
+/// not a worker's rendering: an MCP server URL, a request URL composed from a
+/// worker's address and a path. It works on the string alone: nothing is
+/// parsed, and an `@` before the first `/` of a schemeless string counts as
+/// userinfo as well.
 pub(crate) fn redacted_url(url: &str) -> Cow<'_, str> {
     // The authority runs from the scheme separator (when the text before it
     // is a scheme) to the first `/`, `?` or `#`.

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer as HfTokenizer;
 
-use crate::traits::TokenIdType;
+use crate::{byte_level::max_token_id, traits::TokenIdType};
 
 /// What an id contributes to a decode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,6 +50,16 @@ impl PieceTable {
     /// then `ByteFallback` and `Fuse`, then an optional `Strip(" ", 1, 0)`;
     /// any other chain keeps the `tokenizers` decode.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
+        Self::build_with_max_id(tokenizer, None, None)
+    }
+
+    /// [`Self::build`] with the model's largest id as the file's read saw
+    /// it, when it did (see `byte_level::max_token_id`).
+    pub(crate) fn build_with_max_id(
+        tokenizer: &HfTokenizer,
+        model_max_id: Option<u32>,
+        listing: Option<&crate::word_cache::Listing>,
+    ) -> Option<Arc<Self>> {
         let chain = serde_json::to_value(tokenizer.get_decoder()?).ok()?;
         let decoders = chain.get("decoders")?.as_array()?;
         let replace = serde_json::json!(
@@ -73,7 +83,7 @@ impl PieceTable {
         // Each id through the lookups the decode uses: `id_to_token` (an added
         // token before a model piece that shares its id) and the added
         // vocabulary's own notion of special, as the byte-level table does.
-        let max_id = tokenizer.get_vocab(true).values().copied().max()?;
+        let max_id = max_token_id(tokenizer, model_max_id)?;
         let added = tokenizer.get_added_vocabulary();
         let ids = max_id as usize + 1;
         let mut offsets = Vec::with_capacity(ids + 1);
@@ -81,7 +91,7 @@ impl PieceTable {
         let mut text = Vec::with_capacity(ids * 4);
         let mut piece = Vec::with_capacity(ids);
         for id in 0..=max_id {
-            let kind = match tokenizer.id_to_token(id) {
+            let kind = match crate::word_cache::token_of(tokenizer, listing, id) {
                 None => Piece::Absent,
                 Some(token) => match byte_token(&token) {
                     Some(byte) => Piece::Byte(byte),
@@ -151,6 +161,17 @@ impl PieceTable {
         out
     }
 
+    /// `text`, a piece's, as the window's first piece renders it: without its
+    /// one leading space when the chain strips it (`Strip(" ", 1, 0)` over the
+    /// whole text), as it is otherwise. [`Self::render`] of that piece alone.
+    pub(crate) fn at_window_start<'t>(&self, text: &'t str) -> &'t str {
+        if self.strips_leading_space {
+            text.strip_prefix(' ').unwrap_or(text)
+        } else {
+            text
+        }
+    }
+
     /// The text `id` adds to a window that has nothing pending, when that is
     /// all a step needs to know: a plain piece (or a kept special token) with
     /// text that does not end in a replacement character, which the step
@@ -168,7 +189,7 @@ impl PieceTable {
 
 /// The byte a `<0xHH>` token stands for, exactly as the `ByteFallback`
 /// decoder reads it.
-fn byte_token(token: &str) -> Option<u8> {
+pub(crate) fn byte_token(token: &str) -> Option<u8> {
     (token.len() == 6 && token.starts_with("<0x") && token.ends_with('>'))
         .then(|| u8::from_str_radix(&token[3..5], 16).ok())
         .flatten()

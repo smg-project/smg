@@ -5,6 +5,7 @@ use openai_protocol::common::{Function, Tool};
 use serde_json::{json as value, Value};
 
 use crate::{
+    adapt,
     event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::Format,
     grammar::{GrammarStart, Options},
@@ -56,7 +57,7 @@ pub(crate) fn arguments_of(events: &[Event], call: u32) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::ToolCallArguments { index, json, .. } if *index == call => Some(json.as_str()),
+            Event::ToolCallArguments { index, json, .. } if *index == call => Some(json.as_ref()),
             _ => None,
         })
         .collect()
@@ -67,7 +68,7 @@ pub(crate) fn arguments(events: &[Event]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+            Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
             _ => None,
         })
         .collect()
@@ -79,6 +80,18 @@ pub(crate) fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
         .iter()
         .filter_map(|event| match event {
             Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The text of every malformed report, one entry per event, whatever its reason (a report of no
+/// bytes counts here, where the joined texts would not show it); the reasons are [`malformed`]'s.
+pub(crate) fn malformed_texts<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Malformed { text, .. } => Some(&*text.text),
             _ => None,
         })
         .collect()
@@ -104,6 +117,26 @@ pub(crate) fn calls(events: &[Event]) -> Vec<(String, String)> {
             Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
             Event::ToolCallArguments { json, .. } => {
                 calls.last_mut().expect("a call started").1.push_str(json);
+            }
+            _ => {}
+        }
+    }
+    calls
+}
+
+/// The calls as (index, name, arguments), the fragments of each joined onto the
+/// last call started; an arguments event before any call is left out.
+pub(crate) fn indexed_calls(events: &[Event]) -> Vec<(u32, String, String)> {
+    let mut calls: Vec<(u32, String, String)> = Vec::new();
+    for event in events {
+        match event {
+            Event::ToolCallStart { index, name, .. } => {
+                calls.push((*index, name.clone(), String::new()));
+            }
+            Event::ToolCallArguments { json, .. } => {
+                if let Some(last) = calls.last_mut() {
+                    last.2.push_str(json);
+                }
             }
             _ => {}
         }
@@ -217,6 +250,109 @@ pub(crate) fn the_same_at_every_cut(
         );
     }
     whole
+}
+
+/// Every shape of an invoke a model writes outside a block on a table whose `run` reads an output
+/// after a prompt, read whole, one character at a time and at every two-way cut as the serving
+/// engines' own parsers read them: `invoke` alone is the call; bare and then again inside a block
+/// (`open` to `close`), two calls and the model's text; prose after a bare call is text between
+/// calls, shown to a chat client as content; an invoke inside the thought stays there; after a
+/// preamble the blank line before a bare invoke is the text's; two bare invokes are two calls.
+/// `chat` is the prompt that closed the thought, `thinking` the one that left it open; `invoke`
+/// calls `add_integers` with 6 and 8.
+pub(crate) fn an_invoke_outside_a_block_reads_as_the_engines_do(
+    run: impl Fn(&str, &[&str]) -> Vec<Event<'static>>,
+    invoke: &str,
+    open: &str,
+    close: &str,
+    chat: &str,
+    thinking: &str,
+) {
+    let call = (
+        "add_integers".to_string(),
+        r#"{"a": 6, "b": 8}"#.to_string(),
+    );
+    let shapes: [(&str, String, &str, usize, &str); 6] = [
+        ("the bare invoke alone", invoke.to_string(), chat, 1, ""),
+        (
+            "bare, then the block",
+            format!("\n\n:tool\n{invoke}\n\n{open}\n{invoke}\n{close}"),
+            chat,
+            2,
+            "\n\n:tool\n",
+        ),
+        (
+            "bare, then prose",
+            format!("{invoke}\nThe sum is 14."),
+            chat,
+            1,
+            "",
+        ),
+        (
+            "inside the thought",
+            format!("Let me add.{invoke}</think>Done."),
+            thinking,
+            0,
+            "Done.",
+        ),
+        (
+            "after a preamble",
+            format!("Let me check.\n\n{invoke}"),
+            chat,
+            1,
+            "Let me check.\n\n",
+        ),
+        (
+            "two bare invokes",
+            format!("{invoke}\n{invoke}"),
+            chat,
+            2,
+            "",
+        ),
+    ];
+    for (name, output, prompt, count, content) in shapes {
+        assert_eq!(bytes(&run(prompt, &[&output])), output, "{name}");
+        let said = the_same_at_every_cut(|pieces| run(prompt, pieces), &output);
+        assert_eq!(said.content, content, "{name}");
+        assert_eq!(said.calls.len(), count, "{name}: {:?}", said.calls);
+        assert!(
+            said.calls.iter().all(|c| *c == call),
+            "{name}: {:?}",
+            said.calls
+        );
+        assert_eq!(
+            said.finish.map(|(_, calls)| calls),
+            Some(count as u32),
+            "{name}"
+        );
+    }
+    // The bare invoke alone: nothing malformed, and a chat client reads the call alone.
+    let events = run(chat, &[invoke]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Malformed { .. })),
+        "{events:?}"
+    );
+    let choice = adapt::chat::message(0, &events);
+    assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(choice.message.content, None);
+    // Prose after a bare call is text between calls, shown to a chat client as content.
+    let events = run(chat, &[&format!("{invoke}\nThe sum is 14.")]);
+    let between: String = malformed(&events)
+        .into_iter()
+        .filter(|(_, why)| *why == MalformedReason::TextBetweenCalls)
+        .map(|(text, _)| text)
+        .collect();
+    assert_eq!(between, "The sum is 14.");
+    assert_eq!(
+        adapt::chat::message(0, &events).message.content.as_deref(),
+        Some("The sum is 14.")
+    );
+    // Inside the thought, the invoke's bytes are the thought's.
+    let output = format!("Let me add.{invoke}</think>Done.");
+    let said = the_same_at_every_cut(|pieces| run(thinking, pieces), &output);
+    assert_eq!(said.reasoning, format!("Let me add.{invoke}"));
 }
 
 /// The structural tag of a forced call on `format`, a table whose layout writes `after` after
@@ -401,7 +537,7 @@ pub(crate) fn tool(name: &str, parameters: Value) -> Tool {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
@@ -447,4 +583,47 @@ pub(crate) fn weather_declared() -> Declared {
             "days": {"type": "integer"},
         }}),
     )])
+}
+
+/// The events a test writes by hand: the tool-call events with the id and the
+/// empty source the adapters do not read, and the engine's finish with no
+/// reasoning tokens.
+pub(crate) mod events {
+    use crate::event::{Event, FinishReason, Text};
+
+    /// A call's start, `call_<index>` as its id.
+    pub(crate) fn call(index: u32, name: &str) -> Event<'static> {
+        Event::ToolCallStart {
+            index,
+            id: format!("call_{index}"),
+            name: name.into(),
+            source: Text::default(),
+        }
+    }
+
+    /// A fragment of a call's arguments.
+    pub(crate) fn arguments(index: u32, json: &str) -> Event<'static> {
+        Event::ToolCallArguments {
+            index,
+            json: json.to_owned().into(),
+            source: Text::default(),
+        }
+    }
+
+    /// A call's end.
+    pub(crate) fn end(index: u32) -> Event<'static> {
+        Event::ToolCallEnd {
+            index,
+            source: Text::default(),
+        }
+    }
+
+    /// The engine's finish with the calls counted and no reasoning tokens.
+    pub(crate) fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
+        Event::Finish {
+            reason,
+            tool_calls,
+            reasoning_tokens: 0,
+        }
+    }
 }

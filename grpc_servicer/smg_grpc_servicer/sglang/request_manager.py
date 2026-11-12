@@ -6,6 +6,7 @@ Mimics TokenizerManager's state management and ZMQ communication patterns.
 import asyncio
 import copy
 import dataclasses
+import inspect
 import logging
 import os
 import signal
@@ -165,7 +166,10 @@ class GrpcReqState:
 
     # Metrics (same as TokenizerManager's ReqState)
     time_stats: APIServerReqTimeStats
-    last_completion_tokens: int = 1
+    last_completion_tokens: int = 0
+    ttft_observed: bool = False
+    abort_observed: bool = False
+    log_metrics: bool = True
 
     # Streaming state
     stream_finished: bool = False
@@ -248,8 +252,41 @@ class GrpcRequestManager:
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
-        # Metrics
+        # Metrics. SGLang's gRPC entrypoint sets up the multiprocess
+        # registry before constructing this manager; its HTTP sidecar scrapes it.
         self.last_receive_tstamp = real_time()
+        self.metrics_collector = None
+        if server_args.enable_metrics:
+            # Keep Prometheus initialization behind --enable-metrics and after
+            # the entrypoint has configured PROMETHEUS_MULTIPROC_DIR.
+            from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+
+            labels = {
+                "model_name": server_args.served_model_name,
+                "engine_type": DisaggregationMode.to_engine_type(server_args.disaggregation_mode),
+            }
+            if getattr(server_args, "enable_priority_scheduling", False):
+                labels["priority"] = ""
+            for label in (
+                getattr(server_args, "tokenizer_metrics_allowed_custom_labels", None) or []
+            ):
+                labels[label] = ""
+            labels.update(getattr(server_args, "extra_metric_labels", None) or {})
+            self.metrics_collector = TokenizerMetricsCollector(
+                server_args=server_args,
+                labels=labels,
+                bucket_time_to_first_token=server_args.bucket_time_to_first_token,
+                bucket_e2e_request_latency=server_args.bucket_e2e_request_latency,
+                bucket_inter_token_latency=server_args.bucket_inter_token_latency,
+            )
+            # Collector versions differ in streaming labels and optional log
+            # fields. Resolve optional arguments once, not on every output.
+            self._ttft_metric_parameters = inspect.signature(
+                self.metrics_collector.observe_time_to_first_token
+            ).parameters
+            self._finished_metric_parameters = inspect.signature(
+                self.metrics_collector.observe_one_finished_request
+            ).parameters
 
         # Crash dump for debugging
         self.crash_dump_request_list = []
@@ -343,7 +380,7 @@ class GrpcRequestManager:
 
         # Send prefix caching request and consume response
         async for _ in self._handle_single_request(
-            prefix_obj, f"{base_request_id}-prefix", grpc_context
+            prefix_obj, f"{base_request_id}-prefix", grpc_context, log_metrics=False
         ):
             # Consume prefix response (usually just one chunk with finish_reason)
             pass
@@ -469,6 +506,8 @@ class GrpcRequestManager:
         obj: TokenizedGenerateReqInput,
         request_id: str | None = None,
         grpc_context: grpc.aio.ServicerContext | None = None,
+        *,
+        log_metrics: bool = True,
     ):
         """Handle a single request - core implementation without n>1 logic."""
         # Generate request ID if not provided
@@ -479,6 +518,12 @@ class GrpcRequestManager:
 
         self._req_stats_init(obj, grpc_context)
         state = self.rid_to_state[request_id]
+        state.log_metrics = (
+            log_metrics
+            and getattr(obj, "log_metrics", True)
+            and getattr(getattr(obj, "sampling_params", None), "max_new_tokens", None) != 0
+            and not request_id.startswith(("HEALTH_CHECK", "WARMUP_", "smg-warmup-"))
+        )
         self.record_request_for_crash_dump(obj)
 
         try:
@@ -571,29 +616,21 @@ class GrpcRequestManager:
         asyncio.create_task(wait_for_result())
         return future
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(self, request_id: str, finished_reason: dict | None = None) -> bool:
         """Abort a running request.
 
-        Sends abort request to scheduler and marks local state as finished
-        to stop processing any further outputs from the scheduler.
+        Wake local consumers and dispatch an abort to the scheduler.
+
+        The return value reports dispatch success, not engine termination.
         """
         # Skip aborting health check requests (they clean themselves up)
         if request_id.startswith("HEALTH_CHECK"):
             return False
 
-        # Mark state as finished immediately to stop processing scheduler outputs
-        state = self.rid_to_state.get(request_id)
-        if state:
-            # The request's root span ends here, once: the scheduler's final
-            # abort output reaches a state already finished (or gone).
-            if self.enable_trace and not state.finished:
-                state.time_stats.set_finished_time()
-            state.finished = True
-            state.stream_finished = True
-            logger.debug(f"Marked request {request_id} as aborted locally")
+        # A running scheduler request need not return AbortReq. Finish locally
+        # before dispatch, even if dispatch fails; the consumer owns cleanup.
+        await self._handle_abort_req(AbortReq(rid=request_id, finished_reason=finished_reason))
 
-        # Send abort to scheduler - the scheduler will send AbortReq back
-        # which will be handled by _handle_abort_req
         abort_req = AbortReq(rid=request_id)
         try:
             await self._send_to_scheduler(abort_req)
@@ -686,6 +723,8 @@ class GrpcRequestManager:
                     self.last_receive_tstamp = real_time()
                     if getattr(recv_obj, "rid", None):
                         await self._handle_health_check_output(recv_obj)
+                elif isinstance(recv_obj, AbortReq):
+                    await self._handle_abort_req(recv_obj)
                 elif not self._dispatch_communicator_output(recv_obj):
                     logger.warning(f"Unknown type on tokenizer socket: {type(recv_obj)}")
             except zmq.error.Again:
@@ -767,12 +806,6 @@ class GrpcRequestManager:
                 logger.debug(f"Skipping output for aborted request {rid}")
                 continue
 
-            # Update metrics
-            if state.time_stats.first_token_time == 0.0:
-                state.time_stats.set_first_token_time()
-            else:
-                state.time_stats.set_last_time()
-
             # Extract output for this request
             prompt_tokens = batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
             completion_tokens = batch_out.completion_tokens[i] if batch_out.completion_tokens else 0
@@ -780,6 +813,15 @@ class GrpcRequestManager:
             reasoning_tokens_list = getattr(batch_out, "reasoning_tokens", None)
             reasoning_tokens = reasoning_tokens_list[i] if reasoning_tokens_list else 0
             token_ids = batch_out.output_ids[i] if batch_out.output_ids else []
+
+            # A retracted prefill can emit a nonterminal zero-token output.
+            # Preserve the previous output timestamp until ITL has been observed,
+            # and do not mistake that output for the first generated token.
+            first_output_time = None
+            if completion_tokens > 0 and state.time_stats.first_token_time == 0.0:
+                state.time_stats.set_first_token_time()
+                first_output_time = state.time_stats.first_token_time
+
             finished = batch_out.finished_reasons[i] is not None
             finish_reason = batch_out.finished_reasons[i] if batch_out.finished_reasons[i] else None
 
@@ -796,6 +838,21 @@ class GrpcRequestManager:
                 },
             }
 
+            # Scheduler counters are cumulative snapshots, not per-chunk deltas.
+            # Only forward actual engine counters; verify counts cannot determine
+            # proposal totals when speculative decoding uses adaptive draft sizes.
+            for key in ("spec_num_correct_drafts", "spec_num_proposed_drafts"):
+                counters = getattr(batch_out, key, None)
+                if counters is not None and i < len(counters) and counters[i] is not None:
+                    # Proto scalar defaults cannot distinguish unknown accepted from
+                    # measured zero. Proposals alone would falsely imply all rejected.
+                    if (
+                        key == "spec_num_proposed_drafts"
+                        and "spec_num_correct_drafts" not in output_data["meta_info"]
+                    ):
+                        continue
+                    output_data["meta_info"][key] = counters[i]
+
             # Accumulate logprobs (following tokenizer_manager pattern)
             # Use getattr for safe access - not all request types have return_logprob
             # (e.g., TokenizedEmbeddingReqInput)
@@ -805,15 +862,12 @@ class GrpcRequestManager:
                 except ValueError as exc:
                     # Raising out of this loop would strand the waiting client.
                     # Finish with an engine error and stop any remaining decode.
-                    output_data["error"] = str(exc)
-                    output_data["finished"] = True
-                    output_data["meta_info"]["finish_reason"] = {
-                        "type": "abort",
-                        "message": str(exc),
-                        "status_code": 500,
-                    }
+                    reason = {"type": "abort", "message": str(exc), "status_code": 500}
                     if not finished:
-                        await self.abort_request(rid)
+                        await self.abort_request(rid, finished_reason=reason)
+                    else:
+                        await self._handle_abort_req(AbortReq(rid=rid, finished_reason=reason))
+                    continue
 
             # Send input logprobs based if available
             if (
@@ -892,7 +946,9 @@ class GrpcRequestManager:
             # Handle completion
             if output_data["finished"]:
                 state.finished = True
-                state.time_stats.set_finished_time()
+                # A first-and-final batch has no decode interval. Reuse its
+                # arrival time rather than fabricating request-level TPOT.
+                state.time_stats.set_finished_time(ts=first_output_time)
                 state.stream_finished = True
                 state.event.set()
 
@@ -904,9 +960,116 @@ class GrpcRequestManager:
 
                 cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
 
+            try:
+                self._collect_generation_metrics(state, output_data, batch_out, i)
+            except Exception:
+                # Observability must not prevent this or any sibling response.
+                logger.exception("Failed to collect generation metrics for request %s", rid)
+
         # Execute all queue.put() operations in parallel
         if put_tasks:
             await asyncio.gather(*put_tasks, return_exceptions=True)
+
+    def _request_metric_labels(self, state, collector):
+        labels = dict(collector.labels)
+        for key, value in (getattr(state.obj, "custom_labels", None) or {}).items():
+            if key in labels:
+                labels[key] = value
+        if "priority" in labels and getattr(state.obj, "priority", None) is not None:
+            labels["priority"] = str(state.obj.priority)
+        return labels
+
+    def _collect_aborted_metrics(self, state):
+        collector = self.metrics_collector
+        if collector is None or not state.log_metrics or state.abort_observed:
+            return
+        observe_abort = getattr(collector, "observe_one_aborted_request", None)
+        if observe_abort is not None:
+            try:
+                observe_abort(self._request_metric_labels(state, collector))
+            except Exception:
+                # Metrics must never interrupt cancellation or terminal delivery.
+                logger.exception("Failed to record abort metrics for request %s", state.request_id)
+            else:
+                state.abort_observed = True
+
+    def _collect_generation_metrics(self, state, output_data, batch_out, index):
+        """Record worker-local generation metrics using SGLang's collector.
+
+        The clock starts in _req_stats_init, not at router ingress. ITL is
+        token-weighted, matching the HTTP worker's TPOT dashboard definition.
+        """
+        collector = self.metrics_collector
+        if collector is None or not state.log_metrics:
+            return
+
+        meta = output_data["meta_info"]
+        reason = meta["finish_reason"]
+        # Cancellations/errors must not be counted as normal completions.
+        # Already-finished states are skipped by _handle_batch_output.
+        if output_data.get("error") or (isinstance(reason, dict) and reason.get("type") == "abort"):
+            self._collect_aborted_metrics(state)
+            return
+
+        labels = self._request_metric_labels(state, collector)
+
+        completion_tokens = meta["completion_tokens"]
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            if not state.ttft_observed and completion_tokens > 0:
+                ttft_kwargs = {}
+                if "stream" in self._ttft_metric_parameters:
+                    ttft_kwargs["stream"] = bool(state.obj.stream)
+                collector.observe_time_to_first_token(
+                    labels, state.time_stats.get_first_token_latency(), **ttft_kwargs
+                )
+                state.ttft_observed = True
+                state.last_completion_tokens = completion_tokens
+            elif state.ttft_observed:
+                num_new_tokens = completion_tokens - state.last_completion_tokens
+                if num_new_tokens > 0:
+                    collector.observe_inter_token_latency(
+                        labels, state.time_stats.get_interval(), num_new_tokens
+                    )
+                    state.time_stats.set_last_time()
+                    state.last_completion_tokens = completion_tokens
+
+        if output_data["finished"]:
+            sampling = state.obj.sampling_params
+            has_grammar = any(
+                getattr(sampling, name, None)
+                for name in ("json_schema", "regex", "ebnf", "structural_tag")
+            )
+            cache_details = getattr(batch_out, "cached_tokens_details", None)
+            finished_kwargs = {}
+            if "is_streaming" in self._finished_metric_parameters:
+                finished_kwargs["is_streaming"] = bool(state.obj.stream)
+            if "first_token_time" in self._finished_metric_parameters:
+                finished_kwargs["first_token_time"] = state.time_stats.get_first_token_latency()
+            if "spec_verify_ct" in self._finished_metric_parameters:
+                spec_verify_ct = getattr(batch_out, "spec_verify_ct", None)
+                finished_kwargs["spec_verify_ct"] = (
+                    spec_verify_ct[index] if spec_verify_ct and index < len(spec_verify_ct) else 0
+                )
+            if "time_per_output_token" in self._finished_metric_parameters:
+                finished_kwargs["time_per_output_token"] = (
+                    state.time_stats.get_time_per_output_token(completion_tokens)
+                    if self.disaggregation_mode != DisaggregationMode.PREFILL
+                    and isinstance(reason, dict)
+                    and reason.get("type") in ("stop", "length")
+                    else None
+                )
+            # Reuse the completion hook so E2E and its companion request/token
+            # counters have the same population and buckets as the HTTP worker.
+            collector.observe_one_finished_request(
+                labels=labels,
+                prompt_tokens=meta["prompt_tokens"],
+                generation_tokens=completion_tokens,
+                cached_tokens=meta["cached_tokens"],
+                e2e_latency=state.time_stats.get_e2e_latency(),
+                has_grammar=has_grammar,
+                cached_tokens_details=cache_details[index] if cache_details else None,
+                **finished_kwargs,
+            )
 
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
@@ -915,6 +1078,8 @@ class GrpcRequestManager:
                 continue
 
             state = self.rid_to_state[rid]
+            if state.finished:
+                continue
 
             # Create result
             result = {
@@ -981,6 +1146,9 @@ class GrpcRequestManager:
             return
 
         state = self.rid_to_state[recv_obj.rid]
+        if state.finished:
+            return
+        self._collect_aborted_metrics(state)
 
         # Mark as finished; a scheduler-initiated abort ends the request's
         # root span here, once (a client cancel ended it in abort_request).

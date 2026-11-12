@@ -4,6 +4,20 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
 use super::{test_support::render_with_recorder, *};
+use crate::worker::{BasicWorkerBuilder, Worker};
+
+/// A removed worker nothing holds any more: a dead witness for `retire`.
+fn gone(url: &str) -> Weak<dyn Worker> {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    Arc::downgrade(&worker)
+}
+
+/// A removed worker a handle still holds: the worker and its witness.
+fn held(url: &str) -> (Arc<dyn Worker>, Weak<dyn Worker>) {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    let witness = Arc::downgrade(&worker);
+    (worker, witness)
+}
 
 #[test]
 fn tokenizer_activity_registers_both_layers_on_scrape() {
@@ -40,15 +54,13 @@ fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
             "missing path {path}: {rendered}"
         );
     }
-    for reason in ["not_nfc", "piece_declined"] {
-        assert!(
-            rendered.lines().any(|line| {
-                line.starts_with("smg_tokenizer_encode_fallbacks_total{")
-                    && line.contains(&format!("reason=\"{reason}\""))
-            }),
-            "missing reason {reason}: {rendered}"
-        );
-    }
+    assert!(
+        rendered.lines().any(|line| {
+            line.starts_with("smg_tokenizer_encode_fallbacks_total{")
+                && line.contains("reason=\"piece_declined\"")
+        }),
+        "missing reason piece_declined: {rendered}"
+    );
 }
 
 #[test]
@@ -116,7 +128,7 @@ fn prefill_worker_removal_releases_its_admission_series() {
     metrics::with_local_recorder(&recorder, || {
         Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 7);
         Metrics::set_pd_prefill_admission_inflight("http://kept-prefill", 3);
-        workers.retire("http://removed-prefill");
+        workers.retire("http://removed-prefill", gone("http://removed-prefill"));
         // A release racing the removal must not bring the series back.
         Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 6);
     });
@@ -284,6 +296,82 @@ fn record_engine_load_sets_pd_gauges_when_disagg_present() {
         "smg_engine_pd_decode_queue_reqs",
         &pd_labels,
         "4",
+    );
+}
+
+/// The `smg_engine_*` set recorded through kept handles renders exactly as
+/// it does with a key built per record: the same series with the same
+/// values, a capacity or PD series only where a load carried the figure,
+/// and a rank's own record (the pushed shape) moving that rank's values
+/// alone.
+#[test]
+fn the_engine_load_set_renders_the_same_through_kept_handles() {
+    let report = |running: i32, hit_rate: f64| WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 2,
+        loads: vec![
+            SchedulerLoadSnapshot {
+                dp_rank: 0,
+                num_running_reqs: running,
+                num_waiting_reqs: 1,
+                token_usage: 0.5,
+                gen_throughput: 42.0,
+                cache_hit_rate: hit_rate,
+                max_total_num_tokens: 262_144,
+                disagg_mode: Some("prefill".to_string()),
+                kv_transfer_latency_ms: Some(3.5),
+                prefill_queue_reqs: Some(9),
+                ..Default::default()
+            },
+            SchedulerLoadSnapshot {
+                dp_rank: 1,
+                num_running_reqs: running + 1,
+                cache_hit_rate: hit_rate,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let records = || {
+        Metrics::record_engine_load("http://w:1", "m", &report(7, 0.25));
+        Metrics::record_engine_rank_load("http://w:1", "m", &report(8, 0.75).loads[0]);
+        Metrics::record_engine_load("http://w:2", "m2", &report(1, 0.5));
+    };
+    let built = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(false));
+        records();
+        handles::reset();
+    });
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 8",
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 8",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 0.75",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 0.25",
+        "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 262144",
+        "smg_engine_pd_kv_transfer_latency_ms{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 3.5",
+        "smg_engine_pd_prefill_queue_reqs{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 9",
+        "smg_engine_running_requests{worker=\"http://w:2\",model=\"m2\",dp_rank=\"1\"} 2",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+    assert!(
+        !kept.contains(
+            "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\""
+        ),
+        "a rank whose loads carry no capacity has no capacity series:\n{kept}"
+    );
+    assert!(
+        !kept.contains("smg_engine_pd_kv_transfer_speed_gb_s"),
+        "a figure no load carried has no series:\n{kept}"
     );
 }
 
@@ -935,6 +1023,60 @@ fn pd_phase_families_describe_what_they_measure() {
     );
 }
 
+/// The router's first-token and generation families say on `/metrics` where
+/// their clock starts: at the answering attempt's RPC dispatch (the prefill
+/// dispatch of a pair, after a pushed encode call), so a refused attempt's
+/// wait and its backoff are in the request duration (the backoff alone in the
+/// backoff histogram, the attempt in the retry count), not in them.
+#[test]
+fn router_stream_families_name_the_attempt_anchor() {
+    let (rendered, ()) = with_test_recorder(|| {
+        init_metrics();
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_REGULAR,
+            model_id: "m",
+            endpoint: "chat",
+            ttft: Some(Duration::from_millis(5)),
+            generation_duration: Duration::from_millis(9),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: 2,
+        });
+    });
+    let help = |family: &str| -> String {
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("# HELP {family} ")))
+            .unwrap_or_else(|| panic!("no # HELP for {family}; rendered:\n{rendered}"))
+            .to_owned()
+    };
+    for family in [
+        "smg_router_ttft_seconds",
+        TIME_TO_FIRST_TOKEN_SECONDS,
+        "smg_router_generation_duration_seconds",
+    ] {
+        let text = help(family);
+        assert!(
+            text.contains("answering attempt's RPC dispatch"),
+            "{family}: {text}"
+        );
+    }
+    for family in [
+        "smg_router_ttft_seconds",
+        "smg_router_generation_duration_seconds",
+    ] {
+        let text = help(family);
+        assert!(
+            text.contains("smg_router_request_duration_seconds")
+                && text.contains("after the encode call when encode pushes")
+                && text.contains("smg_worker_retry_backoff_seconds")
+                && text.contains("smg_worker_retries_total"),
+            "{family}: {text}"
+        );
+    }
+}
+
 #[test]
 fn test_record_pd_kv_connector_mode_counts_by_mode() {
     let (rendered, ()) = with_test_recorder(|| {
@@ -1206,7 +1348,7 @@ fn kept_worker_counters_follow_the_workers_registrations() {
         Metrics::record_worker_request("http://w2", "m");
         assert_eq!(counts(), [Some("2".to_owned()), Some("1".to_owned())]);
 
-        workers.retire("http://w1");
+        workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
         // A send racing the removal: its write is dropped, not kept.
         Metrics::record_worker_request("http://w1", "m");
@@ -1272,7 +1414,7 @@ fn kept_worker_gauges_set_the_recorders_series() {
             Some("4")
         );
 
-        workers.retire("http://w1");
+        workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
         Metrics::set_worker_requests_active("http://w1", 9);
         assert_eq!(value("smg_worker_requests_active", "http://w1"), None);
@@ -1288,6 +1430,76 @@ fn kept_worker_gauges_set_the_recorders_series() {
     handles::reset();
 }
 
+/// The upkeep forgets a retired address once nothing holds the removed
+/// worker: the set is bounded by the removed workers still referenced, not
+/// by the process's history of removals.
+#[test]
+fn upkeep_forgets_the_retired_addresses_whose_workers_are_gone() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    for n in 0..3 {
+        let url = format!("http://gone-{n}");
+        workers.retire(&url, gone(&url));
+    }
+    let (held_worker, witness) = held("http://held");
+    workers.retire("http://held", witness);
+    assert_eq!(workers.retired_len(), 4);
+    workers.run_upkeep();
+    assert_eq!(workers.retired_len(), 1, "the held worker's address stays");
+    drop(held_worker);
+    workers.run_upkeep();
+    assert_eq!(workers.retired_len(), 0);
+}
+
+/// A removed worker a handle still holds keeps its address retired through
+/// the upkeep, so its late write lands nowhere; the address is forgotten
+/// once the handle is gone.
+#[test]
+fn a_held_removed_worker_keeps_its_address_retired_through_upkeep() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    let listed = || {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered.lines().any(|line| {
+            line.starts_with("smg_worker_requests_total{") && line.contains("worker=\"http://w1\"")
+        })
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_worker_request("http://w1", "m");
+        assert!(listed());
+        let (worker, witness) = held("http://w1");
+        workers.retire("http://w1", witness);
+        handles::worker_set_changed();
+        workers.run_upkeep();
+        // A write from a handle that still holds the removed worker lands nowhere.
+        Metrics::record_worker_request("http://w1", "m");
+        assert!(!listed());
+        assert_eq!(workers.retired_len(), 1);
+        drop(worker);
+        workers.run_upkeep();
+        assert_eq!(workers.retired_len(), 0);
+    });
+    handles::reset();
+}
+
 /// The registry's registration and removal hooks are what move the
 /// worker-set generation the kept counters are checked against.
 #[test]
@@ -1295,7 +1507,7 @@ fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
     let mut kept = handles::WorkerRequests::default();
     kept.for_worker("http://w")
         .insert(Arc::from("m"), metrics::Counter::noop());
-    Metrics::remove_worker_metrics("http://gone");
+    Metrics::remove_worker_metrics("http://gone", gone("http://gone"));
     assert!(kept.for_worker("http://w").is_empty(), "a removal");
     kept.for_worker("http://w")
         .insert(Arc::from("m"), metrics::Counter::noop());
@@ -1477,6 +1689,10 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         Metrics::record_worker_cache_aware_policy_branch("tree_match");
         Metrics::record_worker_cache_aware_policy_branch("tree_match");
         Metrics::record_worker_cache_aware_policy_branch("spill");
+        Metrics::record_worker_manual_policy_branch("occupied_hit");
+        Metrics::record_worker_manual_policy_branch("occupied_hit");
+        Metrics::record_worker_consistent_hashing_policy_branch("routing_key_hit");
+        Metrics::record_worker_prefix_hash_policy_branch("ring_hit");
         Metrics::record_cache_aware_match_ratio(0.25);
         Metrics::record_cache_aware_match_ratio(0.75);
         Metrics::record_routing_key_source("header");
@@ -1508,6 +1724,9 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         "smg_worker_selection_total{worker_type=\"prefill\",connection_mode=\"grpc\",model=\"m2\",policy=\"random\"} 1",
         "smg_cache_aware_policy_branch_total{branch=\"tree_match\"} 2",
         "smg_cache_aware_policy_branch_total{branch=\"spill\"} 1",
+        "smg_manual_policy_branch_total{branch=\"occupied_hit\"} 2",
+        "smg_consistent_hashing_policy_branch_total{branch=\"routing_key_hit\"} 1",
+        "smg_prefix_hash_policy_branch_total{branch=\"ring_hit\"} 1",
         "smg_cache_aware_match_ratio_count 2",
         "smg_routing_key_source_total{source=\"header\"} 1",
         "smg_admission_queue_depth 1",
@@ -1564,7 +1783,7 @@ fn kept_worker_outcome_counters_follow_the_workers_registrations() {
         assert_eq!(value("http://w1", "success").as_deref(), Some("2"));
         assert_eq!(value("http://w1", "failure").as_deref(), Some("1"));
 
-        workers.retire("http://w1");
+        workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
         Metrics::record_worker_cb_outcome("http://w1", "success");
         assert_eq!(value("http://w1", "success"), None);
@@ -1613,4 +1832,41 @@ fn time_per_request_records() {
     handles::force_on_this_thread(Some(true));
     time("handles kept per thread");
     handles::reset();
+}
+
+#[test]
+fn a_duration_bucket_list_is_refused_unless_finite_positive_and_strictly_ascending() {
+    for (buckets, reason) in [
+        (vec![0.5, f64::NAN], "finite number above 0"),
+        (vec![0.5, f64::INFINITY], "finite number above 0"),
+        (vec![0.0, 1.0], "finite number above 0"),
+        (vec![-1.0], "finite number above 0"),
+        (vec![1.0, 1.0], "ascend strictly"),
+        (vec![2.0, 1.0], "ascend strictly"),
+    ] {
+        let err = PrometheusConfig::validate_duration_buckets(&buckets)
+            .expect_err("the list is refused")
+            .to_string();
+        assert!(err.contains(reason), "{buckets:?}: {err}");
+    }
+    for buckets in [&[][..], &[0.1, 0.5, 2.0][..]] {
+        PrometheusConfig::validate_duration_buckets(buckets)
+            .expect("an empty or strictly ascending list is accepted");
+    }
+}
+
+#[test]
+fn the_multimodal_harness_repeats_the_malloc_conf() {
+    // The harness sits below this crate and cannot import the constant: it
+    // repeats the bytes by hand, and this is what keeps that copy equal.
+    let harness = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/multimodal/examples/mm_baseline.rs"
+    ));
+    let conf = std::str::from_utf8(&SERVER_MALLOC_CONF[..SERVER_MALLOC_CONF.len() - 1])
+        .expect("the malloc conf is ASCII");
+    assert!(
+        harness.contains(conf),
+        "crates/multimodal/examples/mm_baseline.rs no longer carries SERVER_MALLOC_CONF ({conf})"
+    );
 }

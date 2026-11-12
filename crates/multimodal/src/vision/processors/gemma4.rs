@@ -26,7 +26,9 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::Array3;
 
 use crate::{
-    encoder_inputs::ModelSpecificValue,
+    buffer_pool,
+    encoder_inputs::{EncoderDtype, EncoderInput, ModelSpecificValue, PixelNorm},
+    pixel_convert::WireWriter,
     types::{Modality, RgbFrameRef},
     vision::{
         preprocessor_config::PreProcessorConfig,
@@ -148,14 +150,49 @@ impl Params {
     fn soft_tokens(self, target: (usize, usize)) -> usize {
         (target.0 / self.patch) * (target.1 / self.patch) / (self.pool * self.pool)
     }
+
+    /// The `(height, width)` the encode works on for a `source_h` x
+    /// `source_w` input: the reference's resize target when `do_resize` is
+    /// on, the source itself otherwise, refused as the encode refuses it (a
+    /// side that is zero or not a multiple of the pooled patch, a grid above
+    /// the patch budget). The count and the encode take their size from here,
+    /// so they agree in both modes.
+    fn input_size(
+        self,
+        do_resize: bool,
+        source_h: usize,
+        source_w: usize,
+    ) -> Result<(usize, usize), TransformError> {
+        let (height, width) = if do_resize {
+            self.target_size(source_h, source_w)?
+        } else {
+            (source_h, source_w)
+        };
+        let side = self.side_mult();
+        if height == 0 || width == 0 || !height.is_multiple_of(side) || !width.is_multiple_of(side)
+        {
+            return Err(shape(format!(
+                "Gemma 4 input {width}x{height} is not a multiple of {side} pixels"
+            )));
+        }
+        let num_patches = (height / self.patch) * (width / self.patch);
+        if num_patches > self.max_patches() {
+            return Err(shape(format!(
+                "Gemma 4 input {width}x{height} has {num_patches} patches, above the budget of {}",
+                self.max_patches()
+            )));
+        }
+        Ok((height, width))
+    }
 }
 
-/// The pixel transform as a per-channel table: `rescale_factor` times the
-/// byte, and the fused normalization of the reference when it is not the
-/// identity. An identity normalization (mean 0, std 1) is skipped: the
-/// engine's image processor never normalizes, and `x * rescale` is its
-/// arithmetic where `(x - 0) / (1 / rescale)` could differ in the last bit.
-fn pixel_lut(config: &PreProcessorConfig) -> Result<[[f32; 256]; 3], TransformError> {
+/// The pixel transform in the crate's form: `rescale_factor` times the byte,
+/// and the fused normalization of the reference when it is not the identity.
+/// An identity normalization (mean 0, std 1) is skipped: the engine's image
+/// processor never normalizes, and `x * rescale` is its arithmetic where
+/// `(x - 0) / (1 / rescale)` could differ in the last bit. The channel block
+/// is one: a patch row interleaves its channels.
+fn pixel_norm(config: &PreProcessorConfig) -> Result<PixelNorm, TransformError> {
     let rescale = if config.do_rescale.unwrap_or(true) {
         config.rescale_factor.unwrap_or(1.0 / 255.0)
     } else {
@@ -179,41 +216,67 @@ fn pixel_lut(config: &PreProcessorConfig) -> Result<[[f32; 256]; 3], TransformEr
             "invalid Gemma 4 pixel rescale or normalization values",
         ));
     }
-    let lut = std::array::from_fn(|channel| {
-        if normalize {
-            // The reference fuses the rescale into the normalization:
-            // `(x - mean / rescale) / (std / rescale)`, in float32.
-            let fused_mean = mean[channel] as f32 * (1.0 / rescale) as f32;
-            let fused_std = std[channel] as f32 * (1.0 / rescale) as f32;
-            std::array::from_fn(|value| (value as f32 - fused_mean) / fused_std)
-        } else {
-            let scale = rescale as f32;
-            std::array::from_fn(|value| value as f32 * scale)
+    let norm = if normalize {
+        // The reference fuses the rescale into the normalization:
+        // `(x - mean / rescale) / (std / rescale)`, in float32.
+        let into_bytes = (1.0 / rescale) as f32;
+        PixelNorm {
+            scale: 1.0,
+            offset: std::array::from_fn(|channel| mean[channel] as f32 * into_bytes),
+            divisor: std::array::from_fn(|channel| std[channel] as f32 * into_bytes),
+            channel_block: 1,
         }
-    });
-    lut.iter()
+    } else {
+        PixelNorm {
+            scale: rescale as f32,
+            offset: [0.0; 3],
+            divisor: [1.0; 3],
+            channel_block: 1,
+        }
+    };
+    norm.table_f32()
+        .iter()
         .flatten()
         .all(|value| value.is_finite())
-        .then_some(lut)
+        .then_some(norm)
         .ok_or_else(|| shape("Gemma 4 pixel transform overflow"))
 }
 
 /// The pixel pipeline a config sets: whether an image is resized, the
-/// filter it is resized with, and the per-channel table of [`pixel_lut`].
+/// filter it is resized with, the normalization of [`pixel_norm`] and its
+/// per-channel table.
 #[derive(Debug, Clone)]
 struct Pixels {
     do_resize: bool,
     filter: FilterType,
+    norm: PixelNorm,
     lut: [[f32; 256]; 3],
 }
 
 impl Pixels {
     fn from_config(config: &PreProcessorConfig) -> Result<Self, TransformError> {
+        let norm = pixel_norm(config)?;
         Ok(Self {
             do_resize: config.do_resize.unwrap_or(true),
             filter: pil_to_filter(config.resampling.or(Some(3))),
-            lut: pixel_lut(config)?,
+            norm,
+            lut: norm.table_f32(),
         })
+    }
+
+    /// Whether the three channels map a byte to one value (the released
+    /// checkpoints: a rescale and no normalization), so a patch row's
+    /// interleaved RGB bytes convert as one run of one channel.
+    fn one_table(&self) -> bool {
+        let PixelNorm {
+            offset, divisor, ..
+        } = self.norm;
+        offset[1..]
+            .iter()
+            .all(|value| value.to_bits() == offset[0].to_bits())
+            && divisor[1..]
+                .iter()
+                .all(|value| value.to_bits() == divisor[0].to_bits())
     }
 }
 
@@ -262,6 +325,86 @@ struct Encoded {
     tokens: usize,
 }
 
+/// The geometry of one image or frame after the resize rule: its size and
+/// its patch grid, within the budget.
+struct Layout {
+    height: usize,
+    width: usize,
+    grid_h: usize,
+    grid_w: usize,
+}
+
+impl Layout {
+    fn new(
+        source_w: usize,
+        source_h: usize,
+        params: Params,
+        pixels: &Pixels,
+    ) -> Result<Self, TransformError> {
+        let (height, width) = params.input_size(pixels.do_resize, source_h, source_w)?;
+        let (grid_h, grid_w) = (height / params.patch, width / params.patch);
+        Ok(Self {
+            height,
+            width,
+            grid_h,
+            grid_w,
+        })
+    }
+
+    fn num_patches(&self) -> usize {
+        self.grid_h * self.grid_w
+    }
+
+    /// The frame's pixels at this size: its own when the rule keeps it, else
+    /// resized with the configured filter.
+    fn pixels<'a>(
+        &self,
+        raw: Cow<'a, [u8]>,
+        source_w: usize,
+        source_h: usize,
+        filter: FilterType,
+    ) -> Result<Cow<'a, [u8]>, TransformError> {
+        if (self.height, self.width) == (source_h, source_w) {
+            return Ok(raw);
+        }
+        let resized = if filter == FilterType::CatmullRom {
+            resize_bicubic_torch_aa_rgb(
+                raw.as_ref(),
+                source_w as u32,
+                source_h as u32,
+                self.width as u32,
+                self.height as u32,
+            )?
+        } else {
+            resize_rgb_bytes(
+                raw.as_ref(),
+                source_w as u32,
+                source_h as u32,
+                self.width as u32,
+                self.height as u32,
+                filter,
+            )?
+        };
+        Ok(Cow::Owned(resized.into_raw()))
+    }
+
+    /// `(x, y)` per patch in reading order into `positions`, `-1` for the
+    /// padding after them.
+    fn write_positions(&self, positions: &mut [i64]) {
+        let real = self.num_patches() * 2;
+        for (index, position) in positions[..real]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            position[0] = (index % self.grid_w) as i64;
+            position[1] = (index / self.grid_w) as i64;
+        }
+        positions[real..].fill(-1);
+    }
+}
+
 /// The resized, patchified and padded form of one image or frame.
 fn encode<F: RgbSource>(
     frame: &F,
@@ -270,87 +413,79 @@ fn encode<F: RgbSource>(
 ) -> Result<Encoded, TransformError> {
     let (source_w, source_h) = frame.dimensions();
     let (source_w, source_h) = (source_w as usize, source_h as usize);
-    let raw = frame.rgb()?;
+    let layout = Layout::new(source_w, source_h, params, pixels)?;
+    let data = layout.pixels(frame.rgb()?, source_w, source_h, pixels.filter)?;
     let lut = &pixels.lut;
-    let (height, width) = if pixels.do_resize {
-        params.target_size(source_h, source_w)?
-    } else {
-        (source_h, source_w)
-    };
-    let side = params.side_mult();
-    if height == 0 || width == 0 || !height.is_multiple_of(side) || !width.is_multiple_of(side) {
-        return Err(shape(format!(
-            "Gemma 4 input {width}x{height} is not a multiple of {side} pixels"
-        )));
-    }
-    let (grid_h, grid_w) = (height / params.patch, width / params.patch);
-    let num_patches = grid_h * grid_w;
-    if num_patches > params.max_patches() {
-        return Err(shape(format!(
-            "Gemma 4 input {width}x{height} has {num_patches} patches, above the budget of {}",
-            params.max_patches()
-        )));
-    }
-    let pixels: Cow<'_, [u8]> = if (height, width) == (source_h, source_w) {
-        raw
-    } else {
-        let filter = pixels.filter;
-        let resized = if filter == FilterType::CatmullRom {
-            resize_bicubic_torch_aa_rgb(
-                raw.as_ref(),
-                source_w as u32,
-                source_h as u32,
-                width as u32,
-                height as u32,
-            )?
-        } else {
-            resize_rgb_bytes(
-                raw.as_ref(),
-                source_w as u32,
-                source_h as u32,
-                width as u32,
-                height as u32,
-                filter,
-            )?
-        };
-        Cow::Owned(resized.into_raw())
-    };
-
     let patch_pixels = params.patch_pixels();
-    let mut values = vec![0.0_f32; params.max_patches() * patch_pixels];
-    let row_bytes = width * CHANNELS;
-    for patch_y in 0..grid_h {
-        for patch_x in 0..grid_w {
+    // The patches in reading order, then the zero padding, each element
+    // written once into a plain allocation: a zeroed allocation of this size
+    // costs the allocator's page faults per image, and the patches overwrite
+    // all of it but the padding.
+    let mut values = Vec::with_capacity(params.max_patches() * patch_pixels);
+    let row_bytes = layout.width * CHANNELS;
+    for patch_y in 0..layout.grid_h {
+        for patch_x in 0..layout.grid_w {
             // Patch elements run `[dy][dx][channel]`, the interleaved layout
             // of the source rows (the reference's `(ph, pw, p, p, c)` view).
-            let patch = &mut values[(patch_y * grid_w + patch_x) * patch_pixels..][..patch_pixels];
             for dy in 0..params.patch {
                 let source =
                     (patch_y * params.patch + dy) * row_bytes + patch_x * params.patch * CHANNELS;
-                let row = &pixels[source..source + params.patch * CHANNELS];
-                let out = &mut patch[dy * params.patch * CHANNELS..][..params.patch * CHANNELS];
-                for (out, (value, lut)) in out.iter_mut().zip(row.iter().zip(lut.iter().cycle())) {
-                    *out = lut[*value as usize];
-                }
+                let row = &data[source..source + params.patch * CHANNELS];
+                values.extend(
+                    row.iter()
+                        .zip(lut.iter().cycle())
+                        .map(|(value, lut)| lut[*value as usize]),
+                );
             }
         }
     }
-    // `(x, y)` per patch in reading order, `-1` for the padding.
-    let mut positions = vec![-1_i64; params.max_patches() * 2];
-    for (index, position) in positions[..num_patches * 2]
-        .as_chunks_mut::<2>()
-        .0
-        .iter_mut()
-        .enumerate()
-    {
-        position[0] = (index % grid_w) as i64;
-        position[1] = (index / grid_w) as i64;
-    }
+    values.resize(params.max_patches() * patch_pixels, 0.0);
+    let mut positions = vec![0_i64; params.max_patches() * 2];
+    layout.write_positions(&mut positions);
     Ok(Encoded {
         values,
         positions,
-        tokens: num_patches / (params.pool * params.pool),
+        tokens: layout.num_patches() / (params.pool * params.pool),
     })
+}
+
+/// [`encode`] straight into the wire: the patches of one image or frame
+/// written once in `writer`'s dtype into `band` (the padding patches as
+/// zeros after them) and its positions into `positions`; the soft-token
+/// count. The channels share one table ([`Pixels::one_table`]), so each
+/// patch row's interleaved bytes convert as one run.
+fn encode_wire<F: RgbSource>(
+    frame: &F,
+    params: Params,
+    pixels: &Pixels,
+    writer: &WireWriter,
+    band: &mut [u8],
+    positions: &mut [i64],
+) -> Result<usize, TransformError> {
+    let (source_w, source_h) = frame.dimensions();
+    let (source_w, source_h) = (source_w as usize, source_h as usize);
+    let layout = Layout::new(source_w, source_h, params, pixels)?;
+    let data = layout.pixels(frame.rgb()?, source_w, source_h, pixels.filter)?;
+    let run = params.patch * CHANNELS;
+    let run_bytes = run * writer.element_size();
+    let row_bytes = layout.width * CHANNELS;
+    let mut written = 0;
+    for patch_y in 0..layout.grid_h {
+        for patch_x in 0..layout.grid_w {
+            for dy in 0..params.patch {
+                let source = (patch_y * params.patch + dy) * row_bytes + patch_x * run;
+                writer.write_run(
+                    &mut band[written..written + run_bytes],
+                    &data[source..source + run],
+                    0,
+                );
+                written += run_bytes;
+            }
+        }
+    }
+    band[written..].fill(0);
+    layout.write_positions(positions);
+    Ok(layout.num_patches() / (params.pool * params.pool))
 }
 
 /// Stack encoded items along the first dimension.
@@ -492,12 +627,84 @@ impl Gemma4Processor {
             )))
         }
     }
+
+    /// [`VisionPreProcessor::preprocess_wire`]'s work once the writer exists:
+    /// a pooled wire buffer with one band per image, each image's patches and
+    /// their zero padding written once in the wire's dtype, the positions
+    /// beside them.
+    fn preprocess_into_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+        writer: &WireWriter,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        if images.is_empty() {
+            return Err(TransformError::EmptyBatch);
+        }
+        let params = self.params_for(Modality::Image)?;
+        let (max_patches, patch_pixels) = (params.max_patches(), params.patch_pixels());
+        let band_bytes = max_patches * patch_pixels * writer.element_size();
+        let wire_len = band_bytes
+            .checked_mul(images.len())
+            .ok_or_else(|| shape("Gemma 4 wire size overflow"))?;
+        // A pooled buffer: its bytes are a previous request's until the bands
+        // below, padding included, are written.
+        let mut wire = buffer_pool::take(wire_len);
+        let mut positions = vec![0_i64; images.len() * max_patches * 2];
+        let mut tokens = Vec::with_capacity(images.len());
+        for ((image, band), positions) in images
+            .iter()
+            .zip(wire.chunks_exact_mut(band_bytes))
+            .zip(positions.chunks_exact_mut(max_patches * 2))
+        {
+            tokens.push(encode_wire(
+                *image,
+                params,
+                &self.pixels,
+                writer,
+                band,
+                positions,
+            )?);
+        }
+        let encoder_input = EncoderInput::wire(
+            wire,
+            dtype,
+            vec![images.len(), max_patches, patch_pixels],
+            self.pixels.norm,
+        )
+        .map_err(shape)?;
+        let sizes = images
+            .iter()
+            .copied()
+            .map(GenericImageView::dimensions)
+            .collect();
+        Ok(
+            PreprocessedEncoderInputs::new(encoder_input, tokens, sizes).with_extra(
+                "pixel_position_ids",
+                ModelSpecificValue::IntTensor {
+                    data: positions,
+                    shape: vec![images.len(), max_patches, 2],
+                },
+            ),
+        )
+    }
 }
 
 impl VisionPreProcessor for Gemma4Processor {
     /// Each image is resized, patchified and padded on its own.
     fn supports_per_image_preprocessing(&self) -> bool {
         true
+    }
+
+    /// The BF16 wire has one independently padded slice per image.
+    fn supports_bf16_batch_cache(&self) -> bool {
+        self.pixels.one_table()
+    }
+
+    /// Every cache entry includes the full padded patch dimension.
+    fn image_input_elements(&self, _width: u32, _height: u32) -> Option<usize> {
+        let params = self.params_for(Modality::Image).ok()?;
+        params.max_patches().checked_mul(params.patch_pixels())
     }
 
     fn default_mean(&self) -> [f64; 3] {
@@ -510,7 +717,7 @@ impl VisionPreProcessor for Gemma4Processor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -518,12 +725,32 @@ impl VisionPreProcessor for Gemma4Processor {
         let params = self.params_for(Modality::Image)?;
         let encoded = images
             .iter()
-            .map(|image| encode(image, params, &self.pixels))
+            .map(|image| encode(*image, params, &self.pixels))
             .collect::<Result<Vec<_>, _>>()?;
         let (tensor, positions, tokens) = stack(encoded, params)?;
-        let sizes = images.iter().map(GenericImageView::dimensions).collect();
+        let sizes = images
+            .iter()
+            .copied()
+            .map(GenericImageView::dimensions)
+            .collect();
         Ok(PreprocessedEncoderInputs::new(tensor, tokens, sizes)
             .with_extra("pixel_position_ids", positions))
+    }
+
+    /// The image batch written once in `dtype` through the crate's writer.
+    /// `None` for the `uint8` wire (the processor emits floats) and for a
+    /// normalization whose channels differ (the interleaved rows cannot
+    /// convert as one run; the two-pass path serves).
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        if !self.pixels.one_table() {
+            return None;
+        }
+        let writer = WireWriter::new(&self.pixels.norm, dtype)?;
+        Some(self.preprocess_into_wire(images, dtype, &writer))
     }
 
     fn preprocess_video(
@@ -542,12 +769,13 @@ impl VisionPreProcessor for Gemma4Processor {
         preprocess_video_frames(frames, self.params_for(Modality::Video)?, &self.pixels)
     }
 
-    /// Soft tokens for an image of this size; the preprocessing error for a
-    /// size the reference rule cannot resize.
+    /// Soft tokens for an image of this size, counted on the size the encode
+    /// works on (the resize target, or the source itself under
+    /// `do_resize: false`); the preprocessing error for a size it refuses.
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         let params = self.params_for(Modality::Image)?;
-        let target = params.target_size(height as usize, width as usize)?;
-        Ok(params.soft_tokens(target))
+        let input = params.input_size(self.pixels.do_resize, height as usize, width as usize)?;
+        Ok(params.soft_tokens(input))
     }
 
     fn model_name(&self) -> &'static str {
@@ -662,7 +890,7 @@ mod tests {
         let image = solid(512, 512, [255, 0, 51]);
         let out = Gemma4Processor::from_config_for(&image_config(), Modality::Image)
             .unwrap()
-            .preprocess(std::slice::from_ref(&image))
+            .preprocess(&[&image])
             .unwrap();
         assert_eq!(out.encoder_input.shape(), &[1, 2520, 768]);
         assert_eq!(out.feature_token_counts, vec![256]);
@@ -690,11 +918,55 @@ mod tests {
     }
 
     #[test]
+    fn the_patch_tensor_equals_its_zero_filled_form() {
+        // The patches in reading order, then zero padding to the budget, as the
+        // zero-filled tensor held them; an unresized gradient, so every patch
+        // element is checked against the index form.
+        let params = params();
+        let side = params.side_mult();
+        let (width, height) = (2 * side, side);
+        let pixels = crate::test_support::gradient_rgb(width, height, 7);
+        let frame = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(width as u32, height as u32, pixels.clone()).unwrap(),
+        );
+        let pipeline = Pixels {
+            do_resize: false,
+            ..Pixels::from_config(&image_config()).unwrap()
+        };
+        let encoded = encode(&frame, params, &pipeline).unwrap();
+        let (patch, patch_pixels) = (params.patch, params.patch_pixels());
+        let (grid_w, grid_h) = (width / patch, height / patch);
+        let mut expected = vec![0.0_f32; params.max_patches() * patch_pixels];
+        for patch_y in 0..grid_h {
+            for patch_x in 0..grid_w {
+                for dy in 0..patch {
+                    for dx in 0..patch {
+                        for channel in 0..CHANNELS {
+                            let source = ((patch_y * patch + dy) * width + patch_x * patch + dx)
+                                * CHANNELS
+                                + channel;
+                            let index = (patch_y * grid_w + patch_x) * patch_pixels
+                                + (dy * patch + dx) * CHANNELS
+                                + channel;
+                            expected[index] = pipeline.lut[channel][pixels[source] as usize];
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(encoded.values, expected);
+        assert_eq!(
+            encoded.tokens,
+            grid_w * grid_h / (params.pool * params.pool)
+        );
+    }
+
+    #[test]
     fn batches_stack_images_of_different_sizes() {
         let images = [solid(64, 64, [1, 2, 3]), solid(1920, 1080, [4, 5, 6])];
         let out = Gemma4Processor::from_config_for(&image_config(), Modality::Image)
             .unwrap()
-            .preprocess(&images)
+            .preprocess(&images.iter().collect::<Vec<_>>())
             .unwrap();
         assert_eq!(out.encoder_input.shape(), &[2, 2520, 768]);
         assert_eq!(out.feature_token_counts, vec![256, 264]);
@@ -785,12 +1057,15 @@ mod tests {
         let no_resize: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"do_resize": false})).unwrap();
         let no_resize = Gemma4Processor::from_config_for(&no_resize, Modality::Image).unwrap();
-        assert!(no_resize.preprocess(&[solid(100, 100, [0; 3])]).is_err());
-        let aligned = no_resize.preprocess(&[solid(96, 48, [0; 3])]).unwrap();
+        assert!(no_resize.preprocess(&[&solid(100, 100, [0; 3])]).is_err());
+        let aligned = no_resize.preprocess(&[&solid(96, 48, [0; 3])]).unwrap();
         assert_eq!(aligned.feature_token_counts, vec![2]);
+        // The size-only count takes the same source size as the encode.
+        assert_eq!(no_resize.calculate_num_tokens(96, 48).unwrap(), 2);
+        assert!(no_resize.calculate_num_tokens(100, 100).is_err());
         // Aligned but over the budget of 2520 patches (180 x 60 = 10,800).
         assert!(no_resize
-            .preprocess(&[solid(48 * 60, 48 * 20, [0; 3])])
+            .preprocess(&[&solid(48 * 60, 48 * 20, [0; 3])])
             .is_err());
     }
 
@@ -800,15 +1075,112 @@ mod tests {
             "do_normalize": true, "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5]
         }))
         .unwrap();
-        let lut = pixel_lut(&config).unwrap();
+        let lut = pixel_norm(&config).unwrap().table_f32();
         assert_eq!(lut[0][255], (255.0_f32 - 127.5) / 127.5);
         assert_eq!(lut[1][0], -1.0);
-        let identity = pixel_lut(&video_config()).unwrap();
+        let identity = pixel_norm(&video_config()).unwrap().table_f32();
         assert_eq!(identity[2][255], 255.0_f32 * (1.0_f32 / 255.0));
         let bad: PreProcessorConfig = serde_json::from_value(
             serde_json::json!({"do_normalize": true, "image_mean": [0.0, 0.0, 0.0], "image_std": [0.0, 1.0, 1.0]}),
         )
         .unwrap();
-        assert!(pixel_lut(&bad).is_err());
+        assert!(pixel_norm(&bad).is_err());
+    }
+
+    fn gradient(width: u32, height: u32, seed: usize) -> DynamicImage {
+        let pixels = crate::test_support::gradient_rgb(width as usize, height as usize, seed);
+        DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, pixels).unwrap())
+    }
+
+    /// The one-pass wire carries the bytes of `preprocess` followed by the
+    /// write in the wire's dtype, with the same counts, sizes and positions:
+    /// single images and batches of different sizes, resized (640x480,
+    /// 1920x1080 and 96x48 all map to other sizes under the budget) and not
+    /// (768x768 is the budget's own square and maps to itself, so its bytes
+    /// are the frame's own), in every float dtype. The pool hands the writer
+    /// a buffer with a previous request's bytes (the debug sentinel here), so
+    /// the padding is checked as written, not as inherited.
+    #[test]
+    fn the_wire_equals_the_two_pass_bytes() {
+        let processor = Gemma4Processor::from_config_for(&image_config(), Modality::Image).unwrap();
+        let images = [
+            gradient(640, 480, 3),
+            gradient(1920, 1080, 5),
+            gradient(96, 48, 9),
+            gradient(768, 768, 7),
+        ];
+        for dtype in [
+            EncoderDtype::BFloat16,
+            EncoderDtype::Float16,
+            EncoderDtype::Float32,
+        ] {
+            for refs in [
+                vec![&images[0]],
+                vec![&images[3]],
+                vec![&images[1], &images[2], &images[3], &images[0]],
+            ] {
+                let neutral = processor.preprocess(&refs).unwrap();
+                let wire = processor
+                    .preprocess_wire(&refs, dtype)
+                    .expect("a float wire is written in one pass")
+                    .unwrap();
+                assert_eq!(wire.encoder_input.shape(), neutral.encoder_input.shape());
+                assert_eq!(
+                    wire.encoder_input.write_as(dtype),
+                    neutral.encoder_input.write_as(dtype),
+                    "{dtype}, {} images",
+                    refs.len()
+                );
+                assert_eq!(wire.feature_token_counts, neutral.feature_token_counts);
+                assert_eq!(wire.item_sizes, neutral.item_sizes);
+                assert_eq!(
+                    format!("{:?}", wire.model_specific["pixel_position_ids"]),
+                    format!("{:?}", neutral.model_specific["pixel_position_ids"])
+                );
+            }
+        }
+    }
+
+    /// Where the two-pass path is the form: the `uint8` wire (the processor
+    /// emits floats) and a normalization whose channels differ (the rows
+    /// cannot convert as one run); a shared non-identity normalization is
+    /// written; the empty batch and the other modality's processor answer as
+    /// `preprocess` does.
+    #[test]
+    fn the_wire_is_refused_where_the_two_pass_path_is_the_form() {
+        let processor = Gemma4Processor::from_config_for(&image_config(), Modality::Image).unwrap();
+        let image = gradient(64, 64, 1);
+        assert!(processor
+            .preprocess_wire(&[&image], EncoderDtype::Uint8)
+            .is_none());
+        let normalized = |mean: [f64; 3]| -> Gemma4Processor {
+            let config: PreProcessorConfig = serde_json::from_value(serde_json::json!({
+                "do_normalize": true, "image_mean": mean, "image_std": [0.5, 0.5, 0.5]
+            }))
+            .unwrap();
+            Gemma4Processor::from_config_for(&config, Modality::Image).unwrap()
+        };
+        assert!(normalized([0.5, 0.4, 0.3])
+            .preprocess_wire(&[&image], EncoderDtype::BFloat16)
+            .is_none());
+        let shared = normalized([0.5, 0.5, 0.5]);
+        let neutral = shared.preprocess(&[&image]).unwrap();
+        let wire = shared
+            .preprocess_wire(&[&image], EncoderDtype::BFloat16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            wire.encoder_input.write_as(EncoderDtype::BFloat16),
+            neutral.encoder_input.write_as(EncoderDtype::BFloat16)
+        );
+        assert!(matches!(
+            processor.preprocess_wire(&[], EncoderDtype::BFloat16),
+            Some(Err(TransformError::EmptyBatch))
+        ));
+        let video = Gemma4Processor::from_config_for(&video_config(), Modality::Video).unwrap();
+        assert!(video
+            .preprocess_wire(&[&image], EncoderDtype::BFloat16)
+            .unwrap()
+            .is_err());
     }
 }

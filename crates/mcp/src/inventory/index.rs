@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use tracing::warn;
 
 use super::types::{QualifiedToolName, ToolCategory, ToolEntry, ALIAS_SERVER_KEY};
-use crate::core::config::{Prompt, RawResource, Tool};
+use crate::core::config::{Prompt, Resource, Tool};
 
 /// Cached prompt with metadata
 #[derive(Clone)]
@@ -26,7 +26,7 @@ pub(crate) struct CachedPrompt {
 #[derive(Clone)]
 pub(crate) struct CachedResource {
     pub server_name: String,
-    pub resource: RawResource,
+    pub resource: Resource,
 }
 
 pub struct ToolInventory {
@@ -286,7 +286,7 @@ impl ToolInventory {
     }
 
     /// Get a resource by URI, returning the server and resource info.
-    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, RawResource)> {
+    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, Resource)> {
         self.resources
             .get(resource_uri)
             .map(|entry| (entry.server_name.clone(), entry.resource.clone()))
@@ -298,12 +298,7 @@ impl ToolInventory {
     }
 
     /// Insert or update a resource.
-    pub fn insert_resource(
-        &self,
-        resource_uri: String,
-        server_name: String,
-        resource: RawResource,
-    ) {
+    pub fn insert_resource(&self, resource_uri: String, server_name: String, resource: Resource) {
         self.resources.insert(
             resource_uri,
             CachedResource {
@@ -314,7 +309,7 @@ impl ToolInventory {
     }
 
     /// List all resources as (uri, server, resource) tuples.
-    pub fn list_resources(&self) -> Vec<(String, String, RawResource)> {
+    pub fn list_resources(&self) -> Vec<(String, String, Resource)> {
         self.resources
             .iter()
             .map(|entry| {
@@ -451,7 +446,7 @@ pub struct IndexCounts {
 mod tests {
     use super::*;
     use crate::{
-        core::config::{Prompt, RawResource, Tool},
+        core::config::{Prompt, Resource, Tool},
         inventory::AliasTarget,
     };
 
@@ -494,8 +489,8 @@ mod tests {
     }
 
     // Helper to create a test resource
-    fn create_test_resource(uri: &str) -> RawResource {
-        RawResource::new(uri, uri)
+    fn create_test_resource(uri: &str) -> Resource {
+        Resource::new(uri, uri)
             .with_description(format!("Test resource: {uri}"))
             .with_mime_type("text/plain")
     }

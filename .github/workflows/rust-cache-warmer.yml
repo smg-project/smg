@@ -20,10 +20,6 @@ concurrency:
   group: rust-cache-warmer
   cancel-in-progress: false
 
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
-
 permissions:
   contents: read
 
@@ -72,7 +68,3 @@ jobs:
           for leg in all-features self-hosted anthropic-only; do
             bash scripts/ci_rust_tests.sh lint "$leg"
           done
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats

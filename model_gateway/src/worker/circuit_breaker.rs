@@ -6,7 +6,7 @@ use std::{
 use parking_lot::Mutex;
 use tracing::info;
 
-use crate::observability::metrics::Metrics;
+use crate::{observability::metrics::Metrics, worker::endpoint::Endpoint};
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,7 +244,7 @@ impl CircuitBreaker {
             CircuitState::Closed => {}
             CircuitState::Open => {
                 tracing::warn!(
-                    worker_url = %self.metric_label,
+                    worker_url = %Endpoint::redacted_str(&self.metric_label),
                     "Success recorded while circuit is open"
                 );
             }
@@ -275,8 +275,8 @@ impl CircuitBreaker {
     }
 
     /// Move to `new_state` by a swap: the counters' own moves (a trip, a
-    /// close, a forced open, a reset). A swap onto the same state is no
-    /// transition and leaves no trace.
+    /// close, a reset). A swap onto the same state is no transition and
+    /// leaves no trace.
     fn transition_to(&self, new_state: CircuitState) {
         let old_state =
             CircuitState::from_int(self.state.swap(new_state.as_int(), Ordering::AcqRel));
@@ -306,7 +306,7 @@ impl CircuitBreaker {
         let (from, to) = (from.as_str(), to.as_str());
         // An absent `cause` records no field: the line reads as before.
         info!(
-            worker_url = %self.metric_label,
+            worker_url = %Endpoint::redacted_str(&self.metric_label),
             from,
             to,
             cause,
@@ -407,11 +407,6 @@ impl CircuitBreaker {
         }
         self.entered(CircuitState::Open, CircuitState::HalfOpen, Some(cause));
         true
-    }
-
-    /// Force the circuit to open (for manual intervention)
-    pub fn force_open(&self) {
-        self.transition_to(CircuitState::Open);
     }
 
     /// Get circuit breaker statistics
@@ -524,7 +519,7 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         cb.record_success();
         assert_eq!(cb.state(), CircuitState::Closed);
-        cb.force_open();
+        cb.transition_to(CircuitState::Open);
         cb.record_success();
 
         for (from, to) in [
@@ -794,16 +789,6 @@ mod tests {
         cb.clear_failure_streak();
         assert_eq!(cb.state(), CircuitState::Open);
         assert_eq!(cb.consecutive_failures(), 3);
-    }
-
-    #[test]
-    fn test_force_open() {
-        let cb = CircuitBreaker::new();
-        assert_eq!(cb.state(), CircuitState::Closed);
-
-        cb.force_open();
-        assert_eq!(cb.state(), CircuitState::Open);
-        assert!(!cb.can_execute());
     }
 
     #[test]

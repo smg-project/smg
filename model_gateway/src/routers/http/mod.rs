@@ -7,11 +7,10 @@ pub(crate) mod request_stream;
 pub mod router;
 pub(crate) mod stream_failure;
 pub(crate) mod stream_relay;
+pub(crate) mod tenant_rate_limit;
 
 use axum::response::Response;
-use openai_protocol::{
-    chat::ChatCompletionRequest, messages::CreateMessageRequest, profile::ProviderProfile,
-};
+use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};
 use serde_json::Value;
 
 use crate::routers::error;
@@ -51,8 +50,8 @@ pub(crate) fn set_request_model(json: &mut Value, canonical_model_id: &str) {
 /// count, which the gateway gives where it renders the prompt itself); it
 /// keeps the 400 the request validation gave before, naming the field, rather
 /// than handing the engine a request that generates nothing.
-pub(crate) fn refuse_max_tokens_zero(body: &CreateMessageRequest) -> Option<Response> {
-    (body.max_tokens == 0).then(|| {
+pub(crate) fn refuse_max_tokens_zero(max_tokens: u32) -> Option<Response> {
+    (max_tokens == 0).then(|| {
         error::bad_request(
             "max_tokens_zero_not_relayed",
             "max_tokens: must be greater than 0 for this model, which is served through \

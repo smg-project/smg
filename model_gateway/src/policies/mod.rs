@@ -5,6 +5,8 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+use rand::RngExt as _;
+
 use crate::{
     config::CacheIndexKind,
     worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker},
@@ -16,7 +18,9 @@ mod cache_namespace;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
+pub mod engine_host;
 mod factory;
+pub mod host_stores;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -34,6 +38,7 @@ pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
+pub use engine_host::Decider;
 pub use factory::PolicyFactory;
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;
@@ -61,11 +66,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// * `info` - Additional information for routing decisions
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
 
-    /// Update policy state after request completion
+    /// Update policy state when a request ends.
     ///
-    /// This is called when a request completes (successfully or not) to allow
-    /// policies to update their internal state.
-    fn on_request_complete(&self, _worker_url: &str, _success: bool) {
+    /// Called when the request's load guard on `_worker_url` drops, whatever
+    /// the outcome, so a policy releases what it booked at dispatch. The
+    /// outcome itself is not carried here: it reaches the worker's circuit
+    /// breaker through `record_outcome`, and a policy that wants a failure
+    /// signal reads the worker's breaker state.
+    fn on_request_complete(&self, _worker_url: &str) {
         // Default: no-op for stateless policies
     }
 
@@ -104,6 +112,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// Whether routing reads the model's KV-event index: a gRPC worker this
+    /// policy places streams its KV events into that index, where any other
+    /// streams its load records alone (see `UpdatePoliciesStep`). A
+    /// constant for the policy's lifetime.
+    fn needs_kv_events(&self) -> bool {
+        false
+    }
+
     /// Whether this policy weighs a worker's load against the cache it holds
     /// for the request and moves a request off a saturated holder itself
     /// (cache-aware's count-pressure spill). Disaggregated pair placement
@@ -112,6 +128,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// holding its prefix (see `placement::select_pair`). A constant for the
     /// policy's lifetime.
     fn balances_load_against_affinity(&self) -> bool {
+        false
+    }
+
+    /// Whether this policy places `info`'s request on the owner of its
+    /// explicit session key (a routing key, or the rid-derived key under the
+    /// routing-key override) rather than by load: consistent hashing's ring
+    /// owner. Single-worker placement over regular workers then leaves the
+    /// absolute overload veto off the selection instead of moving the session
+    /// off the worker holding its cache each time that worker crosses a
+    /// threshold (see `placement::select_from`).
+    fn routes_by_session_key(&self, _info: &SelectWorkerInfo) -> bool {
         false
     }
 
@@ -145,6 +172,26 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// The consistent-hashing policy behind a policy handle, when it is one: the
+/// one spelling of that downcast for the placement rules and the tests.
+pub(crate) fn as_consistent_hashing(
+    policy: &dyn LoadBalancingPolicy,
+) -> Option<&ConsistentHashingPolicy> {
+    policy.as_any().downcast_ref::<ConsistentHashingPolicy>()
+}
+
+/// The cache-aware policy behind a policy handle, when it is one: the one
+/// spelling of that downcast for the registry, the mesh wiring and the tests.
+pub(crate) fn as_cache_aware(policy: &dyn LoadBalancingPolicy) -> Option<&CacheAwarePolicy> {
+    policy.as_any().downcast_ref::<CacheAwarePolicy>()
+}
+
+/// The bucket policy behind a policy handle, when it is one: the one
+/// spelling of that downcast for the registry and the tests.
+pub(crate) fn as_bucket(policy: &dyn LoadBalancingPolicy) -> Option<&BucketPolicy> {
+    policy.as_any().downcast_ref::<BucketPolicy>()
 }
 
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
@@ -211,13 +258,13 @@ pub struct CacheAwareConfig {
     /// Must match the backend's block size. Default: 16 (one engine's page size).
     pub block_size: usize,
     /// KV-usage **spread** (hottest minus coldest backend, 0.0–1.0) above which
-    /// the pool is treated as imbalanced and cache affinity is abandoned for
-    /// shortest-queue. This is the balance signal for long-context workloads
-    /// where a few requests saturate one engine's KV without tripping the
-    /// request-count thresholds; being backend-reported, it is invariant to the
-    /// number of gateway replicas. Requires the backend to report `token_usage`
-    /// (gRPC/`GetLoads`); falls back to the count spread when unavailable.
-    /// `>= 1.0` disables it (default).
+    /// cache affinity is abandoned fleet-wide for the expected-wait winner.
+    /// This is the balance signal for long-context workloads where a few
+    /// requests saturate one engine's KV without tripping the per-candidate
+    /// count gate; being backend-reported, it is invariant to the number of
+    /// gateway replicas. Requires the backend to report `token_usage` in its
+    /// load reports; without it the trigger is inert and the count gate is
+    /// the only balance. `>= 1.0` disables it (default).
     pub balance_token_usage_threshold: f32,
     /// Backend KV-cache utilization **ceiling** (0.0–1.0): when the hottest
     /// engine exceeds it the pool is treated as imbalanced regardless of spread,
@@ -304,14 +351,9 @@ impl Default for BucketConfig {
     }
 }
 
-/// Helper function to filter routable workers and return their indices.
-///
-/// [`Worker::is_available`] folds the absolute overload veto into the health +
-/// circuit-breaker test it already performed, under the same guards and with
-/// the same short-circuit order — the veto is one more test on a word already
-/// in hand, never a second walk. A selection whose caller lifted that veto
-/// ([`SelectWorkerInfo::overload_lifted`]) tests every other veto instead
-/// ([`RoutingState::eligible_ignoring_overload`]).
+/// Helper function to filter routable workers and return their indices: one
+/// [`SelectWorkerInfo::admits`] read per worker of the pool and one list, for the
+/// policies that need the whole eligible set (a rotation, an argmin).
 pub(crate) fn get_healthy_worker_indices(
     workers: &[Arc<dyn Worker>],
     info: &SelectWorkerInfo,
@@ -319,15 +361,41 @@ pub(crate) fn get_healthy_worker_indices(
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| {
-            if info.overload_lifted {
-                w.routing_state().eligible_ignoring_overload()
-            } else {
-                w.is_available()
-            }
-        })
+        .filter(|(_, w)| info.admits(w.routing_state()))
         .map(|(idx, _)| idx)
         .collect()
+}
+
+/// Draws a sampled pick makes before it gives the draw up and walks the pool
+/// instead. The second draw of a pair also rejects the first's index, so the
+/// odds depend on the pool: a large pool half eligible fails a draw of two
+/// about once in 30,000 picks, a pool of four with two eligible about once in
+/// a hundred; a pool mostly vetoed walks, at the price of one list. The walk
+/// is uniform too, so the pick's distribution does not depend on which path
+/// made it.
+const ELIGIBLE_DRAWS: u32 = 16;
+
+/// One index drawn uniformly over the workers `info` admits, other than
+/// `taken`, by rejection over the whole slice: an index drawn uniformly from
+/// `0..workers.len()` is kept when its worker is eligible, so a kept draw is
+/// uniform over the eligible workers without listing them, and the pick reads
+/// the eligibility of the drawn workers alone. `None` after `ELIGIBLE_DRAWS`
+/// rejections, which a pool with too few eligible workers for the pick
+/// always reaches: the caller walks the pool then. A pool too small to hold
+/// the pick (empty, or one worker when one is taken) answers without drawing.
+pub(crate) fn draw_eligible(
+    workers: &[Arc<dyn Worker>],
+    info: &SelectWorkerInfo,
+    taken: Option<usize>,
+) -> Option<usize> {
+    if workers.len() <= usize::from(taken.is_some()) {
+        return None;
+    }
+    let mut rng = rand::rng();
+    (0..ELIGIBLE_DRAWS).find_map(|_| {
+        let idx = rng.random_range(0..workers.len());
+        (taken != Some(idx) && info.admits(workers[idx].routing_state())).then_some(idx)
+    })
 }
 
 /// Helper function to normalize model_id to a key for policy lookups.
@@ -380,9 +448,11 @@ pub struct SelectWorkerInfo<'a> {
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     pub headers: Option<&'a http::HeaderMap>,
-    /// Validated `x-smg-routing-key` hint (non-empty UTF-8, <= 128 bytes);
-    /// consistent_hashing and prefix_hash prefer it over their other keying
-    /// input.
+    /// The validated routing-key header (non-empty UTF-8, <= 128 bytes) as
+    /// `PolicyRegistry::sticky_header_key` derives it: lineage-stripped
+    /// (`conv_t2_r1` -> `conv`) under the routing-key override, raw
+    /// otherwise; the key the load guard counts under. consistent_hashing,
+    /// manual and prefix_hash prefer it over their other keying input.
     pub routing_key: Option<&'a str>,
     /// The request's cache partition (cache salt / extra key / LoRA), when
     /// set. Cache-aware routing keys its affinity under it so requests the
@@ -405,7 +475,9 @@ pub struct SelectWorkerInfo<'a> {
     /// when every worker is over them (health, the circuit breaker and the
     /// liveness veto still apply). Set by disaggregated pair placement for
     /// such a prefill pool (see `placement::select_pair`); every other pool
-    /// keeps the veto and the least-loaded steering default.
+    /// keeps the veto and the least-loaded steering default. Single-worker
+    /// placement over regular workers also sets it for a request its policy
+    /// places by session key ([`LoadBalancingPolicy::routes_by_session_key`]).
     pub overload_lifted: bool,
 }
 
@@ -680,5 +752,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Four workers, the second not ready: the draw never returns it, never
+    /// the taken index, and returns every other worker over enough draws. A
+    /// draw may give up (sixteen rejections at one chance in two: once in
+    /// 65,536 calls), which is the function's contract, not a failure here.
+    #[test]
+    fn the_draw_skips_the_vetoed_workers_and_the_taken_index() {
+        let workers = test_support::make_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        workers[1].set_status(WorkerStatus::NotReady);
+        let info = SelectWorkerInfo::default();
+        let mut seen = [0usize; 4];
+        for _ in 0..2_000 {
+            let Some(idx) = draw_eligible(&workers, &info, Some(3)) else {
+                continue;
+            };
+            seen[idx] += 1;
+        }
+        assert_eq!(seen[1], 0, "a not-ready worker was drawn: {seen:?}");
+        assert_eq!(seen[3], 0, "the taken index was drawn: {seen:?}");
+        assert!(
+            seen[0] > 700 && seen[2] > 700,
+            "the two eligible workers share the draws evenly: {seen:?}"
+        );
+    }
+
+    /// A pool without two eligible workers ends the draw with nothing: the
+    /// caller walks it. An empty pool the same, without drawing.
+    #[test]
+    fn the_draw_gives_up_on_a_pool_without_an_eligible_worker_to_draw() {
+        let workers = test_support::make_workers(&["http://w1:8000"]);
+        let info = SelectWorkerInfo::default();
+        assert_eq!(draw_eligible(&workers, &info, None), Some(0));
+        assert_eq!(draw_eligible(&workers, &info, Some(0)), None);
+        workers[0].set_status(WorkerStatus::NotReady);
+        assert_eq!(draw_eligible(&workers, &info, None), None);
+        assert_eq!(draw_eligible(&[], &info, None), None);
     }
 }

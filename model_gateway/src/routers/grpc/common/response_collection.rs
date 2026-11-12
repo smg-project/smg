@@ -90,7 +90,7 @@ pub(crate) async fn collect_responses(
     merge_logprobs: bool,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let all_responses = match execution_result {
-        ExecutionResult::Single { mut stream } => {
+        ExecutionResult::Single { mut stream, .. } => {
             let responses = collect_stream_responses(&mut stream, "Single", None, None).await?;
             stream.mark_completed();
             responses
@@ -325,6 +325,7 @@ mod tests {
     use std::{
         net::TcpListener,
         sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
     };
 
     use axum::http::StatusCode;
@@ -333,8 +334,7 @@ mod tests {
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
-        test_support::RefusedAddress,
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+        worker::{test_support::RefusedAddress, BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
     /// A stream that is already at EOF, as sequential PD hands to the
@@ -351,6 +351,10 @@ mod tests {
         fn defer_abort_until_first_item(self) -> Self {
             self
         }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
+            self
+        }
     }
 
     /// A stream the engine ends with `status` before any response.
@@ -364,6 +368,10 @@ mod tests {
         fn mark_completed(&mut self) {}
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }
@@ -393,6 +401,10 @@ mod tests {
         fn defer_abort_until_first_item(self) -> Self {
             self
         }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
+            self
+        }
     }
 
     /// A stream that yields one `Complete`, then the engine's report.
@@ -417,6 +429,10 @@ mod tests {
         fn mark_completed(&mut self) {}
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }

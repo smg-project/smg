@@ -1,15 +1,18 @@
 //! Applying an image's orientation tag (the EXIF orientation the decoders
 //! report) to decoded RGB8 pixels: the eight transforms with the geometry of
 //! `DynamicImage::apply_orientation`, as tile transposes and row reversals on
-//! the vector unit (AArch64) and plain loops elsewhere. Pure permutations of
-//! the pixels, so every path writes the same bytes; images of other types
-//! take the `image` crate's own transform.
+//! the vector unit (AArch64 and x86-64) and plain loops elsewhere. Pure
+//! permutations of the pixels, so every path writes the same bytes; images of
+//! other types take the `image` crate's own transform.
 //!
 //! The AArch64 path is the module's only use of `core::arch` vector loads and
 //! stores, hence the local override of the workspace-wide
 //! `unsafe_code = "deny"`; every pointer it forms comes from an exact-size
 //! slice (a 48-byte run), so a wrong length or offset is a bounds check,
-//! never an out-of-bounds vector access.
+//! never an out-of-bounds vector access. The x86-64 path carries no `unsafe`:
+//! `multiversion` selects its AVX2 clones at the first call, and every vector
+//! word enters and leaves them through a `bytemuck` cast of an exact-size
+//! byte array.
 #![cfg_attr(target_arch = "aarch64", allow(unsafe_code))]
 
 use image::{metadata::Orientation, DynamicImage, RgbImage};
@@ -36,6 +39,28 @@ pub(crate) fn oriented(image: DynamicImage, orientation: Orientation) -> Dynamic
 struct Transpose {
     reverse_rows: bool,
     reverse_columns: bool,
+}
+
+impl Transpose {
+    /// The destination row of source column `x`, `out_h` the rows of the
+    /// transposed image.
+    fn row_of(self, out_h: usize, x: usize) -> usize {
+        if self.reverse_rows {
+            out_h - 1 - x
+        } else {
+            x
+        }
+    }
+
+    /// The destination column of source row `y`, `out_w` the width of the
+    /// transposed image.
+    fn col_of(self, out_w: usize, y: usize) -> usize {
+        if self.reverse_columns {
+            out_w - 1 - y
+        } else {
+            y
+        }
+    }
 }
 
 fn oriented_rgb8(image: &RgbImage, orientation: Orientation) -> RgbImage {
@@ -135,6 +160,11 @@ fn reverse_pixels(row: &[u8], out_row: &mut [u8]) {
         unsafe { neon::reverse_pixels(row, out_row) };
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        avx2::reverse_pixels(row, out_row);
+        return;
+    }
     reverse_pixels_scalar(row, out_row);
 }
 
@@ -156,24 +186,14 @@ fn transposed(src: &[u8], w: usize, h: usize, layout: Transpose) -> Vec<u8> {
     let mut out = vec![0u8; src.len()];
     let (out_w, out_h) = (h, w);
     // Destination row of source column x, destination column of source row y.
-    let row_of = |x: usize| {
-        if layout.reverse_rows {
-            out_h - 1 - x
-        } else {
-            x
-        }
-    };
-    let col_of = |y: usize| {
-        if layout.reverse_columns {
-            out_w - 1 - y
-        } else {
-            y
-        }
-    };
+    let row_of = |x: usize| layout.row_of(out_h, x);
+    let col_of = |y: usize| layout.col_of(out_w, y);
     let (tiles_x, tiles_y) = (w / 16, h / 16);
     #[cfg(target_arch = "aarch64")]
     let vector = std::arch::is_aarch64_feature_detected!("neon");
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    let vector = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let vector = false;
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
@@ -184,6 +204,8 @@ fn transposed(src: &[u8], w: usize, h: usize, layout: Transpose) -> Vec<u8> {
                 unsafe {
                     neon::transpose_tile(src, w, &mut out, out_w, tx * 16, ty * 16, layout);
                 }
+                #[cfg(target_arch = "x86_64")]
+                avx2::transpose_tile(src, w, &mut out, out_w, tx * 16, ty * 16, layout);
             } else {
                 transpose_block(
                     src,
@@ -375,17 +397,285 @@ mod neon {
         };
         for j in 0..16 {
             let x = x0 + j;
-            let row = if layout.reverse_rows {
-                out_h - 1 - x
-            } else {
-                x
-            };
+            let row = layout.row_of(out_h, x);
             // The destination run, a 48-byte slice as above.
             let start = (row * out_w + col0) * 3;
             let run = &mut out[start..start + 48];
             // SAFETY: `run` is 48 bytes.
             unsafe {
                 vst3q_u8(run.as_mut_ptr(), uint8x16x3_t(r[j], g[j], b[j]));
+            }
+        }
+    }
+}
+
+/// The x86-64 path: a row's pixels reversed with three byte shuffles per
+/// word, and a 16 x 16 pixel tile transposed as 4 x 4 blocks of 32-bit
+/// lanes, each pixel widened to four bytes on the way in and narrowed on the
+/// way out. `multiversion` compiles each entry with AVX2 and
+/// without and selects the clone at the first call; the clone without AVX2
+/// is the plain loop, reached only through a call built without the
+/// detection, which none is. No `unsafe`: the words move through `bytemuck`
+/// casts of exact-size arrays.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use core::arch::x86_64::{
+        __m128i, _mm_or_si128, _mm_shuffle_epi8, _mm_unpackhi_epi32, _mm_unpackhi_epi64,
+        _mm_unpacklo_epi32, _mm_unpacklo_epi64,
+    };
+
+    use multiversion::{multiversion, target::match_target};
+
+    use super::Transpose;
+    use crate::vision::rgb_runs::avx2::place;
+
+    /// The pixels of `row` in reverse order into `out_row` (cut to `row`'s
+    /// length).
+    #[multiversion(targets("x86_64+avx2"))]
+    pub(super) fn reverse_pixels(row: &[u8], out_row: &mut [u8]) {
+        match_target! {
+            "x86_64+avx2" => reverse_pixels_avx2(row, out_row),
+            _ => super::reverse_pixels_scalar(row, out_row),
+        }
+    }
+
+    /// The 16 x 16 pixel tile at (`x0`, `y0`) of `src` (`w` pixels wide)
+    /// transposed into `out` (`out_w` pixels wide) under `layout`.
+    #[multiversion(targets("x86_64+avx2"))]
+    pub(super) fn transpose_tile(
+        src: &[u8],
+        w: usize,
+        out: &mut [u8],
+        out_w: usize,
+        x0: usize,
+        y0: usize,
+        layout: Transpose,
+    ) {
+        match_target! {
+            "x86_64+avx2" => transpose_tile_avx2(src, w, out, out_w, x0, y0, layout),
+            _ => super::transpose_block(
+                src,
+                w,
+                out,
+                out_w,
+                x0,
+                y0,
+                16,
+                16,
+                &|x| layout.row_of(w, x),
+                &|y| layout.col_of(out_w, y),
+            ),
+        }
+    }
+
+    /// The reverse of sixteen pixels: the masks of output word `out_word`,
+    /// whose byte `i` is output byte `g = 16 out_word + i` of the 48, source
+    /// byte `45 - 3 (g / 3) + g % 3`, gathered from the three source words.
+    const fn reverse_masks(out_word: usize) -> [[u8; 16]; 3] {
+        let mut masks = [[0x80; 16]; 3];
+        let mut word = 0;
+        while word < 3 {
+            let mut i = 0;
+            while i < 16 {
+                let g = 16 * out_word + i;
+                masks[word][i] = place(45 - 3 * (g / 3) + g % 3, word);
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const REVERSE_0: [[u8; 16]; 3] = reverse_masks(0);
+    const REVERSE_1: [[u8; 16]; 3] = reverse_masks(1);
+    const REVERSE_2: [[u8; 16]; 3] = reverse_masks(2);
+
+    /// Forty-eight bytes (sixteen pixels) with the pixels in reverse order.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reversed_pixels(chunk: [u8; 48]) -> [u8; 48] {
+        let words: [__m128i; 3] = bytemuck::must_cast(chunk);
+        let word = |masks: &[[u8; 16]; 3]| {
+            _mm_or_si128(
+                _mm_or_si128(
+                    _mm_shuffle_epi8(words[0], bytemuck::must_cast(masks[0])),
+                    _mm_shuffle_epi8(words[1], bytemuck::must_cast(masks[1])),
+                ),
+                _mm_shuffle_epi8(words[2], bytemuck::must_cast(masks[2])),
+            )
+        };
+        bytemuck::must_cast([word(&REVERSE_0), word(&REVERSE_1), word(&REVERSE_2)])
+    }
+
+    /// Sixteen pixels per step from the source's head into the destination's
+    /// tail; the remainder (the source's tail, the destination's head) pixel
+    /// by pixel.
+    #[target_feature(enable = "avx2")]
+    fn reverse_pixels_avx2(row: &[u8], out_row: &mut [u8]) {
+        let out_row = &mut out_row[..row.len()];
+        let (chunks, rest) = row.as_chunks::<48>();
+        let (out_rest, out_chunks) = out_row.as_rchunks_mut::<48>();
+        for (chunk, out) in chunks.iter().zip(out_chunks.iter_mut().rev()) {
+            *out = reversed_pixels(*chunk);
+        }
+        super::reverse_pixels_scalar(rest, out_rest);
+    }
+
+    /// Sixteen pixels of a row as four words of four-byte pixels (`r g b 0`),
+    /// so the tile transposes as 32-bit lanes: the masks of word `q`, which
+    /// holds pixels `4 q` to `4 q + 3`, byte `i` of it source byte
+    /// `3 (4 q + i / 4) + i % 4` for a channel and zero for the pad, gathered
+    /// from the `WORDS` source words from `first` on.
+    const fn widen_masks<const WORDS: usize>(q: usize, first: usize) -> [[u8; 16]; WORDS] {
+        // The words from `first` hold all twelve channel bytes of the four pixels.
+        assert!(16 * first <= 12 * q && 12 * q + 12 <= 16 * (first + WORDS));
+        let mut masks = [[0x80; 16]; WORDS];
+        let mut word = 0;
+        while word < WORDS {
+            let mut i = 0;
+            while i < 16 {
+                if i % 4 != 3 {
+                    masks[word][i] = place(3 * (4 * q + i / 4) + i % 4, first + word);
+                }
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const WIDEN_0: [[u8; 16]; 1] = widen_masks(0, 0);
+    const WIDEN_1: [[u8; 16]; 2] = widen_masks(1, 0);
+    const WIDEN_2: [[u8; 16]; 2] = widen_masks(2, 1);
+    const WIDEN_3: [[u8; 16]; 1] = widen_masks(3, 2);
+
+    /// Back to 48 packed bytes: the masks of output word `o`, whose byte `i`
+    /// is packed byte `g = 16 o + i`, channel `g % 3` of pixel `g / 3`, at
+    /// `4 (g / 3) + g % 3` of the four-byte-pixel words, gathered from words
+    /// `o` and `o + 1`.
+    const fn narrow_masks(o: usize) -> [[u8; 16]; 2] {
+        let mut masks = [[0x80; 16]; 2];
+        let mut word = 0;
+        while word < 2 {
+            let mut i = 0;
+            while i < 16 {
+                let g = 16 * o + i;
+                masks[word][i] = place(4 * (g / 3) + g % 3, o + word);
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const NARROW_0: [[u8; 16]; 2] = narrow_masks(0);
+    const NARROW_1: [[u8; 16]; 2] = narrow_masks(1);
+    const NARROW_2: [[u8; 16]; 2] = narrow_masks(2);
+
+    /// A run of sixteen pixels as four words of four-byte pixels.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn widened(run: [u8; 48]) -> [[u8; 16]; 4] {
+        let [w0, w1, w2]: [__m128i; 3] = bytemuck::must_cast(run);
+        let two = |a: __m128i, b: __m128i, masks: &[[u8; 16]; 2]| {
+            _mm_or_si128(
+                _mm_shuffle_epi8(a, bytemuck::must_cast(masks[0])),
+                _mm_shuffle_epi8(b, bytemuck::must_cast(masks[1])),
+            )
+        };
+        [
+            bytemuck::must_cast(_mm_shuffle_epi8(w0, bytemuck::must_cast(WIDEN_0[0]))),
+            bytemuck::must_cast(two(w0, w1, &WIDEN_1)),
+            bytemuck::must_cast(two(w1, w2, &WIDEN_2)),
+            bytemuck::must_cast(_mm_shuffle_epi8(w2, bytemuck::must_cast(WIDEN_3[0]))),
+        ]
+    }
+
+    /// Four words of four-byte pixels as the 48 packed bytes of their
+    /// sixteen pixels.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn narrowed(words: [[u8; 16]; 4]) -> [u8; 48] {
+        let [w0, w1, w2, w3]: [__m128i; 4] = bytemuck::must_cast(words);
+        let two = |a: __m128i, b: __m128i, masks: &[[u8; 16]; 2]| {
+            _mm_or_si128(
+                _mm_shuffle_epi8(a, bytemuck::must_cast(masks[0])),
+                _mm_shuffle_epi8(b, bytemuck::must_cast(masks[1])),
+            )
+        };
+        bytemuck::must_cast([
+            two(w0, w1, &NARROW_0),
+            two(w1, w2, &NARROW_1),
+            two(w2, w3, &NARROW_2),
+        ])
+    }
+
+    /// Four words of four 32-bit lanes, transposed: lane `c` of input `r`
+    /// becomes lane `r` of output `c`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn transpose4x4(rows: [__m128i; 4]) -> [__m128i; 4] {
+        let [a0, a1, a2, a3] = rows;
+        let (t0, t1) = (_mm_unpacklo_epi32(a0, a1), _mm_unpackhi_epi32(a0, a1));
+        let (t2, t3) = (_mm_unpacklo_epi32(a2, a3), _mm_unpackhi_epi32(a2, a3));
+        [
+            _mm_unpacklo_epi64(t0, t2),
+            _mm_unpackhi_epi64(t0, t2),
+            _mm_unpacklo_epi64(t1, t3),
+            _mm_unpackhi_epi64(t1, t3),
+        ]
+    }
+
+    /// The source rows are loaded in the order the destination columns take
+    /// and widened to four-byte pixels into one stack scratch; each group of
+    /// four destination rows is then transposed from the scratch as four
+    /// 4 x 4 blocks of 32-bit lanes and narrowed back to packed bytes
+    /// straight from the registers into its destination rows. Every run is a
+    /// 48-byte slice (a wrong origin is a bounds check).
+    #[target_feature(enable = "avx2")]
+    fn transpose_tile_avx2(
+        src: &[u8],
+        w: usize,
+        out: &mut [u8],
+        out_w: usize,
+        x0: usize,
+        y0: usize,
+        layout: Transpose,
+    ) {
+        let h = src.len() / (w * 3);
+        let out_h = w;
+        // `rows[k]`: source row `y` of destination column `col0 + k`.
+        let rows: [[[u8; 16]; 4]; 16] = std::array::from_fn(|k| {
+            let y = if layout.reverse_columns {
+                y0 + 15 - k
+            } else {
+                y0 + k
+            };
+            let start = (y * w + x0) * 3;
+            let run: [u8; 48] = bytemuck::pod_read_unaligned(&src[start..start + 48]);
+            widened(run)
+        });
+        let col0 = if layout.reverse_columns {
+            h - 16 - y0
+        } else {
+            y0
+        };
+        // The four blocks of source column group `q`: `blocks[g][c]` is
+        // destination row `4 q + c`, its word `g` (destination columns
+        // `col0 + 4 g` onwards).
+        let blocks_of = |q: usize| -> [[__m128i; 4]; 4] {
+            std::array::from_fn(|g| {
+                transpose4x4(std::array::from_fn(|i| {
+                    bytemuck::must_cast(rows[4 * g + i][q])
+                }))
+            })
+        };
+        for (q, blocks) in (0..4).map(blocks_of).enumerate() {
+            let row_words = |c: usize| -> [u8; 48] {
+                narrowed(std::array::from_fn(|g| bytemuck::must_cast(blocks[g][c])))
+            };
+            for (c, words) in (0..4).map(row_words).enumerate() {
+                let x = x0 + 4 * q + c;
+                let row = layout.row_of(out_h, x);
+                let start = (row * out_w + col0) * 3;
+                out[start..start + 48].copy_from_slice(&words);
             }
         }
     }
@@ -453,6 +743,20 @@ mod tests {
                     "{w}x{h} {orientation:?}: pixels differ"
                 );
             }
+        }
+    }
+
+    /// Rows of every length from 0 to 40 pixels (whole vectors and every
+    /// remainder) reversed by the dispatching path and by the plain loop:
+    /// the same bytes.
+    #[test]
+    fn every_row_length_reverses_like_the_plain_loop() {
+        for n in 0..=40 {
+            let row: Vec<u8> = (0..3 * n).map(|i| (i * 37 % 251) as u8).collect();
+            let (mut fast, mut plain) = (vec![0u8; 3 * n], vec![0u8; 3 * n]);
+            reverse_pixels(&row, &mut fast);
+            reverse_pixels_scalar(&row, &mut plain);
+            assert_eq!(fast, plain, "{n} pixels");
         }
     }
 

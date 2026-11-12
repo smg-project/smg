@@ -47,8 +47,11 @@ mod tests {
                 ext: Default::default(),
                 content: Some(MessageContent::Text("Hi there".to_string())),
                 name: None,
+                refusal: None,
+                audio: None,
+                function_call: None,
                 tool_calls: None,
-                reasoning_content: None,
+                reasoning: Default::default(),
             },
         ];
 
@@ -151,8 +154,11 @@ mod tests {
                 ext: Default::default(),
                 content: Some(MessageContent::Text("World".to_string())),
                 name: None,
+                refusal: None,
+                audio: None,
+                function_call: None,
                 tool_calls: None,
-                reasoning_content: None,
+                reasoning: Default::default(),
             },
         ];
 

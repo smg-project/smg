@@ -2,10 +2,10 @@
 //!
 //! Worker addresses arrive in several spellings for the same backend: bare
 //! `host:port` from discovery, `http://`/`grpc://` forms from configuration
-//! and the admin API, `ipc://` paths for ZMQ, and a `@rank` suffix that the
-//! registration workflow appends when it expands a data-parallel worker. Before
-//! this module each consumer stripped what it cared about with its own ad-hoc
-//! string handling, and those implementations disagreed — notably on `@` inside
+//! and the admin API, `ipc://` paths and `tcp://` addresses for ZMQ, and a
+//! `@rank` suffix that the registration workflow appends when it expands a
+//! data-parallel worker. Before this module each consumer stripped what it
+//! cared about with its own ad-hoc string handling, and those implementations disagreed — notably on `@` inside
 //! an IPC path or an address such as `http://user@worker:3000`, and on
 //! uppercase schemes.
 //!
@@ -33,6 +33,8 @@ pub enum Scheme {
     Grpc,
     Grpcs,
     Ipc,
+    /// A ZMQ worker whose engines dial from other hosts.
+    Tcp,
 }
 
 impl Scheme {
@@ -44,17 +46,19 @@ impl Scheme {
             Scheme::Grpc => "grpc://",
             Scheme::Grpcs => "grpcs://",
             Scheme::Ipc => "ipc://",
+            Scheme::Tcp => "tcp://",
         }
     }
 
     /// Match a scheme prefix case-insensitively, returning it and the rest.
     fn split_from(input: &str) -> Option<(Scheme, &str)> {
-        const SCHEMES: [Scheme; 5] = [
+        const SCHEMES: [Scheme; 6] = [
             Scheme::Http,
             Scheme::Https,
             Scheme::Grpc,
             Scheme::Grpcs,
             Scheme::Ipc,
+            Scheme::Tcp,
         ];
         SCHEMES.into_iter().find_map(|scheme| {
             let prefix = scheme.as_prefix();
@@ -346,9 +350,39 @@ impl Endpoint {
         }
     }
 
-    /// Render this endpoint with the workflow's rank suffix.
-    pub fn render_with_rank(&self, rank: usize) -> String {
-        format!("{}@{rank}", self.render())
+    /// The address as a request's success path shows it: the routed-worker
+    /// response header, the cache-trace header and the request-sent event.
+    /// An address without userinfo, query or fragment is the registered
+    /// string, byte for byte, so the header a client matches against the
+    /// address it registered does not change; one with userinfo is
+    /// [`Self::redacted_str`]'s form (the userinfo masked whole, a DP rank
+    /// kept), one with a query or fragment is cut at its path like it (they
+    /// may carry a token), and so is one the parser refuses. A worker
+    /// computes it once at registration (`WorkerMetadata::redacted_url`);
+    /// nothing on a request path parses.
+    pub fn redacted_url(input: &str) -> String {
+        match Self::parse_with_rank(input) {
+            Ok((endpoint, _)) if endpoint.userinfo.is_none() && !input.contains(['?', '#']) => {
+                input.to_string()
+            }
+            _ => Self::redacted_str(input),
+        }
+    }
+
+    /// Whether the address carries userinfo: a username, a password or a
+    /// token.
+    pub fn has_credentials(&self) -> bool {
+        self.userinfo.is_some()
+    }
+
+    /// The address without its userinfo: what is written where an address
+    /// must be read back and may not carry a credential (the manifest
+    /// export). The scheme, host, port and path stay.
+    pub fn without_credentials(&self) -> Self {
+        Self {
+            userinfo: None,
+            ..self.clone()
+        }
     }
 }
 
@@ -555,6 +589,18 @@ mod tests {
         assert_eq!(key_of("ipc://worker:3000"), key_of("worker:3000"));
     }
 
+    /// A ZMQ worker served over TCP is a host and port like any network
+    /// address, and renders back with its scheme.
+    #[test]
+    fn a_tcp_zmq_address_is_a_host_and_port() {
+        let endpoint = Endpoint::parse("tcp://10.0.0.5:31000").unwrap();
+        assert_eq!(endpoint.scheme(), Some(Scheme::Tcp));
+        assert_eq!(endpoint.port(), Some(31000));
+        assert!(!endpoint.is_ipc());
+        assert_eq!(endpoint.key().as_str(), "10.0.0.5:31000");
+        assert_eq!(endpoint.render(), "tcp://10.0.0.5:31000");
+    }
+
     #[test]
     fn ipc_rank_suffix_is_a_rank_not_part_of_the_path() {
         let (endpoint, rank) = Endpoint::parse_with_rank("ipc:///tmp/w.sock@3").unwrap();
@@ -631,7 +677,6 @@ mod tests {
     fn render_brackets_ipv6_so_the_port_stays_readable() {
         let endpoint = Endpoint::parse("http://[fd00::1]:8080").unwrap();
         assert_eq!(endpoint.render(), "http://[fd00::1]:8080");
-        assert_eq!(endpoint.render_with_rank(2), "http://[fd00::1]:8080@2");
     }
 
     #[test]
@@ -891,6 +936,49 @@ mod tests {
         );
         assert_eq!(
             Endpoint::redacted_str("not an address"),
+            "<unparsable address>"
+        );
+    }
+
+    /// `redacted_url` is what the request path renders: an address without
+    /// userinfo byte for byte as registered (its spelling, rank, path, IPC
+    /// and IPv6 forms included), one with userinfo in `redacted_str`'s form.
+    #[test]
+    fn redacted_url_keeps_an_address_without_userinfo_byte_for_byte() {
+        for plain in [
+            "http://worker:3000",
+            "http://Worker:3000/",
+            "grpc://10.0.0.1:30000@2",
+            "http://[0:0:0:0:0:0:0:1]:8000/v1",
+            "ipc:///tmp/engine.sock",
+            "worker:3000",
+        ] {
+            assert_eq!(Endpoint::redacted_url(plain), plain);
+        }
+        assert_eq!(
+            Endpoint::redacted_url("http://user:secret@worker:3000"),
+            "http://***@worker:3000"
+        );
+        assert_eq!(
+            Endpoint::redacted_url("http://user:secret@worker:3000@2"),
+            "http://***@worker:3000@2"
+        );
+        assert_eq!(
+            Endpoint::redacted_url("http://api-token@worker:3000"),
+            "http://***@worker:3000"
+        );
+        // A query or a fragment may carry a token: cut at the path, as the
+        // log rendering does.
+        assert_eq!(
+            Endpoint::redacted_url("http://worker:3000/v1?token=abc"),
+            "http://worker:3000/v1"
+        );
+        assert_eq!(
+            Endpoint::redacted_url("http://worker:3000/v1#frag"),
+            "http://worker:3000/v1"
+        );
+        assert_eq!(
+            Endpoint::redacted_url("not an address"),
             "<unparsable address>"
         );
     }

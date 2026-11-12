@@ -31,7 +31,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 use smg::observability::metrics::SERVER_MALLOC_CONF;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 72] = SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 
 // Re-export error types
 // Re-export client stream function (defined in client.rs but used by stream)
@@ -111,28 +111,40 @@ mod allocator_tests {
 
     /// The options jemalloc runs with, read back through its control
     /// interface: the background purging thread, the dirty and muzzy decay
-    /// times in milliseconds and the arena count.
-    fn options_in_effect() -> Result<(bool, isize, isize, u32), tikv_jemalloc_ctl::Error> {
+    /// times in milliseconds, the arena count and the size from which an
+    /// allocation bypasses the arenas' dirty cache. jemalloc skips a
+    /// misspelled entry with a warning on stderr and runs on, so each one is
+    /// read back.
+    fn options_in_effect() -> Result<(bool, isize, isize, u32, usize), tikv_jemalloc_ctl::Error> {
         let background_thread = opt::background_thread::read()?;
         let narenas = opt::narenas::read()?;
         // SAFETY: NUL-terminated option names read into the types jemalloc
-        // documents for them (both `ssize_t`).
-        let (dirty_decay_ms, muzzy_decay_ms) = unsafe {
+        // documents for them (`ssize_t` for the decay times, `size_t` for the
+        // threshold).
+        let (dirty_decay_ms, muzzy_decay_ms, oversize_threshold) = unsafe {
             (
                 raw::read::<isize>(b"opt.dirty_decay_ms\0")?,
                 raw::read::<isize>(b"opt.muzzy_decay_ms\0")?,
+                raw::read::<usize>(b"opt.oversize_threshold\0")?,
             )
         };
-        Ok((background_thread, dirty_decay_ms, muzzy_decay_ms, narenas))
+        Ok((
+            background_thread,
+            dirty_decay_ms,
+            muzzy_decay_ms,
+            narenas,
+            oversize_threshold,
+        ))
     }
 
     #[test]
     fn the_library_applies_the_server_malloc_conf() {
         // The crate's `_rjem_malloc_conf` symbol: purge on a background
         // thread, dirty pages back to the OS after 10 s, muzzy pages at once,
-        // and 16 arenas instead of four per CPU.
+        // 16 arenas instead of four per CPU, and allocations below 32 MiB
+        // served from the arenas' dirty cache.
         #[cfg_attr(target_vendor = "apple", expect(unused_variables))]
-        let (background_thread, dirty_decay_ms, muzzy_decay_ms, narenas) =
+        let (background_thread, dirty_decay_ms, muzzy_decay_ms, narenas, oversize_threshold) =
             options_in_effect().expect("the options in effect");
         // jemalloc does not compile background-thread support for Mach-O.
         #[cfg(not(target_vendor = "apple"))]
@@ -141,9 +153,9 @@ mod allocator_tests {
             "jemalloc did not take the library's malloc_conf: no background thread"
         );
         assert_eq!(
-            (dirty_decay_ms, muzzy_decay_ms, narenas),
-            (10_000, 0, 16),
-            "jemalloc did not take the library's malloc_conf (dirty_decay_ms, muzzy_decay_ms, narenas)"
+            (dirty_decay_ms, muzzy_decay_ms, narenas, oversize_threshold),
+            (10_000, 0, 16, 32 << 20),
+            "jemalloc did not take the library's malloc_conf (dirty_decay_ms, muzzy_decay_ms, narenas, oversize_threshold)"
         );
     }
 
@@ -173,7 +185,7 @@ mod allocator_tests {
         );
         assert!(
             stdout.contains(
-                "options in effect: background_thread=false dirty_decay_ms=2000 muzzy_decay_ms=0 narenas=16"
+                "options in effect: background_thread=false dirty_decay_ms=2000 muzzy_decay_ms=0 narenas=16 oversize_threshold=33554432"
             ),
             "_RJEM_MALLOC_CONF did not override the library's malloc_conf entry by entry: {stdout}"
         );
@@ -188,10 +200,10 @@ mod allocator_tests {
         reason = "the parent test reads this line from the child's stdout"
     )]
     fn print_the_options_in_effect() {
-        let (background_thread, dirty_decay_ms, muzzy_decay_ms, narenas) =
+        let (background_thread, dirty_decay_ms, muzzy_decay_ms, narenas, oversize_threshold) =
             options_in_effect().expect("the options in effect");
         println!(
-            "options in effect: background_thread={background_thread} dirty_decay_ms={dirty_decay_ms} muzzy_decay_ms={muzzy_decay_ms} narenas={narenas}"
+            "options in effect: background_thread={background_thread} dirty_decay_ms={dirty_decay_ms} muzzy_decay_ms={muzzy_decay_ms} narenas={narenas} oversize_threshold={oversize_threshold}"
         );
     }
 }

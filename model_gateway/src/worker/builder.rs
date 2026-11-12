@@ -11,12 +11,15 @@ use openai_protocol::{
 use tokio::sync::mpsc;
 
 use super::{
+    basic::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    endpoint::Endpoint,
     event::WorkerConnected,
     http_client::LazyHttpClient,
+    metadata::DecodingLabels,
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
-    worker::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
+    Worker,
 };
 use crate::{
     config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
@@ -91,6 +94,54 @@ impl BasicWorkerBuilder {
             overload_defaults: OverloadThresholds::default(),
             discovered_labels: HashMap::new(),
         }
+    }
+
+    /// A builder over a live worker's resolved state: the spec, HTTP/2, the
+    /// discovered labels, the health config and endpoint, the resilience,
+    /// the breaker config, the ZMQ bounds, the overload block, a
+    /// materialized HTTP client and the current status, so a rebuild keeps
+    /// what registration resolved. The caller applies its own changes, the
+    /// gateway's overload defaults and the connect signal, then shares the
+    /// KV engine state with the worker it replaces.
+    pub(crate) fn carrying(worker: &Arc<dyn Worker>) -> Self {
+        let metadata = worker.metadata();
+        let mut builder = Self::from_spec((*metadata.spec).clone())
+            .http2(worker.http2())
+            .discovered_labels((*metadata.discovered_labels).clone())
+            .health_config(metadata.health_config.clone())
+            .health_endpoint(metadata.health_endpoint.clone())
+            .resilience(worker.resilience().clone())
+            // The resolved thresholds stand as the defaults the spec's block
+            // re-resolves against, so a rebuild without the gateway config at
+            // hand keeps the effective thresholds.
+            .overload(metadata.spec.overload)
+            .overload_defaults(metadata.overload)
+            .zmq_startup_timeout(metadata.zmq_startup_timeout)
+            .status(worker.status());
+        // `from_spec` starts on the built-in breaker config; with the live one
+        // the registry's replacement adopts the live breaker and its state.
+        if let Some(config) = worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .map(BasicWorker::circuit_breaker_config)
+        {
+            builder = builder.circuit_breaker_config(config);
+        }
+        if let Some(timeout) = metadata.zmq_request_timeout {
+            builder = builder.zmq_request_timeout(timeout);
+        }
+        // A never-HTTP worker keeps a deferred client slot.
+        if let Some(client) = worker.http_client_handle_if_initialized() {
+            builder = builder.http_client(client);
+        }
+        builder
+    }
+
+    /// The engine's KV block size in tokens as a registration states it;
+    /// `None` leaves it to what the engine's streams report.
+    pub fn kv_block_size(mut self, tokens: Option<usize>) -> Self {
+        self.spec.kv_block_size = tokens;
+        self
     }
 
     /// Set the bootstrap port (for prefill workers in PD disaggregation)
@@ -345,6 +396,8 @@ impl BasicWorkerBuilder {
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
+            redacted_url: Endpoint::redacted_url(&self.spec.url),
+            decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
@@ -403,6 +456,7 @@ impl BasicWorkerBuilder {
             backend_client,
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
+            superseded: AtomicBool::new(false),
             connect_signal_tx: self.connect_signal_tx,
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,
@@ -442,11 +496,17 @@ fn parse_bootstrap_host(url: &str) -> String {
         host
     } else if !clean_url.contains("://") {
         try_parse(&format!("http://{clean_url}")).unwrap_or_else(|| {
-            tracing::warn!("Failed to parse URL '{}', defaulting to localhost", url);
+            tracing::warn!(
+                "Failed to parse URL '{}', defaulting to localhost",
+                Endpoint::redacted_str(url)
+            );
             "localhost".to_string()
         })
     } else {
-        tracing::warn!("Failed to parse URL '{}', defaulting to localhost", url);
+        tracing::warn!(
+            "Failed to parse URL '{}', defaulting to localhost",
+            Endpoint::redacted_str(url)
+        );
         "localhost".to_string()
     }
 }
@@ -456,7 +516,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::worker::worker::Worker;
+    use crate::worker::basic::Worker;
 
     /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
     /// worker, every default written once.
@@ -481,6 +541,20 @@ mod tests {
         assert_eq!(from_url.is_healthy(), from_spec.is_healthy());
     }
 
+    /// The rendered URL is computed once at build: a URL without userinfo is
+    /// the URL byte for byte (its spelling kept), one with userinfo masks it
+    /// whole and keeps the DP rank.
+    #[test]
+    fn the_rendered_url_masks_a_userinfo_and_keeps_a_plain_url_byte_for_byte() {
+        let plain = BasicWorkerBuilder::new("http://Worker:8080/").build();
+        assert_eq!(plain.redacted_url(), plain.url());
+        let with_secret = BasicWorkerBuilder::new("http://user:secret@worker:8080")
+            .dp_config(2, 4)
+            .build();
+        assert_eq!(with_secret.url(), "http://user:secret@worker:8080@2");
+        assert_eq!(with_secret.redacted_url(), "http://***@worker:8080@2");
+    }
+
     #[test]
     fn zmq_engine_group_sets_size_without_rank_or_url_rewrite() {
         // A grouped ZMQ worker is one worker awaiting N engines: dp_size set,
@@ -492,15 +566,17 @@ mod tests {
         assert_eq!(worker.metadata().spec.url, "ipc:///tmp/w.ipc");
         assert_eq!(worker.metadata().spec.dp_size, Some(4));
         assert_eq!(worker.metadata().spec.dp_rank, None);
-        assert_eq!(worker.metadata().zmq_engine_count(), 4);
+        assert_eq!(worker.metadata().zmq_engine_count(), Some(4));
     }
 
     #[test]
-    fn ungrouped_worker_awaits_one_engine() {
+    fn ungrouped_worker_awaits_the_engines_it_is_dialed_by() {
+        // No count: the handshake awaits the group the first engine declares
+        // (one engine for an engine that declares none).
         let worker = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
             .connection_mode(ConnectionMode::Zmq)
             .build();
-        assert_eq!(worker.metadata().zmq_engine_count(), 1);
+        assert_eq!(worker.metadata().zmq_engine_count(), None);
     }
 
     #[test]
@@ -521,7 +597,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(crate::clients::http_client()))
+            .http_client(Arc::new(crate::server::http_client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }
@@ -620,6 +696,27 @@ mod tests {
         assert!(!worker.is_healthy());
     }
 
+    /// The built worker's health check reads back `health_config`'s timeout,
+    /// interval and thresholds.
+    fn assert_health_config(worker: &BasicWorker, health_config: &HealthCheckConfig) {
+        assert_eq!(
+            worker.metadata().health_config.timeout_secs,
+            health_config.timeout_secs
+        );
+        assert_eq!(
+            worker.metadata().health_config.check_interval_secs,
+            health_config.check_interval_secs
+        );
+        assert_eq!(
+            worker.metadata().health_config.failure_threshold,
+            health_config.failure_threshold
+        );
+        assert_eq!(
+            worker.metadata().health_config.success_threshold,
+            health_config.success_threshold
+        );
+    }
+
     #[test]
     fn test_basic_worker_builder_full() {
         let mut labels = HashMap::new();
@@ -656,22 +753,7 @@ mod tests {
         assert_eq!(worker.connection_mode(), &ConnectionMode::Grpc);
         assert_eq!(worker.metadata().spec.labels, labels);
         assert_eq!(worker.metadata().health_endpoint, "/health");
-        assert_eq!(
-            worker.metadata().health_config.timeout_secs,
-            health_config.timeout_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.check_interval_secs,
-            health_config.check_interval_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.failure_threshold,
-            health_config.failure_threshold
-        );
-        assert_eq!(
-            worker.metadata().health_config.success_threshold,
-            health_config.success_threshold
-        );
+        assert_health_config(&worker, &health_config);
     }
 
     #[test]
@@ -734,22 +816,7 @@ mod tests {
         assert_eq!(worker.dp_size(), Some(16));
         assert_eq!(worker.metadata().spec.labels, labels);
         assert_eq!(worker.metadata().health_endpoint, "/status");
-        assert_eq!(
-            worker.metadata().health_config.timeout_secs,
-            health_config.timeout_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.check_interval_secs,
-            health_config.check_interval_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.failure_threshold,
-            health_config.failure_threshold
-        );
-        assert_eq!(
-            worker.metadata().health_config.success_threshold,
-            health_config.success_threshold
-        );
+        assert_health_config(&worker, &health_config);
     }
 
     #[test]

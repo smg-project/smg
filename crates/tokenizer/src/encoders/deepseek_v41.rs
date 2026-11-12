@@ -9,11 +9,12 @@
 // mid-conversation system messages count as user turns, and image content
 // parts collapse to [`IMAGE_PLACEHOLDER`].
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
-// `DsEncodingError` lives in `deepseek_common` (shared with V4); re-exported
-// here because it is part of this module's public API, and `pub(super)` items
-// are not reachable from outside `encoders` on their own.
+// `DsEncodingError` lives in `deepseek_common` (one type for the three
+// renderers); re-exported here because it is part of this module's public
+// API, and `pub(super)` items are not reachable from outside `encoders` on
+// their own.
 pub use super::deepseek_common::DsEncodingError;
 pub use super::deepseek_common::{
     BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
@@ -21,18 +22,19 @@ pub use super::deepseek_common::{
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
-// Message-shape preprocessing, drop-thinking, DSML argument rendering and the
-// tools template are V4's too, apart from the tag strings and the last-turn
+// The message read (`Turn`), message-shape preprocessing, drop-thinking, DSML
+// argument rendering, the tools template and the tools-and-response-format
+// section are V4's too, apart from the tag strings and the last-turn
 // definition; see `deepseek_common` for the shared implementation and its
 // own doc comments.
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
-        has_tools, merge_tool_messages, render_v4_tools_template, sort_tool_results_by_call_order,
-        task_sp_token, to_json, tool_calls_from_openai_format, tool_schemas,
-        tools_from_openai_format, DsmlTags,
+        has_tools, merge_tool_messages, push_tools_and_response_format, render_v4_tools_template,
+        sort_tool_results_by_call_order, task_sp_token, text, to_json, tool_schemas, DsmlTags,
+        IncomingBlocks, Turn,
     },
-    RendererProfile,
+    truthy, RendererProfile,
 };
 // The family's special tokens: the private markers for this module, the
 // public ones re-exported under this renderer's path (the formatter keeps
@@ -105,7 +107,6 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
         enable_thinking_alias: true,
         native_assistant_continuation: true,
         raw_tool_call_arguments: true,
-        declares_tools_under_tool_choice_none: false,
         ..RendererProfile::NO_CAPABILITIES
     },
     thinking_mode: None,
@@ -255,13 +256,6 @@ fn render_tools(tools: &[Value]) -> String {
     render_v4_tools_template(TOOL_CALLS_BLOCK_NAME, &DSML_TAGS, &tool_schemas(tools))
 }
 
-fn render_response_format(schema: &Value) -> String {
-    format!(
-        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
-        to_json(schema)
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Image/content-part normalisation
 // ---------------------------------------------------------------------------
@@ -274,24 +268,102 @@ fn render_response_format(schema: &Value) -> String {
 /// Mirrors the engine's `_normalize_messages` flattening plus the HF
 /// `_validate_no_image_sp_tokens` check (see the header comment above): list
 /// content collapses to the text V4.1 encodes, and no text may carry the image
-/// placeholder.
+/// placeholder. A message's own content blocks go through the reference's
+/// image pass, and when they are its only content (no string content), their
+/// text blocks joined by a blank line become its content, as the reference
+/// fills it for every role.
 fn process_image_messages(messages: &[Value]) -> Result<Vec<Value>, DsEncodingError> {
     let mut processed: Vec<Value> = Vec::with_capacity(messages.len());
     for msg in messages {
         let mut msg = msg.clone();
         validate_no_image_sp_tokens(&msg)?;
+        let content_is_text = matches!(msg.get("content"), Some(Value::String(_)));
         let flattened = match msg.get("content") {
             Some(Value::Array(parts)) => Some(flatten_content_parts(parts)?),
             _ => None,
         };
-        if let Some(text) = flattened {
-            if let Some(obj) = msg.as_object_mut() {
+        let blocks = match msg.get("content_blocks") {
+            Some(Value::Array(blocks)) => Some(process_content_blocks(text(&msg, "role"), blocks)?),
+            _ => None,
+        };
+        if let Some(obj) = msg.as_object_mut() {
+            if let Some(text) = flattened {
                 obj.insert("content".to_string(), Value::String(text));
+            }
+            if let Some(blocks) = blocks {
+                if !content_is_text && !blocks.is_empty() {
+                    obj.insert("content".to_string(), Value::String(blocks_text(&blocks)));
+                }
+                obj.insert("content_blocks".to_string(), Value::Array(blocks));
             }
         }
         processed.push(msg);
     }
     Ok(processed)
+}
+
+/// The text of processed content blocks as the reference writes it into a
+/// message's content: the text blocks' texts (an image block is one by then,
+/// a tool result is not) joined by a blank line.
+fn blocks_text(blocks: &[Value]) -> String {
+    let texts: Vec<&str> = blocks
+        .iter()
+        .filter(|block| text(block, "type") == "text")
+        .map(|block| text(block, "text"))
+        .collect();
+    texts.join("\n\n")
+}
+
+/// Mirrors `_process_image_blocks` over a message's own content blocks: an
+/// image block (`image` or `image_url`, the reference's set) with a source
+/// becomes a text block holding the placeholder and one without is refused,
+/// a tool result's list content is walked the same way, and a text block may
+/// not carry the placeholder; any other block stays as it is, for
+/// `render_content_block` to mark.
+fn process_content_blocks(role: &str, blocks: &[Value]) -> Result<Vec<Value>, DsEncodingError> {
+    blocks
+        .iter()
+        .map(|block| match text(block, "type") {
+            "image" | "image_url" if image_has_source(block) => {
+                Ok(json!({ "type": "text", "text": IMAGE }))
+            }
+            "image" | "image_url" => Err(DsEncodingError::InvalidMessage {
+                role: role.to_string(),
+                msg: "Image block does not contain a valid source".to_string(),
+            }),
+            "tool_result" => match block.get("content") {
+                Some(Value::Array(items)) => {
+                    let content = Value::Array(process_content_blocks(role, items)?);
+                    let mut block = block.clone();
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.insert("content".to_string(), content);
+                    }
+                    Ok(block)
+                }
+                _ => Ok(block.clone()),
+            },
+            "text" if text(block, "text").contains(IMAGE_PLACEHOLDER) => {
+                Err(DsEncodingError::PlaceholderInText)
+            }
+            _ => Ok(block.clone()),
+        })
+        .collect()
+}
+
+/// Mirrors `_extract_image`'s source check: an `image_url` block names a URL
+/// (as a string or under `url`), an `image` block carries a `source`, `url`
+/// or `data`.
+fn image_has_source(block: &Value) -> bool {
+    if text(block, "type") == "image_url" {
+        return match block.get("image_url") {
+            Some(Value::String(url)) => !url.is_empty(),
+            Some(image_url) => !text(image_url, "url").is_empty(),
+            None => false,
+        };
+    }
+    ["source", "url", "data"]
+        .iter()
+        .any(|key| block.get(key).is_some_and(truthy))
 }
 
 /// Mirrors `_validate_no_image_sp_tokens`: user text may not smuggle in the
@@ -348,62 +420,6 @@ fn find_last_turn_index(messages: &[Value]) -> Option<usize> {
         }
     }
     None
-}
-
-/// One message as the renderer reads it: the fields of the OpenAI-shape
-/// value, read once, with the tools and tool calls in the encoder's shape
-/// and empty lists dropped the way Python's truthiness drops them.
-struct Turn<'m> {
-    index: usize,
-    msg: &'m Value,
-    role: &'m str,
-    content: &'m str,
-    tools: Option<Vec<Value>>,
-    /// Python `if response_format:` — absent, null and `{}` are all falsy.
-    response_format: Option<&'m Value>,
-    tool_calls: Option<Vec<Value>>,
-    reasoning_content: &'m str,
-    wo_eos: bool,
-}
-
-impl<'m> Turn<'m> {
-    fn read(index: usize, messages: &'m [Value]) -> Result<Self, DsEncodingError> {
-        let Some(msg) = messages.get(index) else {
-            return Err(DsEncodingError::IndexOutOfRange {
-                index,
-                len: messages.len(),
-            });
-        };
-        let tools = msg
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .map(|tools| tools_from_openai_format(tools))
-            .filter(|tools| !tools.is_empty());
-        let tool_calls = msg
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .map(|tool_calls| tool_calls_from_openai_format(tool_calls))
-            .filter(|tool_calls| !tool_calls.is_empty());
-        Ok(Self {
-            index,
-            msg,
-            role: text(msg, "role"),
-            content: text(msg, "content"),
-            tools,
-            response_format: msg
-                .get("response_format")
-                .filter(|v| !v.is_null() && v.as_object().is_none_or(|map| !map.is_empty())),
-            tool_calls,
-            reasoning_content: text(msg, "reasoning_content"),
-            wo_eos: msg.get("wo_eos").and_then(|v| v.as_bool()).unwrap_or(false),
-        })
-    }
-}
-
-/// A string field of a message, empty when absent or not a string, as the
-/// reference's `msg.get(key, "")` reads it.
-fn text<'m>(msg: &'m Value, key: &str) -> &'m str {
-    msg.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
 /// Mirrors the reference's `render_message`: one turn's text, by role in the
@@ -475,34 +491,26 @@ fn render_system(turn: &Turn<'_>, prompt: &mut String) {
         prompt.push_str(SYSTEM);
     }
     prompt.push_str(turn.content);
-    push_tools_and_response_format(turn, prompt);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
 }
 
-/// A developer turn renders as a user turn; an empty one is an error.
+/// A developer turn renders as a user turn; an empty one is refused.
 fn render_developer(turn: &Turn<'_>, prompt: &mut String) -> Result<(), DsEncodingError> {
-    if turn.content.is_empty() {
-        return Err(DsEncodingError::InvalidMessage {
-            role: turn.role.to_string(),
-            msg: turn.msg.to_string(),
-        });
-    }
+    let content = turn.developer_content()?;
     prompt.push_str(USER);
-    prompt.push_str(turn.content);
-    push_tools_and_response_format(turn, prompt);
+    prompt.push_str(content);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
     Ok(())
-}
-
-/// The tools template and the response format of a system or developer
-/// turn, each after a blank line, when the turn has them.
-fn push_tools_and_response_format(turn: &Turn<'_>, prompt: &mut String) {
-    if let Some(tools) = &turn.tools {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_tools(tools));
-    }
-    if let Some(schema) = turn.response_format {
-        prompt.push_str("\n\n");
-        prompt.push_str(&render_response_format(schema));
-    }
 }
 
 /// A user turn: its content blocks (text and the tool results
@@ -585,7 +593,7 @@ fn render_assistant(
     if let Some(tool_calls) = &turn.tool_calls {
         prompt.push_str(&tool_calls_block(tool_calls));
     }
-    if !turn.wo_eos {
+    if !turn.wo_eos() {
         prompt.push_str(EOS);
     }
 }
@@ -713,15 +721,14 @@ pub(crate) fn render_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
+    // The engine's renderer hands the conversation to this encoder with a
+    // `developer` message as written (its developer-to-system rewrite belongs
+    // to its template path, which this encoder never takes), so the vendor
+    // encoding's own rules apply: dropped before the last user-like turn with
+    // the thinking, a user turn otherwise.
     let messages = marks::without_marks(messages);
-    // The engine's renderer rewrites a `developer` message as a `system` one
-    // (and merges the system messages when one is not first) before any
-    // tokenizer mode's own encoder sees the conversation, so the vendor
-    // encoding's developer branch is never reached there; the same rule here.
-    let developer = crate::chat_template::developer_messages_as_system(&messages);
-    let messages = developer.as_deref().unwrap_or(&messages);
-    let normalized = process_image_messages(messages)?;
-    let merged = merge_tool_messages(&normalized);
+    let normalized = process_image_messages(&messages)?;
+    let merged = merge_tool_messages(&normalized, IncomingBlocks::Kept);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
         BOS.to_string()
@@ -757,7 +764,7 @@ pub(crate) fn render_messages(
 mod tests {
     use serde_json::{json, Value};
 
-    use super::*;
+    use super::{super::deepseek_common::object_arguments_render_one_parameter_per_key_through, *};
 
     fn user(q: &str) -> Value {
         json!({ "role": "user", "content": q })
@@ -1037,50 +1044,135 @@ mod tests {
         assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,");
     }
 
-    /// The engine's renderer hands every tokenizer mode a `developer` message
-    /// as a `system` one, so the encoder renders it as the system turn's
-    /// content after the effort directive (the recorded reference of the
-    /// developer-role case), not as a user turn, and an empty one is an empty
-    /// system message rather than an error.
+    fn developer(text: &str) -> Value {
+        json!({ "role": "developer", "content": text })
+    }
+
+    /// The engine's renderer hands this encoder a `developer` message as
+    /// written (its developer-to-system rewrite is the template path's), so
+    /// the encoding's own rules apply: in thinking mode the thinking-drop
+    /// removes a developer message before the last user-like turn entirely;
+    /// in chat mode it is a user turn, the user token and the content. The
+    /// recorded reference of the developer-role case is the thinking render,
+    /// byte for byte; never the system turn's prompt. An empty developer
+    /// message is refused where it is rendered and dropped where the
+    /// thinking-drop reaches it first.
     #[test]
-    fn developer_message_is_the_system_turn_as_the_engine_hands_it() {
-        let msgs = [
-            json!({"role": "developer", "content": "Answer in one word."}),
-            user("Colour of the sky?"),
-        ];
+    fn developer_message_renders_as_the_encoder_developer_turn() {
+        let msgs = [developer("Answer in one word."), user("Colour of the sky?")];
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
-        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nAnswer in one word.<｜User｜>Colour of the sky?<｜Assistant｜><think>");
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Colour of the sky?<｜Assistant｜><think>");
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>Answer in one word.<｜User｜>Colour of the sky?<｜Assistant｜></think>");
         let as_system = [
             json!({"role": "system", "content": "Answer in one word."}),
             user("Colour of the sky?"),
         ];
         for mode in [ThinkingMode::Thinking, ThinkingMode::Chat] {
-            assert_eq!(
+            assert_ne!(
                 encode_messages(&msgs, mode, &params(None)).unwrap(),
                 encode_messages(&as_system, mode, &params(None)).unwrap()
             );
         }
-        let empty = [json!({"role": "developer", "content": ""}), user("q")];
-        let empty_system = [json!({"role": "system", "content": ""}), user("q")];
-        assert_eq!(
-            encode_messages(&empty, ThinkingMode::Chat, &params(None)).unwrap(),
-            encode_messages(&empty_system, ThinkingMode::Chat, &params(None)).unwrap()
+        let empty = [developer(""), user("q")];
+        let out = encode_messages(&empty, ThinkingMode::Thinking, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>");
+        let err = encode_messages(&empty, ThinkingMode::Chat, &params(None)).unwrap_err();
+        assert!(
+            matches!(err, DsEncodingError::InvalidMessage { ref role, .. } if role == "developer"),
+            "{err}"
         );
     }
 
-    /// Before the last user turn a developer message is kept as the system
-    /// message is, where the vendor branch dropped it with the thinking.
+    /// Earlier in the conversation the same rule: gone with the thinking-drop,
+    /// a user turn in chat mode (the assistant turn after it closes as it does
+    /// after a user turn).
     #[test]
-    fn developer_message_before_the_last_user_turn_is_kept_as_the_system_message() {
+    fn a_developer_message_before_the_last_user_turn_goes_with_the_thinking_drop() {
         let msgs = [
-            json!({"role": "developer", "content": "DEV"}),
+            developer("DEV"),
             user("q1"),
             json!({"role": "assistant", "content": "a1"}),
             user("q2"),
         ];
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
-        assert!(out.contains("\n\nDEV<｜User｜>q1"), "{out}");
-        assert!(out.ends_with("<｜User｜>q2<｜Assistant｜><think>"), "{out}");
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜><think>");
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>DEV<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜></think>");
+    }
+
+    /// A developer message that ends the conversation is the last user-like
+    /// turn: kept in both modes, the assistant header and the thinking token
+    /// after it. Before a system message that ends the conversation it goes
+    /// with the thinking-drop (that system message is the last user-like turn
+    /// here) and the first system message left opens no turn; in chat mode it
+    /// stays a user turn and the mid-conversation system message, with its own
+    /// system token, opens the turn.
+    #[test]
+    fn a_trailing_developer_message_is_the_last_user_turn() {
+        let msgs = [user("Colour of the sky?"), developer("Answer in one word.")];
+        let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Colour of the sky?<｜User｜>Answer in one word.<｜Assistant｜><think>");
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>Colour of the sky?<｜User｜>Answer in one word.<｜Assistant｜></think>");
+        let developer_then_system = [
+            developer("Be terse."),
+            json!({"role": "system", "content": "Answer in French."}),
+        ];
+        let out = encode_messages(
+            &developer_then_system,
+            ThinkingMode::Thinking,
+            &params(None),
+        )
+        .unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nAnswer in French.");
+        let out =
+            encode_messages(&developer_then_system, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>Be terse.<｜System｜>Answer in French.<｜Assistant｜></think>");
+    }
+
+    /// A developer message's own tools and response format render under its
+    /// content after a blank line, as a system turn's do; declared tools keep
+    /// the thinking-drop off, so the message stays in thinking mode too.
+    #[test]
+    fn a_developer_message_carries_its_tools_and_response_format() {
+        let with_tools = [json!({
+            "role": "developer",
+            "content": "Follow the policy.",
+            "tools": [{"type": "function", "function": {"name": "lookup_weather",
+                "description": "Look up", "parameters": {"type": "object",
+                "properties": {"query": {"type": "string"}}, "required": ["query"]}}}],
+        })];
+        let with_format = [json!({
+            "role": "developer",
+            "content": "Answer in one word.",
+            "response_format": {"type": "json_object"},
+        })];
+        const EFFORT: &str = "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+        for (mode, prefix, thinking_token) in [
+            (ThinkingMode::Thinking, EFFORT, "<think>"),
+            (ThinkingMode::Chat, "<｜begin▁of▁sentence｜>", "</think>"),
+        ] {
+            let out = encode_messages(&with_tools, mode, &params(None)).unwrap();
+            assert!(
+                out.starts_with(&format!(
+                    "{prefix}<｜User｜>Follow the policy.\n\n## Tools\n\n"
+                )) && out.contains(r#""name": "lookup_weather""#)
+                    && out.ends_with(&format!(
+                        "schemas to invoke tool calls.\n<｜Assistant｜>{thinking_token}"
+                    )),
+                "{out}"
+            );
+            let out = encode_messages(&with_format, mode, &params(None)).unwrap();
+            assert_eq!(
+                out,
+                format!(
+                    "{prefix}<｜User｜>Answer in one word.\n\n## Response Format:\n\n\
+                     You MUST strictly adhere to the following schema to reply:\n\
+                     {{\"type\": \"json_object\"}}<｜Assistant｜>{thinking_token}"
+                )
+            );
+        }
     }
 
     #[test]
@@ -1141,9 +1233,12 @@ mod tests {
             };
             let mut messages: Vec<Value> = case["messages"].as_array().unwrap().clone();
 
-            // The engine's renderer rewrites developer messages as system
-            // ones (and merges them) before its wrapper attaches the tools;
-            // the shim keeps that order, and so does this.
+            // Three cases were recorded with their developer message folded
+            // into a system one by the recording script, not by the encoder
+            // (the engine's renderer hands the role as written, and the
+            // encoder drops the message or writes a user turn: the tests
+            // above); the fold stays here so those recordings still describe
+            // the system path they took.
             if let Some(rewritten) = crate::chat_template::developer_messages_as_system(&messages) {
                 messages = rewritten;
             }
@@ -1207,5 +1302,164 @@ mod tests {
             window(&expected_chars),
             window(&actual_chars)
         )
+    }
+
+    /// The reference keeps a `content_blocks` list a user message carries and
+    /// renders it in place of the content; an empty list falls back to the
+    /// content (the engine's own encoder copy renders these bytes).
+    #[test]
+    fn a_user_messages_own_content_blocks_render_in_place_of_its_content() {
+        let with_block = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{ "type": "text", "text": "from the block" }],
+        })];
+        let out = encode_messages(&with_block, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>from the block<｜Assistant｜></think>"
+        );
+        let empty_list = [json!({ "role": "user", "content": "hello", "content_blocks": [] })];
+        let out = encode_messages(&empty_list, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn object_form_tool_call_arguments_render_params() {
+        object_arguments_render_one_parameter_per_key_through(
+            |msgs| encode_messages(msgs, ThinkingMode::Chat, &params(None)),
+            " parameter",
+        );
+    }
+
+    #[test]
+    fn a_kept_empty_content_blocks_list_drops_its_messages_content_through_a_merge() {
+        // The reference rebuilds a user message's blocks from its content only
+        // when the list is absent (`if content_blocks is None`), so an empty
+        // list a message carries is kept and a following user message's blocks
+        // extend it: the first message's content is not rendered.
+        let with_empty_list = [
+            json!({ "role": "user", "content": "A", "content_blocks": [] }),
+            user("B"),
+        ];
+        let out = encode_messages(&with_empty_list, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>B<｜Assistant｜></think>"
+        );
+        let without = [user("A"), user("B")];
+        let out = encode_messages(&without, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>A\n\nB<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn image_blocks_among_a_user_messages_own_content_blocks_render_the_placeholder() {
+        let image = json!({ "type": "image_url", "image_url": { "url": "http://x" } });
+        let beside_text = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{ "type": "text", "text": "look" }, image.clone()],
+        })];
+        let out = encode_messages(&beside_text, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>look\n\n<｜deepseek_image｜><｜Assistant｜></think>"
+        );
+        let inside_a_tool_result = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{
+                "type": "tool_result",
+                "tool_call_id": "c1",
+                "content": [{ "type": "text", "text": "seen" }, image],
+            }],
+        })];
+        let out =
+            encode_messages(&inside_a_tool_result, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜><tool_result>seen\n\n<｜deepseek_image｜></tool_result><｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn content_blocks_that_are_a_messages_only_content_render_their_text_for_every_role() {
+        let system = [
+            json!({
+                "role": "system",
+                "content_blocks": [
+                    { "type": "text", "text": "Be brief." },
+                    { "type": "text", "text": "Answer in French." },
+                ],
+            }),
+            user("hello"),
+        ];
+        let out = encode_messages(&system, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜System｜>Be brief.\n\nAnswer in French.<｜User｜>hello<｜Assistant｜></think>"
+        );
+        let with_image = [
+            json!({
+                "role": "system",
+                "content_blocks": [
+                    { "type": "text", "text": "Look:" },
+                    { "type": "image_url", "image_url": { "url": "http://x" } },
+                ],
+            }),
+            user("hello"),
+        ];
+        let out = encode_messages(&with_image, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜System｜>Look:\n\n<｜deepseek_image｜><｜User｜>hello<｜Assistant｜></think>"
+        );
+        let history = [
+            user("first"),
+            json!({
+                "role": "assistant",
+                "content_blocks": [{ "type": "text", "text": "earlier answer" }],
+            }),
+            user("second"),
+        ];
+        let out = encode_messages(&history, ThinkingMode::Chat, &params(None)).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>first<｜Assistant｜></think>earlier answer<｜end▁of▁sentence｜><｜User｜>second<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn a_users_own_content_blocks_are_refused_as_the_reference_refuses_them() {
+        let with_blocks = |blocks: Value| {
+            [json!({ "role": "user", "content": "ignored", "content_blocks": blocks })]
+        };
+        let placeholder =
+            with_blocks(json!([{ "type": "text", "text": "a <｜deepseek_image｜> b" }]));
+        let err = encode_messages(&placeholder, ThinkingMode::Chat, &params(None)).unwrap_err();
+        assert!(matches!(err, DsEncodingError::PlaceholderInText), "{err}");
+        let nested = with_blocks(json!([{
+            "type": "tool_result",
+            "tool_call_id": "c1",
+            "content": [{ "type": "text", "text": "x<｜deepseek_image｜>" }],
+        }]));
+        let err = encode_messages(&nested, ThinkingMode::Chat, &params(None)).unwrap_err();
+        assert!(matches!(err, DsEncodingError::PlaceholderInText), "{err}");
+        let no_source = with_blocks(json!([{ "type": "image" }]));
+        let err = encode_messages(&no_source, ThinkingMode::Chat, &params(None)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DsEncodingError::InvalidMessage { ref msg, .. }
+                    if msg == "Image block does not contain a valid source"
+            ),
+            "{err}"
+        );
     }
 }

@@ -3,17 +3,18 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize};
 use serde_json::Value;
 use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, strict_schema_missing_additional_properties, validate_json_schema_shape,
-        validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function,
-        FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
-        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
-        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
+        default_true, json_type_name, strict_schema_missing_additional_properties,
+        validate_json_schema_shape, validate_stop, ChatLogProbs, ContextManagementEntry,
+        ConversationRef, Detail, Function, FunctionChoice, GenerationRequest, PromptCacheRetention,
+        PromptTokenUsageInfo, ResponsePrompt, StreamOptions, StringOrArray,
+        ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage,
+        UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -522,10 +523,10 @@ pub enum NamespaceTool {
     Custom(CustomTool),
 }
 
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, schemars::JsonSchema)]
 pub struct FunctionTool {
-    /// Flatten to match Responses API tool JSON shape.
+    /// Flat, as the Responses API tool JSON shape is; the schema follows the
+    /// function object, the wire form is written below.
     #[serde(flatten)]
     pub function: Function,
 }
@@ -543,6 +544,39 @@ impl<'de> Deserialize<'de> for FunctionTool {
             return Err(serde::de::Error::unknown_field(key, FIELDS));
         }
         Ok(Self { function })
+    }
+}
+
+/// A function tool writes `parameters` whether or not the client gave a
+/// schema: the Responses API reference lists the field as required and
+/// nullable (the chat API's reference, which [`Function`]'s own form follows,
+/// as optional), so a tool declared without one is forwarded, and echoed back,
+/// with `"parameters": null`, as the engine's own server writes it. The other
+/// fields keep the function object's form and order.
+impl Serialize for FunctionTool {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Function {
+            name,
+            description,
+            parameters,
+            strict,
+            extra,
+        } = &self.function;
+        let mut tool = serializer.serialize_map(Some(
+            2 + usize::from(description.is_some()) + usize::from(strict.is_some()) + extra.len(),
+        ))?;
+        tool.serialize_entry("name", name)?;
+        if let Some(description) = description {
+            tool.serialize_entry("description", description)?;
+        }
+        tool.serialize_entry("parameters", parameters)?;
+        if let Some(strict) = strict {
+            tool.serialize_entry("strict", strict)?;
+        }
+        for (key, value) in extra {
+            tool.serialize_entry(key, value)?;
+        }
+        tool.end()
     }
 }
 
@@ -3039,6 +3073,9 @@ impl ResponseUsage {
             prompt_tokens_details: Some(PromptTokenUsageInfo {
                 cached_tokens: self.input_tokens_details.cached_tokens,
                 audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
             }),
         }
     }
@@ -3292,6 +3329,30 @@ pub struct ResponsesRequest {
 pub enum ResponseInput {
     Items(Vec<ResponseInputOutputItem>),
     Text(String),
+}
+
+impl ResponsesRequest {
+    /// `top_k` when the request set it: the field is a plain value whose
+    /// serde default (`-1`) stands for unset, so a reader whose own `top_k`
+    /// is an `Option` (the chat request, where `None` lets the model's own
+    /// defaults fill the knob) does not take the default for a choice. A
+    /// request that writes `-1` by hand reads as unset too; keeping the two
+    /// apart would take an `Option` field.
+    pub fn top_k_if_set(&self) -> Option<i32> {
+        (self.top_k != default_top_k()).then_some(self.top_k)
+    }
+
+    /// `min_p` when the request set it; the serde default (`0.0`) stands for
+    /// unset, as for [`Self::top_k_if_set`].
+    pub fn min_p_if_set(&self) -> Option<f32> {
+        (self.min_p != 0.0).then_some(self.min_p)
+    }
+
+    /// `repetition_penalty` when the request set it; the serde default
+    /// (`1.0`) stands for unset, as for [`Self::top_k_if_set`].
+    pub fn repetition_penalty_if_set(&self) -> Option<f32> {
+        (self.repetition_penalty != default_repetition_penalty()).then_some(self.repetition_penalty)
+    }
 }
 
 impl Default for ResponsesRequest {
@@ -3641,7 +3702,9 @@ fn validate_openai_structured_output_rules(
         };
         let function = &function_tool.function;
         if function.strict == Some(true) {
-            if let Some(path) = strict_schema_missing_additional_properties(&function.parameters) {
+            if let Some(path) =
+                strict_schema_missing_additional_properties(function.parameters_schema())
+            {
                 return Err(invalid(
                     "invalid_function_parameters",
                     format!(
@@ -3899,12 +3962,12 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             // the OpenAI vendor profile in the cross-parameter validation).
             ResponseTool::Function(function_tool) => {
                 let function = &function_tool.function;
-                if !function.parameters.is_object() {
+                if !function.parameters_schema().is_object() {
                     return Err(invalid(
                         "invalid_type",
                         format!(
                             "Invalid type for 'tools[{idx}].parameters': expected an object, but got {} instead.",
-                            json_type_name(&function.parameters)
+                            json_type_name(function.parameters_schema())
                         ),
                     ));
                 }
@@ -3973,18 +4036,6 @@ fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
         validate_json_schema_shape(name, schema)?;
     }
     Ok(())
-}
-
-/// The JSON type name used in validation messages.
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
 }
 
 /// Normalize a SimpleInputMessage to a proper Message item
@@ -4483,6 +4534,64 @@ impl ResponseReasoningContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three sampling knobs the request keeps as plain values read as set
+    /// only off their serde defaults: absent is unset, a value is set, and a
+    /// knob written as the default's own value reads as unset (the limit of a
+    /// plain field).
+    #[test]
+    fn the_plain_valued_sampling_knobs_read_as_set_only_off_their_defaults() {
+        let parse = |body: Value| -> ResponsesRequest {
+            serde_json::from_value(body).expect("the request deserializes")
+        };
+
+        let unset = parse(serde_json::json!({"model": "m", "input": "hi"}));
+        assert_eq!(unset.top_k_if_set(), None, "an absent top_k is unset");
+        assert_eq!(unset.min_p_if_set(), None, "an absent min_p is unset");
+        assert_eq!(
+            unset.repetition_penalty_if_set(),
+            None,
+            "an absent repetition_penalty is unset"
+        );
+
+        let set = parse(serde_json::json!({
+            "model": "m", "input": "hi", "top_k": 40, "min_p": 0.05, "repetition_penalty": 1.1
+        }));
+        assert_eq!(
+            set.top_k_if_set(),
+            Some(40),
+            "a top_k the request wrote is set"
+        );
+        assert_eq!(
+            set.min_p_if_set(),
+            Some(0.05),
+            "a min_p the request wrote is set"
+        );
+        assert_eq!(
+            set.repetition_penalty_if_set(),
+            Some(1.1),
+            "a repetition_penalty the request wrote is set"
+        );
+
+        let at_default = parse(serde_json::json!({
+            "model": "m", "input": "hi", "top_k": -1, "min_p": 0.0, "repetition_penalty": 1.0
+        }));
+        assert_eq!(
+            at_default.top_k_if_set(),
+            None,
+            "a top_k written as -1 reads as unset"
+        );
+        assert_eq!(
+            at_default.min_p_if_set(),
+            None,
+            "a min_p written as 0 reads as unset"
+        );
+        assert_eq!(
+            at_default.repetition_penalty_if_set(),
+            None,
+            "a repetition_penalty written as 1 reads as unset"
+        );
+    }
 
     /// The outputs of calls not among the items go; every other item keeps
     /// its place.

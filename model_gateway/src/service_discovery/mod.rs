@@ -24,7 +24,7 @@
 //!   starts that provider.
 //!
 //! SMG mesh-router peer discovery is a different concern — it discovers router
-//! peers, not inference workers — and lives in [`crate::mesh_discovery`].
+//! peers, not inference workers — and lives in [`crate::mesh::discovery`].
 
 mod consul;
 mod file;
@@ -38,6 +38,7 @@ mod snapshot;
 pub(crate) mod testing;
 
 pub use consul::ConsulProviderConfig;
+pub(crate) use file::export_manifest;
 pub use file::FileProviderConfig;
 #[cfg(feature = "test-util")]
 pub use kubernetes::start_service_discovery_with_client;

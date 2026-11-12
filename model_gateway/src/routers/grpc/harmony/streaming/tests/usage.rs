@@ -1,0 +1,665 @@
+//! The usage object of a Harmony chat completion is the same whether its
+//! answer is streamed or not: the final usage of a stream driven over
+//! scripted engine frames equals, field for field, the usage of the
+//! non-streamed answer built from the same frames, with the reasoning tokens
+//! the Harmony parser counts and every detail counter present. The usage of a
+//! Responses API iteration is checked the same way, and so is the settlement
+//! of a chat request's reservation: the engine's counts, streamed and not.
+
+use std::sync::Arc;
+
+use openai_protocol::{chat::ChatCompletionRequest, responses::ResponsesRequest};
+use serde_json::{json, Value};
+use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
+
+use super::super::HarmonyStreamingProcessor;
+use crate::{
+    observability::metrics::metrics_labels,
+    rate_limit::{test_support::RecordingBackend, SharedReservationHandle, UsageSettlement},
+    routers::{
+        common::sse::sse_channel,
+        grpc::{
+            common::{
+                response_formatting::TokenCounts, responses::streaming::ResponseStreamEventEmitter,
+            },
+            context,
+            harmony::{
+                processor::{HarmonyResponseProcessor, ResponsesIterationResult},
+                try_harmony_encoding,
+            },
+            regular::streaming::tests::eof::scripted_stream,
+            utils,
+        },
+    },
+};
+
+/// The engine's counters for one request, as its `Complete` frames carry them.
+#[derive(Clone, Copy)]
+struct Counters {
+    prompt: u32,
+    cached: u32,
+    spec_accepted: u32,
+    spec_drafted: u32,
+}
+
+/// The tokens of one assistant turn in the Harmony format: the `analysis`
+/// channel (the reasoning the parser counts) when given, then the `final`
+/// channel's `text`.
+pub(super) fn harmony_tokens(analysis: Option<&str>, text: &str) -> Vec<u32> {
+    let mut turn = String::new();
+    if let Some(analysis) = analysis {
+        turn.push_str("<|channel|>analysis<|message|>");
+        turn.push_str(analysis);
+        turn.push_str("<|end|><|start|>assistant");
+    }
+    turn.push_str("<|channel|>final<|message|>");
+    turn.push_str(text);
+    turn.push_str("<|return|>");
+    try_harmony_encoding()
+        .expect("harmony encoding must load")
+        .tokenizer()
+        .encode_with_special_tokens(&turn)
+}
+
+/// The frames of one choice: `token_ids` in chunks of three, then the
+/// terminal frame with `counters` and the whole output (the streamed path
+/// parses the chunks, the non-streamed one the terminal frame).
+fn choice_frames(
+    index: u32,
+    token_ids: &[u32],
+    counters: Counters,
+) -> Vec<proto::GenerateResponse> {
+    let mut frames: Vec<proto::GenerateResponse> = token_ids
+        .chunks(3)
+        .map(|ids| proto::GenerateResponse {
+            response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
+                index,
+                completion_tokens: ids.len() as u32,
+                token_ids: ids.to_vec(),
+                ..Default::default()
+            })),
+        })
+        .collect();
+    frames.push(proto::GenerateResponse {
+        response: Some(GenerationEvent::Complete(proto::GenerateComplete {
+            index,
+            finish_reason: "stop".to_string(),
+            prompt_tokens: counters.prompt,
+            completion_tokens: token_ids.len() as u32,
+            cached_tokens: counters.cached,
+            spec_accepted_tokens: counters.spec_accepted,
+            spec_draft_tokens: counters.spec_drafted,
+            output_ids: token_ids.to_vec(),
+            ..Default::default()
+        })),
+    });
+    frames
+}
+
+/// The frames of `choices` choices that each generate `token_ids`.
+fn frames(token_ids: &[u32], choices: u32, counters: Counters) -> Vec<proto::GenerateResponse> {
+    (0..choices)
+        .flat_map(|index| choice_frames(index, token_ids, counters))
+        .collect()
+}
+
+fn dispatch() -> context::DispatchMetadata {
+    context::DispatchMetadata {
+        request_id: "harmony-usage".to_string(),
+        model: "harmony-test".to_string(),
+        created: 1,
+        weight_version: None,
+    }
+}
+
+fn chat_request(choices: u32, stream: bool) -> ChatCompletionRequest {
+    let mut request = json!({
+        "model": "harmony-test", "messages": [], "n": choices, "stream": stream,
+    });
+    if stream {
+        request["stream_options"] = json!({"include_usage": true});
+    }
+    serde_json::from_value(request).expect("chat request")
+}
+
+/// The events of a Harmony chat stream with `stream_options.include_usage`,
+/// `[DONE]` left out.
+async fn streamed_chat_events(
+    frames: Vec<proto::GenerateResponse>,
+    choices: u32,
+    reservation: Option<Arc<SharedReservationHandle>>,
+) -> Vec<Value> {
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let dispatch = dispatch();
+    let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
+    let response = Arc::new(HarmonyStreamingProcessor::new())
+        .process_streaming_chat_response(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
+            Arc::new(chat_request(choices, true)),
+            dispatch,
+            Vec::new(),
+            reservation,
+            None,
+            source,
+        )
+        .await;
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("the stream's body");
+    server.abort();
+    let events: Vec<Value> = std::str::from_utf8(&body)
+        .expect("UTF-8 SSE")
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("SSE JSON"))
+        .collect();
+    assert!(
+        events.iter().all(|event| event.get("error").is_none()),
+        "the stream completes without an error event: {events:?}"
+    );
+    events
+}
+
+/// The `usage` of the usage-only chunk that ends a Harmony chat stream with
+/// `stream_options.include_usage`.
+async fn streamed_chat_usage(
+    frames: Vec<proto::GenerateResponse>,
+    choices: u32,
+    reservation: Option<Arc<SharedReservationHandle>>,
+) -> Value {
+    let events = streamed_chat_events(frames, choices, reservation).await;
+    let usage_chunk = events
+        .iter()
+        .rfind(|event| event["choices"].as_array().is_some_and(Vec::is_empty))
+        .expect("a usage-only chunk");
+    usage_chunk["usage"].clone()
+}
+
+/// Under `stream_options.include_usage` every chunk before the usage-only one
+/// carries the `usage: null` placeholder the public API writes, on this
+/// pipeline as on the regular chat stream.
+#[tokio::test]
+async fn harmony_chat_chunks_before_the_usage_chunk_carry_the_placeholder() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let tokens = harmony_tokens(None, "Hello there!");
+    let events = streamed_chat_events(frames(&tokens, 1, counters), 1, None).await;
+    let (last, earlier) = events.split_last().expect("events");
+    assert!(
+        last["choices"].as_array().is_some_and(Vec::is_empty) && last["usage"].is_object(),
+        "{last}"
+    );
+    assert!(!earlier.is_empty(), "{events:?}");
+    assert!(
+        earlier
+            .iter()
+            .all(|event| event.get("usage") == Some(&Value::Null)),
+        "{events:?}"
+    );
+}
+
+/// The non-streamed answer's usage and the settlement its counters make.
+async fn non_streamed_chat(
+    frames: Vec<proto::GenerateResponse>,
+    choices: u32,
+) -> (Value, UsageSettlement) {
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let (response, counts) = HarmonyResponseProcessor::new()
+        .process_non_streaming_chat_response(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
+            Arc::new(chat_request(choices, false)),
+            dispatch(),
+            &[],
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
+    server.abort();
+    let usage = serde_json::to_value(response).expect("a JSON response")["usage"].clone();
+    (usage, counts.settlement())
+}
+
+async fn non_streamed_chat_usage(frames: Vec<proto::GenerateResponse>, choices: u32) -> Value {
+    non_streamed_chat(frames, choices).await.0
+}
+
+/// The detail counters the OpenAI API sends on every chat completion.
+const CHAT_DETAIL_COUNTERS: [&str; 6] = [
+    "/prompt_tokens_details/cached_tokens",
+    "/prompt_tokens_details/audio_tokens",
+    "/completion_tokens_details/reasoning_tokens",
+    "/completion_tokens_details/audio_tokens",
+    "/completion_tokens_details/accepted_prediction_tokens",
+    "/completion_tokens_details/rejected_prediction_tokens",
+];
+
+#[tokio::test]
+async fn harmony_chat_usage_is_the_same_streamed_and_not() {
+    let plain = Counters {
+        prompt: 10,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let cached = Counters { cached: 4, ..plain };
+    let speculative = Counters {
+        spec_accepted: 2,
+        spec_drafted: 3,
+        ..cached
+    };
+    for (name, analysis, choices, counters) in [
+        ("final channel only", None, 1, plain),
+        (
+            "analysis then final, cached prompt",
+            Some("The user greets; a short answer will do."),
+            1,
+            cached,
+        ),
+        (
+            "analysis then final, speculative decoding, two choices",
+            Some("Two choices think alike."),
+            2,
+            speculative,
+        ),
+    ] {
+        let tokens = harmony_tokens(analysis, "Hello there!");
+        let streamed = streamed_chat_usage(frames(&tokens, choices, counters), choices, None).await;
+        let whole = non_streamed_chat_usage(frames(&tokens, choices, counters), choices).await;
+        assert_eq!(
+            streamed, whole,
+            "{name}: the streamed usage chunk vs the non-streamed usage"
+        );
+        for pointer in CHAT_DETAIL_COUNTERS {
+            assert!(
+                streamed.pointer(pointer).is_some_and(Value::is_number),
+                "{name}: {pointer} missing from {streamed}"
+            );
+        }
+        assert_eq!(
+            streamed["prompt_tokens_details"]["cached_tokens"], counters.cached,
+            "{name}: {streamed}"
+        );
+        let reasoning = streamed["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .expect("a reasoning count");
+        if analysis.is_some() {
+            assert!(
+                reasoning > 0,
+                "{name}: the tokens the parser counted on the analysis channel: {streamed}"
+            );
+        } else {
+            assert_eq!(reasoning, 0, "{name}: {streamed}");
+        }
+    }
+}
+
+/// The `usage` an iteration result carries.
+fn iteration_usage(result: ResponsesIterationResult) -> Value {
+    let usage = match result {
+        ResponsesIterationResult::Completed { usage, .. } => usage,
+        ResponsesIterationResult::ToolCallsFound { usage, .. } => usage,
+    };
+    serde_json::to_value(usage).expect("a JSON usage")
+}
+
+/// The streamed Responses iteration over `frames`: its result and the
+/// engine's counts its terminal frame brought (none when the frames end
+/// before it).
+async fn streamed_responses_iteration(
+    frames: Vec<proto::GenerateResponse>,
+) -> (ResponsesIterationResult, Option<TokenCounts>) {
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let mut emitter = ResponseStreamEventEmitter::new(
+        "resp_harmony-usage".to_string(),
+        "harmony-test".to_string(),
+        1,
+    );
+    let (tx, mut rx) = sse_channel();
+    // The events are read as they come, so the processor never waits on the
+    // channel.
+    let drain = async { while rx.recv().await.is_some() {} };
+    let iteration = async {
+        let result = HarmonyStreamingProcessor::process_responses_iteration_stream(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
+            &mut emitter,
+            &tx,
+            None,
+            None,
+            &[],
+        )
+        .await;
+        drop(tx);
+        result
+    };
+    let (streamed, ()) = tokio::join!(iteration, drain);
+    server.abort();
+    streamed.expect("the streamed iteration")
+}
+
+/// The non-streamed Responses iteration over `frames`: its result and the
+/// engine's counts of its terminal frame.
+async fn whole_responses_iteration(
+    frames: Vec<proto::GenerateResponse>,
+) -> (ResponsesIterationResult, TokenCounts) {
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let request: ResponsesRequest =
+        serde_json::from_value(json!({"model": "harmony-test", "input": "hi"}))
+            .expect("responses request");
+    let whole = HarmonyResponseProcessor::new()
+        .process_responses_iteration(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
+            Arc::new(request),
+            dispatch(),
+            &[],
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
+    server.abort();
+    whole
+}
+
+#[tokio::test]
+async fn harmony_responses_iteration_usage_is_the_same_streamed_and_not() {
+    let counters = Counters {
+        prompt: 12,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 3,
+    };
+    let tokens = harmony_tokens(Some("Think, then answer."), "Done.");
+
+    let (streamed, _) = streamed_responses_iteration(frames(&tokens, 1, counters)).await;
+    let (whole, _) = whole_responses_iteration(frames(&tokens, 1, counters)).await;
+
+    let (streamed, whole) = (iteration_usage(streamed), iteration_usage(whole));
+    assert_eq!(
+        streamed, whole,
+        "the streamed iteration's usage vs the non-streamed one"
+    );
+    assert_eq!(
+        streamed["prompt_tokens_details"]["cached_tokens"], 4,
+        "{streamed}"
+    );
+    assert!(
+        streamed["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .is_some_and(|reasoning| reasoning > 0),
+        "{streamed}"
+    );
+    assert_eq!(
+        streamed["completion_tokens_details"]["accepted_prediction_tokens"], 2,
+        "{streamed}"
+    );
+}
+
+/// The settlement of a Harmony Responses iteration carries the engine's
+/// counts, streamed and not, as a chat request's does: the prompt and its
+/// cache hit, the completion, and the engine's own reasoning count, zero
+/// here (the terminal frame carries none) though the parser counted the
+/// analysis channel and the usage object shows that count.
+#[tokio::test]
+async fn harmony_responses_iteration_settlement_carries_the_engines_counts_streamed_and_not() {
+    let counters = Counters {
+        prompt: 12,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 3,
+    };
+    let tokens = harmony_tokens(Some("Think, then answer."), "Done.");
+    let expected = UsageSettlement {
+        actual_input_tokens: 12,
+        completion_tokens: tokens.len() as u32,
+        cached_input_tokens: 4,
+        reasoning_tokens: 0,
+    };
+
+    let (streamed, streamed_counts) =
+        streamed_responses_iteration(frames(&tokens, 1, counters)).await;
+    let streamed_counts = streamed_counts.expect("the terminal frame brought the counts");
+    let (_, whole_counts) = whole_responses_iteration(frames(&tokens, 1, counters)).await;
+
+    assert_eq!(streamed_counts.settlement(), expected);
+    assert_eq!(whole_counts.settlement(), expected);
+    assert_eq!(streamed_counts, whole_counts);
+    let usage = iteration_usage(streamed);
+    assert!(
+        usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .is_some_and(|reasoning| reasoning > 0),
+        "the usage shows the parser's count, the settlement the engine's: {usage}"
+    );
+}
+
+/// A streamed Responses iteration whose stream ends before its terminal
+/// frame (a clean EOF after the chunks) brings no counts to settle with: the
+/// prompt count would read zero and a settlement would hand the reserved
+/// estimate back, where the chat streams keep the debit. The result still
+/// carries what the chunks showed.
+#[tokio::test]
+async fn harmony_responses_iteration_cut_before_its_terminal_frame_brings_no_counts() {
+    let counters = Counters {
+        prompt: 12,
+        cached: 4,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let tokens = harmony_tokens(None, "Done.");
+    let mut cut = frames(&tokens, 1, counters);
+    let terminal = cut.pop().expect("a terminal frame");
+    assert!(matches!(
+        terminal.response,
+        Some(GenerationEvent::Complete(_))
+    ));
+
+    let (result, counts) = streamed_responses_iteration(cut).await;
+
+    assert!(
+        counts.is_none(),
+        "no terminal frame, nothing to settle with"
+    );
+    assert!(
+        matches!(result, ResponsesIterationResult::Completed { .. }),
+        "the iteration still answers with what the chunks showed"
+    );
+}
+
+/// The settlement of a Harmony chat request carries the engine's counts,
+/// streamed and not: the cache hit of the shared prompt, and the engine's
+/// own reasoning count, zero here (the engine proto's terminal frame carries
+/// none) though the parser counted the analysis channel and the usage
+/// object shows that count.
+#[tokio::test]
+async fn harmony_chat_settlement_carries_the_engines_counts_streamed_and_not() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let tokens = harmony_tokens(Some("Think first."), "Hello there!");
+    let choices = 2;
+    let expected = UsageSettlement {
+        actual_input_tokens: 10,
+        completion_tokens: tokens.len() as u32 * choices,
+        cached_input_tokens: 4,
+        reasoning_tokens: 0,
+    };
+
+    let (handle, backend) = RecordingBackend::reservation();
+    let streamed =
+        streamed_chat_usage(frames(&tokens, choices, counters), choices, Some(handle)).await;
+    assert!(
+        streamed["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .is_some_and(|reasoning| reasoning > 0),
+        "the usage shows the parser's count: {streamed}"
+    );
+    assert_eq!(backend.settlements(), vec![expected]);
+    assert_eq!(backend.closes(), 0);
+
+    let (whole, settlement) = non_streamed_chat(frames(&tokens, choices, counters), choices).await;
+    assert_eq!(whole, streamed);
+    assert_eq!(settlement, expected);
+}
+
+#[tokio::test]
+async fn spec_usage_regression_harmony_streamed_and_nonstreamed_formatting() {
+    let tokens = tokio::task::spawn_blocking(|| harmony_tokens(Some("I think."), "Hello!"))
+        .await
+        .expect("initialize Harmony outside the async runtime");
+    for (first, second, rejected) in [
+        ((2, 0), (1, 10), None),
+        ((0, 0), (0, 10), None),
+        ((0, 7), (0, 0), None),
+        ((0, 7), (0, 10), Some(17)),
+        ((4, 2), (1, 10), None),
+        ((0, 0), (1, 10), None),
+        ((2, 3), (1, 10), Some(10)),
+        ((2, 2), (1, 1), Some(0)),
+        ((0, 0), (0, 0), Some(0)),
+    ] {
+        let counters = |(a, d)| Counters {
+            prompt: 10,
+            cached: 4,
+            spec_accepted: a,
+            spec_drafted: d,
+        };
+        let mut data = choice_frames(0, &tokens, counters(first));
+        data.extend(choice_frames(1, &tokens, counters(second)));
+        let streamed = streamed_chat_usage(data.clone(), 2, None).await;
+        let whole = non_streamed_chat_usage(data, 2).await;
+        assert_eq!(streamed, whole);
+        let details = &streamed["completion_tokens_details"];
+        assert_eq!(details["accepted_prediction_tokens"], first.0 + second.0);
+        assert!(details["reasoning_tokens"].as_u64().unwrap() > 0);
+        match rejected {
+            Some(n) => assert_eq!(details["rejected_prediction_tokens"], n),
+            None => assert!(
+                details.get("rejected_prediction_tokens").is_none(),
+                "{streamed}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn spec_usage_regression_harmony_missing_choice_is_unknown() {
+    let tokens = tokio::task::spawn_blocking(|| harmony_tokens(None, "Hello!"))
+        .await
+        .expect("initialize Harmony outside the async runtime");
+    for chunk_only in [false, true] {
+        let mut data = choice_frames(
+            0,
+            &tokens,
+            Counters {
+                prompt: 10,
+                cached: 4,
+                spec_accepted: 0,
+                spec_drafted: 10,
+            },
+        );
+        if chunk_only {
+            let mut partial = choice_frames(
+                1,
+                &tokens,
+                Counters {
+                    prompt: 10,
+                    cached: 4,
+                    spec_accepted: 0,
+                    spec_drafted: 0,
+                },
+            );
+            partial.pop(); // The second choice never supplies its terminal counters.
+            data.extend(partial);
+        }
+        let usage = streamed_chat_usage(data, 2, None).await;
+        let details = &usage["completion_tokens_details"];
+        assert_eq!(details["accepted_prediction_tokens"], 0);
+        assert!(
+            details.get("rejected_prediction_tokens").is_none(),
+            "{usage}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collected_harmony_missing_choice_keeps_rejections_unknown() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 2,
+    };
+    let tokens = harmony_tokens(None, "ok");
+    let (usage, settlement) = non_streamed_chat(choice_frames(0, &tokens, counters), 2).await;
+    assert_eq!(settlement.actual_input_tokens, 10);
+    assert_eq!(settlement.cached_input_tokens, 4);
+    assert_eq!(
+        usage["completion_tokens_details"]["accepted_prediction_tokens"],
+        2
+    );
+    assert!(
+        usage["completion_tokens_details"]
+            .get("rejected_prediction_tokens")
+            .is_none(),
+        "{usage}"
+    );
+}
+
+#[tokio::test]
+async fn collected_harmony_membership_and_proposal_controls() {
+    let tokens = harmony_tokens(None, "ok");
+    for (n, entries, rejected) in [
+        (2, &[(0, 2, 2), (0, 2, 2)][..], None),
+        (2, &[(1, 2, 2), (0, 2, 2)][..], Some(0)),
+        (2, &[(0, 0, 0), (1, 0, 0)][..], Some(0)),
+        (2, &[(0, 0, 0), (1, 0, 10)][..], None),
+        (1, &[(0, 0, 5)][..], Some(5)),
+        (0, &[(0, 2, 2)][..], Some(0)),
+    ] {
+        let frames = entries
+            .iter()
+            .flat_map(|&(index, accepted, drafted)| {
+                choice_frames(
+                    index,
+                    &tokens,
+                    Counters {
+                        prompt: 10,
+                        cached: 4,
+                        spec_accepted: accepted,
+                        spec_drafted: drafted,
+                    },
+                )
+            })
+            .collect();
+        let usage = non_streamed_chat_usage(frames, n).await;
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+        let details = &usage["completion_tokens_details"];
+        assert_eq!(
+            details["accepted_prediction_tokens"],
+            entries.iter().map(|e| e.1).sum::<u32>()
+        );
+        assert_eq!(
+            details.get("rejected_prediction_tokens"),
+            rejected.map(|v| json!(v)).as_ref(),
+            "n={n}, {entries:?}: {usage}"
+        );
+    }
+}

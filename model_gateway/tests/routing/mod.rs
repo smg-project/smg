@@ -1,4 +1,7 @@
-//! Routing integration tests
+//! Routing integration tests, and the streaming chat request two of them send.
+
+use openai_protocol::chat::ChatCompletionRequest;
+use serde_json::json;
 
 pub mod cache_aware_backward_compat_test;
 pub mod cache_namespace_routing_test;
@@ -11,6 +14,7 @@ pub mod model_alias_test;
 pub mod payload_size_test;
 pub mod pd_routing_test;
 pub mod policy_completion_test;
+pub mod policy_engine_test;
 pub mod power_of_two_test;
 pub mod prefix_hash_test;
 pub mod service_discovery_test;
@@ -23,3 +27,14 @@ pub mod transcription_body_cap_test;
 pub mod upstream_effort_alias_test;
 pub mod upstream_http2_test;
 pub mod worker_management_test;
+
+/// A streaming chat request for the mock model.
+#[expect(clippy::unwrap_used, reason = "test helper")]
+fn streaming_chat_request() -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": true
+    }))
+    .unwrap()
+}

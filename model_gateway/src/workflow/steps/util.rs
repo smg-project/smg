@@ -256,11 +256,24 @@ pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(
 /// answering its health check as its overrides say (healthy until told
 /// otherwise): its `grpc://` URL and those overrides.
 #[cfg(test)]
+pub(crate) async fn mock_grpc_engine() -> (
+    String,
+    std::sync::Arc<mock_worker::overrides::WorkerOverrides>,
+) {
+    mock_grpc_engine_on(mock_worker::config::SchedulerWire::TokenSpeed).await
+}
+
+/// [`mock_grpc_engine`] speaking `wire`'s proto, for the reads that pick a
+/// client by the runtime's name: the engine's model info and server info
+/// answer as its overrides say (served until told otherwise).
+#[cfg(test)]
 #[expect(
     clippy::disallowed_methods,
     reason = "test helper: the mock engine's serve task runs for the test process's lifetime"
 )]
-pub(crate) async fn mock_grpc_engine() -> (
+pub(crate) async fn mock_grpc_engine_on(
+    wire: mock_worker::config::SchedulerWire,
+) -> (
     String,
     std::sync::Arc<mock_worker::overrides::WorkerOverrides>,
 ) {
@@ -275,15 +288,16 @@ pub(crate) async fn mock_grpc_engine() -> (
         http_count: 0,
         grpc_base_port: port,
         grpc_count: 1,
+        grpc_wire: wire,
         model_id: "probe-model".to_string(),
         tokenizer_path: "probe-model".to_string(),
         ..mock_worker::config::Config::default()
     });
+    // A port an earlier test's engine served on keeps that engine's
+    // overrides; this engine starts from fresh ones.
+    let overrides = mock_worker::overrides::fresh_for_port(port);
     tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
-    (
-        format!("grpc://127.0.0.1:{port}"),
-        mock_worker::overrides::for_port(port),
-    )
+    (format!("grpc://127.0.0.1:{port}"), overrides)
 }
 
 #[cfg(test)]

@@ -10,8 +10,9 @@ use openai_protocol::{
     worker::{ConstrainedDecoding, WorkerLoadResponse},
 };
 use smg_grpc_client::{
-    common_proto, mlx_proto, sglang_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle,
-    tokenspeed_proto, trtllm_proto, vllm_proto, BoxedTraceInjector, MlxEngineClient,
+    common_proto, media_identity::sglang as media_contract, mlx_proto, sglang_proto,
+    tokenizer_bundle, tokenizer_bundle::StreamBundle, tokenspeed_proto, trtllm_proto, vllm_proto,
+    BoxedTraceInjector, FormatSetAside, MlxEngineClient, OutputConstraint,
     SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
     TrtllmServiceClient, VllmEngineClient,
 };
@@ -59,6 +60,11 @@ pub enum GrpcClient {
 pub struct GenerateRequestBuildOptions {
     pub multimodal_inputs: Option<MultimodalData>,
     pub tool_constraints: Option<(String, String)>,
+    /// Which of a chat body's own format fields `tool_constraints` answers (a
+    /// table's tag for a JSON `response_format`; the whole turn's grammar for
+    /// the `regex` and the `ebnf` too): the builders read them as absent, so
+    /// the engine's request carries the constraint alone.
+    pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
     /// `tool_constraints` was led with the model's thought and its close for
     /// a worker whose engine starts the grammar at the first generated token:
@@ -230,7 +236,11 @@ impl GrpcClient {
                 let resp = client.get_loads(include()).await?;
                 Ok(WorkerLoadResponse::from(resp))
             }
-            _ => Err(tonic::Status::unimplemented(
+            Self::Trtllm(client) => {
+                let resp = client.get_loads(include()).await?;
+                Ok(WorkerLoadResponse::from(resp))
+            }
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "GetLoads RPC not supported for this backend",
             )),
         }
@@ -312,6 +322,25 @@ impl GrpcClient {
                     .subscribe_kv_events_with_load_records(start_seq)
                     .await
             }
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents RPC not supported for MLX backend",
+            )),
+        }
+    }
+
+    /// The servicer's load records alone, no events (`SubscribeKvEvents`
+    /// with `loads_only`): what a worker streams when routing reads its load
+    /// and keeps no KV index. A servicer that predates the field streams its
+    /// events too; the subscriber drops them. `Unimplemented` on backends
+    /// without the stream.
+    pub async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Sglang(client) => client.subscribe_load_records().await,
+            Self::Vllm(client) => client.subscribe_load_records().await,
+            Self::Trtllm(client) => client.subscribe_load_records().await,
+            Self::TokenSpeed(client) => client.subscribe_load_records().await,
             Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "SubscribeKvEvents RPC not supported for MLX backend",
             )),
@@ -543,9 +572,14 @@ impl GrpcClient {
         let GenerateRequestBuildOptions {
             multimodal_inputs,
             tool_constraints,
+            format_set_aside,
             require_reasoning,
             first_token_grammar,
         } = options;
+        let constraint = OutputConstraint {
+            tool: tool_constraints,
+            set_aside: format_set_aside,
+        };
         let EngineBuilders {
             sglang,
             vllm,
@@ -556,10 +590,12 @@ impl GrpcClient {
         let mut request = match self {
             Self::Sglang(client) => {
                 let sglang_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
-                    MultimodalData::Sglang(data) => Some(data.into_proto()),
+                    MultimodalData::Sglang(data) => Some(data.into_protos()),
                     _ => None,
                 });
-                let req = sglang(
+                let (sglang_mm, extras) =
+                    sglang_mm.map_or((None, Vec::new()), |(first, extras)| (Some(first), extras));
+                let mut req = sglang(
                     client,
                     request_id,
                     body,
@@ -567,10 +603,12 @@ impl GrpcClient {
                     token_ids,
                     SglangGenerateRequestOptions {
                         multimodal_inputs: sglang_mm,
-                        tool_call_constraint: tool_constraints,
+                        tool_call_constraint: constraint.tool,
+                        format_set_aside: constraint.set_aside,
                         require_reasoning,
                     },
                 )?;
+                req.extra_mm_inputs = extras;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(_) => {
@@ -579,14 +617,7 @@ impl GrpcClient {
                     _ => None,
                 });
                 finish_vllm_request(vllm_mm, |mm| {
-                    vllm(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        tool_constraints,
-                    )
+                    vllm(request_id, body, processed_text, token_ids, mm, constraint)
                 })
             }
             Self::Trtllm(client) => {
@@ -601,7 +632,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     trtllm_mm,
-                    tool_constraints,
+                    constraint,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
@@ -613,7 +644,7 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    tool_constraints,
+                    constraint,
                 )?;
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
@@ -623,14 +654,7 @@ impl GrpcClient {
                     _ => None,
                 });
                 finish_tokenspeed_request(tokenspeed_mm, |mm| {
-                    tokenspeed(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        tool_constraints,
-                    )
+                    tokenspeed(request_id, body, processed_text, token_ids, mm, constraint)
                 })
             }
         }?;
@@ -684,7 +708,7 @@ pub(crate) type VllmMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<vllm_proto::MultimodalInputs>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<vllm_proto::GenerateRequest, String>;
 
 /// The TokenSpeed counterpart of [`VllmMmBuilder`].
@@ -694,7 +718,7 @@ pub(crate) type TokenSpeedMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<tokenspeed_proto::MultimodalInputs>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<tokenspeed_proto::GenerateRequest, String>;
 
 /// The SGLang counterpart of [`VllmMmBuilder`] on the connected client; its
@@ -716,7 +740,7 @@ type TrtllmClientMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<trtllm_proto::MultimodalInput>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<trtllm_proto::GenerateRequest, String>;
 
 /// The MLX counterpart of [`VllmMmBuilder`] on the connected client; MLX
@@ -727,7 +751,7 @@ type MlxClientMmBuilder<B> = fn(
     &B,
     String,
     Vec<u32>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<mlx_proto::GenerateRequest, String>;
 
 /// A vLLM builder for a request kind with neither multimodal inputs nor tool
@@ -941,6 +965,9 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
+    media_contract::LABEL,
+    "mm_processor",
+    "mm_media_ref_schemes",
     "model_path",
     "served_model_name",
     "tokenizer_path",
@@ -982,6 +1009,13 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // servicer writes both.
     "engine_reasoning_parser",
     "constrained_decoding_start",
+    // The vocabulary of structural-tag nodes the engine's grammar compiler
+    // takes (`older` for an xgrammar that predates the `optional`, `plus`,
+    // `star` and `token` nodes), which the servicer reads off the installed
+    // xgrammar: the label by which a worker's structural tags are spelled
+    // without `optional`, `plus` and `star` (`TagVocabulary::Older`; a `token`
+    // node stays as derived).
+    "structural_tag_vocabulary",
     // A servicer's own vision verdict. `GetModelInfo.supports_vision` is a
     // proto3 bool, so a `false` there cannot be told from a field the servicer
     // never set and is dropped for this runtime (`ModelInfo::to_labels`); a
@@ -1031,6 +1065,13 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     // on a thinking prompt, as for SGLang above; the servicer writes both.
     "engine_reasoning_parser",
     "constrained_decoding_start",
+    // The vocabulary of structural-tag nodes the engine's grammar compiler
+    // takes (`older` for an xgrammar that predates the `optional`, `plus`,
+    // `star` and `token` nodes), which the servicer reads off the installed
+    // xgrammar: the label by which a worker's structural tags are spelled
+    // without `optional`, `plus` and `star` (`TagVocabulary::Older`; a `token`
+    // node stays as derived).
+    "structural_tag_vocabulary",
     // RL control plane (crates/rl): where the engine's SGLang-compatible
     // control app listens and what it implements. The engine advertises
     // these; SMG's discovery turns them into the labels the RL crate reads.
@@ -1113,9 +1154,23 @@ fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Stru
 mod tests {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
+    use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
+
+    /// EC compatibility fields survive discovery as routing labels.
+    #[test]
+    fn vllm_ec_capabilities_flatten_into_labels() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            supports_ec_transfer: true,
+            ec_connector: "ECCPUConnector".into(),
+            ec_role: "ec_producer".into(),
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(labels["ec_connector"], "ECCPUConnector");
+        assert_eq!(labels["ec_role"], "ec_producer");
+    }
 
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
     /// are: the engine's per-prompt media limits arrive as `mm_item_limits`
@@ -1189,6 +1244,87 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The vocabulary of structural-tag nodes a worker's grammar compiler
+    /// takes becomes the `structural_tag_vocabulary` label on every runtime
+    /// whose servicer reports it: a field of the vLLM and TensorRT-LLM server
+    /// info, a `server_args` key of SGLang's and TokenSpeed's; a servicer
+    /// that says nothing (the proto default, no key) sets no label.
+    #[test]
+    fn server_info_to_labels_carries_the_structural_tag_vocabulary() {
+        let vllm = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            structural_tag_vocabulary: "older".to_string(),
+            ..Default::default()
+        }))
+        .to_labels();
+        assert_eq!(
+            vllm.get("structural_tag_vocabulary").map(String::as_str),
+            Some("older")
+        );
+        assert!(!ServerInfo::Vllm(Box::default())
+            .to_labels()
+            .contains_key("structural_tag_vocabulary"));
+
+        let trtllm = ServerInfo::Trtllm(trtllm_proto::GetServerInfoResponse {
+            structural_tag_vocabulary: "older".to_string(),
+            ..Default::default()
+        })
+        .to_labels();
+        assert_eq!(
+            trtllm.get("structural_tag_vocabulary").map(String::as_str),
+            Some("older")
+        );
+        assert!(!ServerInfo::Trtllm(Default::default())
+            .to_labels()
+            .contains_key("structural_tag_vocabulary"));
+
+        let keyed = prost_types::Struct {
+            fields: BTreeMap::from([(
+                "structural_tag_vocabulary".to_string(),
+                string_value("older"),
+            )]),
+        };
+        let sglang = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+            server_args: Some(keyed.clone()),
+            ..Default::default()
+        }))
+        .to_labels();
+        assert_eq!(
+            sglang.get("structural_tag_vocabulary").map(String::as_str),
+            Some("older")
+        );
+        let tokenspeed =
+            ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+                server_args: Some(keyed),
+                ..Default::default()
+            }))
+            .to_labels();
+        assert_eq!(
+            tokenspeed
+                .get("structural_tag_vocabulary")
+                .map(String::as_str),
+            Some("older")
+        );
+        let silent = prost_types::Struct {
+            fields: BTreeMap::from([("grammar_backend".to_string(), string_value("xgrammar"))]),
+        };
+        assert!(
+            !ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+                server_args: Some(silent.clone()),
+                ..Default::default()
+            }))
+            .to_labels()
+            .contains_key("structural_tag_vocabulary")
+        );
+        assert!(
+            !ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+                server_args: Some(silent),
+                ..Default::default()
+            }))
+            .to_labels()
+            .contains_key("structural_tag_vocabulary")
+        );
     }
 
     /// A TokenSpeed servicer's declared constrained-decoding policy travels as

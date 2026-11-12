@@ -1,0 +1,16 @@
+# Router with per-tenant rate limits and the priority scheduler, each reading
+# its YAML from a ConfigMap of yours, mounted whole into the router pod.
+# Usage: kubectl create configmap smg-rate-limit --from-file=rate-limit.yaml=./rate-limit.yaml
+#        kubectl create configmap smg-scheduler --from-file=scheduler.yaml=./scheduler.yaml
+#        helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-admission-config.yaml
+router:
+  workerUrls:
+    - http://worker-1:8000
+  tenantRateLimit:
+    enabled: true
+    configMap:
+      name: smg-rate-limit
+  priorityScheduler:
+    enabled: true
+    configMap:
+      name: smg-scheduler

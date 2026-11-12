@@ -7,11 +7,15 @@ This module handles:
   session-scoped worker pool (``infra.worker_pool``) doesn't have to
   evict-and-restart between consecutive classes that share a backend.
 - Session teardown: Stop all pooled workers on session finish.
+- Rerun record: name every case pytest-rerunfailures ran again (the terminal
+  summary, the run page's annotations and step summary, ``reruns.txt`` under
+  ``E2E_LOG_DIR``).
 """
 
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 from infra import (
@@ -121,10 +125,12 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
     # ``hooks.py`` is not itself a conftest — only the functions conftest.py
-    # re-imports act as hooks — so the collection-summary reporter is
-    # registered here as a plugin object instead.
+    # re-imports act as hooks — so the selection and passing-call reporter and
+    # the rerun reporter are registered here as plugin objects instead.
     if not config.pluginmanager.has_plugin("e2e_selection_reporter"):
         config.pluginmanager.register(_SelectionReporter(), "e2e_selection_reporter")
+    if not config.pluginmanager.has_plugin("e2e_rerun_reporter"):
+        config.pluginmanager.register(_RerunReporter(), "e2e_rerun_reporter")
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +302,7 @@ def _topology_mode(param) -> str | None:
 
 def _is_epd_topology(param) -> bool:
     """True when a ``setup_backend`` param asks for an encode-prefill-decode
-    fleet (``("epd_grpc", (e, p, d))``, or a bare ``epd_*`` mode), whose
-    encode role runs the Python servicer only."""
+    fleet (``("epd_grpc", (e, p, d))``, or a bare ``epd_*`` mode)."""
     return (_topology_mode(param) or "").startswith("epd")
 
 
@@ -320,14 +325,12 @@ def _filter_tokenspeed_rust_items(
     workers run the Rust servicer (by the lane's setting or by the servicer
     package's default: ``infra.constants.get_servicer_impl``).
 
-    The Rust servicer reaches the scheduler over the msgpack wire, which
-    carries generate and abort only: no control messages, so the admin
-    operations (flush cache, profiling) stay with the Python servicer. The
-    prefill/decode topologies run on it (the request's bootstrap fields ride
-    the wire; the launcher starts the prefill side's bootstrap server); the
-    encode-prefill-decode topologies need the encode role, which stays with
-    the Python servicer, so their cases are dropped here rather than failing
-    on a known gap, as are the multi-worker fleets of plain workers.
+    The Rust servicer reaches the scheduler over the engine's msgpack wire,
+    whose handshake declares the control messages (flush cache, profiling),
+    the encode role and the logprob columns, so the admin operations, the
+    prefill/decode topologies and the encode-prefill-decode topologies all run
+    on it. Dropped here rather than failing on a known gap: the wires this
+    lane does not serve, and the multi-worker fleets of plain workers.
     """
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
@@ -335,15 +338,17 @@ def _filter_tokenspeed_rust_items(
         param = _setup_backend_param(item)
         workers = _workers_marker_kwargs(item)
         # A wire this lane does not serve: anything but the local wires and
-        # the prefill/decode topologies (an EPD topology is one of those).
+        # the prefill/decode and encode-prefill-decode topologies. The wire is
+        # the param's mode: a topology tuple may carry per-pool dicts, which
+        # no set membership can hash.
         unserved_wire = (
-            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_topology(param)
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not (_is_pd_topology(param) or _is_epd_topology(param))
         )
-        admin_ops = "test_admin_ops.py" in item.nodeid
-        encode_workers = bool(workers.get("encode"))
         pd_workers = bool(workers.get("prefill") or workers.get("decode"))
         plain_fleet = (workers.get("count") or 1) > 1 and not pd_workers
-        if unserved_wire or _is_epd_topology(param) or encode_workers or plain_fleet or admin_ops:
+        if unserved_wire or plain_fleet:
             deselected.append(item)
         else:
             kept.append(item)
@@ -369,8 +374,12 @@ def _filter_sglang_rust_items(
         param = _setup_backend_param(item)
         # The wires this servicer serves: the local ones and the
         # prefill/decode topologies; EPD and anything else stay with Python.
+        # The wire is the param's mode (a topology tuple may carry per-pool
+        # dicts, which no set membership can hash).
         unserved_wire = (
-            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_param(param)
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not _is_pd_param(param)
         )
         if unserved_wire or _is_epd_worker_set(item):
             deselected.append(item)
@@ -445,9 +454,11 @@ def _enforce_selection_floor(selected_count: int) -> None:
         pytest.exit(
             f"e2e selection: only {selected_count} "
             f"{'test' if selected_count == 1 else 'tests'} selected, below the "
-            f"E2E_MIN_SELECTED floor of {floor}. The E2E_ENGINE/E2E_VENDOR/"
-            f"E2E_GPU_TIER env filter in e2e_test/fixtures/hooks.py is the "
-            f"likely cause (marker drift or a lane env-var typo).",
+            f"E2E_MIN_SELECTED floor of {floor}. The count is what runs after "
+            f"the E2E_ENGINE/E2E_VENDOR/E2E_GPU_TIER env filter in "
+            f"e2e_test/fixtures/hooks.py and the command line's -k/-m filter; "
+            f"a filter that matches too little (marker drift, a lane env-var "
+            f"typo, a renamed test id) is the likely cause.",
             returncode=1,
         )
 
@@ -478,18 +489,162 @@ def _format_selection_line(stats: dict) -> str:
 
 
 class _SelectionReporter:
-    """Terminal plugin printing the selection summary after collection.
+    """Report selection, apply the ``E2E_MIN_SELECTED`` floor at collection
+    finish and enforce ``E2E_AMD_REQUIRE_PASSING_CALL`` at exit.
 
     Lives on the plugin manager (registered in ``pytest_configure``) because
     ``hooks.py`` is not a conftest, so a module-level
     ``pytest_report_collectionfinish`` here would never be discovered.
     """
 
+    def __init__(self) -> None:
+        self.require_passing_call = os.environ.get("E2E_AMD_REQUIRE_PASSING_CALL") == "1"
+        self.passing_calls = 0
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.when == "call" and report.passed:
+            self.passing_calls += 1
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, session: pytest.Session) -> None:
+        if (
+            self.require_passing_call
+            and self.passing_calls == 0
+            and session.exitstatus == pytest.ExitCode.OK
+        ):
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:
+                reporter.write_line(
+                    "AMD_E2E_NO_PASSING_CALL: qualification incomplete; "
+                    "no test call passed (check prerequisite/infra skips)"
+                )
+
     def pytest_report_collectionfinish(self, config: pytest.Config) -> str | None:
         stats = config.stash.get(_SELECTION_STATS_KEY, None)
         if not stats:
             return None
         return _format_selection_line(stats)
+
+    def pytest_collection_finish(self, session: pytest.Session) -> None:
+        """Apply the ``E2E_MIN_SELECTED`` floor to what will run.
+
+        ``session.items`` is the selection after every
+        ``pytest_collection_modifyitems`` hook, the env filter above and
+        pytest's own ``-k``/``-m`` deselection included. A count taken in
+        the env filter's hook saw the set before ``-k``: a lane whose filter
+        selects 26 of 133 compared its floor with 133.
+        """
+        if sys.exc_info()[0] is not None or session.testsfailed:
+            # pytest calls this hook from the ``finally`` of
+            # ``Session.perform_collect``, so it also runs while collection is
+            # unwinding from its own error (a missing path, a failing hook, an
+            # interrupt), and a module that fails to import is a recorded
+            # collection error that pytest reports after this hook. A floor
+            # exit here would replace that error's own message and exit code.
+            return
+        _enforce_selection_floor(len(session.items))
+
+
+# The most of a failure's first line a rerun record keeps: an assertion that
+# quotes a response body can run to kilobytes, and the record is one line.
+_REASON_CHARS = 200
+
+
+def _first_failure_line(report: pytest.TestReport) -> str:
+    """The first line of a failed report's reason, at most ``_REASON_CHARS``
+    long: the crash message of its traceback (``AssertionError: ...``), else
+    the first line of its text."""
+    crash = getattr(report.longrepr, "reprcrash", None)
+    text = crash.message if crash is not None else report.longreprtext
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()[:_REASON_CHARS]
+    return "(no failure text)"
+
+
+def _annotation(record: str) -> str:
+    """The GitHub Actions warning command carrying one rerun record: the
+    runner reads it from the step's output and lists it on the run page."""
+    message = record.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return f"::warning title=e2e rerun::{message}"
+
+
+# The run page shows ten warning annotations per step and drops the rest
+# without a word; the reporter is the only annotator of the test step.
+_ANNOTATIONS_PER_STEP = 10
+
+
+def _annotations(records: list[str]) -> list[str]:
+    """The warning commands for the run page: every record when they fit the
+    step's ten, else the first nine and one carrying the count of the rest, so
+    the page always shows how many reruns there were."""
+    if len(records) <= _ANNOTATIONS_PER_STEP:
+        return [_annotation(record) for record in records]
+    shown = records[: _ANNOTATIONS_PER_STEP - 1]
+    rest = len(records) - len(shown)
+    return [_annotation(record) for record in shown] + [
+        _annotation(f"{rest} more reruns, see the step summary")
+    ]
+
+
+class _RerunReporter:
+    """Record the reruns of a session.
+
+    pytest-rerunfailures logs a failed attempt it will run again with the
+    outcome ``rerun``. A case that passes on its rerun is green on the row,
+    and the ``RERUN`` mark inside the step log is its only trace. This plugin
+    keeps every rerun (the case, the attempt, the first line of its failure)
+    and puts it where a green row is read: an ``e2e reruns: N`` count and one
+    ``e2e rerun:`` line per rerun in the terminal summary, a warning
+    annotation per rerun on the run page under GitHub Actions (ten at most,
+    the last one counting the rest), and
+    ``reruns.txt`` under ``E2E_LOG_DIR``, the directory a row's worker logs
+    are uploaded from. The rows upload that directory on failure alone, so
+    the same lines go into the step summary (``GITHUB_STEP_SUMMARY``), the
+    record of a green row's reruns that outlives the runner.
+    """
+
+    def __init__(self) -> None:
+        # Keyed by case and attempt: a call failure and a teardown failure of
+        # one attempt are two rerun reports of one rerun, and the first names it.
+        self.reruns: dict[tuple[str, int], str] = {}
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.outcome != "rerun":
+            return
+        # The plugin counts the attempts before this one on the report.
+        attempt = getattr(report, "rerun", 0) + 1
+        self.reruns.setdefault((report.nodeid, attempt), _first_failure_line(report))
+
+    def records(self) -> list[str]:
+        """One record per rerun: the case, the attempt and its first failure line."""
+        return [
+            f"{nodeid} attempt {attempt} failed: {reason}"
+            for (nodeid, attempt), reason in self.reruns.items()
+        ]
+
+    def pytest_terminal_summary(self, terminalreporter: pytest.TerminalReporter) -> None:
+        records = self.records()
+        lines = [f"e2e rerun: {record}" for record in records]
+        terminalreporter.write_line(f"e2e reruns: {len(records)}")
+        for line in lines:
+            terminalreporter.write_line(line)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            for command in _annotations(records):
+                terminalreporter.write_line(command)
+        text = "\n".join(lines) + "\n"
+        log_dir = os.environ.get("E2E_LOG_DIR")
+        if lines and log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, "reruns.txt"), "w", encoding="utf-8") as file:
+                file.write(text)
+        step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if lines and step_summary:
+            # A line break first: the step's earlier summary may end without
+            # one, and a heading renders only at the start of a line.
+            with open(step_summary, "a", encoding="utf-8") as file:
+                file.write(f"\n### e2e reruns: {len(records)}\n\n```text\n{text}```\n")
 
 
 def pytest_collection_modifyitems(
@@ -505,8 +660,9 @@ def pytest_collection_modifyitems(
 
     Every dropped item is reported through ``pytest_deselected`` (so terminal
     output shows ``N deselected`` instead of silently running fewer tests than
-    collected) and tallied into the ``e2e selection:`` summary line. When
-    ``E2E_MIN_SELECTED`` is set, a final selection below it aborts the session.
+    collected) and tallied into the ``e2e selection:`` summary line. The
+    ``E2E_MIN_SELECTED`` floor is applied by ``_SelectionReporter`` at
+    collection finish, after pytest's own ``-k``/``-m`` deselection.
 
     Ordering: items are sorted by ``(backend, model)`` so consecutive
     classes that share a backend cluster together. This is what lets
@@ -589,7 +745,10 @@ def pytest_collection_modifyitems(
     config.stash[_SELECTION_STATS_KEY] = stats
 
     items.sort(key=_pool_sort_key)
-    _enforce_selection_floor(len(items))
+    # The E2E_MIN_SELECTED floor is applied by _SelectionReporter at
+    # collection finish, after pytest's own -k and -m deselection: this hook
+    # runs before the mark plugin's, so a count taken here would miss the
+    # filter a lane passes on its command line.
 
 
 def _pool_sort_key(item: pytest.Item) -> tuple:

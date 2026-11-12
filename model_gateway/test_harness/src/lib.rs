@@ -1,9 +1,15 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
+pub mod decode_stream;
+pub mod engine_answers;
 pub mod grpc_harness;
 pub mod held_worker;
-pub mod hub_fetch;
+/// The gateway's hub fetcher (beside the checkpoint tokenizer fixtures of the
+/// gRPC router's tests), re-exported so a test binary that links both crates
+/// has one module and one download lock.
+pub use smg::routers::grpc::tokenizer_cache::hub_fetch;
+pub mod metrics_capture;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
@@ -91,7 +97,7 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -123,7 +129,7 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -352,7 +358,8 @@ impl AppTestContext {
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();
-            let manager = Gateway::new(app_context.worker_registry.clone());
+            let manager = Gateway::new(app_context.worker_registry.clone())
+                .with_policies(app_context.policy_registry.clone());
             let router_id = Gateway::determine_router_id(&config.mode, config.connection_mode);
             let manager = Arc::new(manager);
             manager.register_router(router_id, Arc::from(inner_router));
@@ -401,6 +408,20 @@ impl AppTestContext {
         )
     }
 
+    /// The production routers with initialized control-plane auth.
+    pub fn create_apps_with_auth(
+        &self,
+        control_plane_auth: Option<smg_auth::ControlPlaneAuthState>,
+        admin_listener: bool,
+    ) -> smg::server::GatewayApps {
+        test_app::create_test_apps_with_context_and_auth(
+            Arc::clone(&self.router),
+            Arc::clone(&self.app_context),
+            control_plane_auth,
+            admin_listener,
+        )
+    }
+
     pub async fn shutdown(mut self) {
         for worker in &mut self.workers {
             worker.stop().await;
@@ -431,7 +452,7 @@ async fn build_test_app_context(
     use smg_mcp::McpOrchestrator;
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
-    let client = smg::clients::http_client_builder()
+    let client = smg::server::http_client_builder()
         .no_proxy()
         .build()
         .expect("test client");
@@ -453,10 +474,14 @@ async fn build_test_app_context(
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::with_override(
-        config.policy.clone(),
-        config.routing_key_override.clone(),
-    ));
+    let policy_registry = Arc::new(
+        PolicyRegistry::with_override(config.policy.clone(), config.routing_key_override.clone())
+            .with_policy_engine(
+                config.policy_engine,
+                config.mode.get_prefill_policy(&config.policy),
+                config.mode.get_decode_policy(&config.policy),
+            ),
+    );
 
     // Initialize storage backends (Memory for tests, unless the caller brought
     // its own: a history store that is down, for one).
@@ -609,12 +634,26 @@ pub fn create_test_context_with_tokenizer_registry(
         // the public direct setter added for this purpose).
         let tenant_rate_limit_manager = smg::rate_limit::RateLimitManager::from_config(&config)
             .expect("tenant rate limit config should be valid");
+        create_test_context_with_rate_limiter(config, tokenizer_registry, tenant_rate_limit_manager)
+            .await
+    })
+}
+
+/// [`create_test_context_with_tokenizer_registry`] with a tenant rate limiter
+/// of the caller's (a manager over a backend of the test's, or none) in place
+/// of the one `config` would build.
+pub fn create_test_context_with_rate_limiter(
+    config: RouterConfig,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    Box::pin(async move {
         build_test_app_context(
             config,
             tokenizer_registry,
             Some(ReasoningParserFactory::new()),
             Some(ToolParserFactory::new()),
-            tenant_rate_limit_manager,
+            rate_limit_manager,
             empty_mcp_config(),
             None,
         )
@@ -754,8 +793,59 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
     let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
         .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
     let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
-    hub_fetch::cached_download(&smg::clients::blocking_http_client(), &url, &path, 100);
+    hub_fetch::cached_download(&smg::server::blocking_http_client(), &url, &path, 100);
     path
+}
+
+/// Waits for `done` to hold, polling it every 20 ms, within `bound`; the
+/// bound passing first fails the test naming `what`. The wait for something
+/// another task finishes (a registration, a promotion, a recovery): the
+/// condition ends it, where a fixed sleep is too long on a quiet machine and
+/// too short on a loaded one.
+pub async fn wait_until(what: &str, bound: std::time::Duration, mut done: impl FnMut() -> bool) {
+    let started = tokio::time::Instant::now();
+    while !done() {
+        assert!(started.elapsed() < bound, "{what}: not within {bound:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits, within `bound`, for the worker at `url` to be registered and its
+/// registration job to be over. The registration workflow inserts the worker
+/// into the registry and then activates it and updates the policies, so a
+/// worker in the registry alone may still be unready; a finished job's entry
+/// leaves the job queue's status map. A failed one's stays with the job's
+/// message, and the wait fails at once naming it.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a context without a job queue fails the fixture"
+)]
+pub async fn wait_for_worker_registration(
+    app_context: &AppContext,
+    url: &str,
+    bound: std::time::Duration,
+) {
+    let queue = app_context
+        .worker_job_queue
+        .get()
+        .expect("the context's job queue");
+    wait_until(&format!("the registration of {url}"), bound, || {
+        let failed = queue
+            .get_status(url)
+            .filter(|status| status.status == "failed");
+        assert!(
+            failed.is_none(),
+            "the registration of {url} failed: {:?}",
+            failed.and_then(|status| status.message)
+        );
+        app_context
+            .worker_registry
+            .get_all_urls()
+            .iter()
+            .any(|registered| registered == url)
+            && queue.get_status(url).is_none()
+    })
+    .await;
 }
 
 /// Common test prompts for consistency across tests
@@ -782,12 +872,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "search".to_string(),
                 description: Some("Search for information".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -797,7 +887,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: Some("Get weather information".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "city": {"type": "string"},
@@ -805,7 +895,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "date": {"type": "string"},
                         "units": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -815,13 +905,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "calculate".to_string(),
                 description: Some("Perform calculations".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "x": {"type": "number"},
                         "y": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -831,14 +921,14 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "translate".to_string(),
                 description: Some("Translate text".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "text": {"type": "string"},
                         "to": {"type": "string"},
                         "target_lang": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -848,13 +938,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "get_time".to_string(),
                 description: Some("Get current time".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "timezone": {"type": "string"},
                         "format": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -864,13 +954,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "get_current_time".to_string(),
                 description: Some("Get current time".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "timezone": {"type": "string"},
                         "format": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -880,13 +970,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "update_settings".to_string(),
                 description: Some("Update settings".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "preferences": {"type": "object"},
                         "notifications": {"type": "boolean"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -896,7 +986,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "ping".to_string(),
                 description: Some("Ping service".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
+                parameters: Some(json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -906,7 +996,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "test".to_string(),
                 description: Some("Test function".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
+                parameters: Some(json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -916,7 +1006,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "process".to_string(),
                 description: Some("Process data".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "count": {"type": "number"},
@@ -925,7 +1015,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "data": {"type": "object"},
                         "text": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -935,14 +1025,14 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "web_search".to_string(),
                 description: Some("Search the web".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
                         "num_results": {"type": "number"},
                         "search_type": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -952,12 +1042,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "get_tourist_attractions".to_string(),
                 description: Some("Get tourist attractions".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "city": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -967,14 +1057,14 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "config".to_string(),
                 description: Some("Configuration function".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "debug": {"type": "boolean"},
                         "verbose": {"type": "boolean"},
                         "optional": {"type": "null"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -984,14 +1074,14 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "test_func".to_string(),
                 description: Some("Test function".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "bool_true": {"type": "boolean"},
                         "bool_false": {"type": "boolean"},
                         "none_val": {"type": "null"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1001,13 +1091,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "create".to_string(),
                 description: Some("Create resource".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
                         "email": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1017,13 +1107,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "add".to_string(),
                 description: Some("Add operation".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "x": {"type": "number"},
                         "y": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1033,12 +1123,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "calc".to_string(),
                 description: Some("Calculate".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "x": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1048,7 +1138,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "func1".to_string(),
                 description: Some("Function 1".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
+                parameters: Some(json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1058,12 +1148,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "func2".to_string(),
                 description: Some("Function 2".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "y": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1073,7 +1163,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "tool1".to_string(),
                 description: Some("Tool 1".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
+                parameters: Some(json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1083,12 +1173,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "tool2".to_string(),
                 description: Some("Tool 2".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "y": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },

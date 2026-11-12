@@ -14,9 +14,11 @@
 //!
 //! Engines plug in via the `AbortOnDropClient` trait — they describe how
 //! to translate `(client, request_id)` into the abort future. This keeps
-//! the (large) Drop / Stream impl in one place instead of replicated
-//! across `mlx_engine`, `sglang_scheduler`, `vllm_engine`, and
-//! `trtllm_service`.
+//! the (large) Drop / Stream impl in one place instead of replicated per
+//! engine client: `mlx_engine`, `sglang_scheduler`, `tokenspeed_scheduler`
+//! and `vllm_engine` take the trait through the crate root's
+//! `impl_abort_for_drop_with_reason` macro (their `abort_request` takes a
+//! reason), `trtllm_service` implements it by hand.
 
 use std::{
     future::Future,
@@ -36,10 +38,12 @@ use tracing::{debug, warn};
 
 use crate::request_deadline::RequestDeadline;
 
-/// Upper bound on how long a deferred abort waits for the stream's first
-/// item before aborting anyway. Bounds the detached drain task when the
-/// backend never produces output (e.g. its upstream handoff peer died).
-const DEFERRED_ABORT_MAX_WAIT: Duration = Duration::from_secs(30);
+/// The longest a deferred abort waits for the stream's first item before
+/// aborting anyway; bounds the detached drain task when the backend never
+/// produces output (e.g. its upstream handoff peer died). A bound a caller
+/// gives the deferral ([`AbortOnDropStream::defer_abort_within`]) shortens
+/// the wait, never lengthens it.
+pub const DEFERRED_ABORT_MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// Upper bound on how long a dropped stream is read for the worker's own end
 /// of it, after the abort RPC, before it is released by a reset. A worker
@@ -75,12 +79,16 @@ pub struct AbortOnDropStream<T: Send + 'static, C: AbortOnDropClient> {
     aborted: Arc<AtomicBool>,
     /// When set, a drop that happens before the stream yielded its first
     /// item drains the stream in the background until that first item (or a
-    /// terminal event / [`DEFERRED_ABORT_MAX_WAIT`]) before sending the
+    /// terminal event / `deferred_abort_bound`) before sending the
     /// abort. For workers whose request must not be torn down mid-handoff —
     /// e.g. a disaggregated decode side receiving KV state from its prefill
     /// peer — an early abort can kill the transfer while the peer is still
     /// writing; the first generated item is the proof the handoff completed.
     defer_abort_until_first_item: bool,
+    /// How long a deferred abort waits for that first item:
+    /// [`DEFERRED_ABORT_MAX_WAIT`], or the shorter bound the caller holds for
+    /// the item (see [`Self::defer_abort_within`]).
+    deferred_abort_bound: Duration,
     /// Whether `poll_next` has yielded at least one item (data or error).
     saw_item: bool,
     /// How long a drop waits for the worker to end the stream after the
@@ -102,6 +110,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
             client,
             aborted: Arc::new(AtomicBool::new(false)),
             defer_abort_until_first_item: false,
+            deferred_abort_bound: DEFERRED_ABORT_MAX_WAIT,
             saw_item: false,
             release_drain_bound: RELEASE_DRAIN_MAX_WAIT,
             deadline: None,
@@ -147,6 +156,23 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
         self
     }
 
+    /// [`Self::defer_abort_until_first_item`] with the wait for the first
+    /// item bounded by `bound` where that is shorter than
+    /// [`DEFERRED_ABORT_MAX_WAIT`]. The caller trades protection for
+    /// release: a stream whose first item is its whole answer (a
+    /// non-streaming generation) would otherwise hold its worker for the
+    /// answer's length after a drop, the cap at most, so the caller gives
+    /// the deferral its own estimate of the handoff's length (a
+    /// disaggregated pair's decode bound) and accepts the shorter window.
+    /// Nothing gives such a stream up at that bound; a stream with a first
+    /// token to wait for keeps the cap.
+    #[must_use]
+    pub fn defer_abort_within(mut self, bound: Duration) -> Self {
+        self.defer_abort_until_first_item = true;
+        self.deferred_abort_bound = bound.min(DEFERRED_ABORT_MAX_WAIT);
+        self
+    }
+
     /// Suppress the abort-on-drop. Call after the stream completes
     /// successfully so the backend isn't told to abort an already-finished
     /// request.
@@ -185,6 +211,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
         let request_id = self.request_id.clone();
         let client = self.client.clone();
         let defer = self.defer_abort_until_first_item && !self.saw_item;
+        let defer_bound = self.deferred_abort_bound;
         let release_bound = self.release_drain_bound;
         // The stream goes to the cleanup task whole: it is released there by
         // the worker's own end of it (see below), not by the reset that
@@ -208,7 +235,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
                         "Stream dropped before first item for request {}, draining before abort",
                         request_id
                     );
-                    let first_item = tokio::time::timeout(DEFERRED_ABORT_MAX_WAIT, async {
+                    let first_item = tokio::time::timeout(defer_bound, async {
                         // `Streaming::message` resolves on the next message,
                         // stream end, or transport error — any of which ends the
                         // protected window.
@@ -216,10 +243,19 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
                     })
                     .await;
                     if first_item.is_err() {
-                        warn!(
-                            "Deferred abort for request {} timed out waiting for the first item",
-                            request_id
-                        );
+                        if defer_bound < DEFERRED_ABORT_MAX_WAIT {
+                            // The caller's bound: the expected end of the
+                            // wait for an answer that outlives its client.
+                            debug!(
+                                "Deferred abort for request {} reached its bound ({:?}) before the first item",
+                                request_id, defer_bound
+                            );
+                        } else {
+                            warn!(
+                                "Deferred abort for request {} timed out waiting for the first item",
+                                request_id
+                            );
+                        }
                     }
                 }
             }

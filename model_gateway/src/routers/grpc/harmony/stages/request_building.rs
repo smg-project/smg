@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use smg_grpc_client::{
-    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
-    VllmEngineClient,
+    FormatSetAside, OutputConstraint, SglangGenerateRequestOptions, SglangSchedulerClient,
+    TokenSpeedSchedulerClient, VllmEngineClient,
 };
 use tracing::{debug, error};
 
@@ -15,11 +15,13 @@ use crate::routers::{
         client::GrpcClient,
         common::stages::{helpers, BuildStage},
         context::{
-            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
-            ExecutionPlanKind, PreparationOutput, RequestContext, RequestType,
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, PlanSettings,
+            PreparationOutput, RequestContext, RequestType,
         },
         proto_wrapper::ProtoGenerateRequest,
+        regular::stages::token_ids,
         spec::{HarmonyResponseSpec, ResponseSpec},
+        utils::missing_tokenizer_response,
         zmq_client::ZmqDialect,
     },
 };
@@ -29,17 +31,13 @@ use crate::routers::{
 /// Takes the Harmony-encoded input_ids from preparation and builds a proto::GenerateRequest.
 /// Unlike regular request building, this uses token_ids directly (Harmony encoding handles messages).
 pub(crate) struct HarmonyRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 }
 
 impl HarmonyRequestBuildingStage {
     /// Create a new Harmony request building stage
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
     }
 }
 
@@ -146,6 +144,38 @@ impl BuildStage for HarmonyRequestBuildingStage {
             }
         };
 
+        // The engine builders lay a chat request's `logit_bias` on the wire,
+        // past the engine front ends that bound its ids, so the ids are judged
+        // here first, as a pretokenized prompt's are. This pipeline encodes
+        // with its own Harmony encoding and resolves no tokenizer for the
+        // request, so the model's is looked up here, for a request with a
+        // bias only.
+        if let HarmonyBody::Chat(request) = &body {
+            if let Some(bias) = request.logit_bias.as_ref().filter(|bias| !bias.is_empty()) {
+                let model_id = ctx.input.model_id.as_str();
+                // A model without a registered tokenizer is answered as the
+                // regular pipeline answers it (not found; not ready, with a
+                // retry hint, while the gateway loads it; a gateway fault
+                // without autoload), not as a fault of the keys.
+                let Some(tokenizer) = ctx.components.tokenizer_registry.get(model_id) else {
+                    return Err(missing_tokenizer_response(
+                        "HarmonyRequestBuildingStage::build",
+                        model_id,
+                        ctx.components.worker_registry.contains_model(model_id),
+                        ctx.components.tokenizer_autoload,
+                        ctx.components
+                            .tokenizer_load_failures
+                            .get(model_id)
+                            .as_ref(),
+                    ));
+                };
+                token_ids::validate_logit_bias_token_ids(Some(bias), tokenizer.as_ref(), || {
+                    token_ids::reported_embedding_rows(&ctx.components.worker_registry, model_id)
+                })
+                .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
+            }
+        }
+
         let mut proto_request = build_harmony_proto(
             builder_client,
             body,
@@ -184,14 +214,14 @@ impl BuildStage for HarmonyRequestBuildingStage {
         ctx.state.response.router_stop_obligations = builder_client
             .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
 
-        if self.inject_pd_metadata {
+        if self.settings.inject_pd_metadata {
             if let Some(workers) = ctx.state.workers.as_ref() {
                 helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
             }
         }
 
         Ok(BuildOutput {
-            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
+            plan: ExecutionPlan::generate(self.settings.plan_kind, proto_request),
             spec: ResponseSpec::Harmony(harmony_spec),
             stamp: AttemptStamp {
                 id: id_stamp,
@@ -199,7 +229,7 @@ impl BuildStage for HarmonyRequestBuildingStage {
                 // retries must not start applying them.
                 sampling_mask: None,
                 sampling_baseline: None,
-                inject_pd_metadata: self.inject_pd_metadata,
+                inject_pd_metadata: self.settings.inject_pd_metadata,
                 // Harmony's constraint is never shaped per worker; retries
                 // carry it as built.
                 tool_constraint: None,
@@ -213,10 +243,7 @@ impl BuildStage for HarmonyRequestBuildingStage {
 
     #[cfg(test)]
     fn signature(&self) -> String {
-        format!(
-            "HarmonyRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
-        )
+        format!("HarmonyRequestBuildingStage({})", self.settings.signature())
     }
 }
 
@@ -252,6 +279,7 @@ fn build_harmony_proto(
                 SglangGenerateRequestOptions {
                     multimodal_inputs: None,
                     tool_call_constraint: tool_constraints,
+                    format_set_aside: FormatSetAside::default(),
                     require_reasoning: false,
                 },
             )?))
@@ -272,7 +300,7 @@ fn build_harmony_proto(
                 text,
                 token_ids,
                 None, // No multimodal in the Harmony pipeline
-                tool_constraints,
+                OutputConstraint::tool(tool_constraints),
             )?))
         }
         (BackendClient::Grpc(GrpcClient::Trtllm(c)), Responses(b)) => {
@@ -284,9 +312,15 @@ fn build_harmony_proto(
                 tool_constraints,
             )?))
         }
-        (BackendClient::Grpc(GrpcClient::Mlx(c)), Chat(b)) => ProtoGenerateRequest::Mlx(Box::new(
-            c.build_generate_request_from_chat(request_id, b, text, token_ids, tool_constraints)?,
-        )),
+        (BackendClient::Grpc(GrpcClient::Mlx(c)), Chat(b)) => {
+            ProtoGenerateRequest::Mlx(Box::new(c.build_generate_request_from_chat(
+                request_id,
+                b,
+                text,
+                token_ids,
+                OutputConstraint::tool(tool_constraints),
+            )?))
+        }
         (BackendClient::Grpc(GrpcClient::Mlx(c)), Responses(b)) => {
             ProtoGenerateRequest::Mlx(Box::new(c.build_generate_request_from_responses(
                 request_id,
@@ -332,7 +366,7 @@ fn build_vllm(
             text,
             token_ids,
             None, // No multimodal in the Harmony pipeline
-            tool_constraints,
+            OutputConstraint::tool(tool_constraints),
         )?,
         HarmonyBody::Responses(b) => VllmEngineClient::build_generate_request_from_responses(
             request_id,
@@ -361,7 +395,7 @@ fn build_tokenspeed(
             text,
             token_ids,
             None, // Harmony path: multimodal not yet wired
-            tool_constraints,
+            OutputConstraint::tool(tool_constraints),
         )?,
         HarmonyBody::Responses(b) => {
             TokenSpeedSchedulerClient::build_generate_request_from_responses(
@@ -392,6 +426,7 @@ fn build_sglang(
             SglangGenerateRequestOptions {
                 multimodal_inputs: None, // Harmony path: multimodal not yet wired
                 tool_call_constraint: tool_constraints,
+                format_set_aside: FormatSetAside::default(),
                 require_reasoning: false,
             },
         )?,

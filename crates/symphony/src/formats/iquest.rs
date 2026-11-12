@@ -36,7 +36,7 @@ mod tests {
         event::{Event, Events},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{bytes, drive, weather_declared},
+        testing::{bytes, calls, content, drive, reasoning, weather_declared},
     };
 
     const PROMPT: &str = "<think>\n";
@@ -54,22 +54,6 @@ mod tests {
         )
     }
 
-    fn arguments(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    if let Some(last) = calls.last_mut() {
-                        last.1.push_str(json);
-                    }
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
     #[test]
     fn the_prompt_is_replayed_from_iquests_own_turn_opener() {
         // A call marker quoted in the user's turn, then the generation prompt opening the thought:
@@ -81,23 +65,9 @@ mod tests {
         let events = run(prompt, output);
         assert_eq!(events[0], Event::ReasoningStart);
         assert_eq!(bytes(&events), output);
-        assert!(arguments(&events).is_empty());
-        let reasoning: String = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect();
-        let content: String = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(reasoning, "The user asks about the tag.");
-        assert_eq!(content, "It opens a call.");
+        assert!(calls(&events).is_empty());
+        assert_eq!(reasoning(&events), "The user asks about the tag.");
+        assert_eq!(content(&events), "It opens a call.");
     }
 
     #[test]
@@ -105,7 +75,7 @@ mod tests {
         let events = run(PROMPT, OUTPUT);
         assert_eq!(bytes(&events), OUTPUT);
         assert_eq!(
-            arguments(&events),
+            calls(&events),
             [
                 (
                     "get_weather".to_string(),
@@ -118,19 +88,12 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 2, .. })
         ));
-        let reasoning: String = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(reasoning, "The user asks.");
+        assert_eq!(reasoning(&events), "The user asks.");
     }
 
     #[test]
     fn every_chunking_says_the_same_and_accounts_for_every_byte() {
-        let whole = arguments(&run(PROMPT, OUTPUT));
+        let whole = calls(&run(PROMPT, OUTPUT));
         for cut in 1..OUTPUT.len() {
             if !OUTPUT.is_char_boundary(cut) {
                 continue;
@@ -168,7 +131,7 @@ mod tests {
                 .expect("end");
             let events = out.drain();
             assert_eq!(bytes(&events), OUTPUT, "cut at {cut}");
-            assert_eq!(arguments(&events), whole, "cut at {cut}");
+            assert_eq!(calls(&events), whole, "cut at {cut}");
         }
     }
 }

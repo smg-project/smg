@@ -18,8 +18,8 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    path::Path,
-    process::{Command, ExitStatus, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{Mutex, MutexGuard, PoisonError},
     thread,
     time::{Duration, Instant},
@@ -184,6 +184,121 @@ pub fn log_with_line(log_path: &Path, line: &str, timeout: Duration) -> Result<S
     }
 }
 
+/// A gateway a test starts and keeps running until it drops it, for the
+/// tests that drive a serving gateway (a request to its control plane, a
+/// file it reads again) rather than read its start-up refusals.
+pub struct Gateway {
+    child: Child,
+    /// Its stdout and stderr, as a file: read with [`Gateway::log`] or
+    /// waited on with [`log_with_line`].
+    pub log: PathBuf,
+}
+
+impl Gateway {
+    /// Starts the gateway with `args` as its complete flag list and a bare
+    /// environment (`PATH` alone: a credential must come from the flags or
+    /// the files they name), its output in `log`, and waits until
+    /// `GET /health` answers 200 on `addr`. A gateway that exits first, or
+    /// does not serve within [`EXIT_TIMEOUT`], fails the test with its log.
+    /// The caller holds [`serial`] from the moment it picked the ports.
+    pub fn start(args: &[String], addr: SocketAddr, log: &Path) -> Self {
+        let file = File::create(log).expect("log file");
+        let child = Command::new(env!("CARGO_BIN_EXE_smg"))
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(file.try_clone().expect("log handle")))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .expect("spawn the gateway");
+        let mut gateway = Self {
+            child,
+            log: log.to_path_buf(),
+        };
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        loop {
+            if let Some(status) = gateway.child.try_wait().expect("poll the gateway") {
+                panic!(
+                    "the gateway exited ({status}) before serving\n{}",
+                    gateway.log()
+                );
+            }
+            if request(addr, "GET", "/health", None, None).is_some_and(|(status, _)| status == 200)
+            {
+                return gateway;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the gateway did not serve within {EXIT_TIMEOUT:?}\n{}",
+                gateway.log()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The log as it stands.
+    pub fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Whether the serving layer accepts `key` on a keyed serving route: the
+/// layer alone answers 401, and the route behind it answers for itself (a
+/// body error, since the probe sends none).
+pub fn serving_accepts(addr: SocketAddr, key: Option<&str>) -> bool {
+    request(addr, "POST", "/v1/tokenize", key, None)
+        .expect("the gateway answers")
+        .0
+        != 401
+}
+
+/// One `method path` request to `addr` over a connection closed with the
+/// response, with `key` as the bearer and `body` as a JSON body when given:
+/// the status and the response body, or `None` when nothing answered.
+pub fn request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body: Option<&str>,
+) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let authorization = key.map_or(String::new(), |key| {
+        format!("Authorization: Bearer {key}\r\n")
+    });
+    let (content_type, body) = match body {
+        Some(body) => ("Content-Type: application/json\r\n", body),
+        None => ("", ""),
+    };
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{authorization}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    let status = response
+        .strip_prefix("HTTP/1.1 ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let body = response
+        .split_once("\r\n\r\n")
+        .map_or(String::new(), |(_, body)| body.to_string());
+    Some((status, body))
+}
+
 /// Whether the gateway answers `GET /health` with 200 over `stream`, a
 /// connection to its port.
 fn answers_health(mut stream: TcpStream) -> bool {
@@ -197,4 +312,93 @@ fn answers_health(mut stream: TcpStream) -> bool {
     let mut head = [0u8; 64];
     let read = stream.read(&mut head).unwrap_or(0);
     head[..read].starts_with(b"HTTP/1.1 200")
+}
+
+/// A connection to `addr` with the tests' read timeout; `None` when the
+/// kernel refuses it.
+pub fn connect(addr: SocketAddr) -> Option<TcpStream> {
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    Some(stream)
+}
+
+/// What a keep-alive GET for `path` got back: the response (the head and the
+/// `Content-Length` body), the connection closed or reset before a byte of
+/// response arrived, or the read timing out with the connection still open
+/// (which is not a closure, and fails a case that expects one).
+#[derive(Debug)]
+pub enum Reply {
+    Answered(String),
+    Closed,
+    TimedOut,
+}
+
+/// One keep-alive `GET path` on `stream` (no `Connection: close`), and what
+/// it got back.
+pub fn keep_alive_get(stream: &mut TcpStream, path: &str) -> Reply {
+    let _ = stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes());
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) if bytes.is_empty() => return Reply::Closed,
+            Err(e) if bytes.is_empty() => {
+                return match e.kind() {
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                        Reply::TimedOut
+                    }
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof => Reply::Closed,
+                    _ => panic!("reading the response: {e}"),
+                };
+            }
+            Ok(0) | Err(_) => break,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(head_end) = text.find("\r\n\r\n") {
+            let content_length: usize = text[..head_end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= head_end + 4 + content_length {
+                break;
+            }
+        }
+    }
+    Reply::Answered(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether a reply is a 200.
+pub fn answered_200(reply: Reply) -> bool {
+    matches!(reply, Reply::Answered(response) if response.starts_with("HTTP/1.1 200"))
+}
+
+/// A connection the gateway serves and keeps: connected and answered 200 on
+/// `GET /health` within `within`, retried while the gateway refuses (a permit
+/// on its way back). The read answer proves the connection holds a permit,
+/// where a bare connect returns before the acceptor has admitted it.
+pub fn served_connection(addr: SocketAddr, within: Duration) -> TcpStream {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(mut stream) = connect(addr) {
+            if answered_200(keep_alive_get(&mut stream, "/health")) {
+                return stream;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no connection was served within {within:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }

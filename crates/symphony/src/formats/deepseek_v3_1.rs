@@ -9,13 +9,15 @@
 //! Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "Paris"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>
 //! ```
 //!
-//! The templates of DeepSeek V3.1, V3.1-Terminus and V3.2-Exp write this spelling (the gateway's
-//! older `deepseek31` parser's); DeepSeek V3's puts `function<｜tool▁sep｜>` before the name and a
+//! The templates of DeepSeek V3.1 and V3.1-Terminus write this spelling (the gateway's older
+//! `deepseek31` parser's); DeepSeek V3's puts `function<｜tool▁sep｜>` before the name and a
 //! `json` code fence around the arguments ([`deepseek_v3`]), and V3.2 and V4 write DSML, each with
-//! a table of its own ([`deepseek_v3_2`], [`deepseek_v4`]). Recorded as `deepseek-v3.1`, whose
-//! parse sets hold content alone: the template takes a call's arguments as a string, so the
-//! recorder, whose corpus holds them as an object, refused every call case; the calls stand on
-//! the turns the template renders, held in the tests below.
+//! a table of its own ([`deepseek_v3_2`], [`deepseek_v4`]). DeepSeek-V3.2-Exp's template writes
+//! this spelling too, but the engine renders that checkpoint through the V3.2 encoder, so its
+//! group reads with [`deepseek_v3_2`]. Recorded as `deepseek-v3.1`, whose parse sets hold content
+//! alone: the template takes a call's arguments as a string, so the recorder, whose corpus holds
+//! them as an object, refused every call case; the calls stand on the turns the template renders,
+//! held in the tests below.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 //!
@@ -70,7 +72,7 @@ mod tests {
         grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{bytes, calls, content, finish, reasoning, tool},
+        testing::{bytes, calls, content, finish, malformed_texts, reasoning, tool},
         Declared,
     };
 
@@ -112,16 +114,6 @@ mod tests {
             )
             .expect("end");
         out.into_owned().drain()
-    }
-
-    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
     }
 
     /// A turn as the checkpoint's chat template renders it (`chat_template` of
@@ -243,7 +235,7 @@ mod tests {
             .collect();
         assert_eq!(calls(events), expected, "{how}: {:?}", turn.output);
         assert_eq!(
-            malformed(events),
+            malformed_texts(events),
             Vec::<&str>::new(),
             "{how}: {:?}",
             turn.output
@@ -340,7 +332,7 @@ mod tests {
         assert_eq!(bytes(&whole), output);
         assert_eq!(calls(&whole), expected_calls);
         assert_eq!(content(&whole), "");
-        assert_eq!(malformed(&whole), ["and", " also", " this", " one"]);
+        assert_eq!(malformed_texts(&whole), ["and", " also", " this", " one"]);
         assert_eq!(shown(&whole).as_deref(), Some(prose));
         assert_eq!(streamed(&whole), prose);
         for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
@@ -536,7 +528,7 @@ mod tests {
     fn written_call(tool: &Tool) -> Value {
         value!({"type": "sequence", "elements": [
             {"type": "const_string", "value": format!("<｜tool▁call▁begin｜>{}<｜tool▁sep｜>", tool.function.name)},
-            {"type": "json_schema", "json_schema": tool.function.parameters},
+            {"type": "json_schema", "json_schema": tool.function.parameters_schema()},
             {"type": "const_string", "value": "<｜tool▁call▁end｜>"},
         ]})
     }
@@ -571,7 +563,7 @@ mod tests {
     fn the_same_at_every_cut(tail: &str, output: &str) -> Said {
         let events = run(tail, &[output]);
         assert_eq!(bytes(&events), output);
-        assert_eq!(malformed(&events), Vec::<&str>::new(), "{output:?}");
+        assert_eq!(malformed_texts(&events), Vec::<&str>::new(), "{output:?}");
         let whole = said(&events);
         for (at, _) in output.char_indices().skip(1) {
             let (head, rest) = output.split_at(at);

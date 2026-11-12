@@ -18,6 +18,7 @@ pub mod registry;
 pub mod sequence;
 pub mod stop;
 pub mod stream;
+mod token_text;
 pub mod traits;
 #[cfg(feature = "tokenizers-v1")]
 mod v1;
@@ -26,6 +27,7 @@ mod word_cache;
 pub mod chat_template;
 pub mod huggingface;
 mod kimi_k2_tokenizer;
+mod tekken;
 pub mod tiktoken;
 
 #[cfg(test)]
@@ -47,7 +49,7 @@ pub use mock::MockTokenizer;
 pub use registry::{LoadError, LoadOutcome, TokenizerRegistry};
 pub use sequence::Sequence;
 pub use stop::{
-    SequenceDecoderOutput, SequenceDecoderStep, StopSequenceConfig, StopSequenceDecoder,
+    SequenceDecoderOutput, SequenceDecoderStep, StopRules, StopSequenceConfig, StopSequenceDecoder,
 };
 pub use stream::DecodeStream;
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};

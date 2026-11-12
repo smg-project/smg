@@ -2,19 +2,17 @@ name: Release SMG+Engine Docker Image
 
 run-name: >-
   SMG+${{ inputs.engine || 'all engines' }} |
-  base=${{ inputs.base_image_ref || (inputs.source_build && 'source build') || (github.event_name == 'push' && 'release bases' || 'engine default') }} |
+  base=${{ inputs.base_image_ref || (inputs.source_build && 'source build') || 'engine default' }} |
   engine=${{ inputs.engine_commit || 'latest' }} |
-  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'release tag' }} |
+  smg=${{ github.event_name == 'pull_request' && github.base_ref || inputs.smg_commit || 'release tag' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
   by @${{ github.actor }}
 
+# The images are published only on a maintainer's dispatch against a release tag
+# (scripts/release/README.md); a pull request that touches the image build runs it as a dry run.
 on:
-  push:
-    branches: [main]
-    paths:
-      - bindings/python/pyproject.toml
   pull_request:
-    branches: [main]
+    branches: [main, release/**]
     paths:
       - 'docker/engine.Dockerfile'
       - 'docker/ucx.conf'
@@ -60,10 +58,19 @@ on:
         required: false
         type: string
 
+# One live dry run per pull request: a newer push cancels the superseded head's run, whose
+# four image builds would otherwise stay queued on the image runner ahead of every later
+# job. A dispatch gets a group of its own, keyed on the run id rather than the ref: a release
+# dispatches one run per engine and release base against one tag, and a group keeps at most
+# one run pending. Keep the pull request form in sync with cancel-pr-workflows.yml.
+concurrency:
+  group: release-engine-docker-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
-  # The SMG release the images are built from on a push and on a dispatch that names no commit.
+  # The SMG release the images are built from on a dispatch that names no commit.
   # scripts/check_release_versions.py reads and bumps this line.
-  SMG_RELEASE_TAG: v1.13.0
+  SMG_RELEASE_TAG: v1.16.0-dev
 
 permissions:
   contents: read
@@ -98,8 +105,6 @@ jobs:
             "tokenspeed": {"release_bases": [""]}
           }'
           case "${EVENT}" in
-            push)              # every engine, every release base
-              rows=$(jq -c 'to_entries | map(.key as $engine | .value.release_bases[] | {engine: $engine, base_image: .})' <<< "${engines}") ;;
             pull_request)      # every engine, its default base, as a dry run
               rows=$(jq -c 'to_entries | map({engine: .key, base_image: .value.release_bases[0]})' <<< "${engines}") ;;
             workflow_dispatch) # the chosen engine: the given base, its default, or none for a source build
@@ -130,12 +135,22 @@ jobs:
         id: smg
         env:
           EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
           SMG_COMMIT: ${{ inputs.smg_commit }}
         run: |
           if [ "${EVENT}" = "pull_request" ]; then
-            smg_commit=main
+            smg_commit="${BASE_REF:-main}"
           else
             smg_commit="${SMG_COMMIT:-${SMG_RELEASE_TAG}}"
+            # On main the line reads the next development version (v1.15.0-dev), which is no tag: a dispatch
+            # that names no commit would fail only at the Dockerfile's checkout. Said here instead.
+            if [ -z "${SMG_COMMIT:-}" ]; then
+              case "${SMG_RELEASE_TAG}" in
+                *-dev)
+                  echo "::error::SMG_RELEASE_TAG ${SMG_RELEASE_TAG} is main's development version, not a release tag: dispatch this workflow against a release tag, or name smg_commit"
+                  exit 1 ;;
+              esac
+            fi
           fi
           echo "smg_commit=${smg_commit}" >> "$GITHUB_OUTPUT"
 

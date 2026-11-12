@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
+        layouts::{grid_patch_fields, grid_patch_layouts_for},
         MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{
@@ -18,21 +19,11 @@ pub(super) struct Qwen3VLVisionSpec;
 
 impl Qwen3VLVisionSpec {
     fn image_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 
     fn video_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["video_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "video_token_id".to_string(),
-            })
+        metadata.config_token_id("video_token_id")
     }
 
     fn vision_start_token_id(metadata: &ModelMetadata) -> Option<TokenId> {
@@ -296,13 +287,34 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         }
     }
 
+    /// The family sets no per-request image or video count of its own: its
+    /// serving engines read both counts as unlimited (the processing info of
+    /// the Qwen2-VL line, which the Qwen3-VL and Qwen3.5 infos inherit,
+    /// declares `image: None, video: None`), the checkpoints' processor
+    /// configs bound an image's pixels and a clip's frames, not how many of
+    /// either, and the context length is the practical bound. Both stay
+    /// declared (an undeclared modality is refused as unsupported) without a
+    /// bound of the spec's, so the effective limit is the engine's advertised
+    /// one, else the deployment's `--mm-per-request-image-limit` /
+    /// `SMG_IMAGE_MAX_COUNT` for images and `SMG_VIDEO_MAX_COUNT` for video.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        let mut limits = HashMap::from([(Modality::Image, 10)]);
+        let mut limits = HashMap::from([(Modality::Image, usize::MAX)]);
         if metadata.config_u32(&["video_token_id"]).is_some() {
-            limits.insert(Modality::Video, 1);
+            limits.insert(Modality::Video, usize::MAX);
         }
         Ok(limits)
     }
@@ -397,17 +409,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         // encoder_input is patchified: [total_patches, patch_features].
         // patches_per_image tells how many patches belong to each image.
         // image_grid_thw is [num_images, 3].
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
+        grid_patch_fields()
     }
 
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
@@ -415,23 +417,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         // and `video_grid_thw` and no image tensor at all, so slicing its
         // patches by `patches_per_image` (the legacy map's one answer) fails
         // at assembly for every video; the image batch is the mirror case.
-        match modality {
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            _ => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-        }
+        grid_patch_layouts_for(modality)
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
@@ -698,6 +684,97 @@ mod tests {
         let spec = registry.lookup(&metadata).expect("should match qwen3");
         // Must match qwen3_vl spec, not qwen_vl
         assert_eq!(spec.name(), "qwen3_vl");
+    }
+
+    /// The family bounds its images by context, not by count: the spec
+    /// declares the modality without a limit of its own (the ten it carried
+    /// was the first registry's default, never a count of the family's), so
+    /// a deployment knob is the only router-side bound; video stays declared
+    /// (without a count either) and audio stays unsupported.
+    #[test]
+    fn qwen3_vl_declares_images_without_a_count_of_its_own() {
+        use std::collections::HashMap;
+
+        use crate::registry::{ModelProcessorSpec, ModelRegistryError};
+
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
+        let config = video_config("qwen3_vl");
+        let metadata = ModelMetadata {
+            model_id: "Qwen3-VL-8B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = super::Qwen3VLVisionSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, usize::MAX)])
+        );
+        for count in [11, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Image, count)])
+                .unwrap_or_else(|error| panic!("{count} images: {error}"));
+        }
+        // A deployment's own cap (the flag, else the environment override)
+        // still binds.
+        let capped = HashMap::from([(Modality::Image, 10)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Image, 11)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "qwen3_vl",
+                modality: Modality::Image,
+                limit: 10,
+                requested: 11,
+            })
+        );
+        assert!(matches!(
+            spec.validate_media_request(&metadata, &[(Modality::Audio, 1)]),
+            Err(ModelRegistryError::UnsupportedModality {
+                modality: Modality::Audio,
+                ..
+            })
+        ));
+    }
+
+    /// The family bounds its video by context, not by count: the spec
+    /// declares the modality without a limit of its own (the one clip it
+    /// carried was a declared default, never a count of the family's), so a
+    /// deployment's `SMG_VIDEO_MAX_COUNT` or the engine's advertised limit is
+    /// the only router-side bound.
+    #[test]
+    fn qwen3_vl_declares_video_without_a_count_of_its_own() {
+        use std::collections::HashMap;
+
+        use crate::registry::{ModelProcessorSpec, ModelRegistryError};
+
+        let tokenizer = TestTokenizer::new(&[("<|video_pad|>", 151656)]);
+        let config = video_config("qwen3_vl");
+        let metadata = ModelMetadata {
+            model_id: "Qwen3-VL-8B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = super::Qwen3VLVisionSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap()[&Modality::Video],
+            usize::MAX
+        );
+        for count in [2, 100] {
+            spec.validate_media_request(&metadata, &[(Modality::Video, count)])
+                .unwrap_or_else(|error| panic!("{count} clips: {error}"));
+        }
+        // A deployment's own cap (the environment override, or the engine's
+        // advertised limit the gateway passes in) still binds.
+        let capped = HashMap::from([(Modality::Video, 1)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Video, 2)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "qwen3_vl",
+                modality: Modality::Video,
+                limit: 1,
+                requested: 2,
+            })
+        );
     }
 
     #[test]

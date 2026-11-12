@@ -25,6 +25,7 @@ use super::{
     conversions,
 };
 use crate::{
+    config::ParserChoice,
     observability::metrics::Metrics,
     routers::{
         common::{
@@ -34,7 +35,7 @@ use crate::{
         error,
         grpc::common::responses::{
             collect_user_function_names, ensure_mcp_connection, load_history,
-            persist_response_if_needed, NotStored, ResponsesContext,
+            persist_response_if_needed, NotStored, ReplayInto, ResponsesContext,
         },
     },
 };
@@ -46,15 +47,25 @@ use crate::{
 /// 2. Checks for MCP tools
 /// 3. Executes with or without MCP tool loop
 /// 4. Persists to storage
+///
+/// The answer comes with the parser that read it (the chat completion's,
+/// what the chat route answers in `x-smg-parser`), for the handler's own
+/// response header.
 pub(super) async fn route_responses_internal(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     params: ResponsesCallContext,
-) -> Result<ResponsesResponse, Response> {
+) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // 1. Load conversation history (as the caller's tenant may see it) and
     //    build modified request
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
-    let modified_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
+    let modified_request = load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Chat,
+    )
+    .await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -64,7 +75,7 @@ pub(super) async fn route_responses_internal(
     )
     .await?;
 
-    let responses_response = if has_mcp_tools {
+    let (responses_response, parser) = if has_mcp_tools {
         debug!("MCP tools detected, using tool loop");
 
         // Execute with MCP tool loop
@@ -88,16 +99,16 @@ pub(super) async fn route_responses_internal(
     .await
     .map_err(NotStored::into_response)?;
 
-    Ok(responses_response)
+    Ok((responses_response, parser))
 }
 
 /// Execute request without MCP tool loop (simple pipeline execution)
-pub(super) async fn execute_without_mcp(
+async fn execute_without_mcp(
     ctx: &ResponsesContext,
     modified_request: &ResponsesRequest,
     original_request: &ResponsesRequest,
     params: ResponsesCallContext,
-) -> Result<ResponsesResponse, Response> {
+) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = conversions::responses_to_chat(modified_request).map_err(|e| {
         error!(
@@ -105,14 +116,11 @@ pub(super) async fn execute_without_mcp(
             error = %e,
             "Failed to convert ResponsesRequest to ChatCompletionRequest"
         );
-        error::bad_request(
-            "convert_request_failed",
-            format!("Failed to convert request: {e}"),
-        )
+        error::bad_request(e.code(), format!("Failed to convert request: {e}"))
     })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
-    let chat_response = ctx
+    let (chat_response, parser) = ctx
         .pipeline
         .execute_chat_for_responses(
             Arc::new(chat_request),
@@ -124,8 +132,9 @@ pub(super) async fn execute_without_mcp(
         .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request, params.response_id).map_err(
-        |e| {
+    conversions::chat_to_responses(&chat_response, original_request, params.response_id)
+        .map(|responses_response| (responses_response, parser))
+        .map_err(|e| {
             error!(
                 function = "execute_without_mcp",
                 error = %e,
@@ -135,8 +144,7 @@ pub(super) async fn execute_without_mcp(
                 "convert_to_responses_format_failed",
                 format!("Failed to convert to responses format: {e}"),
             )
-        },
-    )
+        })
 }
 
 /// Execute the MCP tool calling loop
@@ -146,13 +154,16 @@ pub(super) async fn execute_without_mcp(
 /// 2. Checks if response has tool calls
 /// 3. If yes, executes MCP tools and builds resume request
 /// 4. Repeats until no more tool calls or limit reached
+///
+/// The answer comes with the parser that read the completion it is built
+/// from; the readers of one turn are the same.
 pub(super) async fn execute_tool_loop(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     params: &ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
-) -> Result<ResponsesResponse, Response> {
+) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // The loop is rebuilt on the loaded request: a stored turn's tool calls
     // and outputs stay in front of the calls this loop executes.
     let mut state = ToolLoopState::new(&current_request);
@@ -193,17 +204,14 @@ pub(super) async fn execute_tool_loop(
                         error = %e,
                         "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
                     );
-                    error::bad_request(
-                        "convert_request_failed",
-                        format!("Failed to convert request: {e}"),
-                    )
+                    error::bad_request(e.code(), format!("Failed to convert request: {e}"))
                 })?;
 
         // Prepare tool_choice for this iteration
         prepare_tool_choice(&mut chat_request, state.iteration);
 
         // Execute chat pipeline (errors already have proper HTTP status codes)
-        let chat_response = ctx
+        let (chat_response, parser) = ctx
             .pipeline
             .execute_chat_for_responses(
                 Arc::new(chat_request),
@@ -285,7 +293,7 @@ pub(super) async fn execute_tool_loop(
             );
 
             responses_response.usage = state.usage.map(ResponsesUsage::Modern);
-            return Ok(responses_response);
+            return Ok((responses_response, parser));
         } else {
             state.iteration += 1;
 
@@ -396,7 +404,7 @@ pub(super) async fn execute_tool_loop(
                     }));
                 }
                 responses_response.usage = state.usage.map(ResponsesUsage::Modern);
-                return Ok(responses_response);
+                return Ok((responses_response, parser));
             }
 
             // Build resume request with conversation history

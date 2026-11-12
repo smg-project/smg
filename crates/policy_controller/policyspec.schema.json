@@ -1,0 +1,1267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PolicySpec",
+  "description": "The policy specification, version `smg.policy/v1`: what the host builds\ninto the view, the per-model index settings, the profiles with their\nstages, the plans' rules and the ordered bindings. An unknown field at\nany level is refused by name.",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "description": "`smg.policy/v1`.",
+      "type": "string"
+    },
+    "generation": {
+      "description": "The document's generation: written by the operator, or by the apply\nthat persisted it.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 0
+    },
+    "view": {
+      "description": "What the host builds into every decision's view.",
+      "$ref": "#/$defs/ViewSpec"
+    },
+    "index": {
+      "description": "The prefix-index settings per model glob. Where two keys match one\nmodel the most specific wins: an exact id, then the longer of a\n`prefix*` and a `*suffix`, then `*`; a `prefix*` and a `*suffix` of\none length are refused as a pair.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/IndexSpec"
+      }
+    },
+    "profiles": {
+      "description": "The profiles by name.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ProfileSpec"
+      }
+    },
+    "plans": {
+      "description": "The plans' rules.",
+      "$ref": "#/$defs/PlansSpec"
+    },
+    "bindings": {
+      "description": "The bindings in order; the first match wins. Empty binds the first\nprofile to everything.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/BindingSpec"
+      },
+      "default": []
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "profiles"
+  ],
+  "$defs": {
+    "ViewSpec": {
+      "description": "What the host builds into every decision's view beyond the facts it\nderives itself: the request headers a stage may read, and the hashing\ninputs a host keeps until it learns them from its engines.",
+      "type": "object",
+      "properties": {
+        "headers": {
+          "description": "The request headers a stage may read, lowercase, in the order their\npositions take on the wire. A name on the deny-list (`authorization`,\n`proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, the host's\ntenant header) is refused. Every header a binding's `sessions`,\n`canary` or `match.header` names must be listed here. At most 256: a\nview names a header by its position in one byte.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "default": []
+        },
+        "block_size": {
+          "description": "The token block size the host hashes prefixes by when no engine has\npublished one; absent, the host's own default. The block size of\nrecord learned from an engine's events wins at run time.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "boundaries": {
+          "description": "Ascending token positions the hash index and the prefix-hash ring\nkey on; empty for none. A hash index needs at least one.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "default": []
+        },
+        "max_block_hashes": {
+          "description": "How many prefix block hashes a request carries into the view.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 256
+        }
+      },
+      "additionalProperties": false
+    },
+    "IndexSpec": {
+      "description": "A model's prefix-index settings. They are per model, never per profile,\nso two profiles bound to one model never carry two settings.\nTwo keys matching one model resolve by specificity, see\n[`PolicySpec::index_for`].",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/IndexKind",
+          "default": "tree"
+        },
+        "ttl_s": {
+          "description": "How long a hash-index placement stays routable, in seconds.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 180
+        },
+        "max_size": {
+          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "default": 67108864
+        },
+        "sweep_s": {
+          "description": "The index's sweep cadence, in seconds.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 120
+        }
+      },
+      "additionalProperties": false
+    },
+    "IndexKind": {
+      "description": "The under-layer of a model's prefix index.",
+      "oneOf": [
+        {
+          "description": "Radix trees over the prefixes seen.",
+          "type": "string",
+          "const": "tree"
+        },
+        {
+          "description": "A placement map keyed by the request's head at `view.boundaries`,\neach placement living `ttl_s`.",
+          "type": "string",
+          "const": "hash"
+        }
+      ]
+    },
+    "ProfileSpec": {
+      "description": "One profile: an ordered set of filters, weighted scorers and exactly one\npicker.",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "description": "The hard filters, in order.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "score": {
+          "description": "The scorers, each a name or a name with its weight and parameters.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ScoreSpec"
+          },
+          "default": []
+        },
+        "pick": {
+          "description": "The picker.",
+          "$ref": "#/$defs/PickSpec"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pick"
+      ]
+    },
+    "ScoreSpec": {
+      "description": "A scorer: its bare name (the stage at its defaults), or the name mapped to its weight and parameters.",
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "least-load",
+            "least-requests",
+            "fewest-sessions",
+            "session-affinity",
+            "prefix-affinity",
+            "kv-pressure",
+            "warmup-slice",
+            "bucket",
+            "consistent-hash"
+          ]
+        },
+        {
+          "$ref": "#/$defs/ScoreStage"
+        }
+      ]
+    },
+    "ScoreStage": {
+      "description": "A scorer with its parameters, keyed by the scorer's name: `{ least-load:\n{ weight: 0.3 } }`. One key per entry; a second key or an unknown\nparameter is refused by name.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "least-load": {
+              "$ref": "#/$defs/LeastLoadParams"
+            }
+          },
+          "required": [
+            "least-load"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "least-requests": {
+              "$ref": "#/$defs/Weight"
+            }
+          },
+          "required": [
+            "least-requests"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "fewest-sessions": {
+              "$ref": "#/$defs/Weight"
+            }
+          },
+          "required": [
+            "fewest-sessions"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session-affinity": {
+              "$ref": "#/$defs/Weight"
+            }
+          },
+          "required": [
+            "session-affinity"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "prefix-affinity": {
+              "$ref": "#/$defs/PrefixAffinityParams"
+            }
+          },
+          "required": [
+            "prefix-affinity"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kv-pressure": {
+              "$ref": "#/$defs/KvPressureParams"
+            }
+          },
+          "required": [
+            "kv-pressure"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "warmup-slice": {
+              "$ref": "#/$defs/WarmupSliceParams"
+            }
+          },
+          "required": [
+            "warmup-slice"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bucket": {
+              "$ref": "#/$defs/BucketParams"
+            }
+          },
+          "required": [
+            "bucket"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "consistent-hash": {
+              "$ref": "#/$defs/ConsistentHashParams"
+            }
+          },
+          "required": [
+            "consistent-hash"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "resident-work": {
+              "$ref": "#/$defs/ResidentWorkParams"
+            }
+          },
+          "required": [
+            "resident-work"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "LeastLoadParams": {
+      "description": "The least-load scorer: the expected wait from token work over the drain\nrate, with a convex KV-pressure barrier.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "kv_pressure_weight": {
+          "description": "The weight of the KV-pressure barrier in the expected wait; at or\nabove zero (default 0.15).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "mean_prefill_tokens": {
+          "description": "The token-work estimate for a request whose count is unknown; above\nzero (default 1024).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "default_throughput": {
+          "description": "The drain rate assumed when no candidate reports a live one, in\ntokens per second; above zero (default 2000).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Weight": {
+      "description": "A scorer with no parameters of its own: its weight alone.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PrefixAffinityParams": {
+      "description": "The prefix-affinity scorer: the matched prefix share per candidate, with\nthe match threshold, the spill gate and the placement source.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "threshold": {
+          "description": "The matched share under which a request is balanced instead of\npinned; between 0 and 1 (default 0.3).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "decay": {
+          "description": "The decay of the overlap by the candidate's waiting backlog; at or\nabove zero (default 0, off).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "source": {
+          "description": "Where placements come from (default `index`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AffinitySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "accounting_ttl_ms": {
+          "description": "How long an optimistic dispatch booking lives before the engine\nreports it, in milliseconds (default 0, off).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spill": {
+          "description": "The spill gate.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpillParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AffinitySource": {
+      "description": "Where prefix affinity reads placements from.",
+      "oneOf": [
+        {
+          "description": "The event-fed prefix index.",
+          "type": "string",
+          "const": "index"
+        },
+        {
+          "description": "The side index of prefixes sent, for workers without an event\nsubscription.",
+          "type": "string",
+          "const": "predictor"
+        },
+        {
+          "description": "Both, merged by per-worker maximum.",
+          "type": "string",
+          "const": "merged"
+        }
+      ]
+    },
+    "SpillParams": {
+      "description": "The spill gate of prefix affinity: when the affine worker is loaded this\nfar past the least-loaded one, the request spills to the latter.",
+      "type": "object",
+      "properties": {
+        "abs": {
+          "description": "The absolute part of the gate, in requests (default 64).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "rel": {
+          "description": "The relative part of the gate; at least 1 (default 1.5).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 1.0
+        },
+        "prefix_margin_tokens": {
+          "description": "The gate's floor from the held prefix, in tokens (default 0).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "uncached_credit": {
+          "description": "Credit a hit with its uncached remainder only (default false).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "KvPressureParams": {
+      "description": "The KV-pressure scorer: the fleet's KV-usage spread past which affinity\nyields to load, and the per-candidate ceiling above which the hottest\ncandidate is de-ranked.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "spread": {
+          "description": "The usage spread above which load wins; above zero, 1 and above\nswitches the rule off (default 1).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "exclusiveMinimum": 0
+        },
+        "ceiling": {
+          "description": "The usage ceiling above which a candidate is de-ranked; above zero,\n1 and above switches the rule off (default 1).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "WarmupSliceParams": {
+      "description": "The warm-up slice: the share of misses offered to workers whose index is\nstill thin.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "secs": {
+          "description": "How long after admission a worker counts as warming, in seconds; 0\nswitches the age rule off (default 60).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "share": {
+          "description": "The share of misses offered to warming workers; between 0 and 1\n(default 0.25).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "blocks": {
+          "description": "The index growth after which a worker is warm, in blocks (default\n1024).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "thin_ratio": {
+          "description": "The share of the fleet's median index under which a worker is thin;\nbetween 0 and 1, 0 keeps the age rule alone (default 0.5).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "divert_every": {
+          "description": "One hit in this many is diverted to a thin worker; 0 switches the\ndiversion off (default 8).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "BucketParams": {
+      "description": "The bucket scorer: prefill placement by request-size buckets whose\nboundaries a periodic task adjusts.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "abs_threshold": {
+          "description": "The absolute part of the balance rule, in requests (default 64).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "rel_threshold": {
+          "description": "The relative part of the balance rule; at least 1 (default 1.5).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 1.0
+        },
+        "adjust_interval_s": {
+          "description": "The boundary task's cadence, in seconds; above zero (default 5).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConsistentHashParams": {
+      "description": "The consistent-hash scorer: a per-model ring keyed by the routing key or\nby the request's prefix, with a bounded-load rule.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "prefix_tokens": {
+          "description": "How many prefix tokens hash when the ring keys by prefix; above zero\n(default 256).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "bounded_load": {
+          "description": "The bounded-load rule.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BoundedLoadParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "BoundedLoadParams": {
+      "description": "The bounded-load rule of the consistent-hash scorer: a ring owner loaded\nthis far past the mean passes the request on.",
+      "type": "object",
+      "properties": {
+        "factor": {
+          "description": "The relative part of the rule; at least 1 (default 1.25).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 1.0
+        },
+        "abs_margin": {
+          "description": "The absolute part of the rule, in requests (default 10).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResidentWorkParams": {
+      "description": "The resident-work scorer: the tokens resident on a candidate, with the\nrequest's own token count added for the comparison.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "request_tokens": {
+          "description": "The request's token count added to each candidate's resident\ntokens; above zero.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_tokens"
+      ]
+    },
+    "PickSpec": {
+      "description": "A picker: its bare name, or the name mapped to its parameters.",
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "best",
+            "round-robin",
+            "random",
+            "power-of-two",
+            "count-first",
+            "power-of-two-count-first",
+            "passthrough",
+            "manual"
+          ]
+        },
+        {
+          "$ref": "#/$defs/PickStage"
+        }
+      ]
+    },
+    "PickStage": {
+      "description": "A picker with its parameters, keyed by the picker's name.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "best-with-temperature": {
+              "$ref": "#/$defs/BestWithTemperatureParams"
+            }
+          },
+          "required": [
+            "best-with-temperature"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "BestWithTemperatureParams": {
+      "description": "The `best-with-temperature` picker's parameters.",
+      "type": "object",
+      "properties": {
+        "temperature": {
+          "description": "The softmax temperature over the combined scores; at or above zero,\n0 picks the best.",
+          "type": "number",
+          "format": "float",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "temperature"
+      ]
+    },
+    "PlansSpec": {
+      "description": "The plans' rules, by plan name.",
+      "type": "object",
+      "properties": {
+        "pd-pair": {
+          "$ref": "#/$defs/PdPairPlanSpec",
+          "default": {
+            "pairing": "lenient"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PdPairPlanSpec": {
+      "description": "The `pd-pair` plan's rules.",
+      "type": "object",
+      "properties": {
+        "pairing": {
+          "$ref": "#/$defs/Pairing",
+          "default": "lenient"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Pairing": {
+      "description": "How strictly a prefill pairs with a decode on their KV-transfer\ndescriptor. A descriptor component an engine does not report is unknown.",
+      "oneOf": [
+        {
+          "description": "Pair on nothing, as if no descriptor existed.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "A known difference in runtime, transport or KV layout refuses the\npair; unknown components pair with anything.",
+          "type": "string",
+          "const": "lenient"
+        },
+        {
+          "description": "Runtime, transport and KV layout are known on both sides and agree,\nand reported engine versions match.",
+          "type": "string",
+          "const": "strict"
+        }
+      ]
+    },
+    "BindingSpec": {
+      "description": "A binding: the requests it matches, the profile or plan they resolve to,\nand the rules around the decision.",
+      "type": "object",
+      "properties": {
+        "match": {
+          "$ref": "#/$defs/Match",
+          "default": {
+            "model": "*",
+            "phase": []
+          }
+        },
+        "profile": {
+          "description": "The profile of a single decision.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "description": "`single` (the default), `pd-pair` or `epd`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "profiles": {
+          "description": "The profiles per side: `single`, or every side of the plan\n(`prefill` and `decode`; `encode` too under `epd`), each named.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "overload": {
+          "description": "The overload veto's defaults for the binding's workers.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OverloadSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessions": {
+          "description": "Sticky sessions.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionsSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shadow": {
+          "description": "A profile evaluated after the live one on the same view, never\ndispatched, counted as disagreement.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canary": {
+          "description": "A second profile deciding a share of the requests.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanarySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "override": {
+          "description": "Whether a request may name its profile (default `locked`).",
+          "$ref": "#/$defs/Override"
+        },
+        "admission": {
+          "description": "Fairness admission; reserved in v1.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdmissionSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Match": {
+      "description": "What a binding matches on. Bindings are ordered; the first match wins.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "description": "The model id after aliasing: an exact id, `prefix*`, `*suffix` or\n`*`.",
+          "type": "string",
+          "default": "*"
+        },
+        "phase": {
+          "description": "The phases the binding covers; empty covers every phase. A plan with\nseveral sides names every side's phase or none.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Phase"
+          },
+          "default": []
+        },
+        "tenant": {
+          "description": "The tenant the request resolved to.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "description": "The priority band the request carries, as a closed range.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Bounds_for_int32"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "header": {
+          "description": "A request header, present or holding one of the values.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderMatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prompt_tokens": {
+          "description": "The request's prompt token count, as a closed range.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Bounds_for_uint32"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "labels": {
+          "description": "Registration labels the binding is restricted to.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Phase": {
+      "description": "Which phase of a request a decision is for.",
+      "type": "string",
+      "enum": [
+        "single",
+        "prefill",
+        "decode",
+        "encode"
+      ]
+    },
+    "Bounds_for_int32": {
+      "description": "A closed range with one or both bounds.",
+      "type": "object",
+      "properties": {
+        "min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      },
+      "additionalProperties": false
+    },
+    "HeaderMatch": {
+      "description": "A request header among `view.headers`: present, or holding one of the\nvalues.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The header's name, lowercase, listed in `view.headers`.",
+          "type": "string"
+        },
+        "values": {
+          "description": "The values that match; empty matches the header's presence.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Bounds_for_uint32": {
+      "description": "A closed range with one or both bounds.",
+      "type": "object",
+      "properties": {
+        "min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PlanName": {
+      "description": "The plan a binding runs.",
+      "oneOf": [
+        {
+          "description": "One profile over one pool.",
+          "type": "string",
+          "const": "single"
+        },
+        {
+          "description": "The prefill profile, then the decode profile over the chosen\nprefill's partners; both sides named.",
+          "type": "string",
+          "const": "pd-pair"
+        },
+        {
+          "description": "The encode profile once per encode item, then the pair; all three\nsides named.",
+          "type": "string",
+          "const": "epd"
+        }
+      ]
+    },
+    "OverloadSpec": {
+      "description": "The overload veto's defaults for the binding's workers: evaluated per\nload report by the host and latched, never per request; a worker's own\nregistration thresholds resolve over these.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the host's thresholds veto at all (a worker's own block still\ndoes).",
+          "type": "boolean",
+          "default": true
+        },
+        "waiting_requests": {
+          "description": "Queued requests, summed over an engine's ranks, at or above which a\nworker is vetoed; at least 1 (default 8).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "token_usage": {
+          "description": "Mean KV usage over an engine's ranks at or above which a worker is\nvetoed; above 0 and at most 1 (default 0.8).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "maximum": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "shed_when_all_vetoed": {
+          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "SessionsSpec": {
+      "description": "Sticky sessions on the binding: a keyed request stays on the worker its\nkey was first placed on.",
+      "type": "object",
+      "properties": {
+        "sticky_header": {
+          "description": "The header whose value is the session key; listed in `view.headers`.",
+          "type": "string"
+        },
+        "headers": {
+          "description": "The headers looked up in order for the key, the sticky header among\nthem; empty means the sticky header alone. Each listed in\n`view.headers`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ttl_s": {
+          "description": "How long an idle key stays pinned, in seconds; above zero (default\n14400), `4294967295` for ever.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 14400
+        },
+        "sweep_s": {
+          "description": "The sweep cadence of idle keys, in seconds; above zero (default 120),\n`4294967295` for never, allowed under a `ttl_s` for ever alone.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 120
+        },
+        "assignment": {
+          "description": "How a first-seen key picks its worker (default `delegate`).",
+          "$ref": "#/$defs/Assignment",
+          "default": "delegate"
+        },
+        "inflight_cap": {
+          "description": "How many requests of one key a worker carries before the next steps\naside; above zero (default 2), `65535` for no cap.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 2
+        },
+        "issue_session_id": {
+          "description": "Issue a session id to a request that carries none (default false;\nnot in this build: set, it is refused by name).",
+          "type": "boolean",
+          "default": false
+        },
+        "recovery": {
+          "description": "Which pin leads once both of a key's pins are routable (default\n`original`).",
+          "$ref": "#/$defs/Recovery",
+          "default": "original"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sticky_header"
+      ]
+    },
+    "Assignment": {
+      "description": "How a session key seen for the first time picks its worker.",
+      "oneOf": [
+        {
+          "description": "A random worker.",
+          "type": "string",
+          "const": "random"
+        },
+        {
+          "description": "The worker with the fewest running requests.",
+          "type": "string",
+          "const": "min_load"
+        },
+        {
+          "description": "The worker with the fewest active keys.",
+          "type": "string",
+          "const": "min_group"
+        },
+        {
+          "description": "The profile's own pick, then pinned. The `manual` picker, having no\nprofile to delegate to, takes `min_load`.",
+          "type": "string",
+          "const": "delegate"
+        }
+      ]
+    },
+    "Recovery": {
+      "description": "Which of a key's two pins leads once both are routable again: the first\nworker the key was placed on (the manual policy's order) or the latest\none it was dispatched to (the sticky override's under `delegate`).",
+      "type": "string",
+      "enum": [
+        "original",
+        "latest"
+      ]
+    },
+    "CanarySpec": {
+      "description": "A second profile deciding a share of the binding's requests, the\ndeciding profile recorded on the lease. Exactly one of `percent`,\n`tenants` and `header` chooses the share.",
+      "type": "object",
+      "properties": {
+        "profile": {
+          "description": "The profile deciding the canary's share.",
+          "type": "string"
+        },
+        "percent": {
+          "description": "A share of requests, 0 to 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "tenants": {
+          "description": "The tenants whose requests the canary decides.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "header": {
+          "description": "A request header that selects the canary.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderMatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile"
+      ]
+    },
+    "Override": {
+      "description": "Whether a request may name its profile through the override header.",
+      "oneOf": [
+        {
+          "description": "The override header is honoured.",
+          "type": "string",
+          "const": "allowed"
+        },
+        {
+          "description": "The override header is ignored.",
+          "type": "string",
+          "const": "locked"
+        }
+      ]
+    },
+    "AdmissionSpec": {
+      "description": "Fairness admission on the binding; reserved in v1 and off.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

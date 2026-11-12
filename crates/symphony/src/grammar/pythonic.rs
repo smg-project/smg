@@ -91,7 +91,7 @@ fn calls_joined(dialect: Dialect, tools: &[&Tool], count: Count<'_>, between: &s
             .map(|tool| {
                 call(
                     &tool.function.name,
-                    &tool.function.parameters,
+                    tool.function.parameters_schema(),
                     dialect.values,
                 )
             })

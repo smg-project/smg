@@ -22,6 +22,7 @@ import types
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer import constrained_decoding as cd
 from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.sglang import plugin, rust
 
@@ -49,6 +50,14 @@ def _install_fake_servicer(monkeypatch, server, init_servicer_tracing=None):
         SglangGrpcServer=server,
         init_servicer_tracing=init_servicer_tracing or (lambda *_args, **_kwargs: None),
     )
+
+
+@pytest.fixture(autouse=True)
+def restore_native_thread_defaults(monkeypatch):
+    """Restore launch defaults even when configure_threads creates absent variables."""
+    for name in ["SMG_SERVICER_WORKER_THREADS", "SMG_MM_THREADS", "SMG_MM_IMAGE_CONCURRENCY"]:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
 
 
 @pytest.fixture
@@ -114,7 +123,8 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env(no_parsed_flag):
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert rust.resolve_servicer_impl(environ={"SMG_SGLANG_SERVICER_IMPL": "python"}) == "python"
     assert rust.resolve_servicer_impl(environ={"SMG_SGLANG_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -136,7 +146,7 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env(no_parsed_
 
 
 def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back(no_parsed_flag):
-    assert rust.servicer_impl_source(environ={}) == ("python", "default")
+    assert rust.servicer_impl_source(environ={}) == ("rust", "default")
     assert rust.servicer_impl_source(environ={"SMG_SGLANG_SERVICER_IMPL": "rust"}) == (
         "rust",
         "env",
@@ -149,7 +159,7 @@ def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back(no_parsed_
     assert environ == {"SMG_SGLANG_SERVICER_IMPL": "python"}
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("rust", "default")
     assert environ == {}
     # The flag the plugin parsed in this process counts as the launcher's:
     # SGLang's ServerArgs does not carry it.
@@ -968,9 +978,9 @@ def test_a_disaggregation_role_plans_its_warm_up_without_a_peer(monkeypatch, tmp
     planned = {}
     plan_for = rust_lifecycle.plan_for
 
-    def spying_plan_for(setting, inputs, *, knob):
+    def spying_plan_for(setting, inputs, *, knob, nonce=None):
         planned["inputs"] = inputs
-        return plan_for(setting, inputs, knob=knob)
+        return plan_for(setting, inputs, knob=knob, nonce=nonce)
 
     monkeypatch.setattr(rust_lifecycle, "plan_for", spying_plan_for)
     for mode in ("prefill", "decode"):
@@ -1369,3 +1379,71 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     with pytest.raises(RuntimeError, match="scheduler would not start"):
         asyncio.run(rust.serve_rust(_server_args()))
     assert events == ["serving:False", "stop:5.0"]
+
+
+def test_server_facts_carry_the_structural_tag_vocabulary_of_an_older_xgrammar(monkeypatch):
+    # The xgrammar installed beside the engine predates the structural-tag
+    # nodes the Router writes (0.1.33 is the first release with them): the
+    # key says so under the backends that run xgrammar (the engine's default
+    # included); a current xgrammar, or a backend with a vocabulary of its
+    # own, leaves no key.
+    monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+    older = json.loads(rust.server_facts(_server_args(grammar_backend=None))["server_args_json"])
+    assert older["grammar_backend"] == "xgrammar"
+    assert older["structural_tag_vocabulary"] == "older"
+    other = json.loads(
+        rust.server_facts(_server_args(grammar_backend="llguidance"))["server_args_json"]
+    )
+    assert "structural_tag_vocabulary" not in other
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.33")
+    current = json.loads(
+        rust.server_facts(_server_args(grammar_backend="xgrammar"))["server_args_json"]
+    )
+    assert "structural_tag_vocabulary" not in current
+
+
+def test_native_media_processor_launch_options(monkeypatch):
+    """Forward native processor settings and enforce positive admission limits."""
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "smg")
+    monkeypatch.setenv("SMG_SGLANG_MM_MAX_INFLIGHT", "8")
+    monkeypatch.setattr(rust, "_model_config", lambda _: SimpleNamespace(dtype="bfloat16"))
+    monkeypatch.setattr("smg_grpc_servicer.sglang.mm_defaults.configure_threads", lambda: None)
+    options = rust.SglangLauncher().server_extras(
+        _server_args(limit_mm_data_per_request={"image": 2, "video": 1}), "/tok"
+    )
+    assert options["smg_media_processor"]["model_dir"] == str(_server_args().model_path)
+    assert options["smg_media_processor"]["max_inflight"] == 8
+    assert options["smg_media_processor"]["engine_item_limits"] == {"image": 2, "video": 1}
+    assert "encode_dispatcher" not in options
+    with pytest.raises(ValueError, match="encode disaggregation"):
+        rust.SglangLauncher().server_extras(
+            _server_args(language_only=True, encoder_transfer_backend="zmq_to_scheduler"),
+            "/tok",
+        )
+    with pytest.raises(ValueError, match="tokenizer directory"):
+        rust.SglangLauncher().server_extras(_server_args(), None)
+    for invalid in ("0", "-1", "sixty-four"):
+        monkeypatch.setenv("SMG_SGLANG_MM_MAX_INFLIGHT", invalid)
+        with pytest.raises(ValueError, match="SMG_SGLANG_MM_MAX_INFLIGHT must be positive"):
+            rust.SglangLauncher().server_extras(_server_args(), "/tok")
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "python")
+    with pytest.raises(ValueError, match="empty or smg"):
+        rust.SglangLauncher().server_extras(_server_args(), "/tok")
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
+def test_native_media_dtype(monkeypatch, dtype):
+    """Pass each supported vision dtype to the native worker."""
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "smg")
+    monkeypatch.setenv("SMG_SGLANG_MM_DTYPE", dtype)
+    options = rust.SglangLauncher().server_extras(_server_args(), "/tok")
+    assert options["smg_media_processor"]["encoder_dtype"] == dtype
+
+
+def test_native_media_dtype_rejects_unknown(monkeypatch):
+    """Reject unsupported pixel dtypes before server startup."""
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "smg")
+    monkeypatch.setenv("SMG_SGLANG_MM_DTYPE", "fp8")
+    with pytest.raises(ValueError, match="SMG_SGLANG_MM_DTYPE"):
+        rust.SglangLauncher().server_extras(_server_args(), "/tok")

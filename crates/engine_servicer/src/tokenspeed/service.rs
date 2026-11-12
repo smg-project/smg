@@ -3,7 +3,10 @@
 //! (`FlushCache`, profiling) ride the wire's control call when the
 //! scheduler's handshake declared its control reply (the control-wire
 //! revision), and answer UNIMPLEMENTED naming the gap on a scheduler whose
-//! wire carries generate and abort only.
+//! wire carries generate and abort only. In the encode role this service is
+//! the discovery surface (health, model and server facts): `Generate` and
+//! the control RPCs are refused there by name, before the engine is asked,
+//! and the encoder service (`encode.rs`) takes the requests.
 
 use std::sync::Arc;
 
@@ -14,11 +17,26 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{kv_events, tokenizer_bundle, BoxStream};
+use crate::{kv_events, rpc, servicer::RequestOrigin, BoxStream};
 
 #[derive(Clone)]
 pub(super) struct TokenSpeedService {
     pub(super) state: Arc<State>,
+}
+
+impl TokenSpeedService {
+    /// The encode role's answer to a scheduler control RPC, before the
+    /// engine is asked: UNIMPLEMENTED naming the RPC. The role's worker
+    /// lists the encode request alone, so a control frame would have no
+    /// rank to dispatch it, whatever reply layout the handshake declared.
+    fn refuse_control_in_encode_role(&self, rpc: &str) -> Result<(), Status> {
+        if self.state.encode_role.is_some() {
+            return Err(Status::unimplemented(format!(
+                "{rpc} is unavailable on TokenSpeed encode workers"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -31,17 +49,23 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        generate::generate(&self.state, request.into_inner())
-            .await
-            .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
-            .map(Response::new)
+        // The encode role runs the vision tower alone: the gRPC servicer's
+        // words for its Generate, before the engine is even asked.
+        if self.state.encode_role.is_some() {
+            return Err(Status::failed_precondition(
+                "Generate is unavailable on TokenSpeed encode workers",
+            ));
+        }
+        let stream =
+            generate::generate(&self.state, request.into_inner(), RequestOrigin::Client).await;
+        rpc::generated(&self.state, stream)
     }
 
     async fn health_check(
         &self,
         _request: Request<ts::HealthCheckRequest>,
     ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(info::health_check(&self.state)))
+        Ok(Response::new(info::health_check(&self.state).await))
     }
 
     async fn abort(
@@ -50,14 +74,23 @@ impl TokenSpeedScheduler for TokenSpeedService {
     ) -> Result<Response<ts::AbortResponse>, Status> {
         let request = request.into_inner();
         // The choices of an `n > 1` request live under the one registration,
-        // so aborting the parent id ends every choice.
-        self.state
+        // so aborting the parent id ends every choice. An unknown or finished
+        // id is reported as the Python servicer reports it.
+        let found = self
+            .state
             .shared
             .registry
             .abort(std::slice::from_ref(&request.request_id))?;
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: format!("aborted {}", request.request_id),
+        Ok(Response::new(if found > 0 {
+            ts::AbortResponse {
+                success: true,
+                message: format!("aborted {}", request.request_id),
+            }
+        } else {
+            ts::AbortResponse {
+                success: false,
+                message: format!("Request {} not found", request.request_id),
+            }
         }))
     }
 
@@ -86,6 +119,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
+        self.refuse_control_in_encode_role("FlushCache")?;
         crate::admin::flush_cache(&self.state.shared, request)
             .await
             .map(Response::new)
@@ -95,6 +129,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
+        self.refuse_control_in_encode_role("StartProfile")?;
         crate::admin::start_profile(&self.state.shared, request.into_inner())
             .await
             .map(Response::new)
@@ -104,6 +139,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
+        self.refuse_control_in_encode_role("StopProfile")?;
         crate::admin::stop_profile(&self.state.shared)
             .await
             .map(Response::new)
@@ -113,20 +149,13 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.shared.tokenizer_dir.clone())
-            .await
-            .map(Response::new)
+        rpc::get_tokenizer(&self.state).await
     }
 
     async fn subscribe_kv_events(
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let Some(relay) = &self.state.shared.kv_relay else {
-            return Err(Status::unimplemented(
-                kv_events::TOKENSPEED_DISABLED_MESSAGE,
-            ));
-        };
-        relay.subscribe(request.into_inner()).map(Response::new)
+        rpc::subscribe_kv_events(&self.state, request, kv_events::TOKENSPEED_DISABLED_MESSAGE)
     }
 }

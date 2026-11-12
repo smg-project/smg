@@ -1,13 +1,17 @@
 //! The gateway over a held worker, read frame by frame: what an SSE stream
 //! carries while its engine is silent.
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+//!
+//! The arrival stamps and the read budget are on tokio's clock, as the
+//! keep-alive timer and the held worker's silence are. A test that pauses
+//! the clock from the response headers on ([`stream_paused_from_the_headers`])
+//! reads the gateway's timers as exact instants; on the wall clock tokio's
+//! `Instant` is the system's.
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, Bytes},
     http::{header::CONTENT_TYPE, Method, Request, StatusCode},
+    response::Response,
     Router,
 };
 use http_body_util::BodyExt;
@@ -17,7 +21,7 @@ use smg::{
     routers::RouterFactory,
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
 use tower::ServiceExt;
 
 use crate::held_worker::HeldWorker;
@@ -80,7 +84,8 @@ pub async fn app(
     (app, server)
 }
 
-/// One chunk of the response body and when it arrived, from the request.
+/// One chunk of the response body and when it arrived, from the response
+/// headers, on tokio's clock.
 #[derive(Debug)]
 pub struct Arrival {
     pub at: Duration,
@@ -106,20 +111,53 @@ pub async fn stream(
 
 /// [`stream`], and whether the body closed (EOF) within the budget rather
 /// than the budget running out with the body still open.
-#[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]
 pub async fn stream_to_end(
     app: &Router,
     path: &str,
     body: serde_json::Value,
     budget: Duration,
 ) -> (Vec<Arrival>, bool) {
+    let response = send(app, path, body).await;
+    read(path, response, budget).await
+}
+
+/// [`stream`] with tokio's clock paused from the response headers on, for
+/// a test that reads the gateway's timers as exact instants. The request,
+/// its dial and its hops to the engine run on the wall clock: a paused
+/// clock's auto-advance polls I/O once and, with nothing ready, moves on to
+/// the next timer, which on a loaded host would be the dial's own timeout.
+/// The silence after the headers has only the gateway's timers, which the
+/// runtime advances to with no wall time spent. Returns the arrivals and
+/// the request's wall duration before the pause: a timer the gateway armed
+/// at the headers is due that much earlier than the arrival clock says, at
+/// most. Needs a current-thread runtime, as `tokio::time::pause` does.
+pub async fn stream_paused_from_the_headers(
+    app: &Router,
+    path: &str,
+    body: serde_json::Value,
+    budget: Duration,
+) -> (Vec<Arrival>, Duration) {
+    let sent = Instant::now();
+    let response = send(app, path, body).await;
+    tokio::time::pause();
+    let slack = sent.elapsed();
+    (read(path, response, budget).await.0, slack)
+}
+
+#[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]
+async fn send(app: &Router, path: &str, body: serde_json::Value) -> Response {
     let request = Request::builder()
         .method(Method::POST)
         .uri(path)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
+    app.clone().oneshot(request).await.unwrap()
+}
+
+/// The response's chunks as they arrive, until the body ends or `budget`
+/// has passed since the response headers, and whether the body closed.
+async fn read(path: &str, response: Response, budget: Duration) -> (Vec<Arrival>, bool) {
     // The keep-alive interval counts from the response headers, so the
     // arrival clock and the budget start here, not before the request.
     let started = Instant::now();

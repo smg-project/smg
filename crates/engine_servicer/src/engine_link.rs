@@ -85,7 +85,7 @@ pub(crate) async fn connect_engine(
     runtime: RuntimeType,
     words: PeerWords,
     inputs: ConnectInputs,
-    configure: impl FnOnce(&ZmqEngineClient),
+    configure: impl FnOnce(&ZmqEngineClient) -> Result<(), String>,
 ) {
     let ConnectInputs {
         ipc_base_url,
@@ -118,7 +118,16 @@ pub(crate) async fn connect_engine(
     .await
     {
         Ok(client) => {
-            configure(&client);
+            // What the handshake declared against what this servicer was
+            // launched for: a disagreement is a connect failure with its
+            // reason, never a servicer that reports SERVING for a role the
+            // wire cannot serve.
+            if let Err(message) = configure(&client) {
+                error!(%message);
+                link.fail(message.clone());
+                record_error(&last_error, message);
+                return;
+            }
             silence.apply(&client);
             info!(
                 handshake = %handshake_address,
@@ -190,6 +199,17 @@ impl EngineLink {
     pub(crate) fn prefill_pending_tokens(&self) -> Option<u32> {
         let tokens = self.client.get()?.prefill_pending_tokens();
         Some(u32::try_from(tokens).unwrap_or(u32::MAX))
+    }
+
+    /// The engine's KV-event publisher sent a batch the relay read live, in
+    /// the publisher's sequence: the engine stepped (it stored or freed KV
+    /// blocks), whatever its output wire has said since. The connected
+    /// client ends its silence count on it as on an output; nothing while
+    /// the handshake runs.
+    pub(crate) fn note_engine_progress(&self) {
+        if let Some(client) = self.client.get() {
+            client.note_progress();
+        }
     }
 }
 

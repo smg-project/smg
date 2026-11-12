@@ -13,12 +13,11 @@
 
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     clippy::disallowed_methods,
     reason = "test failures should panic; the upstream tasks live for the test process"
 )]
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -45,21 +44,10 @@ use crate::common::{
     grpc_harness::{
         build_grpc_router, grpc_router_config, health_checks_off, serve_canned_worker, Canned,
     },
-    test_app::{create_test_app_context, create_test_app_with_context},
+    test_app::{create_test_app_context, create_test_app_with_context, scrape},
 };
 
 const MODEL: &str = "counter-test-model";
-
-async fn scrape(addr: SocketAddr) -> String {
-    smg::clients::http_client()
-        .get(format!("http://{addr}/metrics"))
-        .send()
-        .await
-        .expect("metrics endpoint reachable")
-        .text()
-        .await
-        .expect("metrics body")
-}
 
 /// The value of the worker's request counter in a scrape, if the series exists.
 ///

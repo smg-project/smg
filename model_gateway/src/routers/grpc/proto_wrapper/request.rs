@@ -35,6 +35,14 @@ impl ProtoRequest {
             Self::Embed(req) => req.request_id(),
         }
     }
+
+    /// The prompt's token ids from either variant (empty for a text input).
+    pub fn token_ids(&self) -> &[u32] {
+        match self {
+            Self::Generate(req) => req.token_ids(),
+            Self::Embed(req) => req.token_ids(),
+        }
+    }
 }
 
 /// Unified GenerateRequest that works with all backends
@@ -47,17 +55,7 @@ pub enum ProtoGenerateRequest {
     TokenSpeed(Box<tokenspeed::GenerateRequest>),
 }
 
-/// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions` in vLLM); a few ints per item. The video
-/// timing has two spellings: `second_per_grid_ts` from the Qwen-VL
-/// processors, `video_second_per_grid` from the Qwen-Omni family and this
-/// gateway's own processors. The servicer's `GRID_KEYS` mirrors this list.
-pub(crate) const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
-    "image_grid_thw",
-    "video_grid_thw",
-    "second_per_grid_ts",
-    "video_second_per_grid",
-];
+pub(crate) use smg_grpc_client::media_identity::GRID_KEYS as VLLM_MROPE_GRID_KEYS;
 
 /// A JSON answer's constraint as the worker of an attempt takes it: the table's
 /// structural tag, or the request's own schema where the table gives that
@@ -249,9 +247,20 @@ impl ProtoGenerateRequest {
     pub fn clone_without_mm_pixels(&mut self) -> Self {
         match self {
             Self::Sglang(req) => {
+                // A reference request still has unexpanded anchors. Decode
+                // must run the same processor to obtain the same prompt
+                // length and positions before receiving Prefill's KV.
+                if req.mm_inputs.as_ref().is_some_and(|mm| {
+                    mm.pixel_values.is_none()
+                        && (!mm.image_urls.is_empty() || !mm.video_urls.is_empty())
+                }) {
+                    return Self::Sglang(req.clone());
+                }
                 let mm = req.mm_inputs.take();
+                let extras = std::mem::take(&mut req.extra_mm_inputs);
                 let clone = Self::Sglang(req.clone());
                 req.mm_inputs = mm;
+                req.extra_mm_inputs = extras;
                 clone
             }
             Self::Vllm(req) => {
@@ -342,7 +351,10 @@ impl ProtoGenerateRequest {
     /// but prefill still needs placeholders/model-specific metadata to slot them.
     pub fn clear_mm_pixel_values(&mut self) {
         match self {
-            Self::Sglang(req) => req.mm_inputs = None,
+            Self::Sglang(req) => {
+                req.mm_inputs = None;
+                req.extra_mm_inputs.clear();
+            }
             Self::Vllm(req) => {
                 req.mm_inputs = None;
                 req.extra_mm_inputs.clear();
@@ -407,43 +419,66 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Prompt tokens the engine has to prefill for this request: the
-    /// tokenized input's length (zero for a text input, which the engine
-    /// tokenizes itself).
-    pub fn prompt_len(&self) -> usize {
+    /// The prompt's token ids: the tokenized input's (empty for a text
+    /// input, which the engine tokenizes itself). A retry's re-selection
+    /// routes by them, so the routing snapshot keeps no copy.
+    pub fn token_ids(&self) -> &[u32] {
         match self {
             Self::Sglang(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_ids.len()),
+                .map_or(&[], |input| input.input_ids.as_slice()),
             Self::Vllm(req) => match &req.input {
-                Some(vllm::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
-                _ => 0,
+                Some(vllm::generate_request::Input::Tokenized(input)) => &input.input_ids,
+                _ => &[],
             },
             Self::Trtllm(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_token_ids.len()),
+                .map_or(&[], |input| input.input_token_ids.as_slice()),
             Self::Mlx(req) => match &req.input {
-                Some(mlx::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
-                _ => 0,
+                Some(mlx::generate_request::Input::Tokenized(input)) => &input.input_ids,
+                _ => &[],
             },
             Self::TokenSpeed(req) => req
                 .tokenized
                 .as_ref()
-                .map_or(0, |input| input.input_ids.len()),
+                .map_or(&[], |input| input.input_ids.as_slice()),
         }
     }
 
-    /// Attach media references for worker-side multimodal processing (vLLM only).
-    pub fn set_vllm_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
+    /// Prompt tokens the engine has to prefill for this request: the
+    /// tokenized input's length (zero for a text input, which the engine
+    /// tokenizes itself).
+    pub fn prompt_len(&self) -> usize {
+        self.token_ids().len()
+    }
+
+    /// Attach media references for worker-side multimodal processing.
+    pub fn set_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
         match self {
             Self::Vllm(req) => {
                 req.media_refs = Some(refs);
                 Ok(())
             }
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                Err("media refs require a vLLM gRPC worker".to_string())
+            Self::Sglang(req) => {
+                let mut mm = sglang::MultimodalInputs::default();
+                for item in refs.items {
+                    match smg_grpc_client::common_proto::Modality::try_from(item.modality) {
+                        Ok(smg_grpc_client::common_proto::Modality::Image) => {
+                            mm.image_urls.push(item.url);
+                        }
+                        Ok(smg_grpc_client::common_proto::Modality::Video) => {
+                            mm.video_urls.push(item.url);
+                        }
+                        _ => return Err("SGLang media references require images or videos".into()),
+                    }
+                }
+                req.mm_inputs = Some(Box::new(mm));
+                Ok(())
+            }
+            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                Err("media refs require a supported gRPC worker".to_string())
             }
         }
     }

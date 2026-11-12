@@ -147,8 +147,11 @@ fn owned_workers(app_context: &AppContext, kind: DiscoveryKind) -> Vec<OwnedWork
             let endpoint = match Endpoint::parse_with_rank(worker.url()) {
                 Ok((endpoint, _)) => endpoint,
                 Err(e) => {
+                    // The address the parser refused reads as its marker, so the
+                    // id says which worker was skipped.
                     warn!(
-                        worker_url = %worker.url(),
+                        worker_id = %worker_id.as_str(),
+                        worker_url = %worker.redacted_url(),
                         error = %e,
                         "Skipping discovery-owned worker with an unparsable address"
                     );
@@ -1006,7 +1009,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),

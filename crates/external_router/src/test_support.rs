@@ -1,6 +1,8 @@
 //! What the crate's capture tests drive a request through: a worker at an
 //! address of the test's choosing, a worker source over such workers, the
-//! HTTP client they share, and an address nothing answers at.
+//! HTTP client they share, an address nothing answers at, a provider's
+//! answer of the test's making, and how a test reads an answer's body back
+//! as text.
 
 use std::{
     fmt,
@@ -10,7 +12,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axum::{http::HeaderMap, response::Response};
+use axum::{
+    body::to_bytes,
+    http::{header::CONTENT_TYPE, HeaderMap},
+    response::Response,
+};
 use openai_protocol::worker::ProviderType;
 use rustls::crypto::ring::default_provider;
 use tokio::net::TcpSocket;
@@ -42,9 +48,32 @@ pub(crate) fn http_client() -> reqwest::Client {
         .expect("a client")
 }
 
+/// A provider's answer of the test's making: `status`, the content type
+/// when one is given, and `body`.
+pub(crate) fn upstream(
+    status: u16,
+    content_type: Option<&str>,
+    body: impl Into<reqwest::Body>,
+) -> reqwest::Response {
+    let mut builder = http::Response::builder().status(status);
+    if let Some(ct) = content_type {
+        builder = builder.header(CONTENT_TYPE, ct);
+    }
+    reqwest::Response::from(builder.body(body.into()).expect("a response"))
+}
+
+/// The whole body of `response`, as text.
+pub(crate) async fn text_of(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8")
+}
+
 /// A worker at one address, serving model `m`, with no API key of its own.
 pub(crate) struct StubWorker {
     url: String,
+    redacted: String,
     healthy: bool,
     client: reqwest::Client,
 }
@@ -54,6 +83,7 @@ impl StubWorker {
     pub(crate) fn at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
+            redacted: crate::worker::redacted_url(url).into_owned(),
             healthy: true,
             client: http_client(),
         })
@@ -67,6 +97,7 @@ impl StubWorker {
     pub(crate) fn unhealthy_at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
+            redacted: crate::worker::redacted_url(url).into_owned(),
             healthy: false,
             client: http_client(),
         })
@@ -85,6 +116,10 @@ impl fmt::Debug for StubWorker {
 impl ExternalWorker for StubWorker {
     fn url(&self) -> &str {
         &self.url
+    }
+
+    fn redacted_url(&self) -> &str {
+        &self.redacted
     }
 
     fn api_key(&self) -> Option<&String> {

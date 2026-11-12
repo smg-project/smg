@@ -39,8 +39,13 @@ on:
       - .github/workflows/bellwether-fixtures.yml
       - .github/actions/setup-rust/**
       - scripts/ci_install_rust.sh
+      - scripts/ci_apt_mirror.sh
+      - scripts/ci_apt_update.sh
+      - scripts/ci_retry.sh
+      - scripts/ci_install_build_deps.sh
+      - scripts/ci_install_protoc.sh
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/** ]
     types: [opened, synchronize, reopened]
     paths:
       - crates/protocols/**
@@ -56,6 +61,11 @@ on:
       - .github/workflows/bellwether-fixtures.yml
       - .github/actions/setup-rust/**
       - scripts/ci_install_rust.sh
+      - scripts/ci_apt_mirror.sh
+      - scripts/ci_apt_update.sh
+      - scripts/ci_retry.sh
+      - scripts/ci_install_build_deps.sh
+      - scripts/ci_install_protoc.sh
   workflow_dispatch:
 
 permissions:
@@ -67,10 +77,6 @@ permissions:
 concurrency:
   group: bellwether-fixtures-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: true
-
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   fixture-tests:
@@ -100,25 +106,58 @@ jobs:
       # the CPU runner image carries no git-lfs, so the job brings its own: the
       # release binary for the runner's architecture, checked against the
       # checksum pinned here, on PATH for the rest of the job. No root needed.
+      # The tarball comes from the Actions cache, keyed by version and
+      # architecture, and from the release download only when the cache has
+      # no entry: a release-download outage killed five runs of one pull
+      # request in this step. The checksum decides either way, and the step
+      # says which source served it.
+      - name: Name the git-lfs tarball
+        id: lfs
+        env:
+          GIT_LFS_VERSION: "3.8.0"
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)  arch=amd64 ;;
+            aarch64) arch=arm64 ;;
+            *) echo "::error::no git-lfs build pinned for $(uname -m)"; exit 1 ;;
+          esac
+          echo "arch=$arch" >> "$GITHUB_OUTPUT"
+          echo "tarball=git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the git-lfs tarball
+        id: lfs-tarball
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/git-lfs/${{ steps.lfs.outputs.tarball }}
+          key: git-lfs-tarball-${{ steps.lfs.outputs.tarball }}
+
       - name: Install git-lfs
         env:
           GIT_LFS_VERSION: "3.8.0"
           GIT_LFS_SHA256_AMD64: e455e00f15d9b95661b8d53498ffb0c3367962cf1ec73c31ab7369516cd6ab8d
           GIT_LFS_SHA256_ARM64: ac9c8efac980bb0505ead384d087e2acb6486fd8498691a2165fa174ec6118c2
+          ARCH: ${{ steps.lfs.outputs.arch }}
+          TARBALL: ${{ steps.lfs.outputs.tarball }}
+          CACHE_HIT: ${{ steps.lfs-tarball.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          case "$(uname -m)" in
-            x86_64)  arch=amd64; sha="$GIT_LFS_SHA256_AMD64" ;;
-            aarch64) arch=arm64; sha="$GIT_LFS_SHA256_ARM64" ;;
-            *) echo "::error::no git-lfs build pinned for $(uname -m)"; exit 1 ;;
+          case "$ARCH" in
+            amd64) sha="$GIT_LFS_SHA256_AMD64" ;;
+            arm64) sha="$GIT_LFS_SHA256_ARM64" ;;
+            *) echo "::error::no git-lfs checksum pinned for $ARCH"; exit 1 ;;
           esac
           dir="$RUNNER_TEMP/git-lfs"
           mkdir -p "$dir"
-          tarball="git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz"
-          curl -fsSL --retry 3 -o "$dir/$tarball" \
-            "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/${tarball}"
-          echo "${sha}  $dir/$tarball" | sha256sum -c -
-          tar -xzf "$dir/$tarball" -C "$dir"
+          if [ "$CACHE_HIT" = "true" ] && [ -s "$dir/$TARBALL" ]; then
+            echo "git-lfs ${GIT_LFS_VERSION} tarball: the Actions cache"
+          else
+            echo "git-lfs ${GIT_LFS_VERSION} tarball: the release download (no cache entry)"
+            bash scripts/ci_retry.sh 3 20 curl -fsSL --connect-timeout 10 --max-time 300 -o "$dir/$TARBALL" \
+              "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/${TARBALL}"
+          fi
+          echo "${sha}  $dir/$TARBALL" | sha256sum -c -
+          tar -xzf "$dir/$TARBALL" -C "$dir"
           install -m 0755 "$dir/git-lfs-${GIT_LFS_VERSION}/git-lfs" "$dir/git-lfs"
           echo "$dir" >> "$GITHUB_PATH"
           "$dir/git-lfs" version
@@ -126,6 +165,16 @@ jobs:
           # the LFS filters are in the git configuration; set them for the
           # runner user, outside any repository.
           "$dir/git-lfs" install --skip-repo
+
+      # A run on `main` saves a tarball it had to download, so every later run
+      # of this version restores it; a pull request's save would be visible to
+      # that pull request alone.
+      - name: Save the git-lfs tarball
+        if: github.ref == 'refs/heads/main' && steps.lfs-tarball.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/git-lfs/${{ steps.lfs.outputs.tarball }}
+          key: ${{ steps.lfs-tarball.outputs.cache-primary-key }}
 
       - name: Check out bellwether
         uses: actions/checkout@v7
@@ -149,10 +198,11 @@ jobs:
       # Not the whole tree: at this pin that is 864 GB of compressed sets in
       # Git LFS over 1,470 models. `--plain` writes the hand-written sets alone
       # (common, turns, render common: a few MB, nothing fetched), and
-      # `--sample-sets N` every Nth compressed set of the tree besides, whole,
-      # the same sets on every run of the same pin, so the benchmark-scale
-      # sets keep a rotating foothold in the job. At N=5000 that is about 40
-      # sets and 5 GB of plain lines; the sampled run of 2026-10-22 at N=1000
+      # `--sample-sets N` one compressed set in N besides, whole, picked by a
+      # hash of the set's own id, so the same sets come on every run of the
+      # same pin and a set added elsewhere in the tree moves no other set's
+      # place in the sample. At N=3500 that is 42 sets and 3.9 GB of
+      # plain lines; the sampled run of 2026-10-22 at N=1000
       # (195 sets, 25 GB) took the render-parity harness 4.3 min and the
       # tokenizer harness 8.5 min on 8 threads, so the knob is the runner's
       # disk, not the step's time. Each model's sets.toml in the tree lists
@@ -161,7 +211,7 @@ jobs:
         run: >-
           uv run --locked --project .bellwether bellwether unpack
           --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
-          --plain --sample-sets 5000
+          --plain --sample-sets 3500
 
       # This job builds the bellwether_* test targets and the response-template
       # crate's two, and nothing else, so it keeps its own cache entry instead
@@ -184,7 +234,7 @@ jobs:
       # after the change starts from one of them and saves the one-copy entry
       # under the new key. The restore and the save are separate steps: the
       # cache service answers a share of the restores with 429 (the
-      # repository's matrices and sccache share its quota), the action gives
+      # repository's matrices share its quota), the action gives
       # up after one retry seconds later, and the job then fetches every file
       # from the hub and packs an entry nothing restores. So one more attempt
       # after the limit's window, only when no key matched at all: a job
@@ -256,13 +306,22 @@ jobs:
       # is one thread comparing its sets, the runner has 8 CPUs, so the step
       # takes as long as the longest target, not their sum. The pinned commit
       # records 1,470 models, 814 with sets; the tree the job unpacks holds
-      # their hand-written sets whole and every 5,000th benchmark set (the
+      # their hand-written sets whole and one compressed set in 3,500 (the
       # unpack step above), on which the render-parity and the tokenizer
       # harnesses take minutes, so the step has far more than the longest
-      # needs and the build; Symphony's replay
-      # runs on 1 case in 200 of each benchmark set (its SYMPHONY_SAMPLE_EVERY
-      # switch, the hand-written sets whole), as the whole replay of every
-      # recorded model takes hours. Each target's output is its own group in
+      # needs and the build. Symphony's replay reads every parse case the
+      # tree holds for the models its own list names (the render sets and
+      # the unlisted models' sets are not its): at this pin (ee0e698a) that
+      # is 4,253 recorded cases, 1,474 of them from the three benchmark-scale
+      # sets the unpack's sample holds for those models, in twenty seconds on
+      # eight workstation cores
+      # and under a minute on the runner, minutes under the two harnesses. Its
+      # SYMPHONY_SAMPLE_EVERY switch,
+      # which kept one benchmark case in 200 when the job unpacked
+      # bellwether's whole tree and the whole replay took hours, stays unset:
+      # at 200 it thinned the three sets to nine cases, so a parse change that
+      # read one of the other 1,465 differently passed the job. Each target's
+      # output is its own group in
       # the log, written as the target ends: one line per model with its
       # counts, the first unlisted differences of a model, and the totals.
       # The per-case reports (each set read, every difference with its
@@ -275,7 +334,6 @@ jobs:
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
           BELLWETHER_REPORT_DIR: ${{ runner.temp }}/bellwether-reports
-          SYMPHONY_SAMPLE_EVERY: "200"
           # Some twenty of the recorded templates (Apertus, Arcee Blitz, the
           # Granite 3 and 4 line, the LFM2.5 bases and VL variants, Mistral
           # Small 24B 2501, Muse Glimmer, SmolLM3, a Llama 3.2 variant) write
@@ -365,16 +423,3 @@ jobs:
           path: ${{ runner.temp }}/bellwether-reports/
           if-no-files-found: ignore
           retention-days: 30
-
-      # The stats are for reading, not a verdict. When the job ends before the
-      # Rust setup put sccache on PATH (the unpack failed, say), the step says
-      # so and passes, instead of failing in its turn and hiding the step that
-      # did.
-      - name: Show sccache stats
-        if: always()
-        run: |
-          if command -v sccache >/dev/null 2>&1; then
-            sccache --show-stats
-          else
-            echo "::notice::sccache is not on PATH, the Rust setup did not run: no stats to show"
-          fi

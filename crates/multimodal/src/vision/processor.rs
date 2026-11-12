@@ -86,7 +86,7 @@ pub struct VideoClipOptions {
     /// the double the request or the checkpoint named it.
     pub sample_fps: f64,
     /// The long-side cap the caller asked for, when it named one; the frames
-    /// were already scaled to it.
+    /// are already scaled except on native SGLang MiniMax, which applies Pillow here.
     pub max_long_side_pixel: Option<u32>,
 }
 
@@ -118,6 +118,12 @@ pub trait VisionPreProcessor: Send + Sync {
         false
     }
 
+    /// Whether this processor can split a BF16 batch into independently
+    /// preprocessed images with their metadata.
+    fn supports_bf16_batch_cache(&self) -> bool {
+        false
+    }
+
     /// Whether this processor produces the image's own bytes
     /// ([`EncoderInput::U8`](crate::encoder_inputs::EncoderInput::U8)), so
     /// a destination that normalizes on device can be served raw pixels
@@ -144,6 +150,13 @@ pub trait VisionPreProcessor: Send + Sync {
 
     /// Preprocess a batch of images.
     ///
+    /// The batch is borrowed image by image, as
+    /// [`preprocess_video_rgb`](Self::preprocess_video_rgb) borrows a clip's
+    /// frames: a caller holding its decoded images behind shared handles
+    /// (the gateway's `ImageFrame` cells) passes their references instead of
+    /// copying every image into one contiguous batch. No implementation owns,
+    /// consumes or mutates an input, so the borrowed form costs them nothing.
+    ///
     /// # Arguments
     /// * `images` - Input images to preprocess
     ///
@@ -151,7 +164,7 @@ pub trait VisionPreProcessor: Send + Sync {
     /// Preprocessed encoder inputs ready for the model, or an error.
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
 
     /// [`preprocess`](Self::preprocess) under a request's context. A processor
@@ -159,7 +172,7 @@ pub trait VisionPreProcessor: Send + Sync {
     /// ignores the context.
     fn preprocess_with_context(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         _context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.preprocess(images)
@@ -174,7 +187,7 @@ pub trait VisionPreProcessor: Send + Sync {
     /// in `dtype` would produce.
     fn preprocess_wire(
         &self,
-        _images: &[DynamicImage],
+        _images: &[&DynamicImage],
         _dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         None
@@ -222,6 +235,12 @@ pub trait VisionPreProcessor: Send + Sync {
     /// * `width` - Image width after preprocessing
     /// * `height` - Image height after preprocessing
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError>;
+
+    /// Estimate the number of image tensor elements from the decoded dimensions.
+    /// A processor without an estimate leaves admission to the actual output.
+    fn image_input_elements(&self, _width: u32, _height: u32) -> Option<usize> {
+        None
+    }
 
     /// Get the model family name for identification.
     fn model_name(&self) -> &'static str;

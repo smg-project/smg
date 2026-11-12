@@ -4,22 +4,25 @@ use serde_json::Value;
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        layouts::grid_thws_patch_fields, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{processors::KimiK25Processor, PreProcessorConfig, VisionPreProcessor},
 };
+
+/// The pad token the expansion repeats once per image feature, which Kimi K3
+/// (`super::kimi_k3`) shares; `media_placeholder_token_id` in the config names
+/// its id.
+pub(super) const MEDIA_PAD_TOKEN: &str = "<|media_pad|>";
 
 pub(super) struct KimiK25VisionSpec;
 
 impl KimiK25VisionSpec {
     /// The repeated pad token (`<|media_pad|>`) — `media_placeholder_token_id` in config.
     fn pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["media_placeholder_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "media_placeholder_token_id".to_string(),
-            })
+        metadata.config_token_id("media_placeholder_token_id")
     }
 }
 
@@ -40,7 +43,7 @@ impl ModelProcessorSpec for KimiK25VisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok("<|media_pad|>".to_string())
+        Ok(MEDIA_PAD_TOKEN.to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
@@ -90,14 +93,7 @@ impl ModelProcessorSpec for KimiK25VisionSpec {
         // Kimi-K2.5 uses NaViT-style patchification:
         // encoder_input is [total_patches, patch_features], split by patches_per_image.
         // grid_thws is [num_images, 3] with (temporal, height, width) grid dimensions.
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("grid_thws".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-        ])
+        grid_thws_patch_fields()
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {

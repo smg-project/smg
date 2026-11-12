@@ -528,7 +528,7 @@ async fn fetch_tokenizer_from_worker(
         let runtime = worker.metadata().spec.runtime_type;
         info!(
             "Fetching tokenizer from worker: {} (runtime: {})",
-            worker.url(),
+            worker.redacted_url(),
             runtime
         );
 
@@ -590,13 +590,13 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
         if is_unimplemented {
             debug!(
                 "Worker {} (runtime: {}) does not support GetTokenizer",
-                worker.url(),
+                worker.redacted_url(),
                 runtime
             );
         } else {
             warn!(
                 "Worker {} (runtime: {}) get_tokenizer failed: {}",
-                worker.url(),
+                worker.redacted_url(),
                 runtime,
                 e
             );
@@ -608,7 +608,7 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
     })?;
     debug!(
         "Tokenizer bundle validation passed for worker {}",
-        worker.url()
+        worker.redacted_url()
     );
 
     Ok(bundle)

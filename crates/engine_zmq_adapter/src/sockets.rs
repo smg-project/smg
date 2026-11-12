@@ -1,6 +1,7 @@
-//! Socket addresses for the same-host ZMQ topology: the `ipc://` data plane
-//! SMG binds, the `tcp://` handshake the engine dials, and the owner-only
-//! socket directory they live in.
+//! Socket addresses for the ZMQ topology: the data plane SMG binds (`ipc://`
+//! for a same-host engine, `tcp://` for one on another host), the `tcp://`
+//! handshake the engine dials, and the owner-only socket directory the
+//! `ipc://` sockets live in.
 
 use std::path::Path;
 
@@ -53,6 +54,14 @@ impl<'a> Handshake<'a> {
 
 /// Derive the ZMQ socket addresses for a worker from its base URL.
 ///
+/// A `tcp://<host>:<port>` base serves engines on other hosts: the gateway
+/// binds its handshake at that address itself and its input/output sockets
+/// on ephemeral ports of the same host, which the INIT hands the engines, so
+/// the host must be one they can reach (not a wildcard). The engines dial
+/// `--data-parallel-address <host> --data-parallel-rpc-port <port>`. These
+/// sockets carry no authentication: such a worker belongs on a trusted
+/// network. The rest of this describes the same-host `ipc://` base.
+///
 /// Mirrors vLLM's headless topology: the **handshake is TCP** (the engine dials
 /// it, so it matches `vllm serve --headless --data-parallel-rpc-port`), while
 /// the **data plane is `ipc://`** for the same-host fast path (SMG chooses these
@@ -76,16 +85,23 @@ pub(crate) fn zmq_socket_addresses(
     base_url: &str,
     handshake: Handshake<'_>,
 ) -> Result<(String, String, String), String> {
-    let path = base_url
-        .strip_prefix("ipc://")
-        .ok_or_else(|| format!("ZMQ worker URL must be ipc://<path>, got '{base_url}'"))?;
+    if let Some(authority) = base_url.strip_prefix("tcp://") {
+        return tcp_socket_addresses(base_url, authority, handshake);
+    }
+    let path = base_url.strip_prefix("ipc://").ok_or_else(|| {
+        format!(
+            "ZMQ worker URL must be ipc://<path> or tcp://<host>:<port>, got '{}'",
+            masked(base_url)
+        )
+    })?;
     let handshake = match handshake {
         Handshake::Derived => format!("tcp://{ZMQ_LOOPBACK_HOST}:{}", derive_handshake_port(path)),
         Handshake::Tcp(address) => {
             if !address.starts_with("tcp://") {
                 return Err(format!(
                     "zmq_handshake_address must be a tcp:// address \
-                     (the engine dials a TCP handshake), got '{address}'"
+                     (the engine dials a TCP handshake), got '{}'",
+                    masked(address)
                 ));
             }
             address.to_string()
@@ -93,15 +109,107 @@ pub(crate) fn zmq_socket_addresses(
         Handshake::TcpOrIpc(address) => {
             if !address.starts_with("tcp://") && !address.starts_with("ipc://") {
                 return Err(format!(
-                    "handshake address must be tcp://host:port or ipc://<path>, got '{address}'"
+                    "handshake address must be tcp://host:port or ipc://<path>, got '{}'",
+                    masked(address)
                 ));
             }
             address.to_string()
         }
     };
+    // The override is what the engines dial: a userinfo has no meaning there
+    // either, and would otherwise be bound as written.
+    if handshake
+        .strip_prefix("tcp://")
+        .is_some_and(|authority| authority.contains('@'))
+    {
+        return Err(format!(
+            "handshake address must be tcp://<host>:<port> without userinfo, got '{}'",
+            masked(&handshake)
+        ));
+    }
     let input = format!("ipc://{path}-in.sock");
     let output = format!("ipc://{path}-out.sock");
     Ok((handshake, input, output))
+}
+
+/// [`zmq_socket_addresses`] for a `tcp://<host>:<port>` base (`authority` is
+/// what follows the scheme): the handshake at the base itself, the data plane
+/// on ephemeral ports of its host.
+fn tcp_socket_addresses(
+    base_url: &str,
+    authority: &str,
+    handshake: Handshake<'_>,
+) -> Result<(String, String, String), String> {
+    if !matches!(handshake, Handshake::Derived) {
+        return Err(format!(
+            "ZMQ worker {} is the handshake address its engines dial; it takes no separate \
+             handshake address",
+            masked(base_url)
+        ));
+    }
+    // The URL is what the sockets bind: a userinfo (`user:secret@`) has no
+    // meaning there, and the one with a colon would read as the host below.
+    if authority.contains('@') {
+        return Err(format!(
+            "ZMQ worker URL must be tcp://<host>:<port> without userinfo, got '{}'",
+            masked(base_url)
+        ));
+    }
+    let (host, _port) = authority
+        .rsplit_once(':')
+        .filter(|(host, port)| {
+            // An IPv6 literal rides in brackets: a bare one cannot be told
+            // apart from its port, since the split is at the last colon.
+            let bracketed = host.starts_with('[') && host.ends_with(']');
+            !host.is_empty()
+                && (bracketed || !host.contains(':'))
+                && port.parse::<u16>().is_ok_and(|p| p != 0)
+        })
+        .ok_or_else(|| {
+            format!(
+                "ZMQ worker URL must be tcp://<host>:<port>, got '{}'",
+                masked(base_url)
+            )
+        })?;
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    if unbracketed
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+    {
+        return Err(format!(
+            "ZMQ worker {} names a wildcard host; the gateway hands its engines the addresses \
+             it binds, so name a host they can reach",
+            masked(base_url)
+        ));
+    }
+    let data_plane = format!("tcp://{host}:0");
+    Ok((base_url.to_string(), data_plane.clone(), data_plane))
+}
+
+/// A worker URL as a refusal may show it: its userinfo, when it has one,
+/// masked whole (`tcp://***@host:port`), since the text reaches the start-up
+/// log and the add-worker route's answer, and a userinfo may be a secret.
+fn masked(url: &str) -> String {
+    // The first `://` is the scheme separator only when what precedes it is
+    // made of scheme characters alone (letters, digits, `+`, `-`, `.`): a
+    // schemeless string may carry `://` later, in its path or inside its
+    // userinfo, and that one must not move the split past the userinfo.
+    let (prefix, authority) = match url.split_once("://") {
+        Some((scheme, rest))
+            if !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            (scheme, rest)
+        }
+        _ => ("", url),
+    };
+    match authority.rsplit_once('@') {
+        Some((_, host_port)) if prefix.is_empty() => format!("***@{host_port}"),
+        Some((_, host_port)) => format!("{prefix}://***@{host_port}"),
+        None => url.to_string(),
+    }
 }
 
 /// The TCP handshake address a ZMQ worker will bind.
@@ -128,7 +236,10 @@ pub fn zmq_handshake_address(
 /// its permissions are left untouched (never chmod a shared dir like `/tmp`)
 /// and it is rejected unless it is a real directory owned by the current user.
 pub(crate) async fn ensure_ipc_socket_dir(base_url: &str) -> Result<(), String> {
-    let path = base_url.strip_prefix("ipc://").unwrap_or(base_url);
+    // A `tcp://` worker binds no socket files.
+    let Some(path) = base_url.strip_prefix("ipc://") else {
+        return Ok(());
+    };
     let Some(parent) = Path::new(path).parent() else {
         return Ok(());
     };
@@ -363,6 +474,140 @@ mod tests {
         assert_eq!(handshake, "tcp://127.0.0.1:30500");
         assert_eq!(input, "ipc:///tmp/smg-zmq/ts0.ipc-in.sock");
         assert_eq!(output, "ipc:///tmp/smg-zmq/ts0.ipc-out.sock");
+    }
+
+    /// A `tcp://` worker binds its handshake at its own address and its data
+    /// plane on ephemeral ports of the same host, for engines on other hosts.
+    #[test]
+    fn a_tcp_worker_binds_its_handshake_at_its_url_and_its_data_plane_beside_it() {
+        let (handshake, input, output) =
+            zmq_socket_addresses("tcp://10.0.0.5:31000", Handshake::Derived).unwrap();
+        assert_eq!(handshake, "tcp://10.0.0.5:31000");
+        assert_eq!(input, "tcp://10.0.0.5:0");
+        assert_eq!(output, "tcp://10.0.0.5:0");
+        let (_, input, _) =
+            zmq_socket_addresses("tcp://[fd00::5]:31000", Handshake::Derived).unwrap();
+        assert_eq!(input, "tcp://[fd00::5]:0");
+        assert_eq!(
+            zmq_handshake_address("tcp://node0:31000", None).unwrap(),
+            "tcp://node0:31000"
+        );
+    }
+
+    /// A `tcp://` worker named by hostname keeps the name on its data plane:
+    /// the engines resolve it as they resolved the handshake address.
+    #[test]
+    fn a_tcp_worker_named_by_hostname_keeps_the_name_on_its_data_plane() {
+        let (handshake, input, output) =
+            zmq_socket_addresses("tcp://node0:31000", Handshake::Derived).unwrap();
+        assert_eq!(handshake, "tcp://node0:31000");
+        assert_eq!(input, "tcp://node0:0");
+        assert_eq!(output, "tcp://node0:0");
+    }
+
+    /// The INIT hands the engines the bound addresses, so a wildcard host (no
+    /// engine can dial it), a missing port, a bare IPv6 host without brackets
+    /// (it cannot be told apart from its port), and a second handshake address
+    /// are each refused.
+    #[test]
+    fn a_tcp_worker_refuses_a_wildcard_host_a_missing_port_and_an_override() {
+        for url in ["tcp://0.0.0.0:31000", "tcp://[::]:31000"] {
+            let err = zmq_socket_addresses(url, Handshake::Derived).unwrap_err();
+            assert!(err.contains("wildcard"), "{err}");
+        }
+        for url in [
+            "tcp://10.0.0.5",
+            "tcp://10.0.0.5:0",
+            "tcp://:31000",
+            "tcp://10.0.0.5:x",
+            "tcp://fd00::5",
+            "tcp://fd00::5:31000",
+        ] {
+            let err = zmq_socket_addresses(url, Handshake::Derived).unwrap_err();
+            assert!(err.contains("tcp://<host>:<port>"), "{url}: {err}");
+        }
+        let err = zmq_handshake_address("tcp://10.0.0.5:31000", Some("tcp://10.0.0.5:30500"))
+            .unwrap_err();
+        assert!(err.contains("takes no separate handshake address"), "{err}");
+    }
+
+    /// A `tcp://` URL with userinfo is refused whatever the userinfo's shape
+    /// (one with a colon would otherwise read as the host, one without would
+    /// be bound raw), so is a `tcp://` handshake override with one, and no
+    /// refusal writes a userinfo as written: the address is shown with it
+    /// masked, in every refusal text.
+    #[test]
+    fn a_tcp_worker_url_with_userinfo_is_refused_and_never_shown_raw() {
+        for url in [
+            "tcp://user:secret@10.0.0.5:31000",
+            "tcp://secret@10.0.0.5:31000",
+            "tcp://user:secret@[fd00::5]:31000",
+        ] {
+            let err = zmq_socket_addresses(url, Handshake::Derived).unwrap_err();
+            assert!(err.contains("without userinfo"), "{url}: {err}");
+            assert!(err.contains("tcp://***@"), "{url}: {err}");
+            assert!(!err.contains("secret"), "{url}: {err}");
+        }
+        let err =
+            zmq_socket_addresses("user:secret@10.0.0.5:31000", Handshake::Derived).unwrap_err();
+        assert!(err.contains("got '***@10.0.0.5:31000'"), "{err}");
+        let err = zmq_socket_addresses("tcp://user:secret@0.0.0.0:31000", Handshake::Derived)
+            .unwrap_err();
+        assert!(!err.contains("secret"), "{err}");
+        let err = zmq_handshake_address(
+            "tcp://user:secret@10.0.0.5:31000",
+            Some("tcp://10.0.0.5:30500"),
+        )
+        .unwrap_err();
+        assert!(err.contains("tcp://***@10.0.0.5:31000"), "{err}");
+        assert!(!err.contains("secret"), "{err}");
+        assert_eq!(masked("tcp://10.0.0.5:31000"), "tcp://10.0.0.5:31000");
+        for override_url in [
+            "http://user:secret@10.0.0.5:30500",
+            "user:secret@10.0.0.5:30500",
+            "tcp://user:secret@10.0.0.5:30500",
+        ] {
+            let err = zmq_handshake_address("ipc:///tmp/w", Some(override_url)).unwrap_err();
+            assert!(err.contains("***@10.0.0.5:30500"), "{override_url}: {err}");
+            assert!(!err.contains("secret"), "{override_url}: {err}");
+        }
+        let err = zmq_handshake_address("ipc:///tmp/w", Some("tcp://user:secret@10.0.0.5:30500"))
+            .unwrap_err();
+        assert!(err.contains("without userinfo"), "{err}");
+    }
+
+    /// A schemeless override that carries `://` later in the string (in its
+    /// path, or inside its userinfo) is still masked at its userinfo: the
+    /// later separator does not move the split, so the refusal never writes
+    /// the secret.
+    #[test]
+    fn a_schemeless_override_with_a_later_separator_is_masked() {
+        assert_eq!(masked("user:secret@host/x://y"), "***@host/x://y");
+        assert_eq!(masked("user:abc://def@host:30500"), "***@host:30500");
+        let err =
+            zmq_handshake_address("ipc:///tmp/w", Some("user:abc://def@host:30500")).unwrap_err();
+        assert!(err.contains("***@host:30500"), "{err}");
+        assert!(!err.contains("abc") && !err.contains("def"), "{err}");
+        let err =
+            zmq_handshake_address("ipc:///tmp/w", Some("user:secret@host/x://y")).unwrap_err();
+        assert!(err.contains("***@host/x://y"), "{err}");
+        assert!(!err.contains("secret"), "{err}");
+    }
+
+    /// A `://` inside a `tcp://` URL's path leaves the mask at the userinfo,
+    /// and the URL is refused for the userinfo with the secret masked.
+    #[test]
+    fn a_separator_inside_the_path_does_not_move_the_mask() {
+        assert_eq!(
+            masked("tcp://user:secret@10.0.0.5:31000/x://y"),
+            "tcp://***@10.0.0.5:31000/x://y"
+        );
+        let err =
+            zmq_socket_addresses("tcp://user:secret@10.0.0.5:31000/x://y", Handshake::Derived)
+                .unwrap_err();
+        assert!(err.contains("without userinfo"), "{err}");
+        assert!(err.contains("tcp://***@10.0.0.5:31000/x://y"), "{err}");
+        assert!(!err.contains("secret"), "{err}");
     }
 
     #[tokio::test]

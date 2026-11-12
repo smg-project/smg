@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 pub use engine_zmq_adapter::{
-    connect_for_worker, zmq_handshake_address, EosTokenIds, ZmqDialect, ZmqEngineClient,
-    ZmqGenerateStream, ZmqModelInfo, ZmqServerInfo,
+    connect_for_worker, zmq_handshake_address, EncodeRendezvous, EngineCount, EosTokenIds,
+    SglangProfileStart, ZmqDialect, ZmqEngineClient, ZmqGenerateStream, ZmqModelInfo,
+    ZmqServerInfo,
 };
 use llm_tokenizer::traits::Tokenizer;
 

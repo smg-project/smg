@@ -1,6 +1,7 @@
 //! DeepSeek V3.2: reasoning between `<think>` and `</think>`, the calls of one turn between
 //! `<｜DSML｜function_calls>` and `</｜DSML｜function_calls>`, each call between
-//! `<｜DSML｜invoke name="…">` and `</｜DSML｜invoke>`, everything else content: DSML as V4 spells
+//! `<｜DSML｜invoke name="…">` and `</｜DSML｜invoke>`, an invoke written outside a block a call too,
+//! as the serving engines' own parsers read it, everything else content: DSML as V4 spells
 //! it ([`deepseek_v4`]), with `function_calls` for the block's name where V4 writes `tool_calls`
 //! and V4.1 puts a space after the sentinel. As the reference encoder of
 //! `deepseek-ai/DeepSeek-V3.2` (the repository's `encoding` module, which the checkpoint ships in
@@ -23,12 +24,13 @@
 //! last of them, in the state it names, so the turn's earlier block and a tool result's text are
 //! not walked, and the turn is never unopened (the table has no unopened row: V4's would read the
 //! `<｜end▁of▁sentence｜>` after a tool result as one and start the output in the thought).
-//! DeepSeek-V3.2-Speciale ships the identical encoder; DeepSeek-V3.2-Exp, before
-//! it, writes the V3.1 spelling. The gateway's older `deepseek32` parser reads this format, and
-//! the alias takes a deployment that names it to this table. bellwether has no recorded group for
-//! the family yet: the table stands on the turns the encoder renders, each read as the encoder's
-//! own parser reads it in the tests below, and on the probes; the recorded set replays from the
-//! fixture pin once bellwether has it.
+//! DeepSeek-V3.2-Speciale ships the identical encoder; DeepSeek-V3.2-Exp, before it, ships a chat
+//! template in the V3.1 spelling, but the engine renders its architecture through this encoder
+//! and bellwether records it so, and its group reads here too. The gateway's older `deepseek32`
+//! parser reads this format, and the alias takes a deployment that names it to this table. The
+//! table stands on the turns the encoder renders, each read as the encoder's own parser reads it
+//! in the tests below, and on the probes; the recorded sets replay from the fixture pin as
+//! bellwether records them.
 //!
 //! The block's opener is spelled as the encoder's parser spells it: the blank line the encoder
 //! writes before the block and the tag, `\n\n<｜DSML｜function_calls>`, so the blank line leaves
@@ -71,6 +73,17 @@ pub fn deepseek_v3_2() -> Format {
         .transition("content", "separated_calls_open", "calls")
         .transition("reasoning", "separated_calls_open", "calls")
         .transition("calls", "invoke_open", "invoke")
+        // An invoke the model writes outside a block is the call, as the serving engines' own
+        // parsers for the family read it (their machines start a call at the invoke's opener from
+        // the content as from the block); before this row the table kept such an invoke as
+        // content, its two tags counted as markers out of place, and the call was lost. The
+        // close leads into the block's wrapping state, as a block's invoke's does, so a second
+        // bare invoke is the next call and prose after a bare call is text between calls; a
+        // block opener met there is wrapping, as it is to the engines' machines, so a call the
+        // model writes bare and then again inside a block is two calls and no markup.
+        .transition("content", "invoke_open", "invoke")
+        .transition("calls", "calls_open", "calls")
+        .transition("calls", "separated_calls_open", "calls")
         .transition("invoke", "invoke_close", "calls")
         .transition("invoke", "invoke_open", "invoke")
         .transition("invoke", "calls_close", "content")
@@ -99,7 +112,10 @@ mod tests {
         formats::{deepseek_v4, deepseek_v4_1},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{self, bytes, content, drive_to, reasoning, the_same_at_every_cut},
+        testing::{
+            self, an_invoke_outside_a_block_reads_as_the_engines_do, bytes, content, drive_to,
+            malformed, reasoning, the_same_at_every_cut, weather_tools,
+        },
         Declared,
     };
 
@@ -253,32 +269,61 @@ mod tests {
     }
 
     #[test]
-    fn the_other_dsml_spellings_are_content_here_and_this_one_under_them() {
-        // The registry reads each checkpoint with its own table: under this one the V4 block
-        // name and the V4.1 spaced tags are no markers, and under V4's and V4.1's tables this
-        // block is content.
+    fn the_other_dsml_spellings_read_as_the_engines_own_parsers_read_them() {
+        // The registry reads each checkpoint with its own table. The V4.1 spaced tags are no
+        // markers under this table, so a block in that spelling is content, and this block is
+        // content under V4.1's table. The V4 spelling shares this table's invoke and parameter
+        // tags and differs in the block's name alone: a block in that spelling here, or this
+        // block under V4's table, is the foreign opener as content, its invoke as the call (an
+        // invoke met outside a block the table knows), and the foreign close as text between
+        // calls, as the serving engines' own parsers for either spelling read it.
         let v4 = &OUTPUT.replace("function_calls", "tool_calls");
         let v4_1 = &v4
             .replace("<｜DSML｜", "<｜DSML｜ ")
             .replace("</｜DSML｜", "</｜DSML｜ ");
-        for other in [v4, v4_1] {
-            let events = run(THINKING, &[other]);
-            assert!(calls(&events).is_empty(), "{other:?}");
+        let events = run(THINKING, &[v4_1]);
+        assert!(calls(&events).is_empty(), "{v4_1:?}");
+        assert_eq!(content(&events), &v4_1["Need the weather.</think>".len()..]);
+        assert_eq!(finish(&events), (FinishReason::Stop, 0));
+        let events = run_table(deepseek_v4_1(), THINKING, &[OUTPUT], EngineFinish::Stop);
+        assert!(calls(&events).is_empty());
+        assert_eq!(
+            content(&events),
+            &OUTPUT["Need the weather.</think>".len()..]
+        );
+        for (name, events, opener, close) in [
+            (
+                "the V4 spelling under this table",
+                run(THINKING, &[v4]),
+                "\n\n<｜DSML｜tool_calls>\n",
+                "</｜DSML｜tool_calls>",
+            ),
+            (
+                "this block under V4's table",
+                run_table(deepseek_v4(), THINKING, &[OUTPUT], EngineFinish::Stop),
+                "\n\n<｜DSML｜function_calls>\n",
+                "</｜DSML｜function_calls>",
+            ),
+        ] {
             assert_eq!(
-                content(&events),
-                &other["Need the weather.</think>".len()..]
-            );
-            assert_eq!(finish(&events), (FinishReason::Stop, 0));
-        }
-        for other in [deepseek_v4(), deepseek_v4_1()] {
-            let name = other.name().to_string();
-            let events = run_table(other, THINKING, &[OUTPUT], EngineFinish::Stop);
-            assert!(calls(&events).is_empty(), "{name}");
-            assert_eq!(
-                content(&events),
-                &OUTPUT["Need the weather.</think>".len()..],
+                calls(&events),
+                [(
+                    "get_weather".to_string(),
+                    value!({"location": "Paris", "days": 3})
+                )],
                 "{name}"
             );
+            assert_eq!(finish(&events), (FinishReason::Stop, 1), "{name}");
+            assert_eq!(content(&events), opener, "{name}");
+            let between = malformed(&events);
+            assert!(
+                between
+                    .iter()
+                    .all(|(_, why)| *why == MalformedReason::TextBetweenCalls),
+                "{name}: {between:?}"
+            );
+            let text: String = between.into_iter().map(|(text, _)| text).collect();
+            assert_eq!(text, close, "{name}");
         }
     }
 
@@ -413,7 +458,9 @@ mod tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}),
+                parameters: Some(
+                    value!({"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}),
+                ),
                 strict: None,
                 extra: Default::default(),
             },
@@ -567,5 +614,52 @@ mod tests {
         // The reading and the writing agree on what the encoder puts before the block.
         let spelled = format!("{}<｜DSML｜function_calls>", Tags::DSML_V4.before_block);
         assert!(deepseek_v3_2().terminal_texts().any(|text| text == spelled));
+    }
+
+    /// Every shape of an invoke written outside a block (the shared
+    /// [`testing::an_invoke_outside_a_block_reads_as_the_engines_do`] lists them) reads as the
+    /// serving engines' own parsers read it; the V4 table's notes say why.
+    #[test]
+    fn every_shape_of_an_invoke_written_outside_a_block_reads_as_the_engines_own_parsers_read_it() {
+        an_invoke_outside_a_block_reads_as_the_engines_do(
+            run,
+            concat!(
+                "<｜DSML｜invoke name=\"add_integers\">\n",
+                "<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n",
+                "<｜DSML｜parameter name=\"b\" string=\"false\">8</｜DSML｜parameter>\n",
+                "</｜DSML｜invoke>"
+            ),
+            "<｜DSML｜function_calls>",
+            "</｜DSML｜function_calls>",
+            CHAT,
+            THINKING,
+        );
+    }
+
+    /// The rows from the content into an invoke change no forced-call tag: the grammar takes the
+    /// block from the wrapping state's row alone, so a forced call is still written as the block,
+    /// the block's opener with the template's blank line first, the invoke inside it, the block's
+    /// close last.
+    #[test]
+    fn a_forced_call_is_still_written_as_the_block() {
+        let payload = deepseek_v3_2()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let elements = &payload["format"]["elements"];
+        assert_eq!(
+            elements[0],
+            serde_json::json!({"type": "const_string", "value": "\n\n<｜DSML｜function_calls>\n"}),
+            "{payload}"
+        );
+        assert_eq!(
+            elements[1]["tags"][0]["begin"], "<｜DSML｜invoke name=\"get_weather\">\n",
+            "{payload}"
+        );
+        assert_eq!(
+            elements[2],
+            serde_json::json!({"type": "const_string", "value": "</｜DSML｜function_calls>"}),
+            "{payload}"
+        );
     }
 }

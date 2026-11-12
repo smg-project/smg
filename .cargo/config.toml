@@ -1,5 +1,20 @@
 [build]
-rustflags = []
+# LLVM's AArch64 code generator schedules the machine outliner as a module
+# pass, so under fat LTO with one codegen unit every machine function of the
+# whole program stays in memory until that pass has run; x86_64 does not
+# schedule the pass by default and frees each function as soon as it is
+# emitted. The aarch64 release build of the Python extension peaked at 2.2x
+# the x86_64 build for that reason and no longer fit a 16 GiB runner. By
+# default the outliner only touches `minsize` functions, which here are the
+# standard library's cold paths (panic hooks, backtrace symbolization,
+# OnceLock initialisation); nothing of this workspace or its dependencies is
+# marked for size, so turning the pass off leaves hot code untouched and
+# x86_64 byte-identical. Cargo does not merge this list with the per-target
+# lists below, which is why the flag is repeated there. A RUSTFLAGS variable
+# replaces this list as a whole, and several workflow steps set one (the
+# benchmark jobs' env blocks among them: `grep -rn RUSTFLAGS .github/workflows`),
+# so a flag added here is added to each of them as well.
+rustflags = ["-C", "llvm-args=-enable-machine-outliner=never"]
 incremental = true
 
 [env]
@@ -12,10 +27,12 @@ AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE = { value = "16", force = tr
 rustflags = [
     "-C", "link-arg=-undefined",
     "-C", "link-arg=dynamic_lookup",
+    "-C", "llvm-args=-enable-machine-outliner=never",
 ]
 
 [target.x86_64-apple-darwin]
 rustflags = [
     "-C", "link-arg=-undefined",
     "-C", "link-arg=dynamic_lookup",
+    "-C", "llvm-args=-enable-machine-outliner=never",
 ]

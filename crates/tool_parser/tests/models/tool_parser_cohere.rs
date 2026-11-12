@@ -192,20 +192,9 @@ async fn test_cohere_alternative_field_names() {
 
 #[tokio::test]
 async fn test_cohere_streaming_basic() {
-    use openai_protocol::common::Tool;
-
     let mut parser = CohereParser::new();
 
-    let tools = vec![Tool {
-        tool_type: "function".to_string(),
-        function: openai_protocol::common::Function {
-            name: "get_weather".to_string(),
-            description: Some("Get weather".to_string()),
-            parameters: json!({}),
-            strict: None,
-            extra: Default::default(),
-        },
-    }];
+    let tools = vec![common::tool("get_weather", "Get weather")];
 
     let chunks = vec![
         "<|START_RESPONSE|>",

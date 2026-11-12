@@ -16,6 +16,7 @@ use super::{
 use crate::{
     observability::metrics::Metrics,
     worker::{
+        endpoint::Endpoint,
         kv_event_recovery::{Admission, RankState, ResyncReason},
         kv_index_backend::KvIndex,
     },
@@ -175,13 +176,13 @@ impl KvEventMonitor {
         match admission {
             Admission::Apply => {}
             Admission::Stale => {
-                debug!(worker_url = %worker_url, rank, received = seq, "Skipping stale KV event batch");
+                debug!(worker_url = %Endpoint::redacted_str(worker_url), rank, received = seq, "Skipping stale KV event batch");
                 Metrics::record_kv_event_batch(worker_url, "stale");
                 return BatchOutcome::Skipped;
             }
             Admission::Restart if indexed => {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     received = seq,
                     "KV event publisher restarted; clearing the worker's index state"
@@ -206,7 +207,7 @@ impl KvEventMonitor {
                 // once, through its own rank's restart). A replay pending on
                 // that rank went with its old publisher.
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     received = seq,
                     "KV event publisher of another rank restarted; this worker's index is kept"
@@ -229,7 +230,7 @@ impl KvEventMonitor {
             }
             Admission::Unrecovered { missed, cleared } => {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     missed,
                     cleared,
@@ -280,8 +281,8 @@ impl KvEventMonitor {
                 }
                 _ => {}
             }
-            Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
+        Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
         Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
         Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if stored_blocks > 0 {
@@ -323,14 +324,14 @@ impl KvEventMonitor {
         if chunk.index == 0 || state.snapshot.is_none() {
             if chunk.index != 0 {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     index = chunk.index,
                     "KV event relay snapshot arrived without its first chunk; taking it as a resync"
                 );
             }
             info!(
-                worker_url = %worker_url,
+                worker_url = %Endpoint::redacted_str(worker_url),
                 rank,
                 chunks = chunk.count,
                 blocks = chunk.blocks,
@@ -340,7 +341,7 @@ impl KvEventMonitor {
             );
             if chunk.unknown_before > 0 {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     unknown_before = chunk.unknown_before,
                     "KV event relay snapshot starts late: the engine's blocks from before the \
@@ -376,8 +377,8 @@ impl KvEventMonitor {
                 if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
                     snapshot_blocks += stored.blocks.len();
                 }
-                Self::apply_event(event, worker_id, indexer, &mut state.index);
             }
+            Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
             Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
             if snapshot_blocks > 0 {
                 Metrics::record_kv_event_blocks(worker_url, "snapshot", snapshot_blocks);
@@ -392,7 +393,7 @@ impl KvEventMonitor {
             progress.applied += 1;
             if progress.applied >= progress.count {
                 info!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     chunks = progress.count,
                     blocks = progress.blocks,
                     through = batch.sequence_number,
@@ -432,8 +433,9 @@ impl KvEventMonitor {
         dropped
     }
 
-    /// Publish the stores a batch placed without their parent and the
-    /// sub-block stores it left out of the index, if any.
+    /// Publish the stores a batch placed without their parent, the sub-block
+    /// stores it left out of the index and the stores the index declined at an
+    /// arena cap, if any.
     fn record_not_indexed(
         worker_url: &str,
         after: &WorkerIndexCounters,
@@ -446,6 +448,10 @@ impl KvEventMonitor {
         let (stores, blocks) = after.sub_block_since(before);
         if stores > 0 {
             Metrics::record_kv_event_sub_block(worker_url, stores, blocks);
+        }
+        let (stores, blocks) = after.cap_refused_since(before);
+        if stores > 0 {
+            Metrics::record_kv_event_cap_refused(worker_url, stores, blocks);
         }
     }
 
@@ -501,7 +507,10 @@ mod tests {
     };
 
     use super::{super::apply::convert_kv_block, *};
-    use crate::worker::kv_event_recovery::{Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW};
+    use crate::worker::{
+        kv_event_recovery::{Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW},
+        test_support::kv_cache_cleared,
+    };
 
     /// Token ids for engine block `id`: distinct content per id.
     fn tokens_for(id: i64) -> Vec<u32> {
@@ -535,13 +544,6 @@ mod tests {
                 block_hashes: ids.to_vec(),
                 ..Default::default()
             })),
-        }
-    }
-
-    fn cleared() -> KvCacheEvent {
-        KvCacheEvent {
-            event_id: 0,
-            data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
         }
     }
 
@@ -615,7 +617,7 @@ mod tests {
             assert_eq!(index_blocks(&handle), Some(4.0), "two more stored");
 
             assert_eq!(
-                sim.feed(&batch(4, None, vec![cleared()])),
+                sim.feed(&batch(4, None, vec![kv_cache_cleared()])),
                 BatchOutcome::Applied
             );
             assert_eq!(sim.indexer.worker_block_count(sim.worker), 0);
@@ -867,7 +869,11 @@ mod tests {
         // "no cursor" once a batch carried it.
         let mut sim = Sim::new();
         assert_eq!(
-            sim.deliver(&batch(0, None, vec![cleared(), stored(None, &[1, 2])])),
+            sim.deliver(&batch(
+                0,
+                None,
+                vec![kv_cache_cleared(), stored(None, &[1, 2])]
+            )),
             BatchOutcome::Applied
         );
         assert_eq!(
@@ -1390,7 +1396,7 @@ mod tests {
         sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
         // SGLang's first batch after a restart carries AllBlocksCleared and
         // its counter starts over, with the servicer's stream still up.
-        let first = batch(0, None, vec![cleared(), stored(None, &[9])]);
+        let first = batch(0, None, vec![kv_cache_cleared(), stored(None, &[9])]);
         sim.reference_clear();
         sim.reference_apply(&first);
         assert_eq!(sim.feed(&first), BatchOutcome::Applied);
@@ -1413,7 +1419,7 @@ mod tests {
     fn recovery_cleared_event_matches_reference() {
         let mut sim = Sim::new();
         sim.deliver(&batch(1, None, vec![stored(None, &[1, 2, 3])]));
-        sim.deliver(&batch(2, None, vec![cleared()]));
+        sim.deliver(&batch(2, None, vec![kv_cache_cleared()]));
         sim.deliver(&batch(3, None, vec![stored(None, &[4])]));
         sim.assert_matches_reference();
         assert_eq!(sim.reference.worker_block_count(sim.worker), 1);
@@ -1500,7 +1506,7 @@ mod tests {
             .map(|(index, stores)| {
                 let mut events = Vec::new();
                 if index == 0 {
-                    events.push(cleared());
+                    events.push(kv_cache_cleared());
                 }
                 events.extend(stores.iter().cloned());
                 KvEventBatch {
@@ -1958,6 +1964,83 @@ mod tests {
                 Some(1.0)
             );
             sim.assert_matches_reference();
+        });
+    }
+
+    /// A store the index declines at an arena cap is counted per worker from
+    /// the block declined, on either attempt. A run's child table at its cap
+    /// (2^18 slots hold 196,608 live children) is filled by two-block chains
+    /// sharing their first block, the churn bench's fan-out shape; the next
+    /// chain's first block is placed and its second declined (one store, one
+    /// block), and a chain under a parent never seen takes the same refusal on
+    /// the parent-less retry. The reference has no cap, so this feeds the real
+    /// path alone.
+    #[test]
+    fn cap_refusals_are_counted_per_worker_on_either_attempt() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn counter(handle: &PrometheusHandle, name: &str) -> Option<f64> {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        // The first chain's second block is the run's own; every later chain is a
+        // child of the run.
+        const CHAINS: i64 = 196_609;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            let fill: Vec<KvCacheEvent> = (0..CHAINS)
+                .map(|chain| stored(None, &[1, 1_000 + chain]))
+                .collect();
+            sim.feed(&batch(1, None, fill));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_stores_total"),
+                None,
+                "the table takes the children up to the cap"
+            );
+            assert_eq!(
+                sim.indexer.worker_block_count(sim.worker),
+                CHAINS as usize + 1
+            );
+            // The first block is placed, the second declined: one block refused.
+            sim.feed(&batch(2, None, vec![stored(None, &[1, 2_000_000])]));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_stores_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_blocks_total"),
+                Some(1.0)
+            );
+            assert_eq!(sim.state.index.counters.cap_refused_stores, 1);
+            assert_eq!(sim.state.index.counters.cap_refused_blocks, 1);
+            // Under a parent never seen, the parent-less retry is declined the same
+            // way and counted on both counters.
+            sim.feed(&batch(3, None, vec![stored(Some(99), &[1, 2_000_001])]));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_stores_total"),
+                Some(2.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_blocks_total"),
+                Some(2.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                Some(1.0)
+            );
+            // The declined blocks are held by nothing; the placed first block was
+            // held already.
+            assert_eq!(
+                sim.indexer.worker_block_count(sim.worker),
+                CHAINS as usize + 1
+            );
         });
     }
 

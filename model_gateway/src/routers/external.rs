@@ -1,12 +1,13 @@
 //! The gateway's side of the external-router contract: what a third-party
 //! router gets to see of the gateway, and how one is mounted as a router.
 
-use std::{any::Any, fmt, sync::Arc, time::Duration};
+use std::{any::Any, fmt, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
+    common::GenerationRequest,
     interactions::InteractionsRequest,
     messages::CreateMessageRequest,
     realtime_session::{
@@ -21,10 +22,17 @@ use smg_external_router::{
     ExternalContext, ExternalRouter, ExternalRouterSpec, RetryConfig,
 };
 
-use super::{common::worker_selection::WorkerSelector, RouterTrait};
+use super::{
+    common::worker_selection::WorkerSelector,
+    grpc::utils::{error_reason_for_response, error_type_for_response, route_to_endpoint},
+    http::tenant_rate_limit::{self, TenantCharge},
+    RouterTrait,
+};
 use crate::{
     app_context::AppContext,
     middleware::TenantRequestMeta,
+    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    rate_limit::RateLimitManager,
     worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
@@ -40,7 +48,7 @@ impl GatewayWorker {
 impl fmt::Debug for GatewayWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GatewayWorker")
-            .field("url", &self.0.url())
+            .field("url", &self.0.redacted_url())
             .finish()
     }
 }
@@ -48,6 +56,10 @@ impl fmt::Debug for GatewayWorker {
 impl ExternalWorker for GatewayWorker {
     fn url(&self) -> &str {
         self.0.url()
+    }
+
+    fn redacted_url(&self) -> &str {
+        self.0.redacted_url()
     }
 
     fn api_key(&self) -> Option<&String> {
@@ -157,6 +169,13 @@ pub fn external_context(ctx: &AppContext) -> ExternalContext {
 pub struct ExternalRouterAdapter {
     spec: ExternalRouterSpec,
     inner: Arc<dyn ExternalRouter>,
+    /// The tenant rate limiter, when configured: every route that charges a
+    /// tenant reserves through it before the router dispatches
+    /// ([`Self::route_reserved`]).
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// The registry, for the canonical name of the model a route names
+    /// ([`Self::route_reserved`]).
+    worker_registry: Arc<WorkerRegistry>,
 }
 
 impl ExternalRouterAdapter {
@@ -166,11 +185,107 @@ impl ExternalRouterAdapter {
         ctx: &AppContext,
     ) -> Result<Box<dyn RouterTrait>, String> {
         let inner = (spec.build)(external_context(ctx)).await?;
-        Ok(Box::new(Self { spec, inner }))
+        Ok(Box::new(Self {
+            spec,
+            inner,
+            rate_limit_manager: ctx.rate_limit_manager.clone(),
+            worker_registry: ctx.worker_registry.clone(),
+        }))
     }
 
     pub fn spec(&self) -> &ExternalRouterSpec {
         &self.spec
+    }
+
+    /// Route `request` through the provider router under the tenant's
+    /// reservation, as the gateway's own HTTP routers route theirs: reserved
+    /// once before the dispatch, resolved once on the router's answer
+    /// (`tenant_rate_limit`). A denied request never reaches the provider
+    /// router, so its request and its refusal are counted here. The
+    /// reservation is keyed by the canonical name of `model_id`, an alias
+    /// resolved through the registry as the other routers resolve theirs;
+    /// the count carries the name as the route gave it, like the provider
+    /// router's own series.
+    async fn route_reserved<T, F, Fut>(
+        &self,
+        tenant_meta: &TenantRequestMeta,
+        request: T,
+        route: &'static str,
+        model_id: &str,
+        dispatch: F,
+    ) -> Response
+    where
+        T: TenantCharge + Send,
+        F: FnOnce(T) -> Fut + Send,
+        Fut: Future<Output = Response> + Send,
+    {
+        let is_stream = request.is_stream();
+        // Resolve once, here, so the reservation is keyed by the canonical
+        // model ID, as on the regular and the disaggregated routers: the
+        // limiter's per-model rules match the name, and an alias (configured,
+        // or a provider's discovered variant) is registered against the
+        // served one. The provider router gets the name the route gave it,
+        // as before, and so does a refusal's count, which sits next to that
+        // router's own series.
+        let requested_model = model_id;
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let model_id = canonical_model.as_deref().unwrap_or(model_id);
+        let (reservation, denial) = tenant_rate_limit::reserve(
+            tenant_rate_limit::estimate(
+                self.rate_limit_manager.as_deref(),
+                Some(tenant_meta),
+                &request,
+                None,
+            ),
+            model_id,
+        )
+        .await;
+        let response = match denial {
+            Some(denied) => {
+                self.record_denied(requested_model, route, is_stream, &denied);
+                denied
+            }
+            None => dispatch(request).await,
+        };
+        // A buffered answer is the provider's body, held whole already (the
+        // router read it without a bound), so the re-read is unbounded.
+        tenant_rate_limit::resolve(reservation.as_ref(), route, is_stream, response, usize::MAX)
+            .await
+    }
+
+    /// Count a request the tenant limit refused ahead of the provider
+    /// router, which counts the ones it dispatches: the request under the
+    /// router's type (`router_type`, the name the router gives itself) with
+    /// backend `external` and the route's endpoint, and the refusal under its
+    /// class and reason. The OpenAI-compatible router counts its dispatched
+    /// traffic under that same type; the Anthropic router counts its own
+    /// under the HTTP router's type and the Gemini router counts none, so a
+    /// refusal of theirs is the first series under their own name. `model_id`
+    /// is the name the route gave, as those routers label their own series
+    /// (an alias stays an alias), under the gateway's label bound: a name the
+    /// registry does not know counts as `other`, where the provider router's
+    /// own bound keeps the name.
+    fn record_denied(&self, model_id: &str, route: &str, is_stream: bool, denied: &Response) {
+        let router_type = self.inner.router_type();
+        let endpoint = route_to_endpoint(route);
+        let model_label = self.worker_registry.metric_model_label(model_id);
+        Metrics::record_router_request(
+            router_type,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model_label,
+            endpoint,
+            bool_to_static_str(is_stream),
+        );
+        Metrics::record_router_error(
+            router_type,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model_label,
+            endpoint,
+            error_type_for_response(denied),
+            error_reason_for_response(denied),
+        );
     }
 }
 
@@ -208,9 +323,14 @@ impl RouterTrait for ExternalRouterAdapter {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.inner
-            .route_chat(headers, tenant_meta, body, model_id)
-            .await
+        self.route_reserved(
+            tenant_meta,
+            body,
+            "/v1/chat/completions",
+            model_id,
+            |body| self.inner.route_chat(headers, tenant_meta, body, model_id),
+        )
+        .await
     }
 
     async fn route_responses(
@@ -220,9 +340,11 @@ impl RouterTrait for ExternalRouterAdapter {
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.inner
-            .route_responses(headers, tenant_meta, body, model_id)
-            .await
+        self.route_reserved(tenant_meta, body, "/v1/responses", model_id, |body| {
+            self.inner
+                .route_responses(headers, tenant_meta, body, model_id)
+        })
+        .await
     }
 
     async fn route_messages(
@@ -232,9 +354,18 @@ impl RouterTrait for ExternalRouterAdapter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        self.inner
-            .route_messages(headers, tenant_meta, body, model_id)
-            .await
+        // `rid` is this gateway's extension, forwarded to an engine for log
+        // correlation; a provider refuses an unknown top-level field. The
+        // OpenAI-compatible providers drop the gateway-only fields from
+        // their JSON payload (`strip_sglang_fields`); a Messages provider
+        // posts the typed request, so the field is cleared here.
+        let mut body = body;
+        body.rid = None;
+        self.route_reserved(tenant_meta, body, "/v1/messages", model_id, |body| {
+            self.inner
+                .route_messages(headers, tenant_meta, body, model_id)
+        })
+        .await
     }
 
     async fn route_interactions(
@@ -244,9 +375,17 @@ impl RouterTrait for ExternalRouterAdapter {
         body: InteractionsRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.inner
-            .route_interactions(headers, tenant_meta, body, model_id)
-            .await
+        // The charge is keyed by the model the route named, else the one the
+        // request names.
+        let model = model_id
+            .or_else(|| body.get_model())
+            .unwrap_or_default()
+            .to_owned();
+        self.route_reserved(tenant_meta, body, "/v1/interactions", &model, |body| {
+            self.inner
+                .route_interactions(headers, tenant_meta, body, model_id)
+        })
+        .await
     }
 
     async fn route_realtime_session(
@@ -281,5 +420,83 @@ impl RouterTrait for ExternalRouterAdapter {
 
     async fn route_realtime_webrtc(&self, req: Request<Body>, model_id: &str) -> Response {
         self.inner.route_realtime_webrtc(req, model_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use axum::{http::StatusCode, response::IntoResponse};
+    use serde_json::{json, Value};
+    use smg_external_router::spec_for_provider;
+
+    use super::*;
+    use crate::middleware::{RouteRequestMeta, TenantKey};
+
+    /// A provider router of the kind the adapter mounts, keeping the
+    /// Messages request it was handed as the JSON it would post: the trait's
+    /// two required methods, every other route its default.
+    #[derive(Debug, Default)]
+    struct RecordingProvider {
+        posted: Mutex<Option<Value>>,
+    }
+
+    #[async_trait]
+    impl ExternalRouter for RecordingProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn route_messages(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            body: CreateMessageRequest,
+            _model_id: &str,
+        ) -> Response {
+            let posted = serde_json::to_value(&body).expect("a request serializes");
+            *self.posted.lock().expect("the recorder") = Some(posted);
+            StatusCode::OK.into_response()
+        }
+    }
+
+    /// A Messages request reaches its provider without the gateway's `rid`:
+    /// a thread turn carries the id the gateway minted, a plain request the
+    /// client's own, and a provider refuses the unknown field.
+    #[tokio::test]
+    async fn a_provider_gets_no_rid() {
+        let provider = Arc::new(RecordingProvider::default());
+        let adapter = ExternalRouterAdapter {
+            spec: spec_for_provider(None).expect("the OpenAI-compatible spec"),
+            inner: provider.clone(),
+            rate_limit_manager: None,
+            worker_registry: Arc::new(WorkerRegistry::new()),
+        };
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 1,
+            "rid": "msg_minted",
+            "messages": [{"role": "user", "content": "q"}],
+        }))
+        .expect("a request");
+        let tenant_meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+        let response = adapter
+            .route_messages(None, &tenant_meta, request, "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let posted = provider
+            .posted
+            .lock()
+            .expect("the recorder")
+            .take()
+            .expect("a posted request");
+        assert!(posted.get("rid").is_none(), "{posted}");
+        assert_eq!(posted["model"], "m");
+        assert_eq!(posted["messages"][0]["content"], "q");
     }
 }

@@ -43,10 +43,12 @@
 //! rides in the second run's `Malformed` event, so that where the chunks were cut changes
 //! nothing. A region the stream cut is ended with what arrived. Tagged parameters close as the
 //! template's reader closes a region at the end of its text: the arguments' object is closed over
-//! the parameters that finished, and the text of one the cut left unfinished is dropped as
-//! wrapping. One JSON value or object is not closed for the client, and what was held after it
-//! comes back as `Malformed` with `UnterminatedRegion`, the whitespace between its words kept and
-//! the runs before the first word and after the last dropped as wrapping. A value that never began,
+//! the parameters that finished, and the cut is said once before the call's end by a `Malformed`
+//! with `UnterminatedRegion` that carries the bytes of a parameter the cut left open (none when
+//! it fell between parameters). One JSON value or object is not closed for the client, and what
+//! was held after it comes back as `Malformed` with `UnterminatedRegion`, the whitespace between
+//! its words kept and the runs before the first word and after the last dropped as wrapping. A
+//! value that never began,
 //! the cut or the region's close right after the header, is said to be none the same way a
 //! value cut short is, by a `Malformed` event of no bytes before the call's end
 //! ([`json::Arguments::finish`]), so that a call is never handed over whole with an empty string
@@ -368,7 +370,7 @@ impl Assembler {
     /// Append the next bytes of the call, after its start, and push the events they complete,
     /// a parameter's value typed by `declared`. Every byte is the call's until the engine closes
     /// the region.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
         let shape = self.shape;
         let Stage::Body(body) = &mut self.stage else {
             return;
@@ -428,8 +430,10 @@ impl Assembler {
     /// with `UnterminatedRegion`, the whitespace around it dropped and the whitespace between its
     /// words kept; a value that never began is said to be none before the end, as one cut short
     /// is. Tagged parameters close as at the end of the text: those still undecided are decided
-    /// there, the bytes no parameter took are dropped as wrapping, and the arguments' object is
-    /// closed.
+    /// there, the bytes no parameter took are dropped as wrapping, the arguments' object is
+    /// closed, and the cut is said once before the call's end, as the tagged and JSON syntaxes say
+    /// theirs: `Malformed` with `UnterminatedRegion`, its text the bytes of a parameter the cut
+    /// left open (a tag the stream ended inside), none when the cut fell between parameters.
     pub fn finish(mut self, declared: &Declared, out: &mut Events) {
         let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return;
@@ -437,7 +441,11 @@ impl Assembler {
         let ends = match body {
             Body::Value(value) => value.finish(out),
             Body::Params(params) => {
-                params.finish(declared, out);
+                let open = params.finish(declared, out);
+                out.push(Event::Malformed {
+                    text: Text::uncounted(open),
+                    why: MalformedReason::UnterminatedRegion,
+                });
                 true
             }
         };
@@ -492,12 +500,12 @@ impl Value {
         }
     }
 
-    fn feed(
+    fn feed<'d>(
         &mut self,
         shape: &'static CallShape,
         (values, declared): (&Values, &Declared),
-        bytes: &str,
-        out: &mut Events,
+        bytes: &'d str,
+        out: &mut Events<'d>,
     ) {
         let mut rest = bytes;
         let handed_back;
@@ -510,14 +518,15 @@ impl Value {
                 declared,
                 name: &self.name,
             };
+            // The reader takes the delta's own bytes, so a fragment within them borrows them.
             let taken = match &mut self.reader {
-                JsonReader::Json(arguments) => arguments.feed(rest, &typing, out),
-                JsonReader::Envelope(assembler) => assembler.feed(rest, out),
+                JsonReader::Json(arguments) => arguments.feed(bytes, &typing, out),
+                JsonReader::Envelope(assembler) => assembler.feed(bytes, out),
             };
-            if let Some(last) = rest[..taken].chars().next_back() {
+            if let Some(last) = bytes[..taken].chars().next_back() {
                 self.before = Some(last);
             }
-            rest = &rest[taken..];
+            rest = &bytes[taken..];
             if !self.reader.over() {
                 return;
             }
@@ -793,7 +802,7 @@ mod tests {
                         source: bytes,
                     },
                 ) if *index == other => {
-                    json.push_str(&more);
+                    json.to_mut().push_str(&more);
                     source.text.to_mut().push_str(&bytes.text);
                 }
                 (Some(Event::Content(text)), Event::Content(more))
@@ -888,6 +897,13 @@ mod tests {
         }
     }
 
+    fn malformed(text: &str) -> Event<'static> {
+        Event::Malformed {
+            text: Text::uncounted(text.to_owned()),
+            why: MalformedReason::UnterminatedRegion,
+        }
+    }
+
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
     }
@@ -904,7 +920,7 @@ mod tests {
     fn arguments(json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(json.to_owned()),
         }
     }
@@ -1162,7 +1178,7 @@ mod tests {
             function: openai_protocol::common::Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1595,7 +1611,7 @@ mod tests {
     fn member(json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(source.to_owned()),
         }
     }
@@ -1603,7 +1619,7 @@ mod tests {
     fn closed() -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: "}".to_string(),
+            json: "}".into(),
             source: Text::default(),
         }
     }
@@ -1714,10 +1730,10 @@ mod tests {
             function: openai_protocol::common::Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": {
+                parameters: Some(serde_json::json!({"type": "object", "properties": {
                     "s": {"type": "string"},
                     "n": {"type": "integer"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1754,26 +1770,50 @@ mod tests {
             [
                 wrapper("<c>"),
                 start("f", ""),
-                member("{\"a\": 1", "<k=a>1</k>  "),
-                wrapper("<k=b>2"),
-                closed(),
+                member("{\"a\": 1}", "<k=a>1</k>  "),
+                malformed("<k=b>2"),
                 end(""),
                 length.clone(),
             ],
-            "the parameter whose end waited for more whitespace is whole at the end, the one the \
-             cut left unfinished is dropped, and the object closes"
+            "the parameter whose end waited for more whitespace is whole at the end, the object \
+             closes over it, and the one the cut left open is the cut's marker, its bytes \
+             malformed, not wrapping"
         );
         assert_eq!(
             run_after(&format, "", "<c><k=b>2", EngineFinish::Length),
             [
                 wrapper("<c>"),
                 start("f", ""),
-                wrapper("<k=b>2"),
                 member("{}", ""),
+                malformed("<k=b>2"),
+                end(""),
+                length.clone(),
+            ],
+            "a call cut before any parameter finished closes with no arguments and says the cut"
+        );
+        assert_eq!(
+            run_after(&format, "", "<c><k=a>1</k>\n<k", EngineFinish::Length),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1}", "<k=a>1</k>\n"),
+                malformed("<k"),
+                end(""),
+                length.clone(),
+            ],
+            "a start of the trigger the cut left unfinished is the cut's marker, not wrapping"
+        );
+        assert_eq!(
+            run_after(&format, "", "<c><k=a>1</k>\n", EngineFinish::Length),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                member("{\"a\": 1}", "<k=a>1</k>\n"),
+                malformed(""),
                 end(""),
                 length,
             ],
-            "a call cut before any parameter finished closes with no arguments"
+            "a cut between parameters is said with a marker of no bytes, as the tagged syntax says it"
         );
         let stopped = table(tagged(closed_by_tag(), Pattern::default())).closes_at_stop("call");
         assert_eq!(
@@ -1881,6 +1921,7 @@ mod tests {
                 member("{\"a\": 1", "<k=a>1</k>"),
                 wrapper("\n</c>"),
                 closed(),
+                malformed(""),
                 end(""),
                 Event::Finish {
                     reason,
@@ -1896,7 +1937,7 @@ mod tests {
             ),
             cut(crate::event::FinishReason::Stop),
             "without the row the stop does not close the region, which is cut and closes as at \
-             the end of the text"
+             the end of the text, saying the cut once before its end"
         );
         assert_eq!(
             run_after(&format, "", "<c><k=a>1</k>\n</c>", EngineFinish::Length),
@@ -2035,10 +2076,10 @@ mod tests {
             function: openai_protocol::common::Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": {
+                parameters: Some(serde_json::json!({"type": "object", "properties": {
                     "n": {"type": "integer"},
                     "s": {"type": "string"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -2059,7 +2100,7 @@ mod tests {
             events[2],
             Event::ToolCallArguments {
                 index: 0,
-                json: "{\"n\": 5, \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}".to_string(),
+                json: "{\"n\": 5, \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}".into(),
                 source: Text::uncounted(
                     "{\"n\": \"5\", \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}"
                 ),
@@ -2078,7 +2119,7 @@ mod tests {
             [
                 Event::ToolCallArguments {
                     index: 0,
-                    json: "{\"n\": 5, ".to_string(),
+                    json: "{\"n\": 5, ".into(),
                     source: Text::uncounted("{\"n\": \"5\", "),
                 },
                 Event::Malformed {
@@ -2087,7 +2128,7 @@ mod tests {
                 },
                 Event::ToolCallArguments {
                     index: 0,
-                    json: "x}".to_string(),
+                    json: "x}".into(),
                     source: Text::uncounted("x}"),
                 },
             ],

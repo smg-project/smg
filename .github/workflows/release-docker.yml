@@ -1,13 +1,17 @@
 name: Release Docker Image
 
+# A push builds the images to validate the Dockerfile and pushes nothing; the images are published
+# only on a maintainer's dispatch against a release tag or branch (scripts/release/README.md).
+# Two images come out of docker/Dockerfile: the router image and its `-slurm` variant, the
+# router image with the Slurm client commands the Slurm discovery provider runs.
 on:
   push:
     branches:
       - main
+      - release/**
     paths:
       - .cargo/config.toml
       - docker/Dockerfile
-      - bindings/python/pyproject.toml
   workflow_dispatch:
     inputs:
       tag:
@@ -25,7 +29,7 @@ permissions:
 
 jobs:
   # Always runs: validates the Dockerfile builds successfully.
-  # Pushes only when triggered by a version bump (pyproject.toml) or manual dispatch.
+  # Pushes only on a manual dispatch.
   build-and-push:
     name: Build and push Docker image
     if: github.repository == 'smg-project/smg'
@@ -57,28 +61,43 @@ jobs:
         id: should-push
         env:
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_BEFORE: ${{ github.event.before }}
-          EVENT_AFTER: ${{ github.sha }}
         run: |
+          # Only a manual dispatch publishes; a push run validates the build.
           PUSH="false"
-          # Manual dispatch always pushes
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             PUSH="true"
           fi
-          # Push event: only push if pyproject.toml changed (version bump)
-          # Uses the full push range (before..after) to catch changes across
-          # multiple commits, not just HEAD~1.
-          if [[ "${EVENT_NAME}" == "push" ]]; then
-            # Capture changed files first so a git failure fails the step,
-            # instead of being swallowed by the pipe and silently leaving
-            # PUSH=false.
-            CHANGED=$(git diff --name-only "${EVENT_BEFORE}" "${EVENT_AFTER}")
-            if grep -q '^bindings/python/pyproject.toml$' <<<"${CHANGED}"; then
-              PUSH="true"
-            fi
-          fi
           echo "push=${PUSH}" >> "$GITHUB_OUTPUT"
           echo "Will push: ${PUSH}"
+
+      - name: Image tags
+        id: tags
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          # A candidate (a pre-release suffix such as 1.14.0-rc.1) never moves `latest`.
+          # The `-slurm` variant takes every tag of the router image with `-slurm` appended.
+          TAGS="lightseekorg/smg:${VERSION}"$'\n'"ghcr.io/${OWNER}/smg:${VERSION}"
+          LATEST="false"
+          if [[ "${VERSION}" != *-* ]]; then
+            TAGS+=$'\n'"lightseekorg/smg:latest"$'\n'"ghcr.io/${OWNER}/smg:latest"
+            LATEST="true"
+          fi
+          SLURM_TAGS=""
+          while IFS= read -r tag; do
+            SLURM_TAGS+="${SLURM_TAGS:+$'\n'}${tag}-slurm"
+          done <<< "${TAGS}"
+          {
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+            echo "slurm_tags<<EOF"
+            echo "${SLURM_TAGS}"
+            echo "EOF"
+            echo "latest=${LATEST}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tags: ${TAGS//$'\n'/ } and ${SLURM_TAGS//$'\n'/ } (latest moves: ${LATEST})"
 
       - name: Set up QEMU
         if: env.MIRROR_EXISTING != 'true'
@@ -109,12 +128,24 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
+          target: router-image
           push: ${{ steps.should-push.outputs.push }}
-          tags: |
-            lightseekorg/smg:${{ steps.version.outputs.version }}
-            lightseekorg/smg:latest
-            ghcr.io/${{ github.repository_owner }}/smg:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/smg:latest
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      # The same build plus one apt layer: every other layer is a cache hit from the step above.
+      - name: Build and push the variant with the Slurm clients
+        id: build-slurm
+        if: env.MIRROR_EXISTING != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: router-slurm-image
+          push: ${{ steps.should-push.outputs.push }}
+          tags: ${{ steps.tags.outputs.slurm_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
@@ -124,34 +155,54 @@ jobs:
         if: env.MIRROR_EXISTING == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          LATEST: ${{ steps.tags.outputs.latest }}
         run: |
           CURRENT_VERSION=$(grep -m1 '^version = ' bindings/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           if [[ "${VERSION}" != "${CURRENT_VERSION}" ]]; then
             echo "::error::Mirror mode only supports the current release (${CURRENT_VERSION})."
             exit 1
           fi
-          SOURCE="lightseekorg/smg:${VERSION}"
-          GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}"
-          GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest"
-          docker buildx imagetools create \
-            --tag "${GHCR_IMAGE}" \
-            --tag "${GHCR_LATEST}" \
-            "${SOURCE}"
-          DIGEST=$(docker buildx imagetools inspect "${GHCR_IMAGE}" --format '{{.Manifest.Digest}}')
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          # The router image and its -slurm variant, each from its Docker Hub tag. The router
+          # image must be there; a variant that is not (its build failed after the router
+          # image was pushed) is reported and skipped, so the mirror of the rest stands.
+          for VARIANT in "" "-slurm"; do
+            SOURCE="lightseekorg/smg:${VERSION}${VARIANT}"
+            if [[ -n "${VARIANT}" ]] && ! docker buildx imagetools inspect "${SOURCE}" > /dev/null 2>&1; then
+              echo "::warning::${SOURCE} is not on Docker Hub; the ${VARIANT} variant was not mirrored."
+              continue
+            fi
+            GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}${VARIANT}"
+            GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest${VARIANT}"
+            TAG_ARGS=(--tag "${GHCR_IMAGE}")
+            if [[ "${LATEST}" == "true" ]]; then
+              TAG_ARGS+=(--tag "${GHCR_LATEST}")
+            fi
+            docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCE}"
+            DIGEST=$(docker buildx imagetools inspect "${GHCR_IMAGE}" --format '{{.Manifest.Digest}}')
+            echo "digest${VARIANT//-/_}=${DIGEST}" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Summary
         if: always()
         env:
           PUSH: ${{ steps.should-push.outputs.push }}
           PUBLISH_OUTCOME: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outcome || steps.build.outcome }}
+          SLURM_OUTCOME: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outcome || steps.build-slurm.outcome }}
           VERSION: ${{ steps.version.outputs.version }}
+          LATEST: ${{ steps.tags.outputs.latest }}
           DIGEST: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outputs.digest || steps.build.outputs.digest }}
+          SLURM_DIGEST: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outputs.digest_slurm || steps.build-slurm.outputs.digest }}
         run: |
           IMAGE="lightseekorg/smg:${VERSION}"
-          LATEST="lightseekorg/smg:latest"
+          LATEST_IMAGE="lightseekorg/smg:latest"
           GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}"
           GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest"
+          # The variant counts as published only with a digest: in mirror mode a variant missing
+          # from Docker Hub is skipped with a warning and leaves the step's outcome at success.
+          SLURM_PUBLISHED="false"
+          if [[ "${SLURM_OUTCOME}" == "success" && -n "${SLURM_DIGEST}" ]]; then
+            SLURM_PUBLISHED="true"
+          fi
           if [[ "${PUBLISH_OUTCOME}" == "success" && "${PUSH}" == "true" ]]; then
             {
               echo "### ✅ Release images available"
@@ -159,19 +210,39 @@ jobs:
               echo "| Registry | Tag | Reference |"
               echo "| --- | --- | --- |"
               echo "| Docker Hub | \`${VERSION}\` | \`${IMAGE}\` |"
-              echo "| Docker Hub | \`latest\` | \`${LATEST}\` |"
               echo "| GHCR | \`${VERSION}\` | \`${GHCR_IMAGE}\` |"
-              echo "| GHCR | \`latest\` | \`${GHCR_LATEST}\` |"
+              if [[ "${LATEST}" == "true" ]]; then
+                echo "| Docker Hub | \`latest\` | \`${LATEST_IMAGE}\` |"
+                echo "| GHCR | \`latest\` | \`${GHCR_LATEST}\` |"
+              fi
+              if [[ "${SLURM_PUBLISHED}" == "true" ]]; then
+                echo "| Docker Hub | \`${VERSION}-slurm\` | \`${IMAGE}-slurm\` |"
+                echo "| GHCR | \`${VERSION}-slurm\` | \`${GHCR_IMAGE}-slurm\` |"
+                if [[ "${LATEST}" == "true" ]]; then
+                  echo "| Docker Hub | \`latest-slurm\` | \`${LATEST_IMAGE}-slurm\` |"
+                  echo "| GHCR | \`latest-slurm\` | \`${GHCR_LATEST}-slurm\` |"
+                fi
+              fi
               if [[ -n "${DIGEST}" ]]; then
                 echo ""
                 echo "Digest: \`${DIGEST}\`"
               fi
+              if [[ "${SLURM_PUBLISHED}" == "true" ]]; then
+                echo ""
+                echo "Digest of the \`-slurm\` variant: \`${SLURM_DIGEST}\`"
+              else
+                echo ""
+                echo "The \`-slurm\` variant was **not** published (outcome: \`${SLURM_OUTCOME}\`, digest: \`${SLURM_DIGEST:-none}\`)."
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
+            if [[ "${SLURM_PUBLISHED}" != "true" ]]; then
+              echo "::warning::The -slurm variant of ${IMAGE} was not published (outcome: ${SLURM_OUTCOME}, digest: ${SLURM_DIGEST:-none})."
+            fi
           elif [[ "${PUBLISH_OUTCOME}" == "success" ]]; then
             {
-              echo "### ⚠️ Docker image built but NOT pushed"
+              echo "### ⚠️ Docker images built but NOT pushed"
               echo ""
-              echo "\`${IMAGE}\` was built and validated, but not published — no version bump in \`bindings/python/pyproject.toml\` and not a manual dispatch."
+              echo "\`${IMAGE}\` was built and validated (its \`-slurm\` variant: \`${SLURM_OUTCOME}\`), but not published — the images are published on a manual dispatch only."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::Docker image ${IMAGE} was built but not pushed."
           else

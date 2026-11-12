@@ -22,7 +22,8 @@ use std::{
 };
 
 use gateway_launch::{
-    base_args, free_ports, launch, log_with_line, serial, Until, EXIT_TIMEOUT, IP,
+    base_args, free_ports, launch, log_with_line, serial, served_connection, Until, EXIT_TIMEOUT,
+    IP,
 };
 
 use crate::gateway_launch;
@@ -158,6 +159,67 @@ fn the_admin_listener_carries_the_control_plane_and_the_data_listener_answers_40
     let line = format!("Admin listener serving the control plane on {admin} (--admin-port)");
     if let Err(log) = log_with_line(&gateway.log, &line, EXIT_TIMEOUT) {
         panic!("the start does not report the admin listener\n{log}");
+    }
+    drop(gateway);
+}
+
+/// `--admin-max-connections` bounds the admin listener: with a bound of
+/// one, a second connection is closed at accept and answers nothing, the
+/// data listener answers throughout, and the admin listener answers again
+/// once the held connection closes.
+#[test]
+fn the_admin_listener_refuses_connections_beyond_its_bound_at_accept() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let [port, metrics_port, admin_port] = free_ports();
+    let mut args = base_args(port, metrics_port);
+    args.extend(
+        [
+            "--admin-port",
+            &admin_port.to_string(),
+            "--admin-max-connections",
+            "1",
+        ]
+        .map(str::to_string),
+    );
+    let data = SocketAddr::from((IP, port));
+    let admin = SocketAddr::from((IP, admin_port));
+    let gateway = Gateway::start(&args, data, &dir.path().join("gateway.log"));
+
+    let line = "HTTP connection limit on the admin listener";
+    if let Err(log) = log_with_line(&gateway.log, line, EXIT_TIMEOUT) {
+        panic!("the start does not report the admin listener's bound\n{log}");
+    }
+    assert_eq!(status_of(admin, "/health"), Some(200), "under the bound");
+
+    // One served connection, kept open, holds the bound; the next is closed
+    // at accept. Its answer proves it holds the permit before the probe: a
+    // bare connect returns before the acceptor has admitted it, and the
+    // `/health` connection above may still hold the permit for a moment.
+    let held = served_connection(admin, EXIT_TIMEOUT);
+    assert_eq!(
+        status_of(admin, "/health"),
+        None,
+        "the bound-plus-one connection was answered"
+    );
+    // The refusal's WARN names this listener and its flag: the accept site
+    // passes the listener, and a swapped argument there names the other one.
+    let refusal = "the admin listener's connection limit (--admin-max-connections) is reached";
+    if let Err(log) = log_with_line(&gateway.log, refusal, EXIT_TIMEOUT) {
+        panic!("the refusal does not name the admin listener and its flag\n{log}");
+    }
+    assert_eq!(status_of(data, "/health"), Some(200), "the data listener");
+
+    // The permit goes with the held connection; the listener answers again.
+    drop(held);
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    while status_of(admin, "/health") != Some(200) {
+        assert!(
+            Instant::now() < deadline,
+            "the admin listener did not answer again after the held connection closed\n{}",
+            gateway.log()
+        );
+        thread::sleep(Duration::from_millis(50));
     }
     drop(gateway);
 }

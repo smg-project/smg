@@ -1,7 +1,13 @@
-//! The mock engine the client's stream-behaviour tests drive: an in-process
-//! server of the engine's wire that records the request ids it is asked to
-//! abort and keeps the sender of the open generate stream for the test, which
-//! plays the engine's side of it (silence, a chunk, the end of the stream).
+//! The mock engine the client's behaviour tests drive: an in-process server
+//! of the engine's wire that records the request ids it is asked to abort,
+//! the trace header each call carried, and keeps the sender of the open
+//! generate stream for the test, which plays the engine's side of it
+//! (silence, a chunk, the end of the stream).
+#![allow(
+    dead_code,
+    clippy::allow_attributes,
+    reason = "each test binary reads the helpers it needs; the others are unused there"
+)]
 
 use std::{
     sync::{Arc, Mutex},
@@ -15,12 +21,19 @@ use tonic::{transport::Server, Request, Response, Status};
 
 pub type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
+/// The metadata key the client's trace injector writes (the W3C trace
+/// context's header), read by the mock from every call that injects it.
+pub const TRACE_HEADER: &str = "traceparent";
+
 #[derive(Default)]
 pub struct MockState {
     /// Sender feeding the currently open generate stream.
     generate_tx: Mutex<Option<GenerateTx>>,
     /// Request ids passed to Abort.
     aborted: Mutex<Vec<String>>,
+    /// The calls served that the client injects the trace context into,
+    /// each with the `TRACE_HEADER` value it carried, in arrival order.
+    traced: Mutex<Vec<(&'static str, Option<String>)>>,
 }
 
 impl MockState {
@@ -36,6 +49,27 @@ impl MockState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// The injecting calls served so far, each with the trace header it carried.
+    pub fn traced(&self) -> Vec<(&'static str, Option<String>)> {
+        self.traced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records `call` with the trace header `request` carried, if any.
+    fn record_trace<T>(&self, call: &'static str, request: &Request<T>) {
+        let header = request
+            .metadata()
+            .get(TRACE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        self.traced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((call, header));
+    }
 }
 
 #[derive(Clone, Default)]
@@ -47,24 +81,31 @@ struct MockEngine {
 impl proto::vllm_engine_server::VllmEngine for MockEngine {
     async fn start_profile(
         &self,
-        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
+        request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
     ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        self.state.record_trace("StartProfile", &request);
+        Ok(Response::new(
+            smg_grpc_client::common_proto::ProfileResponse::default(),
+        ))
     }
 
     async fn stop_profile(
         &self,
-        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
+        request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
     ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        self.state.record_trace("StopProfile", &request);
+        Ok(Response::new(
+            smg_grpc_client::common_proto::ProfileResponse::default(),
+        ))
     }
 
     type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
 
     async fn generate(
         &self,
-        _request: Request<proto::GenerateRequest>,
+        request: Request<proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        self.state.record_trace("Generate", &request);
         let (tx, rx) = mpsc::channel(4);
         *self.state.lock_tx() = Some(tx);
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -86,6 +127,7 @@ impl proto::vllm_engine_server::VllmEngine for MockEngine {
         &self,
         request: Request<smg_grpc_client::common_proto::FlushCacheRequest>,
     ) -> Result<Response<smg_grpc_client::common_proto::FlushCacheResponse>, Status> {
+        self.state.record_trace("FlushCache", &request);
         Ok(Response::new(
             smg_grpc_client::common_proto::FlushCacheResponse {
                 success: request.into_inner().timeout_s == 1.5,
@@ -96,9 +138,10 @@ impl proto::vllm_engine_server::VllmEngine for MockEngine {
 
     async fn embed(
         &self,
-        _request: Request<proto::EmbedRequest>,
+        request: Request<proto::EmbedRequest>,
     ) -> Result<Response<proto::EmbedResponse>, Status> {
-        Err(Status::unimplemented("unused in tests"))
+        self.state.record_trace("Embed", &request);
+        Ok(Response::new(proto::EmbedResponse::default()))
     }
 
     async fn health_check(
@@ -150,7 +193,8 @@ impl proto::vllm_engine_server::VllmEngine for MockEngine {
     }
 }
 
-pub async fn spawn_mock() -> Result<(String, Arc<MockState>), Box<dyn std::error::Error>> {
+pub async fn spawn_mock(
+) -> Result<(String, Arc<MockState>), Box<dyn std::error::Error + Send + Sync>> {
     let mock = MockEngine::default();
     let state = Arc::clone(&mock.state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

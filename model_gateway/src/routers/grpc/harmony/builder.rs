@@ -37,6 +37,28 @@ use crate::routers::grpc::{
 /// Global Harmony encoding (lazy-initialized)
 static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 
+/// The text of a Responses message item's content parts as Harmony carries
+/// it: input text, output text and a refusal (losslessly text) verbatim. An
+/// image or a file part is refused by name, as chat audio is
+/// ([`reject_chat_audio`]), never dropped from the prompt behind an answer
+/// that reads as if the model had seen it.
+fn harmony_text_parts(parts: &[ResponseContentPart]) -> Result<Vec<String>, String> {
+    parts
+        .iter()
+        .map(|part| match part {
+            ResponseContentPart::OutputText { text, .. }
+            | ResponseContentPart::InputText { text } => Ok(text.clone()),
+            ResponseContentPart::Refusal { refusal } => Ok(refusal.clone()),
+            ResponseContentPart::InputImage { .. } => {
+                Err("Harmony does not support \"input_image\" content parts".to_string())
+            }
+            ResponseContentPart::InputFile { .. } => {
+                Err("Harmony does not support \"input_file\" content parts".to_string())
+            }
+        })
+        .collect()
+}
+
 fn reject_chat_audio(messages: &[ChatMessage]) -> Result<(), String> {
     let has_audio = messages.iter().any(|message| match message {
         ChatMessage::System { content, .. }
@@ -149,16 +171,20 @@ mod own_thread_tests {
     }
 }
 
-/// Convert ProtoOutputLogProbs to OpenAI ChatLogProbs format using Harmony's tokenizer
+/// Convert an output's logprobs, read in place on the engine message, to the
+/// OpenAI ChatLogProbs format using Harmony's tokenizer.
 ///
-/// Delegates to the shared `convert_proto_logprobs` with Harmony's built-in tokenizer
-/// for token ID decoding.
+/// `top_logprobs` is the request's; [`utils::requested_alternatives`] turns it
+/// into the candidates the answer carries per token, the rule the regular chat
+/// path reads, and only those are decoded.
 pub(crate) fn convert_harmony_logprobs(
     encoding: &HarmonyEncoding,
-    proto_logprobs: &ProtoOutputLogProbs,
+    proto_logprobs: ProtoOutputLogProbs<'_>,
+    top_logprobs: Option<u32>,
 ) -> ChatLogProbs {
     let tokenizer = encoding.tokenizer();
-    utils::convert_proto_logprobs(proto_logprobs, |token_id| {
+    let requested = Some(utils::requested_alternatives(top_logprobs));
+    utils::convert_proto_logprobs(proto_logprobs, requested, |token_id| {
         tokenizer
             .decode_utf8([token_id])
             .unwrap_or_else(|_| format!("<token_{token_id}>"))
@@ -197,12 +223,12 @@ const BUILTIN_TOOLS: &[&str] = &[
 
 /// Trait for tool-like objects that can be converted to Harmony ToolDescription
 trait ToolLike {
-    /// Check if this is a built-in tool (should be skipped in developer message).
+    /// Whether this is a built-in tool (one the developer message skips).
     ///
-    /// Only exercised by tests today; once per-worker hosted-tool
-    /// capability flags land (R0 follow-up), production code will dispatch
-    /// on this to gate advertisement per model.
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved for R0 follow-up"))]
+    /// Compiled for the tests alone: nothing in the pipeline reads it yet.
+    /// Once per-worker hosted-tool capability flags land, production code
+    /// dispatches on it to gate advertisement per model.
+    #[cfg(test)]
     fn is_builtin(&self) -> bool;
 
     /// Check if this is a custom tool (function or MCP)
@@ -219,6 +245,7 @@ trait ToolLike {
 
 /// Implement ToolLike for Chat Completion Tool
 impl ToolLike for Tool {
+    #[cfg(test)]
     fn is_builtin(&self) -> bool {
         matches!(
             self.tool_type.as_str(),
@@ -234,13 +261,14 @@ impl ToolLike for Tool {
         Some(ToolDescription::new(
             self.function.name.clone(),
             self.function.description.clone().unwrap_or_default(),
-            Some(self.function.parameters.clone()),
+            Some(self.function.parameters_schema().clone()),
         ))
     }
 }
 
 /// Implement ToolLike for Responses API Tool
 impl ToolLike for ResponseTool {
+    #[cfg(test)]
     fn is_builtin(&self) -> bool {
         matches!(
             self,
@@ -280,7 +308,7 @@ impl ToolLike for ResponseTool {
             ResponseTool::Function(ft) => Some(ToolDescription::new(
                 ft.function.name.clone(),
                 ft.function.description.clone().unwrap_or_default(),
-                Some(ft.function.parameters.clone()),
+                Some(ft.function.parameters_schema().clone()),
             )),
             ResponseTool::ImageGeneration(_) => Some(image_generation_tool_description()),
             _ => None,
@@ -365,6 +393,19 @@ fn chat_tools(request: &ChatCompletionRequest) -> Option<Vec<Tool>> {
         .then(|| request.effective_tools().cloned().collect())
 }
 
+/// A chat request's instructions and the messages after them. As on vLLM's
+/// chat path, a leading system or developer message holds the instructions,
+/// which Harmony carries in the developer message; an empty one holds none.
+fn split_instructions(messages: &[ChatMessage]) -> (Option<String>, &[ChatMessage]) {
+    match messages.split_first() {
+        Some((
+            ChatMessage::System { content, .. } | ChatMessage::Developer { content, .. },
+            rest,
+        )) => (content.has_text().then(|| content.to_simple_string()), rest),
+        _ => (None, messages),
+    }
+}
+
 /// Harmony request builder
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
@@ -407,7 +448,7 @@ impl HarmonyBuilder {
     ///
     /// # Returns
     ///
-    /// HarmonyBuildOutput containing input_ids, stop_token_ids, selection_text, and messages
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids and selection_text
     pub fn build_from_chat(
         &self,
         request: &ChatCompletionRequest,
@@ -421,18 +462,24 @@ impl HarmonyBuilder {
         let sys_msg = self.build_system_message_from_chat(request);
         all_messages.push(sys_msg);
 
-        let dev_msg = self.build_developer_message_from_chat(chat_tools(request).as_ref());
-        all_messages.push(dev_msg);
+        // As on the Responses path, a developer message only when there are
+        // instructions or tools to carry.
+        let (instructions, messages) = split_instructions(&request.messages);
+        let tools = chat_tools(request).filter(|tools| !tools.is_empty());
+        if instructions.is_some() || tools.is_some() {
+            let dev_msg =
+                self.build_developer_message_from_chat(instructions.as_deref(), tools.as_ref());
+            all_messages.push(dev_msg);
+        }
 
-        let mut user_messages = self.convert_chat_messages(&request.messages);
+        let mut user_messages = self.convert_chat_messages(messages);
         all_messages.append(&mut user_messages);
 
-        let conversation = Conversation::from_messages(all_messages.clone());
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
         let token_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
         let stop_token_ids: Vec<u32> = encoding
@@ -445,10 +492,6 @@ impl HarmonyBuilder {
             input_ids: token_ids,
             stop_token_ids,
             selection_text,
-            harmony_messages: all_messages
-                .into_iter()
-                .map(super::types::HarmonyMessage::from_openai_harmony)
-                .collect(),
         })
     }
 
@@ -460,7 +503,7 @@ impl HarmonyBuilder {
     ///
     /// # Returns
     ///
-    /// HarmonyBuildOutput containing input_ids, stop_token_ids, selection_text, and messages
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids and selection_text
     pub fn build_from_responses(
         &self,
         request: &ResponsesRequest,
@@ -468,12 +511,11 @@ impl HarmonyBuilder {
         let encoding = try_harmony_encoding()?;
         let all_messages = self.construct_input_messages_with_harmony(request)?;
 
-        let conversation = Conversation::from_messages(all_messages.clone());
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
         let token_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
         let stop_token_ids: Vec<u32> = encoding
@@ -499,10 +541,6 @@ impl HarmonyBuilder {
             input_ids: token_ids,
             stop_token_ids,
             selection_text,
-            harmony_messages: all_messages
-                .into_iter()
-                .map(super::types::HarmonyMessage::from_openai_harmony)
-                .collect(),
         })
     }
 
@@ -582,7 +620,8 @@ impl HarmonyBuilder {
     ///
     /// # Arguments
     /// * `tools` - Optional list of tools
-    /// * `instructions` - Optional instructions (Responses API only)
+    /// * `instructions` - Optional instructions (a Responses request's
+    ///   `instructions`, or a chat request's leading system or developer message)
     #[expect(
         clippy::unused_self,
         reason = "method on HarmonyBuilder for logical grouping"
@@ -594,7 +633,7 @@ impl HarmonyBuilder {
     ) -> HarmonyMessage {
         let mut dev_content = DeveloperContent::new();
 
-        // Add instructions if provided (Responses API only)
+        // Add instructions if provided
         if let Some(instructions) = instructions {
             dev_content = dev_content.with_instructions(instructions.to_string());
         }
@@ -637,8 +676,12 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
     }
 
-    fn build_developer_message_from_chat(&self, tools: Option<&Vec<Tool>>) -> HarmonyMessage {
-        self.build_developer_message(tools, None)
+    fn build_developer_message_from_chat(
+        &self,
+        instructions: Option<&str>,
+        tools: Option<&Vec<Tool>>,
+    ) -> HarmonyMessage {
+        self.build_developer_message(tools, instructions)
     }
 
     /// Build developer message from Responses request
@@ -781,23 +824,9 @@ impl HarmonyBuilder {
                     _ => Role::User, // Default to user for unknown roles
                 };
 
-                // Extract text from content parts. `Refusal` is losslessly
-                // representable as text and is preserved verbatim. Image /
-                // file parts are currently dropped (R1/R2/R3 will implement
-                // full media handling).
-                let text_parts: Vec<String> = content
-                    .iter()
-                    .filter_map(|part| match part {
-                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                        ResponseContentPart::InputText { text } => Some(text.clone()),
-                        ResponseContentPart::Refusal { refusal } => Some(refusal.clone()),
-                        // R1/R2/R3 will implement full media handling
-                        ResponseContentPart::InputImage { .. }
-                        | ResponseContentPart::InputFile { .. } => None,
-                    })
-                    .collect();
-
-                let text = text_parts.join("\n");
+                // The text of the content parts; an image or a file part is
+                // refused (`harmony_text_parts`).
+                let text = harmony_text_parts(content)?.join("\n");
 
                 Ok(HarmonyMessage {
                     author: Author {
@@ -916,24 +945,7 @@ impl HarmonyBuilder {
 
                 let text = match content {
                     StringOrContentParts::String(s) => s.clone(),
-                    StringOrContentParts::Array(parts) => {
-                        // Extract text from content parts. `Refusal` is
-                        // losslessly representable as text and is preserved
-                        // verbatim. Image / file parts are currently dropped
-                        // (R1/R2/R3 will implement full media handling).
-                        parts
-                            .iter()
-                            .filter_map(|part| match part {
-                                ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                                ResponseContentPart::InputText { text } => Some(text.clone()),
-                                ResponseContentPart::Refusal { refusal } => Some(refusal.clone()),
-                                // R1/R2/R3 will implement full media handling
-                                ResponseContentPart::InputImage { .. }
-                                | ResponseContentPart::InputFile { .. } => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
+                    StringOrContentParts::Array(parts) => harmony_text_parts(parts)?.join("\n"),
                 };
 
                 Ok(HarmonyMessage {
@@ -1109,15 +1121,15 @@ impl HarmonyBuilder {
                     content,
                     name,
                     tool_calls,
-                    reasoning_content,
+                    reasoning,
                     ..
                 } => {
                     if let Some(calls) = tool_calls.as_ref().filter(|c| !c.is_empty()) {
                         // Per Harmony spec: when tool calls are present, include
                         // previous reasoning as a separate analysis channel message
                         // because the model calls tools as part of its chain-of-thought.
-                        if let Some(reasoning) = reasoning_content {
-                            if !reasoning.is_empty() {
+                        if let Some(text) = &reasoning.text {
+                            if !text.is_empty() {
                                 let analysis_msg = HarmonyMessage {
                                     author: Author {
                                         role: Role::Assistant,
@@ -1125,7 +1137,7 @@ impl HarmonyBuilder {
                                     },
                                     recipient: None,
                                     content: vec![Content::Text(TextContent {
-                                        text: reasoning.clone(),
+                                        text: text.clone(),
                                     })],
                                     channel: Some("analysis".to_string()),
                                     content_type: None,
@@ -1212,7 +1224,7 @@ impl HarmonyBuilder {
                         },
                         recipient: Some("assistant".to_string()),
                         content: vec![Content::Text(TextContent {
-                            text: content.clone(),
+                            text: content.clone().unwrap_or_default(),
                         })],
                         channel: None,
                         content_type: None,
@@ -1341,9 +1353,10 @@ mod tests {
     //!      gpt-oss is trained to emit calls against.
 
     use openai_protocol::{
-        common::{AudioUrl, InputAudio},
+        common::{AudioUrl, ChatLogProbsContent, InputAudio},
         responses::{ImageGenerationTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
+    use smg_grpc_client::vllm_proto as vllm;
 
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
@@ -1465,6 +1478,42 @@ mod tests {
         let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
         assert!(error.contains("vendor_media"));
         assert!(error.contains("gRPC"));
+    }
+
+    /// A Responses message item's `input_image` or `input_file` part has no
+    /// form in a Harmony prompt: the build refuses it by name, as it refuses
+    /// chat audio, instead of rendering the turn without it; a message item
+    /// and a simple input message alike.
+    #[test]
+    fn build_from_responses_refuses_image_and_file_parts() {
+        let builder = HarmonyBuilder::new();
+        let parts = [
+            (
+                json!({"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}),
+                "\"input_image\"",
+            ),
+            (
+                json!({"type": "input_file", "file_data": "JVBERi0xLjQK", "filename": "a.pdf"}),
+                "\"input_file\"",
+            ),
+        ];
+        for (part, name) in parts {
+            let inputs = [
+                json!([{"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hi"}, part.clone()
+                ]}]),
+                json!([{"role": "user", "content": [part.clone()]}]),
+            ];
+            for input in inputs {
+                let request: ResponsesRequest =
+                    serde_json::from_value(json!({"model": "gpt-oss-120b", "input": input}))
+                        .unwrap();
+                let error = builder
+                    .build_from_responses(&request)
+                    .expect_err("a media part is refused");
+                assert!(error.contains(name), "{error}");
+            }
+        }
     }
 
     #[test]
@@ -1669,13 +1718,13 @@ mod tests {
                     function: Function {
                         name: "image_generation".to_string(),
                         description: Some("mcp-exposed duplicate".to_string()),
-                        parameters: json!({
+                        parameters: Some(json!({
                             "type": "object",
                             "properties": {
                                 "prompt": {"type": "string"}
                             },
                             "required": ["prompt"]
-                        }),
+                        })),
                         strict: None,
                         extra: Default::default(),
                     },
@@ -1805,7 +1854,7 @@ mod tests {
             });
             assert_eq!(commentary, !expected.is_empty(), "{case}");
             // The developer message describes the same tools.
-            let developer = builder.build_developer_message_from_chat(tools.as_ref());
+            let developer = builder.build_developer_message_from_chat(None, tools.as_ref());
             assert_eq!(developer.content.len(), 1, "{case}");
             let described: Vec<String> = developer
                 .content
@@ -1824,5 +1873,300 @@ mod tests {
                 .collect();
             assert_eq!(described, expected, "{case}");
         }
+    }
+
+    /// An engine's answer for two generated tokens, three candidates each:
+    /// the sampled token ranked beside two runners-up, whether or not
+    /// alternatives were asked for.
+    fn three_candidates_per_position() -> vllm::OutputLogProbs {
+        vllm::OutputLogProbs {
+            token_logprobs: vec![-0.1, -0.2],
+            token_ids: vec![1, 2],
+            top_logprobs: vec![
+                vllm::TopLogProbs {
+                    values: vec![-0.1, -1.5, -2.5],
+                    token_ids: vec![1, 3, 5],
+                },
+                vllm::TopLogProbs {
+                    values: vec![-0.2, -1.6, -2.6],
+                    token_ids: vec![2, 4, 6],
+                },
+            ],
+        }
+    }
+
+    /// The per-token entries of a converted answer.
+    fn entries(logprobs: ChatLogProbs) -> Vec<ChatLogProbsContent> {
+        match logprobs {
+            ChatLogProbs::Detailed { content, .. } => content.unwrap_or_default(),
+            ChatLogProbs::Raw(_) => Vec::new(),
+        }
+    }
+
+    /// A chat request on the Harmony path gets the `top_logprobs` candidates
+    /// it asked for per token, none when it asked for none, as it does on
+    /// the regular path: the engine's surplus candidates stay behind.
+    #[test]
+    fn harmony_logprobs_carry_only_the_requested_candidates() {
+        let encoding = try_harmony_encoding().expect("harmony encoding must load");
+        let proto = three_candidates_per_position();
+        for (top_logprobs, expected) in [
+            (None, 0),
+            (Some(0), 0),
+            (Some(1), 1),
+            (Some(2), 2),
+            (Some(3), 3),
+            (Some(5), 3),
+        ] {
+            let answered = entries(convert_harmony_logprobs(
+                encoding,
+                ProtoOutputLogProbs::Vllm(&proto),
+                top_logprobs,
+            ));
+            let per_token: Vec<usize> = answered
+                .iter()
+                .map(|entry| entry.top_logprobs.len())
+                .collect();
+            assert_eq!(
+                per_token,
+                vec![expected; 2],
+                "top_logprobs {top_logprobs:?}"
+            );
+        }
+    }
+
+    /// The candidates kept are the engine's first ones in its order, each
+    /// decoded by Harmony's tokenizer as the sampled token is.
+    #[test]
+    fn harmony_logprobs_keep_the_engines_first_candidates() {
+        let encoding = try_harmony_encoding().expect("harmony encoding must load");
+        let text = |token_id: u32| {
+            encoding
+                .tokenizer()
+                .decode_utf8([token_id])
+                .expect("a token of the vocabulary")
+        };
+        let proto = three_candidates_per_position();
+        let answered = entries(convert_harmony_logprobs(
+            encoding,
+            ProtoOutputLogProbs::Vllm(&proto),
+            Some(2),
+        ));
+        let tokens: Vec<String> = answered.iter().map(|entry| entry.token.clone()).collect();
+        assert_eq!(tokens, vec![text(1), text(2)]);
+        let candidates: Vec<Vec<String>> = answered
+            .iter()
+            .map(|entry| {
+                entry
+                    .top_logprobs
+                    .iter()
+                    .map(|candidate| candidate.token.clone())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            candidates,
+            vec![vec![text(1), text(3)], vec![text(2), text(4)]]
+        );
+    }
+
+    // The prompts vLLM's Harmony renderer tests expect for the same chat
+    // requests (`rust/src/chat/src/renderer/harmony/fixtures/` in
+    // vllm-project/vllm at 7b77ed58).
+    const SIMPLE_USER: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>",
+        "<|start|>user<|message|>Hello, who are you?<|end|>",
+        "<|start|>assistant",
+    );
+    const LEADING_SYSTEM: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: high\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>",
+        "<|start|>developer<|message|># Instructions\n",
+        "\n",
+        "Answer tersely.<|end|>",
+        "<|start|>user<|message|>What is 2 + 2?<|end|>",
+        "<|start|>assistant",
+    );
+    const DEVELOPER_TOOLS: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.\n",
+        "Calls to these tools must go to the commentary channel: 'functions'.<|end|>",
+        "<|start|>developer<|message|># Instructions\n",
+        "\n",
+        "Use tools when needed.\n",
+        "\n",
+        "# Tools\n",
+        "\n",
+        "## functions\n",
+        "\n",
+        "namespace functions {\n",
+        "\n",
+        "// Lookup a record.\n",
+        "type lookup = (_: {\n",
+        "id: string,\n",
+        "}) => any;\n",
+        "\n",
+        "} // namespace functions<|end|>",
+        "<|start|>user<|message|>Find record abc.<|end|>",
+        "<|start|>assistant",
+    );
+    const REQUEST_TOOLS: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.\n",
+        "Calls to these tools must go to the commentary channel: 'functions'.<|end|>",
+        "<|start|>developer<|message|># Tools\n",
+        "\n",
+        "## functions\n",
+        "\n",
+        "namespace functions {\n",
+        "\n",
+        "// Get weather for a city.\n",
+        "type get_weather = (_: {\n",
+        "city: string,\n",
+        "}) => any;\n",
+        "\n",
+        "} // namespace functions<|end|>",
+        "<|start|>user<|message|>Check Hangzhou weather.<|end|>",
+        "<|start|>assistant",
+    );
+
+    /// The prompt `request` renders to, dated like vLLM's fixtures.
+    fn rendered_chat_prompt(request: serde_json::Value) -> String {
+        let request: ChatCompletionRequest =
+            serde_json::from_value(request).expect("request deserializes");
+        let output = HarmonyBuilder::new()
+            .build_from_chat(&request)
+            .expect("harmony build must succeed");
+        let mut prompt = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+        // The builder dates the conversation today.
+        let date =
+            prompt.find("Current date: ").expect("a conversation date") + "Current date: ".len();
+        prompt.replace_range(date..date + "2025-06-28".len(), "2025-06-28");
+        prompt
+    }
+
+    /// `prompt` without `commentary` in its valid channels: `build_system_message`
+    /// still drops it for a request without tools, where vLLM keeps it.
+    fn without_commentary(prompt: &str) -> String {
+        prompt.replace("analysis, commentary, final", "analysis, final")
+    }
+
+    /// A chat request with neither instructions nor tools gets no developer
+    /// message, as on the Responses path and vLLM's chat path.
+    #[test]
+    fn a_chat_request_without_instructions_or_tools_has_no_developer_message() {
+        let user = json!({"role": "user", "content": "Hello, who are you?"});
+        let cases = [
+            (
+                "no system message",
+                json!({"model": "gpt-oss-120b", "messages": [user]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            (
+                "an empty system message",
+                json!({"model": "gpt-oss-120b", "messages": [{"role": "system", "content": ""}, user]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            (
+                "a system message of empty text parts",
+                json!({"model": "gpt-oss-120b", "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": ""}
+                    ]},
+                    user
+                ]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            // A tool list, even an empty one, keeps the commentary channel.
+            (
+                "an empty tool list",
+                json!({"model": "gpt-oss-120b", "messages": [user], "tools": []}),
+                SIMPLE_USER.to_string(),
+            ),
+        ];
+        for (case, request, expected) in cases {
+            assert_eq!(rendered_chat_prompt(request), expected, "{case}");
+        }
+    }
+
+    /// A leading system or developer message becomes the developer message's
+    /// instructions, as on vLLM's chat path, instead of a second system message
+    /// after the builder's own.
+    #[test]
+    fn a_leading_system_or_developer_message_becomes_the_developer_instructions() {
+        for role in ["system", "developer"] {
+            let prompt = rendered_chat_prompt(json!({
+                "model": "gpt-oss-120b",
+                "reasoning_effort": "high",
+                "messages": [
+                    {"role": role, "content": "Answer tersely."},
+                    {"role": "user", "content": "What is 2 + 2?"}
+                ]
+            }));
+            assert_eq!(prompt, without_commentary(LEADING_SYSTEM), "{role}");
+        }
+    }
+
+    /// Instructions and tools share the one developer message, instructions
+    /// first. vLLM's fixture declares the tool on the developer message; a
+    /// gpt-oss request declares it at the request level.
+    #[test]
+    fn leading_instructions_come_before_the_tools_in_one_developer_message() {
+        let prompt = rendered_chat_prompt(json!({
+            "model": "gpt-oss-120b",
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "description": "Lookup a record.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+            }}],
+            "messages": [
+                {"role": "developer", "content": "Use tools when needed."},
+                {"role": "user", "content": "Find record abc."}
+            ]
+        }));
+        assert_eq!(prompt, DEVELOPER_TOOLS);
+    }
+
+    /// A request with tools and no instructions keeps its tools-only developer
+    /// message.
+    #[test]
+    fn a_chat_request_with_tools_keeps_its_developer_message() {
+        let prompt = rendered_chat_prompt(json!({
+            "model": "gpt-oss-120b",
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city.",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+                "strict": true
+            }}],
+            "messages": [{"role": "user", "content": "Check Hangzhou weather."}]
+        }));
+        assert_eq!(prompt, REQUEST_TOOLS);
     }
 }

@@ -14,7 +14,7 @@ use smg::{
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
-    test_support::RefusedAddress,
+    worker::test_support::RefusedAddress,
 };
 
 use crate::common::{
@@ -1328,6 +1328,9 @@ fn test_usage_conversion() {
         prompt_tokens_details: Some(openai_protocol::common::PromptTokenUsageInfo {
             cached_tokens: 3,
             audio_tokens: None,
+            text_tokens: None,
+            image_tokens: None,
+            cache_write_tokens: None,
         }),
     };
     let response_usage = usage_info.to_response_usage();

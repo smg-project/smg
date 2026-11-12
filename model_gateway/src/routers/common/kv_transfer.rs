@@ -149,7 +149,8 @@ pub(crate) fn is_moriio_worker(worker: &dyn Worker) -> bool {
 /// The host defaults to the worker URL's host and the ports to vLLM's.
 pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, String> {
     let spec = &worker.metadata().spec;
-    let url = worker.url();
+    // The address as the refusals name it: a userinfo in it masked.
+    let url = worker.redacted_url();
     if !is_moriio_worker(worker) {
         return Err(format!("{url} is not a {MORIIO_CONNECTOR} worker"));
     }
@@ -169,7 +170,7 @@ pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, Str
     };
     if worker.dp_rank().is_some() {
         return Err(format!(
-            "{url}: MoRI-IO PD pins both legs of a request to one data-parallel rank itself; \
+            "{url}: MoRI-IO PD pins both sides of a request to one data-parallel rank itself; \
              register the engine once, with a dp_size label, instead of one worker per rank"
         ));
     }
@@ -242,7 +243,7 @@ pub(crate) fn moriio_dp_mismatch_error(
 ) -> Option<String> {
     (prefill.dp_size != decode.dp_size).then(|| {
         format!(
-            "prefill dp_size={} but decode dp_size={}: MoRI-IO PD sends both legs of a \
+            "prefill dp_size={} but decode dp_size={}: MoRI-IO PD sends both sides of a \
              request to the same data-parallel rank, so both engines need the same dp_size",
             prefill.dp_size, decode.dp_size
         )
@@ -501,7 +502,7 @@ pub(crate) fn moriio_side_channel_error(
             .map_or_else(|| "none".to_string(), Value::to_string)
     };
     Some(format!(
-        "prefill reports MoRI-IO side channel handshake {} / notify {}, but the decode leg \
+        "prefill reports MoRI-IO side channel handshake {} / notify {}, but the decode worker \
          was told {} / {}; set labels {MORIIO_HANDSHAKE_PORT_LABEL} / \
          {MORIIO_NOTIFY_PORT_LABEL} on the prefill worker",
         shown("remote_handshake_port"),
@@ -514,7 +515,7 @@ pub(crate) fn moriio_side_channel_error(
 /// Connector id of the engine core serving the prefill side. With DP the cores
 /// suffix the configured id as `{base}_dp{rank}`, so minting needs a pinned
 /// rank; unpinned DP>1 yields None (no mint — decode recomputes locally).
-pub(crate) fn effective_kv_engine_id(
+fn effective_kv_engine_id(
     base: Option<&str>,
     dp_size: Option<usize>,
     dp_rank: Option<usize>,
@@ -540,7 +541,7 @@ pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode 
         // could target the wrong engine core, so fail closed: no mint, decode
         // recomputes the prompt.
         warn!(
-            worker = %worker.url(),
+            worker = %worker.redacted_url(),
             dp_size = ?dp_label,
             "invalid dp_size label; treating DP topology as unknown and \
              skipping KV engine-id minting"

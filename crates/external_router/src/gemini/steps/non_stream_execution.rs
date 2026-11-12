@@ -3,10 +3,7 @@
 //! Transition: NonStreamRequest → ProcessResponse (no tool calls)
 //!                               | NonStreamRequest (MCP tool loop — Phase 2)
 
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
 use crate::{
@@ -97,8 +94,6 @@ pub(crate) async fn non_stream_request_execution(
     worker.record_outcome(status.as_u16());
 
     if !status.is_success() {
-        let status = StatusCode::from_u16(response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
         let body = response.text().await.unwrap_or_else(|e| {
             tracing::warn!("Failed to read upstream error body: {e}");
@@ -146,12 +141,10 @@ mod tests {
     use axum::http::StatusCode;
     use openai_protocol::interactions::InteractionsRequest;
     use serde_json::json;
-    use smg_mcp::{McpConfig, McpOrchestrator};
 
     use super::non_stream_request_execution;
     use crate::{
         gemini::context::{RequestContext, SharedComponents},
-        openai_bridge::FormatRegistry,
         tenant::{TenantKey, TenantRequestMeta},
         test_support::{
             http_client, StubWorker, StubWorkers, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
@@ -160,16 +153,10 @@ mod tests {
 
     /// A request context past worker selection and request building, its
     /// worker at `worker_url`.
-    async fn context_for(worker_url: &str) -> RequestContext {
+    fn context_for(worker_url: &str) -> RequestContext {
         let components = SharedComponents {
             client: http_client(),
             workers: Arc::new(StubWorkers::default()),
-            mcp_orchestrator: Arc::new(
-                McpOrchestrator::new(McpConfig::default())
-                    .await
-                    .expect("an orchestrator"),
-            ),
-            mcp_format_registry: FormatRegistry::new(),
             request_timeout: Duration::from_secs(5),
         };
         let request: InteractionsRequest =
@@ -195,7 +182,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn a_failed_send_names_the_worker_masked_in_its_line() {
-        let mut ctx = context_for(CREDENTIALED_WORKER_URL).await;
+        let mut ctx = context_for(CREDENTIALED_WORKER_URL);
 
         let Err(response) = non_stream_request_execution(&mut ctx).await else {
             panic!("a failed send");

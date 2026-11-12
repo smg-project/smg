@@ -83,10 +83,24 @@ jobs:
             echo "${parts[0]}.${parts[1]}.${parts[2]}"
           }
 
+          # main reads the next development version with a -dev suffix (1.15.0-dev once
+          # release/1.14 is cut: scripts/release/README.md): that number is the one to
+          # build, as 1.15.0.devYYYYMMDD, below the release it leads to and above every
+          # release before it. A plain X.Y.Z (a release branch, an older tree) keeps the
+          # patch step above it.
+          dev_version() {
+            local version
+            version=$(read_version "$1")
+            case "${version}" in
+              *-dev) echo "${version%-dev}.${DEV}" ;;
+              *) echo "$(bump_patch "${version}").${DEV}" ;;
+            esac
+          }
+
           {
-            echo "smg_version=$(bump_patch "$(read_version bindings/python/pyproject.toml)").${DEV}"
-            echo "proto_version=$(bump_patch "$(read_version crates/grpc_client/python/pyproject.toml)").${DEV}"
-            echo "servicer_version=$(bump_patch "$(read_version grpc_servicer/pyproject.toml)").${DEV}"
+            echo "smg_version=$(dev_version bindings/python/pyproject.toml)"
+            echo "proto_version=$(dev_version crates/grpc_client/python/pyproject.toml)"
+            echo "servicer_version=$(dev_version grpc_servicer/pyproject.toml)"
             echo "release_tag=nightly-${IMAGE_SUFFIX}"
             echo "image_suffix=${IMAGE_SUFFIX}"
           } >> "$GITHUB_OUTPUT"
@@ -284,6 +298,13 @@ jobs:
               if grep -q "no matching package named" "pkg-${name}.err"; then
                 dep="$(sed -n 's/.*no matching package named `\([^`]*\)`.*/\1/p' "pkg-${name}.err" | head -1)"
                 echo "::warning::skipping ${name}: depends on unpublished crate ${dep}"
+                skipped="${skipped} ${name}(needs ${dep})"
+              elif grep -q "failed to select a version for the requirement" "pkg-${name}.err"; then
+                # The same fact for a published name at a version crates.io does not hold yet:
+                # between a cut and the release's crate publish, main's pins lead the registry
+                # (the trunk is next: main carries the versions the cut gave the branch).
+                dep="$(sed -n 's/.*failed to select a version for the requirement `\([^`]*\)`.*/\1/p' "pkg-${name}.err" | head -1)"
+                echo "::warning::skipping ${name}: depends on ${dep}, a version not on crates.io yet"
                 skipped="${skipped} ${name}(needs ${dep})"
               else
                 cat "pkg-${name}.err"

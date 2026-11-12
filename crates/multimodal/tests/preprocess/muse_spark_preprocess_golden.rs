@@ -239,7 +239,7 @@ fn images_match_the_reference_fingerprints_and_expansions() {
         let name = &case.name;
         let images = images_for(case);
         let out = processor
-            .preprocess(&images)
+            .preprocess(&images.iter().collect::<Vec<_>>())
             .unwrap_or_else(|e| panic!("{name}: preprocess: {e}"));
         let grid: Vec<i64> = match &case.grid_thw {
             serde_json::Value::Array(rows) if rows.first().is_some_and(|v| v.is_array()) => rows
@@ -337,7 +337,7 @@ fn clips_match_the_reference_sampling_fingerprints_and_stamps() {
     let processor = spec
         .vision_processor(&model_config, &config, Modality::Video)
         .expect("the family's video processor");
-    let sampling = spec.video_frame_sampling_with(Some(&config));
+    let sampling = spec.video_frame_sampling_with(&config);
     assert_eq!(
         sampling,
         FrameSampling::TemporalGroups {
@@ -347,7 +347,7 @@ fn clips_match_the_reference_sampling_fingerprints_and_stamps() {
     );
     let fetch = VideoFetchConfig {
         sample_fps: spec
-            .default_video_sample_fps_with(Some(&config))
+            .default_video_sample_fps_with(&config)
             .expect("the reference's rate"),
         sampling,
         ..VideoFetchConfig::default()

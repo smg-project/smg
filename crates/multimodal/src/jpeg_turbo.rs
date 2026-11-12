@@ -173,21 +173,32 @@ pub fn pil_cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> [u8; 3] {
 /// Convert a packed CMYK8 buffer (as decoded by libjpeg) to packed RGB8, PIL's
 /// way, in place: pixel `i` is read from `4i..4i+4` before `3i..3i+3` is
 /// written, so no unread byte is overwritten and the decoded buffer stays the
-/// one allocation `MAX_DECODED_BYTES` bounds. On AArch64 the vector unit does
-/// sixteen pixels at a time with the same arithmetic in 16-bit lanes; the
-/// rest, and every other target, is the formula pixel by pixel.
+/// one allocation `MAX_DECODED_BYTES` bounds. On AArch64 and x86-64 the
+/// vector unit does sixteen pixels at a time with the same arithmetic in
+/// 16-bit lanes; the rest, and every other target, is the formula pixel by
+/// pixel.
 fn cmyk_to_rgb_like_pil(mut buf: Vec<u8>) -> Vec<u8> {
     let pixels = buf.len() / 4;
     #[cfg(target_arch = "aarch64")]
     let start = neon::convert_in_place(&mut buf[..4 * pixels]);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    let start = avx2::convert_in_place(&mut buf[..4 * pixels]);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let start = 0;
-    for i in start..pixels {
+    convert_pixels(&mut buf[..4 * pixels], start);
+    buf.truncate(pixels * 3);
+    buf
+}
+
+/// Pixels `from` onwards of `buf` (`4 * n` bytes of CMYK) converted in place
+/// to RGB at `3i` by the pixel formula; returns `n`.
+fn convert_pixels(buf: &mut [u8], from: usize) -> usize {
+    let pixels = buf.len() / 4;
+    for i in from..pixels {
         let [c, m, y, k] = [buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]];
         buf[3 * i..3 * i + 3].copy_from_slice(&pil_cmyk_to_rgb(c, m, y, k));
     }
-    buf.truncate(pixels * 3);
-    buf
+    pixels
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -244,6 +255,124 @@ mod neon {
                 );
                 vst3q_u8(base.add(3 * i), rgb);
             }
+            i += 16;
+        }
+        full
+    }
+}
+
+/// The x86-64 path of the CMYK conversion: sixteen pixels per step, the four
+/// planes gathered with byte shuffles, `MULDIV255` in 16-bit lanes, the three
+/// result planes rejoined with the channel-run module's shuffles. The entry
+/// is dispatched by `multiversion`; the clone for a core without AVX2 is the
+/// pixel formula. No `unsafe` of its own: the words move through `bytemuck`
+/// casts of exact-size arrays.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use core::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_mullo_epi16, _mm_or_si128, _mm_packus_epi16, _mm_set1_epi16,
+        _mm_setzero_si128, _mm_shuffle_epi8, _mm_srli_epi16, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+
+    use multiversion::{multiversion, target::match_target};
+
+    use crate::vision::rgb_runs::avx2::{interleave16, place};
+
+    /// The leading whole blocks of sixteen CMYK pixels of `buf` (`4 * n`
+    /// bytes) converted in place to RGB at `3i`; returns the pixels done, the
+    /// rest (fewer than sixteen) is the caller's. Zero on a core without the
+    /// vector unit.
+    pub(super) fn convert_in_place(buf: &mut [u8]) -> usize {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return 0;
+        }
+        convert_blocks(buf)
+    }
+
+    #[multiversion(targets("x86_64+avx2"))]
+    fn convert_blocks(buf: &mut [u8]) -> usize {
+        match_target! {
+            "x86_64+avx2" => convert_blocks_avx2(buf),
+            _ => super::convert_pixels(buf, 0),
+        }
+    }
+
+    /// The masks that gather plane `p` of sixteen four-byte pixels from the
+    /// block's four words: byte `i` is source byte `4 i + p`, in word
+    /// `i / 4` of the four.
+    const fn plane_masks(p: usize) -> [[u8; 16]; 4] {
+        let mut masks = [[0x80; 16]; 4];
+        let mut word = 0;
+        while word < 4 {
+            let mut i = 0;
+            while i < 16 {
+                masks[word][i] = place(4 * i + p, word);
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const PLANE_C: [[u8; 16]; 4] = plane_masks(0);
+    const PLANE_M: [[u8; 16]; 4] = plane_masks(1);
+    const PLANE_Y: [[u8; 16]; 4] = plane_masks(2);
+    const PLANE_K: [[u8; 16]; 4] = plane_masks(3);
+
+    /// One plane of sixteen pixels from the block's four words.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn plane(words: [__m128i; 4], masks: &[[u8; 16]; 4]) -> __m128i {
+        _mm_or_si128(
+            _mm_or_si128(
+                _mm_shuffle_epi8(words[0], bytemuck::must_cast(masks[0])),
+                _mm_shuffle_epi8(words[1], bytemuck::must_cast(masks[1])),
+            ),
+            _mm_or_si128(
+                _mm_shuffle_epi8(words[2], bytemuck::must_cast(masks[2])),
+                _mm_shuffle_epi8(words[3], bytemuck::must_cast(masks[3])),
+            ),
+        )
+    }
+
+    /// `MULDIV255(ink, k)` on sixteen pixels in 16-bit lanes: `ink * k + 128`
+    /// is at most 65,153 and `t + (t >> 8)` at most 65,407, both within a
+    /// `u16`, and the high byte of the latter is the scalar formula's value.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn muldiv255(ink: __m128i, k: __m128i) -> __m128i {
+        let zero = _mm_setzero_si128();
+        let bias = _mm_set1_epi16(128);
+        let low = _mm_add_epi16(
+            _mm_mullo_epi16(_mm_unpacklo_epi8(ink, zero), _mm_unpacklo_epi8(k, zero)),
+            bias,
+        );
+        let high = _mm_add_epi16(
+            _mm_mullo_epi16(_mm_unpackhi_epi8(ink, zero), _mm_unpackhi_epi8(k, zero)),
+            bias,
+        );
+        let low = _mm_add_epi16(low, _mm_srli_epi16::<8>(low));
+        let high = _mm_add_epi16(high, _mm_srli_epi16::<8>(high));
+        _mm_packus_epi16(_mm_srli_epi16::<8>(low), _mm_srli_epi16::<8>(high))
+    }
+
+    /// The whole blocks of sixteen pixels: the 64 bytes at `4 i` are read
+    /// before the 48 bytes at `3 i` are written (which end before `4 i + 64`),
+    /// so no pixel still to be read is overwritten.
+    #[target_feature(enable = "avx2")]
+    fn convert_blocks_avx2(buf: &mut [u8]) -> usize {
+        let pixels = buf.len() / 4;
+        let full = pixels - pixels % 16;
+        let mut i = 0;
+        while i < full {
+            let block: [u8; 64] = bytemuck::pod_read_unaligned(&buf[4 * i..4 * i + 64]);
+            let words: [__m128i; 4] = bytemuck::must_cast(block);
+            let k = plane(words, &PLANE_K);
+            let rgb = interleave16([
+                bytemuck::must_cast(muldiv255(plane(words, &PLANE_C), k)),
+                bytemuck::must_cast(muldiv255(plane(words, &PLANE_M), k)),
+                bytemuck::must_cast(muldiv255(plane(words, &PLANE_Y), k)),
+            ]);
+            buf[3 * i..3 * i + 48].copy_from_slice(&rgb);
             i += 16;
         }
         full
@@ -334,6 +463,63 @@ pub fn is_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
 }
 
+/// What a JPEG's frame header says: the dimensions and the component count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameHeader {
+    width: i32,
+    height: i32,
+    components: u8,
+}
+
+/// The frame header of a JPEG, read from its marker segments. The TurboJPEG
+/// header call reports the same when it can classify the frame's sampling;
+/// libjpeg-turbo 2.x refuses a frame whose components are sampled unlike each
+/// other (a CMYK file with subsampled inks and a full-resolution black) with
+/// "Could not determine subsampling type", though its decoder takes such a
+/// frame, so this reader stands in for the call. `None` when the scan or the
+/// end of the image comes before a frame header, or a segment is cut short.
+fn frame_header(bytes: &[u8]) -> Option<FrameHeader> {
+    if !is_jpeg(bytes) {
+        return None;
+    }
+    let mut at = 2;
+    loop {
+        let (&0xFF, &marker) = (bytes.get(at)?, bytes.get(at + 1)?) else {
+            return None;
+        };
+        match marker {
+            // A fill byte before the next marker.
+            0xFF => at += 1,
+            // Standalone markers: the restart markers, SOI and TEM.
+            0xD0..=0xD8 | 0x01 => at += 2,
+            // The scan or the end of the image, with no frame header before it.
+            0xD9 | 0xDA => return None,
+            _ => {
+                let length = usize::from(u16::from_be_bytes([
+                    *bytes.get(at + 2)?,
+                    *bytes.get(at + 3)?,
+                ]));
+                // The length counts its own two bytes.
+                let payload = bytes.get(at + 4..at + 2 + length)?;
+                // SOF0 to SOF15 carry the frame header; DHT, JPG and DAC share
+                // the range.
+                if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                    let (&[_precision, h0, h1, w0, w1, components], _) =
+                        payload.split_first_chunk::<6>()?;
+                    let (height, width) =
+                        (u16::from_be_bytes([h0, h1]), u16::from_be_bytes([w0, w1]));
+                    return (width > 0 && height > 0).then(|| FrameHeader {
+                        width: i32::from(width),
+                        height: i32::from(height),
+                        components,
+                    });
+                }
+                at += 2 + length;
+            }
+        }
+    }
+}
+
 /// Decode a JPEG to an RGB8 `DynamicImage` via libjpeg-turbo (PIL-compatible
 /// defaults). A CMYK or YCCK JPEG is decompressed to CMYK, the only output
 /// TurboJPEG offers for it, and converted with [`pil_cmyk_to_rgb`]. Returns
@@ -350,13 +536,18 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
     //   exactly once and never used after destruction.
     // - `bytes` is a live `&[u8]`; its ptr/len describe a valid immutable region
     //   for the duration of the calls (libjpeg-turbo only reads it).
-    // - `buf` is an owned `Vec<u8>` sized to exactly `w*h*channels`
-    //   (overflow-checked) from the header dimensions, with `channels` the
+    // - `buf` is an owned `Vec<u8>` whose length is exactly `w*h*channels`
+    //   (overflow-checked) from the frame's dimensions (the header call's, or
+    //   the frame header's when that call refuses the sampling; the decoder
+    //   never writes past the size it is given), with `channels` the
     //   pixel size of the format requested (3 for `TJPF_RGB`, 4 for
-    //   `TJPF_CMYK`), and is the sole alias passed to the decoder; with
+    //   `TJPF_CMYK`); a pooled buffer has a larger capacity, the length is
+    //   what matters. It is the sole alias passed to the decoder; with
     //   `pitch=0` (=> `w*channels`) the decoder writes at most `w*h*channels`
     //   bytes, so no out-of-bounds write occurs. The image is built only after
-    //   `rc == 0` confirms a successful, complete write.
+    //   `rc == 0` confirms a successful, complete write, which covers every
+    //   byte of the buffer (its contents before the write are a previous
+    //   frame's, not zeros).
     unsafe {
         let handle = (tj.init)();
         if handle.is_null() {
@@ -372,14 +563,43 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
             &mut subsamp,
             &mut colorspace,
         );
-        if hdr != 0 || w <= 0 || h <= 0 {
+        // The header call fills the dimensions once it has read the frame,
+        // before it classifies the sampling; a header it could not read
+        // leaves them at zero (3.x reports -1), and the file falls back as
+        // before, with no buffer taken and no second read on the handle.
+        if w <= 0 || h <= 0 {
             (tj.destroy)(handle);
             return None;
         }
-        let (wu, hu) = (w as usize, h as usize);
         // A CMYK or YCCK source can only come out as CMYK; everything else
-        // (YCbCr, grayscale, RGB) comes out as RGB.
-        let cmyk = colorspace == TJCS_CMYK || colorspace == TJCS_YCCK;
+        // (YCbCr, grayscale, RGB) comes out as RGB. When the call read the
+        // frame and refused only its sampling (libjpeg-turbo 2.x on
+        // components sampled unlike each other), the frame header supplies
+        // the component count, and four components mean CMYK: the decoder
+        // takes the frame the call would not classify. The call writes that
+        // refusal into the sampling before it throws; a failure with the
+        // sampling known is a header warning, and the decode would end in the
+        // same warning, so the file falls back at once. A frame of two or of
+        // five and more components is refused on its sampling too, and the
+        // decoder has no colour conversion for it: three and four components
+        // alone take the fallback.
+        let (w, h, cmyk) = if hdr == 0 {
+            (w, h, colorspace == TJCS_CMYK || colorspace == TJCS_YCCK)
+        } else if subsamp < 0 {
+            match frame_header(bytes) {
+                Some(frame) if matches!(frame.components, 3 | 4) => {
+                    (frame.width, frame.height, frame.components == 4)
+                }
+                _ => {
+                    (tj.destroy)(handle);
+                    return None;
+                }
+            }
+        } else {
+            (tj.destroy)(handle);
+            return None;
+        };
+        let (wu, hu) = (w as usize, h as usize);
         let (pixel_format, channels) = if cmyk { (TJPF_CMYK, 4) } else { (TJPF_RGB, 3) };
         // Guard against absurd dimensions before allocating.
         let nbytes = match decoded_buffer_len(wu, hu, channels) {
@@ -389,7 +609,7 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
                 return None;
             }
         };
-        let mut buf = vec![0_u8; nbytes];
+        let mut buf = crate::buffer_pool::take(nbytes);
         let rc = (tj.decompress)(
             handle,
             bytes.as_ptr(),
@@ -403,6 +623,10 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
         );
         (tj.destroy)(handle);
         if rc != 0 {
+            // A failed decode (the library reports a warning the same way, and
+            // a corrupt-data warning is common) hands its buffer back, so the
+            // next request's take is warm.
+            crate::buffer_pool::recycle(buf);
             return None;
         }
         let rgb = if cmyk { cmyk_to_rgb_like_pil(buf) } else { buf };
@@ -531,12 +755,11 @@ mod tests {
     /// expected pixels and the FNV-1a 64 hash of the RGB8 buffer are what
     /// PIL 12.3 on libjpeg-turbo 2.1.5 returns for `Image.open(f).convert("RGB")`.
     /// Needs libturbojpeg at runtime; without it the pure-Rust fallback
-    /// decodes CMYK with its own DCT and upsampling, so this test skips.
+    /// decodes CMYK with its own DCT and upsampling, so this test skips, or
+    /// fails where `SMG_REQUIRE_TURBOJPEG` says the library must be there.
     #[test]
-    #[expect(clippy::print_stderr)]
     fn cmyk_and_ycck_jpegs_decode_to_pils_pixels() {
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the CMYK parity test");
+        if !crate::test_support::turbojpeg_or_skip("the CMYK parity test") {
             return;
         }
         type Pixel = (u32, u32, [u8; 3]);
@@ -587,6 +810,237 @@ mod tests {
         }
     }
 
+    /// A 16x8 four-component baseline JPEG whose first component is sampled
+    /// 2x2 and the other three 1x1: the shape a CMYK file written with chroma
+    /// subsampling takes, which libjpeg-turbo 2.x's header call cannot name.
+    /// One MCU with every coefficient zero, so every sample decodes to 128.
+    /// Built here rather than stored: a byte table would be test data.
+    fn unequal_sampling_cmyk_jpeg() -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8];
+        // DQT: one table of ones.
+        jpeg.extend([0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        jpeg.extend([1u8; 64]);
+        // SOF0: 8 bits, 8 rows, 16 columns, four components (2x2, 1x1, 1x1, 1x1).
+        jpeg.extend([0xFF, 0xC0, 0x00, 0x14, 0x08, 0x00, 0x08, 0x00, 0x10, 0x04]);
+        jpeg.extend([1, 0x22, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0]);
+        // DHT: a DC table and an AC table with one code each, for symbol 0 (a
+        // zero difference; the end of a block).
+        for class in [0x00, 0x10] {
+            jpeg.extend([0xFF, 0xC4, 0x00, 0x14, class, 1]);
+            jpeg.extend([0u8; 15]);
+            jpeg.push(0x00);
+        }
+        // SOS: the four components on tables 0 and 0, the whole spectrum.
+        jpeg.extend([
+            0xFF, 0xDA, 0x00, 0x0E, 0x04, 1, 0, 2, 0, 3, 0, 4, 0, 0, 0x3F, 0,
+        ]);
+        // Seven blocks (four of the first component, one of each other), each
+        // a zero difference and an end of block: fourteen zero bits, padded.
+        jpeg.extend([0x00, 0x03, 0xFF, 0xD9]);
+        jpeg
+    }
+
+    /// The reader finds the frame header behind the tables, in a file written
+    /// by a compressor as in one built by hand, steps over fill bytes, and
+    /// reads nothing from a file whose scan comes first, whose height is zero,
+    /// that ends before the frame header, or that is no JPEG at all.
+    #[test]
+    fn the_frame_header_reads_the_dimensions_and_the_component_count() {
+        let jpeg = unequal_sampling_cmyk_jpeg();
+        let frame = FrameHeader {
+            width: 16,
+            height: 8,
+            components: 4,
+        };
+        assert_eq!(frame_header(&jpeg), Some(frame));
+        assert_eq!(
+            frame_header(&fixture("ycck_adobe_16x16_420.jpg")),
+            Some(FrameHeader {
+                width: 16,
+                height: 16,
+                components: 4
+            })
+        );
+        // SOI and the quantization table are 71 bytes; the frame header follows.
+        assert_eq!(
+            frame_header(&jpeg[..71]),
+            None,
+            "cut before the frame header"
+        );
+        assert_eq!(
+            frame_header(&jpeg[..80]),
+            None,
+            "cut inside the frame header"
+        );
+        assert_eq!(frame_header(b"not a jpeg"), None);
+        // Fill bytes before a marker are stepped over.
+        let mut filled = jpeg.clone();
+        filled.splice(2..2, [0xFF, 0xFF]);
+        assert_eq!(
+            frame_header(&filled),
+            Some(frame),
+            "fill bytes before a marker"
+        );
+        // A standalone marker (TEM) carries no length and is stepped over.
+        let mut standalone = jpeg.clone();
+        standalone.splice(2..2, [0xFF, 0x01]);
+        assert_eq!(
+            frame_header(&standalone),
+            Some(frame),
+            "a standalone marker before the frame header"
+        );
+        // A zero height (a file that defines it by a DNL segment) is no frame
+        // header: the height sits five bytes into the segment at 71.
+        let mut dnl = jpeg.clone();
+        dnl[76..78].copy_from_slice(&[0, 0]);
+        assert_eq!(frame_header(&dnl), None, "a zero height");
+        // The scan before any frame header.
+        assert_eq!(
+            frame_header(&[0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02]),
+            None,
+            "a scan before the frame header"
+        );
+    }
+
+    /// libjpeg-turbo 2.x's header call refuses a four-component frame whose
+    /// black is sampled unlike its first component; the decoder takes it, so
+    /// the frame header stands in and the image decodes through the library
+    /// (the pure-Rust fallback differs from it by a few levels per pixel).
+    #[test]
+    fn a_four_component_jpeg_with_unequal_sampling_decodes_through_turbojpeg() {
+        if !crate::test_support::turbojpeg_or_skip("the unequal-sampling test") {
+            return;
+        }
+        let image = decode_jpeg_rgb(&unequal_sampling_cmyk_jpeg())
+            .expect("decoded through libjpeg-turbo, the header call notwithstanding");
+        let rgb = image.to_rgb8();
+        assert_eq!((rgb.width(), rgb.height()), (16, 8));
+        let expected = pil_cmyk_to_rgb(128, 128, 128, 128);
+        assert!(
+            rgb.pixels().all(|pixel| pixel.0 == expected),
+            "every sample is 128 before the inversion: {expected:?}"
+        );
+    }
+
+    /// A header the library cannot read leaves the dimensions unset, and the
+    /// decode answers `None` without taking a buffer: the hand-built file with
+    /// its precision set to 9 bits (no build reads it: 2.x wants its compiled
+    /// 8, 3.x takes 8, 12 and 16) and its frame grown to 1024x1024, which the
+    /// frame header alone would read and serve from the 4 MiB class.
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_header_the_library_cannot_read_takes_no_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the unreadable-header test");
+            return;
+        }
+        let mut jpeg = unequal_sampling_cmyk_jpeg();
+        // The frame header at 71: marker, length, precision, height, width.
+        jpeg[75] = 9;
+        jpeg[76..80].copy_from_slice(&[0x04, 0x00, 0x04, 0x00]);
+        assert_eq!(
+            frame_header(&jpeg),
+            Some(FrameHeader {
+                width: 1024,
+                height: 1024,
+                components: 4
+            }),
+            "the frame header alone still reads the frame"
+        );
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
+        assert!(decoded.is_none(), "the library cannot read a 9-bit header");
+        assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
+    }
+
+    /// A header the library read but warned about is not the sampling
+    /// refusal: the fixture with two stray bytes between its frame header and
+    /// the next segment ("extraneous bytes before marker") fails the header
+    /// call with its dimensions and sampling filled, and its decode would end
+    /// in the same warning. The file falls back at once with no buffer taken:
+    /// its frame is grown to 1024x1024, which the fallback would serve from
+    /// the 4 MiB class.
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_header_with_a_warning_takes_no_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the warned-header test");
+            return;
+        }
+        let mut jpeg = fixture("ycck_adobe_16x16_420.jpg");
+        assert!(
+            decode_jpeg_rgb(&jpeg).is_some(),
+            "the fixture itself decodes"
+        );
+        // SOI, APP14 and two quantization tables are 156 bytes; the frame
+        // header follows (marker, length, precision, height, width) and ends
+        // at 178, where the first Huffman table begins.
+        assert_eq!(
+            jpeg[178..180],
+            [0xFF, 0xC4],
+            "the fixture's first Huffman table"
+        );
+        jpeg[161..165].copy_from_slice(&[0x04, 0x00, 0x04, 0x00]);
+        jpeg.splice(178..178, [0x00, 0x00]);
+        assert_eq!(
+            frame_header(&jpeg).map(|frame| (frame.width, frame.height)),
+            Some((1024, 1024)),
+            "the frame header reads the grown frame"
+        );
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
+        assert!(decoded.is_none(), "a warned header falls back");
+        assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
+    }
+
+    /// A frame of two components is refused on its sampling like the
+    /// four-component file, and the decoder has no colour conversion for it:
+    /// the hand-built file cut to two components and grown to 1024x1024
+    /// answers `None` with no buffer taken, where the frame header alone
+    /// would serve the 4 MiB class.
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_two_component_frame_takes_no_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the two-component test");
+            return;
+        }
+        let mut jpeg = unequal_sampling_cmyk_jpeg();
+        // The frame header at 71: its length 20 becomes 14, the count 4
+        // becomes 2, the height and width grow, and the third and fourth
+        // component specs (six bytes from 87) go.
+        jpeg[74] = 0x0E;
+        jpeg[76..80].copy_from_slice(&[0x04, 0x00, 0x04, 0x00]);
+        jpeg[80] = 2;
+        jpeg.drain(87..93);
+        // The scan header, now at 131: its length 14 becomes 10, the count 4
+        // becomes 2, and the third and fourth component selectors (four bytes
+        // from 140) go.
+        assert_eq!(jpeg[131..133], [0xFF, 0xDA], "the scan header");
+        jpeg[134] = 0x0A;
+        jpeg[135] = 2;
+        jpeg.drain(140..144);
+        assert_eq!(
+            frame_header(&jpeg),
+            Some(FrameHeader {
+                width: 1024,
+                height: 1024,
+                components: 2
+            }),
+            "the frame header reads the two-component frame"
+        );
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
+        assert!(
+            decoded.is_none(),
+            "two components decode through no path here"
+        );
+        assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
+    }
+
     /// The policy reads its two values in any case and spacing, names an
     /// unknown one, and round-trips through serde as its lowercase name.
     #[test]
@@ -635,5 +1089,75 @@ mod tests {
             turbojpeg_available()
         );
         assert_eq!(enforce_policy(TurboJpegPolicy::Prefer), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+    use crate::buffer_pool::{self, BufferPool};
+
+    /// The decoded frame is a pooled buffer: the second decode of a frame
+    /// takes the buffer the first one returned and writes the same pixels
+    /// into it (the library writes every pixel of the frame it reports).
+    #[test]
+    fn a_decode_reuses_the_returned_buffer_and_writes_the_same_pixels() {
+        if !crate::test_support::turbojpeg_or_skip("the pooled decode test") {
+            return;
+        }
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            // 4000x3000: 36 MB of pixels, the 64 MiB class.
+            let bytes = std::fs::read(format!(
+                "{}/tests/fixtures/images/large.jpg",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("fixture");
+            let first = decode_jpeg_rgb(&bytes).expect("decoded");
+            let address = first.as_bytes().as_ptr();
+            let reference = first.as_bytes().to_vec();
+            buffer_pool::recycle_image(first);
+            assert_eq!(MINE.held(), 64 << 20);
+            let second = decode_jpeg_rgb(&bytes).expect("decoded");
+            assert_eq!(
+                second.as_bytes().as_ptr(),
+                address,
+                "the second decode took the first's buffer"
+            );
+            assert!(
+                second.as_bytes() == reference.as_slice(),
+                "the pixels differ on the reused buffer"
+            );
+        });
+    }
+
+    /// A decode the library refuses (a truncated file ends with the premature
+    /// end-of-file warning, which the binding reads as a failure) returns its
+    /// buffer to the pool instead of freeing it, so the next decode of that
+    /// class is warm.
+    #[test]
+    fn a_failed_decode_returns_its_buffer_to_the_pool() {
+        if !crate::test_support::turbojpeg_or_skip("the failed-decode pool test") {
+            return;
+        }
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            let bytes = std::fs::read(format!(
+                "{}/tests/fixtures/images/large.jpg",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("fixture");
+            let truncated = &bytes[..bytes.len() / 2];
+            assert_eq!(MINE.held(), 0);
+            assert!(
+                decode_jpeg_rgb(truncated).is_none(),
+                "a truncated file decodes to nothing"
+            );
+            assert_eq!(
+                MINE.held(),
+                64 << 20,
+                "the failed decode's buffer is back in its class"
+            );
+        });
     }
 }

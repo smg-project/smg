@@ -39,6 +39,48 @@ https://github.com/organizations/smg-project/settings/installations/<installatio
 See GitHub's [ARC authentication documentation](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api)
 for the authoritative permission list.
 
+## 1a. No API keys in the runner container
+
+The runner container of every scale set carries no API key, and none may be added: every job of
+every workflow runs in that container, so a key in its environment is readable by any pull request
+that reaches a runner. The keys the automated reviews and the scheduled Claude workflows use stay in
+the Kubernetes secrets (`openai-api-key`, `anthropic-api-key`) and are mounted only into the
+`ai-key-proxy` sidecar of `runner-values-cpu.yaml` and `runner-values-review.yaml`: an nginx container that listens on
+`127.0.0.1:8787`, pod-local, and puts the real key on each request it forwards to
+`api.anthropic.com`, `api.openai.com`, or `api.x.ai`. The workflows point Claude (`ANTHROPIC_BASE_URL`) and the
+Codex action (`responses-api-endpoint`) at it with placeholder keys. A separate container's
+environment and memory are unreadable from the runner container, so nothing a job runs can print a
+key; what a job can do is spend through the proxy, which the keys' spend caps bound. Rotating a key is
+`kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` on the secret and a roll of the
+runner pods. A live set whose runner container carries a key, or runs privileged (only the `dind`
+sidecar may), has drifted from these values; `helm upgrade` from the files here removes both.
+
+Vendor E2E uses the same pod-local proxy with public placeholder keys. Its gateway worker roots are
+`http://127.0.0.1:8787/openai`, `/anthropic`, or `/xai` without a trailing slash or `/v1`;
+an OpenAI SDK that calls the provider directly uses `/openai/v1` (or `/xai/v1`). The OpenAI
+location forwards WebSocket Upgrade/Connection for Realtime as well as HTTP and SSE. These URLs
+apply only inside a CPU runner pod with this sidecar; bare-metal/GPU Docker jobs do not acquire
+access to this loopback endpoint by setting an environment variable.
+
+The proposed xAI route reads only `XAI_API_KEY` from the optional sidecar Secret reference
+`xai-api-key`. This does not assert that the Secret exists in a cluster. If it is unavailable, the
+proxy still starts for the existing providers and `/xai/` returns 503 without contacting xAI;
+the required xAI tests remain failing. An authorized deployment must confirm or bind the approved
+credential in `actions-runner-system`, apply the reviewed CPU values, roll affected runner pods in
+an approved window, and verify HTTP/SSE and a Realtime WebSocket handshake through the deployed
+sidecar. Source changes or `/healthz` alone do not prove that rollout, credential availability,
+provider quality, or successful paid tests. No raw key belongs in workflow/job environment values.
+
+The same sidecar holds the private key of the **SMG Codex Review** GitHub App (secret
+`codex-github-app` with `app-id`, `installation-id` and `private-key`, the key in PKCS#8 form:
+`openssl pkcs8 -topk8 -nocrypt -in downloaded.pem`) and mints one-hour installation tokens for it
+on `POST http://127.0.0.1:8787/github/app-token`, which the Codex workflow's post job uses to post
+as `smg-codex-review[bot]`. The endpoint requires the calling job's GitHub Actions OIDC token
+(audience `ai-key-proxy`), checked against GitHub's signing keys and pinned to this repository and
+the Codex workflow file, so a fork's run, which gets no OIDC token, or another workflow's job on
+the same pod cannot mint. The key never leaves the pod; a job sees only the token. To rotate it,
+generate a new key on the App's settings page, replace the secret, and roll the runner set.
+
 ## 2. Create or update the Kubernetes secret
 
 Never paste credentials into `archived/arc-secret-template.yaml` or commit a private key.
@@ -158,6 +200,27 @@ helm upgrade --install 4-gpu-h100 \
   -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-4-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+
+`k8s-runner-review` runs the automated code reviews, apart from the test jobs: on the shared CPU
+set a review job waited 52 minutes for a runner and then worked for three, and the next push
+cancelled the reviews that never got one (2026-11-12). The review workflows select the set through
+the repository variable `SMG_RUNNER_REVIEW` and fall back to `k8s-runner-cpu` while it is unset, so
+install the set first and set the variable second; deleting the variable sends the reviews back.
+Its pods request 2 CPU and 4 GiB, carry no docker and so no privileged container, and four stay
+warm so a review's status note appears within seconds. They run the key proxy of the CPU set
+without the xAI key; change the proxy in both values files together, which
+`scripts/tests/test_runner_values_policy.py` enforces.
+
+```bash
+helm upgrade --install k8s-runner-review \
+  --namespace actions-runner-system \
+  --create-namespace \
+  --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-review.yaml \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+
+gh variable set SMG_RUNNER_REVIEW --repo smg-project/smg --body k8s-runner-review
 ```
 
 `bellwether-record` runs bellwether's `record` workflow, one job per checkpoint group. It is registered to the
@@ -352,6 +415,56 @@ One issue per check, never per node; the issue body lists the affected nodes.
 | WARN | GPU memory held by no pod | over 2 GiB allocated with no pod attached for 30 min |
 | WARN | GPU over 85C | for 15 min |
 | WARN | Workflow runs queued over 24h | runs that will never be picked up |
+
+### A queued job left behind when a scale set drains to zero
+
+`GPU runner label starved` with one job queued, no registered runner for its
+label and every pool idle is a known shape, not a lost runner: a matrix's jobs
+for the label were all served, the scale set scaled to zero, and one job was
+still queued at that moment. It stays queued until the next job for the label
+arrives, because the scale-up is driven by job arrival and a job already in the
+queue does not bring a runner back by itself. In fourteen days of this
+repository's records (2026-10-20 to 2026-11-03) the single-GPU set did this
+thirteen times, always in a quiet period, with waits of 45 minutes to 22 hours
+46 minutes; twelve of the thirteen jobs were picked up 13 to 19 seconds after
+the next matrix's jobs were created, before any of those jobs. Every case ran
+with the set's floor at zero.
+
+- Confirm it: `kubectl get autoscalingrunnersets -n actions-runner-system`
+  (current and desired runners of the set), the repository's runner list for the
+  label (the scale set's ephemeral runners carry no labels in the API; group
+  them by name prefix), and the listener pod's log around the wave's last job
+  completion and around the queued job's request id.
+- Unstick it: raise the set's floor until the queued job is picked up (a runner
+  pod can take more than a minute to register), then restore the overlay's
+  value; the queued job is handed to the first runner that registers. Do not
+  cancel and re-run the workflow run: a queued job cannot be re-run on its own,
+  a whole-run re-run restarts every job, and the run's record is lost.
+
+  ```bash
+  kubectl patch autoscalingrunnerset <set> -n actions-runner-system \
+    --type=merge -p '{"spec":{"minRunners":1}}'
+  ```
+
+- Prevent it: keep a floor on every scale set (`minRunners` at least 1; the
+  overlays in this directory carry 4 for the 1- and 2-set overlays and the CPU
+  set, 2 for the 4-set overlay and the record set). The floor is what makes the
+  shape impossible, and it also removes the cold-start minute of a wave's first
+  jobs. Check the live floor and the stored release against the overlay the
+  install command in section 4 names: the live object first (a patch applied by
+  the unstick step is visible only here; Helm does not record it), then the
+  stored values; the floor was found at zero live while the file said 4. At a
+  quiet moment the runner list shows the floor's runners idle.
+
+  ```bash
+  kubectl get autoscalingrunnerset <set> -n actions-runner-system \
+    -o jsonpath='{.spec.minRunners}'
+  helm get values <release> -n actions-runner-system
+  ```
+
+- Upstream: the listener log at the wave's last completion and at the moment the
+  left-behind job is finally assigned is the evidence a report to the
+  controller's project needs.
 
 ### Noise rules
 

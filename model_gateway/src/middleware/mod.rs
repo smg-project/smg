@@ -8,12 +8,14 @@ pub mod auth;
 pub mod body_limit;
 pub mod body_timeout;
 pub mod concurrency;
+pub mod duty;
 pub mod edge_body;
 pub mod inert;
 pub mod logging;
 pub mod messages_errors;
 pub mod metrics;
 pub mod request_id;
+pub mod request_start;
 pub mod scheduler;
 pub mod sse_keepalive;
 pub mod storage_context;
@@ -21,7 +23,10 @@ pub mod tenant_resolution;
 pub mod token_bucket;
 pub mod wasm;
 
-pub use auth::{auth_middleware, deny_all_middleware, AuthConfig};
+#[cfg(test)]
+pub(crate) mod test_support;
+
+pub use auth::{auth_middleware, deny_all_middleware, key_fingerprint, AuthConfig};
 pub use body_limit::{RequestBodyLimit, RequestBodyLimitLayer};
 pub use body_timeout::{RequestBodyTimeoutLayer, RequestBodyTimeouts};
 pub use concurrency::{AdmissionQueue, ConcurrencyLimitLayer};
@@ -36,6 +41,7 @@ pub use messages_errors::{
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
+pub use request_start::RequestStarted;
 pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{

@@ -84,8 +84,9 @@ pub enum ConnectionMode {
     Http,
     /// gRPC connection.
     Grpc,
-    /// Direct ZMQ connection to a same-host engine core (bypasses the gRPC
-    /// Python servicer). Speaks the engine's native ZMQ IPC.
+    /// Direct ZMQ connection to an engine core (bypasses the gRPC Python
+    /// servicer). Speaks the engine's native ZMQ wire: over `ipc://` sockets
+    /// to a same-host engine, over `tcp://` to engines on other hosts.
     Zmq,
 }
 
@@ -95,7 +96,7 @@ impl ConnectionMode {
     /// scheme) or an unrecognized scheme, leaving the default to the caller
     /// (some probe both protocols; some default to HTTP).
     pub fn from_url(url: &str) -> Option<Self> {
-        if url.starts_with("ipc://") {
+        if url.starts_with("ipc://") || url.starts_with("tcp://") {
             Some(ConnectionMode::Zmq)
         } else if url.starts_with("grpc://") || url.starts_with("grpcs://") {
             Some(ConnectionMode::Grpc)
@@ -659,6 +660,39 @@ impl ConstrainedDecoding {
     }
 }
 
+/// The vocabulary of structural-tag nodes a worker's grammar compiler
+/// takes, from its `structural_tag_vocabulary` label: the current one unless
+/// the label says `older`, for a compiler that predates the `optional`,
+/// `plus` and `star` nodes and refuses a tag that carries one. The tables'
+/// tags go to such a worker spelled without them, the same language, which
+/// every compiler takes; a worker without the label gets the tag as the
+/// table built it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TagVocabulary {
+    /// Every node the tables use.
+    #[default]
+    Current,
+    /// Without the `optional`, `plus` and `star` nodes; a `token` node stays
+    /// as derived.
+    Older,
+}
+
+impl TagVocabulary {
+    /// The worker label that carries it.
+    pub const LABEL: &'static str = "structural_tag_vocabulary";
+    /// The label's value for [`Self::Older`].
+    pub const OLDER: &'static str = "older";
+
+    /// The vocabulary a worker's `structural_tag_vocabulary` label names;
+    /// anything else, the label's absence included, is [`Self::Current`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        match value {
+            Some(Self::OLDER) => Self::Older,
+            _ => Self::Current,
+        }
+    }
+}
+
 // ── Core identity ────────────────────────────────────────────────────
 
 /// Core worker identity and configuration.
@@ -1059,45 +1093,69 @@ pub struct JobStatus {
 }
 
 impl JobStatus {
-    /// Create a pending job status
-    pub fn pending(job_type: &str, worker_url: &str) -> Self {
+    /// A status with the given word, stamped now, with the message a
+    /// terminal status carries.
+    fn stamped(job_type: &str, worker_url: &str, status: &str, message: Option<String>) -> Self {
         Self {
             job_type: job_type.to_string(),
             worker_url: worker_url.to_string(),
-            status: "pending".to_string(),
-            message: None,
+            status: status.to_string(),
+            message,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
         }
+    }
+
+    /// Create a pending job status
+    pub fn pending(job_type: &str, worker_url: &str) -> Self {
+        Self::stamped(job_type, worker_url, "pending", None)
     }
 
     /// Create a processing job status
     pub fn processing(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "processing".to_string(),
-            message: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        }
+        Self::stamped(job_type, worker_url, "processing", None)
     }
 
     /// Create a failed job status
     pub fn failed(job_type: &str, worker_url: &str, error: String) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "failed".to_string(),
-            message: Some(error),
-            timestamp: std::time::SystemTime::now()
+        Self::stamped(job_type, worker_url, "failed", Some(error))
+    }
+}
+
+#[cfg(test)]
+mod job_status_tests {
+    use super::JobStatus;
+
+    #[test]
+    fn a_status_carries_its_word_its_message_and_a_stamp_of_now() {
+        let seconds_since_epoch = || {
+            std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs(),
+                .as_secs()
+        };
+        let before = seconds_since_epoch();
+        let pending = JobStatus::pending("AddWorker", "http://w:8000");
+        let processing = JobStatus::processing("AddWorker", "http://w:8000");
+        let failed = JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string());
+        let after = seconds_since_epoch();
+        let words = |status: &JobStatus| (status.status.clone(), status.message.clone());
+        assert_eq!(words(&pending), ("pending".to_string(), None));
+        assert_eq!(words(&processing), ("processing".to_string(), None));
+        assert_eq!(
+            words(&failed),
+            ("failed".to_string(), Some("boom".to_string()))
+        );
+        for status in [&pending, &processing, &failed] {
+            assert_eq!(status.job_type, "AddWorker");
+            assert_eq!(status.worker_url, "http://w:8000");
+            assert!(
+                (before..=after).contains(&status.timestamp),
+                "stamped between {before} and {after}, not at {}",
+                status.timestamp
+            );
         }
     }
 }
@@ -1325,6 +1383,34 @@ pub struct ListWorkersQuery {
     /// Only return workers serving this model, e.g. `?model=moonshotai/Kimi-K2.5`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The shape of the answer: the worker records when absent, or
+    /// `manifest`, the file discovery provider's manifest, which a second
+    /// gateway reads with `--discovery-provider file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<WorkerListFormat>,
+    /// Only the workers of this origin: `local`, registered at start-up or
+    /// through this API, or `discovery`, registered by a discovery provider
+    /// that re-registers them on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<WorkerListOrigin>,
+}
+
+/// The shape `GET /workers` answers in, when not the worker records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerListFormat {
+    /// The file discovery provider's manifest: `{"version": 1, "workers": [...]}`.
+    Manifest,
+}
+
+/// Who registered a worker, as `GET /workers?origin=` filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerListOrigin {
+    /// The start-up flags or the worker API.
+    Local,
+    /// A discovery provider: Kubernetes, a file, Slurm or Consul.
+    Discovery,
 }
 
 // ── Response types ──────────────────────────────────────────────────
@@ -1347,16 +1433,18 @@ pub struct WorkerErrorResponse {
 }
 
 /// Result from flush cache operations across workers
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FlushCacheResult {
     pub successful: Vec<String>,
     pub failed: Vec<(String, String)>,
     pub total_workers: usize,
     pub http_workers: usize,
+    /// gRPC workers, and direct-ZMQ engines whose wire carries the flush.
     #[serde(default)]
     pub grpc_workers: usize,
     /// Workers skipped because their transport has no cache-flush RPC
-    /// (direct-ZMQ engines). Keeps `total = http + grpc + zmq` exact.
+    /// (direct-ZMQ engines whose wire carries no control calls). Keeps
+    /// `total = http + grpc + zmq` exact.
     #[serde(default)]
     pub zmq_workers: usize,
     pub message: String,
@@ -1367,7 +1455,7 @@ pub struct FlushCacheResult {
 /// Mirrors the engines' native profile parameters: serialized verbatim as
 /// the JSON body for HTTP workers and mapped to the `StartProfile` RPC for
 /// gRPC workers. Unset fields fall back to backend defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ProfileOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1386,7 +1474,7 @@ pub struct ProfileOptions {
 }
 
 /// Result from profile start/stop operations across workers
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ProfileResult {
     pub successful: Vec<String>,
     pub failed: Vec<(String, String)>,
@@ -1397,7 +1485,7 @@ pub struct ProfileResult {
 /// Request body for the gateway `/start_profile` route: profile options
 /// plus an optional worker URL to target a single worker (e.g. one
 /// PD-disaggregation role). All workers are profiled when `url` is unset.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct StartProfileRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1408,7 +1496,7 @@ pub struct StartProfileRequest {
 
 /// Request body for the gateway `/stop_profile` route: optional worker URL
 /// to target a single worker.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct StopProfileRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1444,7 +1532,14 @@ pub struct SchedulerLoadSnapshot {
     /// Older backends omit this; pressure then uses their legacy token usage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_token_usage: Option<f64>,
+    /// Context tokens (prompt plus committed output) of every request the
+    /// rank holds. Older backends omit this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_resident_tokens: Option<i64>,
     pub gen_throughput: f64,
+    /// Actual non-cached input tokens per active prefill second; unknown/stale is None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_throughput: Option<f64>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
@@ -1620,6 +1715,16 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Resident context tokens summed across all DP ranks; `None` unless
+    /// every rank reports them.
+    pub fn total_resident_tokens(&self) -> Option<i64> {
+        self.loads
+            .iter()
+            .map(|l| l.num_resident_tokens)
+            .sum::<Option<i64>>()
+            .filter(|_| !self.loads.is_empty())
+    }
+
     /// Total running requests summed across all DP ranks.
     pub fn total_running_reqs(&self) -> i64 {
         self.loads.iter().map(|l| l.num_running_reqs as i64).sum()
@@ -1731,6 +1836,10 @@ mod connection_mode_tests {
     fn from_url_classifies_known_schemes() {
         assert_eq!(
             ConnectionMode::from_url("ipc:///tmp/e"),
+            Some(ConnectionMode::Zmq)
+        );
+        assert_eq!(
+            ConnectionMode::from_url("tcp://10.0.0.5:31000"),
             Some(ConnectionMode::Zmq)
         );
         assert_eq!(

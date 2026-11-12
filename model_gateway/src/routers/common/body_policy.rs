@@ -27,6 +27,8 @@ pub(crate) const REASON_POLICY_NEEDS_TEXT: &str = "policy_needs_text";
 pub(crate) const REASON_MODEL_AMBIGUOUS: &str = "model_ambiguous";
 pub(crate) const REASON_WORKER_MUTATES_BODY: &str = "worker_mutates_body";
 pub(crate) const REASON_WASM_REQUEST_HOOK: &str = "wasm_request_hook";
+pub(crate) const REASON_TENANT_RATE_LIMIT: &str = "tenant_rate_limit";
+pub(crate) const REASON_MESSAGE_THREAD: &str = "message_thread";
 pub(crate) const REASON_NO_CONTENT_LENGTH: &str = "no_content_length";
 pub(crate) const REASON_NO_AVAILABLE_WORKER: &str = "no_available_worker";
 pub(crate) const REASON_MODEL_SELECTION: &str = "model_selection";
@@ -44,6 +46,12 @@ pub(crate) struct BodyPathInputs {
     pub content_length: Option<u64>,
     pub retries_enabled: bool,
     pub max_buffered_request_bytes: u64,
+    /// A tenant rate limiter is on: every streamable route reserves an
+    /// estimate read from the request's body.
+    pub tenant_rate_limited: bool,
+    /// The request names the message-threads beta: a thread turn is rebuilt
+    /// from its body before the route and its answer stored after it.
+    pub message_thread: bool,
 }
 
 /// Decide the request body path before the body arrives. Buffer when
@@ -51,7 +59,9 @@ pub(crate) struct BodyPathInputs {
 /// the fallback key), a text-routing policy without a valid hint-header
 /// waiver, a registry serving more than one model (content-blind selection
 /// could land the request on the wrong model's worker), a body-mutating
-/// worker, a WASM request hook, or a missing/invalid Content-Length.
+/// worker, a WASM request hook, a tenant rate limiter (the reservation's
+/// estimate is read from the body), a message-thread turn (the thread layer
+/// reads the body), or a missing/invalid Content-Length.
 /// Otherwise, with router retries enabled, buffer up to
 /// `max_buffered_request_bytes` to keep the request replayable — a larger
 /// body streams and forfeits router retries. Otherwise stream, at any size.
@@ -70,6 +80,12 @@ pub(crate) fn decide_body_path(inputs: &BodyPathInputs) -> BodyPath {
     }
     if inputs.wasm_request_hooks {
         return BodyPath::Buffer(REASON_WASM_REQUEST_HOOK);
+    }
+    if inputs.tenant_rate_limited {
+        return BodyPath::Buffer(REASON_TENANT_RATE_LIMIT);
+    }
+    if inputs.message_thread {
+        return BodyPath::Buffer(REASON_MESSAGE_THREAD);
     }
     let Some(content_length) = inputs.content_length else {
         return BodyPath::Buffer(REASON_NO_CONTENT_LENGTH);
@@ -97,6 +113,8 @@ mod tests {
             content_length: Some(content_length),
             retries_enabled: true,
             max_buffered_request_bytes: 1024,
+            tenant_rate_limited: false,
+            message_thread: false,
         }
     }
 
@@ -108,6 +126,7 @@ mod tests {
             model_ambiguous: true,
             worker_mutates_body: true,
             wasm_request_hooks: true,
+            tenant_rate_limited: true,
             content_length: None,
             ..eligible(0)
         };
@@ -154,6 +173,20 @@ mod tests {
             ),
             (
                 BodyPathInputs {
+                    tenant_rate_limited: true,
+                    ..eligible(64)
+                },
+                REASON_TENANT_RATE_LIMIT,
+            ),
+            (
+                BodyPathInputs {
+                    message_thread: true,
+                    ..eligible(64)
+                },
+                REASON_MESSAGE_THREAD,
+            ),
+            (
+                BodyPathInputs {
                     content_length: None,
                     ..eligible(64)
                 },
@@ -161,6 +194,23 @@ mod tests {
             ),
         ] {
             assert_eq!(decide_body_path(&inputs), BodyPath::Buffer(reason));
+        }
+    }
+
+    /// A message-thread turn buffers under every retry setting and at any
+    /// size: the thread layer reads the body before the route.
+    #[test]
+    fn a_message_thread_turn_buffers_whatever_the_retry_setting() {
+        for retries_enabled in [true, false] {
+            let inputs = BodyPathInputs {
+                message_thread: true,
+                retries_enabled,
+                ..eligible(u64::MAX)
+            };
+            assert_eq!(
+                decide_body_path(&inputs),
+                BodyPath::Buffer(REASON_MESSAGE_THREAD)
+            );
         }
     }
 

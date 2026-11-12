@@ -18,7 +18,12 @@ import time
 from pathlib import Path
 
 import pytest
-from infra.constants import ENV_SHOW_ROUTER_LOGS, ENV_SHOW_WORKER_LOGS, ConnectionMode
+from infra.constants import (
+    CLOUD_REQUEST_TIMEOUT_SECS,
+    ENV_SHOW_ROUTER_LOGS,
+    ENV_SHOW_WORKER_LOGS,
+    ConnectionMode,
+)
 from infra.gateway import Gateway
 from infra.process_utils import ProcessExitedError, wait_for_health, wait_for_workers_ready
 from infra.worker import Worker
@@ -37,6 +42,9 @@ FAKE_ROUTER = textwrap.dedent(
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--prometheus-port", type=int, required=True)
     parser.add_argument("--worker-urls", nargs="*", default=[])
+    # The disaggregated flags: ``URL [BOOTSTRAP_PORT]`` per worker, repeatable.
+    for role in ("--encode", "--prefill", "--decode"):
+        parser.add_argument(role, nargs="+", action="append", default=[])
     parser.add_argument("--fake", default="serve", choices=["serve", "exit", "hold-last"])
     parser.add_argument("--fake-dp", action="store_true", help="register rank-suffixed URLs")
     args, _ = parser.parse_known_args()
@@ -58,7 +66,8 @@ FAKE_ROUTER = textwrap.dedent(
         sys.exit(1)
     metrics.listen(1)
 
-    urls = args.worker_urls[:-1] if args.fake == "hold-last" else args.worker_urls
+    urls = args.worker_urls + [flag[0] for flag in args.encode + args.prefill + args.decode]
+    urls = urls[:-1] if args.fake == "hold-last" else urls
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -69,7 +78,10 @@ FAKE_ROUTER = textwrap.dedent(
                 ]
                 body = {"total": len(urls), "workers": workers}
             elif self.path == "/readiness":
-                body = {"status": "ready", "healthy_workers": len(urls)}
+                # Like the router's disaggregated readiness: held while no
+                # worker of a role is registered.
+                status = "ready" if urls else "waiting"
+                body = {"status": status, "healthy_workers": len(urls)}
             elif self.path == "/health":
                 body = {"status": "ok"}
             else:
@@ -184,6 +196,68 @@ def test_the_timeout_names_the_workers_still_missing(fake_router):
     message = str(excinfo.value)
     assert "workers: 1/2" in message
     assert f"missing: {WORKERS[1]}" in message
+    assert "readiness: waiting for workers" in message
+
+
+class _Started:
+    """A launched worker as the disaggregated branches read one: its URL, its
+    bootstrap port and the liveness check of the readiness wait."""
+
+    def __init__(self, url: str, bootstrap_port: int | None = None) -> None:
+        self.base_url = url
+        self.worker_url = url
+        self.bootstrap_port = bootstrap_port
+
+    def raise_if_exited(self) -> None:
+        """Alive for the whole wait."""
+
+
+def test_a_pd_launch_waits_on_the_readiness_gate(fake_router):
+    """The stand-in never registers the decode worker: the PD launch waits
+    for readiness as the regular one does, and the timeout names the state."""
+    gateway = Gateway()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            gateway.start(
+                prefill_workers=[_Started(WORKERS[0], bootstrap_port=8998)],
+                decode_workers=[_Started(WORKERS[1])],
+                timeout=4,
+                extra_args=["--fake", "hold-last"],
+            )
+    finally:
+        gateway.shutdown()
+    message = str(excinfo.value)
+    assert "workers: 1/2" in message
+    assert "readiness: waiting for workers" in message
+
+
+def test_an_empty_pd_launch_returns_on_health_alone(fake_router):
+    """A disaggregated gateway started with no worker (a fleet registered
+    through the API afterwards) returns on /health: its readiness needs each
+    role, so there is nothing to wait for yet."""
+    gateway = Gateway()
+    try:
+        gateway.start(prefill_workers=[], decode_workers=[], timeout=4)
+    finally:
+        gateway.shutdown()
+
+
+def test_an_epd_launch_waits_on_the_readiness_gate(fake_router):
+    """The same wait for the three-role gateway, the decode worker held."""
+    gateway = Gateway()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            gateway.start(
+                encode_workers=[_Started("http://127.0.0.1:3")],
+                prefill_workers=[_Started(WORKERS[0], bootstrap_port=8998)],
+                decode_workers=[_Started(WORKERS[1])],
+                timeout=4,
+                extra_args=["--fake", "hold-last"],
+            )
+    finally:
+        gateway.shutdown()
+    message = str(excinfo.value)
+    assert "workers: 2/3" in message
     assert "readiness: waiting for workers" in message
 
 
@@ -344,3 +418,14 @@ def test_the_readiness_wait_stops_when_a_launched_worker_exits(tmp_path, monkeyp
         if worker._log_file is not None:
             worker._log_file.close()
     assert time.perf_counter() - started < 10
+
+
+def test_a_cloud_gateway_gets_a_budget_for_each_call_to_its_provider(monkeypatch):
+    """A provider call that never answers ends at the budget as a gateway error
+    the SDK clients retry on their own, instead of holding the test for the ten
+    minutes of the SDK's own timeout (twice in one job: the job's cap)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    args = Gateway()._build_cloud_args("openai", "memory")
+
+    assert args[args.index("--request-timeout-secs") + 1] == str(CLOUD_REQUEST_TIMEOUT_SECS)

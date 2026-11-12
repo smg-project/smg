@@ -1,16 +1,17 @@
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, invalid, is_false, is_true, validate_json_schema_shape,
-        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
-        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
-        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, json_type_name, on_field,
+        validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
+        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse, FunctionChoice,
+        GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
+        ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -25,6 +26,9 @@ use crate::{
 // Chat Messages
 // ============================================================================
 
+/// One message of a chat conversation, tagged by its `role` (system, user,
+/// assistant, tool, function, developer or root), carrying the content and
+/// fields that role has.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "role")]
@@ -46,15 +50,27 @@ pub enum ChatMessage {
         #[schemars(skip)]
         ext: KimiUserExt,
     },
+    /// An earlier model turn, replayed by the client. The refusal, the audio
+    /// reference and the deprecated function call are carried as the client
+    /// sent them, for an upstream that reads them; the gRPC chat template
+    /// never sees them, as the engines' own chat utils leave them out.
+    ///
+    /// The variant is the largest of the enum, so its room is every turn's:
+    /// the deprecated function call and the provider extension ride behind a
+    /// pointer each, which keeps a turn under 192 bytes (a history of four
+    /// turns in the allocator's 768-byte class, of eight in the 1,536 one).
     #[serde(rename = "assistant")]
     Assistant {
         content: Option<MessageContent>,
+        refusal: Option<String>,
         name: Option<String>,
+        audio: Option<ChatAssistantAudio>,
         tool_calls: Option<Vec<ToolCall>>,
-        /// Reasoning content for O1-style models (an engine extension); another
-        /// engine's `reasoning` spelling is accepted on input.
-        #[serde(alias = "reasoning")]
-        reasoning_content: Option<String>,
+        function_call: Option<Box<FunctionCallResponse>>,
+        /// Reasoning content for O1-style models (an engine extension), read
+        /// from `reasoning_content` or `reasoning`; see [`AssistantReasoning`].
+        #[serde(flatten)]
+        reasoning: AssistantReasoning,
         #[serde(flatten)]
         #[schemars(skip)]
         ext: KimiAssistantExt,
@@ -64,8 +80,15 @@ pub enum ChatMessage {
         content: MessageContent,
         tool_call_id: String,
     },
+    /// The deprecated function result: its content is a string or null, as
+    /// the public API has it, and the key is required there, so a `null`
+    /// stays on the wire when the request is written back for an upstream.
     #[serde(rename = "function")]
-    Function { content: String, name: String },
+    Function {
+        #[serialize_always]
+        content: Option<String>,
+        name: String,
+    },
     #[serde(rename = "developer")]
     Developer {
         content: MessageContent,
@@ -84,6 +107,102 @@ pub enum ChatMessage {
     },
 }
 
+/// The audio answer of an earlier assistant turn, referred to by its id: the
+/// history carries the reference, not the audio.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatAssistantAudio {
+    pub id: String,
+}
+
+/// The reasoning text of an assistant message on input. It is read from
+/// `reasoning_content` (the key this crate writes) or from `reasoning` (the key
+/// of vLLM and OpenRouter). Agent clients send some messages with both keys.
+/// One key, or both keys with the same text, gives that text. Both keys with
+/// different text are refused as a value (`invalid_value`): the gateway cannot
+/// know which text the model produced. An empty text does not count and cannot
+/// disagree. A serde alias between the two keys refused a message with both as
+/// a duplicate field (#5092).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct AssistantReasoning {
+    /// Reasoning content for O1-style models (an engine extension). The
+    /// `reasoning` key is accepted on input too.
+    #[serde(rename = "reasoning_content", skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Reads each key by its own name, with no alias between them.
+/// `deserialize_struct` names the two keys. Under `#[serde(flatten)]` serde then
+/// gives this reader only those keys; the provider extension keeps its own.
+impl<'de> Deserialize<'de> for AssistantReasoning {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["reasoning_content", "reasoning"];
+
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            ReasoningContent,
+            Reasoning,
+            #[serde(other)]
+            Other,
+        }
+
+        struct ReasoningVisitor;
+
+        impl<'de> de::Visitor<'de> for ReasoningVisitor {
+            type Value = AssistantReasoning;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an assistant message's reasoning")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut reasoning_content: Option<Option<String>> = None;
+                let mut reasoning: Option<Option<String>> = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::ReasoningContent => {
+                            if reasoning_content.is_some() {
+                                return Err(de::Error::duplicate_field("reasoning_content"));
+                            }
+                            reasoning_content = Some(map.next_value()?);
+                        }
+                        Field::Reasoning => {
+                            if reasoning.is_some() {
+                                return Err(de::Error::duplicate_field("reasoning"));
+                            }
+                            reasoning = Some(map.next_value()?);
+                        }
+                        Field::Other => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let text = match (reasoning_content.flatten(), reasoning.flatten()) {
+                    (Some(content), Some(alias))
+                        if !content.is_empty() && !alias.is_empty() && content != alias =>
+                    {
+                        // Opens with serde's words, so the public code is `invalid_value`.
+                        return Err(de::Error::custom(
+                            "invalid value: `reasoning_content` and `reasoning` disagree; \
+                             send one of them, or the same text in both",
+                        ));
+                    }
+                    (Some(content), Some(alias)) => {
+                        Some(if content.is_empty() { alias } else { content })
+                    }
+                    (Some(text), None) | (None, Some(text)) => Some(text),
+                    (None, None) => None,
+                };
+                Ok(AssistantReasoning { text })
+            }
+        }
+
+        deserializer.deserialize_struct("AssistantReasoning", FIELDS, ReasoningVisitor)
+    }
+}
+
+/// A message's content as the wire carries it: one text string, or a list of
+/// typed parts (text, image, audio, video, refusal).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -107,14 +226,12 @@ impl MessageContent {
             MessageContent::Parts(parts) => {
                 let mut result = String::new();
                 let mut first = true;
-                for part in parts {
-                    if let ContentPart::Text { text } = part {
-                        if !first {
-                            result.push(' ');
-                        }
-                        result.push_str(text);
-                        first = false;
+                for text in parts.iter().filter_map(ContentPart::text) {
+                    if !first {
+                        result.push(' ');
                     }
+                    result.push_str(text);
+                    first = false;
                 }
                 result
             }
@@ -136,15 +253,13 @@ impl MessageContent {
             }
             MessageContent::Parts(parts) => {
                 let mut appended = false;
-                for part in parts {
-                    if let ContentPart::Text { text } = part {
-                        if !text.is_empty() {
-                            if appended {
-                                buffer.push(' ');
-                            }
-                            buffer.push_str(text);
-                            appended = true;
+                for text in parts.iter().filter_map(ContentPart::text) {
+                    if !text.is_empty() {
+                        if appended {
+                            buffer.push(' ');
                         }
+                        buffer.push_str(text);
+                        appended = true;
                     }
                 }
                 appended
@@ -159,7 +274,8 @@ impl MessageContent {
             MessageContent::Text(text) => !text.is_empty(),
             MessageContent::Parts(parts) => parts
                 .iter()
-                .any(|part| matches!(part, ContentPart::Text { text } if !text.is_empty())),
+                .filter_map(ContentPart::text)
+                .any(|text| !text.is_empty()),
         }
     }
 }
@@ -168,6 +284,9 @@ impl MessageContent {
 // Chat Completion Request
 // ============================================================================
 
+/// A request to the chat completions route: the conversation so far, the model,
+/// and the sampling, tool, response-format and streaming parameters, validated
+/// together before dispatch.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Default, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_chat_cross_parameters"))]
@@ -191,7 +310,9 @@ pub struct ChatCompletionRequest {
     #[deprecated(note = "Use tools instead")]
     pub functions: Option<Vec<Function>>,
 
-    /// Modify the likelihood of specified tokens appearing in the completion
+    /// Modify the likelihood of specified tokens appearing in the completion:
+    /// token id to a bias in -100..=100, applied by the engine's sampler
+    #[validate(custom(function = "validate_logit_bias"))]
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Whether to return log probabilities of the output tokens
@@ -216,8 +337,8 @@ pub struct ChatCompletionRequest {
     /// Whether to return audio output.
     pub return_audio: Option<bool>,
 
-    /// How many chat completion choices to generate for each input message
-    #[validate(range(min = 1, max = 10))]
+    /// How many chat completion choices to generate for each input message (1 to 128)
+    #[validate(range(min = 1, max = 128))]
     pub n: Option<u32>,
 
     /// Whether to enable parallel function calling during tool use
@@ -471,10 +592,14 @@ impl ChatCompletionRequest {
     /// a native template effort still ranks that effort above the toggle
     /// when it reads the prompt (the gateway's parser precedence).
     pub fn template_thinking(&self) -> Option<bool> {
-        self.thinking_toggle().or_else(|| {
-            ProviderProfile::for_model(&self.model)
-                .thinking_from_reasoning_effort(self.effective_reasoning_effort())
-        })
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already (the gateway's preparation derives it once per request).
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
+        self.thinking_toggle()
+            .or_else(|| provider.thinking_from_reasoning_effort(self.effective_reasoning_effort()))
     }
 
     /// Whether `continue_final_message` applies: it is set and the request
@@ -548,14 +673,14 @@ pub(crate) fn deserialize_reasoning_effort<'de, D>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     let value = Option::<Value>::deserialize(deserializer)?;
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value)),
         Some(Value::Number(value)) => Ok(Some(value.to_string())),
-        Some(_) => Err(serde::de::Error::custom(
+        Some(_) => Err(de::Error::custom(
             "reasoning_effort must be a string, number, or null",
         )),
     }
@@ -589,13 +714,16 @@ fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError>
     }
 }
 
-/// Schema-level validation for cross-field dependencies
+/// Schema-level validation for cross-field dependencies. Each rule names the
+/// field it is about (`invalid_at`), which the error envelope reports as
+/// `param`; the provider profiles' rules keep their own form.
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
 ) -> Result<(), validator::ValidationError> {
     // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
-        return Err(invalid(
+        return Err(invalid_at(
+            "top_logprobs",
             "top_logprobs_requires_logprobs",
             "top_logprobs is only allowed when logprobs is enabled",
         ));
@@ -603,7 +731,8 @@ fn validate_chat_cross_parameters(
 
     // 2. Validate stream_options dependency
     if req.stream_options.is_some() && !req.stream {
-        return Err(invalid(
+        return Err(invalid_at(
+            "stream_options",
             "stream_options_requires_stream",
             "The 'stream_options' parameter is only allowed when 'stream' is enabled",
         ));
@@ -612,30 +741,39 @@ fn validate_chat_cross_parameters(
     // 3. Validate token limits - min <= max
     if let (Some(min), Some(max)) = (req.min_tokens, req.output_token_cap()) {
         if min > max {
-            return Err(invalid(
+            return Err(invalid_at(
+                "min_tokens",
                 "min_tokens_exceeds_max",
                 "min_tokens cannot exceed max_tokens/max_completion_tokens",
             ));
         }
     }
 
-    // 4. Validate structured output conflicts
-    let has_json_format = matches!(
+    // 4. Validate structured output conflicts: a response format that
+    //    constrains the output (a JSON one, a structural tag) beside a grammar
+    //    of the request's own
+    let has_format_constraint = matches!(
         req.response_format,
-        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        Some(
+            ResponseFormat::JsonObject
+                | ResponseFormat::JsonSchema { .. }
+                | ResponseFormat::StructuralTag { .. }
+        )
     );
 
-    if has_json_format && req.regex.is_some() {
-        return Err(invalid(
+    if has_format_constraint && req.regex.is_some() {
+        return Err(invalid_at(
+            "regex",
             "regex_conflicts_with_json",
-            "cannot use regex constraint with JSON response format",
+            "cannot use regex constraint with a JSON or structural_tag response format",
         ));
     }
 
-    if has_json_format && req.ebnf.is_some() {
-        return Err(invalid(
+    if has_format_constraint && req.ebnf.is_some() {
+        return Err(invalid_at(
+            "ebnf",
             "ebnf_conflicts_with_json",
-            "cannot use EBNF constraint with JSON response format",
+            "cannot use EBNF constraint with a JSON or structural_tag response format",
         ));
     }
 
@@ -649,8 +787,11 @@ fn validate_chat_cross_parameters(
     .filter(|&&x| x)
     .count();
 
+    // Only `regex` beside `ebnf` reaches this rule (a format beside either
+    // was refused above); the second constraint is the one named.
     if constraint_count > 1 {
-        return Err(invalid(
+        return Err(invalid_at(
+            "ebnf",
             "multiple_constraints",
             "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
         ));
@@ -658,7 +799,8 @@ fn validate_chat_cross_parameters(
 
     // 6. Validate response format JSON schema name and shape
     if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
-        validate_json_schema_shape(&json_schema.name, &json_schema.schema)?;
+        validate_json_schema_shape(&json_schema.name, &json_schema.schema)
+            .map_err(|error| on_field(error, "response_format"))?;
     }
 
     // 7. A tool_choice against the tools the model will see
@@ -666,49 +808,37 @@ fn validate_chat_cross_parameters(
         validate_tool_choice(req, tool_choice)?;
     }
 
-    // 8. A function's `parameters` is a JSON Schema object (null was already
-    //    read as the empty schema)
+    // 8. A function's `parameters`, when given, is a JSON Schema object (an
+    //    absent or null schema was read as none and passes)
     for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
-        if !tool.function.parameters.is_object() {
-            return Err(invalid(
+        let Some(schema) = &tool.function.parameters else {
+            continue;
+        };
+        if !schema.is_object() {
+            return Err(invalid_at(
+                format!("tools[{index}].function.parameters"),
                 "invalid_type",
                 format!(
                     "Invalid 'tools[{index}].function.parameters': expected an object, but got {} \
                      instead",
-                    json_type_name(&tool.function.parameters)
+                    json_type_name(schema)
                 ),
             ));
         }
     }
 
-    // 9. `logit_bias` is keyed by token ids
-    if let Some(key) = req
-        .logit_bias
-        .iter()
-        .flatten()
-        .map(|(key, _)| key)
-        .find(|key| key.parse::<u64>().is_err())
-    {
-        return Err(invalid(
-            "logit_bias_invalid_key",
-            format!(
-                "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
-                 ids"
-            ),
-        ));
-    }
-
-    // 10. A continued final message and the generation header exclude each
+    // 9. A continued final message and the generation header exclude each
     //     other: the pair set together is refused, as the engine that has
     //     the field refuses it; `continue_final_message` alone continues.
     if req.continue_final_message && req.add_generation_prompt == Some(true) {
-        return Err(invalid(
+        return Err(invalid_at(
+            "add_generation_prompt",
             "add_generation_prompt_conflicts_with_continue_final_message",
             "Cannot set both `continue_final_message` and `add_generation_prompt` to True.",
         ));
     }
 
-    // 11. Provider-profile contract rules, selected from the model id. Both
+    // 10. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
@@ -735,7 +865,8 @@ fn validate_tool_choice(
         ToolChoice::Value(ToolChoiceValue::None | ToolChoiceValue::Auto)
     );
     if requires_tools && !has_tools {
-        return Err(invalid(
+        return Err(invalid_at(
+            "tool_choice",
             "tool_choice_requires_tools",
             "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
         ));
@@ -747,7 +878,8 @@ fn validate_tool_choice(
         effective_tools().any(|tool| tool.tool_type == "function" && tool.function.name == name)
     };
     match tool_choice {
-        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid(
+        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid_at(
+            "tool_choice",
             "tool_choice_function_not_found",
             format!(
                 "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
@@ -755,41 +887,32 @@ fn validate_tool_choice(
             ),
         )),
         ToolChoice::AllowedTools { mode, .. } if mode != "auto" && mode != "required" => {
-            Err(invalid(
+            Err(invalid_at(
+                "tool_choice.mode",
                 "tool_choice_invalid_mode",
                 format!(
-                    "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
+                    "Invalid value for 'tool_choice.allowed_tools.mode': must be 'auto' or 'required', got '{mode}'."
                 ),
             ))
         }
         // The Chat Completions API takes function tools only in an allowed-tools choice.
         ToolChoice::AllowedTools { tools, .. } => tools.iter().try_for_each(|tool_ref| match tool_ref {
-            ToolReference::Function { name } if !declared(name) => Err(invalid(
+            ToolReference::Function { name } if !declared(name) => Err(invalid_at(
+                "tool_choice.tools",
                 "tool_choice_tool_not_found",
-                format!("Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."),
+                format!("Invalid value for 'tool_choice.allowed_tools.tools': tool '{name}' not found in 'tools'."),
             )),
             ToolReference::Function { .. } => Ok(()),
-            _ => Err(invalid(
+            _ => Err(invalid_at(
+                "tool_choice.tools",
                 "tool_choice_invalid_tool_type",
                 format!(
-                    "Invalid value for 'tool_choice.tools': Chat Completion API only supports function tools, got '{}'.",
+                    "Invalid value for 'tool_choice.allowed_tools.tools': Chat Completion API only supports function tools, got '{}'.",
                     tool_ref.identifier()
                 ),
             )),
         }),
         ToolChoice::Function { .. } | ToolChoice::Value(_) => Ok(()),
-    }
-}
-
-/// The JSON type of a value, for error messages (`a string`, `an array`, ...).
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
     }
 }
 
@@ -909,7 +1032,10 @@ impl Normalizable for ChatCompletionRequest {
         ProviderProfile::for_model(&self.model).normalize_chat(self);
 
         // Migrate deprecated functions → tools
-        #[expect(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "the one read of functions: its migration to tools"
+        )]
         if self.tools.is_none() && self.functions.is_some() {
             tracing::warn!("functions is deprecated, use tools instead");
             self.tools = self.functions.as_ref().map(|functions| {
@@ -925,7 +1051,10 @@ impl Normalizable for ChatCompletionRequest {
         }
 
         // Migrate deprecated function_call → tool_choice
-        #[expect(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "the one read of function_call: its migration to tool_choice"
+        )]
         if self.tool_choice.is_none() && self.function_call.is_some() {
             tracing::warn!("function_call is deprecated, use tool_choice instead");
             self.tool_choice = self.function_call.as_ref().map(|fc| match fc {
@@ -1002,9 +1131,7 @@ impl GenerationRequest for ChatCompletionRequest {
                     }
                 }
                 ChatMessage::Assistant {
-                    content,
-                    reasoning_content,
-                    ..
+                    content, reasoning, ..
                 } => {
                     // Append main content
                     if let Some(c) = content {
@@ -1016,18 +1143,18 @@ impl GenerationRequest for ChatCompletionRequest {
                         }
                     }
                     // Append reasoning content
-                    if let Some(reasoning) = reasoning_content {
-                        if !reasoning.is_empty() {
+                    if let Some(text) = &reasoning.text {
+                        if !text.is_empty() {
                             if has_content {
                                 buffer.push(' ');
                             }
-                            buffer.push_str(reasoning);
+                            buffer.push_str(text);
                             has_content = true;
                         }
                     }
                 }
                 ChatMessage::Function { content, .. } => {
-                    if !content.is_empty() {
+                    if let Some(content) = content.as_deref().filter(|c| !c.is_empty()) {
                         if has_content {
                             buffer.push(' ');
                         }
@@ -1046,6 +1173,8 @@ impl GenerationRequest for ChatCompletionRequest {
 // Response Types
 // ============================================================================
 
+/// The complete (non-streamed) answer of the chat completions route, object
+/// `chat.completion`: the choices with their messages, and the usage.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionResponse {
@@ -1101,6 +1230,9 @@ pub struct ChatCompletionMessage {
     // Note: audio is not added yet
 }
 
+/// One generated alternative of a chat completion: its index, the assistant
+/// message, the log probabilities (`null` unless requested) and the reason
+/// generation stopped.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatChoice {
     pub index: u32,
@@ -1117,6 +1249,9 @@ pub struct ChatChoice {
     pub hidden_states: Option<Vec<f32>>,
 }
 
+/// One chunk of a streamed chat completion, object `chat.completion.chunk`: the
+/// choices' deltas and, when requested, the usage (on the last chunk, or the
+/// running usage on every chunk with `continuous_usage_stats`).
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatCompletionStreamResponse {
@@ -1152,6 +1287,9 @@ pub struct ChatMessageDelta {
     pub reasoning_content: Option<String>,
 }
 
+/// One alternative's part of a streamed chunk: its index, the delta since the
+/// previous chunk, the log probabilities when requested, and the finish reason
+/// once it stops.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ChatStreamChoice {
     pub index: u32,
@@ -1228,7 +1366,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessageDelta,
+        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, ChatMessageDelta,
         ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
         ThinkingParam, ThinkingType,
     };
@@ -1683,7 +1821,7 @@ mod tests {
         let request: ChatCompletionRequest =
             serde_json::from_value(value).expect("request must deserialize");
         let tools = request.tools.expect("tools must be present");
-        assert_eq!(tools[0].function.parameters, json!({}));
+        assert_eq!(tools[0].function.parameters_schema(), &json!({}));
     }
 
     #[test]
@@ -1868,6 +2006,35 @@ mod tests {
         ]);
         assert_eq!(request(history).history_tool_calls_count(), 3);
     }
+
+    /// The deprecated function call and the provider extension of an
+    /// assistant turn ride behind a pointer each. The variant is the enum's
+    /// largest, so its room is every chat message's: 176 bytes on 64-bit
+    /// targets before the refusal, the audio reference and the function call
+    /// were kept, 272 with the two inline, and the history of four turns the
+    /// reader grows a vector to had left the allocator's 768-byte class for
+    /// the 1,280 one (eight turns the 1,536 for the 2,560) on every chat
+    /// request. Under 192 bytes a turn, both histories are back in their
+    /// class. A field that grows the turn past it needs its own read.
+    #[test]
+    fn an_assistant_turns_function_call_and_provider_extension_ride_behind_a_pointer_each() {
+        let message: ChatMessage =
+            serde_json::from_value(json!({"role": "assistant", "content": "Hello."}))
+                .expect("a plain assistant turn");
+        let ChatMessage::Assistant {
+            function_call, ext, ..
+        } = &message
+        else {
+            panic!("not an assistant turn");
+        };
+        assert_eq!(size_of_val(function_call), size_of::<usize>());
+        assert_eq!(size_of_val(&ext.tools), size_of::<usize>());
+        assert!(
+            size_of::<ChatMessage>() <= 192,
+            "a chat message is {} bytes",
+            size_of::<ChatMessage>()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1875,7 +2042,7 @@ mod request_contract_tests {
     use serde_json::{json, Value};
     use validator::Validate;
 
-    use super::ChatCompletionRequest;
+    use super::{ChatCompletionRequest, ChatMessage};
 
     fn request(extra: Value) -> ChatCompletionRequest {
         let mut value = json!({
@@ -1924,6 +2091,46 @@ mod request_contract_tests {
         .is_err());
     }
 
+    /// The deprecated function message's content is required and nullable
+    /// on the public API: a `null` reads as none and writes back as `null`,
+    /// not as an absent key, so a request forwarded to an upstream keeps the
+    /// client's shape.
+    #[test]
+    fn a_function_message_without_content_keeps_the_null_on_the_wire() {
+        let message: ChatMessage =
+            serde_json::from_value(json!({"role": "function", "name": "f", "content": null}))
+                .expect("a function message");
+        assert!(matches!(&message, ChatMessage::Function { content: None, name } if name == "f"));
+        assert_eq!(
+            serde_json::to_value(&message).expect("json"),
+            json!({"role": "function", "name": "f", "content": null})
+        );
+        let with_text: ChatMessage =
+            serde_json::from_value(json!({"role": "function", "name": "f", "content": "result"}))
+                .expect("a function message");
+        assert_eq!(
+            serde_json::to_value(&with_text).expect("json"),
+            json!({"role": "function", "name": "f", "content": "result"})
+        );
+    }
+
+    /// `n` takes the public API's 1 to 128; 0 and 129 cross the bound and
+    /// the refusal names the field.
+    #[test]
+    fn n_takes_the_public_apis_bound() {
+        for n in [1, 10, 11, 128] {
+            assert_eq!(rejection(&request(json!({"n": n}))), None, "n {n}");
+        }
+        for (n, bound) in [(0, "min"), (129, "max")] {
+            let errors = request(json!({"n": n}))
+                .validate()
+                .expect_err(&format!("n {n}"));
+            let error = &errors.field_errors()["n"][0];
+            assert_eq!(error.code, "range", "n {n}");
+            assert_eq!(error.params[bound], if n == 0 { 1 } else { 128 }, "n {n}");
+        }
+    }
+
     #[test]
     fn function_parameters_must_be_an_object() {
         let bad = request(
@@ -1938,11 +2145,36 @@ mod request_contract_tests {
         assert_eq!(rejection(&empty), None);
     }
 
+    /// `logit_bias` is keyed by token ids, no two of them spelling one id,
+    /// and its biases stay within the public API's -100..=100; a refusal
+    /// names the field. A single key with a leading zero names its id.
     #[test]
-    fn logit_bias_is_keyed_by_token_ids() {
-        let bad = request(json!({"logit_bias": {"not-a-token": 1}}));
-        assert!(rejection(&bad).is_some_and(|e| e.contains("logit_bias_invalid_key")));
-        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5}}));
+    fn logit_bias_is_keyed_by_token_ids_and_bounded() {
+        for (bias, code) in [
+            (json!({"not-a-token": 1}), "logit_bias_invalid_key"),
+            (json!({"-5": 1}), "logit_bias_invalid_key"),
+            (json!({"99999999999": 1}), "logit_bias_invalid_key"),
+            (json!({"5": 1, "05": 2}), "logit_bias_duplicate_key"),
+            (json!({"1": 1000}), "integer_above_max_value"),
+            (json!({"1": 100.5}), "integer_above_max_value"),
+            (json!({"1": -101}), "integer_below_min_value"),
+        ] {
+            let bad = request(json!({"logit_bias": bias}));
+            let errors = bad.validate().expect_err(&bias.to_string());
+            let error = &errors.field_errors()["logit_bias"][0];
+            assert_eq!(error.code, code, "{bias}");
+        }
+        let colliding = request(json!({"logit_bias": {"5": 1, "05": 2}}));
+        let errors = colliding.validate().expect_err("colliding keys");
+        let message = errors.field_errors()["logit_bias"][0]
+            .message
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            message.contains("'05' and '5' both name token 5"),
+            "{message}"
+        );
+        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5, "7": 100, "08": 0}}));
         assert_eq!(rejection(&good), None);
     }
 
@@ -2032,6 +2264,16 @@ mod tool_choice_tests {
                 json!({"type": "allowed_tools", "mode": "auto",
                        "tools": [{"type": "function", "name": "get_weather"}]}),
                 None,
+            ),
+            (
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "required",
+                       "tools": [{"type": "function", "function": {"name": "get_weather"}}]}}),
+                None,
+            ),
+            (
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+                       "tools": [{"type": "function", "function": {"name": "get_time"}}]}}),
+                Some("tool_choice_tool_not_found"),
             ),
             (
                 json!({"type": "allowed_tools", "mode": "sometimes",

@@ -47,5 +47,6 @@ pub use connector::{
 pub use error::{Error, Result};
 pub use startup::{EngineLiveness, StartupBudget};
 pub use transport::{
-    check_engine_layouts, connect_handshake, ConnectedEngine, EngineId, ENGINE_CORE_DEAD_SENTINEL,
+    check_engine_layouts, connect_handshake, ConnectedEngine, EngineCount, EngineId,
+    ENGINE_CORE_DEAD_SENTINEL,
 };

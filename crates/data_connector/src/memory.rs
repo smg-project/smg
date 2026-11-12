@@ -724,6 +724,7 @@ impl InnerStore {
 /// still running (`queued` or `in_progress`) is not dropped by the count
 /// bound, so its client finds it when it polls; the retention drops it like
 /// any record.
+#[derive(Clone)]
 pub struct MemoryResponseStorage {
     /// Single lock wrapping the maps to prevent deadlocks and ensure atomic updates
     store: Arc<RwLock<InnerStore>>,
@@ -748,6 +749,80 @@ impl MemoryResponseStorage {
     /// `now`; answers how many went. Every write does this at the current time.
     pub fn evict_at(&self, now: DateTime<Utc>) -> usize {
         self.store.write().evict(&self.bounds, now)
+    }
+
+    /// The record written under its id, in place of what was there (a
+    /// record replaced under its id keeps its one index entry); every write
+    /// drops what is over the bounds at this time. The store trait's
+    /// `store_response`.
+    pub fn replace_response(&self, response: StoredResponse) -> ResponseId {
+        let now = Utc::now();
+        let mut store = self.store.write();
+        let response_id = store.insert(response, now).id.clone();
+        store.evict(&self.bounds, now);
+        response_id
+    }
+
+    /// The record written under its id in place of `held` alone, the record
+    /// [`Self::store_response_if_absent`] handed back: a place the bounds
+    /// dropped meanwhile, and whatever took its id since, is left as it is.
+    /// Whether the write happened. The streamed thread turn's final write.
+    pub fn replace_response_if_held(
+        &self,
+        held: &Arc<StoredResponse>,
+        response: StoredResponse,
+    ) -> bool {
+        let now = Utc::now();
+        let mut store = self.store.write();
+        if !store.holds(held) {
+            return false;
+        }
+        store.insert(response, now);
+        store.evict(&self.bounds, now);
+        true
+    }
+
+    /// The record under `response_id` removed, when there is one.
+    pub fn remove_response(&self, response_id: &ResponseId) {
+        self.store.write().remove(response_id);
+    }
+
+    /// The record `held` removed while it is the one under its id: a place
+    /// the bounds dropped meanwhile, and whatever took its id since, is left
+    /// as it is. Whether the removal happened.
+    pub fn remove_response_if_held(&self, held: &Arc<StoredResponse>) -> bool {
+        let mut store = self.store.write();
+        store.holds(held) && store.remove(&held.id)
+    }
+
+    /// Puts `response` under its id when nothing is stored under it, and
+    /// hands back the record as stored, the identity the `_if_held` writes
+    /// compare against; a taken id hands the record back. The eviction runs
+    /// before the check, so absent means absent or expired, and after the
+    /// write for the count bound; the check and the write are under the one
+    /// lock, so two writers of one id store one record.
+    pub fn store_response_if_absent(
+        &self,
+        response: StoredResponse,
+    ) -> Result<Arc<StoredResponse>, Box<StoredResponse>> {
+        self.store_response_if_absent_at(response, Utc::now())
+    }
+
+    /// [`Self::store_response_if_absent`] at `now`, the time the bounds are
+    /// judged at.
+    fn store_response_if_absent_at(
+        &self,
+        response: StoredResponse,
+        now: DateTime<Utc>,
+    ) -> Result<Arc<StoredResponse>, Box<StoredResponse>> {
+        let mut store = self.store.write();
+        store.evict(&self.bounds, now);
+        if store.responses.contains_key(&response.id) {
+            return Err(Box::new(response));
+        }
+        let stored = store.insert(response, now);
+        store.evict(&self.bounds, now);
+        Ok(stored)
     }
 
     /// Get statistics about the store
@@ -784,7 +859,17 @@ impl Default for MemoryResponseStorage {
 impl InnerStore {
     /// Puts `response` under its id (the index keeps one entry per id); a
     /// new id joins the order at `now`, a replaced record keeps its place.
-    fn insert(&mut self, response: StoredResponse, now: DateTime<Utc>) -> ResponseId {
+    /// Whether `held` is the record under its id: the same allocation, not an
+    /// equal record, so a place the bounds dropped and another record took
+    /// since is not it.
+    fn holds(&self, held: &Arc<StoredResponse>) -> bool {
+        self.responses
+            .get(&held.id)
+            .is_some_and(|stored| Arc::ptr_eq(stored, held))
+    }
+
+    /// The record stored under its id, handed back as stored.
+    fn insert(&mut self, response: StoredResponse, now: DateTime<Utc>) -> Arc<StoredResponse> {
         let response_id = response.id.clone();
         if let Some(ref safety_identifier) = response.safety_identifier {
             let ids = self
@@ -795,18 +880,19 @@ impl InnerStore {
                 ids.push(response_id.clone());
             }
         }
+        let stored = Arc::new(response);
         if self
             .responses
-            .insert(response_id.clone(), Arc::new(response))
+            .insert(response_id.clone(), stored.clone())
             .is_none()
         {
-            self.order.push(now, response_id.clone());
+            self.order.push(now, response_id);
         }
         tracing::debug!(
             memory_store_size = self.responses.len(),
             "Response stored in memory"
         );
-        response_id
+        stored
     }
 }
 
@@ -818,14 +904,7 @@ impl ResponseStorage for MemoryResponseStorage {
             response.id = ResponseId::new();
         }
 
-        // Single lock acquisition for atomic update; a record replaced
-        // under its id keeps its one index entry. Every write drops what is
-        // over the bounds at this time.
-        let now = Utc::now();
-        let mut store = self.store.write();
-        let response_id = store.insert(response, now);
-        store.evict(&self.bounds, now);
-        Ok(response_id)
+        Ok(self.replace_response(response))
     }
 
     async fn store_response_if_open(
@@ -885,7 +964,7 @@ impl ResponseStorage for MemoryResponseStorage {
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> ResponseResult<()> {
-        self.store.write().remove(response_id);
+        self.remove_response(response_id);
         Ok(())
     }
 
@@ -1349,6 +1428,132 @@ mod tests {
             .unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().raw_response["output"], json!("Output"));
+    }
+
+    /// A write under a taken id is refused, the record handed back, and the
+    /// A record the count bound dropped, whose id another record took
+    /// since, is not written over and not removed by the writer that held
+    /// it: the held writes answer false and the newer record stays.
+    #[tokio::test]
+    async fn a_held_write_leaves_a_place_taken_again() {
+        let store = MemoryResponseStorage::with_config(&MemoryConfig {
+            max_responses: 1,
+            ..MemoryConfig::default()
+        });
+        let mut first = StoredResponse::new(None);
+        first.id = ResponseId::from("resp_held");
+        first.raw_response = json!({"output": "first"});
+        let held = store.store_response_if_absent(first).expect("an absent id");
+        let mut other = StoredResponse::new(None);
+        other.id = ResponseId::from("resp_other");
+        assert!(store.store_response_if_absent(other).is_ok());
+        let mut taker = StoredResponse::new(None);
+        taker.id = ResponseId::from("resp_held");
+        taker.raw_response = json!({"output": "taker"});
+        let taker = store
+            .store_response_if_absent(taker)
+            .expect("the bound dropped the held record, its id is free");
+        let mut late = StoredResponse::new(None);
+        late.id = ResponseId::from("resp_held");
+        late.raw_response = json!({"output": "late"});
+        assert!(!store.replace_response_if_held(&held, late));
+        assert!(!store.remove_response_if_held(&held));
+        let kept = store
+            .get_response(&ResponseId::from("resp_held"))
+            .await
+            .unwrap()
+            .expect("the taker's record");
+        assert_eq!(kept.raw_response["output"], json!("taker"));
+        let mut final_ = StoredResponse::new(None);
+        final_.id = ResponseId::from("resp_held");
+        final_.raw_response = json!({"output": "final"});
+        assert!(store.replace_response_if_held(&taker, final_));
+        let written = store
+            .get_response(&ResponseId::from("resp_held"))
+            .await
+            .unwrap()
+            .expect("the final record");
+        assert_eq!(written.raw_response["output"], json!("final"));
+        assert!(
+            !store.remove_response_if_held(&taker),
+            "the final record is a new record under the id, not the taker's"
+        );
+    }
+
+    /// first record stays.
+    #[tokio::test]
+    async fn a_write_under_a_taken_id_leaves_the_first_record() {
+        let store = MemoryResponseStorage::new();
+        let mut first = StoredResponse::new(None);
+        first.id = ResponseId::from("resp_taken");
+        first.raw_response = json!({"output": "first"});
+        assert!(store.store_response_if_absent(first).is_ok());
+        let mut second = StoredResponse::new(None);
+        second.id = ResponseId::from("resp_taken");
+        second.raw_response = json!({"output": "second"});
+        let refused = store
+            .store_response_if_absent(second)
+            .expect_err("the id is taken");
+        assert_eq!(refused.raw_response["output"], json!("second"));
+        let kept = store
+            .get_response(&ResponseId::from("resp_taken"))
+            .await
+            .unwrap()
+            .expect("the first record");
+        assert_eq!(kept.raw_response["output"], json!("first"));
+        assert_eq!(store.stats().response_count, 1);
+    }
+
+    /// A write through the conditional store drops what is over the count
+    /// bound, like any write.
+    #[tokio::test]
+    async fn a_store_if_absent_write_keeps_the_count_bound() {
+        let store = MemoryResponseStorage::with_config(&MemoryConfig {
+            max_responses: 2,
+            ..MemoryConfig::default()
+        });
+        for i in 1..=3 {
+            let mut response = StoredResponse::new(None);
+            response.id = ResponseId::from(format!("resp_{i}"));
+            assert!(store.store_response_if_absent(response).is_ok());
+        }
+        assert_eq!(store.stats().response_count, 2);
+        assert!(
+            store
+                .get_response(&ResponseId::from("resp_1"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the first record went"
+        );
+    }
+
+    /// A record past the retention does not block a write under its id:
+    /// the eviction runs before the presence check.
+    #[tokio::test]
+    async fn an_expired_record_does_not_block_a_write_under_its_id() {
+        let store = MemoryResponseStorage::with_config(&MemoryConfig {
+            retention_secs: Some(60),
+            ..MemoryConfig::default()
+        });
+        let written = Utc::now();
+        let mut aged = StoredResponse::new(None);
+        aged.id = ResponseId::from("resp_aged");
+        aged.raw_response = json!({"output": "old"});
+        assert!(store.store_response_if_absent_at(aged, written).is_ok());
+        let mut fresh = StoredResponse::new(None);
+        fresh.id = ResponseId::from("resp_aged");
+        fresh.raw_response = json!({"output": "new"});
+        assert!(store
+            .store_response_if_absent_at(fresh, written + TimeDelta::seconds(61))
+            .is_ok());
+        let kept = store
+            .get_response(&ResponseId::from("resp_aged"))
+            .await
+            .unwrap()
+            .expect("the new record");
+        assert_eq!(kept.raw_response["output"], json!("new"));
+        assert_eq!(store.stats().response_count, 1);
     }
 
     #[tokio::test]

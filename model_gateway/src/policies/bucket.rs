@@ -14,7 +14,7 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, utils::PeriodicTask, BucketConfig,
     LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::worker::Worker;
+use crate::worker::{endpoint::Endpoint, Worker};
 
 #[derive(Debug)]
 pub struct BucketPolicy {
@@ -157,7 +157,10 @@ impl LoadBalancingPolicy for BucketPolicy {
                     .unwrap_or_else(|| {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let url = workers[healthy_indices[idx]].url();
-                        warn!("No URL found, randomly selecting: {}", url);
+                        warn!(
+                            "No URL found, randomly selecting: {}",
+                            Endpoint::redacted_str(url)
+                        );
                         url.to_string()
                     });
                 min_url
@@ -170,7 +173,7 @@ impl LoadBalancingPolicy for BucketPolicy {
                         let selected_url = workers[healthy_indices[idx]].url();
                         warn!(
                             "The bucket lists none of the offered workers for a size of {}, randomly selecting: {}",
-                            char_count, selected_url
+                            char_count, Endpoint::redacted_str(selected_url)
                         );
                         selected_url.to_string()
                     }
@@ -215,7 +218,9 @@ impl LoadBalancingPolicy for BucketPolicy {
             if bucket.remove_prefill_worker_url(url) {
                 info!(
                     "Removed worker {} from bucket for model {} (remaining workers: {})",
-                    url, model_key, bucket.bucket_cnt
+                    Endpoint::redacted_str(url),
+                    model_key,
+                    bucket.bucket_cnt
                 );
             }
         }
@@ -637,7 +642,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+    use crate::worker::{test_support::worker_of, WorkerType};
 
     #[test]
     fn test_drop_stops_adjustment_thread() {
@@ -818,14 +823,7 @@ mod tests {
 
     fn prefill_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
-            .map(|url| {
-                Arc::new(
-                    BasicWorkerBuilder::new(*url)
-                        .worker_type(WorkerType::Prefill)
-                        .health_config(no_health_check())
-                        .build(),
-                ) as Arc<dyn Worker>
-            })
+            .map(|url| worker_of(url, WorkerType::Prefill))
             .collect()
     }
 

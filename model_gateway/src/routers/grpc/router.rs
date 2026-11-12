@@ -1,11 +1,7 @@
 use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use axum::{
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::{http::HeaderMap, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -33,7 +29,7 @@ use super::{
         },
         stages::{
             context_length_exceeded, helpers::resolve_request_id_stamp, smallest_context_length,
-            RateLimitCell, RateLimitOutcome,
+            RateLimitCell,
         },
     },
     context::{RequestType, SharedComponents},
@@ -52,11 +48,13 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
-    routers::{error, grpc::regular::symphony::template::Templates, RouterTrait},
+    routers::{
+        common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
+    },
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
-/// gRPC router implementation for SGLang.
+/// The gRPC family router: one router over the gRPC request pipelines, built for one `Mode`.
 ///
 /// A single `Mode`-parameterized router serving Regular, PrefillDecode, and
 /// EncodePrefillDecode. `mode` selects the disaggregation params baked into
@@ -278,30 +276,15 @@ impl GrpcRouter {
             .to_string()
     }
 
-    /// Close a reservation that a non-2xx final response never got the
-    /// chance to settle (prep failure repeated across every attempt,
-    /// retries exhausted, a non-retryable dispatch failure). No-op if
-    /// nothing was ever reserved. Safe to call unconditionally alongside a
-    /// success path's own inline `settle_success`/streaming `settle_success`+
-    /// `ReservationAttachment` -- `close_reserved_only` is CAS-guarded, only
-    /// the first resolution of a handle wins.
-    async fn close_reservation_if_unsettled(cell: &RateLimitCell, status: StatusCode) {
-        if status.is_success() {
-            return;
-        }
-        if let Some(RateLimitOutcome::Admitted(handle)) = cell.peek() {
-            handle.close_reserved_only().await;
-        }
-    }
-
     /// Run a pipeline call for the canonical `model_id` under a tenant
     /// rate-limit reservation: the cell the pipeline reserves into, the
     /// model's retry config (keyed by the canonical id, see
     /// [`Self::resolve_retry_config_for_canonical`]), `run` with those and
     /// the id, then the close of a reservation a non-2xx answer never
-    /// settled. Every typed route runs its pipeline through here; the
-    /// Responses iterations, which reserve nothing today, call theirs
-    /// directly (see `common/stages/rate_limit.rs`).
+    /// settled (a 2xx settled it inline or handed it to its stream). Every
+    /// typed route runs its pipeline through here; a Responses request's
+    /// iterations take a reservation each inside the pipeline's Responses
+    /// entry points (see `common/stages/rate_limit.rs`).
     async fn execute_reserved<Fut>(
         &self,
         model_id: String,
@@ -313,7 +296,9 @@ impl GrpcRouter {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let retry_config = self.resolve_retry_config_for_canonical(&model_id);
         let response = run(model_id, rate_limit_cell.clone(), retry_config).await;
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        if !response.status().is_success() {
+            rate_limit_cell.close_unsettled().await;
+        }
         response
     }
 
@@ -547,7 +532,7 @@ impl GrpcRouter {
                 serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
             } else {
                 match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
-                    Ok(response) => Json(response).into_response(),
+                    Ok(response) => json_response(&response),
                     Err(error_response) => error_response,
                 }
             }
@@ -698,7 +683,7 @@ impl GrpcRouter {
                 }),
             );
         }
-        (StatusCode::OK, Json(queued)).into_response()
+        json_response(&queued)
     }
 
     /// Main route_embeddings implementation
@@ -737,14 +722,17 @@ impl GrpcRouter {
         .await
     }
 
-    /// Main route_messages implementation
-    async fn route_messages_impl(
+    /// The Messages request as the pipeline takes it: its `model` field
+    /// canonical, in the `Arc` the request context holds, with the canonical
+    /// model id. Done before the async hops of [`Self::route_messages_impl`],
+    /// as [`Self::chat_request_for_pipeline`] does for chat, so that only the
+    /// handle travels through their state machines, not a copy of the request
+    /// per hop.
+    fn messages_request_for_pipeline(
         &self,
-        headers: Option<&HeaderMap>,
-        tenant_meta: &TenantRequestMeta,
         body: CreateMessageRequest,
         model_id: &str,
-    ) -> Response {
+    ) -> (Arc<CreateMessageRequest>, String) {
         debug!("Processing messages request for model: {}", model_id);
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
@@ -752,9 +740,19 @@ impl GrpcRouter {
         // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
-        canonical_body.model = model_id_cloned.clone();
-        let canonical_body = Arc::new(canonical_body);
+        canonical_body.model.clone_from(&model_id_cloned);
+        (Arc::new(canonical_body), model_id_cloned)
+    }
 
+    /// Main route_messages implementation, over the request
+    /// [`Self::messages_request_for_pipeline`] prepared.
+    async fn route_messages_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        canonical_body: Arc<CreateMessageRequest>,
+        model_id_cloned: String,
+    ) -> Response {
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
         // No worker takes part, so the answer carries no rate-limit
@@ -801,27 +799,26 @@ impl GrpcRouter {
     /// tokenizer: the request is rendered through the model's chat template
     /// exactly as `/v1/messages` renders it and the prompt's token count is
     /// returned. No worker takes part, so every worker type is covered.
+    /// Takes the request by reference: an async fn that takes it by value
+    /// and borrows it across the await holds two copies of it in its task,
+    /// the captured argument and the re-bound local.
     async fn route_messages_count_tokens_impl(
         &self,
-        body: CountMessageTokensRequest,
+        body: &CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
         let model_id = self.resolve_canonical_model_id(model_id);
         match self
             .count_prompt_tokens(
                 &model_id,
-                message_utils::MessagesPrompt::from(&body),
+                message_utils::MessagesPrompt::from(body),
                 &body.chat_tools(),
                 body.tool_choice.as_ref(),
                 false,
             )
             .await
         {
-            Ok(input_tokens) => (
-                StatusCode::OK,
-                Json(CountMessageTokensResponse { input_tokens }),
-            )
-                .into_response(),
+            Ok(input_tokens) => json_response(&CountMessageTokensResponse { input_tokens }),
             Err(refused) => refused,
         }
     }
@@ -865,11 +862,7 @@ impl GrpcRouter {
                     .as_ref(),
             ));
         };
-        let tools = message_utils::template_tools(
-            chat_tools,
-            tool_choice,
-            tokenizer.renderer_capabilities(),
-        );
+        let tools = message_utils::template_tools(chat_tools, tool_choice);
         // A token count is not a request the media series count; the
         // `max_tokens: 0` answer is one, and the caller says which.
         let media = message_utils::resolve_messages_media(
@@ -964,7 +957,7 @@ impl GrpcRouter {
             container: None,
         };
         if !stream {
-            return (StatusCode::OK, Json(message)).into_response();
+            return json_response(&message);
         }
 
         let events = [
@@ -992,13 +985,13 @@ impl GrpcRouter {
         ];
         let mut frames: Vec<Result<bytes::Bytes, std::io::Error>> =
             Vec::with_capacity(events.len());
-        let mut buffer = Vec::new();
+        let mut buffer = bytes::BytesMut::new();
         for event in &events {
             if let Err(e) = StreamingProcessor::format_messages_sse_into(&mut buffer, event) {
                 tracing::error!(model = %model_id, error = %e, "max_tokens 0: a stream event does not serialize");
                 return error::internal_error("messages_event_serialization_failed", e);
             }
-            frames.push(Ok(bytes::Bytes::from(std::mem::take(&mut buffer))));
+            frames.push(Ok(buffer.split().freeze()));
         }
         build_sse_response_from_stream(futures::stream::iter(frames))
     }
@@ -1301,6 +1294,7 @@ impl RouterTrait for GrpcRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
+        let (body, model_id) = self.messages_request_for_pipeline(body, model_id);
         self.route_messages_impl(headers, tenant_meta, body, model_id)
             .await
     }
@@ -1312,7 +1306,7 @@ impl RouterTrait for GrpcRouter {
         body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
-        self.route_messages_count_tokens_impl(body, model_id).await
+        self.route_messages_count_tokens_impl(&body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {
@@ -1349,4 +1343,4 @@ fn canonicalize_responses_request<'a>(
 }
 
 #[cfg(test)]
-mod pd_tests;
+mod tests;

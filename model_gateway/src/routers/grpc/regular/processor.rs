@@ -196,7 +196,7 @@ impl ResponseProcessor {
         // token are in the list like the content: a client reads the
         // model's margin at every position of the output, and the list's
         // length is the completion's token count on both sides.
-        let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+        let logprobs = complete.output_logprobs().map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
                 tokenizer,
@@ -265,7 +265,7 @@ impl ResponseProcessor {
         choice.matched_stop = matched_stop_value(stop_decoder, complete);
         // The output's logprobs as the engine reports them, one entry per generated token, as
         // on the older path: a message without content keeps them like any other.
-        choice.logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+        choice.logprobs = complete.output_logprobs().map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
                 tokenizer,
@@ -331,6 +331,11 @@ impl ResponseProcessor {
             Some(messages::StopReason::EndTurn) if stop_sequence.is_some() => {
                 Some(messages::StopReason::StopSequence)
             }
+            // The reader's `max_tokens` is the engine's `length`: the budget
+            // or the window, told apart from the counts.
+            Some(messages::StopReason::MaxTokens) => Some(
+                request.length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
+            ),
             stop_reason => stop_reason,
         };
         let stop_sequence = stop_sequence
@@ -350,6 +355,7 @@ impl ResponseProcessor {
             usage: messages_usage_from_counts(
                 complete.prompt_tokens(),
                 complete.completion_tokens(),
+                complete.cached_tokens(),
                 thinking_requested.then_some(complete.reasoning_tokens().max(reasoning_tokens)),
             ),
             container: None,
@@ -372,10 +378,14 @@ impl ResponseProcessor {
         request_logprobs: bool,
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), axum::response::Response>
     {
-        let started = generation_start(&execution_result, Instant::now());
+        let started = generation_start(&execution_result);
         let model = &dispatch.model;
-        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = self.parser_resolver.tool_parser(model);
+        let reasoning_parser_name = self
+            .parser_resolver
+            .reasoning_parser_for(chat_request.parser_names.as_ref(), model);
+        let tool_parser_name = self
+            .parser_resolver
+            .tool_parser_for(chat_request.parser_names.as_ref(), model);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -400,6 +410,7 @@ impl ResponseProcessor {
 
         let tool_parser_available = tool_choice_enabled
             && chat_request.tools.is_some()
+            && chat_request.symphony.is_none()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
                 tool_parser_name.as_deref(),
@@ -416,7 +427,11 @@ impl ResponseProcessor {
             );
         }
 
-        if chat_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
+        if chat_request.tools.is_some()
+            && tool_choice_enabled
+            && chat_request.symphony.is_none()
+            && !tool_parser_available
+        {
             tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
         }
 
@@ -465,7 +480,10 @@ impl ResponseProcessor {
         // answer builds its usage chunk: with the reasoning tokens the
         // gateway's parser split off when it ran (zero included) and every
         // detail counter present as the OpenAI API sends it.
-        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let counts = response_formatting::TokenCounts::of_collected(
+            &all_responses,
+            chat_request.expected_choices,
+        );
         let usage = response_formatting::chat_usage(
             counts.usage(),
             (reasoning_parser_available || chat_request.symphony.is_some())
@@ -666,7 +684,7 @@ impl ResponseProcessor {
         start_time: Instant,
         metrics_endpoint: &'static str,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
-        let started = generation_start(&execution_result, start_time);
+        let started = generation_start(&execution_result);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -699,7 +717,6 @@ impl ResponseProcessor {
             let output_token_logprobs = if request_logprobs {
                 complete
                     .output_logprobs()
-                    .as_ref()
                     .map(utils::convert_generate_output_logprobs)
             } else {
                 None
@@ -731,8 +748,10 @@ impl ResponseProcessor {
             });
         }
 
-        // The records a streamed generate answer makes at its end, which
-        // counts no prompt figures either.
+        // The records a streamed generate answer makes at its end, from the
+        // counters the settlement reads: the prompt and its cache hit once
+        // per request, the completion tokens of every choice.
+        let counts = response_formatting::TokenCounts::of_generated(&result_array);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
@@ -740,12 +759,9 @@ impl ResponseProcessor {
             endpoint: metrics_endpoint,
             ttft: None,
             generation_duration: started.elapsed(),
-            input_tokens: None,
-            cached_tokens: None,
-            output_tokens: result_array
-                .iter()
-                .map(|response| u64::from(response.meta_info.completion_tokens))
-                .sum(),
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
         });
         Ok(result_array)
     }
@@ -766,10 +782,14 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(Message, response_formatting::TokenCounts), axum::response::Response> {
-        let started = Instant::now();
+        let started = generation_start(&execution_result);
         let model = &dispatch.model;
-        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = self.parser_resolver.tool_parser(model);
+        let reasoning_parser_name = self
+            .parser_resolver
+            .reasoning_parser_for(messages_request.parser_names.as_ref(), model);
+        let tool_parser_name = self
+            .parser_resolver
+            .tool_parser_for(messages_request.parser_names.as_ref(), model);
         // Collect all responses (no logprobs for Messages API)
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
 
@@ -1045,9 +1065,14 @@ impl ResponseProcessor {
         let finish_reason_str = finish_after_local_stop(stopped, complete);
         let stop_sequence = matched_stop_string(stop_decoder, complete);
 
-        // Parsed calls do not override a truncation, as in Chat.
+        // Parsed calls do not override a truncation, as in Chat. The engines
+        // report the request's budget and the model's window alike as
+        // `length`; the spec tells them apart from the counts.
         let stop_reason = if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
+            Some(
+                messages_request
+                    .length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
+            )
         } else if tool_calls.is_some() || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if stop_sequence.is_some() {
@@ -1063,13 +1088,15 @@ impl ResponseProcessor {
             None
         };
 
-        // Step 5: Build usage. A turn that ran with thinking reports its
-        // thinking tokens: the engine's own count when it keeps one, else the
-        // tokens the parser placed in the thinking span.
+        // Step 5: Build usage. The engine's prefix-cache hit is the cache-read
+        // count. A turn that ran with thinking reports its thinking tokens:
+        // the engine's own count when it keeps one, else the tokens the parser
+        // placed in the thinking span.
         let thinking_requested = messages_request.thinking_requested;
         let usage = messages_usage_from_counts(
             complete.prompt_tokens(),
             complete.completion_tokens(),
+            complete.cached_tokens(),
             thinking_requested.then_some(complete.reasoning_tokens().max(thinking_tokens)),
         );
 
@@ -1091,18 +1118,20 @@ impl ResponseProcessor {
     /// Process non-streaming completion response
     ///
     /// Collects all responses (supports n>1 and batched prompts), decodes tokens
-    /// through the stop decoder, applies `echo` and `suffix`, and builds one
-    /// `CompletionResponse` with prompt-major global choice indices
-    /// (`prompt_index * n + choice_index`).
+    /// through the stop decoder, applies `echo` and `suffix`, lists each
+    /// choice's generated tokens' logprobs when the request asked for them,
+    /// and builds one `CompletionResponse` with prompt-major global choice
+    /// indices (`prompt_index * n + choice_index`).
     pub async fn process_non_streaming_completion_response(
         &self,
         execution_result: ExecutionResult,
         completion_req: CompletionResponseSpec,
         dispatch: DispatchMetadata,
+        tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
-        let started = Instant::now();
-        let request_logprobs = completion_req.logprobs;
+        let started = generation_start(&execution_result);
+        let request_logprobs = completion_req.logprobs.is_some();
         let per_prompt_results = match execution_result {
             ExecutionResult::Batch { results } => results,
             other => vec![other],
@@ -1124,7 +1153,21 @@ impl ResponseProcessor {
         let mut total_cached = 0u32;
         let mut total_reasoning = 0u32;
         let mut total_spec_accepted = 0u32;
-        let mut total_spec_drafted = 0u32;
+        // Membership is per prompt: another prompt's choice cannot stand in
+        // for a missing terminal here. Borrow the collected frames so the
+        // shared proposal rule needs no intermediate allocation.
+        let spec_drafted =
+            response_formatting::known_spec_drafted(collected.iter().flatten().map(|complete| {
+                (
+                    complete.spec_accepted_tokens(),
+                    complete.spec_draft_tokens(),
+                )
+            }))
+            .filter(|_| {
+                collected.iter().all(|responses| {
+                    response_formatting::all_choices_completed(responses, choices_per_prompt)
+                })
+            });
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -1155,7 +1198,6 @@ impl ResponseProcessor {
                 total_completion += complete.completion_tokens();
                 total_reasoning += complete.reasoning_tokens();
                 total_spec_accepted += complete.spec_accepted_tokens();
-                total_spec_drafted += complete.spec_draft_tokens();
 
                 let finish_reason =
                     utils::completion_finish_reason(stopped, complete.finish_reason());
@@ -1177,10 +1219,29 @@ impl ResponseProcessor {
                     text.push_str(sfx);
                 }
 
+                // The generated tokens' logprobs when the request asked for
+                // them, as the engine reports them; their offsets count from
+                // the end of the echoed prompt.
+                let mut text_offset = if completion_req.echo {
+                    u32::try_from(prompt_text.chars().count()).unwrap_or(u32::MAX)
+                } else {
+                    0
+                };
+                let logprobs = completion_req.logprobs.and_then(|top_logprobs| {
+                    complete.output_logprobs().map(|proto_logprobs| {
+                        utils::convert_proto_to_completion_logprobs(
+                            proto_logprobs,
+                            tokenizer,
+                            top_logprobs,
+                            &mut text_offset,
+                        )
+                    })
+                });
+
                 choices.push(CompletionChoice {
                     text,
                     index: index_offset + i as u32,
-                    logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
+                    logprobs,
                     finish_reason: Some(finish_reason.to_string()),
                     matched_stop,
                 });
@@ -1218,7 +1279,7 @@ impl ResponseProcessor {
                     cached: total_cached,
                     reasoning: total_reasoning,
                     spec_accepted: total_spec_accepted,
-                    spec_drafted: total_spec_drafted,
+                    spec_drafted,
                 }
                 .usage(),
             ),
@@ -1229,12 +1290,21 @@ impl ResponseProcessor {
 
 /// Where a collected answer's generation clock starts, as its streamed
 /// twin's does: at the prefill dispatch of a disaggregated pair (whose
-/// prefill may already have run when the answer is collected), else at
-/// `start`, the processor's entry or the stage's.
-fn generation_start(execution_result: &ExecutionResult, start: Instant) -> Instant {
+/// prefill may already have run when the answer is collected), or at the
+/// single RPC's dispatch. A batch uses its earliest member. The shapes
+/// that carry no dispatch instant (an embedding answer, an empty batch)
+/// read the clock here, so a generated answer reads it once, at the
+/// dispatch.
+pub(crate) fn generation_start(execution_result: &ExecutionResult) -> Instant {
     match execution_result {
+        ExecutionResult::Single { dispatch_start, .. } => *dispatch_start,
         ExecutionResult::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
-        _ => start,
+        ExecutionResult::Batch { results } => results
+            .iter()
+            .map(generation_start)
+            .min()
+            .unwrap_or_else(Instant::now),
+        ExecutionResult::Embedding { .. } => Instant::now(),
     }
 }
 
@@ -1518,17 +1588,26 @@ fn normalize_assistant_content(text: String) -> Option<String> {
     }
 }
 
-/// Usage for a unary Messages response. Cache counters are integer zeros,
-/// never null: the Anthropic wire contract has always-present cache counters
-/// (0 when caching is unused) and clients do arithmetic on them; the
+/// Usage for a unary Messages response, from the engine's counts: the whole
+/// prompt (`prompt_tokens`) and its prefix-cache hit (`cached_tokens`), the
+/// counts the settlement and the metrics keep whole. The Anthropic wire splits
+/// them: `input_tokens` is the input outside the cache and
+/// `cache_read_input_tokens` the hit, their sum the prompt (the HTTP tenant
+/// settlement sums them back that way). Cache counters are integers, never
+/// null: the wire contract has always-present cache counters and clients do
+/// arithmetic on them; `cache_creation_input_tokens` stays zero, as the
+/// gateway writes no breakpoint-driven cache entries of its own. The
 /// cache-creation breakdown, service tier and inference geography are always
 /// written too, and `output_tokens_details` when the turn ran with thinking.
 fn messages_usage_from_counts(
-    input_tokens: u32,
+    prompt_tokens: u32,
     output_tokens: u32,
+    cached_tokens: u32,
     thinking_tokens: Option<u32>,
 ) -> messages::Usage {
-    let usage = messages::Usage::from_counts(input_tokens, output_tokens);
+    let usage =
+        messages::Usage::from_counts(prompt_tokens.saturating_sub(cached_tokens), output_tokens)
+            .with_cache_read_input_tokens(cached_tokens);
     match thinking_tokens {
         Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens),
         None => usage,
@@ -1591,18 +1670,37 @@ mod messages_usage_wire_tests {
     /// a serde attr silently skipped would still fail here).
     #[test]
     fn cache_counters_serialize_as_integer_zeros() {
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150, None)).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, 0, None)).unwrap();
         assert_eq!(v["input_tokens"], 25);
         assert_eq!(v["output_tokens"], 150);
         assert_eq!(v["cache_creation_input_tokens"], 0);
         assert_eq!(v["cache_read_input_tokens"], 0);
     }
 
+    /// The engine's whole prompt and its hit become the wire's split: the
+    /// input outside the cache beside the hit as the cache-read counter, their
+    /// sum the prompt; a miss leaves the whole prompt as input beside an
+    /// integer zero; a hit an engine reports above its prompt count leaves no
+    /// negative input; the creation counter stays zero throughout.
+    #[test]
+    fn cache_read_input_tokens_is_the_engines_prefix_cache_hit() {
+        let v = serde_json::to_value(messages_usage_from_counts(945, 12, 896, None)).unwrap();
+        assert_eq!(v["input_tokens"], 49);
+        assert_eq!(v["cache_read_input_tokens"], 896);
+        assert_eq!(v["cache_creation_input_tokens"], 0);
+        let v = serde_json::to_value(messages_usage_from_counts(945, 12, 0, None)).unwrap();
+        assert_eq!(v["input_tokens"], 945);
+        assert_eq!(v["cache_read_input_tokens"], 0);
+        let v = serde_json::to_value(messages_usage_from_counts(10, 1, 16, None)).unwrap();
+        assert_eq!(v["input_tokens"], 0);
+        assert_eq!(v["cache_read_input_tokens"], 16);
+    }
+
     /// The public API writes these keys on every message; a typed client
     /// reads a missing `cache_creation` as a decode error, not as zero.
     #[test]
     fn always_present_usage_keys_are_written_without_thinking() {
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150, None)).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, 0, None)).unwrap();
         assert_eq!(
             v["cache_creation"],
             serde_json::json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
@@ -1621,9 +1719,9 @@ mod messages_usage_wire_tests {
     /// included: the key says thinking was on, the count says how much.
     #[test]
     fn thinking_tokens_are_written_when_the_turn_ran_with_thinking() {
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150, Some(40))).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, 0, Some(40))).unwrap();
         assert_eq!(v["output_tokens_details"]["thinking_tokens"], 40);
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150, Some(0))).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, 0, Some(0))).unwrap();
         assert_eq!(v["output_tokens_details"]["thinking_tokens"], 0);
     }
 }

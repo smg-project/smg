@@ -26,10 +26,11 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
+        basic::{merge_labels, RuntimeType, WINDOW_LABELS},
         circuit_breaker::CircuitBreakerConfig,
+        endpoint::Endpoint,
         overload::OverloadThresholds,
         resilience::resolve_resilience,
-        worker::{merge_labels, RuntimeType, WINDOW_LABELS},
         BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
@@ -67,7 +68,10 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),
-                message: format!("Worker {} already exists", config.url),
+                message: format!(
+                    "Worker {} already exists",
+                    Endpoint::redacted_str(&config.url)
+                ),
             });
         }
 
@@ -147,7 +151,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &flags,
             &app_context.worker_registry,
         ) {
-            warn!(model = %model_card.id, worker = %config.url, "{message}");
+            warn!(model = %model_card.id, worker = %Endpoint::redacted_str(&config.url), "{message}");
         }
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -162,7 +166,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         } else {
             debug!(
                 "Runtime type unresolved for {} after detection; defaulting to sglang",
-                config.url
+                Endpoint::redacted_str(&config.url)
             );
             RuntimeType::Sglang
         };
@@ -198,7 +202,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             });
         }
 
-        validate_zmq_worker_type(*connection_mode, config.worker_type, &config.url)?;
+        validate_zmq_worker_type(
+            *connection_mode,
+            runtime_type,
+            config.worker_type,
+            &config.url,
+        )?;
 
         // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
         // one socket set. Every ZMQ runtime routes per rank: vLLM by in-request
@@ -388,7 +397,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                      worker of it processes them"
                 };
                 warn!(
-                    url = %worker.url(),
+                    url = %worker.redacted_url(),
                     model = %worker.model_id(),
                     "worker reports a vision encoder but no worker-side media processor (no \
                      mm_processor label): under --mm-processing worker it receives no media \
@@ -400,7 +409,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",
             workers.len(),
-            url,
+            Endpoint::redacted_str(&url),
             connection_mode,
             labels.len()
         );
@@ -430,7 +439,7 @@ pub(super) fn validate_constrained_decoding_label(
                 .map(drop)
                 .map_err(|why| WorkflowError::StepFailed {
                     step_id: StepId::new(step),
-                    message: format!("Worker {url}: {why}"),
+                    message: format!("Worker {}: {why}", Endpoint::redacted_str(url)),
                 })
         }
         None => Ok(()),
@@ -513,8 +522,8 @@ pub(super) fn warn_on_conflicting_parser_overrides(
                 if new_name != existing_name {
                     tracing::warn!(
                         model = %card.id,
-                        new_worker = worker_url,
-                        existing_worker = existing.url(),
+                        new_worker = %Endpoint::redacted_str(worker_url),
+                        existing_worker = existing.redacted_url(),
                         %kind,
                         new = %new_name,
                         existing = %existing_name,
@@ -566,7 +575,7 @@ pub(super) fn validate_parser_overrides(
 /// the gRPC and ZMQ pipeline reads with Symphony. The legacy parser choice and a model the legacy
 /// parsers read resolve none either (the fallback series of such a model, under `none`, exist from
 /// start-up).
-pub(super) fn symphony_table_of(
+fn symphony_table_of(
     card: &ModelCard,
     parser: ParserChoice,
     connection_mode: ConnectionMode,
@@ -591,7 +600,7 @@ pub(super) fn symphony_table_of(
 /// registry does not know, flags that select nothing or the registry's own table, and the legacy
 /// parser choice. Workers of one model registering at the same moment may each say it, as the
 /// override check above may: the registry gains the worker a step later.
-pub(super) fn registry_reads_over_the_flags(
+fn registry_reads_over_the_flags(
     card: &ModelCard,
     worker_url: &str,
     parser: ParserChoice,
@@ -925,8 +934,9 @@ fn resolve_zmq_health_config(
         return health_config;
     }
     warn!(
-        "Ignoring disabled health checks for ZMQ worker {url}: the ZMQ probe is a local liveness \
-         check and the only path that reconnects a restarted engine, so it stays enabled"
+        "Ignoring disabled health checks for ZMQ worker {}: the ZMQ probe is a local liveness \
+         check and the only path that reconnects a restarted engine, so it stays enabled",
+        Endpoint::redacted_str(url)
     );
     HealthCheckConfig {
         disable_health_check: false,
@@ -940,6 +950,7 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
         || url.starts_with("grpc://")
         || url.starts_with("grpcs://")
         || url.starts_with("ipc://")
+        || url.starts_with("tcp://")
     {
         url.to_string()
     } else {
@@ -953,36 +964,38 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
 
 /// Reject a disaggregated worker the ZMQ path cannot serve.
 ///
-/// The ZMQ wire carries no KV-transfer rendezvous: neither the vLLM
-/// `EngineCoreRequest` nor the TokenSpeed `TokenizedGenerateReqInput` has a
-/// field for the bootstrap info PD injects, so a ZMQ prefill/decode worker would
-/// silently drop it and degrade to a decode-side recompute or a stalled KV
-/// wait. Encode fares no better: encode dispatch is a gRPC encoder RPC a
-/// direct-ZMQ worker has no path for. `Regular` is therefore the only role the
-/// ZMQ lane serves, and every disaggregated worker is rejected at registration —
-/// matching the gRPC-only PD/EPD selection folds, which would otherwise leave
-/// such a worker registered but never selected.
+/// TokenSpeed's wire carries the prefill/decode rendezvous on its generate
+/// request (the bootstrap slots) and takes an encode server's encode request,
+/// so a TokenSpeed ZMQ worker serves every role. vLLM's `EngineCoreRequest`
+/// has no field for the bootstrap info PD injects, and the other runtimes'
+/// encode dispatch is a gRPC encoder RPC, so for them `Regular` is the only
+/// role the ZMQ lane serves. A worker of a role its lane cannot serve is
+/// rejected at registration rather than registered and never selected.
 fn validate_zmq_worker_type(
     connection_mode: ConnectionMode,
+    runtime_type: RuntimeType,
     worker_type: WorkerType,
     url: &str,
 ) -> Result<(), WorkflowError> {
-    if connection_mode == ConnectionMode::Zmq
-        && matches!(
-            worker_type,
-            WorkerType::Prefill | WorkerType::Decode | WorkerType::Encode
-        )
-    {
-        return Err(WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message: format!(
-                "ZMQ worker {url} cannot serve worker type {worker_type}: the direct-ZMQ \
-                 backend carries no KV-transfer metadata and has no encode path, so \
-                 encode/prefill/decode disaggregation requires a gRPC worker"
-            ),
-        });
+    if connection_mode != ConnectionMode::Zmq {
+        return Ok(());
     }
-    Ok(())
+    let reason = match worker_type {
+        WorkerType::Regular => return Ok(()),
+        _ if runtime_type == RuntimeType::TokenSpeed => return Ok(()),
+        WorkerType::Prefill | WorkerType::Decode => format!(
+            "the {runtime_type} direct-ZMQ backend carries no KV-transfer metadata, so \
+             prefill/decode disaggregation requires a gRPC worker or a TokenSpeed engine"
+        ),
+        WorkerType::Encode => format!(
+            "the {runtime_type} direct-ZMQ backend has no encode path, so encode \
+             disaggregation requires a gRPC worker or a TokenSpeed encode server"
+        ),
+    };
+    Err(WorkflowError::StepFailed {
+        step_id: StepId::new("create_worker"),
+        message: format!("ZMQ worker {url} cannot serve worker type {worker_type}: {reason}"),
+    })
 }
 
 /// The labels of one dp-aware rank worker: the engine's labels as they are,
@@ -1138,7 +1151,7 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::RefusedAddress;
+    use crate::worker::test_support::RefusedAddress;
 
     /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
     /// classes are published at zero: the registry's table for an unlabeled worker of a model it
@@ -1424,7 +1437,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         assert_eq!(
@@ -1471,7 +1484,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         data.discovered_labels = HashMap::from([
             ("page_size".to_string(), "256".to_string()),
             ("max_num_seqs".to_string(), "8".to_string()),
@@ -1515,7 +1528,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         data
     }
 
@@ -1625,7 +1638,7 @@ mod tests {
         let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
 
@@ -2205,13 +2218,22 @@ mod tests {
 
     #[test]
     fn zmq_disaggregated_workers_are_rejected_as_a_create_worker_failure() {
-        for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
+        let refused = [
+            (RuntimeType::Vllm, WorkerType::Prefill),
+            (RuntimeType::Vllm, WorkerType::Decode),
+            (RuntimeType::Vllm, WorkerType::Encode),
+            (RuntimeType::Sglang, WorkerType::Prefill),
+            (RuntimeType::Sglang, WorkerType::Decode),
+            (RuntimeType::Sglang, WorkerType::Encode),
+        ];
+        for (runtime, worker_type) in refused {
             let err = validate_zmq_worker_type(
                 ConnectionMode::Zmq,
+                runtime,
                 worker_type,
                 "ipc:///tmp/smg-zmq/ts0.ipc",
             )
-            .expect_err("ZMQ encode/prefill/decode must be rejected");
+            .expect_err("a role the ZMQ lane cannot serve must be rejected");
             match err {
                 WorkflowError::StepFailed { step_id, message } => {
                     assert_eq!(step_id, StepId::new("create_worker"));
@@ -2224,18 +2246,37 @@ mod tests {
             }
         }
 
-        // Regular is the one role the ZMQ lane serves; every worker type over
-        // the other transports stays accepted.
-        validate_zmq_worker_type(
-            ConnectionMode::Zmq,
-            WorkerType::Regular,
-            "ipc:///tmp/smg-zmq/ts0.ipc",
-        )
-        .expect("ZMQ regular workers are the supported case");
+        // Every runtime's ZMQ lane serves Regular; a TokenSpeed engine, whose
+        // generate request carries the rendezvous and whose encode server takes
+        // the encode request, serves every role; every worker type over the
+        // other transports stays accepted.
+        for runtime in [RuntimeType::Vllm, RuntimeType::TokenSpeed] {
+            validate_zmq_worker_type(
+                ConnectionMode::Zmq,
+                runtime,
+                WorkerType::Regular,
+                "ipc:///tmp/smg-zmq/ts0.ipc",
+            )
+            .expect("ZMQ regular workers are the supported case");
+        }
+        for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
+            validate_zmq_worker_type(
+                ConnectionMode::Zmq,
+                RuntimeType::TokenSpeed,
+                worker_type,
+                "ipc:///tmp/smg-zmq/ts0.ipc",
+            )
+            .expect("a TokenSpeed ZMQ worker serves every role");
+        }
         for mode in [ConnectionMode::Http, ConnectionMode::Grpc] {
             for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
-                validate_zmq_worker_type(mode, worker_type, "grpc://worker:8080")
-                    .expect("non-ZMQ transports serve every worker type");
+                validate_zmq_worker_type(
+                    mode,
+                    RuntimeType::Sglang,
+                    worker_type,
+                    "grpc://worker:8080",
+                )
+                .expect("non-ZMQ transports serve every worker type");
             }
         }
     }
@@ -2478,8 +2519,8 @@ mod rank_window_tests {
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
         routers::grpc::client::ServerInfo,
-        worker::{worker::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
-        workflow::steps::local::discover_dp::dp_info_from_labels,
+        worker::{basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
+        workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
     };
 
     #[test]
@@ -2519,7 +2560,7 @@ mod rank_window_tests {
                     assert!(worker.try_admit_pd(window, window));
                     assert!(!worker.try_admit_pd(1, window));
 
-                    let override_labels = labels(&[("max_running_requests", "32")]);
+                    let override_labels = labels_of(&[("max_running_requests", "32")]);
                     let merged = merge_labels(&engine, &override_labels);
                     let overridden = BasicWorkerBuilder::new("grpc://w:30000")
                         .labels(labels_for_rank(&merged, rank, &override_labels))
@@ -2528,13 +2569,6 @@ mod rank_window_tests {
                 }
             }
         }
-    }
-
-    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
     }
 
     /// The rank's labels when every label was discovered (none set by hand).
@@ -2554,8 +2588,8 @@ mod rank_window_tests {
     /// operator's on top.
     #[test]
     fn a_window_the_operator_set_by_hand_is_the_workers_only_window() {
-        let by_hand = labels(&[("max_running_requests", "512"), ("served_model_name", "m")]);
-        let replicas = labels(&[
+        let by_hand = labels_of(&[("max_running_requests", "512"), ("served_model_name", "m")]);
+        let replicas = labels_of(&[
             ("max_num_seqs", "256"),
             ("dp_size", "4"),
             ("served_model_name", "engine"),
@@ -2563,7 +2597,7 @@ mod rank_window_tests {
         let merged = merge_labels(&replicas, &by_hand);
         assert_eq!(
             merged,
-            labels(&[
+            labels_of(&[
                 ("max_running_requests", "512"),
                 ("dp_size", "4"),
                 ("served_model_name", "m"),
@@ -2572,15 +2606,15 @@ mod rank_window_tests {
         assert_eq!(labels_for_rank(&merged, Some((1, 4)), &by_hand), merged);
         assert_eq!(labels_for_rank(&merged, None, &by_hand), merged);
 
-        let by_hand = labels(&[("max_num_seqs", "512")]);
-        let attention = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        let by_hand = labels_of(&[("max_num_seqs", "512")]);
+        let attention = labels_of(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
         let merged = merge_labels(&attention, &by_hand);
         assert_eq!(merged.get("max_running_requests"), None);
         let rank = labels_for_rank(&merged, Some((0, 8)), &by_hand);
         assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("512"));
 
-        let nothing_by_hand = labels(&[("served_model_name", "m")]);
-        let both = labels(&[("max_running_requests", "2048"), ("max_num_seqs", "256")]);
+        let nothing_by_hand = labels_of(&[("served_model_name", "m")]);
+        let both = labels_of(&[("max_running_requests", "2048"), ("max_num_seqs", "256")]);
         let merged = merge_labels(&both, &nothing_by_hand);
         assert_eq!(
             merged.get("max_running_requests").map(String::as_str),
@@ -2598,7 +2632,7 @@ mod rank_window_tests {
     /// dp-aware width of every rank.
     #[test]
     fn an_attention_dp_engines_window_is_each_ranks_share() {
-        let engine = labels(&[
+        let engine = labels_of(&[
             ("max_running_requests", "16384"),
             ("enable_dp_attention", "true"),
             ("dp_size", "8"),
@@ -2609,14 +2643,14 @@ mod rank_window_tests {
             Some("2048")
         );
         assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
-        let newer = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        let newer = labels_of(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
         assert_eq!(
             discovered(&newer, Some((0, 8)))
                 .get("max_running_requests")
                 .map(String::as_str),
             Some("2048")
         );
-        let replicas_of_groups = labels(&[
+        let replicas_of_groups = labels_of(&[
             ("max_running_requests", "4096"),
             ("dp_size", "2"),
             ("attn_dp_size", "4"),
@@ -2635,11 +2669,11 @@ mod rank_window_tests {
     /// whole window.
     #[test]
     fn a_per_rank_window_and_an_unexpanded_worker_keep_their_labels() {
-        let replicas = labels(&[("max_running_requests", "2048"), ("dp_size", "8")]);
+        let replicas = labels_of(&[("max_running_requests", "2048"), ("dp_size", "8")]);
         assert_eq!(discovered(&replicas, Some((1, 8))), replicas);
-        let per_rank = labels(&[("max_num_seqs", "256"), ("dp_size", "4")]);
+        let per_rank = labels_of(&[("max_num_seqs", "256"), ("dp_size", "4")]);
         assert_eq!(discovered(&per_rank, Some((0, 4))), per_rank);
-        let attention = labels(&[
+        let attention = labels_of(&[
             ("max_running_requests", "16384"),
             ("enable_dp_attention", "true"),
         ]);

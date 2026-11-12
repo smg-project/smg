@@ -49,6 +49,10 @@ service TrtllmService {
   // Get server information (version, parallelism, etc.)
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 
+  // The engine's load per data-parallel rank: what the router polls when
+  // the records it takes over SubscribeKvEvents stop (the same figures).
+  rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
+
   // Get tokenizer artifacts for remote construction
   rpc GetTokenizer(smg.grpc.common.GetTokenizerRequest) returns (stream smg.grpc.common.GetTokenizerChunk);
 
@@ -487,6 +491,54 @@ message AbortResponse {
 }
 
 // ============================================================================
+// Load
+// ============================================================================
+
+message GetLoadsRequest {
+  // Optional: filter to a specific DP rank.
+  optional int32 dp_rank = 1;
+
+  // Sections to include (e.g. "core"); the service reports the core only.
+  repeated string include = 2;
+}
+
+message GetLoadsResponse {
+  // ISO 8601 timestamp.
+  string timestamp = 1;
+
+  // TensorRT-LLM version.
+  string version = 2;
+
+  // Number of DP ranks reported.
+  int32 dp_rank_count = 3;
+
+  // Per-DP-rank load metrics.
+  repeated SchedulerLoad loads = 4;
+}
+
+// One rank's load, field for field the vLLM service's SchedulerLoad so the
+// router reads both alike.
+message SchedulerLoad {
+  int32 dp_rank = 1;
+  int32 num_running_reqs = 2;
+  int32 num_waiting_reqs = 3;
+  int32 num_total_reqs = 4;
+  int32 num_used_tokens = 5;
+  int32 max_total_num_tokens = 6;
+  // KV-cache utilization in [0, 1].
+  double token_usage = 7;
+  double gen_throughput = 8;
+  double cache_hit_rate = 9;
+  double utilization = 10;
+  int32 max_running_requests = 11;
+  // Queued token-work: prompt tokens of waiting requests not served from the
+  // prefix cache, as the servicer estimates it.
+  int32 num_waiting_uncached_tokens = 12;
+  // Computed input tokens per active prefill second; absent if unknown or stale.
+  optional double prefill_throughput = 13;
+}
+
+// ============================================================================
 // Model Info
 // ============================================================================
 
@@ -519,4 +571,16 @@ message GetServerInfoResponse {
   int32 pipeline_parallel_size = 4; // PP size
   int32 context_parallel_size = 5;  // CP size
   int32 world_size = 6;             // Total world size
+
+  // The vocabulary of structural-tag nodes the engine's guided-decoding
+  // backend takes: "older" when the xgrammar installed beside the engine
+  // predates the `optional`, `plus`, `star` and `token` nodes (0.1.33 is the
+  // first release with them) and refuses a tag that carries one at compile
+  // time; "" for a current one, another backend, or a servicer that does not
+  // say. Flattened into the `structural_tag_vocabulary` worker label, by
+  // which the router spells such a worker's structural tags without
+  // `optional`, `plus` and `star`, the same language; a `token` node stays as
+  // derived, so a table that writes single-token markers still meets the
+  // older compiler's refusal.
+  string structural_tag_vocabulary = 7;
 }

@@ -1,8 +1,9 @@
-//! Symphony reading a chat response or a message: the opt-in path that parses a model's output
+//! Symphony reading a chat response or a message: the default path that parses a model's output
 //! with one [`Engine`](::symphony::Engine) per choice in place of the tool and reasoning parser crates.
 //!
-//! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `legacy` by default),
-//! which a request's `X-SMG-Parser` header overrides for that one request ([`choice`]). With
+//! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `symphony` by default,
+//! `legacy` the way back to the older parsers), which a request's `X-SMG-Parser` header overrides
+//! for that one request ([`choice`]). With
 //! `symphony` on, one precedence decides what reads a model ([`reads`](names::reads)), among the parser names
 //! set for it (`ParserResolver::names`: the `tool_parser` and `reasoning_parser` of the model's
 //! card, its workers' labels, apart from the gateway's `--tool-call-parser` and
@@ -33,15 +34,18 @@
 //! [`telemetry`]), so an operator can tell how often, and why, before and after the default
 //! changes. What a
 //! request asks of the channels takes a variant of the table rather than another reader: where the
-//! legacy path would run no tool parser (`tool_choice: none`; no tools declared, for a provider
-//! that reads calls only with them), the table without its calls; with
-//! `separate_reasoning: false`, the table without its thought ([`assign`]).
+//! legacy path would run no tool parser (no tools declared, for a provider that reads calls only
+//! with them), the table without its calls; with `separate_reasoning: false`, the table without
+//! its thought ([`assign_for`]). A `tool_choice` of `none` over declared tools keeps the table's
+//! calls: the prompt declares the tools as under `auto`, as the engine's own server renders it,
+//! and the reader drops every call the model writes anyway, counted per table
+//! (`smg_symphony_calls_forbidden_total`), so none is delivered as a call or as content.
 //!
-//! Request building assigns Symphony to a request ([`assign`]) and stores
+//! Request building assigns Symphony to a request ([`assign_for`]) and stores
 //! the [`Assignment`] in the response spec: the table, and the part of the rendered prompt the
 //! engine replays to find the state the generation starts in. Preparation asks the table for the
-//! structural tag of a forced or required call, or of a JSON `response_format` ([`constraint`](fn@constraint))
-//! before the older registry. Both decide with one predicate, so the
+//! structural tag of a forced or required call, or of a JSON `response_format`
+//! ([`constraint_for`]) before the older registry. Both decide with one predicate, so the
 //! output a table's tag constrains is read by that table and never by the older parsers, which
 //! expect another syntax. Request building decides what constrains the output on the worker
 //! selected for the request ([`worker_constraint`]): a worker whose engine takes a grammar on every
@@ -129,14 +133,17 @@ pub(crate) fn choice(
     })
 }
 
+#[cfg(test)]
+pub(crate) use self::{constraint::constraint, reader::assign};
 pub(crate) use self::{
     constraint::{
-        constraint, grammar_start_of, turn_constraint, worker_constraint, Asks, AutoRequest,
-        AutoTag, Prepared, PreparedConstraint,
+        constraint_for, grammar_start_of, turn_constraint, vocabulary_of, worker_constraint, Asks,
+        AutoRequest, AutoTag, Prepared, PreparedConstraint,
     },
     names::{
-        check_names, keeps_special_tokens, labels_select_nothing, named_table, reasoning_open,
-        set_aside_by_the_registry, table_label_read,
+        check_names, keeps_special_tokens_for, labels_select_nothing, named_table, reading,
+        reasoning_open, reasoning_open_for, set_aside_by_the_registry, table_label_read,
+        PromptReplay, Reading,
     },
-    reader::{assign, engine_finish, finished, Assignment, Delta, Reader},
+    reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader},
 };

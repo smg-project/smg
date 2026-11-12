@@ -30,12 +30,12 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import time
 from collections.abc import Iterable
 
 import openai
 import pytest
+from infra.cloud_credentials import resolve_cloud_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -206,18 +206,54 @@ def openai_direct_client():
     resulting ID through the gateway when calling ``responses.create`` with the
     ``file_search`` tool. This keeps the smg-under-test path exercised for the
     annotation round-trip while sidestepping a hard dependency on endpoint
-    coverage that is out of scope for E5. A missing ``OPENAI_API_KEY`` is a hard
+    coverage that is out of scope for E5. Proxy mode uses its explicit /openai/v1
+    SDK endpoint and placeholder; a missing direct-mode ``OPENAI_API_KEY`` is a hard
     misconfiguration for ``@pytest.mark.vendor("openai")`` tests — fail loudly
     rather than silently skipping the only coverage for ``file_citation``.
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    credentials = resolve_cloud_credentials("openai", require_key=False)
+    if not credentials.api_key:
         pytest.fail(
             "OPENAI_API_KEY is required for TestFileCitationAnnotation "
             "(file_search setup needs direct /v1/files + /v1/vector_stores access)."
         )
-    client = openai.OpenAI(api_key=api_key)
+    client = openai.OpenAI(api_key=credentials.api_key, base_url=credentials.sdk_base_url)
     yield client
+
+
+# How long the fixture waits for the provider to index the attached file. Indexing takes
+# seconds on a normal day and took 10 to 17 minutes on a slow one; the lane that runs this
+# suite has a 30-minute cap with about 20 minutes of setup and other tests inside it. A file
+# still indexing at the deadline skips the class with the reason in the log, instead of running
+# a required job into its cap with every test that ran green. The poll uses the two calls every
+# SDK version has (the SDK's own bounded poll is a keyword of a later version, and the harness
+# project is installed into the engine venvs, whose engines pin their own SDK), on a client copy
+# with a short per-request timeout: a request in flight at the deadline overruns it by at most
+# that timeout and the client's two retries (about a minute and a half), not ten minutes.
+_VECTOR_STORE_INDEX_DEADLINE_S = 300
+_VECTOR_STORE_POLL_INTERVAL_S = 2.0
+_VECTOR_STORE_POLL_REQUEST_TIMEOUT_S = 30.0
+
+
+def _index_vector_store_file(client, vector_store_id: str, file_id: str) -> None:
+    """Attach the file to the vector store and wait, bounded, for the provider to index it."""
+    poll_client = client.with_options(timeout=_VECTOR_STORE_POLL_REQUEST_TIMEOUT_S)
+    vs_file = poll_client.vector_stores.files.create(
+        vector_store_id=vector_store_id, file_id=file_id
+    )
+    deadline = time.monotonic() + _VECTOR_STORE_INDEX_DEADLINE_S
+    while vs_file.status == "in_progress":
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.skip(
+                f"vector store file {file_id} is still in_progress after "
+                f"{_VECTOR_STORE_INDEX_DEADLINE_S}s: the provider's indexing is slow, not the "
+                "gateway; the file_citation tests need the indexed store and are skipped"
+            )
+        time.sleep(min(_VECTOR_STORE_POLL_INTERVAL_S, remaining))
+        vs_file = poll_client.vector_stores.files.retrieve(file_id, vector_store_id=vector_store_id)
+    if vs_file.status != "completed":
+        pytest.fail(f"vector store file {file_id} indexing {vs_file.status}: {vs_file.last_error}")
 
 
 @pytest.fixture(scope="class")
@@ -236,7 +272,7 @@ def file_search_vector_store(openai_direct_client):
         buf.name = "project_astra.txt"
         file_obj = client.files.create(file=buf, purpose="assistants")
         vs = client.vector_stores.create(name="smg-e5-annotations-test")
-        client.vector_stores.files.create_and_poll(vector_store_id=vs.id, file_id=file_obj.id)
+        _index_vector_store_file(client, vs.id, file_obj.id)
         yield vs.id
     finally:
         if vs is not None:

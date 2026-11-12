@@ -11,12 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 
 import httpx
 import openai
 import pytest
 import smg_client
-from infra.constants import get_parser, get_runtime
+from infra.constants import effective_parser, get_runtime
 from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,7 @@ PYTHONIC_MESSAGES = [
 
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct", mock="RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.gateway(
     reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
 )
@@ -118,8 +119,8 @@ class TestOpenAIServerFunctionCalling:
     """Tests for OpenAI-compatible function calling with the llama tool parser.
 
     On the mock engine each test states the model's answer first, in the
-    llama parser's syntax (``mock_answers`` does nothing on a real engine);
-    the ``n=2`` cases skip there, the mock answering one choice per request.
+    llama parser's syntax (``mock_answers`` does nothing on a real engine), one
+    answer per choice the request samples.
 
     On a real engine the cases that leave the choice to the model
     (``tool_choice: auto``) decode greedily (``temperature=0``): they assert
@@ -473,9 +474,16 @@ class TestOpenAIServerFunctionCalling:
 
         - When tool_choice is a specific ToolChoice, the model should return one or more tool_calls.
         """
-        # Under a named choice the gateway constrains the engine to that
-        # function's parameters object and names the call itself.
-        mock_answers.enqueue('{"city": "Paris"}')
+        # Under a named choice the gateway constrains the engine to the call it
+        # names: Symphony's json table, this model's under the default, gives
+        # the forced call its own structural tag, the list holding that one
+        # call, which the table reads; the legacy path constrains the engine to
+        # the function's parameters object and names the call itself.
+        mock_answers.enqueue(
+            '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
+            if effective_parser() == "symphony"
+            else '{"city": "Paris"}'
+        )
         tools = [
             {
                 "type": "function",
@@ -539,12 +547,17 @@ class TestOpenAIServerFunctionCalling:
         assert function_name == "get_weather", "Function name should be 'get_weather'"
         assert "city" in args_obj, "Function arguments should have 'city'"
 
-    @pytest.mark.skipif(get_runtime() == "mock", reason="the mock answers one choice per request")
-    def test_streaming_multiple_choices_finish_reason(self, model, api_client):
+    def test_streaming_multiple_choices_finish_reason(self, model, api_client, mock_answers):
         """Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
 
         This tests the fix for the bug where only the last index got a finish_reason chunk.
         """
+        # One answer per choice; under a required choice the gateway constrains
+        # the engine to a JSON array of calls and reads it as one.
+        for _ in range(2):
+            mock_answers.enqueue(
+                '[{"name": "get_current_weather", "parameters": {"location": "Los Angeles, CA"}}]'
+            )
         tools = [
             {
                 "type": "function",
@@ -675,12 +688,14 @@ class TestOpenAIServerFunctionCalling:
             "Final response of no function calling should have finish_reason 'stop'"
         )
 
-    @pytest.mark.skipif(get_runtime() == "mock", reason="the mock answers one choice per request")
-    def test_streaming_multiple_choices_without_tools(self, model, api_client):
+    def test_streaming_multiple_choices_without_tools(self, model, api_client, mock_answers):
         """Test: Verify that each choice gets its own finish_reason chunk without tool calls.
 
         This tests the fix for regular content streaming with multiple choices.
         """
+        # One answer per choice.
+        mock_answers.enqueue("Hello.")
+        mock_answers.enqueue("Hi.")
 
         messages = [{"role": "user", "content": "Say hello in one word."}]
 
@@ -738,17 +753,18 @@ class TestOpenAIServerFunctionCalling:
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 @pytest.mark.skipif(
-    get_parser() == "symphony",
-    reason="the registry reads this model with the json table under --parser symphony; "
+    effective_parser() == "symphony",
+    reason="the registry reads this model with the json table under Symphony, the default; "
     "the pythonic list is the legacy parsers' reading",
 )
 class TestOpenAIPythonicFunctionCalling:
     """Tests for pythonic function calling format.
 
-    Under ``--parser symphony`` the registry reads this model with its own table (``json``)
+    Under Symphony (the default) the registry reads this model with its own table (``json``)
     whatever ``--tool-call-parser`` names, so the gateway-wide ``pythonic`` name this class
-    relies on does not apply there: the class runs where the legacy parsers read, and skips
-    under Symphony at collection, before any fixture starts a worker or a gateway.
+    relies on does not apply there: the class runs where the legacy parsers read (the
+    ``--parser legacy`` lane), and skips under Symphony at collection, before any fixture
+    starts a worker or a gateway.
     """
 
     def test_pythonic_tool_call_prompt(self, model, api_client):
@@ -1039,15 +1055,94 @@ CONFLICTING_DEFS_TOOLS = [
 ]
 
 
+# The tool-call text each class's model writes, for the answers a test states on the mock
+# engine: a list of (function name, arguments) in the model's own syntax, which the lane's
+# parser reads like the engine's output. ``forced`` is the text under a ``required`` or a named
+# ``tool_choice``, where the grammar the gateway installs has the engine write another shape.
+
+
+def _llama_calls_text(calls: list[tuple[str, dict]]) -> str:
+    """Llama 3.2: each call a bare JSON object, parallel calls one after the other."""
+    return "\n\n".join(json.dumps({"name": name, "parameters": args}) for name, args in calls)
+
+
+def _llama_forced_calls_text(calls: list[tuple[str, dict]]) -> str:
+    """Llama 3.2 under a forced choice: the list holding the calls, which the json table reads."""
+    return json.dumps([{"name": name, "parameters": args} for name, args in calls])
+
+
+def _qwen_calls_text(calls: list[tuple[str, dict]]) -> str:
+    """Qwen3: each call a JSON object between its markers, forced or not."""
+    return "\n".join(
+        f"<tool_call>\n{json.dumps({'name': name, 'arguments': args})}\n</tool_call>"
+        for name, args in calls
+    )
+
+
+def _mistral_calls_text(calls: list[tuple[str, dict]]) -> str:
+    """Mistral 7B v0.3: the calls as one JSON list after the marker, forced or not."""
+    return "[TOOL_CALLS] " + json.dumps([{"name": name, "arguments": args} for name, args in calls])
+
+
+# The answers the scenarios below state on the mock engine.
+_WEATHER_CALL = [("get_weather", {"city": "New York", "unit": "celsius"})]
+_TOKYO_WEATHER_CALL = [("get_weather", {"city": "Tokyo"})]
+_TRAVEL_CALLS = [
+    ("get_weather", {"location": "Tokyo", "unit": "celsius"}),
+    ("get_tourist_attractions", {"city": "Tokyo"}),
+]
+_ANALYZE_DATA_CALL = [
+    (
+        "analyze_data",
+        {
+            "data": {
+                "metrics": ["latency", "errors"],
+                "config": {"threshold": 0.5, "enabled": True},
+            },
+            "options": [{"name": "window", "value": "1h"}],
+        },
+    )
+]
+
+
 class _TestToolChoiceBase:
-    """Base class for tool_choice tests. Not collected by pytest (underscore prefix)."""
+    """Base class for tool_choice tests. Not collected by pytest (underscore prefix).
+
+    On the mock engine a test states the model's answer before each request (the
+    ``mock_answers`` fixture, a no-op on a real engine): ``_answer_calls`` writes the
+    calls in the class's syntax (``_calls_text``, and ``_forced_calls_text`` under a
+    ``required`` or named choice), ``mock_answers.enqueue`` a plain-text answer. A
+    class that runs on the mock names its syntaxes; the base has none.
+    """
 
     # Subclasses should override this
     FLAKY_TESTS: set[str] = set()
 
+    # The model's tool-call text for a list of (name, arguments), free and forced:
+    # the classes on the mock engine set them to their model's.
+    _calls_text: Callable[[list[tuple[str, dict]]], str] | None = None
+    _forced_calls_text: Callable[[list[tuple[str, dict]]], str] | None = None
+
+    def _answer_calls(self, mock_answers, calls, *, forced=False):
+        """State the mock engine's next answer: ``calls`` in the class's syntax.
+
+        The forced syntaxes are the shapes Symphony's tables constrain the engine to;
+        the legacy path constrains it to others, which the mock classes do not state.
+        """
+        if not mock_answers.active:
+            return
+        if forced and effective_parser() != "symphony":
+            pytest.skip("the forced answers are stated in the shapes Symphony constrains")
+        write = self._forced_calls_text if forced else self._calls_text
+        assert write is not None, "a class on the mock engine states its model's tool-call syntax"
+        mock_answers.enqueue(write(calls))
+
     def _is_flaky_test(self, test_name):
-        """Check if the current test is marked as flaky for this class."""
-        return test_name in self.FLAKY_TESTS
+        """Whether the class relaxes this test: a weak tool-caller on a real engine.
+
+        On the mock engine the answer is stated, so nothing is relaxed there.
+        """
+        return test_name in self.FLAKY_TESTS and get_runtime() != "mock"
 
     @staticmethod
     def _auto_decision_tools():
@@ -1092,7 +1187,7 @@ class _TestToolChoiceBase:
             args = json.loads(tool_call.function.arguments)
             assert isinstance(args, dict), f"Arguments should parse to a dict, got {type(args)}"
 
-    def test_tool_choice_auto_non_streaming(self, model, api_client):
+    def test_tool_choice_auto_non_streaming(self, model, api_client, mock_answers):
         """Test tool_choice='auto' semantics in non-streaming mode.
 
         - A prompt that clearly needs the declared weather tool should yield a
@@ -1109,6 +1204,7 @@ class _TestToolChoiceBase:
         flaky = self._is_flaky_test("test_tool_choice_auto_non_streaming")
 
         # --- Scenario 1: prompt that needs the weather tool ---
+        self._answer_calls(mock_answers, _TOKYO_WEATHER_CALL)
         response = api_client.chat.completions.create(
             model=model,
             messages=self.AUTO_TOOL_NEEDED_MESSAGES,
@@ -1145,6 +1241,7 @@ class _TestToolChoiceBase:
             )
 
         # --- Scenario 2: prompt that needs no tool ---
+        mock_answers.enqueue("4")
         response = api_client.chat.completions.create(
             model=model,
             messages=self.AUTO_NO_TOOL_MESSAGES,
@@ -1174,7 +1271,7 @@ class _TestToolChoiceBase:
                 f"Expected finish_reason 'stop', got {choice.finish_reason!r}"
             )
 
-    def test_tool_choice_auto_streaming(self, model, api_client):
+    def test_tool_choice_auto_streaming(self, model, api_client, mock_answers):
         """Test tool_choice='auto' semantics in streaming mode.
 
         Same contract as the non-streaming variant, verified over the
@@ -1208,6 +1305,7 @@ class _TestToolChoiceBase:
                 assert isinstance(args, dict)
 
         # --- Scenario 1: prompt that needs the weather tool ---
+        self._answer_calls(mock_answers, _TOKYO_WEATHER_CALL)
         content, tool_calls, finish_reason = collect_stream(
             self.AUTO_TOOL_NEEDED_MESSAGES, max_tokens=2048
         )
@@ -1228,6 +1326,7 @@ class _TestToolChoiceBase:
             assert finish_reason == "stop", f"Expected finish_reason 'stop', got {finish_reason!r}"
 
         # --- Scenario 2: prompt that needs no tool ---
+        mock_answers.enqueue("4")
         content, tool_calls, finish_reason = collect_stream(
             self.AUTO_NO_TOOL_MESSAGES, max_tokens=256
         )
@@ -1246,11 +1345,12 @@ class _TestToolChoiceBase:
             )
             assert finish_reason == "stop", f"Expected finish_reason 'stop', got {finish_reason!r}"
 
-    def test_tool_choice_required_non_streaming(self, model, api_client):
+    def test_tool_choice_required_non_streaming(self, model, api_client, mock_answers):
         """Test tool_choice='required' in non-streaming mode."""
 
         tools = get_test_tools()
         messages = get_test_messages()
+        self._answer_calls(mock_answers, _WEATHER_CALL, forced=True)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -1267,11 +1367,12 @@ class _TestToolChoiceBase:
         assert tool_calls is not None
         assert len(tool_calls) > 0
 
-    def test_tool_choice_required_streaming(self, model, api_client):
+    def test_tool_choice_required_streaming(self, model, api_client, mock_answers):
         """Test tool_choice='required' in streaming mode."""
 
         tools = get_test_tools()
         messages = get_test_messages()
+        self._answer_calls(mock_answers, _WEATHER_CALL, forced=True)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -1288,11 +1389,12 @@ class _TestToolChoiceBase:
         # With required, we should get tool call chunks
         assert len(tool_call_chunks) > 0
 
-    def test_tool_choice_specific_function_non_streaming(self, model, api_client):
+    def test_tool_choice_specific_function_non_streaming(self, model, api_client, mock_answers):
         """Test tool_choice with specific function in non-streaming mode."""
 
         tools = get_test_tools()
         messages = get_test_messages()
+        self._answer_calls(mock_answers, _WEATHER_CALL, forced=True)
 
         tool_choice = {"type": "function", "function": {"name": "get_weather"}}
 
@@ -1313,11 +1415,12 @@ class _TestToolChoiceBase:
         for tool_call in tool_calls:
             assert tool_call.function.name == "get_weather"
 
-    def test_tool_choice_specific_function_streaming(self, model, api_client):
+    def test_tool_choice_specific_function_streaming(self, model, api_client, mock_answers):
         """Test tool_choice with specific function in streaming mode."""
 
         tools = get_test_tools()
         messages = get_test_messages()
+        self._answer_calls(mock_answers, _WEATHER_CALL, forced=True)
 
         tool_choice = {"type": "function", "function": {"name": "get_weather"}}
 
@@ -1338,13 +1441,14 @@ class _TestToolChoiceBase:
         found_name = streamed.tool_calls[0].name
         assert found_name == "get_weather"
 
-    def test_required_streaming_arguments_chunks_json(self, model, api_client):
+    def test_required_streaming_arguments_chunks_json(self, model, api_client, mock_answers):
         """In streaming required mode, complete tool call arguments should be valid JSON when
         all chunks are combined.
         """
 
         tools = get_test_tools()
         messages = get_test_messages()
+        self._answer_calls(mock_answers, _WEATHER_CALL, forced=True)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -1372,8 +1476,9 @@ class _TestToolChoiceBase:
             except json.JSONDecodeError:
                 pytest.fail(f"Invalid JSON in complete tool call arguments: {tool_call.arguments}")
 
-    def test_complex_parameters_required_non_streaming(self, model, api_client):
+    def test_complex_parameters_required_non_streaming(self, model, api_client, mock_answers):
         """Validate complex nested parameter schemas in non-streaming required mode."""
+        self._answer_calls(mock_answers, _ANALYZE_DATA_CALL, forced=True)
 
         complex_tools = [
             {
@@ -1451,11 +1556,12 @@ class _TestToolChoiceBase:
                     f"Invalid JSON in complex tool call arguments: {tool_call.function.arguments}"
                 )
 
-    def test_multi_tool_scenario_auto(self, model, api_client):
+    def test_multi_tool_scenario_auto(self, model, api_client, mock_answers):
         """Test multi-tool scenario with tool_choice='auto'."""
 
         tools = get_travel_tools()
         messages = get_travel_messages()
+        self._answer_calls(mock_answers, _TRAVEL_CALLS)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -1489,11 +1595,12 @@ class _TestToolChoiceBase:
                 f"Expected functions {expected_functions}, got {called_functions}"
             )
 
-    def test_multi_tool_scenario_required(self, model, api_client):
+    def test_multi_tool_scenario_required(self, model, api_client, mock_answers):
         """Test multi-tool scenario with tool_choice='required'."""
 
         tools = get_travel_tools()
         messages = get_travel_messages()
+        self._answer_calls(mock_answers, _TRAVEL_CALLS, forced=True)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -1631,11 +1738,12 @@ class _TestToolChoiceBase:
         assert "invalid tool configuration" in error_msg
         assert "conflicting" in error_msg
 
-    def _assert_conflicting_defs_served(self, model, api_client):
+    def _assert_conflicting_defs_served(self, model, api_client, mock_answers):
         """Under a table whose forced call carries each tool's own `$defs`, the pair is served
         and the call's arguments follow the called tool's definition (a string for tool1, a
         number for tool2). The subclasses whose parser name Symphony answers to call this under
         --parser symphony; the base test keeps the legacy path's refusal."""
+        self._answer_calls(mock_answers, [("tool1", {"data": {"value": "one"}})], forced=True)
         response = api_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "Test the conflicting tools"}],
@@ -1661,16 +1769,23 @@ class _TestToolChoiceBase:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct", mock="RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.gateway(
     reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
 )
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceLlama(_TestToolChoiceBase):
-    """Tests for tool_choice functionality with Llama model."""
+    """Tests for tool_choice functionality with Llama model.
+
+    On the mock engine the answers are written in Llama 3.2's syntax, through the same
+    checkpoint's tokenizer from an ungated repository.
+    """
+
+    _calls_text = staticmethod(_llama_calls_text)
+    _forced_calls_text = staticmethod(_llama_forced_calls_text)
 
     # Mark flaky tests for this model — Llama-3.2-1B does not reliably
     # decide correctly with tool_choice='auto'.
@@ -1681,14 +1796,14 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
         "test_tool_choice_auto_streaming",
     }
 
-    def test_conflicting_defs_required_tool_choice(self, model, api_client):
+    def test_conflicting_defs_required_tool_choice(self, model, api_client, mock_answers):
         """Under --parser symphony the pair is served: the `llama` name reads the json table,
         whose forced call carries each tool's own `$defs`. On the legacy path the merged schema
         refuses the pair, as the base test expects."""
-        if get_parser() != "symphony":
+        if effective_parser() != "symphony":
             super().test_conflicting_defs_required_tool_choice(model, api_client)
             return
-        self._assert_conflicting_defs_served(model, api_client)
+        self._assert_conflicting_defs_served(model, api_client, mock_answers)
 
 
 # =============================================================================
@@ -1696,7 +1811,7 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
 @pytest.mark.gateway(
@@ -1705,19 +1820,25 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceQwen(_TestToolChoiceBase):
-    """Tests for tool_choice functionality with Qwen model."""
+    """Tests for tool_choice functionality with Qwen model.
+
+    On the mock engine the answers are written in Qwen3's syntax.
+    """
 
     # No flaky tests for Qwen
     FLAKY_TESTS: set[str] = set()
 
-    def test_conflicting_defs_required_tool_choice(self, model, api_client):
+    _calls_text = staticmethod(_qwen_calls_text)
+    _forced_calls_text = staticmethod(_qwen_calls_text)
+
+    def test_conflicting_defs_required_tool_choice(self, model, api_client, mock_answers):
         """Under --parser symphony the pair is served: the Qwen3 table gives the forced call a
         structural tag that carries each tool's own `$defs`. On the legacy path the merged schema
         refuses the pair, as the base test expects."""
-        if get_parser() != "symphony":
+        if effective_parser() != "symphony":
             super().test_conflicting_defs_required_tool_choice(model, api_client)
             return
-        self._assert_conflicting_defs_served(model, api_client)
+        self._assert_conflicting_defs_served(model, api_client, mock_answers)
 
 
 # =============================================================================
@@ -1725,7 +1846,7 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.model("mistralai/Mistral-7B-Instruct-v0.3")
 @pytest.mark.gateway(
@@ -1734,7 +1855,13 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceMistral(_TestToolChoiceBase):
-    """Tests for tool_choice functionality with Mistral model."""
+    """Tests for tool_choice functionality with Mistral model.
+
+    On the mock engine the answers are written in Mistral 7B v0.3's syntax.
+    """
+
+    _calls_text = staticmethod(_mistral_calls_text)
+    _forced_calls_text = staticmethod(_mistral_calls_text)
 
     # Mark flaky tests for this model — Mistral-7B-v0.3 is not a reliable
     # tool_choice='auto' decision-maker.
@@ -1745,9 +1872,9 @@ class TestToolChoiceMistral(_TestToolChoiceBase):
         "test_tool_choice_auto_streaming",
     }
 
-    def test_complex_parameters_required_non_streaming(self, model, api_client):
+    def test_complex_parameters_required_non_streaming(self, model, api_client, mock_answers):
         """Validate complex nested parameter schemas in non-streaming required mode."""
-        super().test_complex_parameters_required_non_streaming(model, api_client)
+        super().test_complex_parameters_required_non_streaming(model, api_client, mock_answers)
 
     @pytest.mark.skip(
         reason="Structural tags handle each tool's schema independently — "
@@ -1781,7 +1908,7 @@ WEATHER_TOOL = {
 }
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
 @pytest.mark.gateway(
@@ -1790,11 +1917,16 @@ WEATHER_TOOL = {
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestMultiTurnToolCall:
-    """Multi-turn conversations where the assistant calls a tool and receives the result."""
+    """Multi-turn conversations where the assistant calls a tool and receives the result.
 
-    def test_tool_result_followup(self, model, api_client):
+    On the mock engine the first turn's call and the second turn's text are stated in
+    Qwen3's syntax; the gateway renders the tool result into the second prompt either way.
+    """
+
+    def test_tool_result_followup(self, model, api_client, mock_answers):
         """Model should use tool result to form a final text response."""
         # Step 1: get tool call
+        mock_answers.enqueue(_qwen_calls_text([("get_weather", {"location": "Tokyo"})]))
         response = api_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
@@ -1810,6 +1942,7 @@ class TestMultiTurnToolCall:
         assert tool_call.function.name == "get_weather"
 
         # Step 2: send tool result and get final answer
+        mock_answers.enqueue("It is 22 degrees and sunny in Tokyo.")
         response2 = api_client.chat.completions.create(
             model=model,
             messages=[
@@ -1843,9 +1976,10 @@ class TestMultiTurnToolCall:
         msg2 = response2.choices[0].message
         assert msg2.content, "Model should reply with text after receiving tool result"
 
-    def test_tool_result_followup_streaming(self, model, api_client):
+    def test_tool_result_followup_streaming(self, model, api_client, mock_answers):
         """Streaming follow-up with tool result should produce text content."""
         # Step 1: get tool call
+        mock_answers.enqueue(_qwen_calls_text([("get_weather", {"location": "Paris"})]))
         response = api_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "What's the weather in Paris?"}],
@@ -1860,6 +1994,7 @@ class TestMultiTurnToolCall:
         tool_call = msg.tool_calls[0]
 
         # Step 2: stream the follow-up
+        mock_answers.enqueue("It is 18 degrees and cloudy in Paris.")
         stream = api_client.chat.completions.create(
             model=model,
             messages=[

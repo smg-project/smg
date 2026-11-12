@@ -6,7 +6,6 @@
 //! the payload builder that reads it live in the multimodal module.
 
 use std::{
-    collections::HashMap,
     fs::{read_dir, remove_file, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -25,7 +24,6 @@ use smg_grpc_client::{common_proto as common, tokenspeed_proto as tokenspeed, vl
 
 use super::{
     ProtoGenerateRequest, TokenSpeedMultimodalItem, TokenSpeedTensor, TokenSpeedTensorStorage,
-    VLLM_MROPE_GRID_KEYS,
 };
 
 static TOKENSPEED_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -326,66 +324,6 @@ fn collect_tokenspeed_tensor_shm_handles(
     if let Some(tokenspeed::tensor_data::Payload::Shm(handle)) = &tensor.payload {
         handles.push(handle.clone());
     }
-}
-
-/// The identity of a multimodal batch without its pixels, for the PD decode
-/// side: hashes, placeholders and the M-RoPE grid tensors (a few ints per item,
-/// inline payloads only, since an SHM segment is unreadable after the prefill
-/// send). A hash-less batch carries no identity worth keeping.
-pub(crate) fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
-    if mm.mm_hashes.is_empty() {
-        return None;
-    }
-    let inline_tensor = |key: &str| {
-        mm.model_specific_tensors
-            .get(key)
-            .filter(|tensor| matches!(tensor.payload, Some(vllm::tensor_data::Payload::Inline(_))))
-            .cloned()
-    };
-    let mut grid_tensors: HashMap<String, vllm::TensorData> = VLLM_MROPE_GRID_KEYS
-        .iter()
-        .filter_map(|key| inline_tensor(key).map(|tensor| (key.to_string(), tensor)))
-        .collect();
-    // A flat-classified grid key needs its sizes tensor to keep per-item
-    // slicing on the decode side.
-    let mut flat_keys = HashMap::new();
-    for (key, sizes_key) in &mm.flat_keys {
-        if !grid_tensors.contains_key(key) {
-            continue;
-        }
-        match inline_tensor(sizes_key) {
-            Some(sizes) => {
-                grid_tensors.insert(sizes_key.clone(), sizes);
-                flat_keys.insert(key.clone(), sizes_key.clone());
-            }
-            None => {
-                tracing::warn!(
-                    grid_key = %key,
-                    sizes_key = %sizes_key,
-                    "dropping grid tensor from the PD decode side: its sizes tensor is not inline"
-                );
-                grid_tensors.remove(key);
-            }
-        }
-    }
-    let retained = |keys: &[String]| {
-        keys.iter()
-            .filter(|key| grid_tensors.contains_key(*key))
-            .cloned()
-            .collect()
-    };
-    Some(vllm::MultimodalInputs {
-        im_token_id: mm.im_token_id,
-        mm_placeholders: mm.mm_placeholders.clone(),
-        mm_hashes: mm.mm_hashes.clone(),
-        modality: mm.modality,
-        batched_keys: retained(&mm.batched_keys),
-        keep_on_cpu_keys: retained(&mm.keep_on_cpu_keys),
-        flat_keys,
-        model_specific_tensors: grid_tensors,
-        encoder_input_key: mm.encoder_input_key.clone(),
-        ..Default::default()
-    })
 }
 
 /// The content identity of a multimodal batch for a language-model-only PD

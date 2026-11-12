@@ -197,6 +197,17 @@ impl<'a> ModelMetadata<'a> {
         Self::find_value(self.config, path).and_then(|value| value.as_u64().map(|v| v as u32))
     }
 
+    /// The token id a config field names, or the error naming the field: the
+    /// placeholder and delimiter ids a registry entry reads from its model
+    /// config.
+    pub fn config_token_id(&self, field: &str) -> RegistryResult<TokenId> {
+        self.config_u32(&[field])
+            .map(|id| id as TokenId)
+            .ok_or_else(|| ModelRegistryError::MissingConfigField {
+                field: field.to_string(),
+            })
+    }
+
     pub fn config_model_type(&self) -> Option<&str> {
         Self::find_value(self.config, &["model_type"]).and_then(Value::as_str)
     }
@@ -284,6 +295,18 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// and its workers process media themselves.
     fn encoder_input_format(&self) -> EncoderInputFormat {
         EncoderInputFormat::Reference
+    }
+
+    /// Whether the family sizes its source images itself before the processor
+    /// runs. `true` opts the family into the MiniMax rule of
+    /// [`crate::minimax_resize`]: the gateway then plans the geometry when it
+    /// fetches and marks the frame as sized for the processor. On an SGLang
+    /// worker it also opts into that rule's day-0 image and video preprocessor
+    /// overrides, applied when the worker loads the model's configs. A family
+    /// with a different source rule needs its own answer, not this one. `false`
+    /// for a family whose processor takes the source as decoded.
+    fn resizes_source_images(&self) -> bool {
+        false
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
@@ -514,10 +537,11 @@ pub trait ModelProcessorSpec: Send + Sync {
         None
     }
 
-    /// [`Self::default_video_sample_fps`] given the video preprocessor config
-    /// the checkpoint ships, for a family whose reference reads the rate from
-    /// it; the default ignores the config.
-    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f64> {
+    /// [`Self::default_video_sample_fps`] given the config the video processor
+    /// is built from (the checkpoint's video processor config, else its shared
+    /// one), for a family whose reference reads the rate from it; the default
+    /// ignores the config.
+    fn default_video_sample_fps_with(&self, _config: &PreProcessorConfig) -> Option<f64> {
         self.default_video_sample_fps()
     }
 
@@ -527,10 +551,13 @@ pub trait ModelProcessorSpec: Send + Sync {
         FrameSampling::Even
     }
 
-    /// [`Self::video_frame_sampling`] given the video preprocessor config the
-    /// checkpoint ships, for a family whose reference reads its frame budget
-    /// or grouping from it; the default ignores the config.
-    fn video_frame_sampling_with(&self, _config: Option<&PreProcessorConfig>) -> FrameSampling {
+    /// [`Self::video_frame_sampling`] given the config the video processor is
+    /// built from, for a family whose reference reads its frame budget or
+    /// grouping from it; the default ignores the config. A family sampled by
+    /// its engine's own video loader keeps that loader's constants here: the
+    /// loader reads no processor config, so a group or budget the config
+    /// states reaches the processor alone.
+    fn video_frame_sampling_with(&self, _config: &PreProcessorConfig) -> FrameSampling {
         self.video_frame_sampling()
     }
 }
@@ -1015,5 +1042,23 @@ mod tests {
                 Err(ModelRegistryError::UnsupportedModality { spec: "hooked", .. })
             ));
         }
+    }
+
+    #[test]
+    fn config_token_id_reads_the_field_or_names_it_in_the_error() {
+        let config = json!({ "image_token_id": 151655 });
+        let encoding = TestTokenizer::new(&[]);
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &encoding,
+            config: &config,
+        };
+        assert_eq!(metadata.config_token_id("image_token_id").unwrap(), 151655);
+        assert_eq!(
+            metadata.config_token_id("video_token_id").unwrap_err(),
+            ModelRegistryError::MissingConfigField {
+                field: "video_token_id".to_string(),
+            }
+        );
     }
 }

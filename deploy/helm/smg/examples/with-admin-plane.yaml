@@ -1,0 +1,21 @@
+# Router with the admin listener on its own port and Service, and control-plane
+# API keys from a Secret the chart manages (one id:name:role:key entry per line).
+# Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-admin-plane.yaml
+router:
+  workerUrls:
+    - http://worker-1:8000
+  # The control-plane routes move to this port; <fullname>-router-admin
+  # exposes it inside the cluster, the ingress never does.
+  adminPort: 9001
+  adminService:
+    type: ClusterIP
+    port: 9001
+auth:
+  # The serving routes' shared key, from an existing Secret.
+  existingSecret: smg-auth
+  controlPlane:
+    # Replace the keys before installing; prefer existingSecret for keys
+    # managed outside the chart's values.
+    apiKeys: |
+      ops:Operations:admin:replace-this-admin-key
+      ro:Read only:user:replace-this-user-key

@@ -32,7 +32,7 @@ fn batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             new_token_ids: vec![token],
             new_logprobs,
             finish_reason: finish,
@@ -61,6 +61,14 @@ async fn generate_e2e_translates_and_streams_vllm_proto() {
             other => panic!("expected Add, got {other:?}"),
         };
         assert_eq!(request.request_id, "r1");
+        assert_eq!(
+            request
+                .reasoning_parser_kwargs
+                .as_ref()
+                .unwrap()
+                .chat_template_kwargs["thinking_mode"],
+            "enabled"
+        );
         assert_eq!(request.prompt_token_ids, Some(vec![1, 2, 3]));
         assert_eq!(request.sampling_params.as_ref().unwrap().max_tokens, 2);
         output
@@ -93,6 +101,7 @@ async fn generate_e2e_translates_and_streams_vllm_proto() {
             logprobs: Some(1),
             ..Default::default()
         }),
+        chat_template_kwargs_json: Some(r#"{"thinking_mode":"enabled"}"#.into()),
         stream: true,
         ..Default::default()
     };
@@ -202,7 +211,7 @@ async fn generate_shapes_top_logprobs_to_requested_count() {
     let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![10],
             new_logprobs: Some(Logprobs {
                 positions: vec![position],
@@ -314,7 +323,7 @@ async fn generate_streams_prompt_logprobs() {
     let prefill = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![10],
             new_prompt_logprobs_tensors: Some(prompt_tensors),
             ..Default::default()
@@ -324,7 +333,7 @@ async fn generate_streams_prompt_logprobs() {
     let decode = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![11],
             finish_reason: Some(EngineCoreFinishReason::Length),
             ..Default::default()
@@ -1482,4 +1491,130 @@ async fn an_error_or_abort_finish_of_a_constrained_request_keeps_the_engines_own
         }
     }
     engine_task.await.unwrap();
+}
+
+/// Capacity needs engine timing and successful, non-preempted input work;
+/// consuming a sample cannot make a later decode output calibrate it again.
+#[tokio::test]
+async fn prefill_samples_require_timing_and_skip_preemption_and_errors() {
+    use engine_zmq_client::protocol::vllm::{
+        output::{EngineCoreEvent, EngineCoreEventType},
+        stats::PrefillStats,
+    };
+    let (client, _engine, _dir) = connected_pair(RuntimeType::Vllm).await;
+    for (index, (scheduled, preempted, finish, expected)) in [
+        (true, false, None, Some((2, 10.0, 12.0))),
+        (false, false, None, None),
+        (true, true, None, None),
+        (true, false, Some(EngineCoreFinishReason::Abort), None),
+        (true, false, Some(EngineCoreFinishReason::Error), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = vllm::GenerateRequest {
+            request_id: format!("sample-{index}"),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    ..Default::default()
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(2),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let mut streams = client.generate_vllm_streams(request).await.unwrap();
+        let stream = &mut streams[0];
+        let mut events = vec![];
+        if scheduled {
+            events.push(EngineCoreEvent {
+                r#type: EngineCoreEventType::Scheduled,
+                timestamp: 10.0,
+            });
+        }
+        if preempted {
+            events.push(EngineCoreEvent {
+                r#type: EngineCoreEventType::Preempted,
+                timestamp: 11.0,
+            });
+        }
+        let response = stream.map_output(EngineCoreOutput {
+            events: Some(events),
+            batch_timestamp: Some(12.0),
+            finish_reason: finish,
+            prefill_stats: Some(PrefillStats {
+                num_prompt_tokens: 3,
+                num_cached_tokens: 1,
+                num_computed_tokens: 2,
+                ..Default::default()
+            }),
+            new_token_ids: vec![10],
+            ..Default::default()
+        });
+        assert_eq!(
+            response.is_err(),
+            finish == Some(EngineCoreFinishReason::Error)
+        );
+        assert_eq!(stream.take_prefill_sample(), expected);
+        assert_eq!(stream.take_prefill_sample(), None);
+        if finish.is_some() {
+            continue;
+        }
+        stream
+            .map_output(EngineCoreOutput {
+                batch_timestamp: Some(13.0),
+                new_token_ids: vec![11],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stream.take_prefill_sample(), None);
+    }
+}
+
+/// Parser kwargs survive translation without changing the grammar-start override.
+#[test]
+fn thinking_mode_reaches_engine_reasoning_parser_with_a_constraint() {
+    for mode in [None, Some("enabled"), Some("disabled"), Some("adaptive")] {
+        for first_token in [false, true] {
+            let mut req = tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+                grammar_from_first_token: first_token,
+                ..Default::default()
+            });
+            req.chat_template_kwargs_json =
+                mode.map(|mode| serde_json::json!({"thinking_mode": mode}).to_string());
+            let translated =
+                translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+                    .unwrap();
+            assert_eq!(translated.reasoning_ended, first_token.then_some(true));
+            assert_eq!(
+                translated
+                    .reasoning_parser_kwargs
+                    .map(|kwargs| kwargs.chat_template_kwargs),
+                mode.map(|mode| HashMap::from([(
+                    "thinking_mode".to_string(),
+                    serde_json::json!(mode)
+                )]))
+            );
+        }
+    }
+}
+
+/// Refuse malformed or non-object parser kwargs before submitting engine work.
+#[test]
+fn malformed_reasoning_template_kwargs_are_rejected() {
+    for json in ["{", "[]", "null", "true"] {
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        req.chat_template_kwargs_json = Some(json.to_string());
+        let error = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .unwrap_err();
+        assert!(
+            error.starts_with("invalid chat_template_kwargs_json:"),
+            "{error}"
+        );
+    }
 }

@@ -20,7 +20,7 @@ use crate::routers::{
         common::stages::{helpers, BuildStage},
         context::{
             stage_output, AttemptStamp, BuildOutput, ClientSelection, CompletionItem,
-            ExecutionPlan, ExecutionPlanKind, PreparationOutput, RequestContext, WorkerSelection,
+            ExecutionPlan, PlanSettings, PreparationOutput, RequestContext, WorkerSelection,
         },
         proto_wrapper::ProtoGenerateRequest,
         spec::{CompletionResponseSpec, ResponseSpec},
@@ -28,16 +28,12 @@ use crate::routers::{
 };
 
 pub(crate) struct CompletionRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 }
 
 impl CompletionRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
     }
 
     /// Build one backend request for one prompt. PD bootstrap rooms are minted
@@ -76,7 +72,7 @@ impl CompletionRequestBuildingStage {
         let sampling_baseline =
             helpers::apply_sampling_defaults(&mut proto_request, sampling_mask, workers);
 
-        if self.inject_pd_metadata {
+        if self.settings.inject_pd_metadata {
             if let Some(workers) = workers {
                 helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
             }
@@ -118,6 +114,13 @@ impl BuildStage for CompletionRequestBuildingStage {
         )?;
 
         let completion_request = ctx.completion_request_arc();
+        // The echo prepends each prompt's text: a text prompt as sent, a token
+        // prompt decoded, both prepared above.
+        let prompt_texts = if completion_request.echo {
+            items.iter().map(|item| item.text.clone()).collect()
+        } else {
+            Vec::new()
+        };
 
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
@@ -160,7 +163,7 @@ impl BuildStage for CompletionRequestBuildingStage {
                 ctx.state.response.router_stop_obligations = builder_client
                     .finalize_generate_request(&mut proto_request, tokenizer.as_ref());
                 (
-                    ExecutionPlan::generate(self.plan_kind, proto_request),
+                    ExecutionPlan::generate(self.settings.plan_kind, proto_request),
                     id_stamp,
                 )
             }
@@ -194,7 +197,7 @@ impl BuildStage for CompletionRequestBuildingStage {
                 }
                 (
                     ExecutionPlan::Batch {
-                        kind: self.plan_kind,
+                        kind: self.settings.plan_kind,
                         shared_request_id,
                         requests,
                     },
@@ -205,14 +208,15 @@ impl BuildStage for CompletionRequestBuildingStage {
 
         Ok(BuildOutput {
             plan,
-            spec: ResponseSpec::Completion(CompletionResponseSpec::from(
+            spec: ResponseSpec::Completion(CompletionResponseSpec::new(
                 completion_request.as_ref(),
+                prompt_texts,
             )),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,
                 sampling_baseline,
-                inject_pd_metadata: self.inject_pd_metadata,
+                inject_pd_metadata: self.settings.inject_pd_metadata,
                 tool_constraint: None,
             },
         })
@@ -225,8 +229,8 @@ impl BuildStage for CompletionRequestBuildingStage {
     #[cfg(test)]
     fn signature(&self) -> String {
         format!(
-            "CompletionRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
+            "CompletionRequestBuildingStage({})",
+            self.settings.signature()
         )
     }
 }

@@ -37,14 +37,16 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]  # smg/
 _E2E_TEST = Path(__file__).resolve().parent  # e2e_test/
-_SRC = _ROOT / "bindings" / "python"
+_SRC = _ROOT / "bindings" / "python" / "src"  # the package root (maturin's python-source)
 
 # Add e2e_test to path so "from infra import ..." works
 if str(_E2E_TEST) not in sys.path:
     sys.path.insert(0, str(_E2E_TEST))
 
-# Add bindings/python to path if the wheel is not installed (for local development)
-_wheel_installed = find_spec("smg.smg_rs") is not None
+# Add bindings/python to path if the wheel is not installed (for local development).
+# find_spec imports the parent of a dotted name first, so the smg package is asked for on
+# its own: absent, it reads as no wheel instead of raising ModuleNotFoundError.
+_wheel_installed = find_spec("smg") is not None and find_spec("smg.smg_rs") is not None
 
 if not _wheel_installed and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))

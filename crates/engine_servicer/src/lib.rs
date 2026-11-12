@@ -1,6 +1,8 @@
-//! Rust engine servicers: the per-engine gRPC contract that the Python
-//! `smg_grpc_servicer` package serves today, implemented in Rust over the
-//! same-host ZMQ engine adapter (`engine-zmq-adapter`).
+//! Rust engine servicers: the per-engine gRPC contract the Python
+//! `smg_grpc_servicer` package served before these became the default for
+//! vLLM, SGLang and TokenSpeed (for TensorRT-LLM the engine's own Python
+//! servicer, `tensorrt_llm.grpc.smg`, stays the default), implemented over
+//! the same-host ZMQ engine adapter (`engine-zmq-adapter`).
 //!
 //! The Router keeps speaking the engine's own proto (`vllm_engine.proto` for
 //! vLLM, `sglang_scheduler.proto` for SGLang, `trtllm_service.proto` for
@@ -24,19 +26,24 @@
 //! already passes, on a listener of their own.
 
 mod admin;
+mod choice;
+mod embed;
 pub mod engine_hash;
 mod engine_link;
 mod error;
 mod health;
+mod health_probe;
 pub mod kv_events;
 pub mod kv_history;
 pub mod kv_state;
 pub mod kv_wire;
 mod load_report;
+mod load_stream;
 mod load_tracker;
 mod metrics;
 mod proto_json;
 mod requests;
+mod rpc;
 mod server;
 mod servicer;
 mod servicer_config;
@@ -55,14 +62,17 @@ use std::{pin::Pin, time::Duration};
 
 pub use engine_zmq_adapter::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncodeRelease, EncoderDispatchErrorReq, SglangEncodeDispatcher,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq,
+    SglangEncodeDispatcher,
 };
 pub use error::ServicerError;
 use futures::Stream;
 pub use server::init_tracing;
 pub(crate) use server::{lock, record_error, ServerThread, SharedError, Shutdown};
 pub use servicer_config::ServicerConfig;
-pub use sglang::{SglangModelInfo, SglangServicerConfig, SglangServicerServer};
+pub use sglang::{
+    SglangMediaProcessor, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
+};
 pub use tokenspeed::{TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer};
 use tonic::Status;
 pub use trtllm::{TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer};

@@ -71,7 +71,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -186,8 +186,9 @@ mod tests {
     /// A value the tool types whole (`tags`, an array) in a CDATA section with a word after the
     /// closer, before the closing tag: the value is the section's text, written at the word,
     /// which is refused (counted by a `Malformed` event of no bytes, its bytes `Dropped {
-    /// MalformedCall }`, never a chat client's content); the next parameter and the call's end
-    /// follow as if the word were not there; the same whole, at every cut and one character at a
+    /// MalformedCall }`, never a chat client's content); the next parameter follows as if the
+    /// word were not there, and the call gets no close, since the syntax refused bytes in it, so
+    /// its arguments are no whole value; the same whole, at every cut and one character at a
     /// time. (The word used to drop the held value with the carried bytes, and the closing tag
     /// then read past them.)
     #[test]
@@ -201,7 +202,7 @@ mod tests {
             said.calls,
             vec![(
                 "spotify_play".to_string(),
-                r#"{"tags": ["pop", "live"], "duration": 15}"#.to_string()
+                r#"{"tags": ["pop", "live"], "duration": 15"#.to_string()
             )]
         );
         let events = run(PROMPT, &[call]);
@@ -260,7 +261,7 @@ mod tests {
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

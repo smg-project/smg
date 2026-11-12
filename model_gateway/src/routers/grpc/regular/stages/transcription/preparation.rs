@@ -145,8 +145,11 @@ fn build_chat_request(
         messages.push(ChatMessage::Assistant {
             content: Some(MessageContent::Text(prefill)),
             name: None,
+            refusal: None,
+            audio: None,
+            function_call: None,
             tool_calls: None,
-            reasoning_content: None,
+            reasoning: Default::default(),
             ext: Default::default(),
         });
     }

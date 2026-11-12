@@ -5,15 +5,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::response::Response;
 use openai_protocol::responses::{ResponseUsage, ResponsesRequest};
 use serde_json::json;
-use smg_mcp::{McpServerBinding, McpToolSession};
+use smg_mcp::McpServerBinding;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
     common::{
-        build_next_request_with_tools, strip_image_generation_from_request_tools, McpCallTracking,
+        build_next_request_with_tools, open_mcp_session, strip_image_generation_from_request_tools,
+        McpCallTracking,
     },
-    execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools},
+    execution::execute_mcp_tools,
 };
 use crate::{
     middleware::TenantRequestMeta,
@@ -28,7 +29,7 @@ use crate::{
                 await_stream_startup, ensure_mcp_connection, load_history,
                 persist_response_if_needed, stream_startup_channel,
                 streaming::{ResponseStreamEventEmitter, StreamStartupSender},
-                BackgroundStream, ResponsesContext,
+                tool_call_limit, BackgroundStream, ReplayInto, ResponsesContext,
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
@@ -52,11 +53,17 @@ pub(crate) async fn serve_harmony_responses_stream(
     // Load the history the request continues, as the caller's tenant may see
     // it; `request` itself stays as it came, for the persist.
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
-    let current_request =
-        match load_history(ctx.history_stores(), &request, tenant.as_deref()).await {
-            Ok(req) => req,
-            Err(err_response) => return err_response,
-        };
+    let current_request = match load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Harmony,
+    )
+    .await
+    {
+        Ok(req) => req,
+        Err(err_response) => return err_response,
+    };
 
     // Check MCP connection BEFORE starting stream and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
@@ -191,25 +198,7 @@ async fn execute_mcp_tool_loop_streaming(
     // Note: For streaming, the emitter's original_request (set before spawn) preserves
     // the original tools. MCP tools are only merged into current_request for model calls.
 
-    // Create session once — bundles orchestrator, request_ctx, server_keys, mcp_tools
-    let session_request_id = format!("resp_{}", Uuid::now_v7());
-
-    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
-
-    // Add filtered MCP tools (static + requested dynamic) to the request
-    let mcp_tools = session.mcp_tools();
-    if !mcp_tools.is_empty() {
-        let mcp_response_tools = convert_mcp_tools_to_response_tools(&session);
-        let mut all_tools = current_request.tools.take().unwrap_or_default();
-        all_tools.extend(mcp_response_tools);
-        current_request.tools = Some(all_tools);
-
-        debug!(
-            mcp_tool_count = mcp_tools.len(),
-            total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            "MCP client available - added static MCP tools to Harmony Responses streaming request"
-        );
-    }
+    let session = open_mcp_session(ctx, mcp_servers, &mut current_request);
 
     // Once the MCP loop has taken ownership of image_generation
     // dispatch, drop the hosted-tool descriptor so the harmony builder
@@ -238,7 +227,7 @@ async fn execute_mcp_tool_loop_streaming(
     }
 
     debug!(
-        tool_count = mcp_tools.len(),
+        tool_count = session.mcp_tools().len(),
         "Emitted mcp_list_tools on first iteration"
     );
 
@@ -267,9 +256,10 @@ async fn execute_mcp_tool_loop_streaming(
             "Harmony Responses streaming iteration"
         );
 
-        // Execute pipeline and get stream + load guards
+        // Execute pipeline and get stream + load guards, under the
+        // iteration's tenant rate-limit reservation
         let startup_pending = startup.is_some();
-        let (execution_result, _load_guards) = match ctx
+        let (execution_result, _load_guards, reservation, router_stops) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
@@ -295,18 +285,32 @@ async fn execute_mcp_tool_loop_streaming(
             }
         };
 
-        // Process stream with token-level streaming
+        // Process stream with token-level streaming; the reservation is
+        // settled with the engine's counts the stream brought, or closed
+        // unsettled (its debit kept) when the stream broke or ended before
+        // its terminal frame.
         let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
             execution_result,
             emitter,
             tx,
             Some(&session),
             Some(&ctx.mcp_format_registry),
+            &router_stops,
         )
         .await
         {
-            Ok(result) => result,
+            Ok((result, counts)) => {
+                // The counts come with the terminal frame; a stream that
+                // ended before it brought none, and the reservation keeps
+                // its debit as the chat streams' does.
+                match counts {
+                    Some(counts) => reservation.settle(counts.settlement()).await,
+                    None => reservation.close_unsettled().await,
+                }
+                result
+            }
             Err(err_msg) => {
+                reservation.close_unsettled().await;
                 emitter
                     .emit_error(&err_msg, Some("processing_error"), tx)
                     .await;
@@ -322,6 +326,9 @@ async fn execute_mcp_tool_loop_streaming(
                 partial_text,
                 usage,
                 request_id: _,
+                // The stored object and the terminal read the finish the
+                // emitter was told.
+                finish_reason: _,
             } => {
                 debug!(
                     tool_call_count = tool_calls.len(),
@@ -342,10 +349,7 @@ async fn execute_mcp_tool_loop_streaming(
                 );
 
                 // Check combined limit (user's max_tool_calls vs safety limit)
-                let effective_limit = match max_tool_calls {
-                    Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
-                    None => DEFAULT_MAX_ITERATIONS,
-                };
+                let effective_limit = tool_call_limit(max_tool_calls);
 
                 // Check if we would exceed the limit with these new MCP tool calls
                 let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
@@ -542,9 +546,10 @@ async fn execute_without_mcp_streaming(
     debug!("No MCP tools - executing single iteration");
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
 
-    // Execute pipeline and get stream + load guards
+    // Execute pipeline and get stream + load guards, under the request's
+    // tenant rate-limit reservation
     let startup_pending = startup.is_some();
-    let (execution_result, _load_guards) = match ctx
+    let (execution_result, _load_guards, reservation, router_stops) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(
             current_request,
@@ -570,18 +575,32 @@ async fn execute_without_mcp_streaming(
         }
     };
 
-    // Process stream (no MCP context, all tools treated as function tools)
+    // Process stream (no MCP context, all tools treated as function tools);
+    // the reservation is settled with the engine's counts the stream
+    // brought, or closed unsettled (its debit kept) when the stream broke
+    // or ended before its terminal frame.
     let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
         execution_result,
         emitter,
         tx,
         None,
         None,
+        &router_stops,
     )
     .await
     {
-        Ok(result) => result,
+        Ok((result, counts)) => {
+            // The counts come with the terminal frame; a stream that ended
+            // before it brought none, and the reservation keeps its debit
+            // as the chat streams' does.
+            match counts {
+                Some(counts) => reservation.settle(counts.settlement()).await,
+                None => reservation.close_unsettled().await,
+            }
+            result
+        }
         Err(err_msg) => {
+            reservation.close_unsettled().await;
             emitter
                 .emit_error(&err_msg, Some("processing_error"), tx)
                 .await;

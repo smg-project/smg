@@ -59,6 +59,9 @@ pub async fn serve_mock_worker_with(
     configure: impl FnOnce(u16) -> mock_worker::config::Config,
 ) -> u16 {
     let (listener, port) = ephemeral_listener().await;
+    // A port an earlier test's engine served on keeps that engine's
+    // overrides; this engine starts from fresh ones.
+    mock_worker::overrides::fresh_for_port(port);
     tokio::spawn(mock_worker::grpc::serve_with_listener(
         Arc::new(configure(port)),
         listener,
@@ -178,6 +181,28 @@ pub fn grpc_test_context_with_tokenizer(
     })
 }
 
+/// [`grpc_test_context_with_tokenizer`] with a tenant rate limiter of the
+/// caller's (a manager over a backend of the test's) in place of the one
+/// `config` would build.
+pub fn grpc_test_context_with_rate_limiter(
+    mut config: RouterConfig,
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
+    rate_limit_manager: Arc<smg::rate_limit::RateLimitManager>,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    config.health_check.disable_health_check = true;
+    let model = model.to_owned();
+    Box::pin(async move {
+        let tokenizer_registry = super::tokenizer_registry_with(&model, tokenizer).await;
+        super::create_test_context_with_rate_limiter(
+            config,
+            tokenizer_registry,
+            Some(rate_limit_manager),
+        )
+        .await
+    })
+}
+
 /// [`grpc_test_context_with_tokenizer`] with the mock tokenizer: `common`'s
 /// `create_test_context_with_mock_tokenizer`, the health checks off.
 pub fn grpc_test_context(
@@ -216,4 +241,20 @@ pub fn build_grpc_router(
 ) -> Pin<Box<dyn Future<Output = Box<dyn RouterTrait>> + Send>> {
     let app_context = grpc_test_context(config, model);
     Box::pin(async move { grpc_router(&app_context.await, workers).await })
+}
+
+/// An ephemeral loopback port, bound once to learn its number and released:
+/// the port is free only at return, and another test of the binary may bind
+/// it before the caller does. Use it only where the port has to be named
+/// before something else binds it (an engine restarted on the same port, a
+/// port handed to a configuration); everywhere else bind `127.0.0.1:0` and
+/// keep the listener, as `ephemeral_listener` does.
+#[expect(clippy::expect_used, reason = "test helper")]
+pub async fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("ephemeral port address")
+        .port()
 }

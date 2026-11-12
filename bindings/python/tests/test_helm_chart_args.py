@@ -22,6 +22,7 @@ The render checks need the ``helm`` binary and are skipped without it.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -35,6 +36,7 @@ from smg.router_args import RouterArgs
 REPO = Path(__file__).resolve().parents[3]
 CHART = REPO / "deploy" / "helm" / "smg"
 HELPERS = CHART / "templates" / "_helpers.tpl"
+SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
 # The gateway's Consul provider, which reads Consul's own variables.
 CONSUL_PROVIDER = REPO / "model_gateway" / "src" / "service_discovery" / "consul.rs"
@@ -140,6 +142,8 @@ def test_oracle_variables_are_read_by_the_launcher(monkeypatch):
 
 def helm_template(settings: tuple[str, ...], files: tuple[Path, ...] = ()):
     command = ["helm", "template", "smg", str(CHART), "--kube-version", KUBE_VERSION]
+    # Pinned so the render never follows the kube context (in a cluster, the pod's own namespace).
+    command += ["--namespace", "default"]
     for file in files:
         command += ["-f", str(file)]
     for setting in settings:
@@ -366,6 +370,15 @@ ROLE = {"Role", "RoleBinding"}
 CLUSTER_ROLE = {"ClusterRole", "ClusterRoleBinding"}
 CONSUL_VARIABLES = {"CONSUL_HTTP_TOKEN", "CONSUL_CACERT", "CONSUL_CLIENT_CERT", "CONSUL_CLIENT_KEY"}
 EXAMPLES = sorted((CHART / "examples").glob("*.yaml"))
+# The files the launcher reads while it parses (a Secret mounted into the pod
+# in the cluster), each with a stand-in content of the shape it holds.
+PARSE_TIME_FILES = {
+    "--api-key-file": "example-key\n",
+    "--tenant-api-keys-file": "acme:example-key\n",
+    "--control-plane-api-keys-file": "ops:Operations:admin:example-key\n",
+    "--postgres-db-url-file": "postgresql://smg:example@postgres:5432/smg\n",
+    "--redis-url-file": "redis://redis:6379\n",
+}
 
 
 def router_container(documents: list[dict]) -> dict:
@@ -377,6 +390,18 @@ def launcher_args(args: list[str]) -> RouterArgs:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     RouterArgs.add_cli_args(parser)
     return RouterArgs.from_cli_args(parser.parse_args(args))
+
+
+def with_readable_files(args: list[str], directory: Path) -> list[str]:
+    """The rendered arguments with each file the launcher reads while it
+    parses replaced by a readable stand-in under ``directory``."""
+    args = list(args)
+    for index, flag in enumerate(args[:-1]):
+        if flag in PARSE_TIME_FILES:
+            path = directory / flag.strip("-")
+            path.write_text(PARSE_TIME_FILES[flag], encoding="utf-8")
+            args[index + 1] = str(path)
+    return args
 
 
 def rbac_kinds(documents: list[dict]) -> set[str]:
@@ -545,6 +570,7 @@ def test_file_provider_reads_a_manifest_path_without_a_config_map():
 @needs_helm
 def test_slurm_provider_passes_the_job_names_of_each_role_and_its_settings():
     _, documents = render(
+        "router.disaggregation.mode=pd",
         "router.discovery.provider=slurm",
         "router.discovery.slurm.port=8000",
         "router.discovery.slurm.prefillJobNames={prefill-a,prefill-b}",
@@ -831,9 +857,83 @@ def test_chart_workers_without_discovery_are_passed_as_worker_urls():
 
 @needs_helm
 @pytest.mark.parametrize("example", EXAMPLES, ids=[example.name for example in EXAMPLES])
-def test_every_example_renders_arguments_the_launcher_parses(example):
+def test_every_example_renders_arguments_the_launcher_parses(example, tmp_path):
     _, documents = render(files=(example,))
-    launcher_args(router_container(documents)["args"])
+    launcher_args(with_readable_files(router_container(documents)["args"], tmp_path))
+
+
+@needs_chart
+def test_the_schema_admits_the_policies_the_launcher_takes():
+    """``router.policy`` is rendered as the launcher's ``--policy``, so the
+    schema's enum is that option's choices: no fewer (a policy the gateway
+    runs could not be deployed through the value) and no more (helm would
+    render a pod whose launcher exits at argparse)."""
+    schema = json.loads(SCHEMA.read_text())
+    policy = schema["properties"]["router"]["properties"]["policy"]
+    assert policy["enum"] == router_args.COMMON_POLICY_CHOICES, (
+        "values.schema.json's router.policy enum differs from the launcher's --policy choices"
+    )
+
+
+@needs_helm
+@pytest.mark.parametrize("policy", router_args.COMMON_POLICY_CHOICES)
+def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
+    _, documents = render(f"router.policy={policy}")
+    args = router_container(documents)["args"]
+    assert has_run(args, ["--policy", policy]), f"the chart did not pass --policy {policy}"
+    assert launcher_args(args).policy == policy
+
+
+@needs_helm
+def test_a_prefill_only_policy_is_refused_by_the_schema():
+    """``bucket`` is a ``--prefill-policy`` choice, not a ``--policy`` one; the
+    schema refuses it where the launcher would, at render time."""
+    assert "router.policy must be one of the following" in render_error("router.policy=bucket")
+
+
+@needs_helm
+@pytest.mark.parametrize("value", [-1, 0, 4096])
+def test_the_concurrency_bound_value_reaches_the_launcher_as_given(value):
+    """``router.maxConcurrentRequests`` is passed through as the launcher's
+    ``--max-concurrent-requests``, sentinels included: the gateway reads -1 as
+    the host-derived bound and 0 as no bound."""
+    _, documents = render(f"router.maxConcurrentRequests={value}")
+    assert launcher_args(router_container(documents)["args"]).max_concurrent_requests == value
+
+
+@needs_chart
+def test_the_schema_says_what_the_concurrency_sentinels_do():
+    """The schema describes the key with the gateway's rule for -1 and 0,
+    where the values comment used to say -1 meant unlimited."""
+    schema = json.loads(SCHEMA.read_text())
+    router = schema["properties"]["router"]["properties"]
+    description = router["maxConcurrentRequests"]["description"]
+    assert "-1 derives the bound from the host" in description, description
+    assert "0 lifts the bound" in description, description
+
+
+@needs_helm
+def test_the_default_render_requires_the_native_jpeg_decoder():
+    """The default deployment passes ``--mm-turbojpeg require``: a gateway whose
+    image lacks libjpeg-turbo refuses to start, where the launcher's own default
+    decodes JPEGs with the pure-Rust fallback and only says so in a log line."""
+    _, documents = render()
+    assert launcher_args(router_container(documents)["args"]).mm_turbojpeg == "require"
+
+
+@needs_helm
+def test_the_turbojpeg_policy_reaches_the_launcher_as_given():
+    """``router.mmTurbojpeg: prefer`` is the fallback-tolerant setting a custom
+    image without the library needs."""
+    _, documents = render("router.mmTurbojpeg=prefer")
+    assert launcher_args(router_container(documents)["args"]).mm_turbojpeg == "prefer"
+
+
+@needs_helm
+def test_a_turbojpeg_policy_outside_the_two_names_is_refused_by_the_schema():
+    assert "router.mmTurbojpeg must be one of the following" in render_error(
+        "router.mmTurbojpeg=never"
+    )
 
 
 @needs_helm
@@ -848,3 +948,536 @@ def test_shutdown_settle_window(settle):
         assert flag not in args
     else:
         assert args[args.index(flag) + 1] == str(settle)
+
+
+def worker_container(documents: list[dict], name: str) -> dict:
+    """The engine container of the chart worker ``name``."""
+    (deployment,) = [
+        document
+        for document in documents
+        if document["kind"] == "Deployment" and document["metadata"]["name"] == f"smg-worker-{name}"
+    ]
+    return deployment["spec"]["template"]["spec"]["containers"][0]
+
+
+GRPC_WORKER_FORMS = {
+    # (engine, the port value given, the serving port the probe must name)
+    "vllm-default-port": ("vllm", None, 8000),
+    "sglang-default-port": ("sglang", None, 30000),
+    "vllm-explicit-port": ("vllm", 9100, 9100),
+    "sglang-explicit-port": ("sglang", 9200, 9200),
+}
+
+
+@needs_helm
+@pytest.mark.parametrize("form", sorted(GRPC_WORKER_FORMS))
+def test_a_grpc_worker_startup_probe_names_its_serving_port_as_an_integer(form):
+    """The gRPC probe takes a port number, never a name or a string: an edit that
+    quotes it or names it passes ``helm lint`` and fails only on the cluster."""
+    engine, port, serving = GRPC_WORKER_FORMS[form]
+    settings = [
+        "workers[0].name=engine",
+        f"workers[0].engine={engine}",
+        "workers[0].model=org/model",
+        "workers[0].image.tag=tag",
+        "workers[0].connectionMode=grpc",
+    ]
+    if port is not None:
+        settings.append(f"workers[0].port={port}")
+    container = worker_container(render(*settings)[1], "engine")
+    probe = container["startupProbe"]
+    assert "httpGet" not in probe
+    assert type(probe["grpc"]["port"]) is int
+    assert probe["grpc"]["port"] == serving
+    assert named(container["ports"], "serve")["containerPort"] == serving
+
+
+@needs_helm
+def test_an_http_worker_renders_no_grpc_probe():
+    container = worker_container(render(*WORKER)[1], "llama")
+    probe = container["startupProbe"]
+    assert "grpc" not in probe
+    assert probe["httpGet"] == {"path": "/health", "port": "serve"}
+
+
+ROLE_FLAGS = {
+    "--pd-disaggregation",
+    "--epd-disaggregation",
+    "--prefill-policy",
+    "--decode-policy",
+    "--encode-policy",
+    "--prefill",
+    "--decode",
+    "--encode",
+    "--prefill-selector",
+    "--decode-selector",
+    "--encode-selector",
+}
+
+
+@needs_chart
+def test_the_chart_renders_every_role_flag_the_launcher_takes():
+    """The eleven role flags of disaggregated serving are typed values, not
+    raw ``extraArgs`` strings."""
+    assert ROLE_FLAGS <= router_args_flags()
+
+
+@needs_helm
+def test_a_regular_fleet_renders_no_role_flag():
+    args = router_container(render()[1])["args"]
+    assert not ROLE_FLAGS & set(args), sorted(ROLE_FLAGS & set(args))
+
+
+@needs_helm
+def test_the_prefill_role_renders_its_mode_policy_and_workers():
+    _, documents = render(
+        "router.disaggregation.mode=pd",
+        "router.disaggregation.prefillPolicy=bucket",
+        "router.disaggregation.prefill[0].url=http://prefill-0:8000",
+        "router.disaggregation.prefill[0].bootstrapPort=8998",
+        "router.disaggregation.prefill[1].url=http://prefill-1:8000",
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.pd_disaggregation is True and parsed.epd_disaggregation is False
+    assert parsed.prefill_policy == "bucket"
+    assert parsed.prefill_urls == [("http://prefill-0:8000", 8998), ("http://prefill-1:8000", None)]
+
+
+@needs_helm
+def test_the_decode_role_renders_its_policy_and_workers():
+    _, documents = render(
+        "router.disaggregation.mode=pd",
+        "router.disaggregation.decodePolicy=power_of_two",
+        "router.disaggregation.decode[0].url=http://decode-0:8000",
+        "router.disaggregation.decode[1].url=http://decode-1:8000",
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.decode_policy == "power_of_two"
+    assert parsed.decode_urls == ["http://decode-0:8000", "http://decode-1:8000"]
+
+
+@needs_helm
+def test_the_encode_role_renders_under_epd():
+    _, documents = render(
+        "router.disaggregation.mode=epd",
+        "router.disaggregation.encodePolicy=consistent_hashing",
+        "router.disaggregation.encode[0].url=http://encode-0:8000",
+        "router.disaggregation.encode[0].bootstrapPort=8998",
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.epd_disaggregation is True and parsed.pd_disaggregation is False
+    assert parsed.encode_policy == "consistent_hashing"
+    assert parsed.encode_urls == [("http://encode-0:8000", 8998)]
+
+
+@needs_helm
+def test_the_role_selectors_reach_the_kubernetes_provider():
+    """The README's prefill-decode fleet found by label, from the values alone."""
+    _, documents = render(
+        *PROVIDERS["kubernetes"],
+        "router.disaggregation.mode=pd",
+        "router.disaggregation.prefillPolicy=cache_aware",
+        "router.disaggregation.decodePolicy=power_of_two",
+        "router.discovery.kubernetes.prefillSelector=app=engine role=prefill",
+        "router.discovery.kubernetes.decodeSelector=app=engine role=decode",
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.pd_disaggregation is True
+    assert parsed.prefill_policy == "cache_aware" and parsed.decode_policy == "power_of_two"
+    assert parsed.prefill_selector == {"app": "engine", "role": "prefill"}
+    assert parsed.decode_selector == {"app": "engine", "role": "decode"}
+    assert parsed.selected_discovery_provider() == "kubernetes"
+
+
+@needs_helm
+def test_the_encode_selector_reaches_the_kubernetes_provider_under_epd():
+    _, documents = render(
+        *PROVIDERS["kubernetes"],
+        "router.disaggregation.mode=epd",
+        "router.discovery.kubernetes.encodeSelector=role=encode",
+    )
+    assert launcher_args(router_container(documents)["args"]).encode_selector == {"role": "encode"}
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "router.disaggregation.prefillPolicy=cache_aware",
+        "router.disaggregation.decode[0].url=http://decode-0:8000",
+        "router.discovery.provider=kubernetes,router.discovery.kubernetes.prefillSelector=role=prefill",
+    ],
+)
+def test_a_role_without_its_mode_is_refused_at_render(setting):
+    """The gateway would ignore the role with a warning at start-up; the chart
+    refuses it where the values are written."""
+    assert "router.disaggregation.mode" in render_error(*setting.split(",", 1))
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "router.disaggregation.encodePolicy=random",
+        "router.disaggregation.encode[0].url=http://encode-0:8000",
+        "router.discovery.provider=kubernetes,router.discovery.kubernetes.encodeSelector=role=encode",
+    ],
+)
+def test_the_encode_role_outside_epd_is_refused_at_render(setting):
+    error = render_error("router.disaggregation.mode=pd", *setting.split(",", 1))
+    assert "router.disaggregation.mode=epd" in error
+
+
+SLURM_ROLES = (
+    "router.discovery.provider=slurm",
+    "router.discovery.slurm.port=8000",
+    "router.discovery.slurm.prefillJobNames={prefill}",
+    "router.discovery.slurm.decodeJobNames={decode}",
+)
+
+
+@needs_helm
+def test_the_slurm_role_job_names_follow_the_mode_rule():
+    """The Slurm role job names are role values too: refused without the mode,
+    the regular job names refused under it, the encode names refused outside
+    epd, rendered under the mode."""
+    assert "router.disaggregation.mode" in render_error(*SLURM_ROLES)
+    error = render_error(
+        "router.disaggregation.mode=pd", *SLURM_ROLES, "router.discovery.slurm.jobNames={regular}"
+    )
+    assert "router.discovery.slurm.jobNames" in error
+    error = render_error(
+        "router.disaggregation.mode=pd",
+        *SLURM_ROLES,
+        "router.discovery.slurm.encodeJobNames={encode}",
+    )
+    assert "router.disaggregation.mode=epd" in error
+    _, documents = render("router.disaggregation.mode=pd", *SLURM_ROLES)
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.pd_disaggregation is True
+    assert (parsed.slurm_prefill_job_name, parsed.slurm_decode_job_name) == (
+        ["prefill"],
+        ["decode"],
+    )
+
+
+PD_STATIC_ROLES = (
+    "router.disaggregation.mode=pd",
+    "router.disaggregation.prefill[0].url=http://prefill-0:8000",
+    "router.disaggregation.decode[0].url=http://decode-0:8000",
+)
+
+
+@needs_helm
+def test_regular_workers_under_a_role_mode_are_refused_or_left_out():
+    """A disaggregated gateway reads only its role workers: explicit regular URLs
+    under a mode are refused, the chart's own workers get no ``--worker-urls``
+    when the roles address them, and chart workers given no role are refused."""
+    assert "router.workerUrls" in render_error(
+        *PD_STATIC_ROLES, "router.workerUrls={http://w:8000}"
+    )
+    _, documents = render(*WORKER, *PD_STATIC_ROLES)
+    args = router_container(documents)["args"]
+    assert "--worker-urls" not in args
+    assert "--pd-disaggregation" in args
+    assert "gives no role" in render_error(*WORKER, "router.disaggregation.mode=pd")
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    ("setting", "words"),
+    [
+        (
+            "router.disaggregation.mode=xpd",
+            "router.disaggregation.mode must be one of the following",
+        ),
+        (
+            "router.disaggregation.prefillPolicy=fastest",
+            "router.disaggregation.prefillPolicy must be one of the following",
+        ),
+        (
+            "router.disaggregation.decodePolicy=bucket",
+            "router.disaggregation.decodePolicy must be one of",
+        ),
+        (
+            "router.disaggregation.encodePolicy=cache_aware",
+            "router.disaggregation.encodePolicy must be one of",
+        ),
+        (
+            "router.disaggregation.prefill[0].bootstrapport=8998",
+            "Additional property bootstrapport",
+        ),
+    ],
+)
+def test_a_role_value_outside_the_launcher_choices_is_refused_by_the_schema(setting, words):
+    """The schema carries the launcher's choices per role and the role keys, so
+    a typo fails at render, where a raw extraArgs string failed at start-up."""
+    assert words in render_error("router.disaggregation.mode=epd", setting)
+
+
+ADMIN_EXAMPLE = CHART / "examples" / "with-admin-plane.yaml"
+ADMISSION_EXAMPLE = CHART / "examples" / "with-admission-config.yaml"
+CONTROL_PLANE_KEYS = "ops:Operations:admin:hunter2\nro:Read only:user:hunter3\n"
+
+
+def services(documents: list[dict]) -> dict[str, dict]:
+    return {d["metadata"]["name"]: d for d in documents if d["kind"] == "Service"}
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "settings, words",
+    [
+        (("router.adminHost=0.0.0.0",), "router.adminPort"),
+        (("router.adminPort=30000",), "router.port"),
+        (("router.adminPort=29000", "router.metrics.port=29000"), "router.metrics.port"),
+        (("router.mesh.enabled=true", "router.adminPort=39527"), "router.mesh.port"),
+    ],
+)
+def test_an_admin_listener_the_gateway_would_refuse_is_refused_at_render(settings, words):
+    """A host without the port, or a port another listener holds, fails at the
+    gateway's start; the chart refuses both where the values are written."""
+    assert words in render_error(*settings)
+
+
+@needs_helm
+def test_the_admin_listener_renders_its_port_and_service_only_when_set():
+    """Without ``router.adminPort`` nothing names the admin listener; with it
+    the pod passes the flags and carries the port, and a Service of its own
+    exposes it on a port named ``admin`` while the ingress names the data
+    Service alone."""
+    _, documents = render()
+    assert "smg-router-admin" not in services(documents)
+    args = router_pod(documents)["spec"]["containers"][0]["args"]
+    assert "--admin-port" not in args and "--admin-host" not in args
+
+    _, documents = render(
+        "router.adminPort=9001",
+        "router.adminHost=0.0.0.0",
+        "router.ingress.enabled=true",
+        "router.ingress.hosts[0].host=smg.example.com",
+        "router.ingress.hosts[0].paths[0].path=/",
+        "router.ingress.hosts[0].paths[0].pathType=Prefix",
+    )
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert args[args.index("--admin-port") + 1] == "9001"
+    assert args[args.index("--admin-host") + 1] == "0.0.0.0"
+    ports = {p["name"]: p["containerPort"] for p in pod["spec"]["containers"][0]["ports"]}
+    assert ports["admin"] == 9001
+    admin = services(documents)["smg-router-admin"]
+    assert admin["spec"]["type"] == "ClusterIP"
+    assert admin["spec"]["ports"] == [
+        {"name": "admin", "port": 9001, "targetPort": "admin", "protocol": "TCP"}
+    ]
+    (ingress,) = [d for d in documents if d["kind"] == "Ingress"]
+    backends = {
+        path["backend"]["service"]["name"]
+        for rule in ingress["spec"]["rules"]
+        for path in rule["http"]["paths"]
+    }
+    assert backends == {"smg-router"}
+
+
+@needs_helm
+def test_control_plane_keys_render_into_a_chart_secret_read_as_a_file():
+    """``auth.controlPlane.apiKeys`` is in a chart-managed Secret and nowhere
+    else in the release; the pod reads it as a file and rolls on a change."""
+    rendered, documents = render(f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}")
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert args[args.index("--control-plane-api-keys-file") + 1] == (
+        "/etc/smg/control-plane/control-plane-api-keys"
+    )
+    assert "--control-plane-api-keys" not in args
+    assert "hunter2" not in " ".join(args)
+    (secret,) = [
+        d
+        for d in documents
+        if d["kind"] == "Secret" and d["metadata"]["name"] == "smg-control-plane"
+    ]
+    assert secret["stringData"] == {"control-plane-api-keys": CONTROL_PLANE_KEYS}
+    assert rendered.count("hunter2") == 1
+    mounts = {m["name"]: m["mountPath"] for m in pod["spec"]["containers"][0]["volumeMounts"]}
+    assert mounts["control-plane"] == "/etc/smg/control-plane"
+    (volume,) = [v for v in pod["spec"]["volumes"] if v["name"] == "control-plane"]
+    assert volume["secret"]["secretName"] == "smg-control-plane"
+    checksum = pod["metadata"]["annotations"]["checksum/control-plane"]
+    assert re.fullmatch(r"[0-9a-f]{64}", checksum)
+    _, rotated = render(f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}rotated")
+    assert router_pod(rotated)["metadata"]["annotations"]["checksum/control-plane"] != checksum
+
+
+@needs_helm
+def test_control_plane_keys_from_an_existing_secret():
+    rendered, documents = render(
+        "auth.controlPlane.existingSecret=cp-keys",
+        "auth.controlPlane.secretKey=keys.txt",
+        # Keys left in the values are written nowhere: the existing Secret wins.
+        f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}",
+    )
+    assert "hunter2" not in rendered
+    assert "smg-control-plane" not in secret_names(documents)
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert (
+        args[args.index("--control-plane-api-keys-file") + 1] == "/etc/smg/control-plane/keys.txt"
+    )
+    (volume,) = [v for v in pod["spec"]["volumes"] if v["name"] == "control-plane"]
+    assert volume["secret"] == {
+        "secretName": "cp-keys",
+        "items": [{"key": "keys.txt", "path": "keys.txt"}],
+    }
+    assert "checksum/control-plane" not in (pod["metadata"]["annotations"] or {})
+
+
+@needs_helm
+def test_a_custom_control_plane_secret_key_is_read_from_one_value():
+    """``auth.controlPlane.secretKey`` on the chart-managed Secret names the
+    Secret's data key, the mount's item and the file the flag reads: the three
+    render from the one value."""
+    _, documents = render(
+        f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}",
+        "auth.controlPlane.secretKey=keys.txt",
+    )
+    (secret,) = [
+        d
+        for d in documents
+        if d["kind"] == "Secret" and d["metadata"]["name"] == "smg-control-plane"
+    ]
+    assert secret["stringData"] == {"keys.txt": CONTROL_PLANE_KEYS}
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert (
+        args[args.index("--control-plane-api-keys-file") + 1] == "/etc/smg/control-plane/keys.txt"
+    )
+    (volume,) = [v for v in pod["spec"]["volumes"] if v["name"] == "control-plane"]
+    assert volume["secret"] == {
+        "secretName": "smg-control-plane",
+        "items": [{"key": "keys.txt", "path": "keys.txt"}],
+    }
+
+
+@needs_helm
+def test_an_unknown_control_plane_value_fails_the_render():
+    """The schema closes ``auth.controlPlane``: a misspelt key is refused at
+    render, where an open object would render no control-plane keys at all."""
+    assert "existingsecret" in render_error("auth.controlPlane.existingsecret=cp-keys")
+
+
+@needs_helm
+def test_without_control_plane_keys_nothing_names_them():
+    _, documents = render()
+    pod = router_pod(documents)
+    assert "--control-plane-api-keys-file" not in pod["spec"]["containers"][0]["args"]
+    assert "control-plane" not in {v["name"] for v in pod["spec"]["volumes"]}
+    assert "smg-control-plane" not in secret_names(documents)
+
+
+@needs_helm
+def test_the_admin_plane_example_renders_arguments_the_launcher_parses():
+    """The example installs: its flags are launcher options and parse."""
+    _, documents = render(files=(ADMIN_EXAMPLE,))
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    parsed = parser.parse_args(args)
+    assert parsed.admin_port == 9001
+    assert parsed.control_plane_api_keys_file == "/etc/smg/control-plane/control-plane-api-keys"
+    assert "smg-router-admin" in services(documents)
+
+
+@needs_helm
+def test_without_admission_config_nothing_names_it():
+    """Neither block set: no flag, no mount, no volume."""
+    _, documents = render()
+    pod = router_pod(documents)
+    container = pod["spec"]["containers"][0]
+    flags = {
+        "--tenant-rate-limit-enabled",
+        "--tenant-rate-limit-config",
+        "--priority-scheduler-enabled",
+        "--priority-scheduler-config",
+    }
+    assert not flags & set(container["args"])
+    assert not {"rate-limit", "scheduler"} & {m["name"] for m in container["volumeMounts"]}
+    assert not {"rate-limit", "scheduler"} & {v["name"] for v in pod["spec"]["volumes"]}
+
+
+@needs_helm
+def test_admission_config_maps_mount_whole_and_render_their_flags():
+    """Each ConfigMap is mounted whole at its directory and its file reaches
+    the gateway through the config flag, beside the enable flag; the launcher
+    parses the result."""
+    _, documents = render(
+        "router.tenantRateLimit.enabled=true",
+        "router.tenantRateLimit.configMap.name=smg-rate-limit",
+        "router.priorityScheduler.enabled=true",
+        "router.priorityScheduler.configMap.name=smg-scheduler",
+        "router.priorityScheduler.configMap.key=classes.yaml",
+    )
+    pod = router_pod(documents)
+    container = pod["spec"]["containers"][0]
+    args = container["args"]
+    assert "--tenant-rate-limit-enabled" in args
+    assert (
+        args[args.index("--tenant-rate-limit-config") + 1] == "/etc/smg/rate-limit/rate-limit.yaml"
+    )
+    assert "--priority-scheduler-enabled" in args
+    assert args[args.index("--priority-scheduler-config") + 1] == "/etc/smg/scheduler/classes.yaml"
+    mounts = {m["name"]: m for m in container["volumeMounts"]}
+    assert mounts["rate-limit"] == {
+        "name": "rate-limit",
+        "mountPath": "/etc/smg/rate-limit",
+        "readOnly": True,
+    }
+    assert mounts["scheduler"] == {
+        "name": "scheduler",
+        "mountPath": "/etc/smg/scheduler",
+        "readOnly": True,
+    }
+    volumes = {v["name"]: v for v in pod["spec"]["volumes"]}
+    assert volumes["rate-limit"] == {"name": "rate-limit", "configMap": {"name": "smg-rate-limit"}}
+    assert volumes["scheduler"] == {"name": "scheduler", "configMap": {"name": "smg-scheduler"}}
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    parsed = parser.parse_args(args)
+    assert parsed.tenant_rate_limit_enabled
+    assert parsed.tenant_rate_limit_config == "/etc/smg/rate-limit/rate-limit.yaml"
+    assert parsed.priority_scheduler_enabled
+    assert parsed.priority_scheduler_config == "/etc/smg/scheduler/classes.yaml"
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "setting, words",
+    [
+        ("router.tenantRateLimit.enabled=true", "router.tenantRateLimit.configMap.name"),
+        (
+            "router.priorityScheduler.configMap.name=smg-scheduler",
+            "router.priorityScheduler.enabled",
+        ),
+        (
+            "router.tenantRateLimit.configMap.name=smg-rate-limit",
+            "router.tenantRateLimit.enabled",
+        ),
+    ],
+)
+def test_admission_config_the_gateway_would_refuse_or_ignore_is_refused_at_render(setting, words):
+    """The rate limit enabled without its YAML fails at the gateway's start,
+    and a limits or scheduler table without its flag is ignored with a
+    warning; the chart refuses all three where the values are written."""
+    assert words in render_error(setting)
+
+
+@needs_helm
+def test_the_admission_config_example_renders_arguments_the_launcher_parses():
+    """The example installs: its flags are launcher options and parse."""
+    _, documents = render(files=(ADMISSION_EXAMPLE,))
+    args = router_pod(documents)["spec"]["containers"][0]["args"]
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    parsed = parser.parse_args(args)
+    assert parsed.tenant_rate_limit_config == "/etc/smg/rate-limit/rate-limit.yaml"
+    assert parsed.priority_scheduler_config == "/etc/smg/scheduler/scheduler.yaml"

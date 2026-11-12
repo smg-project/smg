@@ -403,7 +403,7 @@ impl ParserRegistry {
         // Fall back to generic JSON schema
         match tool_choice {
             ToolChoice::Function { .. } => {
-                let params_schema = serde_json::to_string(&tools[0].function.parameters)
+                let params_schema = serde_json::to_string(tools[0].function.parameters_schema())
                     .map_err(|e| format!("Failed to serialize tool parameters: {e}"))?;
                 Ok(Some(ToolConstraint::JsonSchema(params_schema)))
             }
@@ -616,10 +616,9 @@ impl ParserFactory {
         registry.map_model("deepseek-ai/DeepSeek-V3*", "deepseek");
         registry.map_model("deepseek-v3.1*", "deepseek31");
         registry.map_model("deepseek-ai/DeepSeek-V3.1*", "deepseek31");
-        // V3.2-Exp uses V3.1 format (longer patterns take precedence)
-        registry.map_model("deepseek-v3.2-exp*", "deepseek31");
-        registry.map_model("deepseek-ai/DeepSeek-V3.2-Exp*", "deepseek31");
-        // V3.2 DSML format (outer block: function_calls)
+        // V3.2 DSML format (outer block: function_calls); V3.2-Exp reads here too: its own
+        // template spells V3.1's calls, but the engine renders the checkpoint through the V3.2
+        // encoder
         registry.map_model("deepseek-v3.2*", "deepseek32");
         registry.map_model("deepseek-ai/DeepSeek-V3.2*", "deepseek32");
         // V4 DSML format (outer block: tool_calls — same parser as V3.2, different block name)
@@ -786,7 +785,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
                     "type": "string",
                     "enum": [tool.function.name]
                 },
-                "parameters": tool.function.parameters
+                "parameters": tool.function.parameters_schema()
             },
             "required": ["name", "parameters"]
         });
@@ -796,7 +795,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Consolidate $defs from all tools
     let mut all_defs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     for tool in tools {
-        if let serde_json::Value::Object(params) = &tool.function.parameters {
+        if let serde_json::Value::Object(params) = tool.function.parameters_schema() {
             if let Some(serde_json::Value::Object(defs)) = params.get("$defs") {
                 for (def_name, def_schema) in defs {
                     if let Some(existing) = all_defs.get(def_name) {

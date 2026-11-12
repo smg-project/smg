@@ -15,7 +15,6 @@
 use std::{
     borrow::Cow,
     fmt::Write as _,
-    future::Future,
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -38,13 +37,18 @@ use tower_http::{
     classify::ServerErrorsFailureClass,
     trace::{MakeSpan, OnFailure, OnRequest, OnResponse},
 };
-use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Span};
+use tracing::{
+    debug, error, field::Empty, info, info_span, instrument::Instrumented, warn, Instrument, Span,
+};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{
+    auth::fingerprint_of,
+    duty::{Duty, DutyFuture},
     edge_body::BodyDuties,
     metrics::{matched_path_label, BodyProgress, CLIENT_CLOSED_REQUEST_STATUS},
     request_id::RequestId,
+    request_start::{clock_now, RequestStarted},
 };
 use crate::{
     config::AccessLogField,
@@ -135,12 +139,8 @@ impl AccessLogRecord {
     /// log.
     pub fn key_id(&self, key_hash: &[u8; 32]) {
         if self.fields.contains(AccessLogField::KeyId) {
-            let mut id = String::with_capacity(16);
-            for byte in &key_hash[..8] {
-                // Writing into a String cannot fail.
-                let _ = write!(id, "{byte:02x}");
-            }
-            self.span.record("key_id", id.as_str());
+            self.span
+                .record("key_id", fingerprint_of(key_hash).as_str());
         }
     }
 }
@@ -333,6 +333,16 @@ impl<B> MakeSpan<B> for RequestSpan {
             response_bytes = Empty,
             response_bytes_sent = Empty,
             worker = Empty,
+            // What the Symphony reader leaves of an output it did not read
+            // clean (`regular::symphony::telemetry::Mark`), recorded when
+            // the output ends, never for a clean one.
+            symphony.table = Empty,
+            symphony.outcome = Empty,
+            symphony.choice = Empty,
+            symphony.reason = Empty,
+            symphony.bytes = Empty,
+            symphony.malformed_bytes = Empty,
+            symphony.finish = Empty,
             module = "smg"
         );
 
@@ -533,85 +543,131 @@ pub struct RequestTraceService<S> {
 
 impl<S> Service<Request> for RequestTraceService<S>
 where
-    S: Service<Request, Response = Response> + Send + Clone + 'static,
-    S::Future: Send + 'static,
+    S: Service<Request, Response = Response>,
 {
     type Response = Response;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Response, S::Error>> + Send>>;
+    type Future = RequestTraceFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Request) -> Self::Future {
+    fn call(&mut self, mut request: Request) -> Self::Future {
         let span = RequestSpan.make_span(&request);
-        let start = Instant::now();
+        // The latency's origin: the edge's entry stamp when the metrics layer
+        // runs this request inside its scope (see `request_start`), a read
+        // of this layer's own otherwise.
+        let start = RequestStarted::current().unwrap_or_else(clock_now);
         let fields = self.fields;
-        let mut inner = self.inner.clone();
-        Box::pin(async move {
-            record_request_fields(&span, &request, fields);
-            RequestLogger.on_request(&request, &span);
-            let mut request = request;
-            if fields.contains(AccessLogField::Tenant) || fields.contains(AccessLogField::KeyId) {
-                request.extensions_mut().insert(AccessLogRecord {
-                    span: span.clone(),
-                    fields,
-                });
-            }
-            let mut request_bytes = None;
-            if fields.contains(AccessLogField::RequestBytes) {
-                let count = Arc::new(AtomicU64::new(0));
-                let counted = Arc::clone(&count);
-                request = request.map(|body| {
-                    Body::new(CountedBody {
-                        inner: body,
-                        count: counted,
-                    })
-                });
-                request_bytes = Some(count);
-            }
-            let mut close_log = ClientCloseLog::new(span.clone(), start, request_bytes.clone());
-            // The handler's future is created and polled under the span, as
-            // the trace layer did, so everything it logs carries the span.
-            let future = {
-                let _enter = span.enter();
-                inner.call(request)
-            };
-            let mut response = match future.instrument(span.clone()).await {
-                Ok(response) => response,
-                Err(error) => {
-                    close_log.done();
-                    return Err(error);
-                }
-            };
-            let progress = BodyProgress::new(&response);
-            record_response_fields(
-                &span,
-                &response,
+        record_request_fields(&span, &request, fields);
+        RequestLogger.on_request(&request, &span);
+        if fields.contains(AccessLogField::Tenant) || fields.contains(AccessLogField::KeyId) {
+            request.extensions_mut().insert(AccessLogRecord {
+                span: span.clone(),
                 fields,
-                request_bytes.as_deref(),
-                progress.declared(),
-            );
-            ResponseLogger.on_response(&response, start.elapsed(), &span);
-            close_log.head_sent();
-            let count_bytes = fields.contains(AccessLogField::ResponseBytes);
-            // A body without a declared length is a stream: its bytes are
-            // known at its end, which then gets a line of its own.
-            let end_line = count_bytes && progress.declared().is_none();
-            // The span stays open until the body ends: handed to the edge's one
-            // body wrapper with the close line it owes and the bytes it counts,
-            // which the wrapper reports at the body's end, failure or drop.
-            BodyDuties::hand(&mut response, |duties| {
-                duties.span = Some(SpanDuty {
-                    span,
-                    close_log,
-                    count_bytes,
-                    end_line,
-                });
             });
-            Ok(response)
-        })
+        }
+        let mut request_bytes = None;
+        if fields.contains(AccessLogField::RequestBytes) {
+            let count = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&count);
+            request = request.map(|body| {
+                Body::new(CountedBody {
+                    inner: body,
+                    count: counted,
+                })
+            });
+            request_bytes = Some(count);
+        }
+        let close_log = ClientCloseLog::new(span.clone(), start, request_bytes.clone());
+        // The handler's future is created here and polled under the span, as
+        // the trace layer did, so everything it logs carries the span. The
+        // layer keeps no clone of the stack inside it per request (a clone of
+        // a route is a heap copy of the service in it), and its future is the
+        // route's own under the span with the record's duty beside it, not a
+        // box around both.
+        let inner = {
+            let _enter = span.enter();
+            self.inner.call(request)
+        };
+        DutyFuture::new(
+            inner.instrument(span.clone()),
+            RecordDuty {
+                span,
+                start,
+                fields,
+                request_bytes,
+                close_log,
+            },
+        )
+    }
+}
+
+/// The request-span layer's future: the route's future under the request's
+/// span, with the span's record as its duty.
+pub type RequestTraceFuture<F> = DutyFuture<Instrumented<F>, RecordDuty>;
+
+/// What the request-span layer holds for a request between its first line
+/// and the route's answer: the response line of the access log and the
+/// span's hand-over to the edge's body wrapper. Dropped with the future
+/// before the answer, its close log writes the client-closed line.
+pub struct RecordDuty {
+    span: Span,
+    start: Instant,
+    fields: AccessLogFields,
+    request_bytes: Option<Arc<AtomicU64>>,
+    close_log: ClientCloseLog,
+}
+
+impl Duty for RecordDuty {
+    /// The route answered: the response line is written and the span handed
+    /// to the edge's body wrapper; an error of the inner service ends the
+    /// record without a line of its own.
+    fn answered<E>(self, answer: Result<Response, E>) -> Result<Response, E> {
+        let Self {
+            span,
+            start,
+            fields,
+            request_bytes,
+            mut close_log,
+        } = self;
+        let mut response = match answer {
+            Ok(response) => response,
+            Err(error) => {
+                close_log.done();
+                return Err(error);
+            }
+        };
+        let progress = BodyProgress::new(&response);
+        record_response_fields(
+            &span,
+            &response,
+            fields,
+            request_bytes.as_deref(),
+            progress.declared(),
+        );
+        let head_at = clock_now();
+        ResponseLogger.on_response(&response, head_at.saturating_duration_since(start), &span);
+        close_log.head_sent();
+        let count_bytes = fields.contains(AccessLogField::ResponseBytes);
+        // A body without a declared length is a stream: its bytes are
+        // known at its end, which then gets a line of its own.
+        let end_line = count_bytes && progress.declared().is_none();
+        // The span stays open until the body ends: handed to the edge's one
+        // body wrapper with the close line it owes and the bytes it counts,
+        // which the wrapper reports at the body's end, failure or drop. The
+        // head's stamp rides along for the metrics layer's duration.
+        BodyDuties::hand(&mut response, |duties| {
+            duties.head_at = Some(head_at);
+            duties.span = Some(SpanDuty {
+                span,
+                close_log,
+                count_bytes,
+                end_line,
+            });
+        });
+        Ok(response)
     }
 }
 
@@ -724,7 +780,11 @@ pub(crate) struct SpanDuty {
 impl SpanDuty {
     /// The body ended (its last frame, or the declared length out) with
     /// `bytes_sent` bytes out: a streamed body's end gets its line, with the
-    /// bytes, when the record carries them.
+    /// bytes, when the record carries them. The line carries the span's
+    /// fields as they stand at the body's end, so what the request learned
+    /// while it streamed (the Symphony reader's `symphony.*` mark, recorded
+    /// when the output ended) is read here, where the finish line went out
+    /// before it existed.
     pub(crate) fn ended(&mut self, bytes_sent: u64) {
         self.close_log.done();
         if std::mem::replace(&mut self.end_line, false) {
@@ -1034,6 +1094,20 @@ mod client_closed_tests {
             .expect("request")
     }
 
+    /// The response `build`'s router streams at `uri`, its first chunk `first`
+    /// already sent; the sender keeps the stream open until the test drops it.
+    async fn streamed(
+        build: fn(Body) -> Router,
+        uri: &str,
+        first: &'static [u8],
+    ) -> (Response, mpsc::Sender<Result<Bytes, Infallible>>) {
+        let (tx, rx) = mpsc::channel(4);
+        let body = Body::from_stream(ReceiverStream::new(rx));
+        let response = build(body).oneshot(request(uri)).await.expect("response");
+        tx.send(Ok(Bytes::from_static(first))).await.expect("send");
+        (response, tx)
+    }
+
     /// `/stream` hands out `body` once; `/slow` never answers.
     fn app(body: Body) -> Router {
         let slot = Arc::new(Mutex::new(Some(body)));
@@ -1092,14 +1166,7 @@ mod client_closed_tests {
         // left.
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/relay"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(relay_app, "/relay", b"data: x\n\n").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert_eq!(frame.data_ref().map(Bytes::len), Some(9));
@@ -1117,14 +1184,7 @@ mod client_closed_tests {
         // the body short of its declared bytes.
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/relay"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data:")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(relay_app, "/relay", b"data:").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert_eq!(frame.data_ref().map(Bytes::len), Some(5));
@@ -1162,14 +1222,7 @@ mod client_closed_tests {
     async fn a_stream_the_client_dropped_logs_one_info_line_after_the_access_log() {
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/stream"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(app, "/stream", b"data: x\n\n").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert!(frame.is_data());
@@ -1191,14 +1244,7 @@ mod client_closed_tests {
     async fn a_stream_that_ends_logs_no_client_close() {
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/stream"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(app, "/stream", b"data: x\n\n").await;
         drop(tx);
         let _ = response.into_body().collect().await.expect("body");
         assert_eq!(
@@ -1464,6 +1510,37 @@ mod field_tests {
         assert_eq!(lines[0].0, "started processing request");
         assert_eq!(lines[1].0, "finished processing request");
         assert_eq!(keys(&lines[1].1), DEFAULT_FINISH_KEYS);
+    }
+
+    /// The finish line's latency runs from the edge's entry stamp when the
+    /// request runs inside its scope (the metrics layer's, ahead of this
+    /// layer in the gateway's stack), not from a read of this layer's own.
+    #[tokio::test]
+    async fn the_latency_runs_from_the_edge_s_entry_stamp() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(|| async { "ok" }))
+            .layer(create_logging_layer(AccessLogFields::NONE));
+        let earlier = clock_now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("the clock has been running for five seconds");
+        let response = RequestStarted::at(earlier)
+            .scope(app.oneshot(request("/v1/chat/completions")))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.expect("body");
+
+        let lines = access_lines(&capture);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let latency = lines[1].1["latency"]
+            .as_u64()
+            .expect("the latency, in microseconds");
+        assert!(
+            latency >= 5_000_000,
+            "latency {latency} us, expected at least the 5 s since the entry stamp"
+        );
     }
 
     /// Every selected field is on the finish line with its value; the

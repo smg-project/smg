@@ -25,6 +25,7 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
         inputs,
         |client| {
             client.set_structured_outputs_support(super::structured_outputs_support(&state.model));
+            Ok(())
         },
     )
     .await;

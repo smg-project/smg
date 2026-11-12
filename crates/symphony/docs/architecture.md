@@ -143,10 +143,11 @@ Three tiers, two of them at run time:
 - **Dropped**: bytes the format consumed on purpose, each with a `DropReason`: a marker that moved
   the engine or a special token (`ControlToken`, `Wrapper`), the template's wrapping between regions
   (`Wrapper`), whitespace the format treats as structural (`Whitespace`), a call after the first
-  where the request takes one call only (`LaterCall`), and the bytes of a call block a syntax
-  whose block is never prose could not read (`MalformedCall`, behind a `Malformed` event of no
-  bytes that counts the failure). Dropped bytes are expected on every well-formed output, the
-  last kind excepted.
+  where the request takes one call only (`LaterCall`), a call the request forbade with
+  `tool_choice: none` and the model wrote anyway (`ForbiddenCall`, every call of the output), and
+  the bytes of a call block a syntax whose block is never prose could not read (`MalformedCall`,
+  behind a `Malformed` event of no bytes that counts the failure). Dropped bytes are expected on
+  every well-formed output, the last kind excepted.
 - **Malformed**: bytes of a region the parser gave up on, returned whole, each with a
   `MalformedReason` from a closed set: the stream ended inside a region (`UnterminatedRegion`),
   arguments that did not parse (`InvalidArguments`), a call to a function the request did not
@@ -171,6 +172,23 @@ regions by table and reason as a bounded label, log a sample with the table, the
 bytes' length, and mark the request's span; how a gateway surfaces that (metric, log, span event,
 and whether a request may ask for the reasons on the wire) is the gateway's policy, documented with
 its parse-failure telemetry.
+
+What a failure leaves behind in the gateway this repository ships (its `symphony/telemetry`
+module), for the record: per table, counters of outputs by outcome (`clean`, `malformed`,
+`failed`, `empty`, `unknown_tool`, `panicked`) and of malformed runs by reason; for an output
+that was not clean, one log line at WARN with the request id, the choice, the table, the outcome,
+the first run's reason, its place and length in the output, the bytes released, the engine's
+finish and the calls, bounded per table and reason (a burst of twenty lines, then two a second,
+the lines refused meanwhile counted on the next one written), so a flood of one shape hides no
+other; and the same facts as fields of the request's span (`symphony.table`, `symphony.outcome`,
+`symphony.choice`, `symphony.reason`, `symphony.bytes`, `symphony.malformed_bytes`,
+`symphony.finish`), recorded when the output ends, once per request (the first reading that was
+not clean), so a trace of the request carries the reading as attributes, the sampled line carries
+them with the request id, and a whole response's access-log line says how its output read even
+where the output's line was bounded away; a streamed response's access-log line goes out before
+the reading and carries them only where the stream's end line is written (`access_log_fields` with
+`response_bytes`). A clean output leaves one counter increment and nothing else. Nothing
+of any of this reaches the client: the response is the same bytes whatever was recorded.
 
 ## The seam with a caller
 

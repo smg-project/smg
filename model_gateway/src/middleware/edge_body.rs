@@ -35,6 +35,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex, PoisonError},
     task::{ready, Context, Poll},
+    time::Instant,
 };
 
 use axum::{
@@ -45,7 +46,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 
 use super::{
     logging::SpanDuty,
-    metrics::{BodyProgress, ResponseOutcome},
+    metrics::{BodyFailure, BodyProgress, ResponseOutcome},
     sse_keepalive::KeepAlive,
 };
 use crate::observability::{
@@ -72,9 +73,16 @@ pub(crate) struct BodyDuties {
     pub(crate) permit: Option<Box<dyn Permit>>,
     /// The SSE keep-alive: a frame after an interval of silence.
     pub(crate) keep_alive: Option<KeepAlive>,
+    /// When the response head left the handler: the access-log layer's
+    /// stamp, which the metrics layer's duration reads instead of the clock.
+    pub(crate) head_at: Option<Instant>,
     /// The request span, open until the body ends, with the client-close
     /// line the access log owes if the body is dropped first.
     pub(crate) span: Option<SpanDuty>,
+    /// The producer's word on a streamed body that tells the client of a
+    /// failure and then ends as planned: read at the body's end, so the
+    /// response counts as what the client read (see [`BodyFailure`]).
+    pub(crate) failure: Option<BodyFailure>,
 }
 
 /// The response extension that carries [`BodyDuties`] out to the metrics
@@ -137,6 +145,8 @@ pub(crate) struct EdgeBody {
     span: Option<SpanDuty>,
     permit: Option<Box<dyn Permit>>,
     keep_alive: Option<KeepAlive>,
+    /// The producer's word on how the body ended, when it gives one.
+    failure: Option<BodyFailure>,
     /// Whether a frame was ever asked for. A body dropped before any poll is
     /// one the server never meant to send (the answer to a HEAD request), not
     /// one the client cut short.
@@ -166,6 +176,7 @@ impl EdgeBody {
             span: duties.span.take(),
             permit: duties.permit.take(),
             keep_alive: duties.keep_alive.take(),
+            failure: duties.failure.take(),
             polled: false,
             first_data_out: false,
             ended: false,
@@ -187,10 +198,15 @@ impl EdgeBody {
     }
 
     /// The body reached its end: the response is out and counts as its
-    /// head's status; everything held for the body goes.
+    /// head's status, or as a body that failed when its producer told the
+    /// client of a failure on the way; everything held for the body goes.
     fn finished(&mut self) {
         self.release();
-        self.outcome.completed();
+        if self.failure.as_ref().is_some_and(BodyFailure::told) {
+            self.outcome.body_failed();
+        } else {
+            self.outcome.completed();
+        }
         if let Some(span) = &mut self.span {
             span.ended(self.progress.sent());
         }
@@ -344,7 +360,7 @@ impl Drop for EdgeBody {
 pub(crate) fn at_the_edge(mut response: Response) -> Response {
     let tracker = InFlightRequestTracker::new();
     let guard = tracker.track();
-    let mut outcome = ResponseOutcome::pending("/test".to_owned());
+    let mut outcome = ResponseOutcome::pending(super::metrics::PathLabel::Static("/test"));
     outcome.head(&response);
     let progress = BodyProgress::new(&response);
     let duties = BodyDuties::take(&mut response);

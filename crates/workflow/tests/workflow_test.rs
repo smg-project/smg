@@ -674,38 +674,50 @@ fn test_dag_validation_valid_workflow() {
 // Scheduled/Delayed Steps Tests (#24)
 // ============================================================================
 
+/// The delay (or lead time) the timed tests give their one step. Each test
+/// judges it on the step's recorded start against a clock taken before the
+/// run, not on the run's length, which the completion waiter's polls (the
+/// first of them 100 ms in) set with or without the delay.
+const STEP_DELAY: Duration = Duration::from_millis(100);
+
+/// Register `workflow`, start it and wait for its completion, or the
+/// registration's, the start's or the wait's error as text.
+async fn completed(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    workflow: WorkflowDefinition<TestWorkflowData>,
+) -> Result<(), String> {
+    let instance_id = started(engine, workflow).await?;
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_step_delay() {
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
-    // Create a workflow with a 100ms delay
+    // A workflow with one step delayed by STEP_DELAY, recording when it ran.
     let workflow = WorkflowDefinition::new("delay_workflow", "Delay Test").add_step(
-        StepDefinition::new("delayed_step", "Delayed Step", Arc::new(AlwaysSucceedStep))
-            .with_delay(Duration::from_millis(100)),
+        StepDefinition::new(
+            "delayed_step",
+            "Delayed Step",
+            timing_step("delayed_step", 0, &start_times, &end_times),
+        )
+        .with_delay(STEP_DELAY),
     );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
+    let clock = std::time::Instant::now();
+    completed(&engine, workflow).await.unwrap();
 
-    let start = std::time::Instant::now();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
-
-    // Wait for completion
-    engine
-        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
-        .await
-        .unwrap();
-
-    let duration = start.elapsed();
-
-    // Verify delay was applied (should take at least 100ms)
-    // Note: wait_for_completion cleans up state, so we verify via timing
+    // The delay was applied: the step started no sooner than STEP_DELAY after
+    // the clock, which was taken before the registration.
+    let waited = start_times.read()[0].1.duration_since(clock);
     assert!(
-        duration >= Duration::from_millis(100),
-        "Step delay not applied, duration: {duration:?}",
+        waited >= STEP_DELAY,
+        "Step delay not applied, the step started after {waited:?}",
     );
 }
 
@@ -714,41 +726,31 @@ async fn test_step_scheduled_at() {
     use chrono::Utc;
 
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
-    // Schedule step to run 100ms in the future
-    let scheduled_time = Utc::now() + chrono::Duration::milliseconds(100);
+    // Schedule the step STEP_DELAY ahead, with the clock taken before the
+    // schedule is computed.
+    let clock = std::time::Instant::now();
+    let scheduled_time = Utc::now() + chrono::Duration::from_std(STEP_DELAY).unwrap();
 
     let workflow = WorkflowDefinition::new("scheduled_workflow", "Scheduled Test").add_step(
         StepDefinition::new(
             "scheduled_step",
             "Scheduled Step",
-            Arc::new(AlwaysSucceedStep),
+            timing_step("scheduled_step", 0, &start_times, &end_times),
         )
         .scheduled_at(scheduled_time),
     );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
+    completed(&engine, workflow).await.unwrap();
 
-    let start = std::time::Instant::now();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
-
-    // Wait for completion
-    engine
-        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
-        .await
-        .unwrap();
-
-    let duration = start.elapsed();
-
-    // Verify scheduled time was respected (should take at least 100ms)
-    // Note: wait_for_completion cleans up state, so we verify via timing
+    // The schedule was respected: the step started no sooner than STEP_DELAY
+    // after the clock.
+    let waited = start_times.read()[0].1.duration_since(clock);
     assert!(
-        duration >= Duration::from_millis(100),
-        "Scheduled time not respected, duration: {duration:?}",
+        waited >= STEP_DELAY,
+        "Scheduled time not respected, the step started after {waited:?}",
     );
 }
 

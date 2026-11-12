@@ -130,6 +130,12 @@ class ModelConfigSection:
     proto's default."""
 
     hf_config: Any
+    #: The engine's own resolution of the language model's config
+    #: (``ModelConfig.hf_text_config``: the nested text config, below a Qwen
+    #: Omni wrapper's ``thinker_config`` when the checkpoint has one), which
+    #: its executor reads the rope parameters off; ``None`` when the config
+    #: object carries none.
+    hf_text_config: Any
     eos_token_ids: list[int]
     model_type: str
     architectures: list[str]
@@ -151,6 +157,7 @@ class ModelConfigSection:
             eos_token_ids = []
         return cls(
             hf_config=hf_config,
+            hf_text_config=getattr(model_config, "hf_text_config", None),
             eos_token_ids=eos_token_ids,
             model_type=attr_str(hf_config, "model_type"),
             architectures=attr_list(hf_config, "architectures"),

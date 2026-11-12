@@ -42,6 +42,25 @@ pub(crate) fn open_at_the_stop(out: &mut Events) {
     left_open(MalformedReason::OpenAtTheStop, out);
 }
 
+/// The events `take` records for `text`, read into `scratch` and moved into `out` owning
+/// their text: for a piece that is nobody's delta, the copy of the scanner's join that the
+/// held bytes are part of ([`crate::markers::Scanned::pieces_of_delta`]), which no event of
+/// the delta's lifetime can borrow; the engine takes a piece it held the same way. `scratch`
+/// keeps its room between pieces, so the piece costs no list of its own.
+pub(super) fn take_owned<'d>(
+    text: &str,
+    scratch: &mut Events<'static>,
+    out: &mut Events<'d>,
+    take: impl for<'t> FnOnce(&'t str, &mut Events<'t>),
+) {
+    let mut events: Events<'_> = std::mem::take(scratch);
+    take(text, &mut events);
+    for event in events.consume() {
+        out.push(event.into_owned());
+    }
+    *scratch = events.recycle();
+}
+
 /// The one event of a string value that one of a call's two own ends closed: the stream's stop
 /// (`why` = [`MalformedReason::OpenAtTheStop`], [`open_at_the_stop`]) or the call's closing
 /// marker (`why` = [`MalformedReason::OpenAtTheMarker`]: the model ended the call, its own
@@ -95,8 +114,13 @@ pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut E
 /// model's failed call, which the families' own parsers drop whole; a client shown it saw the
 /// format's tags inside the answer. For the attributed syntax inside an invoke the same (a word
 /// between tags, a tag out of its place or cut short, a tail the tag has no place for, an
-/// invoke that named no call). A call that started keeps the pairs it read. Nothing is pushed
-/// for no bytes; the engine renames `UnterminatedRegion` here as anywhere.
+/// invoke that named no call). A call that started keeps the pairs it read, and no assembler
+/// closes its object for it, since the call is no whole call (`attributed::Assembler::close`,
+/// and the keyed, Qwen and XML assemblers' alike; those three read a bare closing tag between
+/// members, one that names nothing open and so carries no member the client could lose, as
+/// costing the call nothing).
+/// Nothing is pushed for no bytes; the engine
+/// renames `UnterminatedRegion` here as anywhere.
 pub(crate) fn refuse(text: String, why: MalformedReason, out: &mut Events) {
     if text.is_empty() {
         return;

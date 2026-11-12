@@ -13,9 +13,9 @@ version=${CHART_VERSION:-0.14.2}
 against=""
 if [ "${1:-}" = "--against" ]; then against=$2; shift 2; fi
 sets=("$@")
-if [ ${#sets[@]} -eq 0 ]; then  # every overlay beside the base: the values files that are not the base, the CPU or the recording set
+if [ ${#sets[@]} -eq 0 ]; then  # every overlay beside the base: the values files that are not the base, the CPU, the review or the recording set
   for f in "$here"/runner-values-*.yaml; do
-    case "$f" in *-gpu-base.yaml|*-cpu.yaml|*-bellwether-record.yaml) continue ;; esac
+    case "$f" in *-gpu-base.yaml|*-cpu.yaml|*-review.yaml|*-bellwether-record.yaml) continue ;; esac
     f=${f##*/runner-values-}; sets+=("${f%.yaml}")
   done
 fi

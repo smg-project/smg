@@ -11,8 +11,29 @@
 # through this gate passed), and the summary lines moved 3.6 - 8.0 % across three builds on a quiet
 # machine. 15 % is the smallest multiple of 5 % at least twice the first and 1.5 x the second.
 
+#
+# Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
+# run's, with every function on a 64-byte boundary (RUSTFLAGS:
+# `-C llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml).
+# symphony.toml records why: identical code sits in one of two speed states chosen by where its
+# unchanged hot functions land modulo 64, and a pull request's code size alone moved them. Under the
+# flags this gate's null read (the same bytes twice, three interleaved runs a side on one core, 17
+# ids) read 0 failed, 0 suspect with a largest change of medians of -2.4 % and +2.4 % at the two
+# ends, so the thresholds stand. An inserted regression on the path the rows run (48 dependent
+# multiply-adds on every allocation of the bench binary's jemalloc, every row allocating) is caught:
+# 15 of 17 failed, bootstrap injection +59 to +87 %, round trips +21 to +39 %, json rows +20 to +38
+# %. Under the 15 % threshold: the generate request deserialize row (+9.4 %, 2.7 allocations on 675
+# ns) and the large chat completion serialize row (+0.2 %, 15 allocations on 12.8 us), the two rows
+# with the fewest allocations per nanosecond.
+
 repeats = 3
 filter = "^(json_serialization|json_deserialization|bootstrap_injection|full_round_trip)/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/request_processing.rs"]
 
 [[gate]]
 pattern = "^(json_serialization|json_deserialization|bootstrap_injection|full_round_trip)/"

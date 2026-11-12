@@ -1,6 +1,6 @@
 [package]
 name = "smg-symphony"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "One parser for everything a model says: content, reasoning and tool calls as typed events from one streaming entry point"
 license = "Apache-2.0"
@@ -21,6 +21,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 rand.workspace = true
+memchr.workspace = true
 
 [build-dependencies]
 serde = { workspace = true, features = ["derive"] }
@@ -32,6 +33,10 @@ regex = "1.12"
 
 [[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "grammar"
 harness = false
 
 [lints]

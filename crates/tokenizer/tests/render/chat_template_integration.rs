@@ -183,8 +183,11 @@ fn test_chatml_template() {
             ext: Default::default(),
             content: Some(MessageContent::Text("Hi there!".to_string())),
             name: None,
+            refusal: None,
+            audio: None,
+            function_call: None,
             tool_calls: None,
-            reasoning_content: None,
+            reasoning: Default::default(),
         },
         ChatMessage::User {
             ext: Default::default(),

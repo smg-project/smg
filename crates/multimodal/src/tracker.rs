@@ -1,5 +1,6 @@
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc};
 
+use futures::FutureExt;
 use tokio::task::JoinHandle;
 
 use super::{
@@ -36,9 +37,56 @@ pub struct TrackerOutput {
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct FetchKey {
     modality: Modality,
-    settings: String,
+    settings: FetchSettings,
     kind: u8,
     len: usize,
+}
+
+/// The settings a fetch runs under, the part of its key that is not the
+/// payload: two parts share a fetch exactly when these are equal. A `Copy`
+/// value compared field by field; the request's settings are one value, so
+/// every part of a request carries the same key without building it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FetchSettings {
+    Image {
+        config: ImageFetchConfig,
+        minimax_cap: Option<u32>,
+        sglang: bool,
+    },
+    Video {
+        min_frames: usize,
+        max_frames: usize,
+        /// The sampling rate's bits: two rates are the same setting exactly
+        /// when they are the same number (the rate is finite and positive by
+        /// the time it is a setting).
+        sample_fps_bits: u64,
+        max_long_side_pixel: Option<u32>,
+        sampling: FrameSampling,
+        sglang: bool,
+    },
+    Audio,
+}
+
+impl FetchSettings {
+    fn video(cfg: &VideoFetchConfig, sglang: bool) -> Self {
+        // Exhaustive: a field added to the video config must find its place
+        // in the key, or this stops compiling.
+        let VideoFetchConfig {
+            min_frames,
+            max_frames,
+            sample_fps,
+            max_long_side_pixel,
+            sampling,
+        } = *cfg;
+        Self::Video {
+            min_frames,
+            max_frames,
+            sample_fps_bits: sample_fps.to_bits(),
+            max_long_side_pixel,
+            sampling,
+            sglang,
+        }
+    }
 }
 
 /// How many distinct payloads of one `FetchKey` a new part is compared
@@ -127,7 +175,7 @@ pub enum FetchOutcome {
     /// decode, a host the policy refuses.
     ClientFault,
     /// Not the caller's fault: a fetch that timed out, a host that failed,
-    /// a decoder this process lacks.
+    /// a decoder this process lacks, a fetch task that panicked.
     HostFault,
 }
 
@@ -203,6 +251,9 @@ pub struct AsyncMultiModalTracker {
     /// [`TransparencyPolicy`]); `KeepAlpha` unless the request's processing
     /// stage set the destination engine's.
     image_transparency: TransparencyPolicy,
+    minimax_image_resize: bool,
+    minimax_sglang_resize: bool,
+    drain_on_error: bool,
 }
 
 impl AsyncMultiModalTracker {
@@ -216,13 +267,36 @@ impl AsyncMultiModalTracker {
             default_video_sample_fps: None,
             video_frame_sampling: FrameSampling::default(),
             image_transparency: TransparencyPolicy::KeepAlpha,
+            minimax_image_resize: false,
+            minimax_sglang_resize: false,
+            drain_on_error: false,
         }
+    }
+
+    /// Keep worker admission until sibling fetches finish, including blocking decode.
+    /// Disabled by default to preserve the router's fail-fast error response.
+    pub fn with_drain_on_error(mut self, enabled: bool) -> Self {
+        self.drain_on_error = enabled;
+        self
     }
 
     /// Decode the request's image frames under `policy` (the destination
     /// engine's own transparency rule); it becomes part of each frame's hash.
     pub fn with_image_transparency(mut self, policy: TransparencyPolicy) -> Self {
         self.image_transparency = policy;
+        self
+    }
+
+    /// Plan M3 image geometry from source headers and resize once at lazy decode.
+    /// Video fetching and other model families retain their existing policy.
+    pub fn with_minimax_image_resize(mut self, enabled: bool) -> Self {
+        self.minimax_image_resize = enabled;
+        self
+    }
+
+    /// Select SGLang's MiniMax image geometry and Pillow resize kernel.
+    pub fn with_minimax_sglang_resize(mut self, enabled: bool) -> Self {
+        self.minimax_sglang_resize = enabled;
         self
     }
 
@@ -310,24 +384,40 @@ impl AsyncMultiModalTracker {
         Ok(())
     }
 
+    /// Collect fetched media, optionally draining siblings before returning an error.
     pub async fn finalize(mut self) -> MultiModalResult<TrackerOutput> {
         let mut data = MultiModalData::new();
+        let mut first_error = None;
         for (modality, slots) in self.pending.drain() {
             let mut items: Vec<TrackedMedia> = Vec::with_capacity(slots.len());
             for slot in slots {
                 let media = match slot {
-                    Slot::Fetch(task) => task.await??,
+                    Slot::Fetch(task) => task
+                        .await
+                        .map_err(MultiModalError::from)
+                        .and_then(|media| media),
                     Slot::SameAs(first) => items.get(first).cloned().ok_or_else(|| {
                         MultiModalError::Validation(format!(
                             "{modality} slot refers to a slot that was never fetched"
                         ))
-                    })?,
+                    }),
                 };
-                items.push(media);
+                match media {
+                    Ok(media) => items.push(media),
+                    Err(error) => {
+                        if !self.drain_on_error {
+                            return Err(error);
+                        }
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
             data.insert(modality, items);
         }
 
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Ok(TrackerOutput {
             data,
             uuids: self.uuids,
@@ -339,7 +429,7 @@ impl AsyncMultiModalTracker {
     fn same_media_as(
         &mut self,
         modality: Modality,
-        settings: String,
+        settings: FetchSettings,
         source: &Arc<FetchSource>,
     ) -> Option<usize> {
         let next = self.pending.entry(modality).or_default().len();
@@ -389,18 +479,39 @@ impl AsyncMultiModalTracker {
         uuid: Option<String>,
         max_long_side_pixel: Option<u32>,
     ) {
+        let sglang = self.minimax_sglang_resize;
+        let minimax_cap = (self.minimax_image_resize || sglang).then_some(
+            max_long_side_pixel.unwrap_or(crate::minimax_resize::IMAGE_DEFAULT_LONG_SIDE),
+        );
         let config = ImageFetchConfig {
             detail,
-            max_long_side_pixel,
+            max_long_side_pixel: if minimax_cap.is_some() {
+                None
+            } else {
+                max_long_side_pixel
+            },
             transparency: self.image_transparency,
         };
         self.enqueue(
             Modality::Image,
             uuid,
-            format!("{config:?}"),
+            FetchSettings::Image {
+                config,
+                minimax_cap,
+                sglang,
+            },
             source,
             move |connector, source| async move {
                 let frame = connector.fetch_image_from(&source, config).await?;
+                let frame = if let Some(cap) = minimax_cap {
+                    if sglang {
+                        crate::minimax_resize::image_for_runtime(frame, cap, true)?
+                    } else {
+                        crate::minimax_resize::image(frame, cap)?
+                    }
+                } else {
+                    frame
+                };
                 Ok(TrackedMedia::Image(frame))
             },
         );
@@ -413,19 +524,36 @@ impl AsyncMultiModalTracker {
         fps: Option<f64>,
         max_long_side_pixel: Option<u32>,
     ) -> MultiModalResult<()> {
-        let cfg = video_fetch_config(
+        let mut cfg = video_fetch_config(
             fps,
             max_long_side_pixel,
             self.default_video_sample_fps,
             self.video_frame_sampling,
         )?;
+        let sglang = self.minimax_sglang_resize;
+        let key = FetchSettings::video(&cfg, sglang);
+        if sglang {
+            // Native MiniMax applies Pillow once, after source-resolution decode.
+            cfg.max_long_side_pixel = None;
+        }
         self.enqueue(
             Modality::Video,
             uuid,
-            format!("{cfg:?}"),
+            key,
             source,
             move |connector, source| async move {
-                let clip = connector.fetch_video_from(&source, cfg).await?;
+                let mut clip = connector.fetch_video_from(&source, cfg).await?;
+                if sglang {
+                    let clip = Arc::make_mut(&mut clip);
+                    clip.max_long_side_pixel = max_long_side_pixel;
+                    // Decode hashed source bytes and sampling without a resize cap.
+                    // Domain-separate Pillow pixels and include the deferred cap.
+                    let mut hash = blake3::Hasher::new();
+                    hash.update(b"minimax-sglang-video-pillow-day0");
+                    hash.update(clip.hash.as_bytes());
+                    hash.update(&max_long_side_pixel.unwrap_or(0).to_le_bytes());
+                    clip.hash = hash.finalize().to_hex().to_string();
+                }
                 Ok(TrackedMedia::Video(clip))
             },
         );
@@ -436,7 +564,7 @@ impl AsyncMultiModalTracker {
         self.enqueue(
             Modality::Audio,
             uuid,
-            String::new(),
+            FetchSettings::Audio,
             source,
             |connector, source| async move {
                 let clip = connector.fetch_audio_from(&source).await?;
@@ -452,7 +580,7 @@ impl AsyncMultiModalTracker {
         &mut self,
         modality: Modality,
         uuid: Option<String>,
-        settings: String,
+        settings: FetchSettings,
         source: MediaSource,
         fetch: F,
     ) where
@@ -478,18 +606,29 @@ impl AsyncMultiModalTracker {
                         let fetching = fetch(connector, source);
                         tokio::spawn(async move {
                             let started = std::time::Instant::now();
-                            let result = fetching.await;
+                            // A fetch that panics is reported too (the host's fault:
+                            // nobody's request), then its panic goes on to the join in
+                            // `finalize`. The future is not touched again after it,
+                            // hence the assertion.
+                            let result = AssertUnwindSafe(fetching).catch_unwind().await;
+                            let (outcome, bytes) = match &result {
+                                Ok(fetched) => (
+                                    FetchOutcome::of(fetched),
+                                    fetched.as_ref().map_or(0, fetched_bytes),
+                                ),
+                                Err(_) => (FetchOutcome::HostFault, 0),
+                            };
                             observer(
                                 &label,
                                 &FetchReport {
                                     modality,
                                     source: kind,
-                                    outcome: FetchOutcome::of(&result),
+                                    outcome,
                                     duration: started.elapsed(),
-                                    bytes: result.as_ref().map_or(0, fetched_bytes),
+                                    bytes,
                                 },
                             );
-                            result
+                            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         })
                     }
                 };
@@ -722,6 +861,15 @@ mod repeat_tests {
         }
     }
 
+    /// The settings an image part carries under the default configuration.
+    fn image_settings() -> FetchSettings {
+        FetchSettings::Image {
+            config: ImageFetchConfig::default(),
+            minimax_cap: None,
+            sglang: false,
+        }
+    }
+
     fn tracker() -> AsyncMultiModalTracker {
         let connector = MediaConnector::new(
             crate::test_support::http_client_builder(),
@@ -729,6 +877,67 @@ mod repeat_tests {
         )
         .expect("default connector");
         AsyncMultiModalTracker::new(Arc::new(connector))
+    }
+
+    /// Workers drain failed siblings; default router processing still returns errors promptly.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test waits for both fetch tasks via finalize and a completion channel"
+    )]
+    async fn failed_fetch_obeys_drain_policy() {
+        use tokio::sync::oneshot;
+        for drain in [false, true] {
+            for panic in [false, true] {
+                let mut tracker = tracker().with_drain_on_error(drain);
+                let (release, wait) = oneshot::channel();
+                let (finished, done) = oneshot::channel();
+                tracker.pending.insert(
+                    Modality::Video,
+                    vec![
+                        Slot::Fetch(tokio::spawn(async move {
+                            assert!(!panic, "fetch panic");
+                            Err(MultiModalError::Validation("first fetch failed".into()))
+                        })),
+                        Slot::Fetch(tokio::spawn(async move {
+                            wait.await.unwrap();
+                            finished.send(()).unwrap();
+                            Err(MultiModalError::Validation("sibling finished".into()))
+                        })),
+                    ],
+                );
+                let finalize = tracker.finalize();
+                tokio::pin!(finalize);
+                let error = if drain {
+                    assert!(tokio::time::timeout(
+                        std::time::Duration::from_millis(20),
+                        &mut finalize
+                    )
+                    .await
+                    .is_err());
+                    release.send(()).unwrap();
+                    finalize.await.unwrap_err()
+                } else {
+                    let error =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), &mut finalize)
+                            .await
+                            .unwrap()
+                            .unwrap_err();
+                    release.send(()).unwrap();
+                    error
+                };
+                done.await.unwrap();
+                let error = error.to_string();
+                assert!(
+                    error.contains(if panic {
+                        "fetch panic"
+                    } else {
+                        "first fetch failed"
+                    }),
+                    "{error}"
+                );
+            }
+        }
     }
 
     /// The plan side classifies a URL part as the fetch will: the scheme as
@@ -794,6 +1003,82 @@ mod repeat_tests {
             .find(|(_, report)| report.outcome == FetchOutcome::ClientFault)
             .expect("the failed fetch");
         assert_eq!(failed.1.bytes, 0, "{:?}", failed.1);
+    }
+
+    /// Only native SGLang defers the cap to its Pillow processor; vLLM still
+    /// receives decoder-scaled frames. Explicit caps survive both paths. Runs
+    /// where ffmpeg and ffprobe are installed, skips elsewhere.
+    #[tokio::test]
+    async fn minimax_video_cap_is_deferred_only_for_sglang() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        if !crate::test_support::video_tools_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=8",
+                "-t",
+                "1",
+                "-filter_threads",
+                "1",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(path).unwrap();
+        let mut identities = std::collections::HashSet::new();
+        for sglang in [false, true] {
+            for cap in [None, Some(168), Some(224)] {
+                let mut tracker = tracker().with_minimax_sglang_resize(sglang);
+                tracker
+                    .push_part(MediaContentPart::VideoUrl {
+                        url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)),
+                        uuid: None,
+                        fps: Some(1.0),
+                        max_long_side_pixel: cap,
+                    })
+                    .unwrap();
+                let output = tracker.finalize().await.unwrap();
+                let TrackedMedia::Video(clip) = &output.data[&Modality::Video][0] else {
+                    panic!("video expected");
+                };
+                assert_eq!(clip.max_long_side_pixel(), cap);
+                assert!(
+                    identities.insert(clip.hash.clone()),
+                    "runtime and cap identify different pixels"
+                );
+                if !sglang {
+                    assert_eq!(
+                        clip.hash,
+                        crate::hasher::hash_video_with_sampling(
+                            &bytes,
+                            1.0,
+                            cap,
+                            FrameSampling::default()
+                        )
+                    );
+                }
+                let frame = &clip.rgb_video().unwrap().frames[0];
+                let expected = if sglang {
+                    (320, 240)
+                } else {
+                    cap.map_or((320, 240), |cap| (cap, cap * 3 / 4))
+                };
+                assert_eq!((frame.width, frame.height), expected);
+            }
+        }
     }
 
     fn image_part(max_long_side_pixel: Option<u32>) -> MediaContentPart {
@@ -891,34 +1176,74 @@ mod repeat_tests {
         let clip = Arc::new(FetchSource::Url("https://example.test/clip.mp4".into()));
         // Same length and kind, different bytes: never merged.
         let other = Arc::new(FetchSource::Url("https://example.test/clop.mp4".into()));
+        let one = FetchSettings::video(&VideoFetchConfig::default(), false);
+        let two = FetchSettings::video(
+            &VideoFetchConfig {
+                sample_fps: 1.0,
+                ..VideoFetchConfig::default()
+            },
+            false,
+        );
 
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), Some(0));
+        assert_eq!(tracker.same_media_as(Modality::Video, two, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Image, one, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &other), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &other), Some(0));
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), Some(0));
+    }
+
+    /// The settings key says what the formatted text said: equal settings are
+    /// one key, a difference in any field (the rate included) another.
+    #[test]
+    fn fetch_settings_differ_exactly_where_the_settings_do() {
+        let base = VideoFetchConfig::default();
         assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            None
+            FetchSettings::video(&base, false),
+            FetchSettings::video(&VideoFetchConfig::default(), false)
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            Some(0)
+        assert_ne!(
+            FetchSettings::video(&base, false),
+            FetchSettings::video(&base, true)
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "two".into(), &clip),
-            None
+        assert_ne!(
+            FetchSettings::video(&base, false),
+            FetchSettings::video(
+                &VideoFetchConfig {
+                    sample_fps: base.sample_fps + 0.5,
+                    ..base
+                },
+                false
+            )
         );
+        let image = ImageFetchConfig::default();
         assert_eq!(
-            tracker.same_media_as(Modality::Image, "one".into(), &clip),
-            None
+            FetchSettings::Image {
+                config: image,
+                minimax_cap: None,
+                sglang: false
+            },
+            FetchSettings::Image {
+                config: ImageFetchConfig::default(),
+                minimax_cap: None,
+                sglang: false
+            }
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &other),
-            None
-        );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &other),
-            Some(0)
-        );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            Some(0)
+        assert_ne!(
+            FetchSettings::Image {
+                config: image,
+                minimax_cap: None,
+                sglang: false
+            },
+            FetchSettings::Image {
+                config: ImageFetchConfig {
+                    detail: ImageDetail::High,
+                    ..image
+                },
+                minimax_cap: None,
+                sglang: false
+            }
         );
     }
 
@@ -946,7 +1271,7 @@ mod repeat_tests {
             .collect();
         for source in &sources {
             assert_eq!(
-                tracker.same_media_as(Modality::Image, String::new(), source),
+                tracker.same_media_as(Modality::Image, image_settings(), source),
                 None,
                 "every distinct payload fetches"
             );
@@ -961,7 +1286,7 @@ mod repeat_tests {
         // Every repeat, in either region of the bucket, finds its first slot.
         for (slot, source) in sources.iter().enumerate().rev() {
             assert_eq!(
-                tracker.same_media_as(Modality::Image, String::new(), source),
+                tracker.same_media_as(Modality::Image, image_settings(), source),
                 Some(slot)
             );
         }
@@ -986,7 +1311,7 @@ mod repeat_tests {
         // A lone payload of another length is neither compared nor hashed.
         let lone = Arc::new(FetchSource::DataUrl(format!("{TINY_PNG_URL}=")));
         assert_eq!(
-            tracker.same_media_as(Modality::Image, String::new(), &lone),
+            tracker.same_media_as(Modality::Image, image_settings(), &lone),
             None
         );
         let lone_bucket = tracker
@@ -1055,5 +1380,40 @@ mod repeat_tests {
             .filter(|slot| matches!(slot, Slot::Fetch(_)))
             .count();
         assert_eq!(slots, 2);
+    }
+
+    /// A fetch whose task panics is reported once, as the host's fault with
+    /// no bytes, and the request still fails with the task's join error.
+    #[tokio::test]
+    async fn a_fetch_that_panics_is_reported_as_the_host_fault() {
+        static REPORTS: std::sync::Mutex<Vec<FetchReport>> = std::sync::Mutex::new(Vec::new());
+        fn observe(_: &str, report: &FetchReport) {
+            REPORTS.lock().expect("reports").push(*report);
+        }
+        let mut tracker = tracker().with_fetch_observer(Arc::from("m"), observe);
+        tracker.enqueue(
+            Modality::Audio,
+            None,
+            FetchSettings::Audio,
+            MediaSource::Url("https://example.test/a.wav".to_string()),
+            |_, _| {
+                std::future::poll_fn(|_| -> std::task::Poll<MultiModalResult<TrackedMedia>> {
+                    panic!("a fetch that dies")
+                })
+            },
+        );
+        let error = tracker
+            .finalize()
+            .await
+            .expect_err("the dead fetch fails the request");
+        assert!(
+            matches!(&error, MultiModalError::Join(join) if join.is_panic()),
+            "{error:?}"
+        );
+        let reports = REPORTS.lock().expect("reports").clone();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].outcome, FetchOutcome::HostFault);
+        assert_eq!(reports[0].bytes, 0);
+        assert_eq!(reports[0].modality, Modality::Audio);
     }
 }

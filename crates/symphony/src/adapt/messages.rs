@@ -317,6 +317,17 @@ impl Stream {
         });
     }
 
+    /// The index of the open text block when `text` would go into it as exactly one `text_delta`
+    /// with its bytes unchanged and nothing else: the text block is open, no whitespace is held and
+    /// `text` is not empty. [`Self::feed`] of that content changes no state of the machine, so a
+    /// caller that writes the delta itself from the borrowed text (the gateway's Messages stream
+    /// writes the frame) skips `feed` for it and loses nothing. `None` in every other state: a
+    /// block to open or close, held whitespace to lead the text, or nothing to send; `feed` runs.
+    pub fn direct_text_index(&self, text: &str) -> Option<u32> {
+        (self.open == Some(Block::Text) && self.held.is_empty() && !text.is_empty())
+            .then_some(self.index)
+    }
+
     /// Makes `block` the open block: nothing when it already is, otherwise the open block is closed
     /// and `content_block` starts at the next index. Held whitespace is let go when the block is
     /// not a text block.
@@ -396,40 +407,9 @@ mod tests {
         event::{DropReason, MalformedReason, Text},
         formats::qwen3,
         ids::is_minted,
+        testing::events::{arguments, call, end, finish},
         CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
     };
-
-    fn call(index: u32, name: &str) -> Event<'static> {
-        Event::ToolCallStart {
-            index,
-            id: format!("call_{index}"),
-            name: name.into(),
-            source: Text::default(),
-        }
-    }
-
-    fn arguments(index: u32, json: &str) -> Event<'static> {
-        Event::ToolCallArguments {
-            index,
-            json: json.into(),
-            source: Text::default(),
-        }
-    }
-
-    fn end(index: u32) -> Event<'static> {
-        Event::ToolCallEnd {
-            index,
-            source: Text::default(),
-        }
-    }
-
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
-        Event::Finish {
-            reason,
-            tool_calls,
-            reasoning_tokens: 0,
-        }
-    }
 
     fn wire(blocks: &[ContentBlock]) -> Value {
         serde_json::to_value(blocks).expect("serializable")
@@ -1369,5 +1349,64 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), 4, "{seen:?}");
+    }
+
+    /// `direct_text_index` is `Some` exactly in the state where feeding the content pushes one
+    /// `text_delta` with the text unchanged and nothing else, in every state the machine takes:
+    /// nothing open, whitespace held with nothing open, a thinking block open, a `tool_use` block
+    /// open, a text block open; for a text, a whitespace-only text and the empty text.
+    #[test]
+    fn direct_text_index_agrees_with_feed_in_every_state() {
+        fn one_text_delta(out: &[MessageStreamEvent], text: &str) -> Option<u32> {
+            match out {
+                [MessageStreamEvent::ContentBlockDelta {
+                    index,
+                    delta: ContentBlockDelta::TextDelta { text: sent },
+                }] if sent == text => Some(*index),
+                _ => None,
+            }
+        }
+        let states: [(&str, Vec<Event<'static>>); 6] = [
+            ("nothing open", vec![]),
+            (
+                "whitespace held, nothing open",
+                vec![Event::Content(Text::uncounted("  \n"))],
+            ),
+            (
+                "thinking open",
+                vec![
+                    Event::ReasoningStart,
+                    Event::Reasoning(Text::uncounted("plan")),
+                ],
+            ),
+            (
+                "tool_use open",
+                vec![call(0, "get_weather"), arguments(0, "{\"city\":")],
+            ),
+            ("text open", vec![Event::Content(Text::uncounted("Hello"))]),
+            (
+                "text open after a thinking block",
+                vec![
+                    Event::ReasoningStart,
+                    Event::Reasoning(Text::uncounted("plan")),
+                    Event::ReasoningEnd,
+                    Event::Content(Text::uncounted("Hello")),
+                ],
+            ),
+        ];
+        for (state, prefix) in states {
+            let mut machine = Stream::new();
+            let mut out = Vec::new();
+            for event in &prefix {
+                machine.feed(event, &mut out);
+            }
+            for text in [" world", " ", "", "caf\u{e9}"] {
+                let direct = machine.direct_text_index(text);
+                let mut probe = machine.clone();
+                let mut out = Vec::new();
+                probe.feed(&Event::Content(Text::uncounted(text)), &mut out);
+                assert_eq!(direct, one_text_delta(&out, text), "{state}, text {text:?}");
+            }
+        }
     }
 }

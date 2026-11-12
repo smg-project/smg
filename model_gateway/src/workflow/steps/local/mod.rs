@@ -12,6 +12,8 @@ mod rediscover_labels;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod submit_tokenizer_job;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod update_policies_for_worker;
 mod update_remaining_policies;
 mod update_worker_properties;
@@ -243,6 +245,7 @@ pub fn create_worker_removal_workflow_data(
         affected_models: std::collections::HashSet::new(),
         app_context: Some(app_context),
         actual_workers_to_remove: None,
+        removed_workers: Vec::new(),
     }
 }
 
@@ -354,7 +357,7 @@ mod dp_removal_tests {
 
     #[test]
     fn base_url_matches_plain_and_expanded_registrations() {
-        for scheme in ["http", "https", "grpc", "grpcs", "ipc"] {
+        for scheme in ["http", "https", "grpc", "grpcs", "ipc", "tcp"] {
             let registry = WorkerRegistry::new();
             let base = format!("{scheme}://worker:3000");
             register(&registry, &base, None);

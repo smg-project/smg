@@ -5,7 +5,7 @@
 use serde_json::json;
 use tool_parser::{JsonParser, ToolParser};
 
-use crate::common::{create_test_tools, streaming_helpers};
+use crate::common::{create_test_tools, streaming_helpers, tool};
 
 #[tokio::test]
 async fn test_simple_json_tool_call() {
@@ -165,22 +165,11 @@ async fn test_json_format_detection() {
 // Streaming tests for JSON array format
 #[tokio::test]
 async fn test_json_array_streaming_required_mode() {
-    use openai_protocol::common::Tool;
-
     // Test that simulates the exact streaming pattern from required mode
     let mut parser = JsonParser::new();
 
     // Define test tools
-    let tools = vec![Tool {
-        tool_type: "function".to_string(),
-        function: openai_protocol::common::Function {
-            name: "get_weather".to_string(),
-            description: Some("Get weather".to_string()),
-            parameters: serde_json::json!({}),
-            strict: None,
-            extra: Default::default(),
-        },
-    }];
+    let tools = vec![tool("get_weather", "Get weather")];
 
     // Simulate the EXACT chunks from the debug log
     let chunks = vec![
@@ -240,32 +229,12 @@ async fn test_json_array_streaming_required_mode() {
 
 #[tokio::test]
 async fn test_json_array_multiple_tools_streaming() {
-    use openai_protocol::common::Tool;
-
     // Test with multiple tools in array
     let mut parser = JsonParser::new();
 
     let tools = vec![
-        Tool {
-            tool_type: "function".to_string(),
-            function: openai_protocol::common::Function {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                parameters: serde_json::json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: openai_protocol::common::Function {
-                name: "get_news".to_string(),
-                description: Some("Get news".to_string()),
-                parameters: serde_json::json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        },
+        tool("get_weather", "Get weather"),
+        tool("get_news", "Get news"),
     ];
 
     // Split into smaller, more realistic chunks
@@ -307,21 +276,10 @@ async fn test_json_array_multiple_tools_streaming() {
 
 #[tokio::test]
 async fn test_json_array_closing_bracket_separate_chunk() {
-    use openai_protocol::common::Tool;
-
     // Test case where the closing ] comes as a separate chunk
     let mut parser = JsonParser::new();
 
-    let tools = vec![Tool {
-        tool_type: "function".to_string(),
-        function: openai_protocol::common::Function {
-            name: "get_weather".to_string(),
-            description: Some("Get weather".to_string()),
-            parameters: json!({}),
-            strict: None,
-            extra: Default::default(),
-        },
-    }];
+    let tools = vec![tool("get_weather", "Get weather")];
 
     // Closing ] as separate chunk, followed by normal text
     let chunks = vec![
@@ -368,21 +326,10 @@ async fn test_json_array_closing_bracket_separate_chunk() {
 
 #[tokio::test]
 async fn test_json_single_object_with_trailing_text() {
-    use openai_protocol::common::Tool;
-
     // Test single object format (no array) with trailing text
     let mut parser = JsonParser::new();
 
-    let tools = vec![Tool {
-        tool_type: "function".to_string(),
-        function: openai_protocol::common::Function {
-            name: "get_weather".to_string(),
-            description: Some("Get weather".to_string()),
-            parameters: serde_json::json!({}),
-            strict: None,
-            extra: Default::default(),
-        },
-    }];
+    let tools = vec![tool("get_weather", "Get weather")];
 
     let chunks = vec![
         "{",
@@ -422,21 +369,10 @@ async fn test_json_single_object_with_trailing_text() {
 
 #[tokio::test]
 async fn test_json_single_object_with_bracket_in_text() {
-    use openai_protocol::common::Tool;
-
     // Test that ] in normal text is NOT stripped for single object format
     let mut parser = JsonParser::new();
 
-    let tools = vec![Tool {
-        tool_type: "function".to_string(),
-        function: openai_protocol::common::Function {
-            name: "get_weather".to_string(),
-            description: Some("Get weather".to_string()),
-            parameters: serde_json::json!({}),
-            strict: None,
-            extra: Default::default(),
-        },
-    }];
+    let tools = vec![tool("get_weather", "Get weather")];
 
     let chunks = vec![
         "{",
@@ -474,21 +410,10 @@ async fn test_json_single_object_with_bracket_in_text() {
 
 #[tokio::test]
 async fn test_json_array_bracket_in_text_after_tools() {
-    use openai_protocol::common::Tool;
-
     // Test that ] in normal text AFTER array tools is preserved
     let mut parser = JsonParser::new();
 
-    let tools = vec![Tool {
-        tool_type: "function".to_string(),
-        function: openai_protocol::common::Function {
-            name: "get_weather".to_string(),
-            description: Some("Get weather".to_string()),
-            parameters: serde_json::json!({}),
-            strict: None,
-            extra: Default::default(),
-        },
-    }];
+    let tools = vec![tool("get_weather", "Get weather")];
 
     let chunks = vec![
         "[",

@@ -2,7 +2,10 @@
 
 use crate::{
     config::types::{RouterConfig, RoutingMode},
-    routers::grpc::{common::stages::WorkerSelectionMode, context::ExecutionPlanKind},
+    routers::grpc::{
+        common::stages::WorkerSelectionMode,
+        context::{ExecutionPlanKind, PlanSettings},
+    },
     worker::{ConnectionMode, RoutingPool},
 };
 
@@ -48,6 +51,13 @@ impl Mode {
     /// must stay false there to avoid double injection.
     pub(crate) fn inject_pd_metadata(self) -> bool {
         matches!(self, Mode::PrefillDecode)
+    }
+    /// Both settings as the one value every request-building stage holds.
+    pub(crate) fn plan_settings(self) -> PlanSettings {
+        PlanSettings {
+            inject_pd_metadata: self.inject_pd_metadata(),
+            plan_kind: self.plan_kind(),
+        }
     }
     /// Metrics/introspection label.
     pub(crate) fn router_type(self) -> &'static str {
@@ -128,6 +138,14 @@ mod tests {
             assert_eq!(m.worker_selection(), ws, "worker_selection {m:?}");
             assert_eq!(m.plan_kind(), pk, "plan_kind {m:?}");
             assert_eq!(m.inject_pd_metadata(), inject, "inject_pd_metadata {m:?}");
+            assert_eq!(
+                m.plan_settings(),
+                PlanSettings {
+                    inject_pd_metadata: inject,
+                    plan_kind: pk,
+                },
+                "plan_settings {m:?}"
+            );
             assert_eq!(m.router_type(), rt, "router_type {m:?}");
             // The pools a request of the mode can reach: the wire dtype is
             // resolved over exactly these before any worker is selected.

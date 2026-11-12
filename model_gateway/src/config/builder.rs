@@ -7,8 +7,8 @@ use smg_mcp::McpConfig;
 use super::{
     AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
-    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PolicyEngineMode,
+    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
@@ -30,23 +30,6 @@ pub struct RouterConfigBuilder {
 impl RouterConfigBuilder {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Takes ownership
-    pub fn from_config(config: RouterConfig) -> Self {
-        Self {
-            config,
-            client_cert_path: None,
-            client_key_path: None,
-            ca_cert_paths: Vec::new(),
-            server_cert_path: None,
-            server_key_path: None,
-            mcp_config_path: None,
-        }
-    }
-
-    pub fn from_config_ref(config: &RouterConfig) -> Self {
-        Self::from_config(config.clone())
     }
 
     // ==================== Routing Mode ====================
@@ -223,6 +206,13 @@ impl RouterConfigBuilder {
     /// no bound.
     pub fn max_connections(mut self, max_connections: usize) -> Self {
         self.config.max_connections = max_connections;
+        self
+    }
+
+    /// Most client connections the admin listener holds open at once; `0`
+    /// is no bound.
+    pub fn admin_max_connections(mut self, admin_max_connections: usize) -> Self {
+        self.config.admin_max_connections = admin_max_connections;
         self
     }
 
@@ -746,6 +736,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn policy_engine(mut self, mode: PolicyEngineMode) -> Self {
+        self.config.policy_engine = mode;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;
@@ -1065,11 +1060,6 @@ impl RouterConfig {
     pub fn builder() -> RouterConfigBuilder {
         RouterConfigBuilder::new()
     }
-
-    /// Create a builder from this configuration
-    pub fn to_builder(&self) -> RouterConfigBuilder {
-        RouterConfigBuilder::from_config_ref(self)
-    }
 }
 
 #[cfg(test)]
@@ -1077,28 +1067,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-
-    /// Test that .to_builder() round-trip conversion works correctly
-    #[test]
-    fn test_builder_from_existing_config() {
-        let original = RouterConfigBuilder::new()
-            .regular_mode(vec!["http://worker1:8000".to_string()])
-            .port(3000)
-            .build()
-            .unwrap();
-
-        let modified = original
-            .to_builder()
-            .port(4000)
-            .enable_metrics("0.0.0.0", 29000)
-            .enable_trace("localhost:4317")
-            .build()
-            .unwrap();
-
-        assert_eq!(modified.port, 4000);
-        assert!(modified.metrics.is_some());
-        assert!(modified.trace_config.is_some());
-    }
 
     /// Test complex routing mode helper method
     #[test]

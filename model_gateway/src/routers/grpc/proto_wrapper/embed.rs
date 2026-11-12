@@ -21,6 +21,20 @@ impl ProtoEmbedRequest {
         }
     }
 
+    /// The input's token ids (empty for a text input).
+    pub fn token_ids(&self) -> &[u32] {
+        match self {
+            Self::Sglang(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(&[], |input| input.input_ids.as_slice()),
+            Self::Vllm(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(&[], |input| input.input_ids.as_slice()),
+        }
+    }
+
     /// Get SGLang variant
     #[expect(
         clippy::panic,

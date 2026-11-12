@@ -225,8 +225,7 @@ mod tests {
     use crate::{
         config::RouterConfig,
         policies::PolicyRegistry,
-        test_support::RefusedAddress,
-        worker::WorkerRegistry,
+        worker::{test_support::RefusedAddress, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 
@@ -237,7 +236,7 @@ mod tests {
         };
         Arc::new(
             AppContext::builder()
-                .client(crate::clients::http_client())
+                .client(crate::server::http_client())
                 .rate_limiter(None)
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)

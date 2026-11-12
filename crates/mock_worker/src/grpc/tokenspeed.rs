@@ -1,0 +1,389 @@
+//! The TokenSpeed scheduler service of the mock gRPC worker: this proto's
+//! `Generate` read into the core's input and the core's frames shaped into
+//! its chunks and completions, with the worker's `weight_version` stamped on
+//! each as the engine stamps them; its info, loads and KV-event subscription.
+//! `--capture` records this wire's requests (the capture file's keys are its
+//! field names).
+//! An encode worker also serves the engine's encoder service beside it
+//! ([`TokenSpeedEncoder`]): its `Encode` takes a request's media with one
+//! rendezvous room per item, and its `Generate` is refused as the wrong pool.
+//! A prefill worker checks the rooms a request's `encode_bootstrap_info`
+//! hands it against the request's media items.
+//! The admin fan-out's flush and profile RPCs are answered by the core, the
+//! same on every wire.
+
+use std::pin::Pin;
+
+use enc::token_speed_encoder_server::{TokenSpeedEncoder, TokenSpeedEncoderServer};
+use futures::{Stream, StreamExt};
+use smg_grpc_client::{
+    common_proto as common, tokenspeed_encoder_proto as enc,
+    tokenspeed_scheduler::tokenspeed_proto as ts,
+};
+use tonic::{Request, Response, Status};
+use ts::{
+    generate_response::Response as GenResp,
+    token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
+};
+
+use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
+use crate::{config::Role, drain::InFlight, engine::KvEventStream, script::MatchedStop};
+
+pub(super) type Server = TokenSpeedSchedulerServer<MockScheduler>;
+/// The encoder service an encode worker mounts beside [`Server`].
+pub(super) type EncoderServer = TokenSpeedEncoderServer<MockScheduler>;
+type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl TokenSpeedScheduler for MockScheduler {
+    type GenerateStream = GenStream;
+    type SubscribeKvEventsStream = KvEventStream;
+    type GetTokenizerStream = TokenizerStream;
+
+    async fn generate(
+        &self,
+        request: Request<ts::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        // An encode worker on this wire takes its requests on the encoder
+        // service: a `Generate` here went to the wrong pool.
+        if self.cfg.role == Some(Role::Encode) {
+            return Err(Status::failed_precondition(
+                "mock-worker: an encode worker on this wire takes Encode, not Generate",
+            ));
+        }
+        let req = request.into_inner();
+        // Record before anything else: the line is in the file before the
+        // stream is returned, so before the gateway can read any frame.
+        if let Some(capture) = &self.capture {
+            if let Err(e) = capture.record(&req) {
+                tracing::error!("capturing request {} failed: {e}", req.request_id);
+                return Err(Status::internal(format!("mock-worker capture failed: {e}")));
+            }
+        }
+        check_encode_bootstrap(&req)?;
+        let tokenized = req.tokenized.unwrap_or_default();
+        let params = req.sampling_params.unwrap_or_default();
+        let rendezvous = req
+            .kv_bootstrap_info
+            .as_ref()
+            .map_or(Rendezvous::None, |info| Rendezvous::Named {
+                host: info.bootstrap_host.clone(),
+                port: info.bootstrap_port,
+                room: info.bootstrap_room,
+            });
+        let frames = self
+            .generate_frames(GenerateInput {
+                request_id: req.request_id.clone(),
+                prompt_ids: tokenized.input_ids,
+                rendered: tokenized.original_text,
+                choices: usize::try_from(params.n).unwrap_or(usize::MAX),
+                max_new: params.max_new_tokens,
+                stream: req.stream,
+                logprobs: req
+                    .return_logprob
+                    .then(|| usize::try_from(req.top_logprobs_num).unwrap_or(0)),
+                // This proto carries no scores row for requested token ids.
+                score_ids: Vec::new(),
+                pin: req.data_parallel_rank,
+                rendezvous,
+            })
+            .await?;
+        let request_id = req.request_id;
+        let weight_version = self.cfg.weight_version.clone();
+        Ok(Response::new(Box::pin(frames.map(move |item| {
+            item.map(|frame| response(&request_id, weight_version.clone(), frame))
+        }))))
+    }
+
+    async fn health_check(
+        &self,
+        _request: Request<ts::HealthCheckRequest>,
+    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
+        let (healthy, message) = self.health();
+        Ok(Response::new(ts::HealthCheckResponse {
+            healthy,
+            message: message.to_string(),
+        }))
+    }
+
+    async fn abort(
+        &self,
+        request: Request<ts::AbortRequest>,
+    ) -> Result<Response<ts::AbortResponse>, Status> {
+        self.abort_everywhere(&request.into_inner().request_id);
+        Ok(Response::new(ts::AbortResponse {
+            success: true,
+            message: String::new(),
+        }))
+    }
+
+    async fn get_model_info(
+        &self,
+        _request: Request<ts::GetModelInfoRequest>,
+    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
+        self.overrides.model_info().refusal("model info")?;
+        Ok(Response::new(ts::GetModelInfoResponse {
+            model_path: self.cfg.model_id.clone(),
+            tokenizer_path: self.cfg.tokenizer_path.clone(),
+            served_model_name: self.cfg.model_id.clone(),
+            model_type: "mock".to_string(),
+            architectures: vec!["MockForCausalLM".to_string()],
+            max_context_length: self.cfg.context_length.min(i32::MAX as u32) as i32,
+            max_req_input_len: self.cfg.context_length.min(i32::MAX as u32) as i32,
+            vocab_size: 32000,
+            eos_token_ids: vec![2],
+            pad_token_id: 0,
+            bos_token_id: 1,
+            weight_version: "mock".to_string(),
+            default_sampling_params_json: self.cfg.default_sampling_params_json.clone(),
+            supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
+            ..Default::default()
+        }))
+    }
+
+    async fn get_server_info(
+        &self,
+        _request: Request<ts::GetServerInfoRequest>,
+    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        self.overrides.server_info().refusal("server info")?;
+        Ok(Response::new(ts::GetServerInfoResponse {
+            server_args: self.server_args(),
+            scheduler_info: None,
+            active_requests: 0,
+            is_paused: false,
+            uptime_seconds: 0.0,
+            max_total_num_tokens: 1_000_000,
+            tokenspeed_version: "mock".to_string(),
+            start_time: None,
+            constrained_decoding: String::new(),
+        }))
+    }
+
+    async fn get_loads(
+        &self,
+        request: Request<ts::GetLoadsRequest>,
+    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
+        let loads: Vec<ts::SchedulerLoad> = self
+            .load_rows(request.into_inner().dp_rank)
+            .into_iter()
+            .map(|(dp_rank, s)| ts::SchedulerLoad {
+                active_token_usage: None,
+                dp_rank,
+                num_running_reqs: s.num_running_reqs,
+                num_waiting_reqs: s.num_waiting_reqs,
+                num_waiting_uncached_tokens: s.num_waiting_uncached_tokens,
+                num_total_reqs: s.num_running_reqs + s.num_waiting_reqs,
+                num_used_tokens: s.num_used_tokens,
+                max_total_num_tokens: s.max_total_num_tokens,
+                max_running_requests: s.max_running_requests,
+                token_usage: s.token_usage,
+                gen_throughput: s.gen_throughput,
+                prefill_throughput: s.prefill_throughput,
+                cache_hit_rate: s.cache_hit_rate,
+                utilization: s.token_usage,
+                memory: None,
+                queues: None,
+                num_resident_tokens: None,
+            })
+            .collect();
+        Ok(Response::new(ts::GetLoadsResponse {
+            timestamp: String::new(),
+            version: "mock".to_string(),
+            dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
+            loads,
+            aggregate: None,
+        }))
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        request: Request<common::SubscribeKvEventsRequest>,
+    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        Ok(Response::new(self.kv_events(request.into_inner())?))
+    }
+
+    async fn flush_cache(
+        &self,
+        _request: Request<common::FlushCacheRequest>,
+    ) -> Result<Response<common::FlushCacheResponse>, Status> {
+        Ok(Response::new(self.flush_cache_response()))
+    }
+
+    async fn start_profile(
+        &self,
+        request: Request<common::StartProfileRequest>,
+    ) -> Result<Response<common::ProfileResponse>, Status> {
+        Ok(Response::new(
+            self.start_profile_response(request.into_inner()),
+        ))
+    }
+
+    async fn stop_profile(
+        &self,
+        _request: Request<common::StopProfileRequest>,
+    ) -> Result<Response<common::ProfileResponse>, Status> {
+        Ok(Response::new(self.stop_profile_response()))
+    }
+
+    async fn get_tokenizer(
+        &self,
+        _request: Request<common::GetTokenizerRequest>,
+    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
+        // The mock has no tokenizer artifacts to serve; the gateway's
+        // remote-tokenizer fallback treats Unimplemented as "not supported".
+        Err(Status::unimplemented("mock-worker"))
+    }
+}
+
+/// The rendezvous a prefill side receives for an encode-prefill-decode
+/// request: one entry per media item, each naming the item, the encode
+/// worker's bootstrap server and the room the embedding travels under. The
+/// engine's prefill waits on that room and fails without it, so a request
+/// whose entries do not cover each of its items once is refused; a request
+/// without entries has no encoder (a prefill alone processes its own media).
+fn check_encode_bootstrap(req: &ts::GenerateRequest) -> Result<(), Status> {
+    let Some(info) = &req.encode_bootstrap_info else {
+        return Ok(());
+    };
+    let items = req.mm_inputs.as_ref().map_or(0, |mm| mm.items.len());
+    let mut covered = vec![false; items];
+    for entry in &info.items {
+        let slot = usize::try_from(entry.item_index)
+            .ok()
+            .and_then(|index| covered.get_mut(index))
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "mock-worker: encode bootstrap info names item {} of {items}",
+                    entry.item_index
+                ))
+            })?;
+        if std::mem::replace(slot, true) {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: encode bootstrap info names item {} twice",
+                entry.item_index
+            )));
+        }
+        if entry.bootstrap_room == 0 || entry.bootstrap_host.is_empty() || entry.bootstrap_port <= 0
+        {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: encode bootstrap info of item {} names no rendezvous \
+                 (host {:?}, port {}, room {})",
+                entry.item_index, entry.bootstrap_host, entry.bootstrap_port, entry.bootstrap_room
+            )));
+        }
+    }
+    if let Some(missing) = covered.iter().position(|seen| !seen) {
+        return Err(Status::invalid_argument(format!(
+            "mock-worker: encode bootstrap info covers {} of {items} media items \
+             (item {missing} has no room)",
+            info.items.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The engine's encoder service, served by an encode worker beside the
+/// scheduler: the gateway hands it a request's media with one rendezvous
+/// room per item and reads its acceptance. The embedding would travel to the
+/// prefill side out of band; the mock moves nothing and counts the request
+/// in the admin API's `encodes`.
+#[tonic::async_trait]
+impl TokenSpeedEncoder for MockScheduler {
+    async fn encode(
+        &self,
+        request: Request<enc::EncodeRequest>,
+    ) -> Result<Response<enc::EncodeResponse>, Status> {
+        let req = request.into_inner();
+        // The request's own checks come first, as the prefill role checks its
+        // input before the hooks: a malformed request spends no armed fault.
+        let items = req.mm_inputs.as_ref().map_or(0, |mm| mm.items.len());
+        if items == 0 || req.items.len() != items {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: an encode request carries one room per media item, got {} \
+                 room(s) for {items} item(s)",
+                req.items.len()
+            )));
+        }
+        if req.items.iter().any(|item| item.bootstrap_room == 0) {
+            return Err(Status::invalid_argument(
+                "mock-worker: an encode request's room is never 0",
+            ));
+        }
+        // The realistic engine's fault and admission hooks apply as to the
+        // prefill role, and the request counts in flight until its answer; an
+        // armed `finish=error` is the engine refusing the request.
+        let _in_flight = InFlight::enter_on(&self.in_flight);
+        let finish_error = self.admit_without_tokens(&req.request_id, None).await?;
+        self.ops.record_encode();
+        let rooms: Vec<i64> = req.items.iter().map(|item| item.bootstrap_room).collect();
+        tracing::info!(
+            "mock-worker {}: encode request {} of {items} item(s) in rooms {rooms:?} {}",
+            self.name,
+            req.request_id,
+            if finish_error {
+                "refused by the armed fault"
+            } else {
+                "accepted"
+            }
+        );
+        Ok(Response::new(enc::EncodeResponse {
+            accepted: !finish_error,
+        }))
+    }
+}
+
+/// A frame in this wire's shape, under the request's id, the worker's
+/// `weight_version` on it (`None` leaves the field unset, like an engine
+/// that predates it).
+fn response(
+    request_id: &str,
+    weight_version: Option<String>,
+    frame: Frame,
+) -> ts::GenerateResponse {
+    let response = match frame {
+        Frame::Chunk(chunk) => GenResp::Chunk(ts::GenerateStreamChunk {
+            token_ids: chunk.token_ids,
+            prompt_tokens: chunk.prompt_tokens,
+            completion_tokens: chunk.completion_tokens,
+            cached_tokens: chunk.cached_tokens,
+            output_logprobs: chunk.logprobs.map(logprobs),
+            index: chunk.index,
+            weight_version,
+        }),
+        Frame::Complete(complete) => GenResp::Complete(ts::GenerateComplete {
+            output_ids: complete.output_ids,
+            finish_reason: complete.finish_reason,
+            prompt_tokens: complete.prompt_tokens,
+            completion_tokens: complete.completion_tokens,
+            cached_tokens: complete.cached_tokens,
+            output_logprobs: complete.logprobs.map(logprobs),
+            matched_stop: complete.matched_stop.map(|stop| match stop {
+                MatchedStop::Token(id) => ts::generate_complete::MatchedStop::MatchedTokenId(id),
+                MatchedStop::Text(text) => ts::generate_complete::MatchedStop::MatchedStopStr(text),
+            }),
+            index: complete.index,
+            weight_version,
+            ..Default::default()
+        }),
+    };
+    ts::GenerateResponse {
+        request_id: request_id.to_string(),
+        response: Some(response),
+    }
+}
+
+/// The frame's logprobs in this wire's shape, one top entry per position.
+fn logprobs(logprobs: LogProbs) -> ts::OutputLogProbs {
+    ts::OutputLogProbs {
+        token_logprobs: logprobs.token_logprobs,
+        token_ids: logprobs.token_ids,
+        top_logprobs: logprobs
+            .top
+            .into_iter()
+            .map(|position| ts::TopLogProbs {
+                values: position.values,
+                token_ids: position.ids,
+            })
+            .collect(),
+    }
+}

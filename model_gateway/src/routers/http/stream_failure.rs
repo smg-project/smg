@@ -181,7 +181,7 @@ impl RelaySource {
         let error_type = error_type_from_status(cut.status);
         let reason = error_reason_from_status(cut.status);
         warn!(
-            worker = self.worker.url(),
+            worker = self.worker.redacted_url(),
             worker_type = self.worker_type,
             route = self.route,
             bytes_relayed,
@@ -262,14 +262,30 @@ pub(crate) fn on_frame_boundary(tail: &[u8]) -> bool {
     tail.is_empty() || tail.ends_with(b"\n\n") || tail.ends_with(b"\r\n\r\n")
 }
 
-/// Keep the last four bytes of what was sent: enough to recognise a blank
-/// line whatever chunking the bytes arrived in.
-pub(crate) fn note_sent(tail: &mut Vec<u8>, bytes: &[u8]) {
-    tail.extend_from_slice(&bytes[bytes.len().saturating_sub(4)..]);
-    if tail.len() > 4 {
-        let excess = tail.len() - 4;
-        tail.drain(..excess);
+/// The last four bytes of what was sent: enough to recognise a blank line
+/// whatever chunking the bytes arrived in, kept in place (a `Vec` for them
+/// was one allocation per streamed response).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SentTail {
+    bytes: [u8; 4],
+    len: usize,
+}
+
+impl SentTail {
+    /// The bytes, oldest first, for [`on_frame_boundary`].
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
+}
+
+/// Keep the last four bytes of what was sent.
+pub(crate) fn note_sent(tail: &mut SentTail, bytes: &[u8]) {
+    let fresh = &bytes[bytes.len().saturating_sub(4)..];
+    let keep = (4 - fresh.len()).min(tail.len);
+    let kept_from = tail.len - keep;
+    tail.bytes.copy_within(kept_from..tail.len, 0);
+    tail.bytes[keep..keep + fresh.len()].copy_from_slice(fresh);
+    tail.len = keep + fresh.len();
 }
 
 #[cfg(test)]
@@ -280,7 +296,9 @@ mod tests {
 
     use super::*;
     use crate::worker::{
-        circuit_breaker::CircuitBreakerConfig, test_support::no_health_check, BasicWorkerBuilder,
+        circuit_breaker::CircuitBreakerConfig,
+        test_support::{no_health_check, RefusedAddress},
+        BasicWorkerBuilder,
     };
 
     const CAUSE: &str = "error decoding response body: error reading a body from connection: \
@@ -328,9 +346,9 @@ mod tests {
     /// A call to a worker nobody listens at: the connect is refused, and the
     /// error carries the worker's URL as reqwest attaches it.
     async fn refused_call() -> (std::net::SocketAddr, reqwest::Error) {
-        let refused = crate::test_support::RefusedAddress::reserve();
+        let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let error = crate::clients::http_client_builder()
+        let error = crate::server::http_client_builder()
             .build()
             .unwrap()
             .get(format!("http://{addr}/v1/chat/completions"))
@@ -543,21 +561,36 @@ mod tests {
     /// The boundary is read from the last bytes sent, across chunks.
     #[test]
     fn the_frame_boundary_is_read_from_the_last_bytes_sent() {
-        let mut tail = Vec::new();
-        assert!(on_frame_boundary(&tail), "nothing sent yet");
+        let mut tail = SentTail::default();
+        assert!(on_frame_boundary(tail.as_slice()), "nothing sent yet");
         note_sent(&mut tail, b"data: {\"choices\":[]}\n\n");
-        assert!(on_frame_boundary(&tail));
+        assert!(on_frame_boundary(tail.as_slice()));
         note_sent(&mut tail, b"data: {\"cho");
-        assert!(!on_frame_boundary(&tail), "a frame cut mid-line");
+        assert!(!on_frame_boundary(tail.as_slice()), "a frame cut mid-line");
         note_sent(&mut tail, b"ices\":[]}\n");
-        assert!(!on_frame_boundary(&tail), "one newline is not a blank line");
+        assert!(
+            !on_frame_boundary(tail.as_slice()),
+            "one newline is not a blank line"
+        );
         note_sent(&mut tail, b"\n");
         assert!(
-            on_frame_boundary(&tail),
+            on_frame_boundary(tail.as_slice()),
             "the blank line split across two chunks"
         );
         note_sent(&mut tail, b"event: x\r\ndata: 1\r\n\r\n");
-        assert!(on_frame_boundary(&tail));
-        assert!(tail.len() <= 4);
+        assert!(on_frame_boundary(tail.as_slice()));
+        assert_eq!(
+            tail.as_slice(),
+            b"\r\n\r\n",
+            "the last four bytes, oldest first"
+        );
+        note_sent(&mut tail, b"ab");
+        assert_eq!(
+            tail.as_slice(),
+            b"\r\nab",
+            "two new bytes keep two old ones"
+        );
+        note_sent(&mut tail, b"");
+        assert_eq!(tail.as_slice(), b"\r\nab", "an empty chunk changes nothing");
     }
 }

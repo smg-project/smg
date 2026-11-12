@@ -4,28 +4,7 @@ use openai_protocol::common::{Function, Tool};
 use serde_json::json;
 use tool_parser::{MinimaxM2Parser, ToolParser};
 
-use crate::common::create_test_tools;
-
-/// Tools matching issue #1743: `update_task(taskId: string, subject: string)`.
-fn update_task_tools() -> Vec<Tool> {
-    vec![Tool {
-        tool_type: "function".to_string(),
-        function: Function {
-            name: "update_task".to_string(),
-            description: None,
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "taskId":  {"type": "string"},
-                    "subject": {"type": "string"}
-                },
-                "required": ["taskId", "subject"]
-            }),
-            strict: None,
-            extra: Default::default(),
-        },
-    }]
-}
+use crate::common::{create_test_tools, update_task_tools};
 
 const UPDATE_TASK_CALL: &str = r#"<minimax:tool_call>
 <invoke name="update_task">
@@ -65,10 +44,10 @@ async fn test_minimax_integer_arg_coerced_with_schema() {
         function: Function {
             name: "update_task".to_string(),
             description: None,
-            parameters: json!({
+            parameters: Some(json!({
                 "type": "object",
                 "properties": { "taskId": {"type": "integer"} }
-            }),
+            })),
             strict: None,
             extra: Default::default(),
         },
@@ -586,10 +565,10 @@ async fn test_minimax_streaming_closes_outer_object_after_nested_value() {
         function: Function {
             name: "process".to_string(),
             description: None,
-            parameters: json!({
+            parameters: Some(json!({
                 "type": "object",
                 "properties": {"data": {"type": "object"}}
-            }),
+            })),
             strict: None,
             extra: Default::default(),
         },

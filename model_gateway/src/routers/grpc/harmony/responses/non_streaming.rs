@@ -14,15 +14,15 @@ use openai_protocol::{
     },
 };
 use serde_json::{json, to_string};
-use smg_mcp::{McpServerBinding, McpToolSession};
+use smg_mcp::McpServerBinding;
 use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata,
+        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session,
         strip_image_generation_from_request_tools, McpCallTracking,
     },
-    execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools, ToolResult},
+    execution::{execute_mcp_tools, ToolResult},
 };
 use crate::{
     middleware::TenantRequestMeta,
@@ -33,8 +33,12 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, load_history,
-                persist_response_if_needed, utils::resolve_function_identity, NotStored,
-                ResponsesContext,
+                persist_response_if_needed, tool_call_limit,
+                utils::{
+                    function_call_status, generation_failure_error, resolve_function_identity,
+                    response_status,
+                },
+                NotStored, ReplayInto, ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
@@ -63,7 +67,13 @@ pub(crate) async fn serve_harmony_responses(
     // Load the history the request continues, as the caller's tenant may see
     // it; `request` itself stays as it came, for the persist.
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
-    let current_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
+    let current_request = load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Harmony,
+    )
+    .await?;
 
     // Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -127,26 +137,7 @@ async fn execute_with_mcp_loop(
     let mut original_tools = current_request.tools.clone();
     let user_function_names = collect_user_function_names(&current_request);
 
-    // Create session once — bundles orchestrator, request_ctx, server_keys, mcp_tools
-    let session_request_id = format!("resp_{}", uuid::Uuid::now_v7());
-
-    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
-
-    // Add filtered MCP tools (static + requested dynamic) to the request
-    let mcp_tools = session.mcp_tools();
-    if !mcp_tools.is_empty() {
-        let mcp_response_tools = convert_mcp_tools_to_response_tools(&session);
-
-        let mut all_tools = current_request.tools.take().unwrap_or_default();
-        all_tools.extend(mcp_response_tools);
-        current_request.tools = Some(all_tools);
-
-        debug!(
-            mcp_tool_count = mcp_tools.len(),
-            total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            "MCP client available - added static MCP tools to Harmony Responses request"
-        );
-    }
+    let session = open_mcp_session(ctx, mcp_servers, &mut current_request);
 
     // Once the MCP loop has taken ownership of image_generation
     // dispatch, drop the hosted-tool descriptor so the harmony builder
@@ -197,6 +188,7 @@ async fn execute_with_mcp_loop(
                 partial_text,
                 usage,
                 request_id,
+                finish_reason,
             } => {
                 debug!(
                     tool_call_count = tool_calls.len(),
@@ -219,10 +211,7 @@ async fn execute_with_mcp_loop(
                 );
 
                 // Check combined limit (user's max_tool_calls vs safety limit)
-                let effective_limit = match max_tool_calls {
-                    Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
-                    None => DEFAULT_MAX_ITERATIONS,
-                };
+                let effective_limit = tool_call_limit(max_tool_calls);
 
                 // Check if we would exceed the limit with these new MCP tool calls
                 let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
@@ -250,6 +239,7 @@ async fn execute_with_mcp_loop(
                         vec![],         // No MCP tools executed
                         vec![],         // No MCP results
                         all_tool_calls, // All tools returned as function calls (not executed)
+                        finish_reason.as_deref(),
                         analysis,
                         partial_text,
                         usage,
@@ -262,8 +252,10 @@ async fn execute_with_mcp_loop(
                     // Per the design, exhausting `max_tool_calls` is a `failed`
                     // status with an `error` payload (truncation
                     // `incomplete_details` is reserved for `max_output_tokens` /
-                    // `content_filter`).
+                    // `content_filter`); a truncation the builder read from the
+                    // finish is cleared, as the streamed exit clears it.
                     response.status = ResponseStatus::Failed;
+                    response.incomplete_details = None;
                     response.error = Some(json!({
                         "code": "max_tool_calls_exceeded",
                         "message": format!(
@@ -321,6 +313,7 @@ async fn execute_with_mcp_loop(
                         mcp_tool_calls,
                         mcp_results,
                         function_tool_calls,
+                        finish_reason.as_deref(),
                         analysis,
                         partial_text,
                         usage,
@@ -408,6 +401,7 @@ async fn execute_without_mcp_loop(
             partial_text,
             usage,
             request_id,
+            finish_reason,
         } => {
             // Function tool calls found - return to caller for execution
             debug!(
@@ -419,6 +413,7 @@ async fn execute_without_mcp_loop(
                 vec![],
                 vec![],
                 tool_calls,
+                finish_reason.as_deref(),
                 analysis,
                 partial_text,
                 usage,
@@ -434,12 +429,15 @@ async fn execute_without_mcp_loop(
     }
 }
 
-/// Build ResponsesResponse with tool calls (MCP and/or function tools)
+/// Build ResponsesResponse with tool calls (MCP and/or function tools). The
+/// function calls' status and the response's are read under `finish_reason`,
+/// the turn's as the parser reads it.
 #[expect(clippy::too_many_arguments)]
 fn build_tool_response(
     mcp_tool_calls: Vec<ToolCall>,
     mcp_results: Vec<ToolResult>,
     function_tool_calls: Vec<ToolCall>,
+    finish_reason: Option<&str>,
     analysis: Option<String>, // Analysis channel content (reasoning)
     partial_text: String,     // Final channel content (message)
     usage: Usage,
@@ -498,12 +496,17 @@ fn build_tool_response(
         });
     }
 
-    // Add function tool calls WITHOUT output (need caller execution)
+    // Add function tool calls WITHOUT output (need caller execution): each
+    // call's status under the turn's finish, which a cut call reads as
+    // incomplete, and the response as cut.
+    let mut cut_call = false;
     for tool_call in function_tool_calls {
         let call_id = tool_call.id.clone();
         let arguments = tool_call.function.arguments.unwrap_or_default();
         let (name, namespace) =
             resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
+        let status = function_call_status(finish_reason, &arguments);
+        cut_call |= status == "incomplete";
         output.push(ResponseOutputItem::FunctionToolCall {
             id: Some(tool_call.id),
             call_id,
@@ -511,23 +514,32 @@ fn build_tool_response(
             namespace,
             arguments,
             output: None, // No output = needs execution
-            status: "completed".to_string(),
+            status: status.to_string(),
         });
     }
 
-    // Build ResponsesResponse with Completed status
+    // The status is read where every Responses object reads it: a `length`
+    // finish is incomplete with `max_output_tokens`, a cut call incomplete
+    // without a reason, a failed generation failed with its error.
+    let (status, incomplete_details) = response_status(finish_reason, cut_call);
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
 
-    ResponsesResponse::builder(&request_id, &responses_request.model)
+    let mut builder = ResponsesResponse::builder(&request_id, &responses_request.model)
         .copy_from_request(&responses_request)
         .created_at(created_at)
-        .status(ResponseStatus::Completed)
+        .status(status)
         .output(output)
-        .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)))
-        .build()
+        .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)));
+    if let Some(details) = incomplete_details {
+        builder = builder.incomplete_details(details);
+    }
+    if let Some(error) = generation_failure_error(finish_reason) {
+        builder = builder.error(error);
+    }
+    builder.build()
 }
 
 #[cfg(test)]
@@ -547,6 +559,7 @@ mod namespace_tests {
             vec![],
             vec![],
             vec![call],
+            Some("tool_calls"),
             None,
             String::new(),
             Usage::from_counts(1, 1),
@@ -556,5 +569,71 @@ mod namespace_tests {
         let wire = serde_json::to_value(response).unwrap();
         assert_eq!(wire["output"][0]["name"], "lookup");
         assert_eq!(wire["output"][0]["namespace"], "weather");
+    }
+}
+
+/// The status of the non-streamed response of a turn that returns its calls
+/// to the caller is read from the turn's finish, as every Responses object's
+/// is: a `length` finish is incomplete with `max_output_tokens`, a call cut
+/// by anything else leaves it incomplete without a reason, and a turn that
+/// ended on its closed calls is completed.
+#[cfg(test)]
+mod status_tests {
+    use serde_json::Value;
+
+    use super::*;
+
+    fn call(arguments: &str) -> ToolCall {
+        serde_json::from_value(json!({
+            "id": "call_time", "type": "function",
+            "function": {"name": "time", "arguments": arguments}
+        }))
+        .unwrap()
+    }
+
+    fn wire(finish_reason: Option<&str>, arguments: &str) -> Value {
+        let response = build_tool_response(
+            vec![],
+            vec![],
+            vec![call(arguments)],
+            finish_reason,
+            None,
+            String::new(),
+            Usage::from_counts(1, 1),
+            "resp_test".into(),
+            Arc::new(ResponsesRequest::default()),
+        );
+        serde_json::to_value(response).unwrap()
+    }
+
+    #[test]
+    fn a_turn_cut_by_max_output_tokens_reads_incomplete_with_the_reason() {
+        let wire = wire(Some("length"), "{\"tz\":");
+        assert_eq!(wire["status"], "incomplete", "{wire}");
+        assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(wire["output"][0]["status"], "incomplete");
+        assert_eq!(wire["output"][0]["arguments"], "{\"tz\":");
+    }
+
+    #[test]
+    fn a_cut_call_under_another_finish_reads_incomplete_without_a_reason() {
+        for finish_reason in [Some("abort"), Some("stop"), None] {
+            let wire = wire(finish_reason, "{\"tz\":");
+            assert_eq!(wire["status"], "incomplete", "{finish_reason:?}: {wire}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason:?}");
+            assert_eq!(
+                wire["output"][0]["status"], "incomplete",
+                "{finish_reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_that_ended_on_its_closed_calls_reads_completed() {
+        let wire = wire(Some("tool_calls"), "{\"tz\": \"UTC\"}");
+        assert_eq!(wire["status"], "completed", "{wire}");
+        assert!(wire["incomplete_details"].is_null());
+        assert!(wire["error"].is_null());
+        assert_eq!(wire["output"][0]["status"], "completed");
     }
 }

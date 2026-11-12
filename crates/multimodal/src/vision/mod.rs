@@ -27,9 +27,10 @@
 //! // Load config from HuggingFace
 //! let config = PreProcessorConfig::from_json(config_json)?;
 //!
-//! // Create a processor that resolves the config once, then preprocess images
+//! // Create a processor that resolves the config once, then preprocess the
+//! // batch's images, borrowed one by one.
 //! let processor = LlavaProcessor::from_configs(&model_config, &config);
-//! let result = processor.preprocess(&images)?;
+//! let result = processor.preprocess(&images.iter().collect::<Vec<_>>())?;
 //! ```
 
 pub mod execution;
@@ -39,6 +40,10 @@ pub mod processor;
 pub mod processors;
 pub(crate) mod rgb_runs;
 pub(crate) mod scratch;
+/// The torch `uint8` resample's own rows (NEON, or the plain loops) for the
+/// targets without the Pillow-exact vector passes; x86-64 routes the torch
+/// taps through those passes in `transforms`.
+#[cfg(not(target_arch = "x86_64"))]
 mod torch_resample;
 pub mod transforms;
 
@@ -53,6 +58,6 @@ pub use processors::{
     DeepseekV41Processor, Gemma4Processor, Glm53FlashProcessor, Llama4VisionProcessor,
     LlavaNextProcessor, LlavaProcessor, MiniMaxM3VisionProcessor, NemotronOmniProcessor,
     Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor,
-    Qwen3OmniVisionProcessor, Qwen3VLProcessor,
+    Qwen3OmniVisionProcessor, Qwen3VLProcessor, Step3VLProcessor,
 };
 pub use transforms::TransformError;

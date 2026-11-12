@@ -20,7 +20,12 @@ use std::{
 use anyhow::{Context, Result as AnyhowResult};
 use ndarray::{Array, ArrayD, ArrayViewD, Axis, Dimension, IxDyn, Slice};
 
-use crate::{pixel_convert, types::FieldLayout, vision::execution};
+use crate::{
+    buffer_pool, pixel_convert,
+    types::FieldLayout,
+    vision::{execution, scratch},
+    WireBytes,
+};
 
 /// The dtypes an encoder input is written in for the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +197,13 @@ pub enum EncoderInput {
         shape: Vec<usize>,
         norm: PixelNorm,
     },
+    /// An immutable view of a cacheable wire allocation.
+    SharedWire {
+        bytes: Box<WireBytes>,
+        dtype: EncoderDtype,
+        shape: Vec<usize>,
+        norm: PixelNorm,
+    },
 }
 
 impl<D: Dimension> From<Array<f32, D>> for EncoderInput {
@@ -213,7 +225,7 @@ impl EncoderInput {
         match self {
             Self::F32(array) => array.shape(),
             Self::U8 { patches, .. } => patches.shape(),
-            Self::Wire { shape, .. } => shape,
+            Self::Wire { shape, .. } | Self::SharedWire { shape, .. } => shape,
         }
     }
 
@@ -258,7 +270,7 @@ impl EncoderInput {
         match self {
             Self::F32(_) => size_of::<f32>(),
             Self::U8 { .. } => size_of::<u8>(),
-            Self::Wire { dtype, .. } => dtype.element_size(),
+            Self::Wire { dtype, .. } | Self::SharedWire { dtype, .. } => dtype.element_size(),
         }
     }
 
@@ -271,7 +283,9 @@ impl EncoderInput {
     pub fn pixel_norm(&self) -> Option<PixelNorm> {
         match self {
             Self::F32(_) => None,
-            Self::U8 { norm, .. } | Self::Wire { norm, .. } => Some(*norm),
+            Self::U8 { norm, .. } | Self::Wire { norm, .. } | Self::SharedWire { norm, .. } => {
+                Some(*norm)
+            }
         }
     }
 
@@ -284,6 +298,15 @@ impl EncoderInput {
         match self {
             Self::F32(array) => Cow::Borrowed(array),
             Self::Wire {
+                bytes,
+                dtype,
+                shape,
+                norm,
+            } => Cow::Owned(
+                ArrayD::from_shape_vec(IxDyn(shape), wire_to_f32(bytes, *dtype, norm))
+                    .unwrap_or_else(|_| ArrayD::zeros(IxDyn(shape))),
+            ),
+            Self::SharedWire {
                 bytes,
                 dtype,
                 shape,
@@ -316,13 +339,15 @@ impl EncoderInput {
     pub fn into_f32(self) -> ArrayD<f32> {
         match self {
             Self::F32(array) => array,
-            other @ (Self::U8 { .. } | Self::Wire { .. }) => other.as_f32().into_owned(),
+            other => other.as_f32().into_owned(),
         }
     }
 
     /// The input as little-endian bytes of `dtype`, consuming it: bytes
     /// already in `dtype` move out; anything else is written as
-    /// [`EncoderInputView::try_write_as`] writes it, with its errors.
+    /// [`EncoderInputView::try_write_as`] writes it, with its errors, and
+    /// the written-out bytes or patches go back to the buffer pool, a
+    /// written-out float tensor's storage to the thread's scratch pool.
     pub fn into_bytes_as(self, dtype: EncoderDtype) -> Result<Vec<u8>, String> {
         match self {
             Self::Wire {
@@ -340,7 +365,81 @@ impl EncoderInput {
                 }
                 Ok(bytes)
             }
-            other => other.view().try_write_as(dtype),
+            other => {
+                let written = other.view().try_write_as(dtype);
+                match other {
+                    Self::Wire { bytes, .. } => buffer_pool::recycle(bytes),
+                    Self::U8 { patches, .. } => {
+                        buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
+                    }
+                    // The processors take their float tensors from the
+                    // thread's scratch pool and give back what they consume
+                    // on the way; the tensor they hand out comes back here,
+                    // so the next image's take on this thread is warm
+                    // instead of a fresh allocation faulted in page by page.
+                    // On a thread that never takes (one that only writes
+                    // tensors made elsewhere) the pool keeps nothing, so the
+                    // give costs that thread no residency.
+                    Self::F32(array) => scratch::give_f32(array.into_raw_vec_and_offset().0),
+                    Self::SharedWire { .. } => {}
+                }
+                written
+            }
+        }
+    }
+
+    /// Consume this input as wire bytes, preserving immutable cache storage.
+    pub fn into_wire_bytes_as(self, dtype: EncoderDtype) -> Result<WireBytes, String> {
+        match self {
+            Self::SharedWire {
+                bytes,
+                dtype: own,
+                shape,
+                ..
+            } if own == dtype => {
+                let expected = shape.iter().product::<usize>() * dtype.element_size();
+                if bytes.len() != expected {
+                    return Err(format!(
+                        "wire holds {} bytes, {expected} needed for {shape:?} in {dtype}",
+                        bytes.len()
+                    ));
+                }
+                Ok(*bytes)
+            }
+            other => other.into_bytes_as(dtype).map(Into::into),
+        }
+    }
+
+    /// Share the wire allocation so independent cache entries can view its rows.
+    pub fn share_wire(&mut self, max_capacity: usize) -> bool {
+        match self {
+            Self::Wire {
+                bytes,
+                dtype,
+                shape,
+                norm,
+            } if bytes.capacity() <= max_capacity => {
+                let bytes = WireBytes::shared(std::mem::take(bytes));
+                *self = Self::SharedWire {
+                    bytes: Box::new(bytes),
+                    dtype: *dtype,
+                    shape: std::mem::take(shape),
+                    norm: *norm,
+                };
+                true
+            }
+            Self::SharedWire { bytes, .. } => bytes
+                .shared_allocation()
+                .is_some_and(|(_, capacity)| capacity <= max_capacity),
+            _ => false,
+        }
+    }
+
+    /// Full allocation retained by a shared wire input.
+    pub fn shared_allocation(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::SharedWire { bytes, .. } => bytes.shared_allocation(),
+            _ => None,
         }
     }
 
@@ -351,7 +450,7 @@ impl EncoderInput {
                 Some(slice) => Cow::Borrowed(slice),
                 None => Cow::Owned(array.iter().copied().collect()),
             },
-            Self::U8 { .. } | Self::Wire { .. } => {
+            Self::U8 { .. } | Self::Wire { .. } | Self::SharedWire { .. } => {
                 Cow::Owned(self.as_f32().into_owned().into_raw_vec_and_offset().0)
             }
         }
@@ -366,6 +465,17 @@ impl EncoderInput {
                 norm: *norm,
             },
             Self::Wire {
+                bytes,
+                dtype,
+                shape,
+                norm,
+            } => EncoderInputView::Wire {
+                bytes,
+                dtype: *dtype,
+                shape: shape.clone(),
+                norm: *norm,
+            },
+            Self::SharedWire {
                 bytes,
                 dtype,
                 shape,
@@ -394,52 +504,142 @@ impl EncoderInput {
         Ok(self.view().slice_axis0(start, len)?.to_owned())
     }
 
+    /// Split a batch along axis zero in order. Shared wires retain their backing.
+    pub fn split_axis0(&self, lengths: &[usize]) -> AnyhowResult<Vec<Self>> {
+        let input = self.view();
+        let mut start = 0;
+        let views = lengths
+            .iter()
+            .map(|&len| {
+                let view = input.slice_axis0(start, len)?;
+                start += len;
+                Ok(view)
+            })
+            .collect::<AnyhowResult<Vec<_>>>()?;
+        anyhow::ensure!(
+            self.shape().first() == Some(&start),
+            "slice lengths do not cover the encoder input"
+        );
+        if let Self::SharedWire { bytes, .. } = self {
+            if bytes.shared_allocation().is_some() {
+                let mut offset = 0;
+                return views
+                    .into_iter()
+                    .map(|view| {
+                        let EncoderInputView::Wire {
+                            bytes: slice,
+                            dtype,
+                            shape,
+                            norm,
+                        } = view
+                        else {
+                            anyhow::bail!("expected a wire view");
+                        };
+                        let end = offset + slice.len();
+                        let bytes = bytes
+                            .shared_slice(offset..end)
+                            .context("invalid wire slice")?;
+                        offset = end;
+                        Ok(Self::SharedWire {
+                            bytes: Box::new(bytes),
+                            dtype,
+                            shape,
+                            norm,
+                        })
+                    })
+                    .collect();
+            }
+        }
+        let tasks = execution::task_count(self.nbytes(), views.len(), 1);
+        if tasks == 1 {
+            return Ok(views.iter().map(EncoderInputView::to_owned).collect());
+        }
+
+        let mut parts = vec![None; views.len()];
+        let chunk_len = views.len().div_ceil(tasks);
+        execution::scope(|spawner| {
+            for (views, slots) in views.chunks(chunk_len).zip(parts.chunks_mut(chunk_len)) {
+                spawner.spawn(move |_| {
+                    for (view, slot) in views.iter().zip(slots) {
+                        *slot = Some(view.to_owned());
+                    }
+                });
+            }
+        });
+        parts
+            .into_iter()
+            .collect::<Option<_>>()
+            .context("missing encoder slice")
+    }
+
     /// Stack inputs along the first axis. Bytes stack with bytes of the same
     /// normalization, floats with floats; the two forms do not mix.
     pub fn concat(parts: &[&Self]) -> AnyhowResult<Self> {
         let first = parts.first().context("cannot join zero encoder inputs")?;
         match first {
-            Self::Wire {
-                dtype, norm, shape, ..
-            } => {
-                let mut bytes = Vec::new();
+            Self::Wire { .. } | Self::SharedWire { .. } => {
+                let (_, dtype, shape, norm) = first.wire_fields().context("expected wire input")?;
+                let mut byte_len = 0usize;
                 let mut rows = 0usize;
-                for part in parts {
-                    match part {
-                        Self::Wire {
-                            bytes: part_bytes,
-                            dtype: part_dtype,
-                            shape: part_shape,
-                            norm: part_norm,
-                        } if part_dtype == dtype
-                            && part_norm == norm
-                            && part_shape.get(1..) == shape.get(1..) =>
-                        {
-                            bytes.extend_from_slice(part_bytes);
-                            rows += part_shape.first().copied().unwrap_or(0);
-                        }
-                        Self::Wire { .. } => anyhow::bail!(
-                            "encoder inputs of the batch parts disagree on wire dtype, normalization or shape"
-                        ),
-                        Self::F32(_) | Self::U8 { .. } => anyhow::bail!(
-                            "encoder inputs of the batch parts mix wire bytes with other forms"
-                        ),
+                let mut slices = Vec::with_capacity(parts.len());
+                let mut contiguous = match first {
+                    Self::SharedWire { bytes, .. } => bytes.shared_slice(0..bytes.len()),
+                    _ => None,
+                };
+                for (index, part) in parts.iter().enumerate() {
+                    let (bytes, part_dtype, part_shape, part_norm) = part.wire_fields().context(
+                        "encoder inputs of the batch parts mix wire bytes with other forms",
+                    )?;
+                    anyhow::ensure!(
+                        part_dtype == dtype && part_norm == norm && part_shape.get(1..) == shape.get(1..),
+                        "encoder inputs of the batch parts disagree on wire dtype, normalization or shape"
+                    );
+                    byte_len = byte_len
+                        .checked_add(bytes.len())
+                        .context("joined wire byte length overflows usize")?;
+                    rows += part_shape.first().copied().unwrap_or(0);
+                    slices.push(bytes);
+                    if index > 0
+                        && contiguous.as_mut().is_some_and(|wire| match part {
+                            Self::SharedWire { bytes, .. } => !wire.join_adjacent(bytes),
+                            _ => true,
+                        })
+                    {
+                        contiguous = None;
                     }
                 }
-                let mut joined = shape.clone();
+                let mut joined = shape.to_vec();
                 if let Some(first_dim) = joined.first_mut() {
                     *first_dim = rows;
                 }
-                Self::wire(bytes, *dtype, joined, *norm).map_err(anyhow::Error::msg)
+                if let Some(bytes) = contiguous {
+                    let expected = joined.iter().product::<usize>() * dtype.element_size();
+                    anyhow::ensure!(
+                        bytes.len() == expected,
+                        "wire holds {} bytes, {expected} needed for {joined:?} in {dtype}",
+                        bytes.len()
+                    );
+                    Ok(Self::SharedWire {
+                        bytes: Box::new(bytes),
+                        dtype,
+                        shape: joined,
+                        norm,
+                    })
+                } else {
+                    Self::wire(concat_byte_slices(&slices, byte_len), dtype, joined, norm)
+                        .map_err(anyhow::Error::msg)
+                }
             }
             Self::F32(_) => {
                 let views = parts
                     .iter()
                     .map(|part| match part {
                         Self::F32(array) => Ok(array.view()),
-                        Self::U8 { .. } | Self::Wire { .. } => Err(anyhow::anyhow!(
-                            "encoder inputs of the batch parts mix bytes and floats"
-                        )),
+                        Self::U8 { .. } | Self::Wire { .. } | Self::SharedWire { .. } => {
+                            Err(anyhow::anyhow!(
+                                "encoder inputs of the batch parts mix bytes and floats"
+                            ))
+                        }
                     })
                     .collect::<AnyhowResult<Vec<_>>>()?;
                 Ok(Self::F32(ndarray::concatenate(Axis(0), &views).context(
@@ -457,9 +657,11 @@ impl EncoderInput {
                         Self::U8 { .. } => Err(anyhow::anyhow!(
                             "encoder inputs of the batch parts disagree on pixel normalization"
                         )),
-                        Self::F32(_) | Self::Wire { .. } => Err(anyhow::anyhow!(
-                            "encoder inputs of the batch parts mix bytes and floats"
-                        )),
+                        Self::F32(_) | Self::Wire { .. } | Self::SharedWire { .. } => {
+                            Err(anyhow::anyhow!(
+                                "encoder inputs of the batch parts mix bytes and floats"
+                            ))
+                        }
                     })
                     .collect::<AnyhowResult<Vec<_>>>()?;
                 Ok(Self::U8 {
@@ -470,6 +672,55 @@ impl EncoderInput {
             }
         }
     }
+
+    /// The wire representation, borrowed without cloning its shape or storage.
+    fn wire_fields(&self) -> Option<(&[u8], EncoderDtype, &[usize], PixelNorm)> {
+        match self {
+            Self::Wire {
+                bytes,
+                dtype,
+                shape,
+                norm,
+            } => Some((bytes, *dtype, shape, *norm)),
+            Self::SharedWire {
+                bytes,
+                dtype,
+                shape,
+                norm,
+            } => Some((bytes, *dtype, shape, *norm)),
+            _ => None,
+        }
+    }
+}
+
+/// Copy large byte batches into disjoint output bands on the shared pool.
+fn concat_byte_slices(slices: &[&[u8]], len: usize) -> Vec<u8> {
+    let tasks = execution::task_count(len, slices.len(), 1);
+    if tasks == 1 {
+        let mut bytes = Vec::with_capacity(len);
+        for slice in slices {
+            bytes.extend_from_slice(slice);
+        }
+        return bytes;
+    }
+
+    let mut bytes = buffer_pool::take(len);
+    let mut remaining = bytes.as_mut_slice();
+    execution::scope(|spawner| {
+        for group in slices.chunks(slices.len().div_ceil(tasks)) {
+            let group_len = group.iter().map(|slice| slice.len()).sum();
+            let (mut dest, rest) = remaining.split_at_mut(group_len);
+            remaining = rest;
+            spawner.spawn(move |_| {
+                for src in group {
+                    let (band, rest) = dest.split_at_mut(src.len());
+                    band.copy_from_slice(src);
+                    dest = rest;
+                }
+            });
+        }
+    });
+    bytes
 }
 
 /// A borrowed [`EncoderInput`]: the whole, or rows of it. Per-destination
@@ -603,8 +854,12 @@ impl<'a> EncoderInputView<'a> {
     /// other conversion is exact), or a wire whose bytes do not match its
     /// shape.
     pub fn try_write_as(&self, dtype: EncoderDtype) -> Result<Vec<u8>, String> {
-        let mut out = vec![0u8; self.len() * dtype.element_size()];
-        self.write_into(dtype, &mut out)?;
+        // A pooled buffer: `write_into` covers it or writes nothing.
+        let mut out = buffer_pool::take(self.len() * dtype.element_size());
+        if let Err(message) = self.write_into(dtype, &mut out) {
+            buffer_pool::recycle(out);
+            return Err(message);
+        }
         Ok(out)
     }
 
@@ -1292,13 +1547,27 @@ impl PreprocessedEncoderInputs {
         if parts.len() == 1 {
             return parts.into_iter().next().context("cannot join zero batches");
         }
+        Self::concat_refs(&parts.iter().collect::<Vec<_>>(), layouts)
+    }
+
+    /// Join shared cache outputs directly into the final batch without cloning
+    /// each input first. A single input is cloned once; layouts and validation
+    /// are the same as for the owned batch join.
+    pub fn concat_refs(
+        parts: &[&Self],
+        layouts: &HashMap<String, FieldLayout>,
+    ) -> AnyhowResult<Self> {
+        anyhow::ensure!(!parts.is_empty(), "cannot join zero batches");
+        if parts.len() == 1 {
+            return Ok(parts[0].clone());
+        }
         let inputs = parts
             .iter()
             .map(|part| &part.encoder_input)
             .collect::<Vec<_>>();
         let encoder_input = EncoderInput::concat(&inputs)?;
-
-        let keys = parts[0].model_specific.keys().cloned().collect::<Vec<_>>();
+        let first = parts.first().context("cannot join zero batches")?;
+        let keys = first.model_specific.keys().cloned().collect::<Vec<_>>();
         let mut model_specific = HashMap::with_capacity(keys.len());
         for key in keys {
             let values = parts
@@ -1349,8 +1618,8 @@ impl PreprocessedEncoderInputs {
         let mut feature_token_counts = Vec::new();
         let mut item_sizes = Vec::new();
         for part in parts {
-            feature_token_counts.extend(part.feature_token_counts);
-            item_sizes.extend(part.item_sizes);
+            feature_token_counts.extend_from_slice(&part.feature_token_counts);
+            item_sizes.extend_from_slice(&part.item_sizes);
         }
         Ok(Self {
             encoder_input,
@@ -1388,6 +1657,33 @@ mod tests {
     use ndarray::Array4;
 
     use super::*;
+
+    /// A float tensor written out as wire bytes returns its storage to the
+    /// thread's scratch pool: the next float take of that size on the thread
+    /// is the same allocation, and the bytes written are the view's.
+    #[test]
+    fn a_float_tensor_written_out_returns_its_storage_to_the_scratch_pool() {
+        let len = 3 * 4 * 4;
+        let mut storage = scratch::take_f32(len);
+        for (i, value) in storage.iter_mut().enumerate() {
+            *value = i as f32 / 8.0 - 2.0;
+        }
+        let ptr = storage.as_ptr();
+        let input = EncoderInput::F32(
+            ArrayD::from_shape_vec(IxDyn(&[1, 3, 4, 4]), storage).expect("shape matches"),
+        );
+        let expected = input.view().write_as(EncoderDtype::BFloat16);
+        let bytes = input
+            .into_bytes_as(EncoderDtype::BFloat16)
+            .expect("floats narrow to bfloat16");
+        assert_eq!(bytes, expected);
+        let again = scratch::take_f32(len);
+        assert_eq!(
+            again.as_ptr(),
+            ptr,
+            "the written-out tensor's storage is the thread's next take"
+        );
+    }
 
     #[test]
     fn encoder_input_accessors_are_modality_neutral() {
@@ -1538,6 +1834,60 @@ mod tests {
             &layouts
         )
         .is_err());
+    }
+
+    /// Repeated borrowed cache entries retain request order and independent output storage.
+    #[test]
+    fn borrowed_concat_preserves_repeated_entries_and_input_storage() {
+        let first = clip(16, 1, 1.0);
+        let second = clip(32, 2, 0.5);
+        let joined =
+            PreprocessedEncoderInputs::concat_refs(&[&second, &first, &second], &video_layouts())
+                .unwrap();
+        assert_eq!(joined.encoder_input_shape(), vec![80, 3]);
+        assert_eq!(joined.feature_token_counts, vec![8, 4, 8]);
+        let values = joined.encoder_input_flat();
+        assert!(values[..32 * 3].iter().all(|&v| v == 32.0));
+        assert!(values[32 * 3..48 * 3].iter().all(|&v| v == 16.0));
+        assert!(values[48 * 3..].iter().all(|&v| v == 32.0));
+        assert!(matches!(
+            &joined.model_specific["video_grid_thw"],
+            ModelSpecificValue::IntTensor { data, shape }
+                if data == &vec![2, 4, 4, 1, 4, 4, 2, 4, 4] && shape == &vec![3, 3]
+        ));
+        let mut single =
+            PreprocessedEncoderInputs::concat_refs(&[&first], &HashMap::new()).unwrap();
+        if let EncoderInput::F32(array) = &mut single.encoder_input {
+            array.fill(0.0);
+        }
+        assert!(first.encoder_input_flat().iter().all(|&v| v == 16.0));
+        assert!(PreprocessedEncoderInputs::concat_refs(&[], &HashMap::new()).is_err());
+    }
+
+    /// Adjacent wire slices can rejoin their original allocation, including transport.
+    #[test]
+    fn adjacent_wire_parts_reuse_the_backing_and_preserve_reordering() {
+        let dtype = EncoderDtype::BFloat16;
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [0.0; 3],
+            divisor: [1.0; 3],
+            channel_block: 1,
+        };
+        let mut wire = EncoderInput::wire((0..12).collect(), dtype, vec![3, 2], norm).unwrap();
+        assert!(wire.share_wire(12));
+        let parts = wire.split_axis0(&[1, 2]).unwrap();
+        let ordered = EncoderInput::concat(&[&parts[0], &parts[1]]).unwrap();
+        assert_eq!(ordered.shared_allocation(), wire.shared_allocation());
+        let payload = ordered.into_wire_bytes_as(dtype).unwrap().into_payload();
+        let original = wire.into_wire_bytes_as(dtype).unwrap();
+        assert_eq!(payload.as_ptr(), original.as_ptr());
+        let reversed = EncoderInput::concat(&[&parts[1], &parts[0]]).unwrap();
+        assert!(reversed.shared_allocation().is_none());
+        assert_eq!(
+            reversed.into_bytes_as(dtype).unwrap(),
+            [4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3]
+        );
     }
 
     #[test]
@@ -1701,6 +2051,49 @@ mod tests {
         }
     }
 
+    /// Splitting and rejoining byte tensors preserves order and repeats.
+    #[test]
+    fn byte_batch_slices_join_in_the_requested_order() {
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [0.0; 3],
+            divisor: [1.0; 3],
+            channel_block: 1,
+        };
+        let row_bytes = 1 << 17;
+        let mut bytes = vec![1; row_bytes];
+        bytes.extend(vec![2; row_bytes * 2]);
+        bytes.extend(vec![3; row_bytes * 3]);
+        let wire = EncoderInput::wire(
+            bytes.clone(),
+            EncoderDtype::BFloat16,
+            vec![6, row_bytes / 2],
+            norm,
+        )
+        .unwrap();
+        let pixels =
+            EncoderInput::bytes(Array::from_shape_vec((6, row_bytes), bytes).unwrap(), norm);
+        for (batch, dtype) in [
+            (wire, EncoderDtype::BFloat16),
+            (pixels, EncoderDtype::Uint8),
+        ] {
+            assert!(batch.split_axis0(&[1, 3]).is_err());
+            assert!(batch.split_axis0(&[1, 3, 3]).is_err());
+            let parts = batch.split_axis0(&[1, 2, 3]).unwrap();
+            let joined =
+                EncoderInput::concat(&[&parts[2], &parts[0], &parts[1], &parts[0]]).unwrap();
+            let bytes = joined.into_bytes_as(dtype).unwrap();
+            assert!(bytes[..row_bytes * 3].iter().all(|&byte| byte == 3));
+            assert!(bytes[row_bytes * 3..row_bytes * 4]
+                .iter()
+                .all(|&byte| byte == 1));
+            assert!(bytes[row_bytes * 4..row_bytes * 6]
+                .iter()
+                .all(|&byte| byte == 2));
+            assert_eq!(&bytes[row_bytes * 6..], &vec![1; row_bytes]);
+        }
+    }
+
     /// A wire's bytes are checked against its shape and dtype by the
     /// constructor, and a malformed one built by hand is refused at the
     /// write, not a panic or a silent truncation.
@@ -1816,5 +2209,70 @@ mod tests {
                 assert!(wire.write_as(EncoderDtype::Float32).is_empty());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use ndarray::Array2;
+
+    use super::*;
+    use crate::buffer_pool::{self, BufferPool};
+
+    fn norm() -> PixelNorm {
+        PixelNorm {
+            scale: 1.0,
+            offset: [127.5; 3],
+            divisor: [127.5; 3],
+            channel_block: 392,
+        }
+    }
+
+    /// Patches written out in a float dtype return their buffer to the pool;
+    /// the written bytes are a pooled buffer of their own.
+    #[test]
+    fn patches_written_out_in_another_dtype_return_their_buffer() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            // 1,411,200 bytes of patches: the 2 MiB class; their bf16 wire is the 4 MiB class.
+            let (rows, features) = (1200, 1176);
+            let mut bytes = buffer_pool::take(rows * features);
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = (index % 251) as u8;
+            }
+            let address = bytes.as_ptr();
+            let patches = Array2::from_shape_vec((rows, features), bytes).expect("shaped");
+            let wire = EncoderInput::bytes(patches, norm())
+                .into_bytes_as(EncoderDtype::BFloat16)
+                .expect("written");
+            assert_eq!(
+                (wire.len(), wire.capacity()),
+                (2 * rows * features, 4 << 20)
+            );
+            assert_eq!(MINE.held(), 2 << 20, "the patches came back");
+            let again = buffer_pool::take(rows * features);
+            assert_eq!(again.as_ptr(), address);
+        });
+    }
+
+    /// A `float32` wire narrowed to a half width returns its buffer to the pool.
+    #[test]
+    fn a_wire_written_in_a_narrower_dtype_returns_its_buffer() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            // 1.6 MB of float32: the 2 MiB class; the halves are below the pooled range.
+            let values = 1000 * 400;
+            let bytes = buffer_pool::take(values * 4);
+            let address = bytes.as_ptr();
+            let wire = EncoderInput::wire(bytes, EncoderDtype::Float32, vec![1000, 400], norm())
+                .expect("a wire");
+            let halves = wire
+                .into_bytes_as(EncoderDtype::BFloat16)
+                .expect("narrowed");
+            assert_eq!(halves.len(), values * 2);
+            assert_eq!(MINE.held(), 2 << 20, "the float32 wire came back");
+            let again = buffer_pool::take(values * 4);
+            assert_eq!(again.as_ptr(), address);
+        });
     }
 }

@@ -27,6 +27,9 @@ pub enum SecretSource {
     Environment,
     /// Read from a file the command line or the environment named.
     File,
+    /// Given as a value by the launcher that started this gateway, from
+    /// its flag or its environment, which the binding does not see.
+    Launcher,
 }
 
 impl SecretSource {
@@ -36,6 +39,7 @@ impl SecretSource {
             Self::Flag => "flag",
             Self::Environment => "env",
             Self::File => "file",
+            Self::Launcher => "launcher",
         }
     }
 }
@@ -49,6 +53,8 @@ pub struct SecretSources {
     pub api_key: Option<SecretSource>,
     /// The per-tenant serving keys, with how many entries the source held.
     pub tenant_api_keys: Option<(SecretSource, usize)>,
+    /// The control-plane API keys, with how many entries the source held.
+    pub control_plane_api_keys: Option<(SecretSource, usize)>,
     /// The PostgreSQL connection URL.
     pub postgres_db_url: Option<SecretSource>,
     /// The Redis connection URL.
@@ -60,6 +66,7 @@ impl SecretSources {
     pub fn any(&self) -> bool {
         self.api_key.is_some()
             || self.tenant_api_keys.is_some()
+            || self.control_plane_api_keys.is_some()
             || self.postgres_db_url.is_some()
             || self.redis_url.is_some()
     }
@@ -70,21 +77,53 @@ pub(crate) const SOURCES_HEADLINE: &str =
     "CREDENTIAL SOURCES: where this start read its secrets (the values are never logged)";
 
 /// Logs the sources record, one INFO, when a secret was given: one field per
-/// secret naming its source, `flag`, `env` or `file`.
-pub(crate) fn log_secret_sources(sources: &SecretSources) {
+/// secret naming its source, `flag`, `env`, `file` or `launcher`, and whether the key
+/// files are watched for changes (`secrets_auto_reload`: `off`, or `on` with
+/// the count of files watched).
+pub(crate) fn log_secret_sources(sources: &SecretSources, secrets_auto_reload: &str) {
     if !sources.any() {
         return;
     }
-    let tenant_api_keys = sources
-        .tenant_api_keys
-        .map(|(source, entries)| format!("{} ({entries} entries)", source.as_str()));
+    let entries_of = |source: Option<(SecretSource, usize)>| {
+        source.map(|(source, entries)| format!("{} ({entries} entries)", source.as_str()))
+    };
+    let tenant_api_keys = entries_of(sources.tenant_api_keys);
+    let control_plane_api_keys = entries_of(sources.control_plane_api_keys);
     info!(
         api_key = sources.api_key.map(SecretSource::as_str),
         tenant_api_keys = tenant_api_keys.as_deref(),
+        control_plane_api_keys = control_plane_api_keys.as_deref(),
         postgres_db_url = sources.postgres_db_url.map(SecretSource::as_str),
         redis_url = sources.redis_url.map(SecretSource::as_str),
+        secrets_auto_reload,
         "{SOURCES_HEADLINE}"
     );
+}
+
+/// The headline of the gated-routes record.
+pub(crate) const GATED_HEADLINE: &str =
+    "GATED CONTROL-PLANE ROUTES: mounted only behind control-plane authentication";
+
+/// Logs the gated-routes record, one INFO: whether the routes that exist
+/// only behind control-plane authentication are mounted on this start,
+/// and which they are, so an operator reading a 404 for one of them
+/// finds the reason in the start-up log.
+pub(crate) fn log_gated_routes(control_plane_auth: bool, routes: &[(&str, &str)]) {
+    let routes = routes
+        .iter()
+        .map(|(method, path)| format!("{method} {path}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if control_plane_auth {
+        info!(mounted = true, routes, "{GATED_HEADLINE}");
+    } else {
+        info!(
+            mounted = false,
+            routes,
+            "{GATED_HEADLINE}; this start has none, so they answer 404; configure \
+             --control-plane-api-keys, --control-plane-api-keys-file or --jwt-issuer/--jwt-audience to mount them"
+        );
+    }
 }
 
 /// The planes a start leaves open, judged the way `build_app` guards them.
@@ -394,7 +433,7 @@ mod tests {
             self_name: "node-a".to_string(),
             bind_addr: addr,
             advertise_addr: addr,
-            init_peer: None,
+            init_peers: Vec::new(),
             mtls_config: mtls,
         }
     }
@@ -470,18 +509,48 @@ mod tests {
     #[traced_test]
     #[test]
     fn the_sources_record_names_sources_alone() {
-        log_secret_sources(&SecretSources {
-            api_key: Some(SecretSource::File),
-            tenant_api_keys: Some((SecretSource::Environment, 3)),
-            postgres_db_url: Some(SecretSource::Flag),
-            redis_url: None,
-        });
+        log_secret_sources(
+            &SecretSources {
+                api_key: Some(SecretSource::File),
+                tenant_api_keys: Some((SecretSource::Environment, 3)),
+                control_plane_api_keys: Some((SecretSource::File, 2)),
+                postgres_db_url: Some(SecretSource::Flag),
+                redis_url: None,
+            },
+            "on (2 files)",
+        );
 
         assert!(logs_contain("CREDENTIAL SOURCES"));
+        assert!(logs_contain("secrets_auto_reload=\"on (2 files)\""));
         assert!(logs_contain("api_key=\"file\""));
         assert!(logs_contain("tenant_api_keys=\"env (3 entries)\""));
+        assert!(logs_contain("control_plane_api_keys=\"file (2 entries)\""));
         assert!(logs_contain("postgres_db_url=\"flag\""));
         assert!(!logs_contain("redis_url="));
+    }
+
+    /// The launcher's word in the record, beside the command line's three.
+    #[test]
+    fn a_launcher_given_secret_reads_launcher() {
+        assert_eq!(SecretSource::Launcher.as_str(), "launcher");
+        assert_eq!(SecretSource::Flag.as_str(), "flag");
+    }
+
+    /// The gated-routes record says whether the routes are mounted and
+    /// names them in both states, with the flags that mount them when
+    /// they are off.
+    #[traced_test]
+    #[test]
+    fn the_gated_routes_record_names_the_routes_in_both_states() {
+        log_gated_routes(false, &[("GET", "/config")]);
+        assert!(logs_contain("GATED CONTROL-PLANE ROUTES"));
+        assert!(logs_contain("mounted=false"));
+        assert!(logs_contain("routes=\"GET /config\""));
+        assert!(logs_contain("--control-plane-api-keys"));
+
+        log_gated_routes(true, &[("GET", "/config"), ("PUT", "/rate-limits")]);
+        assert!(logs_contain("mounted=true"));
+        assert!(logs_contain("routes=\"GET /config, PUT /rate-limits\""));
     }
 
     #[traced_test]
@@ -489,7 +558,7 @@ mod tests {
     fn a_start_without_secrets_logs_no_sources_record() {
         assert!(!SecretSources::default().any());
 
-        log_secret_sources(&SecretSources::default());
+        log_secret_sources(&SecretSources::default(), "off");
 
         assert!(!logs_contain("CREDENTIAL SOURCES"));
     }

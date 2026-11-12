@@ -264,44 +264,60 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v32_renderer_honors_thinking_kwarg_only() {
-        // `thinking: true` → prompt ends with <think> (thinking mode).
-        // `enable_thinking: true` alone → ignored (chat mode), matching
-        // `thinking_key_name() == Some(Thinking)` and the serving engine's DeepSeek path.
+    fn deepseek_v32_renderer_honors_the_enable_thinking_alias_like_thinking() {
+        // The engine's tokenizer wrapper switches thinking on from `thinking`
+        // or its `enable_thinking` alias: either alone ends the prompt with
+        // <think> (thinking mode); `thinking` wins when both are present, as
+        // the gateway reads them when it arms the reasoning parser; and the
+        // profile declares the alias so the gateway reads it at all.
         let (_tmp, tok) = write_dir(Some(&["DeepseekV32ForCausalLM"]));
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        assert!(
+            tokenizer.renderer_capabilities().enable_thinking_alias,
+            "the V3.2 renderer declares the enable_thinking alias"
+        );
         let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let render = |kwargs: &HashMap<String, serde_json::Value>| {
+            tokenizer
+                .apply_chat_template(
+                    &messages,
+                    ChatTemplateParams {
+                        template_kwargs: Some(kwargs),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
 
-        let mut thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
-        thinking_kwargs.insert("thinking".to_string(), serde_json::Value::Bool(true));
-        let out_thinking = tokenizer
-            .apply_chat_template(
-                &messages,
-                ChatTemplateParams {
-                    template_kwargs: Some(&thinking_kwargs),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let thinking_kwargs = HashMap::from([("thinking".to_string(), json!(true))]);
+        let out_thinking = render(&thinking_kwargs);
         assert!(
             out_thinking.ends_with("<think>"),
             "thinking=true should enter thinking mode: {out_thinking}"
         );
 
-        let mut enable_thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
-        enable_thinking_kwargs.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
-        let out_enable = tokenizer
-            .apply_chat_template(
-                &messages,
-                ChatTemplateParams {
-                    template_kwargs: Some(&enable_thinking_kwargs),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let alias_kwargs = HashMap::from([("enable_thinking".to_string(), json!(true))]);
+        let out_alias = render(&alias_kwargs);
+        assert_eq!(
+            out_alias, out_thinking,
+            "enable_thinking=true must render like thinking=true"
+        );
+
+        let alias_off = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+        let out_alias_off = render(&alias_off);
         assert!(
-            out_enable.ends_with("</think>"),
-            "enable_thinking alone must NOT enter thinking mode: {out_enable}"
+            out_alias_off.ends_with("</think>"),
+            "enable_thinking=false stays in chat mode: {out_alias_off}"
+        );
+
+        let both = HashMap::from([
+            ("thinking".to_string(), json!(false)),
+            ("enable_thinking".to_string(), json!(true)),
+        ]);
+        let out_both = render(&both);
+        assert!(
+            out_both.ends_with("</think>"),
+            "thinking=false outranks the alias: {out_both}"
         );
     }
 
@@ -456,12 +472,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 0731-vs-original effort-encoding identification
+    // The effort table is the engine's, never the shipped encoder file's
     // -----------------------------------------------------------------------
 
-    /// Stand-ins for the `encoding/encoding_dsv4.py` each checkpoint ships;
-    /// only the effort block differs between revisions, so the fingerprint is
-    /// the 0731-only `max` prompt text.
+    /// Stand-ins for the `encoding/encoding_dsv4.py` each checkpoint revision
+    /// ships (only the effort block differs between them); the renderer reads
+    /// neither, as the serving engine reads neither.
     const BASE_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_MAX = (
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
 )"#;
@@ -494,23 +510,42 @@ mod tests {
     }
 
     #[test]
-    fn shipped_encoder_fingerprint_beats_dir_name() {
-        // Neutral dir name + 0731 encoder -> 0731 encoding.
-        let (_tmp, tok) = write_v4_model_dir("my-local-v4-copy", Some(V0731_ENCODER_SNIPPET));
-        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-        let out = render_with_native_effort(&tokenizer, "max").unwrap();
-        assert!(out.contains("Reasoning Effort: Beyond maximum"), "{out}");
-
-        // 0731 dir name + base encoder -> original encoding, where `max` is
-        // the only level with a prompt; `low` is thinking mode without one.
-        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", Some(BASE_ENCODER_SNIPPET));
-        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-        let out = render_with_native_effort(&tokenizer, "max").unwrap();
-        assert!(out.contains("Reasoning Effort: Absolute maximum"), "{out}");
-        assert!(!out.contains("Beyond maximum"), "{out}");
-        let out = render_with_native_effort(&tokenizer, "low").unwrap();
-        assert!(!out.contains("Reasoning Effort:"), "{out}");
-        assert!(out.ends_with("<think>"), "{out}");
+    fn the_shipped_encoder_file_never_picks_the_effort_table() {
+        // The serving engine renders every V4 checkpoint with its own copy of
+        // the encoder, whose table is the refreshed one, and never reads the
+        // `encoding/encoding_dsv4.py` the checkpoint ships; so the file,
+        // whichever table it carries, and the directory name change nothing:
+        // a plain thinking request (the `high` effort) writes the "Absolute
+        // maximum" prompt, `max` the "Beyond maximum" one, `low` none.
+        for (name, encoder) in [
+            ("DeepSeek-V4-Flash", Some(BASE_ENCODER_SNIPPET)),
+            ("DeepSeek-V4-Flash-0731", Some(BASE_ENCODER_SNIPPET)),
+            ("my-local-v4-copy", Some(V0731_ENCODER_SNIPPET)),
+        ] {
+            let (_tmp, tok) = write_v4_model_dir(name, encoder);
+            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+            assert_eq!(
+                tokenizer.native_reasoning_effort_values(),
+                &["low", "high", "max"],
+                "{name}"
+            );
+            assert!(
+                tokenizer.renderer_capabilities().leading_system_only,
+                "{name}: the one profile declares it (a system message after the first is a user turn)"
+            );
+            let out = render_v4(&tokenizer, None, None);
+            assert!(out.contains(V4_HIGH_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "max").unwrap();
+            assert!(out.contains(V4_MAX_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "high").unwrap();
+            assert!(
+                out.contains(V4_HIGH_PREFIX) && !out.contains(V4_MAX_PREFIX),
+                "{name}: {out}"
+            );
+            let out = render_with_native_effort(&tokenizer, "low").unwrap();
+            assert!(!out.contains("Reasoning Effort:"), "{name}: {out}");
+            assert!(out.ends_with("<think>"), "{name}: {out}");
+        }
     }
 
     #[test]
@@ -1032,7 +1067,7 @@ DEFAULT_REASONING_EFFORT = "high""#;
             function: Function {
                 name: "lookup".to_string(),
                 description: None,
-                parameters: parameters.clone(),
+                parameters: Some(parameters.clone()),
                 strict: None,
                 extra: Default::default(),
             },

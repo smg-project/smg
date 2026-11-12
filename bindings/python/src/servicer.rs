@@ -22,13 +22,14 @@ use std::{
 use bytes::Bytes;
 use engine_servicer::{
     BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncodeRelease, EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor,
-    MediaRequest, ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher,
-    SglangModelInfo, SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo,
-    TokenSpeedServicerConfig, TokenSpeedServicerServer, TrtllmModelInfo, TrtllmServicerConfig,
-    TrtllmServicerServer, VllmModelInfo, VllmServicerConfig, VllmServicerServer, ALL_MODALITIES,
-    DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC, DEFAULT_ENGINE_SILENCE_TIMEOUT,
-    DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, MediaError,
+    MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia, ServicerConfig, ServicerError,
+    SglangEncodeDispatcher, SglangMediaProcessor, SglangModelInfo, SglangServicerConfig,
+    SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer,
+    TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer, VllmModelInfo, VllmServicerConfig,
+    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    PIXEL_MODALITIES,
 };
 use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
@@ -522,6 +523,77 @@ impl MediaProcessor for SmgMediaProcessor {
     }
 }
 
+struct SmgSglangMediaProcessor {
+    pipeline: Arc<WorkerMediaPipeline>,
+    admission: Arc<tokio::sync::Semaphore>,
+}
+
+impl SglangMediaProcessor for SmgSglangMediaProcessor {
+    fn identity_key(&self) -> Option<&str> {
+        self.pipeline.sglang_identity_key()
+    }
+
+    /// Bound preprocessing concurrency through cancellation and preserve typed media errors.
+    fn process(
+        &self,
+        mut request: smg_grpc_client::sglang_proto::GenerateRequest,
+    ) -> BoxFuture<Result<smg_grpc_client::sglang_proto::GenerateRequest, tonic::Status>> {
+        let pipeline = Arc::clone(&self.pipeline);
+        let admission = Arc::clone(&self.admission);
+        Box::pin(async move {
+            let permit = admission
+                .acquire_owned()
+                .await
+                .map_err(|_| tonic::Status::unavailable("media processor is closing"))?;
+            // Keep admission until preprocessing actually finishes, including
+            // when the caller aborts while a blocking decoder is running.
+            let span = tracing::debug_span!(target: "smg_request_timing",
+                "sglang_media", request_id = %request.request_id);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "keep the processing slot until a cancelled caller's decoder actually finishes"
+            )]
+            tokio::spawn(tracing::Instrument::instrument(async move {
+                let _permit = permit;
+
+                let mm = request.mm_inputs.take()
+                    .ok_or_else(|| tonic::Status::invalid_argument("missing media references"))?;
+                if mm.pixel_values.is_some() || !mm.model_specific_tensors.is_empty()
+                    || !mm.image_data.is_empty() || !mm.video_data.is_empty()
+                    || !mm.audio_urls.is_empty() || !mm.audio_data.is_empty()
+                    || !request.extra_mm_inputs.is_empty() {
+                    return Err(tonic::Status::invalid_argument("SGLang references require images or videos without tensors or raw media"));
+                }
+                // The shared pipeline matches anchors per modality, preserving URL order.
+                let items = mm.image_urls.into_iter().map(|url| (Modality::Image, url))
+                    .chain(mm.video_urls.into_iter().map(|url| (Modality::Video, url)))
+                    .map(|(modality, url)| WorkerMediaItem { modality, url })
+                    .collect::<Vec<_>>();
+                let tokenized = request.tokenized.as_mut()
+                    .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
+                let (tokens, inputs, extras) = pipeline.process_sglang(
+                    std::mem::take(&mut tokenized.input_ids), &items,
+                ).await.map_err(|error| match error {
+                    WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
+                    WorkerMediaError::Internal(message) => tonic::Status::internal(message),
+                    WorkerMediaError::Media { fault, code, message } => {
+                        smg_grpc_client::stamp_media_code(
+                            fault.stamp(match fault {
+                                smg_grpc_client::WorkerMediaFault::Client => tonic::Status::invalid_argument(message),
+                                smg_grpc_client::WorkerMediaFault::Transient => tonic::Status::unavailable(message),
+                            }), code.as_str(),
+                        )
+                    }
+                })?;
+                tokenized.input_ids = tokens;
+                request.mm_inputs = Some(Box::new(inputs));
+                request.extra_mm_inputs = extras;
+                Ok(request)
+            }, span)).await.map_err(|error| tonic::Status::internal(format!("media task: {error}")))?
+        })
+    }
+}
+
 /// The settings the launcher passes as `smg_media_processor`, by key; the
 /// pipeline itself is built off the GIL once the tokenizer is loaded.
 struct NativeMediaOptions {
@@ -562,8 +634,11 @@ fn native_media_options(
     };
     // The engine's own video frame budget (`0`: every frame); absent when
     // the launcher could not tell, which leaves each spec to its constant.
-    // `video_loader_rule` names a loader rule the pipeline cannot follow; the
-    // pipeline refuses it for a spec that samples the way the loader does.
+    // `video_loader_rule` carries the engine's loader rules as the launcher
+    // reported them; the pipeline refuses the entries that reach the family
+    // (every rule the default loader reads for a family on that loader, the
+    // flag rules for a family whose loader the engine registers for its
+    // processor class, none for a sampler that never followed a loader).
     let video_frame_budget = count("video_frame_budget")?;
     // The engine's encoder budget, the most feature tokens one item may
     // carry; absent when the launcher could not tell, which leaves an item's
@@ -608,6 +683,7 @@ fn native_media_options(
     Ok(NativeMediaOptions {
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
+            tokenizer_dir: None,
             model_id: required("model_id")?,
             served_model_name: Some(served_model_name.to_string()),
             pixel_format: if raw_pixels {
@@ -669,6 +745,10 @@ impl PyVllmGrpcServer {
         kv_role = String::new(),
         kv_engine_id = String::new(),
         runs_mooncake = false,
+        supports_ec_transfer = false,
+        ec_connector = String::new(),
+        ec_role = String::new(),
+        ec_zmq_addrs = None,
         kv_cache_dtype = String::new(),
         attention_backend = String::new(),
         model_dtype = String::new(),
@@ -687,6 +767,7 @@ impl PyVllmGrpcServer {
         engine_reasoning_parser = String::new(),
         constrained_decoding_start = String::new(),
         constrained_decoding = String::new(),
+        structural_tag_vocabulary = String::new(),
         log_stats = None,
         media_processor = None,
         smg_media_processor = None,
@@ -695,6 +776,7 @@ impl PyVllmGrpcServer {
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
         metrics_bind_address = None,
+        warmup_nonce = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -723,6 +805,10 @@ impl PyVllmGrpcServer {
         kv_role: String,
         kv_engine_id: String,
         runs_mooncake: bool,
+        supports_ec_transfer: bool,
+        ec_connector: String,
+        ec_role: String,
+        ec_zmq_addrs: Option<Vec<String>>,
         kv_cache_dtype: String,
         attention_backend: String,
         model_dtype: String,
@@ -741,6 +827,7 @@ impl PyVllmGrpcServer {
         engine_reasoning_parser: String,
         constrained_decoding_start: String,
         constrained_decoding: String,
+        structural_tag_vocabulary: String,
         log_stats: Option<bool>,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
@@ -749,6 +836,7 @@ impl PyVllmGrpcServer {
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> PyResult<Self> {
         if media_processor.is_some() && smg_media_processor.is_some() {
             return Err(PyValueError::new_err(
@@ -784,6 +872,10 @@ impl PyVllmGrpcServer {
             kv_role,
             kv_engine_id,
             runs_mooncake,
+            supports_ec_transfer,
+            ec_connector,
+            ec_role,
+            ec_zmq_addrs: ec_zmq_addrs.unwrap_or_default(),
             kv_cache_dtype,
             attention_backend,
             model_dtype,
@@ -802,6 +894,7 @@ impl PyVllmGrpcServer {
             engine_reasoning_parser,
             constrained_decoding_start,
             constrained_decoding,
+            structural_tag_vocabulary,
             log_stats,
         };
         let servicer = ServicerConfig {
@@ -815,6 +908,7 @@ impl PyVllmGrpcServer {
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
+            warmup_nonce,
         };
         let mut config = VllmServicerConfig {
             servicer,
@@ -924,7 +1018,8 @@ impl PyVllmGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
     /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
@@ -993,6 +1088,8 @@ impl PyTokenSpeedGrpcServer {
         spatial_merge_size = None,
         image_token_id = None,
         video_token_id = None,
+        position_id_per_seconds = None,
+        seconds_per_chunk = None,
         model_dtype = String::new(),
         multimodal_encoder_dtype = String::new(),
         server_args_json = String::new(),
@@ -1009,6 +1106,7 @@ impl PyTokenSpeedGrpcServer {
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
         metrics_bind_address = None,
+        warmup_nonce = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1038,6 +1136,8 @@ impl PyTokenSpeedGrpcServer {
         spatial_merge_size: Option<u32>,
         image_token_id: Option<u32>,
         video_token_id: Option<u32>,
+        position_id_per_seconds: Option<f64>,
+        seconds_per_chunk: Option<f64>,
         model_dtype: String,
         multimodal_encoder_dtype: String,
         server_args_json: String,
@@ -1054,6 +1154,7 @@ impl PyTokenSpeedGrpcServer {
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> PyResult<Self> {
         let model = TokenSpeedModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1076,6 +1177,8 @@ impl PyTokenSpeedGrpcServer {
             spatial_merge_size,
             image_token_id,
             video_token_id,
+            position_id_per_seconds,
+            seconds_per_chunk,
             model_dtype,
             multimodal_encoder_dtype,
             server_args_json,
@@ -1099,6 +1202,7 @@ impl PyTokenSpeedGrpcServer {
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
+            warmup_nonce,
         };
         let config = TokenSpeedServicerConfig { servicer, model };
         let inner = py
@@ -1162,7 +1266,8 @@ impl PyTokenSpeedGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
     /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
@@ -1224,18 +1329,40 @@ fn dispatch_answer(py: Python<'_>, answer: &Bound<'_, PyAny>) -> PyResult<Dispat
 
 /// The encode dispatch of an SGLang language-side worker behind a Python
 /// object (see `smg_grpc_servicer.sglang.rust_encode.EncodeDispatchBridge`):
-/// `dispatch(rid, image_urls, on_error)` runs SGLang's own receiver for the
-/// request (the assignment across the encoders, the encode requests to them
-/// on the receiver's thread) and returns a [`DispatchAnswer`]; `on_error` is
-/// this side's [`DispatchError`], which the bridge calls with the receiver's
-/// failure once the release ran, so the notice reaches the scheduler rank
-/// holding the request. Calls into Python only from a blocking thread, as
-/// the media bridge does.
+/// `dispatch(rid, image_urls, video_urls, audio_urls, on_error)` runs
+/// SGLang's own receiver for the request (the assignment across the encoders,
+/// the encode requests to them on the receiver's thread) and returns a
+/// [`DispatchAnswer`]; `on_error` is this side's [`DispatchError`], which the
+/// bridge calls with the receiver's failure once the release ran, so the
+/// notice reaches the scheduler rank holding the request. The bridge's
+/// `transport_mode` (the engine's receiver mode, `http` or `grpc`) is read
+/// once, when the server is built: it decides what the dispatch is asked for
+/// (the gRPC encoder service takes images only). Calls into Python only from
+/// a blocking thread, as the media bridge does.
 struct PythonEncodeDispatcher {
     bridge: Arc<Py<PyAny>>,
+    transport: EncodeTransport,
+}
+
+/// The transport the bridge's receiver runs: its `transport_mode`, the
+/// engine's receiver mode; another value refuses the server by name.
+fn encode_transport(bridge: &Bound<'_, PyAny>) -> PyResult<EncodeTransport> {
+    let mode: String = bridge.getattr("transport_mode")?.extract()?;
+    match mode.as_str() {
+        "http" => Ok(EncodeTransport::Http),
+        "grpc" => Ok(EncodeTransport::Grpc),
+        other => Err(PyValueError::new_err(format!(
+            "the encode dispatcher's transport_mode is {other:?}; the engine's receiver modes \
+             are \"http\" and \"grpc\""
+        ))),
+    }
 }
 
 impl SglangEncodeDispatcher for PythonEncodeDispatcher {
+    fn transport(&self) -> EncodeTransport {
+        self.transport
+    }
+
     fn dispatch(
         &self,
         request: EncodeDispatchRequest,
@@ -1244,7 +1371,12 @@ impl SglangEncodeDispatcher for PythonEncodeDispatcher {
         Box::pin(async move {
             let EncodeDispatchRequest {
                 rid,
-                image_urls,
+                media:
+                    EncodeMediaRefs {
+                        image_urls,
+                        video_urls,
+                        audio_urls,
+                    },
                 on_error,
             } = request;
             // The release becomes its guard inside the blocking task: a
@@ -1261,8 +1393,11 @@ impl SglangEncodeDispatcher for PythonEncodeDispatcher {
                                 sink: on_error,
                             },
                         )?;
-                        let answer =
-                            bridge.call_method1(py, "dispatch", (rid, image_urls, on_error))?;
+                        let answer = bridge.call_method1(
+                            py,
+                            "dispatch",
+                            (rid, image_urls, video_urls, audio_urls, on_error),
+                        )?;
                         dispatch_answer(py, answer.bind(py))
                     })?;
                 let sent = release.map(|release| {
@@ -1364,6 +1499,7 @@ impl PyTrtllmGrpcServer {
         context_parallel_size = 0,
         data_parallel_size = 1,
         guided_decoding_backend = String::new(),
+        structural_tag_vocabulary = String::new(),
         max_running_requests = 0,
         kv_events_endpoint = String::new(),
         kv_events_replay_endpoint = String::new(),
@@ -1373,6 +1509,7 @@ impl PyTrtllmGrpcServer {
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
         metrics_bind_address = None,
+        warmup_nonce = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1400,6 +1537,7 @@ impl PyTrtllmGrpcServer {
         context_parallel_size: i32,
         data_parallel_size: i32,
         guided_decoding_backend: String,
+        structural_tag_vocabulary: String,
         max_running_requests: i32,
         kv_events_endpoint: String,
         kv_events_replay_endpoint: String,
@@ -1409,6 +1547,7 @@ impl PyTrtllmGrpcServer {
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> PyResult<Self> {
         let model = TrtllmModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1429,6 +1568,7 @@ impl PyTrtllmGrpcServer {
             context_parallel_size,
             data_parallel_size,
             guided_decoding_backend,
+            structural_tag_vocabulary,
             max_running_requests,
             kv_events_endpoint,
             kv_events_replay_endpoint,
@@ -1445,6 +1585,7 @@ impl PyTrtllmGrpcServer {
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
+            warmup_nonce,
         };
         let config = TrtllmServicerConfig { servicer, model };
         let inner = py
@@ -1580,11 +1721,13 @@ impl PySglangGrpcServer {
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
         encode_dispatcher = None,
+        smg_media_processor = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
         metrics_bind_address = None,
+        warmup_nonce = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1621,19 +1764,33 @@ impl PySglangGrpcServer {
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
         encode_dispatcher: Option<Bound<'_, PyAny>>,
+        smg_media_processor: Option<Bound<'_, PyDict>>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> PyResult<Self> {
         // The language side's encode dispatch, behind the launcher's bridge
         // object; absent on every other worker.
-        let encode_dispatcher = encode_dispatcher.map(|bridge| {
-            Arc::new(PythonEncodeDispatcher {
-                bridge: Arc::new(bridge.unbind()),
-            }) as Arc<dyn SglangEncodeDispatcher>
-        });
+        let encode_dispatcher = encode_dispatcher
+            .map(|bridge| -> PyResult<Arc<dyn SglangEncodeDispatcher>> {
+                let transport = encode_transport(&bridge)?;
+                Ok(Arc::new(PythonEncodeDispatcher {
+                    bridge: Arc::new(bridge.unbind()),
+                    transport,
+                }))
+            })
+            .transpose()?;
+        let native = smg_media_processor
+            .map(|options| {
+                native_media_options(
+                    &options,
+                    served_model_name.as_deref().unwrap_or(&model_path),
+                )
+            })
+            .transpose()?;
         let model = SglangModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
@@ -1673,15 +1830,57 @@ impl PySglangGrpcServer {
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
+            warmup_nonce,
         };
-        let config = SglangServicerConfig {
+        let mut config = SglangServicerConfig {
             servicer,
             model,
             encode_dispatcher,
+            media_processor: None,
         };
-        let inner = py
-            .detach(|| SglangServicerServer::start(config))
-            .map_err(to_py_err)?;
+        let inner = py.detach(|| -> PyResult<SglangServicerServer> {
+            if let Some(native) = native {
+                if !matches!(
+                    native.settings.encoder_dtype.as_str(),
+                    "float32" | "bfloat16" | "float16"
+                ) {
+                    return Err(PyValueError::new_err(
+                        "SGLang media dtype must be float32, bfloat16 or float16",
+                    ));
+                }
+                if native.max_inflight > tokio::sync::Semaphore::MAX_PERMITS {
+                    return Err(PyValueError::new_err(
+                        "media max_inflight exceeds the semaphore limit",
+                    ));
+                }
+                let dir = config.servicer.tokenizer_dir.as_ref().ok_or_else(|| {
+                    PyValueError::new_err("smg media processing requires tokenizer_dir")
+                })?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                let pipeline = runtime
+                    .block_on(async {
+                        let tokenizer = llm_tokenizer::factory::create_tokenizer_async(dir).await?;
+                        let mut settings = native.settings;
+                        settings.tokenizer_dir = Some(dir.clone());
+                        WorkerMediaPipeline::new_sglang(settings, tokenizer).await
+                    })
+                    .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+                if !matches!(pipeline.spec_name(), "glm53_flash" | "minimax_m3") {
+                    return Err(PyValueError::new_err(format!(
+                        "SGLang smg media processing currently supports GLM-5.3-Flash and MiniMax-M3; got {}",
+                        pipeline.spec_name()
+                    )));
+                }
+                config.media_processor = Some(Arc::new(SmgSglangMediaProcessor {
+                    pipeline: Arc::new(pipeline),
+                    admission: Arc::new(tokio::sync::Semaphore::new(native.max_inflight)),
+                }));
+            }
+            SglangServicerServer::start(config).map_err(to_py_err)
+        })?;
         Ok(Self { inner })
     }
 
@@ -1740,7 +1939,8 @@ impl PySglangGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
     /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);

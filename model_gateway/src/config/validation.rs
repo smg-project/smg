@@ -8,7 +8,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{middleware::scheduler, policies::cost as selection_cost, worker::endpoint::Endpoint};
+use crate::{
+    middleware::scheduler,
+    policies::{
+        cost as selection_cost,
+        engine_host::{preset_name, Decider},
+    },
+    worker::endpoint::Endpoint,
+};
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -76,7 +83,7 @@ fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
     {
         return true;
     }
-    let grpc = |url: &str| url.starts_with("grpc://") || url.starts_with("grpcs://");
+    let grpc = |url: &str| url.starts_with("grpc://");
     match &config.mode {
         RoutingMode::Regular { worker_urls } => worker_urls.iter().any(|url| grpc(url)),
         RoutingMode::PrefillDecode {
@@ -140,7 +147,10 @@ fn local_tokenizer_source_error(path: &Path) -> Result<(), SourceProblem> {
         entry.is_ok_and(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name == "tokenizer.json" || name == "tiktoken.model" || name.ends_with(".tiktoken")
+            name == "tokenizer.json"
+                || name == "tekken.json"
+                || name == "tiktoken.model"
+                || name.ends_with(".tiktoken")
         })
     }) || (path.join("vocab.json").is_file()
         && path.join("merges.txt").is_file());
@@ -148,7 +158,7 @@ fn local_tokenizer_source_error(path: &Path) -> Result<(), SourceProblem> {
         Ok(())
     } else {
         Err(unusable(
-            "contains no tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json with merges.txt)"
+            "contains no tokenizer file (tokenizer.json, tekken.json, tiktoken.model, *.tiktoken, or vocab.json with merges.txt)"
                 .to_string(),
         ))
     }
@@ -208,8 +218,23 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // matches schemes case-sensitively, so a mixed-case scheme would be
     // rewritten downstream and diverge from the reservation key — the
     // same orphan failure as a schemeless URL.
-    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc"];
+    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "ipc", "tcp"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
+    // A gRPC worker over TLS is refused by name, with the reason: the
+    // gateway's gRPC channel speaks plain HTTP/2 over TCP, and no build of
+    // the gateway holds a root store to validate an engine's certificate
+    // against, so no `grpcs://` worker ever completed a handshake the
+    // gateway could trust; the refusal belongs here, at start-up, not at
+    // the first call.
+    if scheme == "grpcs" {
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            Endpoint::redacted_str(url),
+            "grpcs:// workers are not supported: the gateway's gRPC channel speaks plain \
+             HTTP/2 and holds no certificate store to validate an engine's; use grpc://"
+                .to_string(),
+        ));
+    }
     // A refusal names the address through the gateway's masking: it is
     // written to stderr at start-up and answered to the API caller, and
     // the URL may carry credentials. What the address parser accepts (a
@@ -222,8 +247,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // further into a URL could be a userinfo, and is left out.
     if !ALLOWED_SCHEMES.contains(&scheme) {
         let rule =
-            "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// \
-                    scheme";
+            "URL must start with a lowercase http://, https://, grpc://, ipc://, or tcp:// scheme";
         let is_a_scheme = !scheme.is_empty()
             && scheme
                 .chars()
@@ -272,7 +296,92 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
             ));
         }
     }
+    // A tcp:// worker URL is what the ZMQ sockets bind, where a userinfo
+    // (`user:secret@`) has no meaning at all: refused, by the adapter's own
+    // reading (an `@` anywhere after the scheme), so that nothing the
+    // validator passes is refused at registration instead, whatever the
+    // `Endpoint` grammar makes of the rest of the string. (A gRPC worker
+    // URL's userinfo is accepted and named by [`unused_credentials_warning`],
+    // at start-up and at registration, where a log line is seen.)
+    if url
+        .strip_prefix("tcp://")
+        .is_some_and(|authority| authority.contains('@'))
+    {
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            Endpoint::redacted_str(url),
+            "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets at the \
+             host and port",
+        ));
+    }
     Ok(())
+}
+
+/// The warning for a `grpc://` worker URL that carries userinfo
+/// (`user:secret@`), `None` for every other URL. An HTTP worker's userinfo
+/// is sent as basic auth; a gRPC worker never receives it, since the channel
+/// names the host and port alone, so a credential written there is named
+/// once, masked, instead of dropped in silence. The URL stays accepted: it is
+/// otherwise valid and deployments may carry one. Pure, so that start-up can
+/// log it after the subscriber exists (the validator runs before) and the
+/// add-worker route can log it at registration.
+pub fn unused_credentials_warning(url: &str) -> Option<String> {
+    let endpoint = Endpoint::parse(url).ok()?;
+    (url.starts_with("grpc://") && endpoint.has_credentials()).then(|| {
+        format!(
+            "worker URL {} carries userinfo, which is not sent to a gRPC worker: the gateway's \
+             channel names the host and port alone",
+            endpoint.redacted()
+        )
+    })
+}
+
+/// [`unused_credentials_warning`] over every worker URL the configuration
+/// lists for a mode, in the order they are listed.
+pub fn unused_credentials_warnings(mode: &RoutingMode) -> Vec<String> {
+    let urls: Vec<&str> = match mode {
+        RoutingMode::Regular { worker_urls }
+        | RoutingMode::OpenAI { worker_urls }
+        | RoutingMode::Anthropic { worker_urls }
+        | RoutingMode::Gemini { worker_urls } => worker_urls.iter().map(String::as_str).collect(),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => prefill_urls
+            .iter()
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+        RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            ..
+        } => encode_urls
+            .iter()
+            .chain(prefill_urls.iter())
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+    };
+    urls.into_iter()
+        .filter_map(unused_credentials_warning)
+        .collect()
+}
+
+/// The encode side takes three policies. This is the one list: the mode walk
+/// of the validator reads it in EPD mode, and the Python binding asks it in
+/// every mode, which covers an encode policy given outside EPD.
+pub fn validate_encode_policy(policy: &PolicyConfig) -> ConfigResult<()> {
+    match policy {
+        PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::ConsistentHashing => Ok(()),
+        _ => Err(ConfigError::invalid_value(
+            "encode_policy",
+            policy.name(),
+            "expected random, round_robin or consistent_hashing",
+        )),
+    }
 }
 
 /// Parse a listener host as operators write it: an IP literal, with or
@@ -380,10 +489,63 @@ pub fn available_cpus() -> usize {
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
+    /// Under `--policy-engine engine` every policy that decides (the default
+    /// and the two pair sides) is one whose stages the engine carries in
+    /// this build, and the engine itself accepts the configuration: the
+    /// decider is built once here, so a tunable the engine refuses fails
+    /// the start instead of falling back to the legacy path.
+    fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
+        if config.policy_engine != PolicyEngineMode::Engine {
+            return Ok(());
+        }
+        // The decider binds the default, prefill and decode profiles; an
+        // encode side has none in this build, so an encode decision would
+        // run the default profile where the legacy path hashes content. The
+        // mode is refused by name until the encode step binds its profile.
+        if matches!(config.mode, RoutingMode::EncodePrefillDecode { .. }) {
+            return Err(ConfigError::invalid_value(
+                "policy_engine",
+                "encode-prefill-decode",
+                "the policy engine carries no encode profile in this build; \
+                 encode-prefill-decode runs under --policy-engine legacy",
+            ));
+        }
+        let prefill = config.mode.get_prefill_policy(&config.policy);
+        let decode = config.mode.get_decode_policy(&config.policy);
+        for policy in [&config.policy, prefill, decode] {
+            if preset_name(policy).is_none() {
+                return Err(ConfigError::invalid_value(
+                    "policy_engine",
+                    policy.name(),
+                    "the policy engine carries random, round_robin, passthrough, power_of_two \
+                     (expected_wait, requests, least_requests), least_load and manual in this \
+                     build",
+                ));
+            }
+        }
+        Decider::from_configs(
+            &config.policy,
+            prefill,
+            decode,
+            &config.routing_key_override,
+        )
+        .map_err(|error| {
+            let mut names = vec![config.policy.name()];
+            for policy in [prefill, decode] {
+                if !names.contains(&policy.name()) {
+                    names.push(policy.name());
+                }
+            }
+            ConfigError::invalid_value("policy_engine", names.join("/"), error.to_string())
+        })?;
+        Ok(())
+    }
+
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_policy_engine(config)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
@@ -665,13 +827,26 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validates `tenant_api_keys`: non-empty `tenant_id`/`key`, and no two
-    /// credentials (including the shared `api_key`) sharing a secret value —
-    /// duplicates would silently attribute one tenant's traffic to another.
-    /// Runs regardless of construction path, since `TenantApiKeyEntry` is a
-    /// public deserializable struct. Compares hashes only; errors never
-    /// include a raw key value.
+    /// Validates `tenant_api_keys` against the shared `api_key`: the rules
+    /// of [`Self::tenant_credentials`] over the start's configuration. Runs
+    /// regardless of construction path, since `TenantApiKeyEntry` is a
+    /// public deserializable struct.
     fn validate_tenant_api_keys(config: &RouterConfig) -> ConfigResult<()> {
+        Self::tenant_credentials(config.api_key.as_deref(), &config.tenant_api_keys)
+    }
+
+    /// The rules of a serving key set, the shared key and the tenant
+    /// entries that are in force together: non-empty `tenant_id`/`key`
+    /// without surrounding whitespace, a `tenant_id` within its column, and
+    /// no two credentials (the shared key included) sharing a secret value —
+    /// duplicates would silently attribute one tenant's traffic to another.
+    /// The start runs it over its configuration, and a reload over the set
+    /// it is about to put in force. Compares hashes only; errors never
+    /// include a raw key value.
+    pub(crate) fn tenant_credentials(
+        api_key: Option<&str>,
+        entries: &[TenantApiKeyEntry],
+    ) -> ConfigResult<()> {
         fn hash(key: &str) -> [u8; 32] {
             Sha256::digest(key.as_bytes()).into()
         }
@@ -679,11 +854,11 @@ impl ConfigValidator {
         let mut seen: std::collections::HashMap<[u8; 32], String> =
             std::collections::HashMap::new();
 
-        if let Some(api_key) = &config.api_key {
+        if let Some(api_key) = api_key {
             seen.insert(hash(api_key), "the shared api_key".to_string());
         }
 
-        for entry in &config.tenant_api_keys {
+        for entry in entries {
             let trimmed_tenant_id = entry.tenant_id.trim();
             if trimmed_tenant_id.is_empty() {
                 return Err(ConfigError::ValidationFailed {
@@ -880,7 +1055,7 @@ impl ConfigValidator {
                 }
                 if let Some(policy) = encode_policy {
                     Self::validate_policy(policy)?;
-                    Self::validate_encode_policy(policy)?;
+                    validate_encode_policy(policy)?;
                 }
                 if let Some(policy) = prefill_policy {
                     Self::validate_policy(policy)?;
@@ -1055,7 +1230,6 @@ impl ConfigValidator {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
-                max_waiting_requests: _,
             } => {
                 if !kv_pressure_weight.is_finite() || *kv_pressure_weight < 0.0 {
                     return Err(ConfigError::invalid_value(
@@ -1155,18 +1329,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_encode_policy(policy: &PolicyConfig) -> ConfigResult<()> {
-        match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::ConsistentHashing => {
-                Ok(())
-            }
-            _ => Err(ConfigError::IncompatibleConfig {
-                reason: "Encode policy supports random, round_robin, or consistent_hashing"
-                    .to_string(),
-            }),
-        }
-    }
-
     /// Validate listener settings and mode-specific serving constraints.
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if let Err(reason) = parse_bind_host(&config.host) {
@@ -1243,6 +1405,16 @@ impl ConfigValidator {
             if let Err(reason) = parse_bind_host(admin_host) {
                 return Err(ConfigError::invalid_value("admin_host", admin_host, reason));
             }
+        }
+        // The bound is the admin listener's own: without a port there is no
+        // listener for it to bound, and nothing would say so.
+        if config.admin_max_connections > 0 && config.admin_port.is_none() {
+            return Err(ConfigError::invalid_value(
+                "admin_max_connections",
+                config.admin_max_connections,
+                "--admin-max-connections needs --admin-port: the admin listener exists only \
+                 with a port",
+            ));
         }
 
         // Each listener needs its own port. Two of them on one port used to
@@ -1370,6 +1542,13 @@ impl ConfigValidator {
             return Err(ConfigError::invalid_value(
                 "max_connections",
                 config.max_connections,
+                format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
+            ));
+        }
+        if config.admin_max_connections > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::invalid_value(
+                "admin_max_connections",
+                config.admin_max_connections,
                 format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
             ));
         }
@@ -2336,6 +2515,7 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::worker::ConnectionMode;
 
@@ -2553,6 +2733,115 @@ mod tests {
         assert!(matches!(
             ConfigValidator::validate(&config),
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "cache_boundaries"
+        ));
+    }
+
+    /// A tunable the engine refuses (a default throughput that overflows the
+    /// engine's single-precision parameter) fails the start under the
+    /// switch instead of falling back; the legacy path takes it.
+    #[test]
+    fn the_engine_switch_refuses_a_tunable_the_engine_cannot_carry() {
+        let config = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            policy: PolicyConfig::LeastLoad {
+                kv_pressure_weight: 0.15,
+                mean_prefill_tokens: 1024,
+                default_throughput: 1e40,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref value, ref reason })
+                if field == "policy_engine" && value == "least_load" && reason.contains("default_throughput")
+        ));
+        let legacy = RouterConfig {
+            policy_engine: PolicyEngineMode::Legacy,
+            ..config
+        };
+        assert!(ConfigValidator::validate(&legacy).is_ok());
+    }
+
+    /// Under `engine` the encode-prefill-decode mode is refused at start by
+    /// name: the decider binds no encode profile in this build, so an encode
+    /// decision would run the default profile; the legacy path takes it.
+    #[test]
+    fn the_engine_switch_refuses_encode_prefill_decode_without_an_encode_profile() {
+        let config = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            mode: RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("http://encode:8000".to_string(), None)],
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref value, .. })
+                if field == "policy_engine" && value == "encode-prefill-decode"
+        ));
+        let legacy = RouterConfig {
+            policy_engine: PolicyEngineMode::Legacy,
+            ..config
+        };
+        assert!(ConfigValidator::validate(&legacy).is_ok());
+    }
+
+    /// Under `engine` a policy the engine does not carry is refused at start
+    /// by name, on the default and on a pair side; the legacy path takes it.
+    #[test]
+    fn the_engine_switch_refuses_a_policy_the_engine_does_not_carry() {
+        let config = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref value, .. })
+                if field == "policy_engine" && value == "cache_aware"
+        ));
+        let legacy = RouterConfig {
+            policy_engine: PolicyEngineMode::Legacy,
+            ..config
+        };
+        assert!(ConfigValidator::validate(&legacy).is_ok());
+
+        let carried = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            policy: PolicyConfig::RoundRobin,
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(PolicyConfig::LeastLoad {
+                    kv_pressure_weight: 1.0,
+                    mean_prefill_tokens: 100,
+                    default_throughput: 1000.0,
+                }),
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&carried).is_ok());
+        let decode_side = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_metric: PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 64 },
+                }),
+            },
+            ..carried
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&decode_side),
+            Err(ConfigError::InvalidValue { ref field, ref value, .. })
+                if field == "policy_engine" && value == "power_of_two"
         ));
     }
 
@@ -3283,7 +3572,8 @@ mod tests {
             "http://10.0.0.5:8000",
             "https://worker.example.com",
             "grpc://10.0.0.5:50051",
-            "grpcs://worker.example.com:443",
+            "ipc:///tmp/smg-zmq/ts0.ipc",
+            "tcp://10.0.0.5:31000",
         ] {
             assert!(validate_worker_url(url).is_ok(), "expected {url} to pass");
         }
@@ -3337,6 +3627,12 @@ mod tests {
             "{masked}"
         );
         assert!(!masked.contains("secret"), "{masked}");
+        let tls = validate_worker_url("grpcs://user:secret@worker:50051")
+            .expect_err("refused")
+            .to_string();
+        assert!(tls.contains("grpcs://***@worker:50051"), "{tls}");
+        assert!(tls.contains("grpcs:// workers are not supported"), "{tls}");
+        assert!(!tls.contains("secret"), "{tls}");
         let echoed = validate_worker_url("10.0.0.5:8000")
             .expect_err("refused")
             .to_string();
@@ -3364,6 +3660,82 @@ mod tests {
             assert!(!text.contains("secret"), "{text}");
             assert!(text.contains("<unparsable address>"), "{text}");
         }
+    }
+
+    /// A userinfo is refused on a `tcp://` worker URL (the sockets bind the
+    /// host and port; nothing reads it), masked in the refusal.
+    #[test]
+    fn a_tcp_worker_url_with_userinfo_is_refused_masked() {
+        for url in [
+            "tcp://user:secret@10.0.0.5:31000",
+            "tcp://secret@10.0.0.5:31000",
+        ] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("tcp://***@10.0.0.5:31000"), "{text}");
+            assert!(text.contains("takes no userinfo"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+        }
+        assert!(validate_worker_url("tcp://10.0.0.5:31000").is_ok());
+    }
+
+    /// What the ZMQ adapter refuses for a userinfo, the validator refuses
+    /// first: a `tcp://` URL with an `@` that the endpoint grammar reads as
+    /// something else (a rank suffix after it, an empty userinfo) is refused
+    /// here, masked, instead of passing to a refusal at registration.
+    #[test]
+    fn a_tcp_worker_url_the_adapter_refuses_is_refused_by_the_validator() {
+        for url in ["tcp://user:secret@host:1@2", "tcp://@host:31000"] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("takes no userinfo"), "{url}: {text}");
+            assert!(!text.contains("secret"), "{url}: {text}");
+        }
+        let text = validate_worker_url("tcp://user:secret@host:1@2")
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("tcp://***@host:1@2"), "{text}");
+    }
+
+    /// A `grpc://` worker URL with userinfo stays accepted and earns the one
+    /// warning, which names the address masked and never the secret; an
+    /// `http://` URL's userinfo is basic auth and earns none, nor does a URL
+    /// without one. Over a mode, every listed URL is read once, in order.
+    #[test]
+    fn a_grpc_worker_url_with_userinfo_is_accepted_and_named_once_masked() {
+        validate_worker_url("grpc://user:secret@worker:50051").expect("accepted");
+        let warning = unused_credentials_warning("grpc://user:secret@worker:50051").unwrap();
+        assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
+        assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
+        assert!(!warning.contains("secret"), "{warning}");
+        for url in ["http://user:secret@worker:8000", "grpc://worker:50051"] {
+            assert_eq!(unused_credentials_warning(url), None, "{url}");
+        }
+
+        let mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![
+                ("grpc://user:secret@prefill:50051".to_string(), Some(8998)),
+                ("http://user:secret@prefill-http:8000".to_string(), None),
+            ],
+            decode_urls: vec![
+                "grpc://decode:50051".to_string(),
+                "grpc://token@decode-2:50051".to_string(),
+            ],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let warnings = unused_credentials_warnings(&mode);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("grpc://***@prefill:50051"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("grpc://***@decode-2:50051"),
+            "{warnings:?}"
+        );
+        assert!(unused_credentials_warnings(&RoutingMode::Regular {
+            worker_urls: vec!["http://user:secret@worker:8000".to_string()],
+        })
+        .is_empty());
     }
 
     #[test]
@@ -3418,6 +3790,30 @@ mod tests {
             },
             PolicyConfig::Random,
         )
+    }
+
+    /// Under `engine` the sticky override's headers are the default
+    /// binding's sessions rule: a name repeated in another case is one
+    /// header, as under legacy; a header on the engine's deny-list refuses
+    /// the start by name, where the legacy path takes it.
+    #[test]
+    fn the_engine_switch_takes_a_repeated_routing_header_and_refuses_a_denied_one() {
+        let mut config = regular_mode_config();
+        config.policy_engine = PolicyEngineMode::Engine;
+        config.routing_key_override.enabled = true;
+        config.routing_key_override.headers =
+            vec!["X-Routing-Key".to_string(), "x-routing-key".to_string()];
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config.routing_key_override.headers = vec!["x-api-key".to_string()];
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref reason, .. })
+                if field == "policy_engine"
+                    && reason.contains("x-api-key")
+                    && reason.contains("deny-list")
+        ));
+        config.policy_engine = PolicyEngineMode::Legacy;
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
@@ -4479,7 +4875,18 @@ mod tests {
             },
             PolicyConfig::Random,
         );
-        assert!(ConfigValidator::validate(&invalid_cache_aware).is_err());
+        match ConfigValidator::validate(&invalid_cache_aware) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "encode_policy");
+                assert_eq!(value, "cache_aware");
+                assert_eq!(reason, "expected random, round_robin or consistent_hashing");
+            }
+            other => panic!("expected the field-named refusal, got {other:?}"),
+        }
 
         let invalid_least_load = RouterConfig::new(
             RoutingMode::EncodePrefillDecode {
@@ -4490,14 +4897,16 @@ mod tests {
                     kv_pressure_weight: 0.15,
                     mean_prefill_tokens: 1024,
                     default_throughput: 2000.0,
-                    max_waiting_requests: 0,
                 }),
                 prefill_policy: None,
                 decode_policy: None,
             },
             PolicyConfig::Random,
         );
-        assert!(ConfigValidator::validate(&invalid_least_load).is_err());
+        assert!(matches!(
+            ConfigValidator::validate(&invalid_least_load),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "encode_policy"
+        ));
     }
 
     #[test]
@@ -4555,8 +4964,10 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// A gRPC worker over TLS is refused at start-up, by name and with the
+    /// reason, rather than at its first call.
     #[test]
-    fn test_validate_grpcs_worker_url() {
+    fn test_validate_grpcs_worker_url_is_refused() {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpcs://worker:50051".to_string()],
@@ -4567,8 +4978,13 @@ mod tests {
         config.connection_mode = ConnectionMode::Grpc;
         config.model_path = Some("meta-llama/Llama-3-8B".to_string());
 
-        let result = ConfigValidator::validate(&config);
-        assert!(result.is_ok());
+        let error = ConfigValidator::validate(&config).expect_err("grpcs:// is refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("grpcs:// workers are not supported"),
+            "{text}"
+        );
+        assert!(text.contains("use grpc://"), "{text}");
     }
 
     #[test]
@@ -4609,6 +5025,32 @@ mod tests {
             }) if field == expected_field => (value, reason),
             other => panic!("expected a {expected_field} error, got {other:?}"),
         }
+    }
+
+    /// The validator's directory rule is the loader's: a directory holding
+    /// `tekken.json` alone is a tokenizer source, and the exact name is the
+    /// rule (the loader's directory arm reads that file; another name is a
+    /// single-file source, not a directory layout).
+    #[test]
+    fn a_directory_holding_a_tekken_file_alone_is_a_tokenizer_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tekken.json"), "{}").unwrap();
+        assert!(local_tokenizer_source_error(dir.path()).is_ok());
+        let config = RouterConfig {
+            tokenizer_path: Some(dir.path().to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("tekken_v3.json"), "{}").unwrap();
+        let (_, reason) = refused_source(
+            &RouterConfig {
+                tokenizer_path: Some(other.path().to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            "tokenizer_path",
+        );
+        assert!(reason.contains("contains no tokenizer file"), "{reason}");
     }
 
     #[test]
@@ -4710,8 +5152,8 @@ mod tests {
             ("igw", with(regular(&[]), true, None)),
             ("discovery", with(regular(&[]), false, Some(discovery))),
             (
-                "a grpcs url",
-                with(regular(&["grpcs://b:50051"]), false, None),
+                "a grpc url alone",
+                with(regular(&["grpc://b:50051"]), false, None),
             ),
             (
                 "a grpc url beside an http one",
@@ -5053,6 +5495,68 @@ mod tests {
                 assert!(reason.contains("0 = no bound"), "{reason}");
             }
             other => panic!("expected an invalid max_connections, got {other:?}"),
+        }
+    }
+
+    /// The admin listener's bound has the same ceiling, refused by its own
+    /// name; no bound (0) and ordinary counts pass.
+    #[test]
+    fn an_admin_connection_limit_above_the_permit_maximum_is_rejected() {
+        let config = |admin_max_connections: usize| RouterConfig {
+            admin_max_connections,
+            admin_port: Some(30004),
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for accepted in [0, 1, 4096, Semaphore::MAX_PERMITS] {
+            ConfigValidator::validate(&config(accepted))
+                .unwrap_or_else(|e| panic!("admin_max_connections {accepted}: {e}"));
+        }
+        match ConfigValidator::validate(&config(Semaphore::MAX_PERMITS + 1)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "admin_max_connections");
+                assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
+                assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid admin_max_connections, got {other:?}"),
+        }
+    }
+
+    /// The bound is the admin listener's own: without `admin_port` there is
+    /// no listener to bound, so a bound without the port is refused by name
+    /// (as a host without the port is); with the port, or without a bound,
+    /// the settings pass.
+    #[test]
+    fn an_admin_connection_bound_without_an_admin_port_is_rejected() {
+        let config = |admin_max_connections: usize, admin_port: Option<u16>| RouterConfig {
+            admin_max_connections,
+            admin_port,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for (bound, port) in [(0, None), (16, Some(30004))] {
+            ConfigValidator::validate(&config(bound, port))
+                .unwrap_or_else(|e| panic!("bound {bound} with port {port:?}: {e}"));
+        }
+        match ConfigValidator::validate(&config(16, None)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "admin_max_connections");
+                assert_eq!(value, "16");
+                assert!(reason.contains("--admin-port"), "{reason}");
+            }
+            other => panic!("expected an invalid admin_max_connections, got {other:?}"),
         }
     }
 

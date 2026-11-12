@@ -15,19 +15,21 @@ pub(crate) mod tonic_ext;
 // Re-export all public items so consumer imports stay unchanged.
 pub use aliases::{answering_to, ALIASES, UNANSWERED};
 pub(crate) use chat_utils::{
-    completion_finish_reason, encode_blocking, encode_prompt_blocking,
-    filter_chat_request_by_tool_choice, filter_tools_by_tool_choice, generate_tool_call_id,
-    keep_first_tool_call, keep_first_tool_call_items, missing_tokenizer_response,
-    parse_finish_reason, parse_json_schema_response, process_chat_messages_with_placeholders,
-    resolve_tokenizer, send_error_sse, validate_chat_content_parts,
+    completion_finish_reason, decode_ids_blocking, encode_blocking, encode_blocking_in_batch,
+    encode_prompt_blocking, encode_texts_blocking, filter_chat_request_by_tool_choice,
+    filter_tools_by_tool_choice, generate_tool_call_id, keep_first_tool_call,
+    keep_first_tool_call_items, missing_tokenizer_response, parse_finish_reason,
+    parse_json_schema_response, process_chat_messages_with_placeholders, resolve_tokenizer,
+    send_error_sse, validate_chat_content_parts, InPlaceBudget,
 };
 pub use chat_utils::{
     create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,
-    request_as_rendered,
+    request_as_rendered, stop_rules,
 };
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
-    convert_proto_to_openai_logprobs, has_entries,
+    convert_proto_to_completion_logprobs, convert_proto_to_openai_logprobs, has_entries,
+    requested_alternatives,
 };
 pub use message_utils::{process_messages_with_encoding, template_tools};
 pub(crate) use message_utils::{resolve_media, MediaContext};
@@ -35,18 +37,24 @@ pub(crate) use metrics::{
     error_reason_for_response, error_type_for_response, error_type_from_status, mark_error_reason,
     route_to_endpoint,
 };
+#[cfg(test)]
+pub(crate) use parsers::messages_reasoning_starts_in_prefill;
+/// The parser-name resolver, public for its allocation pin
+/// (`tests/parser_read_allocation_pins.rs`): a single read's one String.
+pub use parsers::ParserResolver;
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
 // predicates instead of duplicating them: the rendered one where they render,
 // the request-based guess where they do not.
 pub use parsers::{chat_reasoning_starts_in_prefill, chat_reasoning_starts_in_rendered_prefill};
 pub(crate) use parsers::{
-    check_reasoning_parser_availability, check_tool_parser_availability, create_reasoning_parser,
-    create_tool_parser, get_tool_parser, messages_reasoning_starts_in_prefill,
-    reasoning_parser_requires_special_tokens, rendered_prompt_reasoning_in_prefill,
-    tool_constraints_for_worker, ModelNames, Names, ParserResolver, WorkerDecoding,
+    chat_reasoning_starts_in_rendered_prefill_for, check_reasoning_parser_availability,
+    check_tool_parser_availability, create_reasoning_parser, create_tool_parser, get_tool_parser,
+    messages_reasoning_starts_in_prefill_for, reasoning_parser_requires_special_tokens,
+    rendered_prompt_reasoning_in_prefill, tool_constraints_for_worker, ModelNames, Names,
+    TagVocabulary, WorkerDecoding,
 };
 pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
-pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
+pub(crate) use stream_failure::{choice_mut, send_stream_failure, StreamFailure, StreamSource};
 
 /// One WARN per choice whose stream recovered from a rewritten decode prefix
 /// (see `smg_detokenize_prefix_mismatch_total`): the client got the text as

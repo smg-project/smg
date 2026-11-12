@@ -75,6 +75,8 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         .block_on(AppContext::from_config(config, 30, None, None))
         .unwrap();
     let app_state = Arc::new(AppState {
+        secret_sources: Default::default(),
+        secrets: None,
         router: Arc::new(MockRouter),
         probe_state: ProbeState::new(context.inflight_tracker.clone()),
         context: Arc::new(context),

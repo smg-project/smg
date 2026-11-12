@@ -27,8 +27,33 @@ router:
   #    Deadlines). The mesh StatefulSet has no such field.
   progressDeadlineSeconds: 1920
 
-  # -- Routing policy: cache_aware, round_robin, power_of_two, manual, random, prefix_hash
+  # -- Routing policy: random, round_robin, passthrough, cache_aware, power_of_two,
+  #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
+  #    choices; values.schema.json lists them). bucket is a prefill-side policy:
+  #    router.disaggregation.prefillPolicy.
   policy: cache_aware
+
+  # -- Disaggregated serving: the roles the gateway's --pd-disaggregation and
+  #    --epd-disaggregation take. mode "" (the default) is a regular fleet, "pd"
+  #    prefill and decode workers, "epd" encode, prefill and decode workers. The
+  #    role policies are the launcher's --prefill-policy, --decode-policy and
+  #    --encode-policy ("" leaves the gateway's default); values.schema.json
+  #    lists their choices. The role workers are static URLs, rendered as
+  #    --prefill URL [BOOTSTRAP_PORT], --decode URL and --encode URL
+  #    [BOOTSTRAP_PORT]; under Kubernetes discovery the role selectors
+  #    (router.discovery.kubernetes.prefillSelector, decodeSelector,
+  #    encodeSelector) find the role's pods instead. A role given without its
+  #    mode is refused at render.
+  disaggregation:
+    mode: ""
+    prefillPolicy: ""
+    decodePolicy: ""
+    encodePolicy: ""
+    prefill: []          # - url: http://prefill-0:8000
+                         #   bootstrapPort: 8998    # optional
+    decode: []           # - url: http://decode-0:8000
+    encode: []           # - url: http://encode-0:8000
+                         #   bootstrapPort: 8998    # optional
 
   # -- Enable IGW (Inference Gateway) mode for multi-model support
   enableIgw: false
@@ -39,7 +64,7 @@ router:
   mesh:
     enabled: false
     port: 39527               # mesh gossip port
-    # peerUrls: []            # auto-generated from StatefulSet pod DNS
+    # peerUrls: []            # ip:port entries, one flag each; a hostname is refused
     # Without peerUrls the routers find each other among the release's router
     # pods through the Kubernetes API, which the gateway runs only inside
     # Kubernetes discovery; with the file, slurm or consul discovery
@@ -80,6 +105,9 @@ router:
       clusterWide: false   # watch all namespaces (ClusterRole/ClusterRoleBinding)
       namespace: ""        # defaults to release namespace
       selector: ""         # e.g. "app=sglang-worker"; empty matches no pod
+      prefillSelector: ""  # the prefill pods under router.disaggregation.mode pd or epd
+      decodeSelector: ""   # the decode pods under router.disaggregation.mode pd or epd
+      encodeSelector: ""   # the encode pods under router.disaggregation.mode epd
       port: 80             # for pods without a smg.ai/worker-ports annotation
       modelIdFrom: ""      # "namespace", "label:key", or "annotation:key"
 
@@ -94,9 +122,11 @@ router:
       path: ""             # the manifest's path in the pod (default: the ConfigMap key under /etc/smg/discovery)
 
     # -- Workers on the nodes of running Slurm jobs, found with `squeue` and
-    #    `scontrol`. The published image has no Slurm client: this needs an
-    #    image with Slurm >= 23.11 clients and the cluster's configuration and
-    #    authentication (README, Worker Discovery).
+    #    `scontrol`. The published image has no Slurm client; its `-slurm`
+    #    variant (global.image.tag "<version>-slurm") carries the Slurm 23.11
+    #    clients, for a controller on 23.11 through 25.05. The cluster's
+    #    configuration and authentication (slurm.conf, a running munged's
+    #    socket or auth/jwt) come from the deployment (README, Worker Discovery).
     slurm:
       jobNames: []         # jobs whose nodes are regular workers
       encodeJobNames: []
@@ -146,9 +176,18 @@ router:
   maxPayloadSize: 536870912    # 512MB in bytes
   requestTimeoutSecs: 1800
   grpcRequestTimeoutSecs: 0    # bound on a request to a gRPC worker, from its dispatch to its last message; 0 = no bound
-  maxConcurrentRequests: -1    # -1 = unlimited
+  maxConcurrentRequests: -1    # in-flight requests admitted before shedding with 429 or 503;
+                               # -1 = the host-derived bound (1024 per available core, at least 4096), 0 = no bound
   queueSize: 100
   queueTimeoutSecs: 60
+
+  # -- Multimodal: what the gateway does when libjpeg-turbo (libturbojpeg.so.0)
+  #    cannot be loaded. require (the default) refuses to start, so a gateway
+  #    never decodes JPEGs with the pure-Rust fallback, whose pixels differ from
+  #    the engine's by a few levels; prefer decodes with the fallback, says so
+  #    once and sets the gauge smg_mm_turbojpeg_available to 0. The published
+  #    image ships the library; a custom image without it needs prefer.
+  mmTurbojpeg: require
 
   # -- Resilience: retry
   retry:
@@ -182,6 +221,45 @@ router:
     type: ClusterIP
     port: 80
     annotations: {}
+  # -- The admin listener (--admin-port): when set, the control-plane routes
+  #    (the admin routes, the worker-registry routes /workers and the RL
+  #    routes /v1/rl) are served on this container port, with the probes,
+  #    and the data port answers 404 for them. A second Service,
+  #    <fullname>-router-admin, exposes it inside the cluster; the ingress
+  #    never names it. null keeps the control plane on the data port. A port
+  #    equal to router.port, router.metrics.port or the mesh port is refused
+  #    at render: the gateway refuses two listeners on one port.
+  adminPort: null
+  # -- Bind host of the admin listener (--admin-host); null binds it as the
+  #    data listener is bound. Needs adminPort (refused at render without it).
+  #    A loopback host (127.0.0.1, ::1) leaves the admin Service with nowhere
+  #    to send traffic: Service traffic reaches the pod IP.
+  adminHost: null
+  adminService:
+    type: ClusterIP
+    port: 9001
+    annotations: {}
+  # -- Per-tenant rate limiting: enabled renders --tenant-rate-limit-enabled,
+  #    and the limits YAML comes from a ConfigMap of yours, mounted whole at
+  #    /etc/smg/rate-limit and read with --tenant-rate-limit-config (the key
+  #    names the file). Enabled without a ConfigMap is refused at render: the
+  #    gateway requires the file with the flag. A ConfigMap without enabled is
+  #    refused too: the gateway would ignore it with a warning at start-up.
+  tenantRateLimit:
+    enabled: false
+    configMap:
+      name: ""
+      key: rate-limit.yaml
+  # -- The priority scheduler: enabled renders --priority-scheduler-enabled,
+  #    and its class table comes from a ConfigMap of yours, mounted whole at
+  #    /etc/smg/scheduler and read with --priority-scheduler-config. A
+  #    ConfigMap without enabled is refused at render: the gateway would
+  #    ignore it with a warning at start-up.
+  priorityScheduler:
+    enabled: false
+    configMap:
+      name: ""
+      key: scheduler.yaml
   ingress:
     enabled: false
     className: ""
@@ -310,6 +388,12 @@ router:
     configPath: ""
   reasoningParser: ""
   toolCallParser: ""
+  # -- Which parser reads a chat completion's reasoning and tool calls: "symphony"
+  #    (one table per model family) or "legacy" (the older per-model parsers). Empty
+  #    renders no --parser, so the image's own default applies (Symphony from the
+  #    release after 1.13.0 on, the older parsers on 1.13.0). A set value needs an
+  #    image of 1.13.0 or later and applies to gRPC and ZMQ workers only.
+  parser: ""
 
 # =============================================================================
 # HuggingFace Configuration
@@ -335,6 +419,20 @@ auth:
 
   # -- Rate limiting
   rateLimitTokensPerSecond: -1  # -1 = disabled
+
+  # -- Control-plane API keys: the keys the admin, worker-registry and RL
+  #    routes require, one `id:name:role:key` entry per line (role admin or
+  #    user). Mounted into the router pod from a Secret at
+  #    /etc/smg/control-plane and read with --control-plane-api-keys-file;
+  #    never in the pod's arguments. existingSecret names a Secret the
+  #    operator manages; otherwise apiKeys, when set, is written into a
+  #    chart-managed Secret. With neither, the control plane keeps the
+  #    shared key's rules.
+  controlPlane:
+    existingSecret: ""
+    apiKeys: ""
+    # -- The key within the Secret holding the file
+    secretKey: "control-plane-api-keys"
 
 # =============================================================================
 # History / Storage Backend
@@ -420,17 +518,33 @@ grafana:
 # =============================================================================
 # Prometheus alerting rules (a PrometheusRule for the Prometheus Operator)
 # =============================================================================
-# Ten alerts over the families the router already exposes; the thresholds are
+# Eleven alerts over the families the router already exposes; the thresholds are
 # starting points for a serving fleet, not laws: set them to the deployment's
 # SLOs. The rationale of each default:
 #   errorRatio 0.05 for 5m: one response in twenty failing server-side for five
 #     minutes is an outage to a retrying client; a shorter window pages on one
-#     worker's restart.
+#     worker's restart. The probe routes (/health, /readiness, /liveness) are
+#     out of the ratio: the readiness probe answers 503 for the whole of an
+#     engine's bring-up with no client in sight, and once the fleet serves the
+#     probes' 200s would dilute the share of failing client responses.
+#     The same threshold and window bound the router's server-side failed
+#     share of its requests (SmgHighRouterErrorRatio), which sees the stream
+#     that fails after its first token: a 200 at the edge, a router error. The
+#     client's own refusals (a malformed request, a model nobody serves, a
+#     tenant over its limit, a grammar of its own) are not counted there.
 #   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
 #     p99 above five seconds for ten minutes means queues are building in
-#     front of the engines (set it to the SLO once there is one).
+#     front of the engines (set it to the SLO once there is one). The family
+#     holds the gRPC router's streamed answers alone: the HTTP router records
+#     none, a collected answer records no first token (nor does a streamed
+#     Responses answer on the Harmony pipeline), so a deployment on the HTTP
+#     router or whose clients do not stream has an empty alert.
 #   noHealthyWorkerFor 1m: nothing can be served; one minute rides out the
-#     overlap of a rolling restart.
+#     overlap of a rolling restart. The alert also fires when the gateway has
+#     no worker series at all while its scrape is up (none registered yet, or
+#     every one removed): a fresh install pages from its first minute until
+#     its first engine reports healthy, which for a large checkpoint is tens of
+#     minutes (README, Readiness Deadlines); silence it for a planned bring-up.
 #   kvUsage 0.9 for 10m: above ninety percent of its KV cache an engine
 #     preempts and recomputes; sustained, the fleet is undersized.
 #   scrapeMissingFor 2m: a target down for two scrape intervals is a pod that
@@ -440,8 +554,10 @@ grafana:
 #     its timeout, so a worker that fails requests while passing its health
 #     probes cycles open -> half-open -> open; five minutes in either state
 #     is that worker, not one failed call.
-#   admissionRejectionsFor 5m: rejections at the admission queue for five
-#     minutes are sustained overload, not a burst.
+#   admissionRejectionsFor 5m: rejections at admission for five minutes are
+#     sustained overload, not a burst; the alert reads whichever limiter is
+#     live, the concurrency limit's queue or the priority scheduler's
+#     per-class queues.
 #   eventLoopStalls 5 per 10m: a stall is a wake drift over 5 ms on the
 #     runtime's canary; a handful in ten minutes is a blocked thread or CPU
 #     starvation.
@@ -494,11 +610,13 @@ workers: []
 #       repository: smg-project/smg     # default: the path the engine images are published under
 #       tag: ""                         # engine-specific image tag (required)
 #     port: 8000                        # worker serving port
+#     servicerImpl: ""                  # gRPC mode only: "" runs the launcher's default, the Rust
+#                                       # servicer; "python" the deprecated Python servicer (kept for
+#                                       # the deprecation window); "rust" names the default explicitly
 #     metrics:                          # the engine pod's Prometheus endpoint (gRPC mode only)
-#       enabled: false                  # true: the worker runs the Rust servicer, which serves
-#                                       # GET /metrics (smg_servicer_*); the Python servicer has no
-#                                       # endpoint, and the SGLang Rust servicer serves neither
-#                                       # PD/EPD disaggregation nor image/video input yet
+#       enabled: false                  # true: the Rust servicer's listener serves GET /metrics
+#                                       # (smg_servicer_*); the Python servicer has no endpoint, so
+#                                       # the launcher refuses metrics with servicerImpl "python"
 #       port: 29100                     # the metrics listener's port; must differ from `port`
 #     resources: {}
 #     extraArgs: []                     # extra engine CLI args

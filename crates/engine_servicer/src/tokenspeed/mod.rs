@@ -1,11 +1,12 @@
-//! The `tokenspeed.grpc.scheduler.TokenSpeedScheduler` servicer in Rust: the
-//! contract the Python `smg_grpc_servicer.tokenspeed` package serves, over
-//! the msgpack ZMQ wire a headless TokenSpeed scheduler dials (what
-//! `ts serve --headless` speaks to the Router's direct lane). The Router
-//! cannot tell the two implementations apart; Python keeps the lifecycle,
-//! launching the headless scheduler and driving this server through the
-//! binding.
+//! The `tokenspeed.grpc.scheduler.TokenSpeedScheduler` servicer in Rust, the
+//! default for TokenSpeed: the contract the deprecated Python servicer in
+//! `smg_grpc_servicer.tokenspeed` serves, over the msgpack ZMQ wire a
+//! headless TokenSpeed scheduler dials (what `ts serve --headless` speaks to
+//! the Router's direct lane). The Router cannot tell the two implementations
+//! apart; Python keeps the lifecycle, launching the headless scheduler and
+//! driving this server through the binding.
 
+mod encode;
 mod engine;
 mod generate;
 mod info;
@@ -16,15 +17,20 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    GridTensors, MropeLayout, StructuredOutputBackend, StructuredOutputsBackendConfig,
-    StructuredOutputsSupport,
+    EncodeRendezvous, GridTensors, PositionFacts, StructuredOutputBackend,
+    StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
+use engine_zmq_client::{protocol::handshake::REQUEST_KIND_ENCODE, ConnectedEngine};
 use llm_tokenizer::traits::Tokenizer;
-use smg_grpc_client::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer;
+use smg_grpc_client::{
+    tokenspeed_encoder_proto::token_speed_encoder_server::TokenSpeedEncoderServer,
+    tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer,
+};
 use tonic::service::Routes;
 
 use crate::{
     engine_link::{EngineLink, TokenizerSlot},
+    health_probe,
     kv_events::KvEventRelay,
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
@@ -33,10 +39,14 @@ use crate::{
 
 /// The gRPC service name, as the health service reports it.
 pub const SERVICE_NAME: &str = "tokenspeed.grpc.scheduler.TokenSpeedScheduler";
+/// The encoder service's name, which health reports in the encode role (the
+/// gRPC servicer's primary service there).
+pub const ENCODER_SERVICE_NAME: &str = "tokenspeed.grpc.encoder.TokenSpeedEncoder";
 /// The `wire` label of this servicer's metrics.
 const WIRE: &str = "tokenspeed";
-/// What `HealthCheck`'s message says of a serving engine on this wire.
-const HEALTHY: &str = "healthy";
+/// The knob the Python servicer reads its health probe's bound from, in
+/// seconds; this servicer reads the same one.
+const HEALTH_CHECK_TIMEOUT_ENV: &str = "TOKENSPEED_HEALTH_CHECK_TIMEOUT";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off TokenSpeed's `ModelConfig` and `ServerArgs`, which the
@@ -76,6 +86,16 @@ pub struct TokenSpeedModelInfo {
     pub image_token_id: Option<u32>,
     /// The checkpoint's video placeholder token id (`video_token_id`).
     pub video_token_id: Option<u32>,
+    /// The Qwen3-Omni rule's clock (`thinker_config.position_id_per_seconds`):
+    /// the positions one second of media spans on the time axis. The launcher
+    /// reads it as the engine does, the engine's default for a thinker that
+    /// leaves it unsaid; `None` (no thinker, or not a number) refuses the
+    /// family's items by the fact's name.
+    pub position_id_per_seconds: Option<f64>,
+    /// The seconds one temporal grid of a video spans for that rule when the
+    /// item carries no `video_second_per_grid` (`thinker_config.seconds_per_chunk`),
+    /// read the same way.
+    pub seconds_per_chunk: Option<f64>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,
     /// TokenSpeed's `ServerArgs` as a JSON object, reported as
@@ -109,28 +129,20 @@ pub struct TokenSpeedModelInfo {
 
 impl TokenSpeedModelInfo {
     /// What a multimodal item's grid tensors are for this model
-    /// ([`GridTensors`]): the position rule's layout facts travel together,
-    /// so a launcher that shipped only some of them ships none.
+    /// ([`GridTensors`]): the family's rule reads the facts it needs of the
+    /// ones the launcher shipped.
     pub(super) fn grid_tensors(&self) -> GridTensors {
-        let layout = match (
-            self.spatial_merge_size,
-            self.image_token_id,
-            self.video_token_id,
-        ) {
-            (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
-                Some(MropeLayout {
-                    spatial_merge_size,
-                    image_token_id,
-                    video_token_id,
-                })
-            }
-            _ => None,
-        };
         GridTensors::for_model(
             &self.architectures,
             &self.model_type,
             self.mrope_positions,
-            layout,
+            PositionFacts {
+                spatial_merge_size: self.spatial_merge_size,
+                image_token_id: self.image_token_id,
+                video_token_id: self.video_token_id,
+                position_id_per_seconds: self.position_id_per_seconds,
+                seconds_per_chunk: self.seconds_per_chunk,
+            },
         )
     }
 }
@@ -166,6 +178,101 @@ pub(super) fn structured_outputs_support(model: &TokenSpeedModelInfo) -> Structu
     }
 }
 
+/// The encode role's rendezvous, read off the launch's server args
+/// (`disaggregation_mode == "encode"`, `--disaggregation-bootstrap-port`,
+/// and `encode_bootstrap_host`, the worker's own address as the launcher
+/// adds it, the way the gRPC servicer's encoder fills it); `None` for the
+/// other roles. An encode launch without the host or the port is refused
+/// before anything starts.
+pub(super) fn encode_role(
+    model: &TokenSpeedModelInfo,
+) -> Result<Option<EncodeRendezvous>, ServicerError> {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    if args
+        .get("disaggregation_mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("encode")
+    {
+        return Ok(None);
+    }
+    let bootstrap_host = args
+        .get("encode_bootstrap_host")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty() && !is_unspecified_address(host))
+        .ok_or_else(|| {
+            ServicerError::InvalidConfig(
+                "the encode role needs encode_bootstrap_host in the server args: the worker's \
+                 own address, one the prefill side can reach, which the launcher adds (it read \
+                 none, or an unspecified one)"
+                    .to_string(),
+            )
+        })?
+        .to_string();
+    let bootstrap_port = args
+        .get("disaggregation_bootstrap_port")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|port| i32::try_from(port).ok())
+        .filter(|port| *port > 0)
+        .ok_or_else(|| {
+            ServicerError::InvalidConfig(
+                "the encode role needs disaggregation_bootstrap_port in the server args"
+                    .to_string(),
+            )
+        })?;
+    Ok(Some(EncodeRendezvous {
+        bootstrap_host,
+        bootstrap_port,
+    }))
+}
+
+/// An address no peer can dial (`0.0.0.0`, `::`): a launch's `--host`, never
+/// a rendezvous.
+fn is_unspecified_address(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+}
+
+/// The role this servicer was launched for against what the engines'
+/// handshakes list: the encode role needs every engine to list the encode
+/// request (an engine before the wire carried it lists none and cannot take
+/// the role: the Python servicer serves it there); any other role refuses an
+/// engine that lists encode alone (a disaggregated encode worker dialled a
+/// servicer launched for a language role).
+pub(super) fn check_role_against_wire(
+    encode_role: bool,
+    engines: &[ConnectedEngine],
+) -> Result<(), String> {
+    let lists_encode = |engine: &ConnectedEngine| {
+        engine
+            .ready_response
+            .lists_request_kind(REQUEST_KIND_ENCODE)
+    };
+    if encode_role {
+        if let Some(engine) = engines.iter().find(|engine| !lists_encode(engine)) {
+            return Err(format!(
+                "the encode role needs the engine's encode request on the msgpack wire, which \
+                 this engine's handshake does not list (request_types {:?}): a TokenSpeed that \
+                 serves it, or the Python servicer (--servicer-impl python), serves this worker",
+                engine.ready_response.request_types
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(engine) = engines
+        .iter()
+        .find(|engine| lists_encode(engine) && !engine.ready_response.takes_generate())
+    {
+        return Err(format!(
+            "the engine's handshake lists the encode request alone (a disaggregated encode \
+             worker; request_types {:?}), but this servicer was launched for another role: \
+             launch it with --disaggregation-mode encode",
+            engine.ready_response.request_types
+        ));
+    }
+    Ok(())
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct TokenSpeedServicerConfig {
@@ -183,16 +290,22 @@ pub struct TokenSpeedServicerConfig {
 /// attaches to every batch it streams.
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let response = info::loads(self, dp_rank).ok()?;
-        // The engine reports no queued token-work on this wire yet: the
-        // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(
-            response.loads.first()?,
+        // A connected rank reads its own entry (zero-filled until its first
+        // load tail), never another rank's figures; a rank past the
+        // connected ones gets no record, an encode worker none at all.
+        let load = info::rank_load(self, dp_rank)?;
+        Some(crate::kv_events::record_with_queue(
+            &load,
+            load.num_waiting_uncached_tokens,
         ))
     }
 
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
+    }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
     }
 }
 
@@ -204,6 +317,14 @@ pub(super) struct State {
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused).
     pub(super) tokenizer: TokenizerSlot,
+    /// The disaggregated encode role's rendezvous when this servicer runs it
+    /// (`--disaggregation-mode encode`): the encoder service is mounted,
+    /// `Generate` refused, and the engine's handshake must list the encode
+    /// request.
+    pub(super) encode_role: Option<EncodeRendezvous>,
+    /// How long `HealthCheck`'s probe waits for the scheduler
+    /// ([`HEALTH_CHECK_TIMEOUT_ENV`]).
+    pub(super) health_probe_timeout: Duration,
 }
 
 impl WireState for State {
@@ -271,26 +392,49 @@ impl TokenSpeedServicerServer {
             },
             config.servicer.metrics_bind_address.is_some(),
         )?;
+        let encode_role = encode_role(&config.model)?;
         let state = Arc::new(State {
             model: config.model,
-            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
             tokenizer: TokenizerSlot::new(),
+            encode_role,
+            health_probe_timeout: health_probe::timeout_from_env(HEALTH_CHECK_TIMEOUT_ENV),
         });
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }
-        let routes = Routes::new(
-            TokenSpeedSchedulerServer::new(service::TokenSpeedService {
-                state: Arc::clone(&state),
-            })
-            .max_decoding_message_size(usize::MAX)
-            .max_encoding_message_size(usize::MAX),
-        );
+        let scheduler = TokenSpeedSchedulerServer::new(service::TokenSpeedService {
+            state: Arc::clone(&state),
+        })
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX);
+        // The encode role mounts the encoder service next to the scheduler's
+        // discovery surface and reports health under the encoder's name, as
+        // the gRPC servicer does.
+        let (routes, service_name) = match &state.encode_role {
+            Some(rendezvous) => (
+                Routes::new(scheduler).add_service(
+                    TokenSpeedEncoderServer::new(encode::TokenSpeedEncodeService {
+                        state: Arc::clone(&state),
+                        rendezvous: rendezvous.clone(),
+                    })
+                    .max_decoding_message_size(usize::MAX)
+                    .max_encoding_message_size(usize::MAX),
+                ),
+                ENCODER_SERVICE_NAME,
+            ),
+            None => (Routes::new(scheduler), SERVICE_NAME),
+        };
         let connect_state = Arc::clone(&state);
         let server = servicer::Server::start(
             "smg-tokenspeed-servicer",
             config.servicer,
-            SERVICE_NAME,
+            service_name,
             "TokenSpeed",
             &state,
             routes,
@@ -340,7 +484,8 @@ impl TokenSpeedServicerServer {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.

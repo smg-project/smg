@@ -30,8 +30,7 @@ use k8s_openapi::{
 use rustls::crypto::ring;
 use smg::{
     app_context::AppContext,
-    config::RouterConfig,
-    mesh_discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
+    mesh::discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
     service_discovery::{
         start_service_discovery_with_client, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
         DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
@@ -40,6 +39,7 @@ use smg::{
 };
 use tokio::sync::broadcast;
 
+use super::{start_mock_engine, test_context_with_drain};
 use crate::common;
 
 // ========== Fake Kubernetes API server ==========
@@ -242,29 +242,8 @@ fn discovery_config() -> ServiceDiscoveryConfig {
     }
 }
 
-async fn test_context_with_drain(drain_settle_secs: u64) -> Arc<AppContext> {
-    let mut config = RouterConfig::builder()
-        .worker_startup_timeout_secs(2)
-        .build_unchecked();
-    config.health_check.drain_settle_secs = drain_settle_secs;
-    common::create_test_context(config).await
-}
-
 async fn test_context() -> Arc<AppContext> {
     test_context_with_drain(0).await
-}
-
-async fn start_mock_engine() -> (MockWorker, u16) {
-    let mut worker = MockWorker::new(MockWorkerConfig {
-        port: 0,
-        worker_type: WorkerType::Regular,
-        health_status: HealthStatus::Healthy,
-        response_delay_ms: 0,
-        fail_rate: 0.0,
-    });
-    let url = worker.start().await.unwrap();
-    let port = url.rsplit(':').next().unwrap().parse().unwrap();
-    (worker, port)
 }
 
 /// Poll until the registry satisfies `predicate` or fail with its contents.

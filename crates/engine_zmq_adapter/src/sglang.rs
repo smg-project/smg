@@ -27,6 +27,8 @@ use crate::{
     abort_status::engine_abort_status,
     context_window::admit_prompt,
     fanout::fan_out_n,
+    pin_yield::PinYieldNote,
+    sglang_encode::EncodeMediaRefs,
     stream::{map_slim_output, matched_stop_of, poll_mapped, MappedGenerateStream, StreamState},
     structured_outputs::ConstraintRef,
 };
@@ -85,6 +87,11 @@ impl SglangGenerateStream {
     /// Reasoning tokens the scheduler has counted for this choice so far.
     pub fn reasoning_tokens(&self) -> u32 {
         self.reasoning_tokens
+    }
+
+    /// The choice `index` stamped on this stream's responses.
+    pub fn index(&self) -> u32 {
+        self.index
     }
 
     /// The engine-side id of this choice's request.
@@ -254,6 +261,7 @@ pub fn to_sglang_response(
     sglang_proto::GenerateResponse {
         request_id: request_id.to_string(),
         response: mapped,
+        ..Default::default()
     }
 }
 
@@ -423,12 +431,14 @@ pub(crate) fn fan_out_sglang_requests(
 /// placed among them ([`RankPlacement`]): by its data-parallel pin, as the
 /// engine's own frontend places it ([`routed_dp_rank`]), or, on the prefill
 /// side of a disaggregated pair, by its room's residue
-/// ([`room_residue_rank`]).
+/// ([`room_residue_rank`]), a pin's yield to the room logged on `yields`, the
+/// connection's note, at WARN once and at DEBUG after.
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
     ranks: usize,
     placement: RankPlacement,
+    yields: &PinYieldNote,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let tokenized = req
         .tokenized
@@ -447,14 +457,26 @@ pub(crate) fn translate_request_sglang(
     // embeddings arrive, as behind the engine's own frontend, which sends the
     // text it rendered. Preprocessed tensors take the processor-output path.
     let (mm_inputs, input_text) = match req.mm_inputs {
-        Some(mm) if encode_media_refs(&mm)?.is_some() => (
-            None,
-            (!tokenized.original_text.is_empty()).then_some(tokenized.original_text),
-        ),
+        Some(mm) if names_encode_refs(&mm) => {
+            if !req.extra_mm_inputs.is_empty() {
+                return Err("SGLang media references cannot carry extra tensor batches".into());
+            }
+            (
+                None,
+                (!tokenized.original_text.is_empty()).then_some(tokenized.original_text),
+            )
+        }
         Some(mm) => (
-            Some(translate_sglang_multimodal(mm, input_ids.len())?),
+            Some(translate_sglang_multimodal(
+                *mm,
+                req.extra_mm_inputs,
+                input_ids.len(),
+            )?),
             None,
         ),
+        None if !req.extra_mm_inputs.is_empty() => {
+            return Err("SGLang extra_mm_inputs requires mm_inputs".into())
+        }
         None => (None, None),
     };
     // The prefill/decode rendezvous (the prefill side's bootstrap server and
@@ -472,7 +494,7 @@ pub(crate) fn translate_request_sglang(
     };
     let routed_dp_rank = match (placement, bootstrap_room) {
         (RankPlacement::RoomResidue, Some(room)) => {
-            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id)
+            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id, yields)
         }
         _ => routed_dp_rank(req.data_parallel_rank, ranks)?,
     };
@@ -507,66 +529,100 @@ pub(crate) fn translate_request_sglang(
     })
 }
 
-/// The image references a payload names for the encoders of an
-/// encode/prefill-disaggregated deployment, in prompt order: `Some` for a
-/// payload of references without preprocessed tensors (the encoders' input
-/// on a language-side worker, see [`crate::sglang_encode`]), `None` for one
-/// carrying tensors (the processor-output path, whatever references ride
-/// beside them: the engine's frontend processes such a request locally) or
-/// nothing at all. Video and audio references are refused by name: the
-/// encoders' gRPC service takes images only.
-pub(crate) fn encode_media_refs(
-    mm: &sglang_proto::MultimodalInputs,
-) -> Result<Option<Vec<String>>, String> {
-    if mm.pixel_values.is_some() {
-        return Ok(None);
-    }
-    if !mm.video_urls.is_empty() || !mm.audio_urls.is_empty() {
-        return Err(
-            "multimodal payload carries video or audio references; the encoders of an \
-             encode/prefill-disaggregated deployment take image references only"
-                .to_string(),
-        );
-    }
-    Ok((!mm.image_urls.is_empty()).then(|| mm.image_urls.clone()))
+/// Whether a payload names media references for the encoders of an
+/// encode/prefill-disaggregated deployment: references of any modality
+/// without preprocessed tensors (the encoders' input on a language-side
+/// worker, see [`crate::sglang_encode`]). A payload carrying tensors takes the
+/// processor-output path whatever references ride beside them (the engine's
+/// frontend processes such a request locally); one naming nothing is not a
+/// dispatch. A borrowing test: the translation's guard, free of copies.
+pub(crate) fn names_encode_refs(mm: &sglang_proto::MultimodalInputs) -> bool {
+    mm.pixel_values.is_none()
+        && !(mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty())
 }
 
-/// The request's multimodal payload as the scheduler's processor output, by
-/// the Python servicer's rules (`_parse_mm_inputs`): one image item whose
-/// feature is `pixel_values`, the model-specific tensors beside it, the
-/// placeholder ranges as inclusive `[start, end]` offsets (none at all leaves
-/// the slot unset, with the same warning), and the image token id. Nothing
-/// is derived here: the scheduler hashes the feature, pads the prompt with
-/// its model's pattern and computes the position tensors it needs, as it
-/// does behind the Python servicer. What that servicer would mis-tag or
-/// silently drop is refused instead: a payload naming another modality
-/// (every item is tagged an image), one of media references without tensors
-/// (the encoders' input, which [`encode_media_refs`] takes before this and
-/// the dispatch serves; refused here on a worker that runs none), a tensor
-/// of a dtype the wire does not carry or of the wrong length, and a
-/// placeholder outside the prompt or of zero length.
+/// The media references a payload names for the encoders, by modality, each
+/// list in prompt order ([`names_encode_refs`] says whether there are any):
+/// the dispatch's own copy, taken once per choice. Whether the encoders take
+/// every modality named is the dispatch's question: it knows the transport.
+pub(crate) fn encode_media_refs(mm: &sglang_proto::MultimodalInputs) -> Option<EncodeMediaRefs> {
+    names_encode_refs(mm).then(|| EncodeMediaRefs {
+        image_urls: mm.image_urls.clone(),
+        video_urls: mm.video_urls.clone(),
+        audio_urls: mm.audio_urls.clone(),
+    })
+}
+
+/// Translate a single image or video batch to the scheduler's native
+/// processor output. Preserve patch offsets, modality and model tensors;
+/// the scheduler derives its hashes, padded prompt and position tensors.
+/// Media references must have been resolved by a configured native processor
+/// or dispatched to an encoder before reaching this tensor-only boundary.
 pub(crate) fn translate_sglang_multimodal(
+    mm: sglang_proto::MultimodalInputs,
+    extras: Vec<sglang_proto::MultimodalInputs>,
+    prompt_len: usize,
+) -> Result<SglangWireMmInputs, String> {
+    let mut output = translate_sglang_batch(mm, prompt_len)?;
+    for batch in extras {
+        let translated = translate_sglang_batch(batch, prompt_len)?;
+        if output
+            .mm_items
+            .iter()
+            .any(|item| item.modality == translated.mm_items[0].modality)
+        {
+            return Err("SGLang requires one batch per modality".into());
+        }
+        if translated.video_token_id.is_some() {
+            output.video_token_id = translated.video_token_id;
+        } else {
+            output.im_token_id = translated.im_token_id;
+        }
+        output.mm_items.extend(translated.mm_items);
+    }
+    Ok(output)
+}
+
+/// Translate one modality with its own tensor storage and absolute prompt offsets.
+fn translate_sglang_batch(
     mm: sglang_proto::MultimodalInputs,
     prompt_len: usize,
 ) -> Result<SglangWireMmInputs, String> {
-    if let Some(other) = mm.modalities.iter().find(|modality| *modality != "image") {
+    let modality = if mm.modalities.iter().all(|name| name == "image") {
+        // Empty metadata and repeated image labels are accepted by the
+        // existing image contract.
+        SglangWireModality::Image
+    } else if mm.modalities.iter().all(|name| name == "video") {
+        SglangWireModality::Video
+    } else {
         return Err(format!(
-            "multimodal modality {other:?} is not carried over the SGLang ZMQ backend; the \
-             scheduler takes preprocessed image tensors on this wire"
+            "unsupported SGLang tensor modalities {:?}",
+            mm.modalities
         ));
-    }
-    let Some(pixel_values) = mm.pixel_values else {
-        return Err(
-            if mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty() {
-                "multimodal payload carries no pixel_values".to_string()
-            } else {
-                "multimodal payload carries media references but no preprocessed tensors; the \
-                 scheduler's encode path is not served over the SGLang ZMQ backend"
-                    .to_string()
-            },
-        );
     };
-    let feature = wire_tensor_sglang("pixel_values", pixel_values)?;
+    if modality == SglangWireModality::Video && mm.im_token_id.is_none() {
+        return Err("SGLang video tensors require a placeholder token id".into());
+    }
+    if mm.pixel_values.is_none()
+        && (!mm.image_urls.is_empty() || !mm.video_urls.is_empty() || !mm.audio_urls.is_empty())
+    {
+        return Err(
+            "multimodal payload carries media references but no preprocessed tensors".into(),
+        );
+    }
+    let feature = match mm.pixel_values {
+        Some(pixels) => Some(wire_tensor_sglang("pixel_values", pixels)?),
+        None if mm.feature_hash.is_some()
+            && mm.image_urls.is_empty()
+            && mm.video_urls.is_empty()
+            && mm.audio_urls.is_empty() =>
+        {
+            None
+        }
+        None => {
+            return Err("multimodal payload carries no pixel_values or validated identity".into())
+        }
+    };
     let mut model_specific_data = BTreeMap::new();
     for (key, tensor) in mm.model_specific_tensors {
         let tensor = wire_tensor_sglang(&key, tensor)?;
@@ -602,12 +658,16 @@ pub(crate) fn translate_sglang_multimodal(
     };
     Ok(SglangWireMmInputs {
         mm_items: vec![SglangWireMmItem {
-            modality: SglangWireModality::Image,
+            modality,
+            hash: mm.feature_hash,
             offsets,
-            feature: Some(feature),
+            feature,
             model_specific_data,
         }],
         im_token_id: mm.im_token_id,
+        video_token_id: (modality == SglangWireModality::Video)
+            .then_some(mm.im_token_id)
+            .flatten(),
     })
 }
 
@@ -645,10 +705,17 @@ pub(crate) enum RankPlacement {
 /// The scheduler rank a disaggregated request goes to on a prefill side that
 /// follows the room: `bootstrap_room % ranks`, Python's `%` as the engine
 /// computes it (a negative room folds the same way); a pin that names
-/// another rank is logged and ignored, never refused, since placing by the
-/// pin would fail the request at the engine's KV sender. A single rank takes
+/// another rank yields and is logged on `yields` (at WARN once per
+/// connection, at DEBUG after), never refused, since placing by the pin
+/// would fail the request at the engine's KV sender. A single rank takes
 /// everything.
-fn room_residue_rank(room: i64, pin: Option<i32>, ranks: usize, request_id: &str) -> Option<u32> {
+fn room_residue_rank(
+    room: i64,
+    pin: Option<i32>,
+    ranks: usize,
+    request_id: &str,
+    yields: &PinYieldNote,
+) -> Option<u32> {
     let Ok(ranks) = u32::try_from(ranks) else {
         return None;
     };
@@ -658,14 +725,7 @@ fn room_residue_rank(room: i64, pin: Option<i32>, ranks: usize, request_id: &str
     let rank = u32::try_from(room.rem_euclid(i64::from(ranks))).unwrap_or(0);
     if let Some(pin) = pin {
         if u32::try_from(pin).ok() != Some(rank) {
-            warn!(
-                request_id,
-                data_parallel_rank = pin,
-                bootstrap_room = room,
-                dp_size = ranks,
-                "data_parallel_rank conflicts with the bootstrap_room residue; the room \
-                 stays authoritative on a disaggregated request, the pin is ignored"
-            );
+            yields.log(request_id, pin, room, ranks);
         }
     }
     Some(rank)
@@ -952,6 +1012,7 @@ pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
     use engine_zmq_client::{
         codec::{decode_msgpack, encode_msgpack},
         mock_engine::default_ready_response,
@@ -963,7 +1024,7 @@ mod tests {
     use openai_protocol::worker::RuntimeType;
 
     use super::*;
-    use crate::test_support::connected_pair;
+    use crate::{sglang_encode::EncodeTransport, test_support::connected_pair};
 
     /// The translation under the mock scheduler's context window, one rank.
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
@@ -972,6 +1033,7 @@ mod tests {
             default_ready_response().max_model_len,
             1,
             RankPlacement::Pin,
+            &PinYieldNote::default(),
         )
     }
 
@@ -1008,6 +1070,45 @@ mod tests {
         }
     }
 
+    #[test]
+    /// Preserve item metadata regardless of which modality is the primary batch.
+    fn mixed_media_keeps_each_modality_tensor_offsets_and_token_id() {
+        let image = media_payload();
+        let mut video = media_payload();
+        video.modalities = vec!["video".into()];
+        video.im_token_id = Some(8);
+        video.mm_placeholders[0].offset = 5;
+        let grid = video
+            .model_specific_tensors
+            .remove("image_grid_thw")
+            .unwrap();
+        video
+            .model_specific_tensors
+            .insert("video_grid_thw".into(), grid);
+        for (first, second) in [
+            (image.clone(), video.clone()),
+            (video.clone(), image.clone()),
+        ] {
+            let output = translate_sglang_multimodal(first, vec![second], 9).unwrap();
+            assert_eq!(output.im_token_id, Some(7));
+            assert_eq!(output.video_token_id, Some(8));
+            assert_eq!(output.mm_items.len(), 2);
+            for item in output.mm_items {
+                let (offset, key) = if item.modality == SglangWireModality::Image {
+                    (1, "image_grid_thw")
+                } else {
+                    (5, "video_grid_thw")
+                };
+                assert_eq!(item.offsets, Some(vec![(offset, offset + 2)]));
+                assert!(item.feature.is_some());
+                assert!(item.model_specific_data.contains_key(key));
+            }
+        }
+        assert!(translate_sglang_multimodal(image.clone(), vec![image], 9)
+            .unwrap_err()
+            .contains("one batch per modality"));
+    }
+
     fn media_request(mm: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
         sglang_proto::GenerateRequest {
             request_id: "mm".into(),
@@ -1015,7 +1116,7 @@ mod tests {
                 input_ids: vec![1, 7, 7, 7, 2],
                 original_text: String::new(),
             }),
-            mm_inputs: Some(mm),
+            mm_inputs: Some(Box::new(mm)),
             ..Default::default()
         }
     }
@@ -1063,6 +1164,35 @@ mod tests {
         assert_eq!(translate(text).unwrap().mm_inputs, None);
     }
 
+    #[test]
+    /// Preserve video grid and inclusive offsets; reject missing padding token IDs.
+    fn video_tensors_preserve_modality_grid_and_offsets() {
+        let mut mm = media_payload();
+        mm.modalities = vec!["video".to_string()];
+        let mut missing_id = mm.clone();
+        missing_id.im_token_id = None;
+        assert!(translate_sglang_multimodal(missing_id, Vec::new(), 5)
+            .unwrap_err()
+            .contains("placeholder token id"));
+        let grid = mm.model_specific_tensors.remove("image_grid_thw").unwrap();
+        mm.model_specific_tensors
+            .insert("video_grid_thw".into(), grid.clone());
+        let output = translate_sglang_multimodal(mm, Vec::new(), 5).unwrap();
+        let item = &output.mm_items[0];
+        assert_eq!(item.modality, SglangWireModality::Video);
+        assert_eq!(output.video_token_id, Some(7));
+        assert_eq!(item.offsets, Some(vec![(1, 3)]));
+        assert_eq!(
+            item.model_specific_data["video_grid_thw"]
+                .data
+                .as_raw_view()
+                .expect("inline grid")
+                .as_ref(),
+            grid.data.as_ref()
+        );
+        assert!(!item.model_specific_data.contains_key("image_grid_thw"));
+    }
+
     /// What the Python servicer would mis-tag or drop is refused by name:
     /// another modality, references without tensors, a dtype the wire does
     /// not carry, a wrong byte length, a placeholder outside the prompt or
@@ -1073,16 +1203,16 @@ mod tests {
             let error = translate(media_request(mm)).unwrap_err();
             assert!(error.contains(needle), "{error}");
         };
-        let mut video = media_payload();
-        video.modalities = vec!["video".to_string()];
-        refused(video, "modality \"video\" is not carried");
+        let mut audio = media_payload();
+        audio.modalities = vec!["audio".to_string()];
+        refused(audio, "unsupported SGLang tensor modalities");
         // References without tensors are the encoders' input, taken before
         // this translation by `encode_media_refs`; handed to the
         // processor-output path anyway, they are refused by name.
         let mut references = media_payload();
         references.pixel_values = None;
         references.image_urls = vec!["http://example.test/a.png".to_string()];
-        let error = translate_sglang_multimodal(references, 5).unwrap_err();
+        let error = translate_sglang_multimodal(references, Vec::new(), 5).unwrap_err();
         assert!(
             error.contains("media references but no preprocessed tensors"),
             "{error}"
@@ -1138,17 +1268,22 @@ mod tests {
     /// the media slot empty, carries the unexpanded prompt for the
     /// scheduler's rebuild once the embeddings land, and sets none of the
     /// dispatch's slots (the dispatch does, once it ran). Tensors beside
-    /// references take the processor-output path; video and audio references
-    /// are refused: the encoders take images only.
+    /// references take the processor-output path. Video and audio references
+    /// are the encoders' input as well, each modality in its own list;
+    /// whether the encoders' transport takes them is the dispatch's question.
     #[test]
     fn reference_only_media_is_the_encoders_input_not_the_schedulers() {
         let mut references = media_payload();
         references.pixel_values = None;
         references.image_urls = vec!["http://example.test/a.png".to_string()];
         assert_eq!(
-            encode_media_refs(&references).unwrap(),
-            Some(vec!["http://example.test/a.png".to_string()])
+            encode_media_refs(&references),
+            Some(EncodeMediaRefs {
+                image_urls: vec!["http://example.test/a.png".to_string()],
+                ..Default::default()
+            })
         );
+        assert!(names_encode_refs(&references));
         let mut request = media_request(references.clone());
         request.tokenized.as_mut().unwrap().original_text =
             "<|vision_start|><|image_pad|><|vision_end|>What is this?".to_string();
@@ -1175,25 +1310,48 @@ mod tests {
         // Tensors win: references beside them are the frontend's own record.
         let mut both = media_payload();
         both.image_urls = vec!["http://example.test/a.png".to_string()];
-        assert_eq!(encode_media_refs(&both).unwrap(), None);
+        assert!(!names_encode_refs(&both));
+        assert_eq!(encode_media_refs(&both), None);
         let translated = translate(media_request(both)).unwrap();
         assert!(translated.mm_inputs.is_some() && translated.input_text.is_none());
         // Nothing at all is nothing to dispatch.
         let mut empty = media_payload();
         empty.pixel_values = None;
-        assert_eq!(encode_media_refs(&empty).unwrap(), None);
-        let mut video = media_payload();
-        video.pixel_values = None;
-        video.video_urls = vec!["http://example.test/a.mp4".to_string()];
+        assert!(!names_encode_refs(&empty));
+        assert_eq!(encode_media_refs(&empty), None);
+        // Every modality by reference, each in its own list: the encoders'
+        // input too, translated as the image is; the HTTP transport takes it
+        // all, the gRPC transport the images alone.
+        let mut every = media_payload();
+        every.pixel_values = None;
+        every.image_urls = vec!["http://example.test/a.png".to_string()];
+        every.video_urls = vec!["http://example.test/a.mp4".to_string()];
+        every.audio_urls = vec!["http://example.test/a.wav".to_string()];
+        let media = encode_media_refs(&every).expect("the encoders' input");
+        assert_eq!(
+            media,
+            EncodeMediaRefs {
+                image_urls: vec!["http://example.test/a.png".to_string()],
+                video_urls: vec!["http://example.test/a.mp4".to_string()],
+                audio_urls: vec!["http://example.test/a.wav".to_string()],
+            }
+        );
+        assert!(media.names_video_or_audio() && !media.is_empty());
+        assert!(EncodeTransport::Http.takes(&media) && !EncodeTransport::Grpc.takes(&media));
+        let translated = translate(media_request(every)).unwrap();
+        assert!(translated.mm_inputs.is_none() && translated.need_wait_for_mm_inputs.is_none());
         let mut audio = media_payload();
         audio.pixel_values = None;
         audio.audio_urls = vec!["http://example.test/a.wav".to_string()];
-        for refs in [video, audio] {
-            let error = encode_media_refs(&refs).unwrap_err();
-            assert!(error.contains("image references only"), "{error}");
-            let error = translate(media_request(refs)).unwrap_err();
-            assert!(error.contains("image references only"), "{error}");
-        }
+        let only_audio = encode_media_refs(&audio).expect("the encoders' input");
+        assert!(only_audio.image_urls.is_empty() && !EncodeTransport::Grpc.takes(&only_audio));
+        let mut image = media_payload();
+        image.pixel_values = None;
+        image.image_urls = vec!["http://example.test/a.png".to_string()];
+        let only_image = encode_media_refs(&image).expect("the encoders' input");
+        assert!(
+            EncodeTransport::Grpc.takes(&only_image) && EncodeTransport::Http.takes(&only_image)
+        );
     }
 
     #[test]
@@ -1463,6 +1621,7 @@ mod tests {
                 default_ready_response().max_model_len,
                 ranks,
                 RankPlacement::Pin,
+                &PinYieldNote::default(),
             )
         };
         assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
@@ -1496,9 +1655,10 @@ mod tests {
     /// On the prefill side of a disaggregated pair the room places the
     /// request: `bootstrap_room % ranks` over two and over four ranks, a
     /// negative room folding as the engine's `%` does; a pin that disagrees
-    /// yields to the room (and is logged once, which the servicer's test
-    /// reads); a request without a room, the decode side and an aggregated
-    /// engine keep the pin rule; a single rank takes everything.
+    /// yields to the room (and is logged on the connection's note, whose
+    /// own test pins the levels); a request without a room, the
+    /// decode side and an aggregated engine keep the pin rule; a single rank
+    /// takes everything.
     #[test]
     fn sglang_translation_places_a_prefill_sides_request_by_its_rooms_residue() {
         use RankPlacement::{Pin, RoomResidue};
@@ -1523,6 +1683,7 @@ mod tests {
                 default_ready_response().max_model_len,
                 ranks,
                 placement,
+                &PinYieldNote::default(),
             )
             .map(|wire| wire.routed_dp_rank)
         };
@@ -1553,7 +1714,7 @@ mod tests {
         assert_eq!(
             place(RoomResidue, Some(0), Some(3), 4),
             Ok(Some(0)),
-            "room 0 (a lone leg's stand-in) is a room"
+            "room 0 (a lone side's stand-in) is a room"
         );
         assert_eq!(
             place(RoomResidue, Some(7), Some(1), 1),
@@ -1581,12 +1742,38 @@ mod tests {
             default_ready_response().max_model_len,
             2,
             RoomResidue,
+            &PinYieldNote::default(),
         )
         .unwrap();
         assert_eq!(
             (wire.bootstrap_room, wire.routed_dp_rank),
             (Some(7), Some(1))
         );
+    }
+
+    /// A pin's yield to the room goes through the note of the connection it
+    /// came on (the note's own test pins the WARN-once-then-DEBUG levels): a
+    /// conflicting pin marks that note, an agreeing pin marks nothing, and a
+    /// second connection's conflicting pin marks the second note.
+    #[test]
+    fn a_pins_yield_to_the_room_is_noted_on_the_connection() {
+        let connection = PinYieldNote::default();
+        assert_eq!(
+            room_residue_rank(7, Some(1), 2, "agrees", &connection),
+            Some(1)
+        );
+        assert!(!connection.noted(), "an agreeing pin is no yield");
+        assert_eq!(
+            room_residue_rank(7, Some(0), 2, "yields", &connection),
+            Some(1)
+        );
+        assert!(
+            connection.noted(),
+            "the conflicting pin yielded on this connection"
+        );
+        let other = PinYieldNote::default();
+        assert_eq!(room_residue_rank(7, Some(0), 2, "other", &other), Some(1));
+        assert!(other.noted(), "each connection keeps its own note");
     }
 
     /// Prompt bounds apply before the scheduler, with or without an output
@@ -1629,6 +1816,7 @@ mod tests {
                     max_model_len,
                     1,
                     RankPlacement::Pin,
+                    &PinYieldNote::default(),
                 );
                 assert_eq!(
                     result.is_ok(),

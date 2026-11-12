@@ -27,8 +27,11 @@ const END: &str = "<|end_of_image|>";
 /// clip costs on this path what it costs on the engine's own server only
 /// when the frames are the same.
 const LOADER_MAX_FRAMES: usize = 2048;
-/// The rate the family's loader samples at, which is also the reference
-/// video processor's (`Glm5NextVideoProcessor`) `fps`.
+/// The rate the family's loader samples at: the default of its sampling
+/// kwargs, which the servicer refuses to override for this family, never a
+/// rate the processor config states (the reference video processor's own
+/// `fps`, 2 on the released checkpoints, reaches only its own re-sample of a
+/// clip the loader kept whole).
 const LOADER_FPS: f64 = 2.0;
 /// Frames per temporal group: the engine's timestamps take every second
 /// sampled frame, whatever the configured temporal patch size; the loader's
@@ -39,12 +42,7 @@ pub(super) struct Glm53FlashSpec;
 
 impl Glm53FlashSpec {
     fn image_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|id| id as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 
     /// The timestamp the engine's own server writes before each temporal
@@ -336,19 +334,10 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         }
     }
 
-    /// The rate the family's loader samples at, the reference video
-    /// processor's `fps`.
+    /// The rate the family's loader samples at, whatever rate the processor
+    /// config states.
     fn default_video_sample_fps(&self) -> Option<f64> {
         Some(LOADER_FPS)
-    }
-
-    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f64> {
-        Some(
-            config
-                .and_then(|config| config.get_extra::<f64>("fps"))
-                .filter(|fps| fps.is_finite() && *fps > 0.0)
-                .unwrap_or(LOADER_FPS),
-        )
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -407,12 +396,16 @@ mod tests {
                 temporal_patch_size: FRAMES_PER_GROUP,
             }
         );
+        // The processor config's rate does not move the loader's walk.
         let video_config = PreProcessorConfig::from_value(json!({"fps": 1})).unwrap();
         assert_eq!(
-            spec.default_video_sample_fps_with(Some(&video_config)),
-            Some(1.0)
+            spec.default_video_sample_fps_with(&video_config),
+            Some(LOADER_FPS)
         );
-        assert_eq!(spec.default_video_sample_fps_with(None), Some(LOADER_FPS));
+        assert_eq!(
+            spec.default_video_sample_fps_with(&PreProcessorConfig::default()),
+            Some(LOADER_FPS)
+        );
 
         // Four temporal groups of two tokens each, from eight frames the
         // loader picked at 30 fps: the groups start at frames 0, 17, 35, 53.

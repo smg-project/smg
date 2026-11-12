@@ -74,12 +74,12 @@ mod tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "metric": {"type": "boolean"},
                     "options": {"type": "object"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -184,7 +184,7 @@ mod tests {
         let fragments: Vec<&str> = streamed
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

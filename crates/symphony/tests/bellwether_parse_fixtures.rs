@@ -7,8 +7,11 @@
 //! [`adapt::chat::message`], and compares it with the reference: whole, character by character,
 //! on thirty seeded byte plans, and on the token-level chunk plans bellwether recorded with the
 //! case, each delta carrying its tokens' ids and pieces. Every replay also has to conserve the
-//! output's bytes across its events and agree with the whole one, and a streamed replay's content
-//! deltas have to carry the whole answer's content and nothing else: the template's spacing
+//! output's bytes across its events, give its calls the ids the table's source does (counting
+//! from the engine's nonce, or the header the reference recorded with the call, a repeated header
+//! falling back to a minted id as the table does) and agree with the whole one, and a streamed
+//! replay's content deltas have to carry the whole answer's content and nothing else: the
+//! template's spacing
 //! before a call, shown as content before the call arrived, is what a client of the stream would
 //! see and a client of the whole answer would not. An output of at most 256 bytes
 //! also replays at every two-way split; past that the set is linear in the output's length, so
@@ -16,15 +19,20 @@
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
 //! checkout; without it the test prints a skip notice and passes. `SYMPHONY_SAMPLE_EVERY=n`
-//! replays every n-th case of each recorded set, the same slice every run, for a CI job that
-//! cannot afford a benchmark-scale set whole, and the hand-written sets (`common`, `turns`)
-//! whole; a run that leaves it unset or empty replays every case. A second parity test replays
+//! replays every n-th case of each recorded set, the same slice every run, for a run over a tree
+//! that holds the benchmark-scale sets whole (what `bellwether unpack` writes without `--plain`:
+//! every compressed set fetched and written plain), and the hand-written sets (`common`, `turns`)
+//! whole; a run that leaves it unset or empty replays every case, as the fixture job does over
+//! the tree it unpacks with `--plain --sample-sets 3500` (the hand-written sets and one
+//! compressed set in 3,500). A second parity test replays
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
-//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves,
-//! on as many threads as the run has CPUs, each model's report written in the table's order as
-//! soon as it and the models before it are done; it skips the slugs bellwether has not recorded
-//! yet, and says so. When a preview run sets
+//! case's request tools, and the Qwen2.5 table, each after the turn opener the registry names
+//! for it and the prompt tail its template leaves, on as many threads as the run has CPUs, each
+//! model's report written in the table's order as soon as it and the models before it are done;
+//! it skips the slugs bellwether has not recorded yet, and says so, and a slug whose manifest
+//! names its checkpoint group replays the group's sets, recorded once under its primary's slug,
+//! under its own id ([`sets_of`]). When a preview run sets
 //! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows the classes of difference the recorded
 //! sets have ([`Allowance`]): a reference argument whose type contradicts the one the tool
 //! declares, which the template writes the same way as the string; reasoning in a reference whose
@@ -55,14 +63,29 @@
 //! plans, each delta carrying its tokens' pieces as bellwether records them in `output_pieces`, and
 //! checks that every token is counted once, in the event that carries its first byte.
 //!
+//! A case may carry witnesses beside its reference: what other readers said of it, keyed by
+//! reader, written by `bellwether witness`. An engine's witness names a version and an image and
+//! reads nothing; a library's carries the message the vendor's own output library read from the
+//! case's token ids and its finish reason, or the text with which the library refused the case's
+//! request. The DeepSeek V4 and V4.1 sets carry the vendor's library (`deepseek-recipe`). The
+//! parser has to read every case a library read as the library did, bitwise once the library's
+//! empty reasoning string for an answer without a thought is read as the reference's absent one;
+//! a case it reads differently fails the run, whatever the reference says of it, unless the case
+//! is listed in [`KNOWN_DIFFERENCES`] (a marker inside text, which each reader reads its own way:
+//! the library's reading of it is reported, not held against the parser) or its wrong reading of
+//! the case is recorded in [`LIBRARY_DEFECTS`] (bellwether's `waivers/library_defects.toml`:
+//! reported beside the parser's reading, never held against it, and failing the run once the
+//! library reads the case as the parser does again), and a request the library refused is
+//! counted. Each set's summary line is followed by one per library that witnessed a case of it.
+//!
 //! A fourth test corrupts the recorded outputs: three seeded corruptions of every sampled case of
 //! every recorded model (a span deleted or doubled, one of the table's own markers or a cut one
 //! inserted, the tail cut, a character swapped), each read through the model's table after its
-//! prompt tail, whole, on two seeded plans and, up to 512 bytes, a character at a time. Nothing
-//! may panic, every byte must land in exactly one event with `Finish` last, and the message the
-//! chat adapter folds from the events must be the same however the output was cut; a panic is
-//! caught per output, so one run reports every breach with the case, the round and the corrupted
-//! output that replay it. The sample switch applies as above.
+//! turn opener and prompt tail, whole, on two seeded plans and, up to 512 bytes, a character at a
+//! time. Nothing may panic, every byte must land in exactly one event with `Finish` last, and the
+//! message the chat adapter folds from the events must be the same however the output was cut; a
+//! panic is caught per output, so one run reports every breach with the case, the round and the
+//! corrupted output that replay it. The sample switch applies as above.
 //!
 //! What a replay prints, per model: the cases that differ from the reference and nothing allows
 //! (`DIFFERS`, up to [`SHOWN`] of them) and the summary line of its sets. The per-case report, one
@@ -78,7 +101,7 @@
 mod common;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{BufRead, BufReader, BufWriter, Write},
     num::NonZeroUsize,
@@ -96,16 +119,16 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{for_model, groups, table_for, Table},
-    Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError, Parser,
-    TokenSpan,
+    CallId, Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, ParseError,
+    Parser, Text, TokenSpan,
 };
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 /// Replay every n-th case of each recorded set, counted from the set's first, when this is set
-/// and not empty: a deterministic slice of a benchmark-scale set, so CI can replay a set of fifty
-/// thousand cases in minutes, and a nightly run, which leaves it unset, replays them all. The
-/// hand-written sets ([`HAND_WRITTEN_SETS`]) are replayed whole whatever the step. The run says
-/// so.
+/// and not empty: a deterministic slice of a benchmark-scale set, so a run over a tree that holds
+/// the sets whole (one can be fifty thousand cases) ends in minutes. The fixture job, whose unpack
+/// keeps one compressed set in 3,500, leaves it unset and replays every case. The hand-written
+/// sets ([`HAND_WRITTEN_SETS`]) are replayed whole whatever the step. The run says so.
 const SAMPLE_ENV: &str = "SYMPHONY_SAMPLE_EVERY";
 /// Set to anything but empty or `0`, the per-case report is printed on stdout as well.
 const VERBOSE_ENV: &str = "BELLWETHER_VERBOSE";
@@ -247,33 +270,55 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
+    // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
+    // V4.1 does (`<think>` after the assistant token; `</think>` in chat mode). Its table starts a
+    // turn the prompt opens no turn for inside the thought, so the opener the replay feeds before
+    // the tail ([`GenerationPrompt::text`]) is what tells a closed thought from an unopened turn.
+    ("deepseek-v4-flash", GenerationPrompt::OpensTheThought),
+    // DeepSeek-V4-Pro is a member of the V4-Flash group (the same encoder, tokenizer and
+    // configuration files), so its sets read with the V4 table and the same statement; bellwether
+    // records no set of its own yet, so the slug keeps its notice until one is recorded.
+    ("deepseek-v4-pro", GenerationPrompt::OpensTheThought),
     // DeepSeek V3.2 and V3.2-Speciale write DSML; the encoder ends the prompt with `<think>` in
-    // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. bellwether holds
-    // their manifests and no set yet: each slug is skipped with the notice until the pin holds it.
-    ("deepseek-v3.2", GenerationPrompt::OpensTheThought),
-    ("deepseek-v3.2-speciale", GenerationPrompt::OpensTheThought),
+    // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. Chat mode is its
+    // default: only a request that turns thinking on opens the thought, so a recorded case that
+    // leaves the switch alone starts in content. bellwether holds their manifests and no set yet:
+    // each slug is skipped with the notice until the pin holds it.
+    // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
+    // architecture through the same encoder, and bellwether records it so: its sets read with the
+    // V3.2 table and this statement.
+    ("deepseek-v3.2", GenerationPrompt::OpensTheThoughtWhenAsked),
+    (
+        "deepseek-v3.2-speciale",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "deepseek-v3.2-exp",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
     // The Kimi K2 line reads with one table, and each template ends the generation prompt its own
     // way: K2 Instruct and Instruct-0905 write no thought; K2 Thinking ends at the turn's opener
     // and the model writes its own `<think>`; K2.5, K2.6 and K2.7-Code open the thought in the
     // prompt (`<think>`, no newline: the shared tail's is prompt text inside the thought, as for
     // Kimi K3). K2.5 and K2.6 close it at once (`<think></think>`) when the request's `thinking`
-    // is false, a switch bellwether's requests do not set (they carry `enable_thinking`), so the
-    // recorded sets start inside the thought whatever the request says. bellwether holds the six
-    // manifests and no set yet: each slug is skipped with the notice until the pin holds its sets.
+    // is false: the turns set carries that switch beside `enable_thinking`, so its thinking-off
+    // cases start in content, and the common set carries `enable_thinking` alone, which these
+    // templates do not read, so its cases start inside the thought; K2.7-Code's template reads
+    // neither. bellwether's reference refused the reasoning probes for K2 Thinking, K2.5 and K2.6
+    // ([`REFUSED_PROBES`]).
     ("kimi-k2-instruct", GenerationPrompt::Plain),
     ("kimi-k2-instruct-0905", GenerationPrompt::Plain),
     ("kimi-k2-thinking", GenerationPrompt::ModelDecides),
-    ("kimi-k2.5", GenerationPrompt::AlwaysOpensTheThought),
-    ("kimi-k2.6", GenerationPrompt::AlwaysOpensTheThought),
+    ("kimi-k2.5", GenerationPrompt::OpensTheThoughtOrClosesIt),
+    ("kimi-k2.6", GenerationPrompt::OpensTheThoughtOrClosesIt),
     ("kimi-k2.7-code", GenerationPrompt::AlwaysOpensTheThought),
-    // DeepSeek V3.1 and V3.2-Exp close the thought in the prompt (`</think>` right after the
-    // opener) unless the request's `thinking` kwarg opens it; the recorded requests carry
-    // `enable_thinking`, which these templates do not read, so every recorded prompt closes it
-    // and the output starts in content. DeepSeek V3's template writes no thought. Their sets hold
-    // content alone: the templates take a call's arguments as a string, and the recorder refused every
-    // call case of the corpus, whose arguments are objects.
+    // DeepSeek V3.1 closes the thought in the prompt (`</think>` right after the opener) unless
+    // the request's `thinking` kwarg opens it; the recorded requests carry `enable_thinking`,
+    // which its template does not read, so every recorded prompt closes it and the output starts
+    // in content. DeepSeek V3's template writes no thought. Their sets hold content alone: the
+    // templates take a call's arguments as a string, and the recorder refused every call case of
+    // the corpus, whose arguments are objects.
     ("deepseek-v3.1", GenerationPrompt::Plain),
-    ("deepseek-v3.2-exp", GenerationPrompt::Plain),
     ("deepseek-v3-0324", GenerationPrompt::Plain),
     ("deepseek-v3-0324-bf16", GenerationPrompt::Plain),
     // The R1 line writes V3's call spelling from its history and a thought of its own. The
@@ -287,10 +332,11 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("deepseek-r1-bf16", GenerationPrompt::Plain),
     ("deepseek-r1-distill-llama-8b", GenerationPrompt::Plain),
     ("deepseek-r1-distill-qwen-1.5b", GenerationPrompt::Plain),
-    // Kimi K3 writes XTML and opens the thought in the prompt, whatever the request says: its
-    // recorded requests carry no switch. The shared tail adds a newline the template does not
-    // write; it is prompt text inside the thought and moves nothing.
-    ("kimi-k3", GenerationPrompt::AlwaysOpensTheThought),
+    // Kimi K3 writes XTML and opens the thought in the prompt; a request that turns thinking off
+    // (the engine's renderer hands `enable_thinking` to the vendor class as `thinking`) gets the
+    // answer opened instead, and the output starts in content. The shared tail adds a newline the
+    // template does not write; it is prompt text inside the thought and moves nothing.
+    ("kimi-k3", GenerationPrompt::OpensTheThoughtOrTheAnswer),
     // Muse Spark and Muse Glimmer: the generation prompt ends at the turn's opener, and the model
     // writes the thought's message itself. Glimmer's template writes the same messages (to self,
     // to the tool, to the user) and the same block; its recorded set reads with the Spark table.
@@ -585,8 +631,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("llama-3.2-1b-instruct", GenerationPrompt::Plain),
     ("llama-3.2-11b-vision-instruct", GenerationPrompt::Plain),
     // Llama 3.1 8B/70B/405B Instruct and Llama 3.3 70B Instruct: one template, byte for byte the
-    // one the Nemotron Ultra CPT, UltraLong and Safety Guard rows above carry; bellwether has
-    // recorded neither slug yet, so each is skipped with the notice until the pin holds its sets.
+    // one the Nemotron Ultra CPT, UltraLong and Safety Guard rows above carry. bellwether records
+    // the 3.3 group's hand-written sets; the 3.1 manifest is a member of a group recorded under
+    // another slug (the same inputs, no sets of its own), so its row replays that group's sets
+    // ([`sets_of`]).
     ("llama-3.1-8b-instruct", GenerationPrompt::Plain),
     ("llama-3.3-70b-instruct", GenerationPrompt::Plain),
     // FunctionGemma: Gemma's calls between `<start_function_call>` and `<end_function_call>`,
@@ -750,6 +798,10 @@ impl Recorded for Table {
     }
 }
 
+/// The answer's opener in Kimi K3's spelling: what its template writes after the assistant's
+/// turn opener when the request turns thinking off, in place of the thought's opener.
+const K3_ANSWER_OPEN: &str = "<|open|>response<|sep|>";
+
 /// How a template ends the generation prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationPrompt {
@@ -760,6 +812,14 @@ enum GenerationPrompt {
     /// the request says; their templates have no switch, so the output always starts inside the
     /// thought.
     AlwaysOpensTheThought,
+    /// Kimi K3: `<|open|>think<|sep|>` (the thought opened) unless the request turns thinking
+    /// off, when the template opens the answer instead (`<|open|>response<|sep|>`): the engine's
+    /// renderer hands the request's switch to the vendor class, and the output starts in content.
+    OpensTheThoughtOrTheAnswer,
+    /// Kimi K2.5 and K2.6: `<think>` (the thought opened, no newline) unless the request's
+    /// `thinking` is false, when the template closes it at once (`<think></think>`) and the output
+    /// starts in content; `enable_thinking` moves nothing in these templates.
+    OpensTheThoughtOrClosesIt,
     /// Qwen3.5-2B: `<think>\n` only when the request turns thinking on (`enable_thinking: true`);
     /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
     /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
@@ -783,12 +843,26 @@ enum GenerationPrompt {
 }
 
 impl GenerationPrompt {
-    /// The bytes after the assistant header for the case's request, in the family's spelling of
-    /// the thought's markers.
-    fn tail(self, fixture: &Fixture, table: Table) -> String {
-        self.tail_for(&fixture.request, table)
+    /// The prompt the replay feeds before the output: the turn opener the registry names for the
+    /// model, where its table has one, then the case's tail ([`Self::tail_for`]), as the whole
+    /// prompt the gateway replays carries them (the opener as the registry spells it; the newline
+    /// some templates write after it is not fed, and the walk reads it as whitespace). A table
+    /// that starts a turn the prompt opens no turn for in a state of its own (DeepSeek V4: inside
+    /// the thought) reads a tail with no opener as such a turn, whatever the tail closed, so the
+    /// opener is what tells the closed thought of a thinking-off request from an unopened turn;
+    /// a table without a turn opener gets the tail alone, as before.
+    fn text(self, fixture: &Fixture, format: &Format, table: Table) -> String {
+        self.text_for(&fixture.request, format, table)
     }
 
+    fn text_for(self, request: &Request, format: &Format, table: Table) -> String {
+        let mut text = format.turn_opener().unwrap_or_default().to_string();
+        text.push_str(&self.tail_for(request, table));
+        text
+    }
+
+    /// The bytes after the assistant header for the case's request, in the family's spelling of
+    /// the thought's markers.
     fn tail_for(self, request: &Request, table: Table) -> String {
         let (open, close) = table.think_markers();
         let opened = format!("{open}\n");
@@ -799,6 +873,12 @@ impl GenerationPrompt {
             }
             (Self::OpensTheThought | Self::ModelWritesTheThought, true) => closed,
             (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
+            (Self::OpensTheThoughtOrTheAnswer, true) => K3_ANSWER_OPEN.to_string(),
+            (Self::OpensTheThoughtOrClosesIt, _) if request.thinking_kwarg_off() => {
+                format!("{open}{close}")
+            }
+            (Self::OpensTheThoughtOrClosesIt, _) => opened,
+            (Self::OpensTheThoughtOrTheAnswer, false) => opened,
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
             (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
@@ -819,8 +899,9 @@ impl GenerationPrompt {
 
 /// Every recorded model is in the registry, so the replays below read each with the table
 /// `formats::for_model` gives it, the one the gateway asks for; a correction to the registry
-/// reaches the replay. The replay feeds the generation prompt's tail alone, so it says nothing
-/// about a turn opener: [`MEASURED_OPENERS`] pins those.
+/// reaches the replay. The replay feeds the registry's turn opener and the generation prompt's
+/// tail, and only a table whose start keys on the opener reads a wrong one: [`MEASURED_OPENERS`]
+/// pins the openers measured against the templates.
 #[test]
 fn every_recorded_model_is_in_the_registry() {
     for (slug, _) in MODELS {
@@ -987,8 +1068,10 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         if format.name() == "dots3" {
             continue;
         }
-        let Ok(text) = fs::read_to_string(root.join(slug).join("render").join("common.jsonl"))
-        else {
+        let Some(sets) = sets_of(&root, slug, "render").unwrap_or_else(|e| panic!("{e}")) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(sets.dir.join("common.jsonl")) else {
             continue;
         };
         let Some(rendered) = text
@@ -1038,6 +1121,184 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         root.display()
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A slug's recorded sets of one kind under the tree: their directory, and the primary whose sets
+/// they are when the slug is a member of a checkpoint group.
+#[derive(Debug)]
+struct Sets {
+    dir: PathBuf,
+    /// The slug of the group's primary, for a member; a slug's own sets carry none.
+    primary: Option<String>,
+}
+
+/// Where `slug`'s sets of `kind` (`parse`, `render`) are under `root`: its own `<slug>/<kind>`
+/// when bellwether recorded the slug, else its group's primary's, read from the `group` key of the
+/// slug's `manifest.toml`. bellwether records a checkpoint group (one tokenizer, template and
+/// generation config) once, under its primary's slug; the other members' manifests name the group
+/// and hold no sets, and `bellwether unpack` writes every member's manifest. None when neither
+/// directory exists: the slug is not recorded yet. A manifest whose `group` cannot be read is an
+/// error ([`group_of`]).
+fn sets_of(root: &std::path::Path, slug: &str, kind: &str) -> Result<Option<Sets>, String> {
+    let own = root.join(slug).join(kind);
+    if own.is_dir() {
+        return Ok(Some(Sets {
+            dir: own,
+            primary: None,
+        }));
+    }
+    let Some(primary) = group_of(&root.join(slug).join("manifest.toml"))? else {
+        return Ok(None);
+    };
+    let dir = root.join(&primary).join(kind);
+    Ok(dir.is_dir().then_some(Sets {
+        dir,
+        primary: Some(primary),
+    }))
+}
+
+/// The `group` a bellwether manifest names, the slug of its group's primary: `bellwether
+/// manifests` writes the key as one `group = "<slug>"` line on a member's manifest and none on a
+/// primary's. None when there is no such file or it names no group; an error naming the file when
+/// it cannot be read or its `group` value is not a double-quoted slug (a literal string, a
+/// trailing comment, an escape, a path separator): a none there would read as a slug bellwether
+/// has not recorded, and the member would be skipped with the notice instead of failing the run.
+fn group_of(manifest: &std::path::Path) -> Result<Option<String>, String> {
+    let text = match fs::read_to_string(manifest) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", manifest.display())),
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "group" {
+            continue;
+        }
+        let value = value.trim();
+        let slug = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .filter(|slug| !slug.is_empty() && !slug.contains(['/', '\\', '"']));
+        return match slug {
+            Some(slug) => Ok(Some(slug.to_string())),
+            None => Err(format!(
+                "{}: `group = {value}` is not a double-quoted slug; a member's manifest names \
+                 its group's primary as `group = \"<slug>\"`",
+                manifest.display()
+            )),
+        };
+    }
+    Ok(None)
+}
+
+/// A tree in bellwether's layout under the build's `target/tmp`, removed when dropped.
+struct TempTree(PathBuf);
+
+impl TempTree {
+    fn new(name: &str) -> std::io::Result<Self> {
+        let pid = std::process::id();
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("symphony-bellwether-{name}-{pid}"));
+        fs::create_dir_all(&root)?;
+        Ok(Self(root))
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn a_recorded_slugs_sets_are_its_own() {
+    let tree = TempTree::new("own").expect("a temporary tree");
+    fs::create_dir_all(tree.0.join("primary/parse")).expect("the primary's sets");
+    let sets = sets_of(&tree.0, "primary", "parse")
+        .expect("a readable tree")
+        .expect("recorded");
+    assert_eq!(sets.dir, tree.0.join("primary/parse"));
+    assert!(sets.primary.is_none());
+}
+
+#[test]
+fn a_members_sets_are_its_groups_primarys() {
+    let tree = TempTree::new("member").expect("a temporary tree");
+    fs::create_dir_all(tree.0.join("primary/parse")).expect("the primary's sets");
+    fs::create_dir_all(tree.0.join("member")).expect("the member's directory");
+    // The manifest as `bellwether manifests` writes it: the key padded, a comment, the quoted
+    // keys of `[inputs]`; none of the others is the group.
+    fs::write(
+        tree.0.join("member/manifest.toml"),
+        "model    = \"org/Member\"\nrevision = \"0123abcd\"\ntier     = 3\n\
+         # group = \"not-this-one\"\ngroup    = \"primary\"\n\n\
+         [inputs]  # sha256 of each oracle input\n\"tokenizer.json\" = \"group\"\n",
+    )
+    .expect("the member's manifest");
+    let sets = sets_of(&tree.0, "member", "parse")
+        .expect("a readable tree")
+        .expect("the group is recorded");
+    assert_eq!(sets.dir, tree.0.join("primary/parse"));
+    assert_eq!(sets.primary.as_deref(), Some("primary"));
+    assert!(
+        sets_of(&tree.0, "member", "render")
+            .expect("a readable tree")
+            .is_none(),
+        "the group has no render sets"
+    );
+}
+
+#[test]
+fn a_slug_without_sets_or_a_recorded_group_is_not_recorded() {
+    let tree = TempTree::new("unrecorded").expect("a temporary tree");
+    fs::create_dir_all(tree.0.join("lonely")).expect("a member's directory");
+    fs::write(
+        tree.0.join("lonely/manifest.toml"),
+        "model = \"org/Lonely\"\ngroup = \"absent\"\n",
+    )
+    .expect("a manifest naming a group the tree lacks");
+    fs::create_dir_all(tree.0.join("primary")).expect("a primary's directory");
+    fs::write(
+        tree.0.join("primary/manifest.toml"),
+        "model = \"org/Primary\"\n",
+    )
+    .expect("a primary's manifest before its sets");
+    for slug in ["lonely", "primary", "missing"] {
+        assert!(
+            sets_of(&tree.0, slug, "parse")
+                .expect("a readable tree")
+                .is_none(),
+            "{slug}"
+        );
+    }
+}
+
+#[test]
+fn a_group_value_this_reader_cannot_read_ends_the_run() {
+    let tree = TempTree::new("malformed").expect("a temporary tree");
+    fs::create_dir_all(tree.0.join("primary/parse")).expect("the primary's sets");
+    for (slug, line) in [
+        ("literal", "group = 'primary'"),
+        ("comment", "group = \"primary\"  # the group"),
+        ("escape", "group = \"pri\\\"mary\""),
+        ("separator", "group = \"../primary\""),
+        ("empty", "group = \"\""),
+    ] {
+        fs::create_dir_all(tree.0.join(slug)).expect("the member's directory");
+        fs::write(
+            tree.0.join(slug).join("manifest.toml"),
+            format!("model = \"org/{slug}\"\n{line}\n"),
+        )
+        .expect("the member's manifest");
+        let error = sets_of(&tree.0, slug, "parse")
+            .expect_err("a group value this reader cannot read is an error, not a skip");
+        assert!(
+            error.contains(slug) && error.contains("double-quoted slug"),
+            "{slug}: {error}"
+        );
+    }
 }
 
 /// The id the registry knows `slug` by. Bellwether's slug is the repository name in lower case
@@ -1172,6 +1433,12 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
         "llama-3-3-nemotron-super-49b-v1-5",
         "parse/reasoning-with-marker-text",
     ),
+    // bellwether's reference refused the reasoning probes for these templates: each slug's common
+    // set records the two content probes and the fence probe, three of the sixteen cases, and no
+    // reasoning probe (K2.7-Code's records seven, this one among them).
+    ("kimi-k2-thinking", "parse/reasoning-with-marker-text"),
+    ("kimi-k2.5", "parse/reasoning-with-marker-text"),
+    ("kimi-k2.6", "parse/reasoning-with-marker-text"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
@@ -1210,6 +1477,31 @@ const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
 /// is not this family's marker, so it stays reasoning text, as the reference says.
 const KNOWN_M3_DIFFERENCES: &[KnownDifference] = &[FENCE_PROBE];
 
+/// A case a library witness reads wrongly where the reference and the parser agree, recorded in
+/// bellwether's `waivers/library_defects.toml` with the library's version: the library's reading is
+/// reported beside the parser's and not held against it. An entry is stale when the library reads
+/// the case as the parser does again, and the run says so. `id` keeps the slug: a library's defect
+/// is one model's.
+struct LibraryDefect {
+    library: &'static str,
+    id: &'static str,
+    reason: &'static str,
+}
+
+const LIBRARY_DEFECTS: &[LibraryDefect] = &[LibraryDefect {
+    library: "deepseek-recipe",
+    id: "deepseek-v4.1-flash/parse/tau2-o4-mini-2025-04-16-telecom-workflow-default-150-10",
+    reason: "the library cuts a quoted parameter name at its first space and hands arguments that \
+             are no longer JSON; the parser and the reference keep the whole name (bellwether \
+             waivers/library_defects.toml, deepseek-recipe 0.2.0)",
+}];
+
+fn library_defect(library: &str, id: &str) -> Option<&'static LibraryDefect> {
+    LIBRARY_DEFECTS
+        .iter()
+        .find(|defect| defect.library == library && defect.id == id)
+}
+
 /// The case's id after its slug: what [`KnownDifference::id`] names.
 fn after_slug(id: &str) -> &str {
     id.split_once('/').map_or(id, |(_, rest)| rest)
@@ -1229,6 +1521,10 @@ struct Fixture {
     /// Chunk sizes in tokens by plan name; `whole` and `per_token` carry none and are derived.
     #[serde(default)]
     chunk_plans: BTreeMap<String, Option<Vec<usize>>>,
+    /// What other readers said of the case, by reader (`bellwether witness`); absent before
+    /// bellwether recorded any.
+    #[serde(default)]
+    witnesses: BTreeMap<String, Witness>,
 }
 
 /// The parts of the case's request the replay needs: the tools, which type a tagged call's values,
@@ -1250,6 +1546,15 @@ impl Request {
         self.enable_thinking() == Some(true)
     }
 
+    /// Whether the request's `thinking`, the switch Kimi K2.5's and K2.6's templates read, is
+    /// false.
+    fn thinking_kwarg_off(&self) -> bool {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.thinking)
+            == Some(false)
+    }
+
     fn enable_thinking(&self) -> Option<bool> {
         self.chat_template_kwargs
             .as_ref()
@@ -1260,6 +1565,7 @@ impl Request {
 #[derive(Deserialize)]
 struct ChatTemplateKwargs {
     enable_thinking: Option<bool>,
+    thinking: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1279,6 +1585,9 @@ struct ReferenceMessage {
 
 #[derive(Deserialize)]
 struct ReferenceCall {
+    /// The id the model wrote, which bellwether keeps with a call of a template that renders a
+    /// call's id and not its name, as the Kimi K2 line's do; absent from every other set.
+    id: Option<String>,
     function: ReferenceFunction,
 }
 
@@ -1286,6 +1595,37 @@ struct ReferenceCall {
 struct ReferenceFunction {
     name: String,
     arguments: String,
+}
+
+/// What another reader said of a case: a library's message read from the output ids with its
+/// finish reason, or the text with which it refused the request; an engine's witness carries
+/// neither (its version and image are not read here).
+#[derive(Deserialize)]
+struct Witness {
+    message: Option<ReferenceMessage>,
+    finish_reason: Option<String>,
+    rejected: Option<String>,
+}
+
+impl Witness {
+    /// What the reader said the output means, in the reference's terms; `None` when it read
+    /// nothing. A library writes an empty reasoning string for an answer without a thought, where
+    /// the reference writes none; both say the same, so the empty string is read as none.
+    fn said(&self) -> Option<Said> {
+        let said = Said::of_message(self.message.as_ref()?, self.finish_reason.as_deref()?);
+        Some(Said {
+            reasoning: said.reasoning.filter(|reasoning| !reasoning.is_empty()),
+            ..said
+        })
+    }
+}
+
+/// What a library's witness said of a set's cases, against what the parser said.
+#[derive(Default)]
+struct Witnessed {
+    as_the_parser: usize,
+    differently: usize,
+    refused: usize,
 }
 
 /// What the parser said an output means, in the terms the reference uses.
@@ -1320,16 +1660,19 @@ impl Said {
     }
 
     fn of_reference(reference: &Reference) -> Self {
+        Self::of_message(&reference.message, &reference.finish_reason)
+    }
+
+    fn of_message(message: &ReferenceMessage, finish_reason: &str) -> Self {
         Self {
-            content: reference.message.content.clone().filter(|c| !c.is_empty()),
-            reasoning: reference.message.reasoning_content.clone(),
-            calls: reference
-                .message
+            content: message.content.clone().filter(|c| !c.is_empty()),
+            reasoning: message.reasoning_content.clone(),
+            calls: message
                 .tool_calls
                 .iter()
                 .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
                 .collect(),
-            finish: reference.finish_reason.clone(),
+            finish: finish_reason.to_string(),
         }
     }
 
@@ -1437,6 +1780,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
             respells_arguments: false,
             quotes_values: false,
             holds_a_list_after_content: false,
+            call_id: format.call_id_source(),
         },
     );
     let verbose = verbose();
@@ -1600,21 +1944,28 @@ enum Replayed {
     reason = "a set that cannot be read ends the test with its path"
 )]
 fn replay_model(root: &std::path::Path, slug: &str, prompt: GenerationPrompt) -> Replayed {
-    let dir = root.join(slug).join("parse");
-    if !dir.is_dir() {
+    let Some(Sets { dir, primary }) =
+        sets_of(root, slug, "parse").unwrap_or_else(|e| panic!("{e}"))
+    else {
         return Replayed::Skipped(format!(
             "skipping {slug}: bellwether has not recorded its parse sets yet"
         ));
-    }
-    if let Some((_, reason)) = SKIPPED.iter().find(|(skipped, _)| *skipped == slug) {
+    };
+    // The sets read are the primary's for a member, and the lists keyed by slug describe the
+    // sets; the table and the format are the slug's own.
+    let recorded = primary.as_deref().unwrap_or(slug);
+    if let Some((_, reason)) = SKIPPED
+        .iter()
+        .find(|(skipped, _)| *skipped == slug || *skipped == recorded)
+    {
         return Replayed::Skipped(format!("skipping {slug}: {reason}"));
     }
     let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
     let model = model_of(slug);
     let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
     let format = for_model(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
-    let known_differences = table.known_differences(slug, prompt);
-    let allowed = table.allowances(slug, prompt);
+    let known_differences = table.known_differences(recorded, prompt);
+    let allowed = table.allowances(recorded, prompt);
     let Parity {
         report,
         summary,
@@ -1623,7 +1974,7 @@ fn replay_model(root: &std::path::Path, slug: &str, prompt: GenerationPrompt) ->
         &fixtures,
         &ids,
         &|fixture| Engine::new(format.clone(), Declared::of(&fixture.request.tools)),
-        &|fixture| prompt.tail(fixture, table),
+        &|fixture| prompt.text(fixture, &format, table),
         Rules {
             known_differences: &known_differences,
             allowed: &allowed,
@@ -1631,11 +1982,19 @@ fn replay_model(root: &std::path::Path, slug: &str, prompt: GenerationPrompt) ->
             respells_arguments: table.respells_arguments(),
             quotes_values: table.quotes_values(),
             holds_a_list_after_content: table.holds_a_list_after_content(),
+            call_id: format.call_id_source(),
         },
     );
+    let heading = match &primary {
+        Some(primary) => format!(
+            "{slug} ({}, {prompt:?}), the sets of {primary}:",
+            table.name()
+        ),
+        None => format!("{slug} ({}, {prompt:?}):", table.name()),
+    };
     Replayed::Compared {
-        report: format!("{slug} ({}, {prompt:?}):\n{report}", table.name()),
-        summary: format!("{slug} ({}, {prompt:?}):\n{summary}", table.name()),
+        report: format!("{heading}\n{report}"),
+        summary: format!("{heading}\n{summary}"),
         failures,
     }
 }
@@ -1756,10 +2115,13 @@ struct Rules<'a> {
     quotes_values: bool,
     /// [`Recorded::holds_a_list_after_content`].
     holds_a_list_after_content: bool,
+    /// [`Format::call_id_source`]: where the table's calls take their ids from, which is what a
+    /// replay's ids are checked against.
+    call_id: CallId,
 }
 
-/// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
-/// case's `prompt_tail`, on every chunking, reports one line per case and the set's summary, and
+/// Replays every fixture through a fresh parser from `new_parser`, after the case's
+/// `prompt_text`, on every chunking, reports one line per case and the set's summary, and
 /// returns with them every difference the family's `rules` do not account for. `every_id` is the
 /// id of every case the set files hold, before any sample thinned them: a listed difference no
 /// longer among them is a failure too, so the list cannot rot.
@@ -1771,7 +2133,7 @@ fn parity(
     fixtures: &[Fixture],
     every_id: &[String],
     new_parser: &dyn Fn(&Fixture) -> Engine,
-    prompt_tail: &dyn Fn(&Fixture) -> String,
+    prompt_text: &dyn Fn(&Fixture) -> String,
     rules: Rules<'_>,
 ) -> Parity {
     let Rules {
@@ -1781,6 +2143,7 @@ fn parity(
         respells_arguments,
         quotes_values,
         holds_a_list_after_content,
+        call_id,
     } = rules;
     let known = |id: &str| {
         known_differences
@@ -1794,6 +2157,7 @@ fn parity(
         (0, 0, 0, 0, 0);
     let (mut unreadable, mut undeclared_after_content) = (0, 0);
     let (mut token_plans_run, mut without_pieces, mut content_off_whole) = (0, 0, 0);
+    let mut by_library: BTreeMap<&str, Witnessed> = BTreeMap::new();
     for fixture in fixtures {
         let text = &*fixture.reference.text;
         let expected = Said::of_reference(&fixture.reference);
@@ -1804,7 +2168,7 @@ fn parity(
         let replay_text = |cuts: &[usize], plan: &str| {
             replay_after(
                 &mut new_parser(fixture),
-                &prompt_tail(fixture),
+                &prompt_text(fixture),
                 text,
                 cuts,
                 &finish,
@@ -1816,6 +2180,7 @@ fn parity(
             fixture,
             "whole",
             &replay_text(&plans[0].1, "whole"),
+            call_id,
             &mut failures,
         );
         // What a client of the stream receives as content is every content delta, one per
@@ -1826,7 +2191,7 @@ fn parity(
         let whole_content = said.content.clone().unwrap_or_default();
         let mut off_whole: Option<String> = None;
         let mut streamed = |plan: &str, events: &[Event], failures: &mut Vec<String>| {
-            if checked(fixture, plan, events, failures) != said {
+            if checked(fixture, plan, events, call_id, failures) != said {
                 failures.push(format!(
                     "{}: the {plan} replay disagrees with the whole one",
                     fixture.id
@@ -1873,7 +2238,7 @@ fn parity(
                     &mut new_parser(fixture),
                     Input::Prompt {
                         token_ids: &[],
-                        text: &prompt_tail(fixture),
+                        text: &prompt_text(fixture),
                     },
                     &fixture.output_ids,
                     pieces,
@@ -1966,6 +2331,71 @@ fn parity(
         if let Some(listed_case) = known(&fixture.id) {
             out.push_str(&format!("  {:34} {}\n", "", listed_case.reason));
         }
+        // A library that read the case has to have read it as the parser did, whatever the
+        // reference says of the case, unless its wrong reading is recorded in `LIBRARY_DEFECTS`
+        // (reported, never held against the parser, stale once it reads as the parser does); a
+        // library that refused the request read nothing, and an engine's witness reads nothing
+        // either.
+        for (library, witness) in &fixture.witnesses {
+            let tally = by_library.entry(library).or_default();
+            match witness.said() {
+                Some(read) if read == said => {
+                    tally.as_the_parser += 1;
+                    if known(&fixture.id).is_some() {
+                        out.push_str(&format!(
+                            "  {:34} {library} reads it as the parser does\n",
+                            ""
+                        ));
+                    }
+                    if library_defect(library, &fixture.id).is_some() {
+                        failures.push(format!(
+                            "{}: recorded as a wrong reading of {library} but read as the parser \
+                             now; remove it from LIBRARY_DEFECTS and from bellwether's \
+                             waivers/library_defects.toml",
+                            fixture.id
+                        ));
+                    }
+                }
+                Some(read) => {
+                    tally.differently += 1;
+                    if let Some(defect) = library_defect(library, &fixture.id) {
+                        // The library's own wrong reading, recorded with its version: reported
+                        // beside the parser's reading, never held against the parser.
+                        out.push_str(&format!(
+                            "  {:34} {library} reads it wrongly, as recorded: {}; it read: \
+                             {read:?}\n",
+                            "", defect.reason
+                        ));
+                        continue;
+                    }
+                    out.push_str(&format!(
+                        "  {:34} {library} reads it differently: {read:?}\n",
+                        ""
+                    ));
+                    // A listed case puts a marker inside text, and each reader reads such a
+                    // marker its own way; the list declares the parser's, so the library's is
+                    // reported and not held against it.
+                    if known(&fixture.id).is_none() {
+                        failures.push(format!(
+                            "{}: differs from the reading of {library}\n    said:    {said:?}\n    \
+                             library: {read:?}",
+                            fixture.id
+                        ));
+                    }
+                }
+                None => {
+                    if let Some(reason) = &witness.rejected {
+                        tally.refused += 1;
+                        let reason: Vec<&str> = reason.split_whitespace().collect();
+                        out.push_str(&format!(
+                            "  {:34} {library} refused the request: {}\n",
+                            "",
+                            reason.join(" ")
+                        ));
+                    }
+                }
+            }
+        }
     }
     // A listed case that is no longer among the fixtures would let the list rot. The check reads
     // every id the set files hold, before the sample thinned them, so it holds for a sampled run.
@@ -1993,13 +2423,22 @@ fn parity(
     } else {
         String::new()
     };
-    let totals = format!(
+    let mut totals = format!(
         "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, {respelled} \
          respelled, {listed} listed, {allowed_count} allowed for the corpus{unreadable}{undeclared}; \
          {token_plans_run} token plans replayed, {without_pieces} cases without output_pieces, \
          {content_off_whole} cases whose streamed content differs from the whole answer's\n",
         fixtures.len()
     );
+    for (library, witnessed) in &by_library {
+        if witnessed.as_the_parser + witnessed.differently + witnessed.refused > 0 {
+            totals.push_str(&format!(
+                "{library} read {} cases as the parser did and {} differently, and refused {} \
+                 requests\n",
+                witnessed.as_the_parser, witnessed.differently, witnessed.refused
+            ));
+        }
+    }
     out.push_str(&totals);
     Parity {
         report: out,
@@ -2399,8 +2838,15 @@ fn reasoning_oracle(text: &str, starts: &[usize]) -> usize {
 }
 
 /// One replay's events checked: every output byte in exactly one event, and the calls indexed
-/// and named in order; what it said, for the comparison with the whole replay.
-fn checked(fixture: &Fixture, plan: &str, events: &[Event], failures: &mut Vec<String>) -> Said {
+/// and named in order, each with the id the table's source gives it; what it said, for the
+/// comparison with the whole replay.
+fn checked(
+    fixture: &Fixture,
+    plan: &str,
+    events: &[Event],
+    call_id: CallId,
+    failures: &mut Vec<String>,
+) -> Said {
     let conserved: String = events.iter().map(bytes_of).collect();
     if conserved != fixture.reference.text {
         failures.push(format!(
@@ -2409,22 +2855,49 @@ fn checked(fixture: &Fixture, plan: &str, events: &[Event], failures: &mut Vec<S
         ));
     }
     let mut index = 0;
-    let mut first = None;
+    let mut nonce = None;
+    let mut given = HashSet::new();
     for event in events {
         if let Event::ToolCallStart { index: i, id, .. } = event {
-            // The ids count from a nonce of the engine's own, `call_` and 24 hex characters.
-            let number = common::minted_id(id);
-            let origin = *first.get_or_insert(number);
-            if *i != index || number.is_none() || number != origin.map(|f| f + u128::from(index)) {
+            let as_the_source_gives = match call_id {
+                CallId::Minted => counts_from_the_nonce(id, index, &mut nonce),
+                // The id the model wrote, which the reference keeps with the call: the template
+                // renders it back into the prompt, so the replay has to keep it as recorded. A
+                // header whose id repeats one the replay gave already takes a minted id instead,
+                // as the table does (`CallId::Header`), so a response's ids stay distinct.
+                CallId::Header => match recorded_id(&fixture.reference.message.tool_calls, index) {
+                    Some(recorded) if !given.contains(recorded) => id == recorded,
+                    Some(_) => counts_from_the_nonce(id, index, &mut nonce),
+                    None => false,
+                },
+            };
+            if *i != index || !as_the_source_gives {
                 failures.push(format!(
                     "{}: call index {i} / id {id} on the {plan} replay",
                     fixture.id
                 ));
             }
+            given.insert(id.as_str());
             index += 1;
         }
     }
     Said::of(events)
+}
+
+/// Whether a minted id is the engine's: `call_` and 24 hex characters, counting through the
+/// replay from one nonce, which the replay's first minted id fixes (`nonce` keeps it, or that the
+/// first had none).
+fn counts_from_the_nonce(id: &str, index: u32, nonce: &mut Option<Option<u128>>) -> bool {
+    let number = common::minted_id(id);
+    let start = *nonce.get_or_insert(number.and_then(|n| n.checked_sub(u128::from(index))));
+    number.is_some() && number == start.and_then(|s| s.checked_add(u128::from(index)))
+}
+
+/// The id the reference recorded with the call at `index`, as the model wrote it; none for a call
+/// the reference lacks or recorded without one, which no replay's id can match. A recorded id
+/// that repeats an earlier call's is expected as a minted id, the table's fallback.
+fn recorded_id(calls: &[ReferenceCall], index: u32) -> Option<&str> {
+    calls.get(usize::try_from(index).ok()?)?.id.as_deref()
 }
 
 /// The content a client of the stream receives: the text of every content and malformed event in
@@ -2640,7 +3113,7 @@ fn corruption_seed(id: &str, round: u64) -> u64 {
 /// The pieces a corruption puts into a recorded output: the table's own terminals and the tags
 /// of its call syntax, each whole and cut short at either end and in the middle, and the
 /// delimiters every syntax has a use for.
-fn markers_of(format: &symphony::Format) -> Vec<String> {
+fn markers_of(format: &Format) -> Vec<String> {
     let mut markers: Vec<String> = format.terminal_texts().map(str::to_string).collect();
     if let Some(syntax) = format.call_syntax() {
         markers.extend(syntax.tag_texts().into_iter().map(str::to_string));
@@ -2765,13 +3238,13 @@ fn conserved(text: &str, events: &[Event]) -> Result<(), String> {
 fn replay_plan(
     name: &str,
     new_engine: &dyn Fn() -> Engine,
-    tail: &str,
+    prompt_text: &str,
     text: &str,
     cuts: &[usize],
     finish: &EngineFinish,
 ) -> Result<Vec<Event<'static>>, String> {
     let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        replay_after(&mut new_engine(), tail, text, cuts, finish, false)
+        replay_after(&mut new_engine(), prompt_text, text, cuts, finish, false)
     }));
     match replayed {
         Ok(Ok(events)) => Ok(events),
@@ -2780,18 +3253,18 @@ fn replay_plan(
     }
 }
 
-/// One corrupted output through a fresh engine from `new_engine`, after the prompt's `tail`:
-/// whole, on two seeded plans and, up to 512 bytes, a character at a time; the first breach of
-/// conservation, or of the message the chat adapter folds from the events, if any, named by its
-/// plan.
+/// One corrupted output through a fresh engine from `new_engine`, after `prompt_text` (the turn
+/// opener and the prompt's tail): whole, on two seeded plans and, up to 512 bytes, a character at
+/// a time; the first breach of conservation, or of the message the chat adapter folds from the
+/// events, if any, named by its plan.
 fn check_corrupted(
     new_engine: &dyn Fn() -> Engine,
-    tail: &str,
+    prompt_text: &str,
     text: &str,
     finish: &EngineFinish,
     random: &mut Scramble,
 ) -> Result<(), String> {
-    let whole = replay_plan("whole", new_engine, tail, text, &[], finish)?;
+    let whole = replay_plan("whole", new_engine, prompt_text, text, &[], finish)?;
     conserved(text, &whole).map_err(|e| format!("whole: {e}"))?;
     let expected = Said::of(&whole);
     let mut plans = vec![
@@ -2805,7 +3278,7 @@ fn check_corrupted(
         ));
     }
     for (name, cuts) in plans {
-        let events = replay_plan(name, new_engine, tail, text, &cuts, finish)?;
+        let events = replay_plan(name, new_engine, prompt_text, text, &cuts, finish)?;
         // The plan is named, not spelled out: the seeded plans are rebuilt from the case's id and
         // round, and the character plan from the text.
         conserved(text, &events).map_err(|e| format!("{name}: {e}"))?;
@@ -2853,7 +3326,8 @@ enum Corrupted {
 }
 
 /// Three seeded corruptions of every sampled output of `slug`'s parse sets, each replayed through
-/// the model's table after its prompt tail ([`check_corrupted`]), a panic caught per output.
+/// the model's table after its turn opener and prompt tail ([`check_corrupted`]), a panic caught
+/// per output.
 #[expect(
     clippy::panic,
     reason = "a set that cannot be read ends the test with its path"
@@ -2863,12 +3337,12 @@ fn corrupt_model(
     slug: &'static str,
     prompt: GenerationPrompt,
 ) -> Corrupted {
-    let dir = root.join(slug).join("parse");
-    if !dir.is_dir() {
+    let Some(Sets { dir, .. }) = sets_of(root, slug, "parse").unwrap_or_else(|e| panic!("{e}"))
+    else {
         return Corrupted::Skipped(format!(
             "skipping {slug}: bellwether has not recorded its parse sets yet"
         ));
-    }
+    };
     let Cases { fixtures, .. } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
     let model = model_of(slug);
     let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
@@ -2877,7 +3351,7 @@ fn corrupt_model(
     let mut failures = Vec::new();
     let mut outputs = 0;
     for fixture in &fixtures {
-        let tail = prompt.tail(fixture, table);
+        let prompt_text = prompt.text(fixture, &format, table);
         let finish = engine_finish(&fixture.reference.finish_reason);
         for round in 0..3u64 {
             let mut random = Scramble::new(corruption_seed(&fixture.id, round));
@@ -2886,7 +3360,7 @@ fn corrupt_model(
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 check_corrupted(
                     &|| Engine::new(format.clone(), Declared::of(&fixture.request.tools)),
-                    &tail,
+                    &prompt_text,
                     &text,
                     &finish,
                     &mut random,
@@ -2900,7 +3374,7 @@ fn corrupt_model(
             // The breach and its plan first, the output last: a window on the
             // message keeps what names the failure.
             failures.push(format!(
-                "{} round {round} ({}, prompt tail {tail:?}, finish {finish:?}):\n  \
+                "{} round {round} ({}, prompt {prompt_text:?}, finish {finish:?}):\n  \
                  {failure}\n  corrupted output {text:?}",
                 fixture.id,
                 table.name()
@@ -3017,6 +3491,468 @@ fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
         .known_differences("qwen3.5-2b", when_asked)
         .iter()
         .all(|known| known.id != REASONING_PROBE.id));
+}
+
+/// The prompt fed before the output is the registry's turn opener and the tail. The DeepSeek V4
+/// table starts a turn the prompt opens no turn for inside the thought, so the tail alone, which
+/// holds no opener, started every output there and a thinking-off request's text was said to be
+/// reasoning; after the opener the closed thought reads as the template wrote it, and a thinking
+/// request's output starts inside the thought as before. A table that names no turn opener gets
+/// the tail alone.
+#[test]
+fn the_prompt_fed_before_the_output_is_the_turn_opener_and_the_tail() {
+    let request = |kwargs: &str| -> Request {
+        serde_json::from_str(&format!("{{\"chat_template_kwargs\": {kwargs}}}")).expect("a request")
+    };
+    let (off, on) = (request("{\"enable_thinking\": false}"), request("null"));
+    let opens = GenerationPrompt::OpensTheThought;
+    let v4 = model_of("deepseek-v4-flash");
+    let format = for_model(&v4).expect("in the registry");
+    let table = table_for(&v4).expect("in the registry");
+    let (chat, thinking) = (
+        opens.text_for(&off, &format, table),
+        opens.text_for(&on, &format, table),
+    );
+    assert_eq!(chat, "<｜Assistant｜><think>\n\n</think>\n\n");
+    assert_eq!(thinking, "<｜Assistant｜><think>\n");
+    let said = |prompt_text: &str, output: &str| {
+        let events = replay_after(
+            &mut Engine::new(format.clone(), Declared::default()),
+            prompt_text,
+            output,
+            &[],
+            &EngineFinish::Stop,
+            false,
+        )
+        .expect("replays");
+        let said = Said::of(&events);
+        (said.content, said.reasoning, said.calls)
+    };
+    // Thinking off: the text is content, alone and before a calls block.
+    assert_eq!(
+        said(&chat, "Hello!"),
+        (Some("Hello!".to_string()), None, Vec::new())
+    );
+    let block = concat!(
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+        "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    );
+    assert_eq!(
+        said(&chat, &format!("Let me check.\n\n{block}")),
+        (
+            Some("Let me check.".to_string()),
+            None,
+            vec![(
+                "get_weather".to_string(),
+                "{\"city\": \"Paris\"}".to_string()
+            )]
+        )
+    );
+    // Thinking on: the output starts inside the thought, which `</think>` closes.
+    assert_eq!(
+        said(&thinking, "</think>Hello!"),
+        (Some("Hello!".to_string()), None, Vec::new())
+    );
+    assert_eq!(
+        said(&thinking, "A thought.</think>Hi"),
+        (
+            Some("Hi".to_string()),
+            Some("A thought.".to_string()),
+            Vec::new()
+        )
+    );
+    // The same table after the tail alone is the turn the prompt leaves unopened: the thought.
+    let tail = opens.tail_for(&off, table);
+    assert_eq!(
+        said(&tail, "Hello!"),
+        (None, Some("Hello!".to_string()), Vec::new())
+    );
+    // DeepSeek V3.2 anchors the turn at the encoder's tails and names no opener: the tail alone,
+    // as before. Qwen3's prompt is its own opener as the registry spells it (without the newline
+    // its template writes after it) and the tail.
+    let v3_2 = model_of("deepseek-v3.2");
+    let v3_2_format = for_model(&v3_2).expect("in the registry");
+    assert_eq!(
+        opens.text_for(
+            &off,
+            &v3_2_format,
+            table_for(&v3_2).expect("in the registry")
+        ),
+        tail
+    );
+    let qwen3 = model_of("qwen3-8b");
+    let qwen3_format = for_model(&qwen3).expect("in the registry");
+    assert_eq!(
+        GenerationPrompt::ModelWritesTheThought.text_for(
+            &off,
+            &qwen3_format,
+            table_for(&qwen3).expect("in the registry")
+        ),
+        "<|im_start|>assistant<think>\n\n</think>\n\n"
+    );
+}
+
+/// The corpus replay, as [`replay_model`] runs it for a slug, reads the DeepSeek V4 table's
+/// thinking-off turns as the reference does: five cases in the family's shapes, written here in
+/// a tree of their own (content alone and content before a calls block under thinking off, an
+/// empty and a written thought under thinking on, and the reasoning probe the table lists, so the
+/// list check holds). With the tail alone fed before the output, the two thinking-off cases
+/// differed: the table started them inside the thought and said their text was reasoning.
+#[test]
+fn the_corpus_replay_reads_a_thinking_off_turn_of_the_unopened_row_table_as_content() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("unopened-row-replay-{}", std::process::id()));
+    let dir = root.join("deepseek-v4-flash").join("parse");
+    fs::create_dir_all(&dir).expect("the set's directory");
+    let block = concat!(
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+        "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    );
+    let off = serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}});
+    let on = serde_json::json!({});
+    let call = serde_json::json!([
+        {"function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}
+    ]);
+    let cases = [
+        (
+            "content-thinking-off",
+            &off,
+            "Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+        (
+            "call-with-content",
+            &off,
+            format!("Let me check.\n\n{block}"),
+            serde_json::json!({"content": "Let me check.", "tool_calls": call}),
+            "tool_calls",
+        ),
+        (
+            "content-thinking-on",
+            &on,
+            "</think>Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+        (
+            "reasoning-then-content",
+            &on,
+            "A thought.</think>Hi".to_string(),
+            serde_json::json!({"content": "Hi", "reasoning_content": "A thought."}),
+            "stop",
+        ),
+        (
+            "reasoning-with-marker-text",
+            &on,
+            "A </think> in the text.</think>Hi".to_string(),
+            serde_json::json!({"content": "Hi", "reasoning_content": "A </think> in the text."}),
+            "stop",
+        ),
+    ];
+    let lines: Vec<String> = cases
+        .iter()
+        .map(|(name, request, text, message, finish)| {
+            serde_json::json!({
+                "id": format!("deepseek-v4-flash/parse/{name}"),
+                "request": request,
+                "reference": {"text": text, "message": message, "finish_reason": finish},
+            })
+            .to_string()
+        })
+        .collect();
+    fs::write(dir.join("common.jsonl"), lines.join("\n") + "\n").expect("the set");
+    let replayed = replay_model(
+        &root,
+        "deepseek-v4-flash",
+        GenerationPrompt::OpensTheThought,
+    );
+    fs::remove_dir_all(&root).expect("the tree removed");
+    let (report, failures) = match replayed {
+        Replayed::Compared {
+            report, failures, ..
+        } => (report, failures),
+        Replayed::Skipped(why) => (why, vec!["the slug was skipped".to_string()]),
+    };
+    assert!(failures.is_empty(), "{failures:#?}\n{report}");
+    let verdict = |name: &str| -> String {
+        report
+            .lines()
+            .find(|line| line.ends_with(&format!("parse/{name}")))
+            .map_or("not in the report", str::trim_start)
+            .to_string()
+    };
+    for name in [
+        "content-thinking-off",
+        "call-with-content",
+        "content-thinking-on",
+        "reasoning-then-content",
+    ] {
+        assert!(
+            verdict(name).starts_with("bitwise"),
+            "{name}: {}\n{report}",
+            verdict(name)
+        );
+    }
+    assert!(
+        verdict("reasoning-with-marker-text").starts_with("listed"),
+        "{report}"
+    );
+}
+
+/// Every row the DeepSeek V3.2 table reads states the generation prompt as the family's encoder
+/// renders it: chat mode unless the request turns thinking on. The tail the replay feeds for a
+/// request that leaves the switch alone, or turns it off, is the thought closed, so the output
+/// starts in content, and only `enable_thinking: true` gets it opened; and a row that writes no
+/// thought unasked does not list the reasoning probe, whose request leaves the switch alone,
+/// among the family's differences (a set recorded through the encoder cannot hold it: the turn
+/// carries no reasoning). Stated as opening the thought unless told otherwise, a row fed the open
+/// thought for a request that said nothing and listed the probe.
+#[test]
+fn a_v3_2_rows_generation_prompt_closes_the_thought_unless_the_request_turns_thinking_on() {
+    let request = |text: &str| -> Request { serde_json::from_str(text).expect("a request") };
+    let rows: Vec<(&str, GenerationPrompt)> = MODELS
+        .iter()
+        .copied()
+        .filter(|(slug, _)| table_for(&model_of(slug)) == Some(Table::DeepSeekV3_2))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "no recorded slug reads with the V3.2 table"
+    );
+    let table = Table::DeepSeekV3_2;
+    let (open, close) = table.think_markers();
+    let (opened, closed) = (format!("{open}\n"), format!("{open}\n\n{close}\n\n"));
+    for (slug, prompt) in rows {
+        for unasked in [
+            "{}",
+            "{\"chat_template_kwargs\": null}",
+            "{\"chat_template_kwargs\": {\"enable_thinking\": false}}",
+        ] {
+            assert_eq!(
+                prompt.tail_for(&request(unasked), table),
+                closed,
+                "{slug} ({prompt:?}): the prompt's tail for the request {unasked}"
+            );
+        }
+        assert_eq!(
+            prompt.tail_for(
+                &request("{\"chat_template_kwargs\": {\"enable_thinking\": true}}"),
+                table
+            ),
+            opened,
+            "{slug} ({prompt:?}): the prompt's tail for a request that turns thinking on"
+        );
+        assert!(
+            table
+                .known_differences(slug, prompt)
+                .iter()
+                .all(|known| known.id != REASONING_PROBE.id),
+            "{slug} ({prompt:?}): the reasoning probe is among the listed differences"
+        );
+    }
+}
+
+/// The corpus replay, as [`replay_model`] runs it for a slug, reads a DeepSeek V3.2 set as the
+/// encoder records one: chat mode, so every case starts in content whether its request turns
+/// thinking off or says nothing, and the reasoning probe, whose request says nothing, is refused
+/// at record time and not among the set's cases. Three cases in the family's shapes, written here
+/// in a tree of their own (content alone and content before a calls block under thinking off,
+/// content alone under a request that says nothing), replayed under every row the V3.2 table
+/// reads with that row's statement: every case bitwise, nothing to fail. The table names no turn
+/// opener and the tail holds none of its anchors, so the cases read from content under either
+/// statement; what the statement decides is the family's expected list, and stated as opening
+/// the thought unless told otherwise, a row expected the probe and failed the set for not holding
+/// it (`listed in KNOWN_DIFFERENCES but not among the fixtures`).
+#[test]
+fn the_corpus_replay_reads_a_v3_2_set_recorded_in_chat_mode_without_the_reasoning_probe() {
+    let rows: Vec<(&str, GenerationPrompt)> = MODELS
+        .iter()
+        .copied()
+        .filter(|(slug, _)| table_for(&model_of(slug)) == Some(Table::DeepSeekV3_2))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "no recorded slug reads with the V3.2 table"
+    );
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("v3-2-chat-mode-replay-{}", std::process::id()));
+    let block = concat!(
+        "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+        "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜function_calls>"
+    );
+    let off = serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}});
+    let unasked = serde_json::json!({});
+    let call = serde_json::json!([
+        {"function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}
+    ]);
+    let cases = [
+        (
+            "content-thinking-off",
+            &off,
+            "Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+        (
+            "call-with-content",
+            &off,
+            format!("Let me check.\n\n{block}"),
+            serde_json::json!({"content": "Let me check.", "tool_calls": call}),
+            "tool_calls",
+        ),
+        (
+            "content-unasked",
+            &unasked,
+            "Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+    ];
+    let replayed: Vec<(&str, GenerationPrompt, Replayed)> = rows
+        .iter()
+        .map(|&(slug, prompt)| {
+            let dir = root.join(slug).join("parse");
+            fs::create_dir_all(&dir).expect("the set's directory");
+            let lines: Vec<String> = cases
+                .iter()
+                .map(|(name, request, text, message, finish)| {
+                    serde_json::json!({
+                        "id": format!("{slug}/parse/{name}"),
+                        "request": request,
+                        "reference": {"text": text, "message": message, "finish_reason": finish},
+                    })
+                    .to_string()
+                })
+                .collect();
+            fs::write(dir.join("common.jsonl"), lines.join("\n") + "\n").expect("the set");
+            (slug, prompt, replay_model(&root, slug, prompt))
+        })
+        .collect();
+    fs::remove_dir_all(&root).expect("the tree removed");
+    for (slug, prompt, replayed) in replayed {
+        let (report, failures) = match replayed {
+            Replayed::Compared {
+                report, failures, ..
+            } => (report, failures),
+            Replayed::Skipped(why) => (why, vec!["the slug was skipped".to_string()]),
+        };
+        assert!(
+            failures.is_empty(),
+            "{slug} ({prompt:?}): {failures:#?}\n{report}"
+        );
+        for (name, ..) in &cases {
+            let verdict = report
+                .lines()
+                .find(|line| line.ends_with(&format!("parse/{name}")))
+                .map_or("not in the report", str::trim_start);
+            assert!(
+                verdict.starts_with("bitwise"),
+                "{slug}/{name}: {verdict}\n{report}"
+            );
+        }
+    }
+}
+
+/// The witness rule's second exception, which the sampled corpus run does not reach (the set
+/// [`LIBRARY_DEFECTS`] records lies outside the pinned sample): a one-case set under the recorded
+/// slug, written here with the recorded id and a witness of the recorded library, replayed twice.
+/// With the library reading the call's parameter under another name the case stays bitwise
+/// against the reference, nothing fails, and the report carries the recorded reason beside the
+/// library's actual reading; with the library reading the case as the parser does the run fails
+/// naming the stale entry. The prompt is stated as opening the thought when asked, so the
+/// family's expected list holds no probe and the one-case set is whole.
+#[test]
+fn a_recorded_library_defect_is_reported_and_fails_once_the_library_reads_as_the_parser() {
+    // The test drives a V4.1 DSML call through a `deepseek-recipe` witness, so it needs that
+    // entry; once the stale rule retires it, the test needs a synthetic entry of its own.
+    let defect = LIBRARY_DEFECTS
+        .iter()
+        .find(|defect| {
+            defect.library == "deepseek-recipe" && defect.id.starts_with("deepseek-v4.1-flash/")
+        })
+        .expect(
+            "no deepseek-recipe defect on deepseek-v4.1-flash is recorded; give this test a \
+             synthetic entry",
+        );
+    let (slug, _) = defect
+        .id
+        .split_once('/')
+        .expect("the recorded id carries its slug");
+    assert!(
+        MODELS.iter().any(|(recorded, _)| *recorded == slug),
+        "{slug}: not among the recorded models"
+    );
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("library-defect-replay-{}", std::process::id()));
+    let dir = root.join(slug).join("parse");
+    fs::create_dir_all(&dir).expect("the set's directory");
+    let block = concat!(
+        "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n",
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    );
+    let message = |arguments: &str| {
+        serde_json::json!({
+            "content": "Checking now.",
+            "tool_calls": [{"function": {"name": "get_weather", "arguments": arguments}}]
+        })
+    };
+    let replay = |witness_arguments: &str| {
+        let case = serde_json::json!({
+            "id": defect.id,
+            "request": {"chat_template_kwargs": {"enable_thinking": false}},
+            "reference": {
+                "text": format!("Checking now.\n\n{block}"),
+                "message": message("{\"city\": \"Paris\"}"),
+                "finish_reason": "tool_calls",
+            },
+            "witnesses": {
+                defect.library: {
+                    "message": message(witness_arguments),
+                    "finish_reason": "tool_calls",
+                }
+            },
+        });
+        fs::write(dir.join("common.jsonl"), case.to_string() + "\n").expect("the set");
+        match replay_model(&root, slug, GenerationPrompt::OpensTheThoughtWhenAsked) {
+            Replayed::Compared {
+                report, failures, ..
+            } => (report, failures),
+            Replayed::Skipped(why) => (why, vec!["the slug was skipped".to_string()]),
+        }
+    };
+    let (report, failures) = replay("{\"cit\": \"Paris\"}");
+    let (stale_report, stale_failures) = replay("{\"city\": \"Paris\"}");
+    fs::remove_dir_all(&root).expect("the tree removed");
+    assert!(
+        failures.is_empty(),
+        "the recorded wrong reading failed the run: {failures:#?}\n{report}"
+    );
+    let verdict = report
+        .lines()
+        .find(|line| line.ends_with(defect.id))
+        .map_or("not in the report", str::trim_start);
+    assert!(verdict.starts_with("bitwise"), "{verdict}\n{report}");
+    let recorded = format!(
+        "{} reads it wrongly, as recorded: {}; it read: ",
+        defect.library, defect.reason
+    );
+    assert!(
+        report.contains(&recorded) && report.contains("\\\"cit\\\""),
+        "the recorded line with the library's reading is not in the report:\n{report}"
+    );
+    let stale = format!(
+        "{}: recorded as a wrong reading of {} but read as the parser now",
+        defect.id, defect.library
+    );
+    assert!(
+        stale_failures.len() == 1 && stale_failures[0].starts_with(&stale),
+        "{stale_failures:#?}\n{stale_report}"
+    );
 }
 
 /// Spins until `ready` holds, for at most ten seconds, so that a test waiting on another thread's
@@ -3196,6 +4132,71 @@ fn a_reference_is_unreadable_between_quotes_by_a_quote_at_any_depth_or_a_nested_
     assert!(!said(r#"{"command": "dir C:\\"}"#).holds_a_quote_in_a_string());
     assert!(!said(r#"{"tags": ["a", "b"], "days": 3}"#).holds_a_quote_in_a_string());
     assert!(!said("not json").holds_a_quote_in_a_string());
+}
+
+#[test]
+fn a_replays_call_id_is_the_header_the_reference_recorded_or_counts_from_the_minted_nonce() {
+    // One `get_weather` call per recorded id (`None`: recorded without one), each rendered as the
+    // same header, so a replay of as many `ToolCallStart` events conserves the bytes.
+    const HEADER: &str = "<|call|>functions.get_weather:0";
+    let fixture = |recorded: &[Option<&str>]| -> Fixture {
+        let calls: Vec<String> = recorded
+            .iter()
+            .map(|id| {
+                let id = id.map_or(String::new(), |id| format!(r#""id": "{id}", "#));
+                format!(r#"{{{id}"function": {{"name": "get_weather", "arguments": "{{}}"}}}}"#)
+            })
+            .collect();
+        serde_json::from_str(&format!(
+            r#"{{"id": "a-group/parse/call", "reference": {{"text": "{}", "message": {{"tool_calls":
+            [{}]}}, "finish_reason": "tool_calls"}}}}"#,
+            HEADER.repeat(recorded.len()),
+            calls.join(", ")
+        ))
+        .expect("a fixture")
+    };
+    let replay = |ids: &[&str]| -> Vec<Event> {
+        ids.iter()
+            .zip(0u32..)
+            .map(|(id, index)| Event::ToolCallStart {
+                index,
+                id: (*id).to_string(),
+                name: "get_weather".to_string(),
+                source: Text::new(HEADER, 0),
+            })
+            .collect()
+    };
+    let failures = |fixture: &Fixture, events: &[Event], call_id: CallId| {
+        let mut failures = Vec::new();
+        checked(fixture, "whole", events, call_id, &mut failures);
+        failures
+    };
+    let recorded = fixture(&[Some("functions.get_weather:0")]);
+    let unrecorded = fixture(&[None]);
+    let header = replay(&["functions.get_weather:0"]);
+    let other_header = replay(&["functions.get_weather:1"]);
+    let minted = replay(&["call_000000000000000000000000"]);
+    // A table that keeps the header's id: the replay's is the one the reference recorded, not a
+    // minted one, not the header of another call, and nothing when the reference recorded none.
+    assert!(failures(&recorded, &header, CallId::Header).is_empty());
+    assert_eq!(
+        failures(&recorded, &minted, CallId::Header),
+        ["a-group/parse/call: call index 0 / id call_000000000000000000000000 on the whole replay"]
+    );
+    assert_eq!(failures(&recorded, &other_header, CallId::Header).len(), 1);
+    assert_eq!(failures(&unrecorded, &header, CallId::Header).len(), 1);
+    // The table's fallback: a header that repeats an id the replay gave already takes a minted id,
+    // so the second of two calls recorded under one id is expected minted, counting from the
+    // replay's nonce, and not under the header again.
+    let repeated = fixture(&[Some("functions.get_weather:0"); 2]);
+    let minted_second = replay(&["functions.get_weather:0", "call_000000000000000000000001"]);
+    let header_twice = replay(&["functions.get_weather:0", "functions.get_weather:0"]);
+    assert!(failures(&repeated, &minted_second, CallId::Header).is_empty());
+    assert_eq!(failures(&repeated, &header_twice, CallId::Header).len(), 1);
+    // A table whose ids are minted: they count from the engine's nonce, whatever the reference
+    // recorded with the call.
+    assert!(failures(&recorded, &minted, CallId::Minted).is_empty());
+    assert_eq!(failures(&recorded, &header, CallId::Minted).len(), 1);
 }
 
 #[test]

@@ -143,8 +143,9 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                 Ok(None)
             }
             HarmonyResponseSpec::Responses(responses_request) => {
-                // For streaming Responses API, leave execution_result in context
-                // for external streaming processor (serve_harmony_responses_stream)
+                // For streaming Responses API, leave execution_result (and the
+                // router's stop obligations beside it) in context for the
+                // external streaming processor (serve_harmony_responses_stream)
                 if is_streaming {
                     // Don't take execution_result - let the caller handle it
                     return Ok(None);
@@ -169,12 +170,20 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
-                let iteration_result = self
+                let (iteration_result, counts) = self
                     .processor
-                    .process_responses_iteration(execution_result, responses_request, dispatch)
+                    .process_responses_iteration(
+                        execution_result,
+                        responses_request,
+                        dispatch,
+                        &router_stops,
+                    )
                     .await?;
 
-                ctx.response.responses_iteration_result = Some(iteration_result);
+                ctx.response.responses_iteration_result = Some(Box::new(iteration_result));
+                // The engine's counts, for the settlement of the iteration's
+                // reservation, as the chat branch records them.
+                ctx.response.engine_counts = Some(counts);
                 Ok(None)
             }
         }

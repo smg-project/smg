@@ -4,8 +4,6 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
-use std::collections::HashMap;
-
 use openai_protocol::{common::Usage, generate::GenerateResponse};
 
 use crate::{
@@ -20,23 +18,79 @@ use crate::{
 /// the max over the choices: summing would charge the prompt once per choice
 /// instead of once per request. Each choice is its own generation, so
 /// `completion`, `reasoning` (each choice's own reasoning trace) and the
-/// speculative counts sum. (Completion's own batched usage computation does
+/// accepted counts sum; drafted counts sum only if all choices supply
+/// consistent positive proposals (otherwise unavailable). (Completion's own batched usage computation does
 /// this per prompt and sums across prompts.)
 ///
 /// Every path that aggregates the engine's frames itself builds its usage
 /// from these counters, so the streamed and the non-streamed answer of a
 /// request carry one and the same usage object.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TokenCounts {
     pub prompt: u32,
     pub completion: u32,
     pub cached: u32,
     pub reasoning: u32,
     pub spec_accepted: u32,
-    pub spec_drafted: u32,
+    pub spec_drafted: Option<u32>,
+}
+
+impl Default for TokenCounts {
+    fn default() -> Self {
+        Self {
+            prompt: 0,
+            completion: 0,
+            cached: 0,
+            reasoning: 0,
+            spec_accepted: 0,
+            spec_drafted: Some(0),
+        }
+    }
+}
+
+/// Sum proposals only when every choice supplied a consistent positive count.
+/// Scalar proto zeros have no presence: all-zero legacy usage retains schema
+/// defaults, but a zero mixed with measured speculation makes rejections unknown.
+pub(crate) fn known_spec_drafted(counts: impl Iterator<Item = (u32, u32)>) -> Option<u32> {
+    let mut total = 0;
+    let mut has_unknown = false;
+    for (accepted, drafted) in counts {
+        if drafted < accepted {
+            return None;
+        }
+        has_unknown |= drafted == 0;
+        total += drafted;
+    }
+    if has_unknown && total > 0 {
+        None
+    } else {
+        Some(total)
+    }
+}
+
+/// Every requested choice must have its own terminal frame. Arrival count
+/// alone cannot distinguish a missing choice from a repeated terminal index.
+/// Some legacy workers send only index zero for n>1; those frames cannot prove
+/// complete membership either, so their rejections remain unavailable.
+pub(crate) fn all_choices_completed(
+    responses: &[ProtoGenerateComplete],
+    expected_choices: u32,
+) -> bool {
+    responses.len() >= expected_choices as usize
+        && (0..expected_choices).all(|index| responses.iter().any(|r| r.index() == index))
 }
 
 impl TokenCounts {
+    /// Collected counters retain partial answers, but only certify rejections
+    /// once every choice requested by the client supplied terminal counters.
+    pub(crate) fn of_collected(responses: &[ProtoGenerateComplete], expected_choices: u32) -> Self {
+        let mut counts = Self::of(responses);
+        if !all_choices_completed(responses, expected_choices) {
+            counts.spec_drafted = None;
+        }
+        counts
+    }
+
     /// The counters of the `Complete` frames of one request.
     pub(crate) fn of(responses: &[ProtoGenerateComplete]) -> Self {
         Self {
@@ -53,7 +107,11 @@ impl TokenCounts {
                 .unwrap_or(0),
             reasoning: responses.iter().map(|r| r.reasoning_tokens()).sum(),
             spec_accepted: responses.iter().map(|r| r.spec_accepted_tokens()).sum(),
-            spec_drafted: responses.iter().map(|r| r.spec_draft_tokens()).sum(),
+            spec_drafted: known_spec_drafted(
+                responses
+                    .iter()
+                    .map(|r| (r.spec_accepted_tokens(), r.spec_draft_tokens())),
+            ),
         }
     }
 
@@ -84,7 +142,7 @@ impl TokenCounts {
                 .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
                 .sum(),
             spec_accepted: 0,
-            spec_drafted: 0,
+            spec_drafted: Some(0),
         }
     }
 
@@ -92,10 +150,18 @@ impl TokenCounts {
     /// reasoning and speculative details the engine reported. The usage of
     /// a legacy completion, streamed or not, is this object.
     pub(crate) fn usage(self) -> Usage {
-        Usage::from_counts(self.prompt, self.completion)
+        let mut usage = Usage::from_counts(self.prompt, self.completion)
             .with_cached_tokens(self.cached)
             .with_reasoning_tokens(self.reasoning)
-            .with_speculative_tokens(self.spec_accepted, self.spec_drafted)
+            .with_speculative_tokens(self.spec_accepted, self.spec_drafted.unwrap_or(0));
+        if self.spec_drafted.is_none() {
+            // Keep aggregate availability separate from the old proto's zero sentinel.
+            // Explicit accepted zero must also preserve unknown rejected in chat usage.
+            let details = usage.completion_tokens_details.get_or_insert_default();
+            details.accepted_prediction_tokens = Some(self.spec_accepted);
+            details.rejected_prediction_tokens = None;
+        }
+        usage
     }
 
     /// The settlement of the request's reservation: the engine's counts as
@@ -115,8 +181,8 @@ impl TokenCounts {
 /// engine's counters make: the rendered prompt tokens the provider does not
 /// bill are dropped, the reasoning the gateway's own parser split off is
 /// accounted (`parsed_reasoning`, see `with_parsed_reasoning_tokens`), and
-/// every detail counter is present as the OpenAI API sends it on every chat
-/// completion, zero where nothing was counted. The streamed answer's usage
+/// default counters are present, except unavailable speculative rejections
+/// remain absent even when accepted is zero. The streamed answer's usage
 /// chunk and the non-streamed answer both build their usage here, so a
 /// request's two usage objects are the same.
 pub(crate) fn chat_usage(
@@ -169,18 +235,41 @@ pub(crate) fn effective_weight_version<'a>(
 /// - cumulative streams send the count in the Complete message, and the
 ///   running count in every chunk before it
 pub(crate) struct CompletionTokenTracker {
-    tokens: HashMap<u32, u32>,
-    /// The running count a cumulative stream reported in its latest chunk:
-    /// how far it had come, for a stream that ends before its Complete.
-    reported: HashMap<u32, u32>,
+    /// One entry per choice index, grown as the indices come (the engines
+    /// send them dense from zero): the count known for the choice, and the
+    /// running count a cumulative stream reported in its latest chunk (how
+    /// far it had come, for a stream that ends before its Complete).
+    choices: Vec<TrackedChoice>,
 }
+
+#[derive(Clone, Copy, Default)]
+struct TrackedChoice {
+    tokens: u32,
+    reported: u32,
+}
+
+/// Choice indices past this many are a malformed engine message, not a
+/// vector to grow: their counts are dropped.
+const MAX_TRACKED_CHOICES: usize = 4096;
 
 impl CompletionTokenTracker {
     pub fn new() -> Self {
         Self {
-            tokens: HashMap::new(),
-            reported: HashMap::new(),
+            choices: Vec::new(),
         }
+    }
+
+    /// The entry of choice `index`, made when first seen; `None` for an
+    /// index past [`MAX_TRACKED_CHOICES`].
+    fn choice(&mut self, index: u32) -> Option<&mut TrackedChoice> {
+        let index = index as usize;
+        if index >= MAX_TRACKED_CHOICES {
+            return None;
+        }
+        if self.choices.len() <= index {
+            self.choices.resize(index + 1, TrackedChoice::default());
+        }
+        self.choices.get_mut(index)
     }
 
     /// Record tokens from a streaming chunk.
@@ -188,11 +277,13 @@ impl CompletionTokenTracker {
     /// report it in Complete instead, so a chunk of theirs only notes the
     /// running count it carries.
     pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
+        let Some(choice) = self.choice(chunk.index()) else {
+            return;
+        };
         if chunk.chunk_semantics().is_delta() {
-            *self.tokens.entry(chunk.index()).or_insert(0) += chunk.token_ids().len() as u32;
+            choice.tokens += chunk.token_ids().len() as u32;
         } else {
-            self.reported
-                .insert(chunk.index(), chunk.completion_tokens());
+            choice.reported = chunk.completion_tokens();
         }
     }
 
@@ -200,12 +291,11 @@ impl CompletionTokenTracker {
     /// Delta streams keep the count accumulated from their chunks; cumulative
     /// streams take the value from Complete.
     pub fn record_complete(&mut self, complete: &ProtoGenerateComplete) {
-        let index = complete.index();
-        if complete.chunk_semantics().is_delta() {
-            // Keep accumulated count; ensure entry exists
-            self.tokens.entry(index).or_insert(0);
-        } else {
-            self.tokens.insert(index, complete.completion_tokens());
+        let Some(choice) = self.choice(complete.index()) else {
+            return;
+        };
+        if !complete.chunk_semantics().is_delta() {
+            choice.tokens = complete.completion_tokens();
         }
     }
 
@@ -219,14 +309,14 @@ impl CompletionTokenTracker {
     /// generated past the stop carries the tail's count, and the stream does
     /// not pass it on.
     pub fn record_local_stop(&mut self, index: u32) {
-        let reported = self.reported.get(&index).copied().unwrap_or(0);
-        let known = self.tokens.entry(index).or_insert(0);
-        *known = (*known).max(reported);
+        if let Some(choice) = self.choice(index) {
+            choice.tokens = choice.tokens.max(choice.reported);
+        }
     }
 
     /// Get total completion tokens across all indices
     pub fn total(&self) -> u32 {
-        self.tokens.values().sum()
+        self.choices.iter().map(|choice| choice.tokens).sum()
     }
 
     /// Completion tokens delivered so far across all indices: the count
@@ -234,12 +324,10 @@ impl CompletionTokenTracker {
     /// stream last reported. How far a stream that ends before its Complete
     /// had come.
     pub fn delivered(&self) -> u32 {
-        let mut per_index = self.reported.clone();
-        for (index, tokens) in &self.tokens {
-            let known = per_index.entry(*index).or_insert(0);
-            *known = (*known).max(*tokens);
-        }
-        per_index.values().sum()
+        self.choices
+            .iter()
+            .map(|choice| choice.tokens.max(choice.reported))
+            .sum()
     }
 }
 
@@ -332,7 +420,7 @@ mod tests {
             cached: 4,
             reasoning: 3,
             spec_accepted: 2,
-            spec_drafted: 3,
+            spec_drafted: Some(3),
         }
         .usage();
 
@@ -523,5 +611,81 @@ mod tests {
         tracker.record_local_stop(0);
         tracker.record_complete(&complete(0, 0, 42));
         assert_eq!(tracker.total(), 42, "the engine's own count of the step");
+    }
+
+    #[cfg(test)]
+    mod spec_usage_regression {
+        use smg_grpc_client::tokenspeed_proto as proto;
+
+        use super::*;
+
+        #[test]
+        fn mixed_unknown_proposals_do_not_become_measured_rejections() {
+            for (accepted, drafted) in [(2, 0), (4, 2), (0, 0)] {
+                let responses: Vec<_> = [(accepted, drafted), (1, 10)]
+                    .into_iter()
+                    .map(|(a, d)| {
+                        ProtoGenerateComplete::TokenSpeed(proto::GenerateComplete {
+                            spec_accepted_tokens: a,
+                            spec_draft_tokens: d,
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+                let usage = chat_usage(TokenCounts::of(&responses).usage(), Some(3), 0);
+                let json = serde_json::to_value(usage).unwrap();
+                assert_eq!(
+                    json["completion_tokens_details"]["accepted_prediction_tokens"],
+                    accepted + 1
+                );
+                assert!(
+                    json["completion_tokens_details"]
+                        .get("rejected_prediction_tokens")
+                        .is_none(),
+                    "{json}"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod zero_accepted_aggregation_regression {
+        use smg_grpc_client::tokenspeed_proto as proto;
+
+        use super::*;
+
+        #[test]
+        fn partial_zero_accepted_proposals_stay_unknown() {
+            let responses: Vec<_> = [(0, 0), (0, 10)]
+                .into_iter()
+                .map(|(a, d)| {
+                    ProtoGenerateComplete::TokenSpeed(proto::GenerateComplete {
+                        spec_accepted_tokens: a,
+                        spec_draft_tokens: d,
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            let usage = chat_usage(TokenCounts::of(&responses).usage(), Some(3), 0);
+            let details = usage.completion_tokens_details.unwrap();
+            assert_eq!(details.accepted_prediction_tokens, Some(0));
+            assert_eq!(details.rejected_prediction_tokens, None);
+        }
+    }
+
+    #[cfg(test)]
+    mod default_speculation_control {
+        use super::*;
+
+        #[test]
+        fn default_counts_keep_legacy_zero_rejected() {
+            let details = TokenCounts::default()
+                .usage()
+                .with_complete_details()
+                .completion_tokens_details
+                .unwrap();
+            assert_eq!(details.accepted_prediction_tokens, Some(0));
+            assert_eq!(details.rejected_prediction_tokens, Some(0));
+        }
     }
 }

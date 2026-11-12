@@ -49,7 +49,7 @@ use crate::{
         error::error_type_for_status,
         grpc::context::{DispatchMetadata, WorkerSelection},
     },
-    worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
+    worker::{basic::WorkerTypeExt, endpoint::Endpoint, ConnectionModeExt, Worker},
 };
 
 /// The SSE error `type` of a stream the worker failed: the engine's
@@ -338,6 +338,18 @@ impl fmt::Display for StreamFailure {
     }
 }
 
+/// The per-choice state at the engine's `index` (the unit's own index on the
+/// completion stream), or the decoding failure an index past the choices the
+/// request expects is: the chat and completion streams report it alike.
+pub(crate) fn choice_mut<T>(choices: &mut [T], index: u32) -> Result<&mut T, StreamFailure> {
+    let expected = choices.len();
+    choices.get_mut(index as usize).ok_or_else(|| {
+        StreamFailure::from(format!(
+            "engine sent choice index {index}; the request expects {expected} choice(s)"
+        ))
+    })
+}
+
 /// Where a streaming response is read from, kept by the task that writes it
 /// for the accounting of a failure after the response began.
 #[derive(Clone)]
@@ -446,14 +458,14 @@ impl StreamSource {
         match rendezvous {
             Some(DeadRendezvous(port)) => warn!(
                 request_id = %self.request_id,
-                worker = worker_url,
+                worker = %Endpoint::redacted_str(worker_url),
                 worker_type,
                 completion_tokens,
                 grpc_code = ?status.code(),
                 http_status = class.http.as_u16(),
                 error_type = class.error_type,
                 reason = class.reason,
-                prefill = self.prefill.as_ref().map_or("none", |prefill| prefill.url()),
+                prefill = self.prefill.as_ref().map_or("none", |prefill| prefill.redacted_url()),
                 bootstrap_host = port.host.as_str(),
                 bootstrap_port = port.port,
                 bootstrap_port_source = port.source.label(),
@@ -464,7 +476,7 @@ impl StreamSource {
             ),
             None => warn!(
                 request_id = %self.request_id,
-                worker = worker_url,
+                worker = %Endpoint::redacted_str(worker_url),
                 worker_type,
                 completion_tokens,
                 grpc_code = ?status.code(),
@@ -542,10 +554,9 @@ mod tests {
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
-        test_support::RefusedAddress,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::no_health_check,
+            test_support::{no_health_check, RefusedAddress},
             BasicWorkerBuilder, ConnectionMode,
         },
     };

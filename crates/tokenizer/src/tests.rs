@@ -86,17 +86,55 @@ fn byte_fallback_run_streams_each_complete_character() {
     assert_eq!(deltas.concat(), batch);
     assert_eq!(recoveries, 0);
     // An incomplete trailing sequence is the only thing held; the end of
-    // input releases it as its own replacement characters. Batch decoding
-    // would replace the whole run, the streamed character included, so this
-    // counts as a recovery.
+    // input releases nothing for it (the model never finished the character),
+    // so nothing already streamed is rewritten and no recovery is counted.
+    // Batch decoding replaces the whole run, the streamed character included.
     let mut ids = byte_ids("日");
     ids.extend(byte_ids("本")[..2].iter());
     let (deltas, batch, recoveries) =
         stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
-    assert_eq!(deltas, vec!["日", "\u{FFFD}\u{FFFD}"]);
+    assert_eq!(deltas, vec!["日"]);
     assert_eq!(batch, "\u{FFFD}".repeat(5));
-    assert_eq!(run_bytes(&deltas.concat()), run_bytes(&batch));
-    assert_eq!(recoveries, 1);
+    assert_eq!(recoveries, 0);
+}
+
+/// A ByteFallback vocabulary whose ids have a gap, the byte tokens past it
+/// (more ids than entries): the byte table reaches them, so the stream holds
+/// back a character its end cut short instead of rendering its bytes as
+/// replacement characters.
+#[test]
+fn byte_fallback_byte_tokens_past_a_gap_in_the_ids_are_known_to_the_stream() {
+    let definition = serde_json::json!({
+        "version": "1.0", "added_tokens": [],
+        "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": {
+            "[UNK]": 0, "x": 1, "<0xE2>": 70, "<0x82>": 71, "<0xAC>": 72
+        }},
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "ByteFallback"}, {"type": "Fuse"}
+        ]}
+    });
+    let native =
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&definition).unwrap()).unwrap();
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(native));
+    let (deltas, batch, recoveries) = stream_all(
+        &tokenizer,
+        &[1, 70, 71, 72],
+        crate::StopSequenceConfig::default(),
+        true,
+    );
+    assert_eq!(deltas, vec!["x", "€"]);
+    assert_eq!(batch, "x€");
+    assert_eq!(recoveries, 0);
+    let (deltas, batch, recoveries) = stream_all(
+        &tokenizer,
+        &[1, 70, 71],
+        crate::StopSequenceConfig::default(),
+        true,
+    );
+    assert_eq!(deltas, vec!["x"]);
+    assert_eq!(batch, format!("x{}", "\u{FFFD}".repeat(2)));
+    assert_eq!(recoveries, 0);
 }
 
 #[test]
@@ -393,27 +431,28 @@ fn byte_fallback_eof_preserves_text_and_stops() {
         } else {
             native
         };
-        // An unfinished run at the end of input is released as batch decoding
-        // ends it; a `t` already sent stays, the invalid byte after it becomes
-        // its replacement character (one recovery).
-        for (ids, expected, recoveries) in [
-            (vec![2], "t", 0),
-            (vec![2, 3], "t\u{FFFD}", 1),
-            (vec![5, 6], "é", 0),
-            (vec![1, 2], "regulart", 0),
-            (vec![1, 2, 3], "regulart\u{FFFD}", 1),
-            (vec![2, 7, 3], "t\u{FFFD}", 1),
-            (vec![3], "\u{FFFD}", 0),
-            (vec![3, 3], "\u{FFFD}\u{FFFD}", 0),
-            (vec![5], "\u{FFFD}", 0),
+        // An unfinished run at the end of input: batch decoding renders the
+        // whole run as replacement characters; the stream keeps a `t` already
+        // sent, releases a stray byte the model wrote (an F2 another F2
+        // follows) as its replacement character, and nothing for a character
+        // the end cut (a lone F2 or C3: the start of one the model never
+        // finished), without rewriting anything sent (no recovery).
+        for (ids, expected, batch_text, recoveries) in [
+            (vec![2], "t", "t", 0),
+            (vec![2, 3], "t", "\u{FFFD}\u{FFFD}", 0),
+            (vec![5, 6], "é", "é", 0),
+            (vec![1, 2], "regulart", "regulart", 0),
+            (vec![1, 2, 3], "regulart", "regular\u{FFFD}\u{FFFD}", 0),
+            (vec![2, 7, 3], "t", "\u{FFFD}\u{FFFD}", 0),
+            (vec![3], "", "\u{FFFD}", 0),
+            (vec![3, 3], "\u{FFFD}", "\u{FFFD}\u{FFFD}", 0),
+            (vec![5], "", "\u{FFFD}", 0),
         ] {
             let (deltas, batch, seen) =
                 stream_all(&tokenizer, &ids, StopSequenceConfig::default(), true);
             assert_eq!(deltas.concat(), expected, "{ids:?} cached={cached}");
+            assert_eq!(batch, batch_text, "{ids:?} cached={cached}");
             assert_eq!(seen, recoveries, "{ids:?} cached={cached}");
-            if recoveries == 0 {
-                assert_eq!(batch, expected, "{ids:?} cached={cached}");
-            }
             let mut decoder =
                 StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), true);
             for &id in &ids {
@@ -504,7 +543,8 @@ fn byte_fallback_completed_seed_bytes_do_not_reemit_or_change_prefix() {
             let mut unchanged =
                 crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
             assert_eq!(unchanged.finish().unwrap(), "");
-            for (next, streamed, finished) in [(2, "t", ""), (3, "", "\u{FFFD}")] {
+            // A generated F2 the end cuts: nothing is released for it.
+            for (next, streamed, finished) in [(2, "t", ""), (3, "", "")] {
                 let mut sequence =
                     crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
                 assert_eq!(
@@ -523,6 +563,38 @@ fn byte_fallback_completed_seed_bytes_do_not_reemit_or_change_prefix() {
     }
 }
 
+/// How many bytes at the end of `ids`, in `byte_fallback_tokenizer` (byte
+/// tokens 2 = 74, 3 = F2, 5 = C3, 6 = A9; a skipped `[EOS]` renders nothing,
+/// every other token closes a byte run), are a character the end cut: a
+/// trailing sequence of the last run that is the start of a character and
+/// nothing more, judged from the bytes independently of the decoder.
+fn trailing_cut(ids: &[u32], skip_special: bool) -> usize {
+    let byte = |id: u32| match id {
+        2 => Some(0x74),
+        3 => Some(0xF2),
+        5 => Some(0xC3),
+        6 => Some(0xA9),
+        _ => None,
+    };
+    let mut run = Vec::new();
+    for &id in ids.iter().rev() {
+        match byte(id) {
+            Some(byte) => run.push(byte),
+            None if id == 7 && skip_special => {}
+            None => break,
+        }
+    }
+    run.reverse();
+    run.utf8_chunks().last().map_or(0, |chunk| {
+        let tail = chunk.invalid();
+        if std::str::from_utf8(tail).is_err_and(|error| error.error_len().is_none()) {
+            tail.len()
+        } else {
+            0
+        }
+    })
+}
+
 #[test]
 fn byte_fallback_short_combinations_match_batch_decode() {
     use crate::StopSequenceConfig;
@@ -539,18 +611,24 @@ fn byte_fallback_short_combinations_match_batch_decode() {
                         skip_special,
                     );
                     let text = deltas.concat();
-                    if recoveries == 0 {
+                    // The stream releases nothing for a character the end cut;
+                    // the batch decode renders one replacement character per
+                    // byte of the run it ends. Byte for byte they agree on
+                    // everything else.
+                    let cut = trailing_cut(&ids, skip_special);
+                    assert_eq!(
+                        run_bytes(&text) + cut,
+                        run_bytes(&batch),
+                        "{ids:?} skip_special={skip_special}: {text:?} vs {batch:?}"
+                    );
+                    if recoveries == 0 && cut == 0 {
                         assert_eq!(text, batch, "{ids:?} skip_special={skip_special}");
                     } else {
                         // Batch decoding rewrote characters already streamed as
-                        // replacement characters (one per byte): the stream kept
-                        // them and sent the rest of the run as batch ends it.
+                        // replacement characters (one per byte) or rendered the
+                        // cut character: the stream kept what it sent and
+                        // released the rest of the run as batch ends it.
                         assert_ne!(text, batch, "{ids:?} skip_special={skip_special}");
-                        assert_eq!(
-                            run_bytes(&text),
-                            run_bytes(&batch),
-                            "{ids:?} skip_special={skip_special}"
-                        );
                         assert!(
                             batch.contains('\u{FFFD}'),
                             "{ids:?} skip_special={skip_special}: {text:?} vs {batch:?}"
@@ -577,16 +655,20 @@ fn byte_fallback_token_stop_preserves_pending_text() {
             decoder.process_token(2).unwrap(),
             SequenceDecoderOutput::Text("t".to_string())
         );
-        // An incomplete run before the stop token is released by it.
+        // A stop token ends the stream: an unfinished character before it
+        // (F2, the start of one the model never finished) is released as
+        // nothing, as at a limit; a visible stop's own text still follows.
         assert_eq!(
             decoder.process_token(3).unwrap(),
             SequenceDecoderOutput::Held
         );
         assert_eq!(
             decoder.process_token(7).unwrap(),
-            SequenceDecoderOutput::StoppedWithText(
-                if visible { "\u{FFFD}[EOS]" } else { "\u{FFFD}" }.to_string(),
-            )
+            if visible {
+                SequenceDecoderOutput::StoppedWithText("[EOS]".to_string())
+            } else {
+                SequenceDecoderOutput::Stopped
+            }
         );
         assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Held);
     }
@@ -1062,4 +1144,396 @@ fn test_decode_stream_multibyte_char_boundary() {
     //   "byte index 3 is not a char boundary; it is inside '🎉' (bytes 2..6)"
     let result = stream.step(3).unwrap();
     assert_eq!(result, Some("\u{1F389}".to_string()));
+}
+
+/// The deltas of a stream through the public `Sequence` API, then its finish:
+/// what a client reads over a whole stream.
+fn sequence_deltas(
+    tokenizer: &Arc<dyn crate::TokenizerTrait>,
+    ids: &[u32],
+    skip_special_tokens: bool,
+) -> (Vec<String>, String) {
+    let mut sequence = crate::Sequence::new_with_options(tokenizer.clone(), skip_special_tokens);
+    let mut text = String::new();
+    let deltas = ids
+        .iter()
+        .map(|&id| {
+            let before = text.len();
+            sequence.append_token_into(id, &mut text).unwrap();
+            text[before..].to_string()
+        })
+        .collect();
+    (deltas, sequence.finish().unwrap())
+}
+
+/// What the non-streaming path reads for `ids`: every token, then the finish,
+/// appended into one buffer by the stop decoder.
+fn decoded_whole(
+    tokenizer: &Arc<dyn crate::TokenizerTrait>,
+    ids: &[u32],
+    skip_special_tokens: bool,
+) -> String {
+    let mut decoder = crate::StopSequenceDecoder::new(
+        tokenizer.clone(),
+        crate::StopSequenceConfig::default(),
+        skip_special_tokens,
+    );
+    let mut text = String::new();
+    for &id in ids {
+        decoder.process_token_into(id, &mut text).unwrap();
+    }
+    decoder.finish_into(&mut text).unwrap();
+    text
+}
+
+/// Every case read four ways: the full decode, `Sequence`'s deltas and
+/// finish, the stop decoder's deltas and batch, and the non-streaming path,
+/// each against the case's full or streamed text.
+fn assert_decodes(
+    tokenizer: &Arc<dyn crate::TokenizerTrait>,
+    cases: &[(&[u32], bool, &str, &str)],
+) {
+    for &(ids, skip, full, streamed) in cases {
+        assert_eq!(
+            tokenizer.decode(ids, skip).unwrap(),
+            full,
+            "ids={ids:?} skip={skip}"
+        );
+        let (deltas, finish) = sequence_deltas(tokenizer, ids, skip);
+        assert_eq!(
+            deltas.concat() + &finish,
+            streamed,
+            "ids={ids:?} skip={skip}: deltas {deltas:?}, finish {finish:?}"
+        );
+        let (deltas, batch, _) =
+            stream_all(tokenizer, ids, crate::StopSequenceConfig::default(), skip);
+        assert_eq!(
+            deltas.concat(),
+            streamed,
+            "stop decoder: ids={ids:?} skip={skip}"
+        );
+        assert_eq!(batch, full, "stop decoder batch: ids={ids:?} skip={skip}");
+        assert_eq!(
+            decoded_whole(tokenizer, ids, skip),
+            streamed,
+            "whole: ids={ids:?} skip={skip}"
+        );
+    }
+}
+
+/// A byte-fallback stream that ends while its window holds a byte run: the
+/// end releases what is text (a literal replacement character, a character
+/// complete before the cut bytes, a stray byte as the full decode's
+/// replacement character) and nothing for a character the end cut, through
+/// `Sequence`, the stop decoder and the non-streaming path alike; the full
+/// decode renders a run the cut leaves invalid as one replacement character
+/// per byte.
+#[test]
+fn byte_fallback_stream_end_releases_held_text_but_not_a_cut_character() {
+    let tokenizer = byte_fallback_full_tokenizer(Vec::new());
+    let emoji = byte_ids("\u{1F600}");
+    let mut x_then_half = vec![1];
+    x_then_half.extend_from_slice(&emoji[..2]);
+    let mut stray_then_lead = vec![0xFF + 2];
+    stray_then_lead.push(emoji[0]);
+    let mut e_then_lead = byte_ids("\u{E9}");
+    e_then_lead.push(emoji[0]);
+    let lead_then_special = vec![emoji[0], 258];
+    // (ids, the full decode, what the stream reads); special tokens skipped.
+    let cases: [(Vec<u32>, String, &str); 7] = [
+        (byte_ids("\u{FFFD}"), "\u{FFFD}".into(), "\u{FFFD}"),
+        (emoji.clone(), "\u{1F600}".into(), "\u{1F600}"),
+        (emoji[..3].to_vec(), "\u{FFFD}".repeat(3), ""),
+        (x_then_half, format!("x{}", "\u{FFFD}".repeat(2)), "x"),
+        (e_then_lead, "\u{FFFD}".repeat(3), "\u{E9}"),
+        (stray_then_lead, "\u{FFFD}".repeat(2), "\u{FFFD}"),
+        (lead_then_special, "\u{FFFD}".into(), ""),
+    ];
+    let cases: Vec<(&[u32], bool, &str, &str)> = cases
+        .iter()
+        .map(|(ids, full, streamed)| (ids.as_slice(), true, full.as_str(), *streamed))
+        .collect();
+    assert_decodes(&tokenizer, &cases);
+}
+
+/// A byte-level stream that ends while its decoder still holds bytes: the
+/// end releases the held bytes as the full decode renders them (a complete
+/// character held with the bytes after it, a literal replacement character,
+/// a stray byte and a character the end cut, the first bytes of one the
+/// model never finished, as the replacement character), through `Sequence`
+/// and through the stop decoder alike; nothing comes out earlier than the
+/// reference emits it.
+#[test]
+fn byte_level_stream_end_renders_a_cut_character_as_decode_does() {
+    use crate::byte_level::tests::{byte_level_tokenizer, byte_token, SPECIAL};
+    let hf = byte_level_tokenizer();
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(hf.clone()));
+    let id = |token: &str| hf.token_to_id(token).expect(token);
+    let (hello, world) = (id("hello"), id("Ġworld"));
+    // A lone continuation byte (A9); a lone lead byte (C3); a space and the
+    // lead byte of a three-byte character (20 E0); the first two bytes of a
+    // four-byte emoji (F0 9F) and its third and fourth (98 80); the three
+    // bytes of a literal U+FFFD as one token.
+    let (continuation, lead, space_lead) = (id("©"), id("Ã"), id("Ġà"));
+    let (emoji_half, emoji_third, emoji_last) =
+        (id("ðŁ"), id(&byte_token(0x98)), id(&byte_token(0x80)));
+    let literal = id("ï¿½");
+    let special = id(SPECIAL);
+    // (ids, skip special tokens, the full decode, what the stream reads)
+    let cases: [(&[u32], bool, &str, &str); 12] = [
+        (&[literal], false, "\u{FFFD}", "\u{FFFD}"),
+        (
+            &[hello, world, continuation],
+            false,
+            "hello world\u{FFFD}",
+            "hello world\u{FFFD}",
+        ),
+        (
+            &[hello, continuation, continuation],
+            false,
+            "hello\u{FFFD}\u{FFFD}",
+            "hello\u{FFFD}\u{FFFD}",
+        ),
+        (&[continuation, special], true, "\u{FFFD}", "\u{FFFD}"),
+        (&[space_lead], false, " \u{FFFD}", " \u{FFFD}"),
+        (&[lead], false, "\u{FFFD}", "\u{FFFD}"),
+        (
+            &[hello, emoji_half],
+            false,
+            "hello\u{FFFD}",
+            "hello\u{FFFD}",
+        ),
+        (
+            &[hello, emoji_half, emoji_third],
+            false,
+            "hello\u{FFFD}",
+            "hello\u{FFFD}",
+        ),
+        (
+            &[hello, emoji_half, emoji_third, emoji_last],
+            false,
+            "hello\u{1F600}",
+            "hello\u{1F600}",
+        ),
+        (
+            &[hello, continuation, lead],
+            false,
+            "hello\u{FFFD}\u{FFFD}",
+            "hello\u{FFFD}\u{FFFD}",
+        ),
+        (&[lead, special], true, "\u{FFFD}", "\u{FFFD}"),
+        // A run the model itself closes (a special token after the two
+        // bytes) is no cut: its step renders it as the full decode does.
+        (
+            &[hello, emoji_half, special],
+            false,
+            "hello\u{FFFD}<|im_end|>",
+            "hello\u{FFFD}<|im_end|>",
+        ),
+    ];
+    assert_decodes(&tokenizer, &cases);
+    // The steps hold what the reference holds; the end releases the held
+    // bytes, the cut character as its replacement character.
+    let (deltas, finish) = sequence_deltas(&tokenizer, &[hello, world, continuation], false);
+    assert_eq!(deltas, ["hello", " world", ""]);
+    assert_eq!(finish, "\u{FFFD}");
+    let (deltas, finish) = sequence_deltas(&tokenizer, &[space_lead], false);
+    assert_eq!(deltas, [""]);
+    assert_eq!(finish, " \u{FFFD}");
+    let (deltas, finish) = sequence_deltas(&tokenizer, &[hello, emoji_half, emoji_third], false);
+    assert_eq!(deltas, ["hello", "", ""]);
+    assert_eq!(finish, "\u{FFFD}");
+    // A special token the stream skips after a held byte releases nothing at
+    // its step; the end does for a stray byte and for a cut one alike (as the
+    // full decode without the token reads).
+    let (deltas, finish) = sequence_deltas(&tokenizer, &[continuation, special], true);
+    assert_eq!(deltas, ["", ""]);
+    assert_eq!(finish, "\u{FFFD}");
+    let (deltas, finish) = sequence_deltas(&tokenizer, &[lead, special], true);
+    assert_eq!(deltas, ["", ""]);
+    assert_eq!(finish, "\u{FFFD}");
+}
+
+/// A vocabulary whose decoder is a sequence with a byte-level member gets no
+/// per-id table and streams through the generic window, which holds bytes
+/// too: its end releases the held bytes as the full decode renders them, a
+/// character the end cut as its replacement character, through `Sequence`,
+/// the stop decoder and the one-buffer path alike.
+#[test]
+fn byte_level_in_a_sequence_decoder_ends_the_same_way() {
+    use tokenizers::decoders::{
+        sequence::Sequence as SequenceDecoder, strip::Strip, DecoderWrapper,
+    };
+
+    use crate::byte_level::tests::{byte_level_tokenizer, SPECIAL};
+    let mut hf = byte_level_tokenizer();
+    hf.with_decoder(Some(DecoderWrapper::Sequence(SequenceDecoder::new(vec![
+        ByteLevel::default().into(),
+        Strip::new(' ', 0, 0).into(),
+    ]))));
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(hf.clone()));
+    assert!(tokenizer.incremental_decoder(false).is_none());
+    assert!(!tokenizer.uses_byte_fallback());
+    let id = |token: &str| hf.token_to_id(token).expect(token);
+    let (hello, world) = (id("hello"), id("Ġworld"));
+    let (continuation, lead, space_lead, emoji_half) = (id("©"), id("Ã"), id("Ġà"), id("ðŁ"));
+    let (literal, special) = (id("ï¿½"), id(SPECIAL));
+    let cases: [(&[u32], bool, &str, &str); 7] = [
+        (&[literal], false, "\u{FFFD}", "\u{FFFD}"),
+        (
+            &[hello, world, continuation],
+            false,
+            "hello world\u{FFFD}",
+            "hello world\u{FFFD}",
+        ),
+        (&[space_lead], false, " \u{FFFD}", " \u{FFFD}"),
+        (&[lead], false, "\u{FFFD}", "\u{FFFD}"),
+        (
+            &[hello, emoji_half],
+            false,
+            "hello\u{FFFD}",
+            "hello\u{FFFD}",
+        ),
+        (
+            &[hello, continuation, lead],
+            false,
+            "hello\u{FFFD}\u{FFFD}",
+            "hello\u{FFFD}\u{FFFD}",
+        ),
+        (&[lead, special], true, "\u{FFFD}", "\u{FFFD}"),
+    ];
+    assert_decodes(&tokenizer, &cases);
+}
+
+/// A seeded byte-level sequence: the seed is prompt text, so a sequence that
+/// generated nothing releases nothing at its end even when the seed ends
+/// inside a character; a generated token that completes the seed's character
+/// streams it, as before, and the end releases what the generated tokens
+/// left held.
+#[test]
+fn byte_level_seeded_sequence_does_not_reemit_prompt() {
+    use crate::byte_level::tests::byte_level_tokenizer;
+    let hf = byte_level_tokenizer();
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(hf.clone()));
+    let id = |token: &str| hf.token_to_id(token).expect(token);
+    let (hello, space_lead, c3, a9) = (id("hello"), id("Ġà"), id("Ã"), id("©"));
+    for seed in [
+        vec![hello],
+        vec![hello, space_lead],
+        vec![c3],
+        vec![hello, c3],
+    ] {
+        for skip in [false, true] {
+            let mut unchanged =
+                crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), skip);
+            assert_eq!(unchanged.finish().unwrap(), "", "seed {seed:?} skip={skip}");
+        }
+    }
+    // The seed's lead byte and a generated continuation byte make one character.
+    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![c3], false);
+    assert_eq!(sequence.append_token(a9).unwrap(), "é");
+    assert_eq!(sequence.finish().unwrap(), "");
+    // A generated stray byte left held: the end releases its replacement
+    // character, as the full decode renders it.
+    let mut sequence =
+        crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![hello], false);
+    assert_eq!(sequence.append_token(hello).unwrap(), "hello");
+    assert_eq!(sequence.append_token(a9).unwrap(), "");
+    assert_eq!(sequence.finish().unwrap(), "\u{FFFD}");
+    // A generated lead byte the end cuts: its replacement character, as the
+    // full decode renders it.
+    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer, vec![hello], false);
+    assert_eq!(sequence.append_token(c3).unwrap(), "");
+    assert_eq!(sequence.finish().unwrap(), "\u{FFFD}");
+}
+
+/// Random id lists through the public `Sequence` API with its finish: the
+/// whole stream is the full decode, a character the last token leaves
+/// unfinished included, as the replacement character; some rounds end with
+/// held text and some inside a character.
+#[test]
+fn byte_level_random_id_streams_end_as_the_full_decode() {
+    use crate::byte_level::tests::{byte_level_tokenizer, bytes_of};
+    let hf = byte_level_tokenizer();
+    let vocab_len = hf.get_vocab_size(true) as u32;
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(hf.clone()));
+    let mut state = 0x9E37_79B9u32;
+    let (mut ended_held, mut ended_cut) = (0, 0);
+    for round in 0..400 {
+        let len = 1 + round % 40;
+        let ids: Vec<u32> = (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state % vocab_len
+            })
+            .collect();
+        for skip in [false, true] {
+            let full = tokenizer.decode(&ids, skip).unwrap();
+            // Judged from the bytes, independently of the decoder: the
+            // stream ends inside a character when its last invalid chunk is
+            // the start of one and nothing more.
+            let bytes = bytes_of(&hf, &ids, skip);
+            let cut = bytes.utf8_chunks().last().is_some_and(|chunk| {
+                std::str::from_utf8(chunk.invalid()).is_err_and(|error| error.error_len().is_none())
+            });
+            if cut {
+                assert!(
+                    full.ends_with('\u{FFFD}'),
+                    "the full decode of a cut ends in U+FFFD: {full:?}"
+                );
+            }
+            let (deltas, finish) = sequence_deltas(&tokenizer, &ids, skip);
+            ended_held += usize::from(!finish.is_empty());
+            ended_cut += usize::from(cut);
+            assert_eq!(deltas.concat() + &finish, full, "ids={ids:?} skip={skip}");
+        }
+    }
+    assert!(ended_held > 0, "no round ended with held text");
+    assert!(ended_cut > 0, "no round ended inside a character");
+}
+
+/// A vocabulary with a literal replacement character as a token and neither a
+/// byte-level nor a byte-fallback decoder streams through the generic step,
+/// which holds the character back: the end releases it too.
+#[test]
+fn generic_stream_end_releases_a_held_replacement_character() {
+    let definition = serde_json::json!({
+        "version": "1.0", "added_tokens": [],
+        "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": {
+            "[UNK]": 0, "x": 1, "\u{FFFD}": 2
+        }}
+    });
+    let native =
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&definition).unwrap()).unwrap();
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(native));
+    assert!(tokenizer.incremental_decoder(false).is_none());
+    let cases: [(&[u32], &str); 3] = [
+        (&[1, 2], "x \u{FFFD}"),
+        (&[2], "\u{FFFD}"),
+        (&[1, 2, 2], "x \u{FFFD} \u{FFFD}"),
+    ];
+    for (ids, expected) in cases {
+        assert_eq!(
+            tokenizer.decode(ids, false).unwrap(),
+            expected,
+            "ids={ids:?}"
+        );
+        let (deltas, finish) = sequence_deltas(&tokenizer, ids, false);
+        assert_eq!(
+            deltas.concat() + &finish,
+            expected,
+            "ids={ids:?}: deltas {deltas:?}, finish {finish:?}"
+        );
+        assert!(
+            !finish.is_empty(),
+            "ids={ids:?}: the end releases the held character"
+        );
+    }
 }

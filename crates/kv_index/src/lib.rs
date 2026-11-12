@@ -17,6 +17,7 @@ pub mod chain_index;
 #[doc(hidden)]
 pub mod churn;
 mod common;
+pub mod groups;
 mod lane_map;
 pub mod lane_pool;
 mod path_hash;
@@ -34,6 +35,7 @@ pub use block::{
 };
 pub use chain_index::{BlockRef, ChainIndex, ChainIndexStats};
 pub use common::{MatchResult, TenantId};
+pub use groups::{Cap, Group, GroupCap, GroupKind, GroupViews, GroupViewsRead, WorkerGroups};
 pub use lane_map::ChainBlockMap;
 pub use lane_pool::{
     Claimed, Control, LaneHooks, LanePool, LanePoolConfig, PoolMetrics, QueueFull,

@@ -16,7 +16,7 @@ fn function_tool(name: &str, description: &str) -> Tool {
         function: Function {
             name: name.to_string(),
             description: Some(description.to_string()),
-            parameters: json!({}),
+            parameters: Some(json!({})),
             strict: None,
             extra: Default::default(),
         },
@@ -139,7 +139,7 @@ fn test_functions_normalizes_to_tools() {
         functions: Some(vec![Function {
             name: "test_func".to_string(),
             description: Some("Test function".to_string()),
-            parameters: json!({}),
+            parameters: Some(json!({})),
             strict: None,
             extra: Default::default(),
         }]),
@@ -221,7 +221,7 @@ fn test_function_call_function_variant_normalizes() {
                 function: Function {
                     name: "my_function".to_string(),
                     description: None,
-                    parameters: json!({}),
+                    parameters: Some(json!({})),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -559,11 +559,12 @@ fn test_validate_response_format_json_schema_schema_not_object() {
                 name: None,
             }],
             response_format: Some(ResponseFormat::JsonSchema {
-                json_schema: JsonSchemaFormat {
+                json_schema: Box::new(JsonSchemaFormat {
+                    description: None,
                     name: name.to_string(),
                     schema,
                     strict: None,
-                },
+                }),
             }),
             ..Default::default()
         }

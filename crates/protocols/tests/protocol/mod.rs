@@ -2,9 +2,11 @@
 //! serialization round trips, validation rules and provider profiles.
 
 mod chat;
+mod completion;
 mod decisions;
 mod deepseek_profile;
 mod provider_ext;
 mod responses;
 mod sampling_params;
 mod systemone;
+mod zai_profile;

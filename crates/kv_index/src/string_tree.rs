@@ -24,11 +24,15 @@ type NodeRef = Arc<Node>;
 /// Default DashMap uses num_cpus * 4 shards (e.g., 256 on 64-core machines).
 ///
 /// Root node uses higher shard count since ALL requests pass through it.
-/// Other nodes use lower count as traffic diverges through the tree.
+/// Other nodes use lower count as traffic diverges through the tree: their
+/// tenant and children maps hold a handful of entries, every shard a walk
+/// enters is one allocation (dashmap's iterator wraps each shard guard in an
+/// `Arc`), and every shard is a cache-padded lock in every node, so they take
+/// dashmap's minimum of two.
 ///
 /// This reduces memory by ~90% vs default while maintaining good concurrency.
 const ROOT_SHARD_COUNT: usize = 32;
-const NODE_SHARD_COUNT: usize = 8;
+const NODE_SHARD_COUNT: usize = 2;
 
 /// Create a children DashMap for non-root nodes
 #[inline]
@@ -112,6 +116,19 @@ impl Hasher for CharHasher {
 }
 
 type CharHasherBuilder = BuildHasherDefault<CharHasher>;
+
+/// What a hashed insert does with its hash at the node the path ends at.
+#[derive(Clone, Copy)]
+enum Naming {
+    /// A plain insert: no hash.
+    None,
+    /// The node takes the hash and an earlier, different one leaves: a
+    /// request's insert names the newest sequence that ended at the node.
+    Newest(u64),
+    /// The node takes the hash only when it carries none: a repair page
+    /// fills what the tree has not named itself and displaces nothing.
+    UnlessNamed(u64),
+}
 
 /// Advance a string slice by N characters, returning the remaining slice.
 /// Returns empty string if n >= char count.
@@ -269,6 +286,10 @@ struct Node {
     /// Cached last-accessed tenant for O(1) lookup during prefix match.
     /// Avoids O(shards) DashMap iteration in the common case.
     last_tenant: RwLock<Option<TenantId>>,
+    /// The 8-byte hash of the root-to-node path, set when an insert that
+    /// carried one ended here (see [`Tree::insert_text_with_hash`]); `0`
+    /// when none did. A split leaves it on the node that keeps the path.
+    path_hash: AtomicU64,
 }
 
 impl Node {
@@ -320,6 +341,13 @@ pub struct Tree {
     /// Tree-wide char total (sum of `tenant_char_count`); the budget
     /// checked by `evict_tenant_by_size`
     total_char_count: AtomicUsize,
+    /// The node each hashed insert ended at, by path hash, so a path named
+    /// by its hash alone (a mesh delta) resolves to its node without a
+    /// second copy of the text; an entry leaves with its node, under the
+    /// same eviction (see [`Tree::detach_if_empty`]). The root is never
+    /// named: the empty text ends there, every tenant holds it, and a
+    /// repair page carries it as its first entry.
+    hashed: DashMap<u64, Weak<Node>, FxBuildHasher>,
 }
 
 // For the heap
@@ -332,10 +360,9 @@ struct EvictionEntry {
 
 impl Eq for EvictionEntry {}
 
-#[expect(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for EvictionEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.timestamp.cmp(&other.timestamp))
+        Some(self.cmp(other))
     }
 }
 
@@ -355,64 +382,92 @@ impl PartialEq for EvictionEntry {
 // Note that in rust, `.len()` or slice is operated on the "byte" level. It causes issues for UTF-8 characters because one character might use multiple bytes.
 // https://en.wikipedia.org/wiki/UTF-8
 
-/// Count matching prefix characters between two strings.
-/// Returns the number of characters that match from the start.
-/// Optimized: uses fast byte comparison for ASCII, falls back to char iteration for UTF-8.
+/// Count matching prefix characters between two strings: the character
+/// count of `shared_prefix_len`, one scan on the ASCII path and the
+/// multi-byte path alike.
 #[inline]
 fn shared_prefix_count(a: &str, b: &str) -> usize {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-
-    // Find common byte prefix length using iterator (potentially SIMD-optimized)
-    let common_byte_len = a_bytes
-        .iter()
-        .zip(b_bytes)
-        .position(|(&a_byte, &b_byte)| a_byte != b_byte)
-        .unwrap_or_else(|| a_bytes.len().min(b_bytes.len()));
-
-    // If the common byte prefix is all ASCII, byte count == char count
-    // Otherwise, fall back to char-by-char comparison for UTF-8 safety
-    if a_bytes[..common_byte_len].is_ascii() {
-        common_byte_len
-    } else {
-        shared_prefix_count_chars(a, b)
-    }
+    shared_prefix_len(a, b).0
 }
 
 /// Common prefix of `a` and `b` as (chars, bytes), so the caller can slice
-/// past it without a second walk over the matched text.
-#[inline]
+/// past it without a second walk over the matched text. Inlined into its
+/// callers explicitly: left to the inliner, the fused walk lost it once the
+/// helper had a second caller (a call per entry compared, measured).
+#[inline(always)]
 fn shared_prefix_len(a: &str, b: &str) -> (usize, usize) {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-    let common_byte_len = a_bytes
-        .iter()
-        .zip(b_bytes)
-        .position(|(&a_byte, &b_byte)| a_byte != b_byte)
-        .unwrap_or_else(|| a_bytes.len().min(b_bytes.len()));
+    let common_byte_len = common_byte_prefix(a_bytes, b_bytes);
     if a_bytes[..common_byte_len].is_ascii() {
         return (common_byte_len, common_byte_len);
     }
-    // The byte-level prefix may end inside a character: count whole chars.
-    let mut chars = 0;
-    let mut bytes = 0;
-    for ((offset, a_char), b_char) in a.char_indices().zip(b.chars()) {
-        if a_char != b_char {
-            break;
-        }
-        chars += 1;
-        bytes = offset + a_char.len_utf8();
-    }
-    (chars, bytes)
+    // The byte position may sit inside a character: back it to that
+    // character's first byte (at most three bytes) and count the whole
+    // characters before it. The two strings agree byte for byte up to the
+    // position, so their character boundaries coincide there.
+    let bytes = a.floor_char_boundary(common_byte_len);
+    (a[..bytes].chars().count(), bytes)
 }
 
-/// Fallback char-by-char comparison for strings with non-ASCII characters.
+/// The bytes `a` and `b` share from the start. The span of the shorter run is
+/// compared as one slice: on the tree's walks the input usually runs through
+/// a node's whole text, so one compare settles it, and only a difference goes
+/// on to `first_differing_byte`. The count is the one the byte-wise scan gave,
+/// for every pair.
 #[inline]
-fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(a_char, b_char)| a_char == b_char)
+fn common_byte_prefix(a: &[u8], b: &[u8]) -> usize {
+    let len = a.len().min(b.len());
+    let (a, b) = (&a[..len], &b[..len]);
+    if a == b {
+        len
+    } else {
+        first_differing_byte(a, b)
+    }
+}
+
+/// The index of the first differing byte of two runs of one length that are
+/// known to differ: the equal 32-byte chunks in front of it are skipped whole
+/// (32 bytes is the widest constant compare the compiler expands in line on
+/// the baseline target; a 64-byte chunk became a library call per chunk,
+/// measured), then the first unequal word of eight bytes names the byte by
+/// the lowest set bit of its xor (the lowest-addressed byte, read
+/// little-endian), and the bytes under one word at the end go one at a time.
+/// Out of line and cold: the walks' usual outcome, per node compared, never
+/// reaches it, and their hot paths stay as small as before (smaller: the word
+/// loop and the tail were inlined into every walk). Per operation, a prompt
+/// that departs from every cached text reaches it once, at the node it
+/// departs from: `#[cold]` keeps the locate step out of the walks' code, it
+/// does not say the step is rare per request.
+#[cold]
+#[inline(never)]
+fn first_differing_byte(a: &[u8], b: &[u8]) -> usize {
+    const CHUNK: usize = 32;
+    const WORD: usize = 8;
+    let (a_chunks, _) = a.as_chunks::<CHUNK>();
+    let (b_chunks, _) = b.as_chunks::<CHUNK>();
+    let start = a_chunks
+        .iter()
+        .zip(b_chunks)
+        .take_while(|(x, y)| x == y)
         .count()
+        * CHUNK;
+    let (a, b) = (&a[start..], &b[start..]);
+    let (a_words, a_tail) = a.as_chunks::<WORD>();
+    let (b_words, b_tail) = b.as_chunks::<WORD>();
+    for (i, (x, y)) in a_words.iter().zip(b_words).enumerate() {
+        let differing = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        if differing != 0 {
+            return start + i * WORD + differing.trailing_zeros() as usize / 8;
+        }
+    }
+    start
+        + a_words.len() * WORD
+        + a_tail
+            .iter()
+            .zip(b_tail)
+            .position(|(x, y)| x != y)
+            .unwrap_or(a_tail.len())
 }
 
 impl Default for Tree {
@@ -451,16 +506,167 @@ impl Tree {
                 ),
                 parent: RwLock::new(None),
                 last_tenant: RwLock::new(None),
+                path_hash: AtomicU64::new(0),
             }),
             tenant_char_count: DashMap::with_hasher_and_shard_amount(
                 FxBuildHasher,
                 ROOT_SHARD_COUNT,
             ),
             total_char_count: AtomicUsize::new(0),
+            hashed: DashMap::with_hasher(FxBuildHasher),
         }
     }
 
     pub fn insert_text(&self, text: &str, tenant: &str) {
+        self.insert_text_hashed(text, tenant, Naming::None);
+    }
+
+    /// [`Self::insert_text`], and the node the path ends at remembers
+    /// `path_hash` (the caller's [`crate::hash_node_path`] of `text`) so
+    /// that [`Self::insert_tenant_by_hash`] finds it later. The hash lives
+    /// and dies with the node under the tree's own eviction. The caller
+    /// hashes, so a tree never asked by hash never pays for one.
+    pub fn insert_text_with_hash(&self, text: &str, tenant: &str, path_hash: u64) {
+        self.insert_text_hashed(text, tenant, Naming::Newest(path_hash));
+    }
+
+    /// [`Self::insert_text_with_hash`] for a path a peer repaired: the node
+    /// takes `path_hash` only when it carries none, so a repair never
+    /// displaces the hash this tree recorded from its own request; a node the
+    /// tree never named itself answers to the repair's hash. (Here a request
+    /// and a repair name one text by one hash; the rule is the token tree's,
+    /// kept in the twin.)
+    pub fn insert_text_with_hash_unless_named(&self, text: &str, tenant: &str, path_hash: u64) {
+        self.insert_text_hashed(text, tenant, Naming::UnlessNamed(path_hash));
+    }
+
+    /// Attach `tenant` to the path an earlier hashed insert recorded under
+    /// `path_hash`, as [`Self::insert_text`] of that text would: along the
+    /// whole path, with the end node's LRU stamp. `false` when no live node
+    /// carries the hash, the shape of a path the tree evicted or never
+    /// held; the caller then asks a peer for the text. The text is read
+    /// back from the node's parent chain, each edge with its parent under
+    /// the node's text guard (the pair a split rewrites in one section),
+    /// and inserted through the same descent as any other text, so the
+    /// attach meets every split and eviction rule once, there.
+    pub fn insert_tenant_by_hash(&self, path_hash: u64, tenant: &str) -> bool {
+        let Some(node) = self
+            .hashed
+            .get(&path_hash)
+            .and_then(|entry| entry.value().upgrade())
+        else {
+            return false;
+        };
+        let Some(path) = self.path_of(&node) else {
+            return false;
+        };
+        self.insert_text_hashed(&path, tenant, Naming::Newest(path_hash));
+        true
+    }
+
+    /// How many paths a hash names (the size of the mesh lookup).
+    pub fn hashed_paths(&self) -> usize {
+        self.hashed.len()
+    }
+
+    /// The root-to-node text, read upward edge by edge; `None` when an
+    /// ancestor is gone, that is, the node left the tree with it.
+    fn path_of(&self, node: &NodeRef) -> Option<String> {
+        let mut edges: Vec<String> = Vec::new();
+        let mut current = Arc::clone(node);
+        while !Arc::ptr_eq(&current, &self.root) {
+            let text = current.text.read();
+            let parent = current.parent.read().as_ref().and_then(Weak::upgrade)?;
+            edges.push(text.as_str().to_string());
+            drop(text);
+            current = parent;
+        }
+        let mut path = String::with_capacity(edges.iter().map(String::len).sum());
+        for edge in edges.iter().rev() {
+            path.push_str(edge);
+        }
+        Some(path)
+    }
+
+    /// Apply `naming` at `node`, the end of an inserted path. The two named
+    /// arms may race on one node (a repair page streams while requests
+    /// route); their orders are chosen so that every interleaving ends with
+    /// the request's hash on the node and one entry in the map: a request
+    /// inserts its entry, swaps the node's hash and removes the earlier
+    /// entry (`record_hash`); a repair that has read the node as unnamed
+    /// claims it through [`Self::claim_unless_named`].
+    fn record(&self, node: &NodeRef, naming: Naming) {
+        match naming {
+            Naming::None => {}
+            Naming::Newest(path_hash) => self.record_hash(node, Some(path_hash)),
+            Naming::UnlessNamed(path_hash) => {
+                if node.path_hash.load(Ordering::Relaxed) == 0 {
+                    self.claim_unless_named(node, path_hash);
+                }
+            }
+        }
+    }
+
+    /// A repair's claim of a node it read as unnamed: insert the entry,
+    /// compare-exchange the node's hash from 0, and take the entry back only
+    /// when the exchange lost to a different hash. A request that named the
+    /// node with this same hash in between wrote this same entry (the request
+    /// path and a repair page hash a node's whole text alike), so the
+    /// entry is the request's as much as the repair's and stays; removing it
+    /// would leave a named node that no lookup reaches until its eviction.
+    fn claim_unless_named(&self, node: &NodeRef, path_hash: u64) {
+        if Arc::ptr_eq(node, &self.root) {
+            return;
+        }
+        self.hashed.insert(path_hash, Arc::downgrade(node));
+        if let Err(current) =
+            node.path_hash
+                .compare_exchange(0, path_hash, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            if current != path_hash {
+                self.hashed.remove_if(&path_hash, |_, weak| {
+                    std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
+                });
+            }
+        }
+    }
+
+    /// Remember `node` as the end of the path hashed `path_hash`: the node
+    /// carries the hash and the map names the node. A node that already
+    /// carries it costs one load; a hash moving to another node (its earlier
+    /// node was detached and the text re-inserted) replaces the entry; a
+    /// node handed a second hash keeps the newer one and its earlier entry
+    /// leaves the map (one text ends at one node here; the rule is the token
+    /// tree's, where two sequences that differ only inside their last page
+    /// end at one node), so the map holds at most one entry per hashed node.
+    fn record_hash(&self, node: &NodeRef, path_hash: Option<u64>) {
+        let Some(path_hash) = path_hash else {
+            return;
+        };
+        if Arc::ptr_eq(node, &self.root) || node.path_hash.load(Ordering::Relaxed) == path_hash {
+            return;
+        }
+        self.hashed.insert(path_hash, Arc::downgrade(node));
+        let earlier = node.path_hash.swap(path_hash, Ordering::Relaxed);
+        if earlier != 0 && earlier != path_hash {
+            self.hashed.remove_if(&earlier, |_, weak| {
+                std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
+            });
+        }
+    }
+
+    /// Drop the entry that names `node`, if it still does (a re-inserted
+    /// twin's entry stays), once the node has left the tree.
+    fn forget_hash(&self, node: &NodeRef) {
+        let path_hash = node.path_hash.load(Ordering::Relaxed);
+        if path_hash != 0 {
+            self.hashed.remove_if(&path_hash, |_, weak| {
+                std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
+            });
+        }
+    }
+
+    fn insert_text_hashed(&self, text: &str, tenant: &str, naming: Naming) {
         // Insert text into tree with given tenant
         // Use slice-based traversal to avoid Vec<char> allocation
 
@@ -478,7 +684,7 @@ impl Tree {
             .or_insert(0);
 
         // Descend from the root inserting the whole text.
-        self.insert_from(Arc::clone(&self.root), text, tenant_id);
+        self.insert_from(Arc::clone(&self.root), text, tenant_id, naming);
     }
 
     /// Insert `remaining` for `tenant_id` starting the descent at `start` (treated
@@ -493,7 +699,13 @@ impl Tree {
     /// detached a path node while the caller chose the tenant) it descends again
     /// from the root over the whole text, and this method credits only the edges
     /// it newly attaches, so nothing is counted twice.
-    fn insert_from(&self, start: NodeRef, mut remaining: &str, tenant_id: TenantId) {
+    fn insert_from(
+        &self,
+        start: NodeRef,
+        mut remaining: &str,
+        tenant_id: TenantId,
+        naming: Naming,
+    ) {
         let mut prev = start;
 
         // Result type to carry state out of the match block
@@ -502,7 +714,7 @@ impl Tree {
             Done,
             Continue {
                 next_prev: NodeRef,
-                advance_chars: usize,
+                advance_bytes: usize,
             },
         }
 
@@ -521,6 +733,7 @@ impl Tree {
                         tenant_last_access_time: new_tenant_map(),
                         parent: RwLock::new(Some(Arc::downgrade(&prev))),
                         last_tenant: RwLock::new(Some(Arc::clone(&tenant_id))),
+                        path_hash: AtomicU64::new(0),
                     });
 
                     // Attach tenant to the new leaf node with timestamp
@@ -528,6 +741,8 @@ impl Tree {
                     new_node
                         .tenant_last_access_time
                         .insert(Arc::clone(&tenant_id), epoch);
+                    // The leaf ends the inserted text.
+                    self.record(&new_node, naming);
 
                     entry.insert(new_node);
                     InsertStep::Done
@@ -541,7 +756,8 @@ impl Tree {
                     let matched_node_text_str = matched_node_text.as_str();
 
                     // Use slice-based comparison - no allocation
-                    let shared_count = shared_prefix_count(remaining, matched_node_text_str);
+                    let (shared_count, shared_bytes) =
+                        shared_prefix_len(remaining, matched_node_text_str);
 
                     if shared_count < matched_node_text_count {
                         // Split the matched node
@@ -577,6 +793,7 @@ impl Tree {
                             parent: RwLock::new(Some(Arc::downgrade(&prev))),
                             tenant_last_access_time: tenant_map,
                             last_tenant: RwLock::new(last_tenant),
+                            path_hash: AtomicU64::new(0),
                         });
                         *matched_node.parent.write() = Some(Arc::downgrade(&new_node));
                         *matched_node_text_write = contracted_text;
@@ -599,7 +816,7 @@ impl Tree {
 
                         InsertStep::Continue {
                             next_prev: new_node,
-                            advance_chars: shared_count,
+                            advance_bytes: shared_bytes,
                         }
                     } else {
                         // Full match - move to next node (intermediate - no timestamp update)
@@ -614,7 +831,7 @@ impl Tree {
 
                         InsertStep::Continue {
                             next_prev: matched_node,
-                            advance_chars: shared_count,
+                            advance_bytes: shared_bytes,
                         }
                     }
                 }
@@ -625,10 +842,10 @@ impl Tree {
                 InsertStep::Done => return, // New leaf created with timestamp, we're done
                 InsertStep::Continue {
                     next_prev,
-                    advance_chars,
+                    advance_bytes,
                 } => {
                     prev = next_prev;
-                    remaining = advance_by_chars(remaining, advance_chars);
+                    remaining = &remaining[advance_bytes..];
                 }
             }
         }
@@ -638,6 +855,7 @@ impl Tree {
         let epoch = get_epoch();
         prev.tenant_last_access_time
             .insert(Arc::clone(&tenant_id), epoch);
+        self.record(&prev, naming);
     }
 
     /// Performs prefix matching and returns detailed result with char counts.
@@ -645,6 +863,9 @@ impl Tree {
     pub fn match_prefix_with_counts(&self, text: &str) -> PrefixMatchResult {
         let mut remaining = text;
         let mut matched_chars = 0;
+        // The characters the walk advanced past (its full matches), so the
+        // input's count is theirs plus the remainder's: the fused walk's shape.
+        let mut consumed_chars = 0usize;
         let mut prev = Arc::clone(&self.root);
 
         while let Some(first_char) = remaining.chars().next() {
@@ -666,13 +887,15 @@ impl Tree {
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
+                let (shared_count, shared_bytes) =
+                    shared_prefix_len(remaining, matched_text_guard.as_str());
                 drop(matched_text_guard);
 
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
                     matched_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
+                    consumed_chars += shared_count;
+                    remaining = &remaining[shared_bytes..];
                     prev = matched_node;
                 } else {
                     // Partial match - still use this node for tenant selection
@@ -688,10 +911,9 @@ impl Tree {
 
         let curr = prev;
 
-        // Compute input char count directly from input text.
-        // This is equivalent to matched_chars + remaining.chars().count() but avoids
-        // needing to track remaining precisely through the traversal.
-        let input_char_count = text.chars().count();
+        // Only the remainder is counted here: nothing on a hit, the whole
+        // input only on a miss at the root.
+        let input_char_count = consumed_chars + remaining.chars().count();
 
         // The tenant pick (the `last_tenant` cache first, the tenant map on a
         // miss), its cache populate on that slow path, the probabilistic
@@ -764,7 +986,27 @@ impl Tree {
         // `select` runs exactly once; the Option carries the FnOnce through
         // the FnMut interface of the non-generic walk below.
         let mut select = Some(select);
-        self.match_and_insert_dyn(text, &mut |result| {
+        self.match_and_insert_dyn(text, None, &mut |result| {
+            select.take().and_then(|select| select(result))
+        })
+    }
+
+    /// [`Self::match_and_insert_with`], and, with `path_hash` given, the node
+    /// the inserted path ends at remembers it (see [`Self::insert_text_with_hash`]);
+    /// `None` is the plain fused walk, so one call site serves a caller that
+    /// hashes only while something will ask by hash.
+    #[inline]
+    pub fn match_and_insert_with_hash<'t, F>(
+        &self,
+        text: &str,
+        path_hash: Option<u64>,
+        select: F,
+    ) -> PrefixMatchResult
+    where
+        F: FnOnce(&PrefixMatchResult) -> Option<&'t str>,
+    {
+        let mut select = Some(select);
+        self.match_and_insert_dyn(text, path_hash, &mut |result| {
             select.take().and_then(|select| select(result))
         })
     }
@@ -776,6 +1018,7 @@ impl Tree {
     fn match_and_insert_dyn<'t>(
         &self,
         text: &str,
+        path_hash: Option<u64>,
         select: &mut dyn FnMut(&PrefixMatchResult) -> Option<&'t str>,
     ) -> PrefixMatchResult {
         // ---- Phase 1: MATCH descent (mirrors match_prefix_with_counts) ----
@@ -940,7 +1183,12 @@ impl Tree {
             // edges it newly attaches, so nothing is counted twice, and it
             // splices the suffix under live nodes, so the prompt is cached.
             // One extra descent, in the rare case.
-            self.insert_from(Arc::clone(&self.root), text, tenant_id);
+            self.insert_from(
+                Arc::clone(&self.root),
+                text,
+                tenant_id,
+                path_hash.map_or(Naming::None, Naming::Newest),
+            );
         } else if remaining.is_empty() {
             // Loop-end: `current` is the final leaf; give it the real timestamp
             // (insert_text's tail). It already received the epoch-0 attach above
@@ -952,6 +1200,7 @@ impl Tree {
             };
             leaf.tenant_last_access_time
                 .insert(Arc::clone(&tenant_id), epoch);
+            self.record_hash(leaf, path_hash);
         } else {
             // Fall-off: splice only the unmatched suffix below `current`,
             // reusing insert_text's exact loop (handles split-continue + the
@@ -960,7 +1209,12 @@ impl Tree {
                 Some(i) => Arc::clone(&path[i]),
                 None => Arc::clone(&self.root),
             };
-            self.insert_from(fall_off, remaining, tenant_id);
+            self.insert_from(
+                fall_off,
+                remaining,
+                tenant_id,
+                path_hash.map_or(Naming::None, Naming::Newest),
+            );
         }
 
         result
@@ -1053,13 +1307,14 @@ impl Tree {
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
+                let (shared_count, shared_bytes) =
+                    shared_prefix_len(remaining, matched_text_guard.as_str());
                 drop(matched_text_guard);
 
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
                     matched_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
+                    remaining = &remaining[shared_bytes..];
                     prev = matched_node;
                 } else {
                     // Partial match - still use this node for timestamp update
@@ -1195,7 +1450,7 @@ impl Tree {
             // checks under the parent's shard lock).
             if node.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    Self::detach_if_empty(parent, &node);
+                    self.detach_if_empty(parent, &node);
                 }
             }
 
@@ -1224,6 +1479,11 @@ impl Tree {
                 }
             }
         }
+
+        // An entry whose node left without passing `forget_hash` (a record
+        // that crossed the node's detach) leaves here, so the map never
+        // outgrows the tree's hashed nodes by more than one eviction pass.
+        self.hashed.retain(|_, node| node.strong_count() > 0);
 
         debug!("After eviction - Used size per tenant:");
         for entry in &self.tenant_char_count {
@@ -1309,7 +1569,7 @@ impl Tree {
         }
         for (node, _) in &nodes {
             self.remove_tenant_from_node(node, tenant_id);
-            Self::detach_empty_ancestors(node);
+            self.detach_empty_ancestors(node);
         }
         if let Some((_, count)) = self.tenant_char_count.remove(tenant_id) {
             self.total_char_count.fetch_sub(count, Ordering::Relaxed);
@@ -1340,13 +1600,13 @@ impl Tree {
     /// (the `evict_tenant_by_size` empty-node rule), walking up so ancestors
     /// emptied by the detach are removed too. The root (no parent) is never
     /// detached.
-    fn detach_empty_ancestors(node: &NodeRef) {
+    fn detach_empty_ancestors(&self, node: &NodeRef) {
         let mut current = Arc::clone(node);
         while current.is_empty() {
             let Some(parent) = current.parent.read().as_ref().and_then(Weak::upgrade) else {
                 break;
             };
-            Self::detach_if_empty(&parent, &current);
+            self.detach_if_empty(&parent, &current);
             current = parent;
         }
     }
@@ -1363,13 +1623,20 @@ impl Tree {
     /// `remove_if` evaluates the predicate under the shard lock, so the checks
     /// and the removal cannot be split. The first char is read before the entry
     /// is taken: a split writes this node's text while it holds the parent's
-    /// entry, the reverse order.
-    fn detach_if_empty(parent: &NodeRef, node: &NodeRef) {
+    /// entry, the reverse order. A node that left the tree takes its path
+    /// hash's entry with it.
+    fn detach_if_empty(&self, parent: &NodeRef, node: &NodeRef) {
         let first_char = node.text.read().first_char();
         if let Some(first_char) = first_char {
-            parent.children.remove_if(&first_char, |_, child| {
-                Arc::ptr_eq(child, node) && child.is_empty()
-            });
+            let detached = parent
+                .children
+                .remove_if(&first_char, |_, child| {
+                    Arc::ptr_eq(child, node) && child.is_empty()
+                })
+                .is_some();
+            if detached {
+                self.forget_hash(node);
+            }
         }
     }
 
@@ -1474,6 +1741,7 @@ impl Tree {
         // Clear tenant char counts
         self.tenant_char_count.clear();
         self.total_char_count.store(0, Ordering::Relaxed);
+        self.hashed.clear();
         // Reset root text
         *self.root.text.write() = NodeText::new(String::new());
     }
@@ -1783,6 +2051,7 @@ impl Tree {
                 tenant_last_access_time: new_tenant_map(),
                 parent: RwLock::new(Some(Arc::downgrade(target))),
                 last_tenant: RwLock::new(None),
+                path_hash: AtomicU64::new(0),
             });
 
             self.restore_node(&child_node, nodes, idx);
@@ -1874,6 +2143,7 @@ impl Tree {
                         tenant_last_access_time: new_tenant_map(),
                         parent: RwLock::new(None),
                         last_tenant: RwLock::new(None),
+                        path_hash: AtomicU64::new(0),
                     });
                     below_local_child.children.insert(rem_first, trimmed_remote);
                     self.merge_nodes(&local_child, &below_local_child);
@@ -1904,6 +2174,7 @@ impl Tree {
                         tenant_last_access_time: local_child.tenant_last_access_time.clone(),
                         parent: RwLock::new(Some(Arc::downgrade(local))),
                         last_tenant: RwLock::new(local_child.last_tenant.read().clone()),
+                        path_hash: AtomicU64::new(0),
                     });
                     // Union remote tenants into the split node, updating
                     // tenant_char_count for newly added tenants.
@@ -2028,6 +2299,7 @@ impl Tree {
             tenant_last_access_time: node.tenant_last_access_time.clone(),
             parent: RwLock::new(parent.map(Arc::downgrade)),
             last_tenant: RwLock::new(node.last_tenant.read().clone()),
+            path_hash: AtomicU64::new(0),
         });
 
         for entry in &node.children {

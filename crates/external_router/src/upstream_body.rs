@@ -88,7 +88,7 @@ enum Unread {
 /// warn; the copy kept for the client loses the provider's account
 /// identifiers ([`error::sanitize_error_body`]).
 pub async fn read_error(resp: reqwest::Response, model: &str) -> UpstreamError {
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = resp.status();
     let content_type = resp.headers().get(CONTENT_TYPE).cloned();
     let body = match read_response_body_limited(resp, MAX_ERROR_RESPONSE_SIZE).await {
         ReadBodyResult::Ok(body) => {
@@ -162,30 +162,10 @@ pub async fn answer_error(resp: reqwest::Response, model: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::body::to_bytes;
-
     use super::*;
+    use crate::test_support::{text_of, upstream};
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
-
-    fn upstream(
-        status: u16,
-        content_type: Option<&str>,
-        body: impl Into<reqwest::Body>,
-    ) -> reqwest::Response {
-        let mut builder = http::Response::builder().status(status);
-        if let Some(ct) = content_type {
-            builder = builder.header(CONTENT_TYPE, ct);
-        }
-        reqwest::Response::from(builder.body(body.into()).expect("a response"))
-    }
-
-    async fn text_of(response: Response) -> String {
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        String::from_utf8(bytes.to_vec()).expect("utf-8")
-    }
 
     /// A provider's refusal reaches the caller under its status and content
     /// type with the operator's organization and project gone.

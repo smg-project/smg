@@ -140,7 +140,7 @@ pub async fn forward_realtime_rest(
 /// (the body bounded, the provider's account identifiers removed, its words
 /// in the log at warn).
 pub async fn proxy_response(resp: reqwest::Response, model: &str) -> Response {
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = resp.status();
     if !status.is_success() {
         return upstream_body::answer_error(resp, model).await;
     }
@@ -162,37 +162,25 @@ pub async fn proxy_response(resp: reqwest::Response, model: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::to_bytes, http::header::CONTENT_TYPE};
+    use axum::http::header::CONTENT_TYPE;
 
     use super::*;
+    use crate::test_support::{text_of, upstream};
 
     /// The provider's error envelope as its realtime REST endpoints answer
     /// it: the message names the operator's organization and project.
     const REALTIME_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for realtime-model in organization org-abc123 project proj_xyz789 on requests per min (RPM): Limit 3, Used 3, Requested 1.","type":"requests","param":null,"code":"rate_limit_exceeded"}}"#;
-
-    fn upstream(status: u16, body: &'static str) -> reqwest::Response {
-        reqwest::Response::from(
-            http::Response::builder()
-                .status(status)
-                .header(CONTENT_TYPE, "application/json")
-                .body(reqwest::Body::from(body))
-                .expect("a response"),
-        )
-    }
-
-    async fn text_of(response: Response) -> String {
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        String::from_utf8(bytes.to_vec()).expect("utf-8")
-    }
 
     /// A refusal of a realtime REST call reaches the caller under its status
     /// and content type with the operator's organization and project gone
     /// and the rest of the message kept.
     #[tokio::test]
     async fn a_realtime_refusal_reaches_the_caller_without_the_operators_identifiers() {
-        let response = proxy_response(upstream(429, REALTIME_REFUSAL), "realtime-model").await;
+        let response = proxy_response(
+            upstream(429, Some("application/json"), REALTIME_REFUSAL),
+            "realtime-model",
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
         let text = text_of(response).await;
@@ -210,7 +198,11 @@ mod tests {
     async fn a_realtime_success_passes_as_it_came() {
         const SESSION: &str =
             r#"{"id":"sess_1","object":"realtime.session","client_secret":{"value":"ek_test"}}"#;
-        let response = proxy_response(upstream(200, SESSION), "realtime-model").await;
+        let response = proxy_response(
+            upstream(200, Some("application/json"), SESSION),
+            "realtime-model",
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
         assert_eq!(text_of(response).await, SESSION);

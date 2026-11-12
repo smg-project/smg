@@ -10,18 +10,20 @@
 use std::sync::Arc;
 
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
+    chat::{
+        AssistantReasoning, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+        MessageContent,
+    },
     common::{
         ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, Tool,
-        ToolCall, ToolChoice, ToolChoiceValue, UsageInfo,
+        ToolCall, ToolChoice, ToolChoiceValue, Usage,
     },
     profile::ProviderProfile,
     responses::{
-        CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, IncompleteDetails,
-        IncompleteReason, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseReasoningContent::ReasoningText, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig,
-        TextFormat,
+        CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, ResponseContentPart,
+        ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+        ResponseReasoningContent::ReasoningText, ResponseUsage, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
     },
     UNKNOWN_MODEL_ID,
 };
@@ -30,11 +32,54 @@ use tracing::warn;
 use crate::routers::grpc::common::responses::{
     history::hosted_call_result,
     utils::{
-        custom_tool_input, custom_tool_names, decode_reasoning_content, encode_reasoning_content,
-        extract_tools_from_response_tools, function_call_status, generation_failure_error,
-        resolve_function_identity,
+        custom_tool_input, custom_tool_names, cut_call, decode_reasoning_content,
+        encode_reasoning_content, extract_tools_from_response_tools, function_call_status,
+        generation_failure_error, resolve_function_identity, response_status,
     },
 };
+
+/// Why a Responses request does not convert to a chat request, and the code
+/// its refusal is answered under: a content part the chat pipeline has no
+/// form for, in a message or in a function output, is the chat route's own
+/// `unsupported_content_part`; every other refusal keeps
+/// `convert_request_failed`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ConversionError {
+    /// An input item kind this path does not carry.
+    #[error("Unsupported input item type")]
+    UnsupportedItem,
+    /// A content part of a message item the chat pipeline has no form for
+    /// (see `response_parts_to_message_content`).
+    #[error("Unsupported content part type {part:?} for gRPC backends: {why}")]
+    UnsupportedContentPart {
+        part: &'static str,
+        why: &'static str,
+    },
+    /// A function output with a part the text-only chat path cannot carry
+    /// (`StringOrContentParts::to_text_only`).
+    #[error("{0}")]
+    UnsupportedToolOutput(String),
+    #[error("Request must contain at least one message")]
+    NoMessages,
+    /// A tool result no call before it issued (see
+    /// `ProviderProfile::unanswerable_tool_result`).
+    #[error("No tool call found for function call output with call_id '{0}'")]
+    UnansweredToolResult(String),
+}
+
+impl ConversionError {
+    /// The error envelope's code for this refusal.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedContentPart { .. } | Self::UnsupportedToolOutput(_) => {
+                "unsupported_content_part"
+            }
+            Self::UnsupportedItem | Self::NoMessages | Self::UnansweredToolResult(_) => {
+                "convert_request_failed"
+            }
+        }
+    }
+}
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
 ///
@@ -42,10 +87,17 @@ use crate::routers::grpc::common::responses::{
 /// - `input` (text/items) → `messages` (chat messages)
 /// - `instructions` → system message (prepended)
 /// - `max_output_tokens` → `max_completion_tokens`
+/// - `stop` → `stop` (the engine's stop list and the gateway's own trim of a
+///   matched sequence both read it from the chat request)
 /// - `tools` → function tools extracted from ResponseTools
 /// - `tool_choice` → passed through from request
+/// - the sampling knobs (`temperature`, `top_p`, `frequency_penalty`, `presence_penalty`,
+///   `top_k`, `min_p`, `repetition_penalty`) → their chat twins; the three the Responses
+///   request keeps as plain values cross only when set
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
-pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
+pub(crate) fn responses_to_chat(
+    req: &ResponsesRequest,
+) -> Result<ChatCompletionRequest, ConversionError> {
     responses_to_chat_with_tools(req, None)
 }
 
@@ -57,14 +109,14 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
 pub(super) fn responses_to_chat_with_mcp_tools(
     req: &ResponsesRequest,
     mcp_chat_tools: &[Tool],
-) -> Result<ChatCompletionRequest, String> {
+) -> Result<ChatCompletionRequest, ConversionError> {
     responses_to_chat_with_tools(req, Some(mcp_chat_tools))
 }
 
 fn responses_to_chat_with_tools(
     req: &ResponsesRequest,
     mcp_chat_tools: Option<&[Tool]>,
-) -> Result<ChatCompletionRequest, String> {
+) -> Result<ChatCompletionRequest, ConversionError> {
     let mut messages = Vec::new();
 
     // 1. Add system message if instructions provided
@@ -98,7 +150,7 @@ fn responses_to_chat_with_tools(
 
     // Ensure we have at least one message
     if messages.is_empty() {
-        return Err("Request must contain at least one message".to_string());
+        return Err(ConversionError::NoMessages);
     }
 
     // 3. Extract function tools from ResponseTools; the tool loop's MCP tools
@@ -122,9 +174,7 @@ fn responses_to_chat_with_tools(
     // (`history::load_history`), so a result with no call before it here is
     // the client's.
     if let Some(call_id) = ProviderProfile::for_model(&model).unanswerable_tool_result(&messages) {
-        return Err(format!(
-            "No tool call found for function call output with call_id '{call_id}'"
-        ));
+        return Err(ConversionError::UnansweredToolResult(call_id.to_string()));
     }
 
     Ok(chat_request(req, model, messages, tools, tool_choice))
@@ -138,17 +188,17 @@ fn responses_to_chat_with_tools(
 fn push_item(
     messages: &mut Vec<ChatMessage>,
     item: &ResponseInputOutputItem,
-) -> Result<(), String> {
+) -> Result<(), ConversionError> {
     match item {
         ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
             let content = match content {
                 StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
-                StringOrContentParts::Array(parts) => response_parts_to_message_content(parts),
+                StringOrContentParts::Array(parts) => response_parts_to_message_content(parts)?,
             };
             push_role_message(messages, role, content);
         }
         ResponseInputOutputItem::Message { role, content, .. } => {
-            push_role_message(messages, role, response_parts_to_message_content(content));
+            push_role_message(messages, role, response_parts_to_message_content(content)?);
         }
         ResponseInputOutputItem::FunctionToolCall {
             call_id,
@@ -178,8 +228,13 @@ fn push_item(
                 let assistant = ChatMessage::Assistant {
                     content: None,
                     name: None,
+                    refusal: None,
+                    audio: None,
+                    function_call: None,
                     tool_calls: None,
-                    reasoning_content: Some(reasoning_text),
+                    reasoning: AssistantReasoning {
+                        text: Some(reasoning_text),
+                    },
                     ext: Default::default(),
                 };
                 push_chat_message(messages, assistant);
@@ -191,7 +246,12 @@ fn push_item(
             // Function call output - add as tool message
             // Note: The function name is looked up from prev_outputs in Harmony path
             // For Chat path, we just use the call_id
-            messages.push(tool_result(call_id, output.to_text_only()?));
+            messages.push(tool_result(
+                call_id,
+                output
+                    .to_text_only()
+                    .map_err(ConversionError::UnsupportedToolOutput)?,
+            ));
         }
         // A hosted tool call of a stored turn replays as the
         // assistant's call and, once it ran, its result: the
@@ -279,11 +339,11 @@ fn push_item(
 
 /// The refusal of an item kind this path does not carry, warned about where
 /// the kind says why.
-fn unsupported(warning: Option<&'static str>) -> Result<(), String> {
+fn unsupported(warning: Option<&'static str>) -> Result<(), ConversionError> {
     if let Some(warning) = warning {
         warn!(function = "responses_to_chat", "{warning}");
     }
-    Err("Unsupported input item type".to_string())
+    Err(ConversionError::UnsupportedItem)
 }
 
 /// A tool's result for the call it answers, as the chat history carries it.
@@ -336,9 +396,13 @@ fn custom_tool_output_text(output: &CustomToolCallOutputContent) -> String {
 /// `tool_choice: none` forbids calls; offering the schemas anyway makes the
 /// model re-issue calls on replayed histories, and with parsing disabled the
 /// raw call markup leaks into the message text, so the request's own tools are
-/// withheld then while the MCP tools stay offered. Under the loop the list is
-/// present even when both are empty, as the loop has always sent one; the
-/// plain conversion carries none when there are no tools.
+/// withheld then while the MCP tools stay offered. The chat and Messages paths
+/// render the tools under `none` as the engine's own server does for every
+/// API (`utils::request_as_rendered`), so the same request renders a different
+/// prompt here: a known divergence, kept until this API's rule is decided on
+/// its own. Under the loop the list is present even when both are empty, as
+/// the loop has always sent one; the plain conversion carries none when there
+/// are no tools.
 fn chat_tools(
     req: &ResponsesRequest,
     mcp_chat_tools: Option<&[Tool]>,
@@ -376,6 +440,15 @@ fn chat_request(
         messages,
         model,
         temperature: req.temperature,
+        // The chat twins of these five knobs are `Option`s whose `None` lets
+        // the model's own defaults fill the knob; three of them are plain
+        // values with serde defaults on the Responses request and cross only
+        // when set, or every request would carry the sentinels.
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+        top_k: req.top_k_if_set(),
+        min_p: req.min_p_if_set(),
+        repetition_penalty: req.repetition_penalty_if_set(),
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,
         // Preserve caller-provided stream_options (e.g. `include_obfuscation: false`
@@ -393,6 +466,9 @@ fn chat_request(
         parallel_tool_calls: req.parallel_tool_calls,
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
+        // The engine's stop list and the gateway's own trim of a matched
+        // sequence both read the chat request's `stop`, on every turn.
+        stop: req.stop.clone(),
         skip_special_tokens: true,
         tools,
         tool_choice,
@@ -412,9 +488,16 @@ fn chat_request(
 }
 
 /// Convert Responses content parts to chat message content. Text, output
-/// text and refusals become text parts, `input_image` becomes an `image_url`
-/// part, and `input_file` is dropped (no chat equivalent on this path).
-fn response_parts_to_message_content(content: &[ResponseContentPart]) -> MessageContent {
+/// text and refusals become text parts and an `input_image` with a URL
+/// becomes an `image_url` part. The parts the chat pipeline has no form for
+/// are refused, never dropped: an `input_file` (chat messages carry text,
+/// image, audio and video parts and no file part, and the gateway keeps no
+/// file store to resolve one from) and an `input_image` that names only a
+/// `file_id`. A request answered as if such a part had not been sent is a
+/// wrong answer the client cannot detect.
+fn response_parts_to_message_content(
+    content: &[ResponseContentPart],
+) -> Result<MessageContent, ConversionError> {
     let mut parts = Vec::new();
     for part in content {
         match part {
@@ -439,15 +522,28 @@ fn response_parts_to_message_content(content: &[ResponseContentPart]) -> Message
                     },
                 });
             }
-            ResponseContentPart::InputImage { .. } | ResponseContentPart::InputFile { .. } => {}
+            ResponseContentPart::InputImage {
+                image_url: None, ..
+            } => {
+                return Err(ConversionError::UnsupportedContentPart {
+                    part: "input_image",
+                    why: "it names no image_url, and a file_id is not resolvable here",
+                });
+            }
+            ResponseContentPart::InputFile { .. } => {
+                return Err(ConversionError::UnsupportedContentPart {
+                    part: "input_file",
+                    why: "the chat pipeline carries no file part",
+                });
+            }
         }
     }
     // Plain text stays a string, as it did before parts were carried at all.
-    match parts.as_slice() {
+    Ok(match parts.as_slice() {
         [] => MessageContent::Text(String::new()),
         [ContentPart::Text { text }] => MessageContent::Text(text.clone()),
         _ => MessageContent::Parts(parts),
-    }
+    })
 }
 
 /// Append a role-tagged input message. A `developer` turn folds into the
@@ -489,6 +585,9 @@ fn assistant_tool_call(
     ChatMessage::Assistant {
         content: None,
         name: None,
+        refusal: None,
+        audio: None,
+        function_call: None,
         tool_calls: Some(vec![ToolCall {
             id: call_id.to_string(),
             tool_type: "function".to_string(),
@@ -500,7 +599,7 @@ fn assistant_tool_call(
                 arguments: Some(arguments),
             },
         }]),
-        reasoning_content: None,
+        reasoning: Default::default(),
         ext: Default::default(),
     }
 }
@@ -516,18 +615,18 @@ fn push_chat_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {
             Some(ChatMessage::Assistant {
                 content,
                 tool_calls,
-                reasoning_content,
+                reasoning,
                 ..
             }),
             ChatMessage::Assistant {
                 content: new_content,
                 tool_calls: new_tool_calls,
-                reasoning_content: new_reasoning,
+                reasoning: new_reasoning,
                 ..
             },
         ) => {
-            if let Some(new_reasoning) = new_reasoning {
-                let merged = reasoning_content.get_or_insert_with(String::new);
+            if let Some(new_reasoning) = new_reasoning.text {
+                let merged = reasoning.text.get_or_insert_with(String::new);
                 if !merged.is_empty() {
                     merged.push('\n');
                 }
@@ -579,8 +678,11 @@ fn role_to_chat_message(role: &str, content: MessageContent) -> ChatMessage {
         "assistant" => ChatMessage::Assistant {
             content: Some(content),
             name: None,
+            refusal: None,
+            audio: None,
+            function_call: None,
             tool_calls: None,
-            reasoning_content: None,
+            reasoning: Default::default(),
             ext: Default::default(),
         },
         "system" => ChatMessage::System {
@@ -613,14 +715,15 @@ fn map_text_to_response_format(text: Option<&TextConfig>) -> Option<ResponseForm
         TextFormat::JsonSchema {
             name,
             schema,
-            description: _,
+            description,
             strict,
         } => Some(ResponseFormat::JsonSchema {
-            json_schema: JsonSchemaFormat {
+            json_schema: Box::new(JsonSchemaFormat {
+                description: description.clone(),
                 name: name.clone(),
                 schema: schema.clone(),
                 strict: *strict,
-            },
+            }),
         }),
     }
 }
@@ -644,122 +747,26 @@ pub(crate) fn chat_to_responses(
         .first()
         .ok_or_else(|| "Chat response contains no choices".to_string())?;
 
-    // Convert assistant message to output items. Reasoning comes first (OpenAI
+    // The assistant message as output items. Reasoning comes first (OpenAI
     // order), so items replayed in emitted order rebuild the same turn.
     let mut output: Vec<ResponseOutputItem> = Vec::new();
+    output.extend(reasoning_output_item(choice, &chat_resp.id, original_req));
+    output.extend(message_output_item(choice, &chat_resp.id));
+    // The cut-call read comes before the calls become items: a custom tool's
+    // item carries no status.
+    let cut = cut_call(
+        choice.finish_reason.as_deref(),
+        choice
+            .message
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|call| call.function.arguments.as_deref().unwrap_or_default()),
+    );
+    push_tool_call_output_items(&mut output, choice, original_req);
 
-    if let Some(reasoning) = &choice.message.reasoning_content {
-        if !reasoning.is_empty() {
-            let id = format!("reasoning_{}", chat_resp.id);
-            let content = vec![ReasoningText {
-                text: reasoning.clone(),
-            }];
-            let status = Some("completed".to_string());
-            let include_encrypted = original_req
-                .include
-                .as_deref()
-                .is_some_and(|f| f.contains(&IncludeField::ReasoningEncryptedContent));
-            output.push(if include_encrypted {
-                ResponseOutputItem::new_reasoning_encrypted(
-                    id,
-                    vec![],
-                    content,
-                    encode_reasoning_content(reasoning),
-                    status,
-                )
-            } else {
-                ResponseOutputItem::new_reasoning(id, vec![], content, status)
-            });
-        }
-    }
-
-    // Convert message content to output item
-    if let Some(content) = &choice.message.content {
-        if !content.is_empty() {
-            output.push(ResponseOutputItem::Message {
-                id: format!("msg_{}", chat_resp.id),
-                role: "assistant".to_string(),
-                content: vec![ResponseContentPart::OutputText {
-                    text: content.clone(),
-                    annotations: vec![],
-                    logprobs: choice.logprobs.clone(),
-                }],
-                status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
-                    "in_progress"
-                } else {
-                    "completed"
-                }
-                .to_string(),
-                phase: None,
-            });
-        }
-    }
-
-    // Convert tool calls if present. Calls to downgraded custom tools map back
-    // to `custom_tool_call` items.
-    let custom_names = custom_tool_names(original_req.tools.as_deref());
-    if let Some(tool_calls) = &choice.message.tool_calls {
-        for tool_call in tool_calls {
-            let (name, namespace) =
-                resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
-            if custom_names.contains(&tool_call.function.name) {
-                output.push(ResponseOutputItem::CustomToolCall {
-                    call_id: tool_call.id.clone(),
-                    input: custom_tool_input(
-                        tool_call.function.arguments.as_deref().unwrap_or_default(),
-                    ),
-                    name,
-                    id: Some(tool_call.id.clone()),
-                    namespace,
-                });
-                continue;
-            }
-            output.push(ResponseOutputItem::FunctionToolCall {
-                id: Some(tool_call.id.clone()),
-                call_id: tool_call.id.clone(),
-                name,
-                namespace,
-                arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-                output: None, // Tool execution belongs to the next turn.
-                status: function_call_status(
-                    choice.finish_reason.as_deref(),
-                    tool_call.function.arguments.as_deref().unwrap_or_default(),
-                )
-                .to_string(),
-            });
-        }
-    }
-
-    // Determine response status based on finish_reason. "length" is a
-    // max_output_tokens truncation, which the Responses contract reports as
-    // status=incomplete with incomplete_details.
-    let (status, incomplete_details) = match choice.finish_reason.as_deref() {
-        Some("stop") => (ResponseStatus::Completed, None),
-        Some("length") => (
-            ResponseStatus::Incomplete,
-            Some(IncompleteDetails {
-                reason: IncompleteReason::MaxOutputTokens,
-            }),
-        ),
-        Some("tool_calls") => (ResponseStatus::Completed, None),
-        Some("failed") | Some("error") => (ResponseStatus::Failed, None),
-        _ => (ResponseStatus::Completed, None), // Default to completed
-    };
-
-    // Convert usage from Usage to UsageInfo, then wrap in ResponsesUsage
-    let usage = chat_resp.usage.as_ref().map(|u| {
-        let usage_info = UsageInfo {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            reasoning_tokens: u
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.reasoning_tokens),
-            prompt_tokens_details: u.prompt_tokens_details.clone(),
-        };
-        ResponsesUsage::Modern(usage_info.to_response_usage())
-    });
+    let (status, incomplete_details) = response_status(choice.finish_reason.as_deref(), cut);
+    let usage = chat_resp.usage.as_ref().map(responses_usage);
 
     // Generate response
     let response_id = response_id_override.unwrap_or_else(|| chat_resp.id.clone());
@@ -779,16 +786,124 @@ pub(crate) fn chat_to_responses(
     Ok(builder.build())
 }
 
+/// The assistant's reasoning as the turn's first output item, when it
+/// reasoned: with the opaque encrypted copy when the request asked for it.
+fn reasoning_output_item(
+    choice: &ChatChoice,
+    chat_id: &str,
+    original_req: &ResponsesRequest,
+) -> Option<ResponseOutputItem> {
+    let reasoning = choice.message.reasoning_content.as_ref()?;
+    if reasoning.is_empty() {
+        return None;
+    }
+    let id = format!("reasoning_{chat_id}");
+    let content = vec![ReasoningText {
+        text: reasoning.clone(),
+    }];
+    let status = Some("completed".to_string());
+    let include_encrypted = original_req
+        .include
+        .as_deref()
+        .is_some_and(|f| f.contains(&IncludeField::ReasoningEncryptedContent));
+    Some(if include_encrypted {
+        ResponseOutputItem::new_reasoning_encrypted(
+            id,
+            vec![],
+            content,
+            encode_reasoning_content(reasoning),
+            status,
+        )
+    } else {
+        ResponseOutputItem::new_reasoning(id, vec![], content, status)
+    })
+}
+
+/// The assistant's text as a message item, when it said any; a generation
+/// that failed leaves the message in progress.
+fn message_output_item(choice: &ChatChoice, chat_id: &str) -> Option<ResponseOutputItem> {
+    let content = choice.message.content.as_ref()?;
+    if content.is_empty() {
+        return None;
+    }
+    Some(ResponseOutputItem::Message {
+        id: format!("msg_{chat_id}"),
+        role: "assistant".to_string(),
+        content: vec![ResponseContentPart::OutputText {
+            text: content.clone(),
+            annotations: vec![],
+            logprobs: choice.logprobs.clone(),
+        }],
+        status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
+            "in_progress"
+        } else {
+            "completed"
+        }
+        .to_string(),
+        phase: None,
+    })
+}
+
+/// The assistant's tool calls as output items, in their order; a call to a
+/// downgraded custom tool maps back to a `custom_tool_call` item.
+fn push_tool_call_output_items(
+    output: &mut Vec<ResponseOutputItem>,
+    choice: &ChatChoice,
+    original_req: &ResponsesRequest,
+) {
+    let custom_names = custom_tool_names(original_req.tools.as_deref());
+    let Some(tool_calls) = &choice.message.tool_calls else {
+        return;
+    };
+    for tool_call in tool_calls {
+        let (name, namespace) =
+            resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
+        if custom_names.contains(&tool_call.function.name) {
+            output.push(ResponseOutputItem::CustomToolCall {
+                call_id: tool_call.id.clone(),
+                input: custom_tool_input(
+                    tool_call.function.arguments.as_deref().unwrap_or_default(),
+                ),
+                name,
+                id: Some(tool_call.id.clone()),
+                namespace,
+            });
+            continue;
+        }
+        output.push(ResponseOutputItem::FunctionToolCall {
+            id: Some(tool_call.id.clone()),
+            call_id: tool_call.id.clone(),
+            name,
+            namespace,
+            arguments: tool_call.function.arguments.clone().unwrap_or_default(),
+            output: None, // Tool execution belongs to the next turn.
+            status: function_call_status(
+                choice.finish_reason.as_deref(),
+                tool_call.function.arguments.as_deref().unwrap_or_default(),
+            )
+            .to_string(),
+        });
+    }
+}
+
+/// The chat usage as the Responses API reports it, through the protocol's
+/// one conversion: the streamed object reads it here as well.
+pub(super) fn responses_usage(usage: &Usage) -> ResponsesUsage {
+    ResponsesUsage::Modern(ResponseUsage::from(usage))
+}
+
 #[cfg(test)]
 mod tests {
     use openai_protocol::{
-        chat::{ChatChoice, ChatCompletionMessage},
-        common::{StreamOptions, Usage},
+        chat::ChatCompletionMessage,
+        common::{StreamOptions, StringOrArray},
         responses::ReasoningEffort,
     };
 
     use super::*;
-    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    use crate::routers::grpc::common::responses::utils::{
+        assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
+    };
 
     #[test]
     fn chat_to_responses_serializes_responses_api_usage() {
@@ -808,11 +923,7 @@ mod tests {
                 matched_stop: None,
                 hidden_states: None,
             }])
-            .usage(
-                Usage::from_counts(12, 7)
-                    .with_cached_tokens(3)
-                    .with_reasoning_tokens(2),
-            )
+            .usage(responses_api_test_usage())
             .build();
 
         let response = chat_to_responses(
@@ -822,21 +933,7 @@ mod tests {
         )
         .expect("chat response should convert");
         let wire = serde_json::to_value(response).expect("response should serialize");
-        let usage = wire.get("usage").expect("usage should be present");
-
-        assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
-        assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
-        assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
-        assert_eq!(
-            usage.pointer("/input_tokens_details/cached_tokens"),
-            Some(&serde_json::json!(3))
-        );
-        assert_eq!(
-            usage.pointer("/output_tokens_details/reasoning_tokens"),
-            Some(&serde_json::json!(2))
-        );
-        assert!(usage.get("prompt_tokens").is_none());
-        assert!(usage.get("completion_tokens").is_none());
+        assert_responses_api_usage(&wire);
     }
 
     /// The public API returns these fields on every Response object (the
@@ -919,6 +1016,45 @@ mod tests {
         );
     }
 
+    /// The assistant's reasoning is the turn's first output item, ahead of
+    /// its message, and carries the opaque encrypted copy only when the
+    /// request asked for it.
+    #[test]
+    fn a_reasoning_turn_leads_the_output_and_carries_its_encrypted_copy_only_when_asked() {
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"done",
+                "reasoning_content":"because"},"finish_reason":"stop"}]
+        }))
+        .unwrap();
+
+        let plain = serde_json::to_value(
+            chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plain["output"][0]["type"], "reasoning");
+        assert_eq!(plain["output"][0]["id"], "reasoning_chat_test");
+        assert_eq!(plain["output"][0]["content"][0]["text"], "because");
+        assert!(
+            plain["output"][0]["encrypted_content"].is_null(),
+            "the encrypted copy comes only when asked for"
+        );
+        assert_eq!(plain["output"][1]["type"], "message");
+        assert_eq!(plain["output"][1]["content"][0]["text"], "done");
+
+        let asking = ResponsesRequest {
+            include: Some(vec![IncludeField::ReasoningEncryptedContent]),
+            ..Default::default()
+        };
+        let encrypted =
+            serde_json::to_value(chat_to_responses(&chat, &asking, None).unwrap()).unwrap();
+        assert_eq!(encrypted["output"][0]["content"][0]["text"], "because");
+        assert!(
+            encrypted["output"][0]["encrypted_content"].is_string(),
+            "the request asked for the encrypted copy"
+        );
+    }
+
     /// A Responses request for `model`, from its input items.
     fn items_request(model: &str, input: serde_json::Value) -> ResponsesRequest {
         serde_json::from_value(serde_json::json!({"model": model, "input": input}))
@@ -930,6 +1066,7 @@ mod tests {
     fn refused_under_deepseek(input: serde_json::Value) -> String {
         responses_to_chat(&items_request("deepseek-flash", input))
             .expect_err("a tool result without its call is a malformed history")
+            .to_string()
     }
 
     /// The call ids of the assistant turn at `index` of a converted history.
@@ -1086,6 +1223,42 @@ mod tests {
         assert_eq!(chat_req.temperature, Some(0.7));
     }
 
+    /// The stop sequences a Responses request sets are the chat request's, in
+    /// the string form and in the list form: the engine's stop list and the
+    /// gateway's own trim of a matched sequence both read them there.
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_chat_request_in_both_forms() {
+        let as_string = ResponsesRequest {
+            input: ResponseInput::Text("Count from 1 to 10.".to_string()),
+            model: "local-model".to_string(),
+            stop: Some(StringOrArray::String(",".to_string())),
+            ..Default::default()
+        };
+        let chat = responses_to_chat(&as_string).unwrap();
+        assert_eq!(
+            chat.stop,
+            Some(StringOrArray::String(",".to_string())),
+            "a stop string is the chat request's stop"
+        );
+
+        let as_list = ResponsesRequest {
+            stop: Some(StringOrArray::Array(vec![
+                ",".to_string(),
+                "10".to_string(),
+            ])),
+            ..as_string
+        };
+        let chat = responses_to_chat(&as_list).unwrap();
+        assert_eq!(
+            chat.stop,
+            Some(StringOrArray::Array(vec![
+                ",".to_string(),
+                "10".to_string()
+            ])),
+            "a stop list is the chat request's stop"
+        );
+    }
+
     #[test]
     fn test_reasoning_effort_flows_through() {
         use openai_protocol::responses::ResponseReasoningParam;
@@ -1137,6 +1310,62 @@ mod tests {
 
         let chat_req = responses_to_chat(&req).unwrap();
         assert_eq!(chat_req.reasoning_effort, None);
+    }
+
+    /// The five sampling knobs a Responses request sets are the chat
+    /// request's. Three of them are plain values with serde defaults on the
+    /// Responses request (`top_k` -1, `min_p` 0, `repetition_penalty` 1) and
+    /// cross only when set: an unset knob stays `None`, so the model's own
+    /// defaults still fill it.
+    #[test]
+    fn a_responses_request_s_sampling_knobs_reach_the_chat_request_only_when_set() {
+        let unset = ResponsesRequest {
+            input: ResponseInput::Text("What is 2+2?".to_string()),
+            model: "local-model".to_string(),
+            ..Default::default()
+        };
+        let chat = responses_to_chat(&unset).unwrap();
+        assert_eq!(chat.frequency_penalty, None, "no frequency_penalty was set");
+        assert_eq!(chat.presence_penalty, None, "no presence_penalty was set");
+        assert_eq!(
+            chat.top_k, None,
+            "the serde default -1 is not a top_k the client set"
+        );
+        assert_eq!(
+            chat.min_p, None,
+            "the serde default 0 is not a min_p the client set"
+        );
+        assert_eq!(
+            chat.repetition_penalty, None,
+            "the serde default 1 is not a repetition_penalty the client set"
+        );
+
+        let set = ResponsesRequest {
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            top_k: 40,
+            min_p: 0.05,
+            repetition_penalty: 1.1,
+            ..unset
+        };
+        let chat = responses_to_chat(&set).unwrap();
+        assert_eq!(
+            chat.frequency_penalty,
+            Some(0.5),
+            "frequency_penalty crosses as set"
+        );
+        assert_eq!(
+            chat.presence_penalty,
+            Some(0.3),
+            "presence_penalty crosses as set"
+        );
+        assert_eq!(chat.top_k, Some(40), "top_k crosses as set");
+        assert_eq!(chat.min_p, Some(0.05), "min_p crosses as set");
+        assert_eq!(
+            chat.repetition_penalty,
+            Some(1.1),
+            "repetition_penalty crosses as set"
+        );
     }
 
     #[test]
@@ -1316,6 +1545,34 @@ mod tests {
         );
     }
 
+    /// A Responses request's `json_schema` text format keeps its description in
+    /// the Chat request the gRPC path builds from it.
+    #[test]
+    fn a_json_schema_text_format_keeps_its_description() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Name a city.",
+            "text": {"format": {
+                "type": "json_schema", "name": "city",
+                "description": "A city and its country.",
+                "schema": {"type": "object"}, "strict": true
+            }}
+        }))
+        .unwrap();
+        let chat_req = responses_to_chat(&req).unwrap();
+        let Some(ResponseFormat::JsonSchema { json_schema }) = &chat_req.response_format else {
+            panic!(
+                "expected a json_schema format, got {:?}",
+                chat_req.response_format
+            );
+        };
+        assert_eq!(
+            json_schema.description.as_deref(),
+            Some("A city and its country.")
+        );
+        assert_eq!(json_schema.name, "city");
+    }
+
     #[test]
     fn test_empty_input_error() {
         let req = ResponsesRequest {
@@ -1447,8 +1704,82 @@ mod tests {
         };
 
         let result = responses_to_chat(&req);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Unsupported input item type");
+        assert_eq!(result.unwrap_err(), ConversionError::UnsupportedItem);
+    }
+
+    /// A message item's `input_file`, and an `input_image` that names only a
+    /// `file_id`, have no form in the chat pipeline: the conversion refuses
+    /// the request under the chat route's `unsupported_content_part`, naming
+    /// the part, instead of answering as if the part had not been sent. An
+    /// `input_image` with a URL converts to an `image_url` part as before,
+    /// and the refusal of an item kind keeps `convert_request_failed`.
+    #[test]
+    fn a_part_the_chat_pipeline_has_no_form_for_is_refused_not_dropped() {
+        let message = |parts: serde_json::Value| serde_json::json!([{"type": "message", "role": "user", "content": parts}]);
+        let file = responses_to_chat(&items_request(
+            "local-model",
+            message(serde_json::json!([
+                {"type": "input_text", "text": "Summarize the attached document."},
+                {"type": "input_file", "file_data": "JVBERi0xLjQK", "filename": "a.pdf"}
+            ])),
+        ))
+        .expect_err("a file part has no chat form");
+        assert_eq!(file.code(), "unsupported_content_part");
+        assert!(file.to_string().contains("\"input_file\""), "{file}");
+
+        let by_id = responses_to_chat(&items_request(
+            "local-model",
+            message(serde_json::json!([
+                {"type": "input_image", "file_id": "file_123", "detail": "auto"}
+            ])),
+        ))
+        .expect_err("an image named by a file_id alone has no chat form");
+        assert_eq!(by_id.code(), "unsupported_content_part");
+        assert!(by_id.to_string().contains("\"input_image\""), "{by_id}");
+
+        let simple = responses_to_chat(&items_request(
+            "local-model",
+            serde_json::json!([{"role": "user", "content": [
+                {"type": "input_file", "file_id": "file_123"}
+            ]}]),
+        ))
+        .expect_err("a simple input message is read the same way");
+        assert_eq!(simple.code(), "unsupported_content_part");
+
+        let chat = responses_to_chat(&items_request(
+            "local-model",
+            message(serde_json::json!([
+                {"type": "input_text", "text": "What is in the picture?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ])),
+        ))
+        .expect("an image with a URL converts");
+        match &chat.messages[0] {
+            ChatMessage::User {
+                content: MessageContent::Parts(parts),
+                ..
+            } => {
+                assert!(
+                    matches!(&parts[0], ContentPart::Text { text } if text == "What is in the picture?")
+                );
+                assert!(matches!(
+                    &parts[1],
+                    ContentPart::ImageUrl { image_url } if image_url.url == "data:image/png;base64,iVBORw0KGgo="
+                ));
+            }
+            other => panic!("the user turn carries parts: {other:?}"),
+        }
+        assert_eq!(
+            ConversionError::UnsupportedItem.code(),
+            "convert_request_failed"
+        );
+        assert_eq!(ConversionError::NoMessages.code(), "convert_request_failed");
+        // A function output with a part the text-only chat path cannot carry
+        // is a content-part refusal too (it used to answer convert_request_failed).
+        assert_eq!(
+            ConversionError::UnsupportedToolOutput("image".to_string()).code(),
+            "unsupported_content_part"
+        );
     }
     #[test]
     fn namespace_chat_response_roundtrips_identity() {
@@ -1496,6 +1827,31 @@ mod tests {
             assert_eq!(item["call_id"], call_id);
             assert_eq!(item["arguments"], "{}");
         }
+    }
+
+    /// A call the parser did not read whole, delivered under `tool_calls` with arguments that
+    /// are no JSON value (a tagged syntax that refused bytes inside the call writes no close for
+    /// it): the item is `incomplete`, and so is the response, with no stated reason, as a call
+    /// cut by an abort leaves it.
+    #[test]
+    fn a_generated_call_the_parser_did_not_read_whole_leaves_the_response_incomplete() {
+        let request = ResponsesRequest::default();
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_add","type":"function","function":{"name":"add_integers","arguments":""}}
+            ]},"finish_reason":"tool_calls"}]
+        })).unwrap();
+        let wire = serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+        assert_eq!(wire["status"], "incomplete", "{wire}");
+        assert_eq!(
+            wire["incomplete_details"],
+            serde_json::Value::Null,
+            "{wire}"
+        );
+        assert_eq!(wire["output"][0]["type"], "function_call", "{wire}");
+        assert_eq!(wire["output"][0]["status"], "incomplete", "{wire}");
+        assert_eq!(wire["output"][0]["arguments"], "", "{wire}");
     }
 
     #[test]
@@ -1563,6 +1919,65 @@ mod tests {
         assert_eq!(wire["status"], "incomplete");
         assert_eq!(wire["output"][0]["status"], "completed");
         assert_eq!(wire["output"][0]["arguments"], "{}");
+    }
+
+    #[test]
+    fn a_cut_call_under_a_finish_other_than_length_leaves_the_response_incomplete() {
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
+                ]},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            let wire = serde_json::to_value(
+                chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(wire["output"][0]["status"], "incomplete", "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["arguments"], "{\"tz\":",
+                "{finish_reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_custom_tool_call_leaves_the_response_incomplete_too() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hi",
+            "tools": [{"type": "custom", "name": "emit_command"}]
+        }))
+        .unwrap();
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_c","type":"function","function":{"name":"emit_command","arguments":"{\"input\": \"pw"}}
+                ]},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            let wire =
+                serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["type"], "custom_tool_call",
+                "{finish_reason}"
+            );
+            assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
+        }
     }
 
     /// The MCP tool loop's conversion: the request's function tools and the

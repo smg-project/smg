@@ -17,7 +17,10 @@
 //! should run `--exclusive` (or on nodes of their own): Slurm otherwise shares
 //! a node between jobs.
 //!
-//! A command that fails or times out, or an answer that does not parse,
+//! The provider starts only with both commands on `PATH`: the published router
+//! image has none of the Slurm clients, its `-slurm` variant carries them, and
+//! an image without them would otherwise fail every poll. A command that
+//! fails or times out, or an answer that does not parse,
 //! rejects the whole poll, and the last good one stays. A job that cannot be
 //! placed is left out alone: one whose hostlist does not expand, with a node
 //! `scontrol` does not know or without a usable address, or running with no
@@ -46,6 +49,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::OsStr,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -458,6 +462,40 @@ impl Default for SlurmCli {
     }
 }
 
+impl SlurmCli {
+    /// The first of the commands that is not there to run, if any: a bare
+    /// name is looked up in the directories of `path` (the process's `PATH`),
+    /// a name with a directory is the file it names.
+    fn missing_command(&self, path: Option<&OsStr>) -> Option<&Path> {
+        [self.squeue.as_path(), self.scontrol.as_path()]
+            .into_iter()
+            .find(|program| !is_there(program, path))
+    }
+}
+
+/// Whether `program` names a file, on `path` for a bare name.
+fn is_there(program: &Path, path: Option<&OsStr>) -> bool {
+    let has_directory = program
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if has_directory {
+        return program.is_file();
+    }
+    path.map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .any(|directory| directory.join(program).is_file())
+}
+
+/// Why the provider does not start without `command`.
+fn missing_command_error(command: &Path) -> String {
+    format!(
+        "`{}` is not on PATH: Slurm discovery runs the Slurm client commands, which the router \
+         image's `-slurm` variant carries",
+        command.display()
+    )
+}
+
 /// What a command that exited successfully printed.
 struct CommandOutput {
     /// The command line, for errors.
@@ -782,11 +820,16 @@ fn parse_nodes(stdout: &[u8]) -> Result<Vec<Node>, String> {
 // ---------------------------------------------------------------------------
 
 /// Poll Slurm now and on every tick, reconciling the last good answer each
-/// time.
+/// time. Without the commands on `PATH` the provider is refused at start,
+/// naming the missing one, rather than failing every poll.
 pub(super) fn start_slurm_discovery(
     config: SlurmProviderConfig,
     app_context: Arc<AppContext>,
-) -> task::JoinHandle<()> {
+) -> Result<task::JoinHandle<()>, String> {
+    let client = SlurmCli::default();
+    if let Some(command) = client.missing_command(std::env::var_os("PATH").as_deref()) {
+        return Err(missing_command_error(command));
+    }
     info!(
         "Starting Slurm service discovery | jobs: {} | port: {} | poll every {}s",
         config
@@ -803,10 +846,9 @@ pub(super) fn start_slurm_discovery(
         clippy::disallowed_methods,
         reason = "worker discovery runs for the lifetime of the server; shutdown aborts the handle"
     )]
-    let handle =
-        task::spawn(SlurmDiscovery::new(config, app_context, Box::new(SlurmCli::default())).run());
+    let handle = task::spawn(SlurmDiscovery::new(config, app_context, Box::new(client)).run());
 
-    handle
+    Ok(handle)
 }
 
 /// The provider's loop and its state.
@@ -865,29 +907,13 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::config::test_support::{epd_routing_mode, regular_routing_mode};
 
     const SQUEUE_23_11: &str = include_str!("testdata/slurm/squeue-23.11.json");
     const SQUEUE_24_11: &str = include_str!("testdata/slurm/squeue-24.11.json");
     const SQUEUE_21_08: &str = include_str!("testdata/slurm/squeue-21.08.json");
     const NODES_23_11: &str = include_str!("testdata/slurm/scontrol-nodes-23.11.json");
     const NODES_24_11: &str = include_str!("testdata/slurm/scontrol-nodes-24.11.json");
-
-    fn regular() -> RoutingMode {
-        RoutingMode::Regular {
-            worker_urls: vec![],
-        }
-    }
-
-    fn epd() -> RoutingMode {
-        RoutingMode::EncodePrefillDecode {
-            encode_urls: vec![],
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            encode_policy: None,
-            prefill_policy: None,
-            decode_policy: None,
-        }
-    }
 
     fn discovery_config(job_names: &[&str]) -> SlurmDiscoveryConfig {
         SlurmDiscoveryConfig {
@@ -905,7 +931,7 @@ mod tests {
     }
 
     fn config(job_names: &[&str]) -> SlurmProviderConfig {
-        SlurmProviderConfig::new(&discovery_config(job_names), &regular()).unwrap()
+        SlurmProviderConfig::new(&discovery_config(job_names), &regular_routing_mode()).unwrap()
     }
 
     fn job(jobs: &Jobs, id: u64) -> &Job {
@@ -1205,7 +1231,7 @@ mod tests {
                 bootstrap_port: Some(8998),
                 ..discovery_config(&[])
             },
-            &epd(),
+            &epd_routing_mode(),
         )
         .unwrap();
         let mut workers: Vec<(String, WorkerType, Option<u16>)> = poll(&slurm, &config)
@@ -1527,6 +1553,37 @@ mod tests {
             scontrol,
             timeout: Duration::from_secs(5),
         }
+    }
+
+    /// The start refuses an image without the commands: the first one missing
+    /// is named, looked up on the given `PATH` for a bare name and as the
+    /// file it names otherwise, and the error names the image that has them.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_command_is_named_before_the_first_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_path = Some(dir.path().as_os_str());
+        let commands = SlurmCli::default();
+        assert_eq!(commands.missing_command(None), Some(Path::new("squeue")));
+        script(dir.path(), "squeue", "exit 0");
+        assert_eq!(
+            commands.missing_command(on_path),
+            Some(Path::new("scontrol"))
+        );
+        script(dir.path(), "scontrol", "exit 0");
+        assert_eq!(commands.missing_command(on_path), None);
+
+        let absent = dir.path().join("absent");
+        let by_path = cli(dir.path().join("squeue"), absent.clone());
+        assert_eq!(by_path.missing_command(None), Some(absent.as_path()));
+        assert_eq!(
+            cli(dir.path().join("squeue"), dir.path().join("scontrol")).missing_command(None),
+            None
+        );
+
+        let error = missing_command_error(Path::new("squeue"));
+        assert!(error.starts_with("`squeue` is not on PATH"), "{error}");
+        assert!(error.contains("`-slurm` variant"), "{error}");
     }
 
     /// The real command path end to end: the arguments `squeue` and `scontrol`

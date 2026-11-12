@@ -9,8 +9,8 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use anyhow::{Context, Result};
 use futures::{future::try_join_all, StreamExt, TryStreamExt};
 use llm_multimodal::{
-    AsyncMultiModalTracker, AudioClip, EncoderDtype, EncoderFieldLayouts, ImageFrame,
-    MediaItemInfo, Modality, ModelMetadata, ModelProcessorSpec, PlaceholderRange,
+    AsyncMultiModalTracker, AudioClip, EncoderDtype, EncoderFieldLayouts, FrameSampling,
+    ImageFrame, MediaItemInfo, Modality, ModelMetadata, ModelProcessorSpec, PlaceholderRange,
     PreProcessorConfig, PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput,
     TransparencyPolicy, VideoClip, VideoClipOptions, VisionPreProcessor,
 };
@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     config::{MultimodalComponents, MultimodalModelConfig, VisionProcessors},
-    encoder_budget::check_item_feature_budget,
+    encoder_budget::{check_image_size_feature_budget, check_item_feature_budget},
     log_mm_timing_enabled,
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
@@ -29,6 +29,9 @@ use super::{
     PromptBinding, RegistryTokenizer,
 };
 use crate::observability::metrics::Metrics;
+
+#[path = "batch_image_cache.rs"]
+mod batch_image_cache;
 
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
@@ -56,7 +59,9 @@ struct PlanContext<'a> {
     image_wire_dtype: Option<EncoderDtype>,
     transparency: TransparencyPolicy,
     /// The engine's per-item bound in feature tokens, when known (see
-    /// [`super::encoder_budget`]).
+    /// [`super::encoder_budget`]): held to on an image's header size before
+    /// anything is decoded, and on every item's produced count after its
+    /// preprocessing.
     encoder_budget: Option<usize>,
 }
 
@@ -163,8 +168,10 @@ impl Fetched {
 /// Process a protocol-independent, ordered media plan.
 ///
 /// `encoder_budget` is the engine's per-item bound in feature tokens, when
-/// known (see [`super::encoder_budget`]): an item above it is refused once
-/// its features are counted, before anything reaches the engine.
+/// known (see [`super::encoder_budget`]): an image above it on its header
+/// size alone is refused before any of its batch is decoded or any tensor
+/// built, and any item above it on its produced count is refused once its
+/// features are counted; nothing above it reaches the engine.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_multimodal_plan(
     plan: MediaPlan,
@@ -284,22 +291,57 @@ pub(crate) async fn process_multimodal_plan(
     })
 }
 
+/// The spec's view of a clip for this model: its sampling rate and frame
+/// placement, read from the config its video processor is built from (see
+/// [`preprocessor_config_for`]) so the frames the connector picks and the
+/// frames the processor groups answer one config whatever files the
+/// checkpoint ships; the placement under the engine's frame budget.
+fn video_sampling(
+    spec: &dyn ModelProcessorSpec,
+    model_config: &MultimodalModelConfig,
+    frame_budget: Option<usize>,
+) -> (Option<f64>, FrameSampling) {
+    let config = preprocessor_config_for(model_config, Modality::Video);
+    (
+        spec.default_video_sample_fps_with(config),
+        spec.video_frame_sampling_with(config)
+            .with_frame_budget(frame_budget),
+    )
+}
+
 /// Fetch and decode the plan's media through the tracker, under the spec's
 /// video sampling and the frames' transparency policy.
 async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> {
-    let video_config = ctx.model_config.video_preprocessor_config.as_ref();
+    let (sample_fps, frame_sampling) = video_sampling(
+        ctx.spec,
+        ctx.model_config,
+        ctx.components.video_frame_budget,
+    );
     let mut tracker = AsyncMultiModalTracker::new(ctx.components.media_connector.clone())
+        .with_drain_on_error(ctx.components.drain_fetches_on_error)
         .with_fetch_observer(
             Metrics::interned_model_label(ctx.model_id),
             Metrics::record_mm_fetch,
         )
-        .with_default_video_sample_fps(ctx.spec.default_video_sample_fps_with(video_config))
-        .with_video_frame_sampling(
-            ctx.spec
-                .video_frame_sampling_with(video_config)
-                .with_frame_budget(ctx.components.video_frame_budget),
+        .with_default_video_sample_fps(sample_fps)
+        .with_video_frame_sampling(frame_sampling)
+        .with_image_transparency(ctx.transparency)
+        .with_minimax_sglang_resize(
+            ctx.spec.resizes_source_images()
+                && ctx
+                    .model_config
+                    .preprocessor_config
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+                    .unwrap_or(false),
         )
-        .with_image_transparency(ctx.transparency);
+        .with_minimax_image_resize(
+            ctx.spec.resizes_source_images()
+                && !ctx
+                    .model_config
+                    .preprocessor_config
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+                    .unwrap_or(false),
+        );
 
     for part in plan.into_parts() {
         tracker
@@ -505,24 +547,29 @@ fn intermediate_of(
         .with_encoder_input_format(spec.encoder_input_format()))
 }
 
-/// Preprocess one modality's batch: a small image batch through the pixel
-/// cache, image by image, when the cache is on and the processor allows it;
-/// every other batch whole, on the blocking pool.
+/// Preprocess one modality's batch, using the pixel cache for eligible images.
+/// An image the engine can
+/// never place is refused first, on the size its header gave and the
+/// processor's own size-to-count rule, before any of the batch is decoded
+/// or any tensor built; the counts the preprocessing produces are held to
+/// the same budget in [`prepared_part`].
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
 ) -> Result<PreprocessedEncoderInputs> {
+    if let MediaBatch::Images(images) = media {
+        if let Ok(processor) = ctx.vision_processors.image() {
+            check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
+        }
+    }
     if let Some(preprocessed) = cached_images(media, ctx).await? {
         return Ok(preprocessed);
     }
     preprocess_batch(media, ctx).await
 }
 
-/// The per-image path through the pixel cache for an image batch the cache
-/// takes: one image, or fewer than 32 of a processor that preprocesses each
-/// image independently (retaining individual tensors plus their concatenation
-/// is costly for large requests, which keep their whole-batch allocation
-/// path). `None` sends the batch down the whole-batch path.
+/// Batch misses for processors that support slicing the result into cache
+/// entries. Use the per-image path for other eligible requests.
 async fn cached_images(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
@@ -534,22 +581,20 @@ async fn cached_images(
         return Ok(None);
     };
     let processor = ctx.vision_processors.image();
-    if !(images.len() == 1
-        || (images.len() < 32 && processor.is_ok_and(|p| p.supports_per_image_preprocessing())))
-    {
+    let independent = processor
+        .as_ref()
+        .is_ok_and(|processor| processor.supports_per_image_preprocessing());
+    let batch_cache = ctx.image_wire_dtype == Some(EncoderDtype::BFloat16)
+        && !images.is_empty()
+        && processor.is_ok_and(|processor| processor.supports_bf16_batch_cache());
+    let per_image_cache = images.len() == 1 || (images.len() < 32 && independent);
+    if batch_cache {
+        return batch_image_cache::preprocess(images, cache, ctx, !per_image_cache).await;
+    }
+    if !per_image_cache {
         return Ok(None);
     }
-    let mut config = serde_json::json!({
-        "model_id": ctx.model_id,
-        "model_type": ctx.model_type,
-        "model_config": ctx.model_config.config,
-        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
-        // A one-pass result is only right for its own wire.
-        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
-        "transparency": ctx.transparency,
-    });
-    config.sort_all_objects();
-    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config);
+    let fingerprint = image_cache_fingerprint(ctx)?;
     // Deduplicate within the request even if the result cannot fit
     // in the cache. Record every position before scheduling work.
     let mut unique = HashMap::new();
@@ -594,7 +639,7 @@ async fn cached_images(
         .encoder_field_layouts_for(Modality::Image)
         .model_specific;
     let image_count = images.len();
-    tokio::task::spawn_blocking(move || -> Result<_> {
+    on_pool(ctx.model_id, move || -> Result<_> {
         let mut ordered = vec![None; image_count];
         for (part, positions) in parts.into_iter().zip(positions) {
             let (&last, repeats) = positions
@@ -609,12 +654,69 @@ async fn cached_images(
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .context("Missing image output position")?;
-        PreprocessedEncoderInputs::concat(parts, &layouts)
+        PreprocessedEncoderInputs::concat_refs(
+            &parts
+                .iter()
+                .map(|part| &part.preprocessed)
+                .collect::<Vec<_>>(),
+            &layouts,
+        )
     })
     .await
     .context("Image batch assembly task panicked")?
     .context("Image batch assembly failed")
     .map(Some)
+}
+
+/// Identify the model, wire format and image policy in the pixel cache.
+fn image_cache_fingerprint(ctx: &PlanContext<'_>) -> Result<u64> {
+    let config = serde_json::json!({
+        "model_id": ctx.model_id,
+        "model_type": ctx.model_type,
+        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
+        // A one-pass result is only right for its own wire.
+        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
+        "transparency": ctx.transparency,
+    });
+    Ok(config_fingerprint(
+        ctx.tokenizer_id,
+        &config,
+        &ctx.model_config.config,
+    )?)
+}
+
+/// `work` on the blocking pool, with the time its task waited in the pool's
+/// queue (the gap between the spawn and the closure's first instruction)
+/// recorded as the `pool_queue` stage of `model_id`: one observation per
+/// task, so a burst that queues behind the pool's threads is seen as waiting,
+/// apart from the work itself.
+async fn on_pool<T: Send + 'static>(
+    model_id: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    let model = Metrics::interned_model_label(model_id);
+    on_pool_recording(work, move |waited| {
+        Metrics::record_mm_processing_stage(&model, "pool_queue", waited);
+    })
+    .await
+}
+
+/// `work` on the blocking pool; `record` takes the seconds its task waited
+/// for a pool thread, measured at the closure's first instruction on that
+/// thread. The record happens there and not on the awaiting side, so a task
+/// whose request was dropped while it queued, or whose work panics, still
+/// records its wait: under a burst those are the long tail this stage is
+/// for.
+async fn on_pool_recording<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    record: impl FnOnce(f64) + Send + 'static,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    let queued_at = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        record(queued_at.elapsed().as_secs_f64());
+        work()
+    })
+    .await
 }
 
 /// The whole batch preprocessed on the blocking pool: the CPU-intensive
@@ -655,25 +757,9 @@ async fn preprocess_batch(
     };
     let image_wire_dtype = ctx.image_wire_dtype;
 
-    tokio::task::spawn_blocking(move || match media_for_preprocess {
+    on_pool(ctx.model_id, move || match media_for_preprocess {
         MediaBatch::Images(images) => {
-            // Decode every frame first, in parallel on the preprocessing
-            // pool, rather than one photo after another on this thread.
-            ImageFrame::decode_all(&images)
-                .map_err(llm_multimodal::MultiModalError::Media)?;
-            let processor = vision_processors.image()?;
-            // Decoded (and cloned) inside the blocking closure, off the async
-            // runtime.
-            let raw_images: Vec<image::DynamicImage> = images
-                .iter()
-                .map(|frame| {
-                    frame
-                        .image()
-                        .cloned()
-                        .map_err(llm_multimodal::MultiModalError::Media)
-                })
-                .collect::<Result<_, _>>()?;
-            preprocess_images(processor.as_ref(), &raw_images, image_wire_dtype)
+            preprocess_image_frames(&images, &vision_processors, image_wire_dtype)
         }
         MediaBatch::Videos(videos) => {
             let processor = vision_processors.video()?;
@@ -786,18 +872,19 @@ async fn preprocess_image_cached(
     model_id: String,
     fingerprint: u64,
     image_wire_dtype: Option<EncoderDtype>,
-) -> Result<PreprocessedEncoderInputs> {
+) -> Result<Arc<CachedPreprocessedItem>> {
     let key = PixelCacheKey {
         image_hash: image.hash.clone(),
         config_fingerprint: fingerprint,
     };
     if let Some(cached) = cache.get(&key) {
         Metrics::record_mm_pixel_cache_lookup(&model_id, true);
-        return Ok(cached.preprocessed.clone());
+        return Ok(cached);
     }
     Metrics::record_mm_pixel_cache_lookup(&model_id, false);
 
     let preprocessed = preprocess_image_batch(
+        &model_id,
         vision_processors,
         std::slice::from_ref(&image),
         image_wire_dtype,
@@ -807,36 +894,58 @@ async fn preprocess_image_cached(
     // dtype was resolved (twice the neutral bytes at the half widths, four
     // times at float32, against the same budget), so a hit skips the write
     // pass; the neutral patches otherwise.
-    cache.insert(
-        key,
-        Arc::new(CachedPreprocessedItem {
-            preprocessed: preprocessed.clone(),
-        }),
-    );
-    Ok(preprocessed)
+    let cached = Arc::new(CachedPreprocessedItem { preprocessed });
+    cache.insert(key, cached.clone());
+    Ok(cached)
 }
 
 async fn preprocess_image_batch(
+    model_id: &str,
     vision_processors: Arc<VisionProcessors>,
     images: &[Arc<ImageFrame>],
     image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let raw_images: Vec<image::DynamicImage> = images
+    on_pool(model_id, move || {
+        // Borrowed from the frames' own cells, as the batch path borrows them.
+        let decoded: Vec<&image::DynamicImage> = images
             .iter()
             .map(|frame| {
                 frame
                     .image()
-                    .cloned()
                     .map_err(llm_multimodal::MultiModalError::Media)
             })
             .collect::<Result<_, _>>()?;
         let processor = vision_processors.image()?;
-        preprocess_images(processor.as_ref(), &raw_images, image_wire_dtype)
+        preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
     })
     .await
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
+}
+
+/// Decode a batch in parallel and borrow its frames for the vision processor.
+fn preprocess_image_frames(
+    images: &[Arc<ImageFrame>],
+    vision_processors: &VisionProcessors,
+    image_wire_dtype: Option<EncoderDtype>,
+) -> Result<PreprocessedEncoderInputs> {
+    // Decode every frame first, in parallel on the preprocessing
+    // pool, rather than one photo after another on this thread.
+    ImageFrame::decode_all(images).map_err(llm_multimodal::MultiModalError::Media)?;
+    let processor = vision_processors.image()?;
+    // The frames' own pixels, borrowed from the cells `decode_all`
+    // just filled: no processor owns, consumes or mutates its input,
+    // so the batch costs one pointer per image instead of a deep copy
+    // of every decoded image.
+    let decoded: Vec<&image::DynamicImage> = images
+        .iter()
+        .map(|frame| {
+            frame
+                .image()
+                .map_err(llm_multimodal::MultiModalError::Media)
+        })
+        .collect::<Result<_, _>>()?;
+    preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
 }
 
 /// The images preprocessed: laid out in `wire_dtype` in one pass when the
@@ -844,7 +953,7 @@ async fn preprocess_image_batch(
 /// write otherwise. Both arms produce the same bytes on the wire.
 fn preprocess_images(
     processor: &dyn VisionPreProcessor,
-    images: &[image::DynamicImage],
+    images: &[&image::DynamicImage],
     wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     wire_dtype
@@ -1057,9 +1166,165 @@ fn explicit_feature_ranges(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use llm_multimodal::{ImageDetail, ImageSource, VideoSamplingInfo, VideoSource};
+    use llm_multimodal::{
+        ImageDetail, ImageSource, ModelRegistry, Tokenizer, VideoSamplingInfo, VideoSource,
+    };
 
     use super::*;
+    use crate::observability::metrics::test_support::global_recorder;
+
+    /// The queue wait is measured on the pool thread before the work and
+    /// recorded there: a task behind the one held thread records at least
+    /// the time from its queueing to the hold's release and at most the time
+    /// from just before its queueing to the drain's end, once every record is
+    /// in (the test's own instants bracket each wait from both sides, so a
+    /// wait measured from an instant taken too early fails too), a task whose
+    /// awaiting future was dropped while it queued records its wait all the
+    /// same, and the record is taken before the work runs.
+    #[test]
+    fn the_pool_queue_wait_is_recorded_on_the_pool_thread() {
+        use std::{
+            collections::BTreeMap,
+            future::Future,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                mpsc as std_mpsc,
+            },
+            task::Poll,
+        };
+
+        use tokio::sync::{mpsc, oneshot};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            // Each record: who, the wait, and whether the work had run.
+            let (tx, mut rx) = mpsc::unbounded_channel::<(&'static str, f64, bool)>();
+            // The hold takes the pool's one thread, says so, and keeps it
+            // until the test releases it once both tasks are queued behind.
+            let (taken_tx, taken_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std_mpsc::channel::<()>();
+            let hold = tokio::task::spawn_blocking(move || {
+                let _ = taken_tx.send(());
+                let _ = release_rx.recv();
+            });
+            taken_rx.await.expect("the hold took the thread");
+
+            // Polled once, so its task is queued behind the hold, then dropped.
+            let dropped_tx = tx.clone();
+            let mut dropped = Box::pin(on_pool_recording(
+                || (),
+                move |waited| {
+                    let _ = dropped_tx.send(("dropped", waited, false));
+                },
+            ));
+            // Stamped before the poll, so the task's own clock starts after it.
+            let dropped_before = Instant::now();
+            std::future::poll_fn(|cx| {
+                let _ = dropped.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            // Stamped after the poll, so the task's own clock started first.
+            let dropped_queued = Instant::now();
+            drop(dropped);
+
+            // Queued behind both, then awaited; its work sets a flag the
+            // record closure reads, so the order of the two is recorded.
+            let worked = Arc::new(AtomicBool::new(false));
+            let worked_by_work = Arc::clone(&worked);
+            let worked_by_record = Arc::clone(&worked);
+            let awaited_tx = tx.clone();
+            let mut awaited = Box::pin(on_pool_recording(
+                move || {
+                    worked_by_work.store(true, Ordering::SeqCst);
+                    7
+                },
+                move |waited| {
+                    let _ = awaited_tx.send((
+                        "awaited",
+                        waited,
+                        worked_by_record.load(Ordering::SeqCst),
+                    ));
+                },
+            ));
+            let awaited_before = Instant::now();
+            std::future::poll_fn(|cx| {
+                let _ = awaited.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            let awaited_queued = Instant::now();
+
+            // Stamped before the release, so no record can precede it.
+            let released = Instant::now();
+            release_tx.send(()).expect("the hold is waiting");
+            let value = awaited.await.expect("the work ran");
+            assert_eq!(value, 7);
+            hold.await.expect("the hold ran");
+            drop(tx);
+
+            let mut seen = BTreeMap::new();
+            while let Some((who, waited, worked_first)) = rx.recv().await {
+                seen.insert(who, (waited, worked_first));
+            }
+            // Stamped once every sender is gone: each record was sent before
+            // its sender dropped, whatever order the pool ran the tasks in.
+            let done = Instant::now();
+            for (who, before, queued) in [
+                ("dropped", dropped_before, dropped_queued),
+                ("awaited", awaited_before, awaited_queued),
+            ] {
+                let (waited, _) = seen
+                    .get(who)
+                    .unwrap_or_else(|| panic!("{who}: no wait recorded"));
+                let held = released.duration_since(queued).as_secs_f64();
+                assert!(
+                    *waited >= held,
+                    "{who}: waited {waited} s, queued {held} s before the release"
+                );
+                let bracket = done.duration_since(before).as_secs_f64();
+                assert!(
+                    *waited <= bracket,
+                    "{who}: waited {waited} s, but {bracket} s passed from before its queueing to the drain's end"
+                );
+            }
+            let (_, worked_first) = seen["awaited"];
+            assert!(!worked_first, "the wait was recorded after the work ran");
+        });
+    }
+
+    /// The production wiring: `on_pool` records the wait as the `pool_queue`
+    /// stage of the model's histogram. The record happens on the pool thread,
+    /// so the test reads the binary's one process-wide recorder
+    /// (`test_support::global_recorder`), which the local recorders of the
+    /// other tests take precedence over on their threads.
+    #[test]
+    fn the_pool_queue_stage_is_recorded_under_the_models_label() {
+        let handle = global_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let value = runtime
+            .block_on(on_pool("the-pool-queue-model", || 11))
+            .expect("the work ran");
+        assert_eq!(value, 11);
+        let rendered = handle.render();
+        let counted = rendered.lines().any(|line| {
+            line.starts_with("smg_mm_processing_seconds_count{")
+                && line.contains("model=\"the-pool-queue-model\"")
+                && line.contains("stage=\"pool_queue\"")
+                && line.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()) >= Some(1)
+        });
+        assert!(
+            counted,
+            "no pool_queue count under the model in:\n{rendered}"
+        );
+    }
 
     #[test]
     fn decoded_video_sample_fps_overrides_processor_default() {
@@ -1170,6 +1435,70 @@ mod tests {
         assert_eq!(temporal(&with_video, Modality::Image), Some(2));
         assert_eq!(temporal(&with_video, Modality::Audio), Some(2));
         assert_eq!(temporal(&without_video, Modality::Video), Some(2));
+    }
+
+    /// The samplers read the config the video processor is built from: the
+    /// checkpoint's video config when it ships one, else its shared one, so a
+    /// family whose reference reads its rate and frame budget from that config
+    /// samples a clip the way its processor groups it.
+    #[test]
+    fn video_sampling_reads_the_processors_config() {
+        struct NoTokenizer;
+        impl Tokenizer for NoTokenizer {
+            fn token_to_id(&self, _token: &str) -> Option<u32> {
+                None
+            }
+            fn id_to_token(&self, _id: u32) -> Option<String> {
+                None
+            }
+            fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+                None
+            }
+        }
+        let model = serde_json::json!({
+            "model_type": "muse_spark", "image_token_id": 1, "video_token_id": 2
+        });
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&ModelMetadata {
+                model_id: "muse-spark",
+                tokenizer: &NoTokenizer,
+                config: &model,
+            })
+            .expect("a family whose sampler reads its processor config");
+        let config = |fps: f64, num_frames: usize| {
+            PreProcessorConfig::from_value(
+                serde_json::json!({"fps": fps, "num_frames": num_frames}),
+            )
+            .unwrap()
+        };
+        let shared_only = MultimodalModelConfig::new(serde_json::json!({}), config(1.0, 8), None);
+        let with_video = MultimodalModelConfig::new(
+            serde_json::json!({}),
+            config(1.0, 8),
+            Some(config(2.0, 600)),
+        );
+
+        assert_eq!(
+            video_sampling(spec, &shared_only, None),
+            (
+                Some(1.0),
+                FrameSampling::TemporalGroups {
+                    frame_factor: 2,
+                    max_frames: 8,
+                }
+            )
+        );
+        assert_eq!(
+            video_sampling(spec, &with_video, None),
+            (
+                Some(2.0),
+                FrameSampling::TemporalGroups {
+                    frame_factor: 2,
+                    max_frames: 600,
+                }
+            )
+        );
     }
 
     #[test]

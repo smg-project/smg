@@ -120,12 +120,43 @@ pub struct ResizeConfig {
     pub num_tokens: usize,
 }
 
+/// The reference's `normalize`, per channel and per 8-bit level: `x / 255.0`
+/// in double precision stored as `f32`, then `x -= mean` and `x *= 1 / std`
+/// with double-precision operands and an `f32` store after each step (an
+/// in-place NumPy ufunc computes in the wider operand type and casts on the
+/// store). A fused `x * (1 / (255 std)) - mean / std` rounds once where the
+/// reference rounds three times: under the family's mean and std of 0.5 it
+/// differed by one `f32` ULP on 111 of the 256 levels, which flipped the
+/// bf16 rounding of 0.2-0.3 % of the values on the wire. A table of the 256
+/// values per channel reproduces every rounding at one load per byte.
+fn normalized_levels(mean: &[f64; 3], std: &[f64; 3]) -> [[f32; 256]; 3] {
+    std::array::from_fn(|channel| {
+        let std_inv = 1.0 / std[channel];
+        std::array::from_fn(|level| {
+            let rescaled = (level as f64 / 255.0) as f32;
+            let centred = (f64::from(rescaled) - mean[channel]) as f32;
+            (f64::from(centred) * std_inv) as f32
+        })
+    })
+}
+
 /// Fused resize + zero-pad + normalize into a single [C, H_padded, W_padded] tensor.
 ///
 /// Avoids intermediate allocations by:
 /// 1. Allocating the final padded canvas directly
-/// 2. Pre-filling with normalized black (bias value)
-/// 3. Deinterleaving + normalizing the image region in one pass
+/// 2. Pre-filling with normalized black (the table's entry for a zero byte,
+///    as the reference zero-pads the bytes before it normalizes)
+/// 3. Deinterleaving + normalizing the image region in one pass, every byte
+///    through its channel's table of [`normalized_levels`]
+///
+/// The resize is the reference's `PIL.Image.resize(.., BICUBIC)`: Pillow's
+/// separable bicubic in 22-bit fixed point (`transforms::resize_bicubic_pil_rgb`)
+/// and, for an image whose alpha survives to the resize, Pillow's premultiplied
+/// `RGBa` resample on the same kernel (`transforms::resize_bicubic_pil_rgba`).
+/// The SIMD Catmull-Rom path of `transforms::resize` is the same filter family
+/// in another quantization: it parted from the reference by one 8-bit level on
+/// 12-48 % of the pixels of every image it resized. An image within the patch
+/// budget keeps its size and is not resampled at all, as Pillow copies it.
 ///
 /// Alpha handling follows the reference. With a `transparent_bg` the image is
 /// composited at the configured stage; K3 ships `"after_resize"`, and the
@@ -138,10 +169,9 @@ pub struct ResizeConfig {
 fn resize_pad_and_normalize(
     image: &DynamicImage,
     cfg: &ResizeConfig,
-    mean: &[f64; 3],
-    std: &[f64; 3],
+    levels: &[[f32; 256]; 3],
     transparent_bg: Option<TransparentBg>,
-) -> Array3<f32> {
+) -> Result<Array3<f32>, TransformError> {
     let canvas_h = cfg.new_height + cfg.pad_height;
     let canvas_w = cfg.new_width + cfg.pad_width;
 
@@ -149,7 +179,7 @@ fn resize_pad_and_normalize(
     let bg = transparent_bg.filter(|_| image.color().has_alpha());
 
     // Reduce to RGB up front unless the background is painted after the resize,
-    // in which case alpha has to survive the convolution.
+    // in which case alpha has to survive the resample.
     let pre_flattened = match bg {
         Some(b) if b.stage == TransparentBgFillStage::BeforeResize => Some(
             DynamicImage::ImageRgb8(transforms::fill_transparent_bg(image, b.config)),
@@ -160,43 +190,47 @@ fn resize_pad_and_normalize(
     };
     let source = pre_flattened.as_ref().unwrap_or(image);
 
-    // SIMD-accelerated BICUBIC (fast_image_resize). Surviving alpha is
-    // premultiplied, as `PIL.Image.resize` does for RGBA.
     let after_resize = bg.is_some_and(|b| b.stage == TransparentBgFillStage::AfterResize);
-    let resized = transforms::resize(
-        source,
-        cfg.new_width as u32,
-        cfg.new_height as u32,
-        image::imageops::FilterType::CatmullRom,
-    );
+    let (new_w, new_h) = (cfg.new_width as u32, cfg.new_height as u32);
+    let resized = if source.dimensions() == (new_w, new_h) {
+        None
+    } else if after_resize {
+        Some(DynamicImage::ImageRgba8(
+            transforms::resize_bicubic_pil_rgba(source, new_w, new_h),
+        ))
+    } else {
+        let (width, height, rgb) = transforms::rgb_bytes(source);
+        Some(DynamicImage::ImageRgb8(transforms::resize_bicubic_pil_rgb(
+            &rgb,
+            width as u32,
+            height as u32,
+            new_w,
+            new_h,
+        )?))
+    };
+    let resized = resized.as_ref().unwrap_or(source);
 
     let post_filled = bg
         .filter(|_| after_resize)
-        .map(|b| transforms::fill_transparent_bg(&resized, b.config));
+        .map(|b| transforms::fill_transparent_bg(resized, b.config));
     let (img_w, img_h, raw): (usize, usize, Cow<'_, [u8]>) = match &post_filled {
         Some(rgb) => (
             rgb.width() as usize,
             rgb.height() as usize,
             Cow::Borrowed(rgb.as_raw().as_slice()),
         ),
-        None => transforms::rgb_bytes(&resized),
+        None => transforms::rgb_bytes(resized),
     };
     let canvas_pixels = canvas_h * canvas_w;
-
-    // Precompute fused scale/bias: pixel/255 → normalized
-    // output[c][i] = raw[i*3+c] / 255.0 * (1/std[c]) + (-mean[c]/std[c])
-    let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
-    let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
 
     // Pooled: this per-image CHW buffer (tens of MB) is recycled by the
     // caller after patch extraction, keeping its pages mapped and hot.
     let mut data = scratch::take_f32(3 * canvas_pixels);
-    transforms::paint_rgb_onto_planes(
+    transforms::paint_rgb_onto_planes_by_table(
         &raw,
         (img_w, img_h),
         (canvas_w, canvas_h),
-        scale,
-        bias,
+        levels,
         &mut data,
     );
 
@@ -204,8 +238,8 @@ fn resize_pad_and_normalize(
         clippy::expect_used,
         reason = "data has exactly 3*canvas_h*canvas_w elements by construction"
     )]
-    Array3::from_shape_vec((3, canvas_h, canvas_w), data)
-        .expect("shape matches pre-allocated buffer")
+    Ok(Array3::from_shape_vec((3, canvas_h, canvas_w), data)
+        .expect("shape matches pre-allocated buffer"))
 }
 
 /// Extract [C, patch_size, patch_size] patches from a contiguous [C, H, W] tensor.
@@ -250,7 +284,7 @@ fn extract_patches_into(tensor: &Array3<f32>, patch_size: usize, out: &mut Vec<f
 /// Run the full MoonViT pipeline over a batch of images.
 pub fn preprocess(
     params: MoonVitParams,
-    images: &[DynamicImage],
+    images: &[&DynamicImage],
     transparent_bg: Option<TransparentBg>,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
     if images.is_empty() {
@@ -258,7 +292,7 @@ pub fn preprocess(
     }
 
     let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
-    let (mean, std) = (params.mean, params.std);
+    let levels = normalized_levels(&params.mean, &params.std);
 
     // Pre-size the pooled batch buffer exactly (patch_features per patch =
     // 3 * patch_size^2; this is the data plane's hottest allocation).
@@ -281,7 +315,7 @@ pub fn preprocess(
         let cfg = params.compute_resize_config(w as usize, h as usize);
 
         // Fused resize + pad + normalize in one pass (avoids 2 extra allocations)
-        let tensor = resize_pad_and_normalize(image, &cfg, &mean, &std, transparent_bg);
+        let tensor = resize_pad_and_normalize(image, &cfg, &levels, transparent_bg)?;
 
         let padded_h = cfg.new_height + cfg.pad_height;
         let padded_w = cfg.new_width + cfg.pad_width;
@@ -327,4 +361,255 @@ pub fn preprocess(
                 ModelSpecificValue::int_1d(patches_per_image),
             ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{Rgb, RgbImage};
+
+    use super::*;
+    use crate::test_support::hex;
+
+    /// The reference's three steps, each stored as `f32`.
+    fn reference_level(level: u8, mean: f64, std: f64) -> f32 {
+        let rescaled = (f64::from(level) / 255.0) as f32;
+        let centred = (f64::from(rescaled) - mean) as f32;
+        (f64::from(centred) * (1.0 / std)) as f32
+    }
+
+    /// The bits the checkpoints' own `normalize` gives a byte (NumPy 2.2,
+    /// read back as `f32`): under the family's mean and std of 0.5, and under
+    /// a mean and std no `f32` holds exactly, where the double-precision
+    /// operands show. The fused multiply-add read `0xbb808000`, `0x3f119194`
+    /// and `0x3f7dfe00` at levels 127, 200 and 254 of the first table.
+    #[test]
+    fn normalized_levels_carry_the_reference_bits() {
+        let half = normalized_levels(&[0.5; 3], &[0.5; 3]);
+        for (level, bits) in [
+            (0, 0xbf80_0000),
+            (1, 0xbf7d_fdfe),
+            (2, 0xbf7b_fbfc),
+            (3, 0xbf79_f9fa),
+            (127, 0xbb80_8080),
+            (128, 0x3b80_8100),
+            (200, 0x3f11_9192),
+            (254, 0x3f7d_fdfe),
+            (255, 0x3f80_0000),
+        ] {
+            for (channel, table) in half.iter().enumerate() {
+                assert_eq!(
+                    table[level].to_bits(),
+                    bits,
+                    "level {level} channel {channel}"
+                );
+            }
+        }
+
+        let clip = normalized_levels(
+            &[0.48145466, 0.4578275, 0.40821073],
+            &[0.26862954, 0.26130258, 0.27577711],
+        );
+        for (level, bits) in [
+            (0, [0xbfe5_68dc, 0xbfe0_44b8, 0xbfbd_77d7]),
+            (1, [0xbfe3_8a80, 0xbfde_58f2, 0xbfbb_a5e1]),
+            (2, [0xbfe1_ac23, 0xbfdc_6d2c, 0xbfb9_d3ea]),
+            (3, [0xbfdf_cdc7, 0xbfda_8165, 0xbfb8_01f4]),
+            (127, [0x3d7c_e09e, 0x3e1d_9533, 0x3ea6_c5e5]),
+            (128, [0x3d9c_5626, 0x3e2c_f36d, 0x3eae_0dc3]),
+            (200, [0x3f90_4f64, 0x3f9f_ee32, 0x3fae_90c9]),
+            (254, [0x3ff5_36e5, 0x4003_d502, 0x4008_6d65]),
+            (255, [0x3ff7_1542, 0x4004_cae5, 0x4009_5660]),
+        ] {
+            for (channel, (table, expected)) in clip.iter().zip(bits).enumerate() {
+                assert_eq!(
+                    table[level].to_bits(),
+                    expected,
+                    "level {level} channel {channel}"
+                );
+            }
+        }
+    }
+
+    /// Every level a byte can take, through the whole image path: the bytes
+    /// after the resize, the zero padding and the normalization land on the
+    /// reference's bits. The fused multiply-add this replaces differed on 111
+    /// of the 256 levels.
+    #[test]
+    fn every_byte_level_normalizes_as_the_reference_does() {
+        let params = MoonVitParams {
+            patch_size: 14,
+            merge_size: 2,
+            in_patch_limit: 65536,
+            patch_limit_on_one_side: 512,
+            mean: [0.5; 3],
+            std: [0.5; 3],
+        };
+        // 256 x 28: every level in every channel, under the patch budget, so
+        // the resize is the identity; 24 columns of zero padding follow.
+        let level_at = |x: usize, channel: usize| -> u8 {
+            let x = x as u8;
+            [x, 255 - x, x.wrapping_mul(7)][channel]
+        };
+        let image = DynamicImage::ImageRgb8(RgbImage::from_fn(256, 28, |x, _| {
+            Rgb([
+                level_at(x as usize, 0),
+                level_at(x as usize, 1),
+                level_at(x as usize, 2),
+            ])
+        }));
+
+        let inputs = preprocess(params, &[&image], None).unwrap();
+
+        let (grid_h, grid_w, patch) = (2, 20, 14);
+        assert_eq!(
+            inputs.encoder_input.shape(),
+            &[grid_h * grid_w, 3, patch, patch]
+        );
+        let got = inputs.encoder_input_flat();
+        let mut index = 0;
+        for gh in 0..grid_h {
+            for gw in 0..grid_w {
+                for channel in 0..3 {
+                    for py in 0..patch {
+                        for px in 0..patch {
+                            let x = gw * patch + px;
+                            let level = if x < 256 { level_at(x, channel) } else { 0 };
+                            let expected = reference_level(level, 0.5, 0.5);
+                            assert_eq!(
+                                got[index].to_bits(),
+                                expected.to_bits(),
+                                "patch ({gh}, {gw}) channel {channel} at ({px}, {py}): level {level}"
+                            );
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(index, got.len());
+    }
+
+    /// Bytes from the generator the kernel pins share: a 32-bit linear
+    /// congruential step per byte, the top byte of the state taken.
+    fn generated_bytes(count: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The SHA-256 of the tensor's little-endian f32 bits, in hex.
+    fn digest_of(values: &[f32]) -> String {
+        use sha2::{Digest, Sha256};
+
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        hex(&Sha256::digest(&bytes))
+    }
+
+    /// A budget of three patches: a 60x40 image is resized to 36x24 (a ratio
+    /// of 5/3 on both axes) and zero padded to 56x28, eight patches.
+    fn params_with_a_budget_of_three_patches() -> MoonVitParams {
+        MoonVitParams {
+            patch_size: 14,
+            merge_size: 2,
+            in_patch_limit: 3,
+            patch_limit_on_one_side: 512,
+            mean: [0.5; 3],
+            std: [0.5; 3],
+        }
+    }
+
+    /// An image above the patch budget is resized with the reference's
+    /// kernel. Pillow 12.3.0's `Image.resize(BICUBIC)` of the same 60x40
+    /// bytes, zero padded and normalized in the reference's arithmetic, gives
+    /// these bits: the digest of the whole tensor and six of its values. The
+    /// SIMD Catmull-Rom resize this replaces lands one 8-bit level away on
+    /// part of the pixels.
+    #[test]
+    fn an_image_above_the_patch_budget_is_resized_as_the_reference_resizes_it() {
+        let image = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(60, 40, generated_bytes(60 * 40 * 3, 7)).unwrap(),
+        );
+
+        let inputs = preprocess(params_with_a_budget_of_three_patches(), &[&image], None).unwrap();
+
+        assert_eq!(inputs.encoder_input.shape(), &[8, 3, 14, 14]);
+        let got = inputs.encoder_input_flat();
+        for (index, bits) in [
+            (0, 0xbeda_dada),
+            (1, 0x3e0c_8c90),
+            (17, 0x3e1c_9ca0),
+            (500, 0x3e14_9498),
+            (1000, 0x3e9a_9a9c),
+            (4703, 0xbf80_0000),
+        ] {
+            assert_eq!(got[index].to_bits(), bits, "element {index}");
+        }
+        assert_eq!(
+            digest_of(&got[..]),
+            "2e7a80e6a16c2eeac525b208f17be6f3f508841d3dd322619ca2d6264b1b2283"
+        );
+    }
+
+    /// With the background painted after the resize, an alpha-carrying image
+    /// is resized premultiplied, as Pillow resizes `RGBA`, and composited at
+    /// the new size. The same 60x40 geometry with its first ten columns
+    /// transparent, its last ten opaque and the generator's alpha between,
+    /// over the 8-pixel chessboard, gives these bits (Pillow 12.3.0 and the
+    /// reference's float32 composite). Resampling the four channels without
+    /// the premultiplication differs on 1,795 of the 4,704 elements.
+    #[test]
+    fn an_alpha_image_resized_before_its_background_is_painted_matches_the_reference() {
+        use crate::vision::transforms::{TransparentBgConfig, TransparentBgPattern};
+
+        let mut rgba = generated_bytes(60 * 40 * 4, 11);
+        for (index, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            match index % 60 {
+                column if column < 10 => pixel[3] = 0,
+                column if column >= 50 => pixel[3] = 255,
+                _ => {}
+            }
+        }
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_raw(60, 40, rgba).unwrap());
+        let chessboard = TransparentBg {
+            config: TransparentBgConfig {
+                pattern: TransparentBgPattern::Chessboard,
+                chessboard_square_size: 8,
+                chessboard_square_on_top_left: true,
+                chessboard_white_value: 255,
+                chessboard_gray_value: 180,
+            },
+            stage: TransparentBgFillStage::AfterResize,
+        };
+
+        let inputs = preprocess(
+            params_with_a_budget_of_three_patches(),
+            &[&image],
+            Some(chessboard),
+        )
+        .unwrap();
+
+        assert_eq!(inputs.encoder_input.shape(), &[8, 3, 14, 14]);
+        let got = inputs.encoder_input_flat();
+        for (index, bits) in [
+            (0, 0x3f80_0000),
+            (1, 0x3f80_0000),
+            (17, 0x3f80_0000),
+            (500, 0x3e24_a4a8),
+            (1000, 0x3efe_ff00),
+            (4703, 0xbf80_0000),
+        ] {
+            assert_eq!(got[index].to_bits(), bits, "element {index}");
+        }
+        assert_eq!(
+            digest_of(&got[..]),
+            "47e02f6a5305085afa077da8ab756e1380052bea0a4433ce584c1f1f7e972a50"
+        );
+    }
 }

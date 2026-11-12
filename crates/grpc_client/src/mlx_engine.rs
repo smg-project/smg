@@ -1,17 +1,20 @@
-use std::collections::HashMap;
-
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
-use tracing::debug;
 
-use crate::BoxedTraceInjector;
+use crate::{
+    channel::Channel,
+    request_fields::{logit_bias_by_token_id, OutputConstraint},
+    BoxedTraceInjector,
+};
 
 // Include the generated protobuf code
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod proto {
     #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
     tonic::include_proto!("mlx.grpc.engine");
@@ -37,22 +40,7 @@ impl MlxEngineClient {
         "MLX"
     );
 
-    /// Abort a request
-    pub async fn abort_request(
-        &self,
-        request_id: String,
-        _reason: String,
-    ) -> Result<(), tonic::Status> {
-        debug!("Sending abort request for {}", request_id);
-        let request = Request::new(proto::AbortRequest {
-            request_ids: vec![request_id.clone()],
-        });
-
-        let mut client = self.client.clone();
-        let _response = client.abort(request).await?;
-        debug!("Abort response received for {}", request_id);
-        Ok(())
-    }
+    crate::impl_abort_without_reason!(proto);
 
     crate::impl_get_tokenizer!();
 
@@ -132,12 +120,14 @@ impl MlxEngineClient {
         body: &ChatCompletionRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
-        Self::reject_constraint(constraint.as_ref())?;
+        Self::reject_constraint(constraint.tool.as_ref())?;
         Self::reject_n(body.n)?;
         Self::reject_stop_strings(body.stop.as_ref().is_some_and(|s| !s.is_empty()))?;
-        Self::reject_response_format(body.response_format.is_some())?;
+        Self::reject_response_format(
+            body.response_format.is_some() && !constraint.set_aside.response_format,
+        )?;
 
         let sampling_params = Self::build_sampling_params_from_chat(body);
         Ok(Self::make_generate_request(
@@ -190,9 +180,9 @@ impl MlxEngineClient {
         body: &CreateMessageRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
-        Self::reject_constraint(constraint.as_ref())?;
+        Self::reject_constraint(constraint.tool.as_ref())?;
         Self::reject_stop_strings(body.stop_sequences.as_ref().is_some_and(|s| !s.is_empty()))?;
 
         let sampling_params = Self::build_sampling_params_from_messages(body);
@@ -306,7 +296,7 @@ impl MlxEngineClient {
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             ignore_eos: request.ignore_eos,
             logprobs,
-            logit_bias: convert_logit_bias(request.logit_bias.as_ref()),
+            logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             seed: request.seed.and_then(|s| i32::try_from(s).ok()),
         }
     }
@@ -326,7 +316,7 @@ impl MlxEngineClient {
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             ignore_eos: request.ignore_eos,
             logprobs,
-            logit_bias: convert_logit_bias(request.logit_bias.as_ref()),
+            logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             seed: request.seed.and_then(|s| i32::try_from(s).ok()),
         }
     }
@@ -411,17 +401,6 @@ impl MlxEngineClient {
             logprobs: request.top_logprobs.map(|v| v as i32),
             seed: None,
         }
-    }
-}
-
-/// Convert OpenAI-style logit_bias (String keys) to proto logit_bias (i32 keys).
-fn convert_logit_bias(bias: Option<&HashMap<String, f32>>) -> HashMap<i32, f32> {
-    match bias {
-        Some(map) => map
-            .iter()
-            .filter_map(|(k, v)| k.parse::<i32>().ok().map(|id| (id, *v)))
-            .collect(),
-        None => HashMap::new(),
     }
 }
 

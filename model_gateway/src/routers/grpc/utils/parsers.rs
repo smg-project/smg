@@ -6,6 +6,9 @@ use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
 };
+/// The structural-tag vocabulary label lives beside `ConstrainedDecoding` in the
+/// protocol crate; it is re-exported here, where the routers read it.
+pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
@@ -34,13 +37,13 @@ use crate::{
 /// symphony` a flag may name a Symphony table or the response template, which
 /// no legacy parser reads) → `None`, which lets the factory helpers fall back
 /// to their name-based auto-detection, unchanged. Symphony takes the two
-/// sources apart ([`Self::names`]), the flags as set, with its registry
+/// sources apart (`names_among`), the flags as set, with its registry
 /// between them (`regular::symphony::names::reads`).
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
 #[derive(Clone)]
-pub(crate) struct ParserResolver {
+pub struct ParserResolver {
     /// `None` disables card lookups (parser-free endpoints, tests).
     worker_registry: Option<Arc<WorkerRegistry>>,
     /// The gateway's `--tool-call-parser` and `--reasoning-parser`.
@@ -65,7 +68,7 @@ impl ParserResolver {
     /// model anyway. So such a name is dropped here, once, and the legacy
     /// parsers' own detection reads the model. Under `--parser legacy` the
     /// startup check refuses such a flag, so the flags pass whole.
-    pub(crate) fn new(
+    pub fn new(
         worker_registry: Arc<WorkerRegistry>,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
@@ -121,14 +124,14 @@ impl ParserResolver {
     }
 
     /// Effective tool-parser name for `model`, if any.
-    pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
-        self.card_parser(model, |card| card.tool_parser.as_ref())
+    pub fn tool_parser(&self, model: &str) -> Option<String> {
+        self.card_name(model, ParserKind::Tool)
             .or_else(|| self.legacy_flags.tool.clone())
     }
 
     /// Effective reasoning-parser name for `model`, if any.
-    pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
-        self.card_parser(model, |card| card.reasoning_parser.as_ref())
+    pub fn reasoning_parser(&self, model: &str) -> Option<String> {
+        self.card_name(model, ParserKind::Reasoning)
             .or_else(|| self.legacy_flags.reasoning.clone())
     }
 
@@ -143,12 +146,10 @@ impl ParserResolver {
             .or(self.legacy_flags.tool.as_deref())
     }
 
-    /// The parser names set for `model`, apart by who set them: its card's
-    /// (its workers' labels), and the gateway's flags as set. Symphony reads
-    /// them in that order with its registry between (`regular::symphony::names::reads`);
-    /// the legacy parsers take each kind's first, from the flags only a name
-    /// they read ([`Self::tool_parser`], [`Self::reasoning_parser`],
-    /// [`Self::legacy_tool`]).
+    /// [`Self::names_among`] over this resolver's own registry walk, for the
+    /// tests: a request's readers take the names its preparation resolved
+    /// ([`Self::names_for`]) or read them among the workers the stage holds.
+    #[cfg(test)]
     pub(crate) fn names(&self, model: &str) -> ModelNames<'_> {
         ModelNames {
             labels: self.card_names(model),
@@ -156,52 +157,183 @@ impl ParserResolver {
         }
     }
 
-    /// The names `model`'s own cards set (worker labels), without the process-wide fallback:
-    /// what the workers say of the model, each `None` when no card names one.
-    fn card_names(&self, model: &str) -> Names {
-        Names {
-            tool: self.card_parser(model, |card| card.tool_parser.as_ref()),
-            reasoning: self.card_parser(model, |card| card.reasoning_parser.as_ref()),
+    /// The parser names set for `model`, apart by who set them: its cards'
+    /// (its workers' labels), read among `workers`, the model's workers a
+    /// stage already holds, with no registry walk of this resolver's own; and
+    /// the gateway's flags as set. Symphony reads them in that order with its
+    /// registry between (`regular::symphony::names::reads`); the legacy
+    /// parsers take each kind's first, from the flags only a name they read
+    /// ([`Self::tool_parser`], [`Self::reasoning_parser`],
+    /// [`Self::legacy_tool`]).
+    pub(crate) fn names_among(&self, workers: &[Arc<dyn Worker>], model: &str) -> ModelNames<'_> {
+        ModelNames {
+            labels: if self.worker_registry.is_some() {
+                Self::card_names_among(workers, model)
+            } else {
+                Names::default()
+            },
+            flags: &self.flags,
         }
     }
 
-    fn card_parser(
+    /// [`Self::names_among`] for a request whose preparation resolved the card names once
+    /// (`ProcessingState::parser_names`): `resolved` as they were then, with the flags, and no
+    /// second walk over the model's workers; `None` resolves them now, over the registry's walk.
+    pub(crate) fn names_for(&self, resolved: Option<&Names>, model: &str) -> ModelNames<'_> {
+        ModelNames {
+            labels: resolved.map_or_else(|| self.card_names(model), Names::clone),
+            flags: &self.flags,
+        }
+    }
+
+    /// [`Self::tool_parser`] for a request whose card names were resolved once
+    /// ([`Self::names_for`]).
+    pub(crate) fn tool_parser_for(&self, resolved: Option<&Names>, model: &str) -> Option<String> {
+        match resolved {
+            Some(names) => names
+                .tool
+                .clone()
+                .or_else(|| self.legacy_flags.tool.clone()),
+            None => self.tool_parser(model),
+        }
+    }
+
+    /// [`Self::reasoning_parser`] for a request whose card names were resolved once
+    /// ([`Self::names_for`]).
+    pub(crate) fn reasoning_parser_for(
         &self,
+        resolved: Option<&Names>,
         model: &str,
-        pick: impl Fn(&ModelCard) -> Option<&String>,
     ) -> Option<String> {
-        let registry = self.worker_registry.as_ref()?;
-        // Cards built by the label pipeline agree across workers of one model;
-        // if they don't (mixed labels, e.g. mid rolling-upgrade), pick the
-        // lexicographically smallest so resolution is deterministic rather
-        // than registry-iteration-order dependent. Registration logs a
-        // warning for the conflict; here it's debug (per-request hot path).
-        let mut chosen: Option<String> = None;
-        let mut conflict = false;
-        for worker in registry.get_by_model(model).iter() {
-            let Some(name) = worker.metadata().spec.models.find(model).and_then(&pick) else {
+        match resolved {
+            Some(names) => names
+                .reasoning
+                .clone()
+                .or_else(|| self.legacy_flags.reasoning.clone()),
+            None => self.reasoning_parser(model),
+        }
+    }
+
+    /// The names `model`'s own cards set (worker labels), without the process-wide fallback:
+    /// what the workers say of the model, each `None` when no card names one.
+    fn card_names(&self, model: &str) -> Names {
+        self.worker_registry
+            .as_ref()
+            .map_or_else(Names::default, |registry| {
+                Self::card_names_among(&registry.get_by_model(model), model)
+            })
+    }
+
+    /// One kind's name among `model`'s cards, for a reader that asks for one
+    /// kind: the same walk and the same conflict rule as [`Self::card_names`],
+    /// cloning only the name asked for.
+    fn card_name(&self, model: &str, kind: ParserKind) -> Option<String> {
+        self.worker_registry
+            .as_ref()
+            .and_then(|registry| Self::card_name_among(&registry.get_by_model(model), model, kind))
+    }
+
+    /// Both names `model`'s cards set among `workers`, in one walk. Cards
+    /// built by the label pipeline agree across the workers of one model; where
+    /// they do not (mixed labels, e.g. mid rolling-upgrade) each kind takes
+    /// the lexicographically smallest name, so the choice does not depend on
+    /// the registry's iteration order. Registration logs the conflict as a
+    /// warning; here it is debug (the per-request hot path).
+    fn card_names_among(workers: &[Arc<dyn Worker>], model: &str) -> Names {
+        let mut tool = CardPick::default();
+        let mut reasoning = CardPick::default();
+        for worker in workers {
+            let Some(card) = worker.metadata().spec.models.find(model) else {
                 continue;
             };
-            match &chosen {
-                None => chosen = Some(name.clone()),
-                Some(existing) if existing != name => {
-                    conflict = true;
-                    if name < existing {
-                        chosen = Some(name.clone());
-                    }
-                }
-                Some(_) => {}
-            }
+            tool.offer(ParserKind::Tool.of(card));
+            reasoning.offer(ParserKind::Reasoning.of(card));
         }
-        if conflict {
+        Names {
+            tool: tool.chosen(model, ParserKind::Tool.label()),
+            reasoning: reasoning.chosen(model, ParserKind::Reasoning.label()),
+        }
+    }
+
+    /// [`Self::card_names_among`] for one kind: the one pick over the same
+    /// walk, so a single reader clones nothing it did not ask for.
+    fn card_name_among(
+        workers: &[Arc<dyn Worker>],
+        model: &str,
+        kind: ParserKind,
+    ) -> Option<String> {
+        let mut pick = CardPick::default();
+        for worker in workers {
+            let Some(card) = worker.metadata().spec.models.find(model) else {
+                continue;
+            };
+            pick.offer(kind.of(card));
+        }
+        pick.chosen(model, kind.label())
+    }
+}
+
+/// Which of a card's two parser names a reader asks for.
+#[derive(Clone, Copy)]
+enum ParserKind {
+    Tool,
+    Reasoning,
+}
+
+impl ParserKind {
+    /// The card's name of this kind, borrowed.
+    fn of(self, card: &ModelCard) -> Option<&String> {
+        match self {
+            Self::Tool => card.tool_parser.as_ref(),
+            Self::Reasoning => card.reasoning_parser.as_ref(),
+        }
+    }
+
+    /// The kind's word in the conflict log.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Reasoning => "reasoning",
+        }
+    }
+}
+
+/// One parser kind's choice over a model's cards: the name the cards agree
+/// on, or the lexicographically smallest where they conflict.
+#[derive(Default)]
+struct CardPick<'a> {
+    chosen: Option<&'a String>,
+    conflict: bool,
+}
+
+impl<'a> CardPick<'a> {
+    fn offer(&mut self, name: Option<&'a String>) {
+        let Some(name) = name else {
+            return;
+        };
+        match self.chosen {
+            None => self.chosen = Some(name),
+            Some(existing) if existing != name => {
+                self.conflict = true;
+                if name < existing {
+                    self.chosen = Some(name);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn chosen(self, model: &str, kind: &'static str) -> Option<String> {
+        if self.conflict {
             tracing::debug!(
                 model,
-                chosen = chosen.as_deref(),
+                kind,
+                chosen = self.chosen.map(String::as_str),
                 "Workers for this model declare conflicting parser overrides; \
                  using the lexicographically smallest"
             );
         }
-        chosen
+        self.chosen.cloned()
     }
 }
 
@@ -221,7 +353,7 @@ static NO_NAMES: Names = Names {
     reasoning: None,
 };
 
-/// The parser names set for one model, apart by who set them ([`ParserResolver::names`]): the
+/// The parser names set for one model, apart by who set them ([`ParserResolver::names_among`]): the
 /// names of its card, which its workers' labels (or the operator's card) set for the one model,
 /// and the gateway's flags, which every model shares. Symphony reads the two in that order with
 /// its registry between them (`regular::symphony::names::reads`): the card's names when they select
@@ -301,9 +433,10 @@ pub(crate) fn extract_thinking_from_kwargs(
         Some(ThinkingKeyName::EnableThinking) => {
             kwargs?.get("enable_thinking").and_then(Value::as_bool)
         }
-        // Renderers that honour vLLM's `enable_thinking` alias (DeepSeek-V4.1)
-        // read it too; `thinking` wins when both are present (the renderer
-        // rejects a disagreeing pair before anything is dispatched).
+        // Renderers that honour vLLM's `enable_thinking` alias (DeepSeek-V3.2,
+        // V4 and V4.1) read it too; `thinking` wins when both are present, the
+        // order their shims render in (V3.2 and V4 resolve a disagreeing pair
+        // silently that way; V4.1 rejects it before anything is dispatched).
         Some(ThinkingKeyName::Thinking) => {
             let kwargs = kwargs?;
             kwargs.get("thinking").and_then(Value::as_bool).or_else(|| {
@@ -478,6 +611,25 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
+    chat_reasoning_starts_in_rendered_prefill_for(
+        request,
+        ProviderProfile::for_model(&request.model),
+        generation_prompt,
+        continued_final_message,
+        tokenizer,
+    )
+}
+
+/// [`chat_reasoning_starts_in_rendered_prefill`] with the model's provider
+/// profile already derived: the preparation stage derives it once per request
+/// and the later reads take that copy.
+pub fn chat_reasoning_starts_in_rendered_prefill_for(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    generation_prompt: bool,
+    continued_final_message: bool,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
     if !generation_prompt && !continued_final_message {
         return false;
     }
@@ -487,19 +639,39 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
         request.thinking_toggle(),
         continued_final_message,
         tokenizer,
-        ProviderProfile::for_model(&request.model),
+        provider,
     )
 }
 
-/// [`reasoning_starts_in_prefill`] for a Messages API request: the
-/// `thinking` block is the user's preference (`enabled`/`adaptive` on,
-/// `disabled` off, absent → the template's default), and
-/// `continued_final_message` is the rendered prompt's (a trailing assistant
-/// message with text and no tool call is continued where the template can).
-/// `output_config.effort` is the `reasoning_effort` the template renders, as
-/// a Chat request's effective effort is.
+/// [`messages_reasoning_starts_in_prefill_for`] with the model's provider
+/// profile derived here, as the tests ask it.
+#[cfg(test)]
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
+    continued_final_message: bool,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
+    messages_reasoning_starts_in_prefill_for(
+        request,
+        ProviderProfile::for_model(&request.model),
+        continued_final_message,
+        tokenizer,
+    )
+}
+
+/// [`reasoning_starts_in_prefill`] for a Messages API request, with the
+/// model's provider profile already derived (the preparation stage derives it
+/// once per request): the `thinking` block is the user's preference
+/// (`enabled`/`adaptive` on, `disabled` off, absent → the template's default),
+/// and `continued_final_message` is the rendered prompt's (a trailing
+/// assistant message with text and no tool call is continued where the
+/// template can). `output_config.effort` is the `reasoning_effort` the
+/// template renders, as a Chat request's effective effort is. The tests ask
+/// through `messages_reasoning_starts_in_prefill`, which derives the profile
+/// first.
+pub fn messages_reasoning_starts_in_prefill_for(
+    request: &openai_protocol::messages::CreateMessageRequest,
+    provider: ProviderProfile,
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
@@ -509,7 +681,7 @@ pub fn messages_reasoning_starts_in_prefill(
         request.thinking_toggle(),
         continued_final_message,
         tokenizer,
-        ProviderProfile::for_model(&request.model),
+        provider,
     )
 }
 
@@ -533,6 +705,10 @@ pub struct WorkerDecoding {
     /// label (the servicers advertise it off the engine's config); unknown
     /// without a selection or a label.
     pub start: GrammarStart,
+    /// The vocabulary of structural-tag nodes the engine's grammar compiler
+    /// takes, from the worker's `structural_tag_vocabulary` label; the
+    /// current one without a selection or a label.
+    pub vocabulary: TagVocabulary,
 }
 
 impl WorkerDecoding {
@@ -543,17 +719,19 @@ impl WorkerDecoding {
             None => Self {
                 policy: ConstrainedDecoding::Requested,
                 start: GrammarStart::Unknown,
+                vocabulary: TagVocabulary::Current,
             },
         }
     }
 
+    /// The worker's labels as its metadata parsed them at construction
+    /// (`WorkerMetadata::decoding`): no lookup on a request path.
     fn of_worker(worker: &dyn Worker) -> Self {
-        let spec = &worker.metadata().spec;
+        let labels = worker.metadata().decoding;
         Self {
-            policy: ConstrainedDecoding::of(spec),
-            start: GrammarStart::from_label(
-                spec.labels.get(GrammarStart::LABEL).map(String::as_str),
-            ),
+            policy: labels.policy,
+            start: labels.start,
+            vocabulary: labels.vocabulary,
         }
     }
 
@@ -564,18 +742,22 @@ impl WorkerDecoding {
     }
 
     /// Whether `worker` decides a request's constraint as this one does: the
-    /// same policy, and the whole turn's grammar on both or on neither. A plan
-    /// whose constraint the policy chose holds a retry to such workers, since
-    /// the decision reads the request, which is gone once the plan is built;
-    /// the attempt stamp shapes a tag for the start of the worker the retry
-    /// takes (`helpers::ToolConstraintStamp`). A prefill worker generates no
-    /// token a grammar constrains.
+    /// same policy, the whole turn's grammar on both or on neither, and, where
+    /// the whole turn's applies, the same vocabulary of structural-tag nodes.
+    /// A plan whose constraint the policy chose holds a retry to such workers,
+    /// since the decision reads the request, which is gone once the plan is
+    /// built; the attempt stamp shapes a tag for the start of the worker the
+    /// retry takes (`helpers::ToolConstraintStamp`), and the whole turn's tag,
+    /// spelled once for the first worker's compiler, for its start only. A
+    /// prefill worker generates no token a grammar constrains.
     pub fn decides_alike(self, worker: &dyn Worker) -> bool {
         if *worker.worker_type() == WorkerType::Prefill {
             return true;
         }
         let other = Self::of_worker(worker);
-        other.policy == self.policy && other.takes_the_whole_turn() == self.takes_the_whole_turn()
+        other.policy == self.policy
+            && other.takes_the_whole_turn() == self.takes_the_whole_turn()
+            && (!self.takes_the_whole_turn() || other.vocabulary == self.vocabulary)
     }
 }
 
@@ -810,42 +992,19 @@ mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::MediaPartOrder;
-    use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
-    use tool_parser::ToolConstraint;
 
     use super::*;
     use crate::{
-        routers::grpc::utils::{chat_utils, message_utils},
+        routers::grpc::{
+            testing::{forced_call_on_a_thinking_prompt, worker},
+            utils::{chat_utils, message_utils},
+        },
         worker::{BasicWorkerBuilder, WorkerType},
     };
 
-    fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
-        let mut builder =
-            BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        WorkerSelection::Single {
-            worker: Arc::new(builder.build()),
-        }
-    }
-
-    fn forced_call_on_a_thinking_prompt(factory: &ToolParserFactory) -> (String, String) {
-        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
-            "type": "function",
-            "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
-        }]))
-        .unwrap();
-        let required = ToolChoice::Value(ToolChoiceValue::Required);
-        match factory
-            .registry()
-            .generate_tool_constraint(Some("glm47_moe"), &tools, &required, true)
-            .unwrap()
-        {
-            Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
-            other => panic!("expected a structural tag, got {other:?}"),
-        }
-    }
+    /// A parser that registers a reasoning prefix, so a forced call on a
+    /// thinking prompt takes the shape the worker's engine needs.
+    const PARSER: &str = "glm47_moe";
 
     /// The worker's constrained-decoding policy comes off its spec first, then
     /// its `constrained_decoding` label; the decode worker's under PD; a
@@ -904,22 +1063,31 @@ mod tests {
     }
 
     /// A retry takes only workers that decide a request's constraint as the
-    /// first attempt's did: under `requested` whatever the start, under
-    /// `always` the whole turn's grammar on both or on neither; and any
-    /// prefill worker, which generates no token a grammar constrains.
+    /// first attempt's did: under `requested` whatever the start or the
+    /// vocabulary, under `always` the whole turn's grammar on both or on
+    /// neither, and where it is on both, in the same vocabulary (its tag is
+    /// spelled once, for the first worker's compiler); and any prefill
+    /// worker, which generates no token a grammar constrains.
     #[test]
     fn a_retry_takes_only_workers_that_decide_the_constraint_alike() {
         let always = ("constrained_decoding", "always");
-        let labels: [&[(&str, &str)]; 5] = [
+        let first_token = ("constrained_decoding_start", "first_token");
+        let older = ("structural_tag_vocabulary", "older");
+        let labels: [&[(&str, &str)]; 8] = [
             &[],
-            &[("constrained_decoding_start", "first_token")],
-            &[always, ("constrained_decoding_start", "first_token")],
+            &[first_token],
+            &[always, first_token],
             &[always, ("constrained_decoding_start", "after_reasoning")],
             &[always],
+            &[always, first_token, older],
+            &[older],
+            &[always, older],
         ];
-        // The workers alike: both `requested` ones; the whole turn's alone;
-        // the two `always` ones that start the grammar later or do not say.
-        let alike = [0, 0, 1, 2, 2];
+        // The workers alike: the `requested` ones, whatever their vocabulary;
+        // the whole turn's in the current vocabulary; the `always` ones that
+        // start the grammar later or do not say, whatever their vocabulary;
+        // the whole turn's in the older vocabulary, alone.
+        let alike = [0, 0, 1, 2, 2, 3, 0, 2];
         let engine = |labels: &[(&str, &str)]| match worker(labels) {
             WorkerSelection::Single { worker } => worker,
             WorkerSelection::Disaggregated { .. } => panic!("expected one worker"),
@@ -938,6 +1106,49 @@ mod tests {
             }
             assert!(decided_on.decides_alike(&prefill));
         }
+    }
+
+    /// The worker's `structural_tag_vocabulary` label names the vocabulary of
+    /// structural-tag nodes its grammar compiler takes: the older one on
+    /// `older`, the current one otherwise, the label's absence and any other
+    /// word included; under PD the decode worker's label.
+    #[test]
+    fn the_structural_tag_vocabulary_follows_the_label_of_the_decode_worker() {
+        assert_eq!(WorkerDecoding::of(None).vocabulary, TagVocabulary::Current);
+        assert_eq!(
+            WorkerDecoding::of(Some(&worker(&[]))).vocabulary,
+            TagVocabulary::Current
+        );
+        assert_eq!(
+            WorkerDecoding::of(Some(&worker(&[("structural_tag_vocabulary", "older")]))).vocabulary,
+            TagVocabulary::Older
+        );
+        assert_eq!(
+            WorkerDecoding::of(Some(&worker(&[("structural_tag_vocabulary", "current")])))
+                .vocabulary,
+            TagVocabulary::Current
+        );
+        let prefill = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:50051")
+                .worker_type(WorkerType::Prefill)
+                .label("structural_tag_vocabulary", "older")
+                .build(),
+        );
+        let decode = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:50051")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        assert_eq!(
+            WorkerDecoding::of(Some(&WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill,
+                decode,
+                runtime_type: openai_protocol::worker::RuntimeType::TokenSpeed,
+            }))
+            .vocabulary,
+            TagVocabulary::Current
+        );
     }
 
     /// The worker's `constrained_decoding_start` label names where its engine
@@ -973,8 +1184,8 @@ mod tests {
     #[test]
     fn tool_constraints_take_the_shape_the_workers_engine_needs() {
         let factory = ToolParserFactory::new();
-        let parser = Some("glm47_moe");
-        let built = forced_call_on_a_thinking_prompt(&factory);
+        let parser = Some(PARSER);
+        let built = forced_call_on_a_thinking_prompt(&factory, PARSER);
         let built_tag: Value = serde_json::from_str(&built.1).unwrap();
         assert_eq!(built_tag["format"]["type"], "sequence");
 
@@ -1219,7 +1430,6 @@ mod tests {
                 enable_thinking_alias: true,
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,
-                declares_tools_under_tool_choice_none: false,
                 leading_system_only: false,
             })
     }
@@ -1445,6 +1655,7 @@ mod tests {
                 None,
                 None,
                 MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
             )
             .expect("rendered");
             messages_reasoning_starts_in_prefill(
@@ -1523,6 +1734,7 @@ mod tests {
             None,
             None,
             MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
         )
         .expect("rendered");
         assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
@@ -1556,6 +1768,7 @@ mod tests {
             &tokenizer,
             None,
             MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
         )
         .expect("rendered");
         assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
@@ -2076,6 +2289,8 @@ mod tests {
 
 #[cfg(test)]
 mod parser_resolver_tests {
+    use openai_protocol::model_card::ModelCard;
+
     use super::*;
     use crate::worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType};
 
@@ -2087,6 +2302,49 @@ mod parser_resolver_tests {
             .build();
         registry.register(Arc::new(worker));
         registry
+    }
+
+    /// A request's card names, resolved once in preparation, are what the later reads take: the
+    /// names as resolved then with the legacy flags behind them, and no second walk over the
+    /// model's workers (a card registered after the resolution does not move them); a read with
+    /// nothing resolved walks the cards as before.
+    #[test]
+    fn names_resolved_once_are_read_in_place_of_the_cards() {
+        let registry = registry_with_card(ModelCard::new("m").with_tool_parser("json"));
+        let resolver =
+            ParserResolver::with_flags(Arc::clone(&registry), None, Some("qwen3".to_string()));
+        let resolved = resolver.names("m").labels;
+        assert_eq!(resolved.tool.as_deref(), Some("json"));
+        let later = BasicWorkerBuilder::new("http://w2:8000")
+            .model(ModelCard::new("m").with_tool_parser("alpha"))
+            .worker_type(WorkerType::Regular)
+            .build();
+        registry.register(Arc::new(later));
+        let read = resolver.names_for(Some(&resolved), "m");
+        assert_eq!(read.labels, resolved);
+        assert_eq!(read.flags, &resolver.flags);
+        assert_eq!(
+            resolver.tool_parser_for(Some(&resolved), "m").as_deref(),
+            Some("json")
+        );
+        assert_eq!(
+            resolver
+                .reasoning_parser_for(Some(&resolved), "m")
+                .as_deref(),
+            Some("qwen3")
+        );
+        assert_eq!(
+            resolver.names_for(None, "m").labels.tool.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            resolver.tool_parser_for(None, "m").as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            resolver.reasoning_parser_for(None, "m").as_deref(),
+            Some("qwen3")
+        );
     }
 
     #[test]
@@ -2135,6 +2393,64 @@ mod parser_resolver_tests {
         let resolver = ParserResolver::disabled();
         assert_eq!(resolver.tool_parser("m"), None);
         assert_eq!(resolver.reasoning_parser("m"), None);
+    }
+
+    /// The reading stage holds the model's workers already: the names read among them are the
+    /// names a registry walk resolves, each kind chosen on its own in the one pass (the smallest
+    /// where the cards disagree, a card for another model skipped), and a disabled resolver
+    /// reads none among them either.
+    #[test]
+    fn the_names_among_a_models_workers_are_the_registry_walks() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let cards = [
+            ModelCard::new("m")
+                .with_tool_parser("zebra")
+                .with_reasoning_parser("qwen3"),
+            ModelCard::new("m").with_tool_parser("alpha"),
+            ModelCard::new("other")
+                .with_tool_parser("aardvark")
+                .with_reasoning_parser("basic"),
+        ];
+        for (i, card) in cards.into_iter().enumerate() {
+            let worker = BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                .model(card)
+                .worker_type(WorkerType::Regular)
+                .build();
+            registry.register(Arc::new(worker));
+        }
+        let resolver =
+            ParserResolver::with_flags(Arc::clone(&registry), None, Some("flag".to_string()));
+        let workers = registry.get_by_model("m");
+        let among = resolver.names_among(&workers, "m");
+        assert_eq!(among, resolver.names("m"));
+        assert_eq!(
+            among.labels,
+            Names {
+                tool: Some("alpha".to_string()),
+                reasoning: Some("qwen3".to_string()),
+            }
+        );
+        assert_eq!(among.flags, &resolver.flags);
+        assert_eq!(
+            resolver.names_among(&workers, "other").labels,
+            Names::default()
+        );
+        assert_eq!(
+            ParserResolver::disabled().names_among(&workers, "m").labels,
+            Names::default()
+        );
+        // The slice is the stage's snapshot: a worker registered after it was
+        // taken moves a registry walk's names, not the names read among it.
+        let later = BasicWorkerBuilder::new("http://w3:8000")
+            .model(ModelCard::new("m").with_tool_parser("aardvark"))
+            .worker_type(WorkerType::Regular)
+            .build();
+        registry.register(Arc::new(later));
+        assert_eq!(
+            resolver.names_among(&workers, "m").labels.tool.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(resolver.names("m").labels.tool.as_deref(), Some("aardvark"));
     }
 
     #[test]

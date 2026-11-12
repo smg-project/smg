@@ -124,8 +124,8 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// none when several do, so an entry does not outlive its cause on the cases
 /// another entry names), and when the tree holds its
 /// set and no loaded case is under it; the entries of a benchmark set the
-/// tree omits (`bellwether unpack --sample-sets` writes every Nth) are left
-/// alone, an id of one of its cases among them.
+/// tree omits (`bellwether unpack --sample-sets` writes one set in N, picked
+/// by its id) are left alone, an id of one of its cases among them.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
         "deepseek-v3.1/render/bfcl-*",
@@ -164,32 +164,38 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
-        "deepseek-v3.2-exp/render/no-generation-prompt",
-        "the native renderer writes the generation header whatever `add_generation_prompt` \
-         says, as the engine's own encoder for this family does (it reads neither that flag \
-         nor `continue_final_message`); the recorded template run leaves the conversation \
-         closed",
+        "deepseek-v3.2-exp/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message` (its per-message `wo_eos` route is never set from a chat \
+         request): the vendor-code reference renders the final assistant message closed, with \
+         the end token; the gateway continues it, the message's text after the generation \
+         header, as the serving engine's prefix append does (smg-project/smg#2434, the rule \
+         of smg-project/smg#4280)",
     ),
     (
-        "deepseek-v3.2-exp/render/text-system-after-user",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
+        "deepseek-v3.2/render/continue-final-message",
+        "the checkpoint's own prompt encoder, which the gateway ports (smg-project/smg#1373), \
+         reads no `continue_final_message`: the vendor-code reference renders the final \
+         assistant message closed (the thought's closer, the response, the end of the \
+         message), while the gateway appends the prefill after the generation prompt as the \
+         serving engine's prefill path does; the same class as kimi-k3's entry",
     ),
     (
-        "deepseek-v3.2-exp/render/tools-declared-user-asks",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
+        "deepseek-v4-flash/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message` (its per-message `wo_eos` route is never set from a chat \
+         request): the vendor-code reference renders the final assistant message closed (an \
+         empty thought, the text, the end token); the gateway continues it, the message's \
+         text after the generation header, as the serving engine's prefix append does \
+         (smg-project/smg#2434, the rule of smg-project/smg#4280)",
     ),
     (
-        "deepseek-v3.2-exp/render/tools-schema-with-defs",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
+        "deepseek-v4.1-flash/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message`: the vendor-code reference renders the final assistant \
+         message closed, with the end token; the gateway's port continues it through the \
+         encoder's own `wo_eos` route (no end token, no header; smg-project/smg#2524), the \
+         shape the template-oracle record of this case rendered",
     ),
     (
         "deepseek-v4.1-flash/render/hermes-func-calling-*",
@@ -206,13 +212,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          checkpoint's Jinja template cannot read JSON text and writes the string whole as a \
          single `arguments` parameter, so the reference is the template's own rendering of \
          a call history, not the encoder's (the cases without a call history match)",
-    ),
-    (
-        "deepseek-v4.1-flash/render/no-generation-prompt",
-        "the native renderer writes the generation header whatever `add_generation_prompt` \
-         says, as the engine's own encoder for this family does (it reads neither that flag \
-         nor `continue_final_message`); the recorded template run leaves the conversation \
-         closed",
     ),
     (
         "hermes-4-14b/render/hermes-func-calling-*",
@@ -235,27 +234,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          prefix append does (smg-project/smg#2434)",
     ),
     (
-        "kimi-k3/render/thinking-kwarg-off",
-        "the checkpoint's own encoder reads `thinking`, not the engine's `enable_thinking` \
-         alias, so the vendor-code reference of `enable_thinking: false` keeps thinking on with \
-         the default effort directive; the gateway resolves the alias before rendering as the \
-         engine's own server does (smg-project/smg#3004): no directive, the response channel \
-         opened",
-    ),
-    (
-        "kimi-k3/render/thinking-reasoning-effort-kwarg",
-        "the checkpoint's own encoder reads `thinking_effort`, not the request's \
-         `reasoning_effort`, so the vendor-code reference of `reasoning_effort: low` writes the \
-         default `max`; the gateway maps the request's level to the directive \
-         (smg-project/smg#1968)",
-    ),
-    (
-        "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
-    ),
-    (
         "llama-xlam-2-8b-fc-r/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -266,18 +244,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "mimo-vl-7b-rl-2508/render/glaive-v2-61.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
-    ),
-    (
-        "nft-7b/render/swehero-5.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
     ),
     (
         "nvidia-nemotronlabs-ai-for-media-sports-tennis/render/*",
@@ -308,12 +274,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "shieldvlm-7b-qwen/render/glaive-v2-12.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
@@ -401,6 +361,12 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
     ),
     (
         "llama-3.2-1b-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-3.3-70b-instruct",
         "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
          files behind the gate are not fetched (bellwether recorded the group with its \
          own secret)",
@@ -925,7 +891,7 @@ impl Report {
     /// hand-written case's shape. A benchmark case is `<set>-<n>` and a
     /// hand-written case a name, so an id that no read set prefixes is a
     /// hand-written case unless it ends in `-<n>`: a benchmark set the tree
-    /// omits, the unpack's sample being every Nth, leaves its entries alone,
+    /// omits, the sample being one set in N picked by its id, leaves its entries alone,
     /// an id of one of its cases among them, while an id of a hand-written
     /// case the tree no longer has (renamed, dropped, or a typo in the entry)
     /// is held to the hand-written set and read as gone.
@@ -1319,8 +1285,8 @@ impl Drop for StopOnPanic<'_> {
 /// migration, the `tool_choice` default; a request the gateway would answer
 /// with 400 is a difference, not a rendering), then the tools narrowed by
 /// `tool_choice` as the chat preparation stage does before rendering (every
-/// tool for a named choice, the subset for `allowed_tools`, none for `none`
-/// unless the renderer declares them itself), through the stage's own rule.
+/// tool for a named choice, the subset for `allowed_tools`, every tool under
+/// `none`), through the stage's own rule.
 /// `process_chat_messages` then renders it exactly as the gateway does before
 /// tokenizing, and the ids are the flat encode of that text, which is the
 /// gateway's tokenize step for a renderer that returns text to encode.
@@ -1337,8 +1303,8 @@ fn render(tok: &dyn Tokenizer, model: &str, request: &Value) -> Result<Rendered,
     // The preparation stage's own rule: a named `tool_choice` renders every
     // tool (the engine's own server renders them all and forces the call with
     // its grammar); an `allowed_tools` choice renders its subset; `none`
-    // renders no tool unless the renderer declares the tools itself.
-    let request = request_as_rendered(&request, tok.renderer_capabilities());
+    // renders every tool, as the engine's own server does.
+    let request = request_as_rendered(&request);
     let processed = process_chat_messages(&request, tok, None)?;
     let ids = tok
         .encode(&processed.text, false)
@@ -1594,7 +1560,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     }
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     download(
         &client,
         HUB,
@@ -2144,8 +2110,8 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
     );
     // A prefix under which every loaded case matches must go, and so must one
     // under a set the tree holds that no loaded case begins with; one under a
-    // set the tree omits is left alone, since the tree holds every Nth
-    // benchmark set.
+    // set the tree omits is left alone, since the tree holds one benchmark
+    // set in N, picked by its id.
     let stale = BTreeMap::from([
         (
             "m/render/bfcl-multi-turn-*",
@@ -2201,7 +2167,7 @@ fn an_id_entry_of_an_omitted_benchmark_case_is_left_alone_and_of_a_lost_hand_wri
     // A hand-written case that matches now, a case of a set the tree holds
     // that is not among its cases, and a hand-written name the tree's set
     // lacks (renamed, dropped, or a typo) are stale; a case of a set the tree
-    // omits is left alone, since the tree holds every Nth benchmark set.
+    // omits is left alone, since the tree holds one benchmark set in N, picked by its id.
     let stale = BTreeMap::from([
         ("m/render/bfcl-multi-turn-base-9", "no such case"),
         ("m/render/text-developer-role", "matches now"),
@@ -2629,7 +2595,7 @@ fn loopback(replies: &'static [Reply]) -> io::Result<(String, Arc<AtomicUsize>)>
 fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
     const LIMITED: Reply = Reply::Head("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0");
     const LIMITED_EVERY_TIME: &[Reply] = &[LIMITED; RATE_LIMITED_TRIES as usize];
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
     let answer = fetch(
         &client,
@@ -2704,7 +2670,7 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
     let failed = std::thread::spawn({
         let path = path.clone();
-        move || cached_download(&smg::clients::blocking_http_client(), &url, &path, 2)
+        move || cached_download(&smg::server::blocking_http_client(), &url, &path, 2)
     })
     .join();
     assert!(
@@ -2714,10 +2680,10 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
     assert!(!path.exists(), "a failed download leaves no file");
     let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
-    cached_download(&smg::clients::blocking_http_client(), &url, &path, 2);
+    cached_download(&smg::server::blocking_http_client(), &url, &path, 2);
     assert_eq!(fs::read(&path).unwrap(), b"ok");
     assert_eq!(served.load(Ordering::SeqCst), 2);
-    cached_download(&smg::clients::blocking_http_client(), &url, &path, 2);
+    cached_download(&smg::server::blocking_http_client(), &url, &path, 2);
     assert_eq!(
         served.load(Ordering::SeqCst),
         2,
@@ -2725,13 +2691,13 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     );
 }
 
-/// The gateway's test harness and the tokenizer crate's tests carry the same
-/// `hub_fetch.rs`, so a fix to the retry or the download lock in one reaches
+/// The gateway and the tokenizer crate's tests carry the same `hub_fetch.rs`,
+/// so a fix to the retry or the download lock in one reaches
 /// the other: the two files are checked byte for byte.
 #[test]
 fn the_hub_fetch_module_is_the_tokenizer_crate_s_copy() {
     assert_eq!(
-        include_str!("../test_harness/src/hub_fetch.rs"),
+        include_str!("../src/routers/grpc/tokenizer_cache/hub_fetch.rs"),
         include_str!("../../crates/tokenizer/tests/common/hub_fetch.rs"),
         "the two hub_fetch.rs copies have drifted"
     );
@@ -2741,7 +2707,7 @@ fn the_hub_fetch_module_is_the_tokenizer_crate_s_copy() {
 /// name, and the next run reads it without a request.
 #[test]
 fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let (url, served) = loopback(&[Reply::Head("HTTP/1.1 404 Not Found")]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..2 {
@@ -2760,7 +2726,7 @@ fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
     reason = "the requests counted and the times measured are test diagnostic output"
 )]
 fn a_download_whose_body_breaks_is_sent_again_and_lands_on_the_second_try() {
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let dir = tempfile::tempdir().unwrap();
     let (url, served) = loopback(&[Reply::CutBody, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
     let started = Instant::now();
@@ -2820,7 +2786,7 @@ fn a_broken_body_reads_as_answered_and_no_answer_does_not() {
         Reply::NoAnswer,
     ];
     assert_eq!(CUT_EVERY_TIME.len(), TRANSPORT_ERROR_RETRIES as usize + 1);
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let fetch_error = |replies: &'static [Reply]| {
         let (url, served) = loopback(replies).unwrap();
         let error = fetch(&client, &format!("{url}/org/m/resolve/r/tokenizer.json")).unwrap_err();
@@ -2860,7 +2826,7 @@ fn a_download_that_breaks_at_every_try_fails_after_the_bounded_retries() {
         BROKEN_EVERY_TIME.len(),
         TRANSPORT_ERROR_RETRIES as usize + 1
     );
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let dir = tempfile::tempdir().unwrap();
     let (url, served) = loopback(BROKEN_EVERY_TIME).unwrap();
     let started = Instant::now();
