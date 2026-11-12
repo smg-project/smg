@@ -11,6 +11,7 @@ use llm_tokenizer::{
 pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
+    model_card::ModelCard,
     profile::ProviderProfile,
     worker::ConstrainedDecoding,
 };
@@ -36,13 +37,13 @@ use crate::{
 /// symphony` a flag may name a Symphony table or the response template, which
 /// no legacy parser reads) → `None`, which lets the factory helpers fall back
 /// to their name-based auto-detection, unchanged. Symphony takes the two
-/// sources apart ([`Self::names`]), the flags as set, with its registry
+/// sources apart (`names_among`), the flags as set, with its registry
 /// between them (`regular::symphony::names::reads`).
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
 #[derive(Clone)]
-pub(crate) struct ParserResolver {
+pub struct ParserResolver {
     /// `None` disables card lookups (parser-free endpoints, tests).
     worker_registry: Option<Arc<WorkerRegistry>>,
     /// The gateway's `--tool-call-parser` and `--reasoning-parser`.
@@ -67,7 +68,7 @@ impl ParserResolver {
     /// model anyway. So such a name is dropped here, once, and the legacy
     /// parsers' own detection reads the model. Under `--parser legacy` the
     /// startup check refuses such a flag, so the flags pass whole.
-    pub(crate) fn new(
+    pub fn new(
         worker_registry: Arc<WorkerRegistry>,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
@@ -123,16 +124,14 @@ impl ParserResolver {
     }
 
     /// Effective tool-parser name for `model`, if any.
-    pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
-        self.card_names(model)
-            .tool
+    pub fn tool_parser(&self, model: &str) -> Option<String> {
+        self.card_name(model, ParserKind::Tool)
             .or_else(|| self.legacy_flags.tool.clone())
     }
 
     /// Effective reasoning-parser name for `model`, if any.
-    pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
-        self.card_names(model)
-            .reasoning
+    pub fn reasoning_parser(&self, model: &str) -> Option<String> {
+        self.card_name(model, ParserKind::Reasoning)
             .or_else(|| self.legacy_flags.reasoning.clone())
     }
 
@@ -147,15 +146,9 @@ impl ParserResolver {
             .or(self.legacy_flags.tool.as_deref())
     }
 
-    /// The parser names set for `model`, apart by who set them: its card's
-    /// (its workers' labels), and the gateway's flags as set. Symphony reads
-    /// them in that order with its registry between (`regular::symphony::names::reads`);
-    /// the legacy parsers take each kind's first, from the flags only a name
-    /// they read ([`Self::tool_parser`], [`Self::reasoning_parser`],
-    /// [`Self::legacy_tool`]). The registry walk itself, for the tests: a
-    /// request's readers take the names its preparation resolved
-    /// ([`Self::names_for`]) or read them among the workers the stage holds
-    /// ([`Self::names_among`]).
+    /// [`Self::names_among`] over this resolver's own registry walk, for the
+    /// tests: a request's readers take the names its preparation resolved
+    /// ([`Self::names_for`]) or read them among the workers the stage holds.
     #[cfg(test)]
     pub(crate) fn names(&self, model: &str) -> ModelNames<'_> {
         ModelNames {
@@ -164,9 +157,14 @@ impl ParserResolver {
         }
     }
 
-    /// [`Self::names`] read among `workers`, the model's workers a stage
-    /// already holds: the cards come from that slice, with no registry walk
-    /// of this resolver's own.
+    /// The parser names set for `model`, apart by who set them: its cards'
+    /// (its workers' labels), read among `workers`, the model's workers a
+    /// stage already holds, with no registry walk of this resolver's own; and
+    /// the gateway's flags as set. Symphony reads them in that order with its
+    /// registry between (`regular::symphony::names::reads`); the legacy
+    /// parsers take each kind's first, from the flags only a name they read
+    /// ([`Self::tool_parser`], [`Self::reasoning_parser`],
+    /// [`Self::legacy_tool`]).
     pub(crate) fn names_among(&self, workers: &[Arc<dyn Worker>], model: &str) -> ModelNames<'_> {
         ModelNames {
             labels: if self.worker_registry.is_some() {
@@ -178,9 +176,9 @@ impl ParserResolver {
         }
     }
 
-    /// [`Self::names`] for a request whose preparation resolved the card names once
+    /// [`Self::names_among`] for a request whose preparation resolved the card names once
     /// (`ProcessingState::parser_names`): `resolved` as they were then, with the flags, and no
-    /// second walk over the model's workers; `None` resolves them now, as [`Self::names`] does.
+    /// second walk over the model's workers; `None` resolves them now, over the registry's walk.
     pub(crate) fn names_for(&self, resolved: Option<&Names>, model: &str) -> ModelNames<'_> {
         ModelNames {
             labels: resolved.map_or_else(|| self.card_names(model), Names::clone),
@@ -226,6 +224,15 @@ impl ParserResolver {
             })
     }
 
+    /// One kind's name among `model`'s cards, for a reader that asks for one
+    /// kind: the same walk and the same conflict rule as [`Self::card_names`],
+    /// cloning only the name asked for.
+    fn card_name(&self, model: &str, kind: ParserKind) -> Option<String> {
+        self.worker_registry
+            .as_ref()
+            .and_then(|registry| Self::card_name_among(&registry.get_by_model(model), model, kind))
+    }
+
     /// Both names `model`'s cards set among `workers`, in one walk. Cards
     /// built by the label pipeline agree across the workers of one model; where
     /// they do not (mixed labels, e.g. mid rolling-upgrade) each kind takes
@@ -239,12 +246,54 @@ impl ParserResolver {
             let Some(card) = worker.metadata().spec.models.find(model) else {
                 continue;
             };
-            tool.offer(card.tool_parser.as_ref());
-            reasoning.offer(card.reasoning_parser.as_ref());
+            tool.offer(ParserKind::Tool.of(card));
+            reasoning.offer(ParserKind::Reasoning.of(card));
         }
         Names {
-            tool: tool.chosen(model, "tool"),
-            reasoning: reasoning.chosen(model, "reasoning"),
+            tool: tool.chosen(model, ParserKind::Tool.label()),
+            reasoning: reasoning.chosen(model, ParserKind::Reasoning.label()),
+        }
+    }
+
+    /// [`Self::card_names_among`] for one kind: the one pick over the same
+    /// walk, so a single reader clones nothing it did not ask for.
+    fn card_name_among(
+        workers: &[Arc<dyn Worker>],
+        model: &str,
+        kind: ParserKind,
+    ) -> Option<String> {
+        let mut pick = CardPick::default();
+        for worker in workers {
+            let Some(card) = worker.metadata().spec.models.find(model) else {
+                continue;
+            };
+            pick.offer(kind.of(card));
+        }
+        pick.chosen(model, kind.label())
+    }
+}
+
+/// Which of a card's two parser names a reader asks for.
+#[derive(Clone, Copy)]
+enum ParserKind {
+    Tool,
+    Reasoning,
+}
+
+impl ParserKind {
+    /// The card's name of this kind, borrowed.
+    fn of(self, card: &ModelCard) -> Option<&String> {
+        match self {
+            Self::Tool => card.tool_parser.as_ref(),
+            Self::Reasoning => card.reasoning_parser.as_ref(),
+        }
+    }
+
+    /// The kind's word in the conflict log.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Reasoning => "reasoning",
         }
     }
 }
@@ -304,7 +353,7 @@ static NO_NAMES: Names = Names {
     reasoning: None,
 };
 
-/// The parser names set for one model, apart by who set them ([`ParserResolver::names`]): the
+/// The parser names set for one model, apart by who set them ([`ParserResolver::names_among`]): the
 /// names of its card, which its workers' labels (or the operator's card) set for the one model,
 /// and the gateway's flags, which every model shares. Symphony reads the two in that order with
 /// its registry between them (`regular::symphony::names::reads`): the card's names when they select
