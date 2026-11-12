@@ -208,6 +208,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // 4B its primary): JSON calls, no thought; bellwether records each checkpoint's own sets.
     ("wevisone-vl-4b", GenerationPrompt::Plain),
     ("wevisone-vl-2b", GenerationPrompt::Plain),
+    // Mage-VL-Cowork writes the Qwen3 template over a vision-language stack of its own: JSON calls, the
+    // thought opened in the prompt and closed there when the request turns thinking off.
+    ("mage-vl-cowork", GenerationPrompt::OpensTheThought),
     ("qwen3-vl-30b-a3b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-32b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-235b-a22b-instruct", GenerationPrompt::Plain),
@@ -419,6 +422,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("tinyllama-1.1b-chat-v1.0", GenerationPrompt::Plain),
     ("phi-4-mini-instruct", GenerationPrompt::Plain),
     ("phi-4-multimodal-instruct", GenerationPrompt::Plain),
+    // Youtu-Parsing-Omni's template writes Qwen3's thinking switch under turn headers of its own and
+    // declares no tools; bellwether recorded one content case of it (the rest refused), read with the
+    // plain table: a thought the model may write is content until a set shows one.
+    (
+        "youtu-parsing-omni",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),

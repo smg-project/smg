@@ -108,6 +108,7 @@
   {"model": "meta-llama/Llama-4-Maverick-17B-128E-Instruct", "also": ["Llama-4-Maverick-17B-128E-Instruct-FP8"], "table": "llama4", "opener": null, "after": null},
   {"model": "meta-llama/Llama-4-Scout-17B-16E-Instruct", "also": [], "table": "llama4", "opener": null, "after": null},
   {"model": "Salesforce/Llama-xLAM-2-8b-fc-r", "also": [], "table": "xlam", "opener": null, "after": null},
+  {"model": "microsoft/Mage-VL-Cowork", "also": [], "table": "qwen3", "opener": null, "after": null},
   {"model": "XiaomiMiMo/MiMo-V2.5", "also": ["MiMo-V2.5-Base"], "table": "qwen3_tagged_direct", "opener": null, "after": null},
   {"model": "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B", "also": [], "table": "qwen3_tagged_direct", "opener": null, "after": null},
   {"model": "XiaomiMiMo/MiMo-V2.6-Flash-RL", "also": [], "table": "qwen3_tagged_direct", "opener": null, "after": null},
@@ -187,5 +188,6 @@
   {"model": "stepfun-ai/Step-3.5-Flash", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "Qwen/WebWorld-32B", "also": ["WebWorld-8B", "WebWorld-14B"], "table": "qwen3", "opener": null, "after": null},
-  {"model": "tencent/WeVisOne-VL-4B", "also": ["WeVisOne-VL-2B"], "table": "qwen3", "opener": null, "after": null}
+  {"model": "tencent/WeVisOne-VL-4B", "also": ["WeVisOne-VL-2B"], "table": "qwen3", "opener": null, "after": null},
+  {"model": "tencent/Youtu-Parsing-Omni", "also": [], "table": "plain", "opener": null, "after": null}
 ]

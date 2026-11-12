@@ -1630,6 +1630,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "mage-vl-cowork",
+        model: "microsoft/Mage-VL-Cowork",
+        also: &[],
+        released: "2026-10-30",
+        smg: (None, None),
+        table: Some(Table::Qwen3),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "mimo-v2.5",
         model: "XiaomiMiMo/MiMo-V2.5",
         also: &["MiMo-V2.5-Base"],
@@ -2595,6 +2605,16 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen3),
         set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "youtu-parsing-omni",
+        model: "tencent/Youtu-Parsing-Omni",
+        also: &[],
+        released: "2026-10-09",
+        smg: (None, None),
+        table: Some(Table::Plain),
+        set: Some(1),
         status: Status::Replaying,
     },
 ];
