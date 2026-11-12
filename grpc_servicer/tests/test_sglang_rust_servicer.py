@@ -93,7 +93,9 @@ def _server_args(**overrides):
 
 
 def _model_config(**overrides):
+    """Resolved model configuration shared by both launcher fact producers."""
     config = dict(
+        dtype="torch.bfloat16",
         context_len=4096,
         vocab_size=1024,
         is_generation=True,
@@ -825,9 +827,14 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
     monkeypatch.setattr(
-        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        rust.SglangLauncher,
+        "facts",
+        lambda self, args: {
+            "model_path": args.model_path,
+            "data_parallel_size": 1,
+            "sglang_version": "x",
+        },
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
     supervised: dict = {}
@@ -860,9 +867,14 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
     monkeypatch.setattr(
-        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        rust.SglangLauncher,
+        "facts",
+        lambda self, args: {
+            "model_path": args.model_path,
+            "data_parallel_size": 1,
+            "sglang_version": "x",
+        },
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
     launched = {}
@@ -927,9 +939,14 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False, args=Non
     if real_facts:
         monkeypatch.setattr(rust, "_model_config", lambda args: _model_config())
     else:
-        monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
         monkeypatch.setattr(
-            rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+            rust.SglangLauncher,
+            "facts",
+            lambda self, args: {
+                "model_path": args.model_path,
+                "data_parallel_size": 1,
+                "sglang_version": "x",
+            },
         )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
     monkeypatch.setattr(
@@ -1313,9 +1330,14 @@ def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
     monkeypatch.setattr(
-        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        rust.SglangLauncher,
+        "facts",
+        lambda self, args: {
+            "model_path": args.model_path,
+            "data_parallel_size": 1,
+            "sglang_version": "x",
+        },
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
     launched = {}
@@ -1362,9 +1384,14 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
     monkeypatch.setattr(
-        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        rust.SglangLauncher,
+        "facts",
+        lambda self, args: {
+            "model_path": args.model_path,
+            "data_parallel_size": 1,
+            "sglang_version": "x",
+        },
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
 
@@ -1447,3 +1474,19 @@ def test_native_media_dtype_rejects_unknown(monkeypatch):
     monkeypatch.setenv("SMG_SGLANG_MM_DTYPE", "fp8")
     with pytest.raises(ValueError, match="SMG_SGLANG_MM_DTYPE"):
         rust.SglangLauncher().server_extras(_server_args(), "/tok")
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_launcher_facts_share_resolved_dtype(monkeypatch, dtype):
+    """Read ModelConfig once and publish its effective dtype in server facts."""
+    calls = []
+
+    def config(args):
+        calls.append(args)
+        return _model_config(dtype="torch." + dtype)
+
+    monkeypatch.setattr(rust, "_model_config", config)
+    args = _server_args()
+    facts = rust.SglangLauncher().facts(args)
+    assert calls == [args]
+    assert json.loads(facts["server_args_json"])["multimodal_encoder_dtype"] == dtype

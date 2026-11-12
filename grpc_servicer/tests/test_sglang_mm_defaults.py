@@ -97,3 +97,13 @@ def test_shm_auto_requires_worker_mode_and_honors_opt_out(monkeypatch):
     assert mm_broadcast.enabled()
     monkeypatch.setenv(mm_broadcast.ENV, "0")
     assert not mm_broadcast.enabled()
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32", "float8_e4m3fn"])
+def test_rust_server_facts_advertise_effective_encoder_dtype(dtype):
+    """The Rust servicer's server args carry the same precision as the Python RPC."""
+    import json
+
+    facts = rust.server_facts(SimpleNamespace(), SimpleNamespace(dtype="torch." + dtype))
+    expected = "float32" if dtype == "float8_e4m3fn" else dtype
+    assert json.loads(facts["server_args_json"])["multimodal_encoder_dtype"] == expected
