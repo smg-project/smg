@@ -321,11 +321,14 @@ message WatchWorkersRequest {
   // Empty for every model.
   repeated string models = 1;
   // 0: a snapshot first, then the tail; otherwise the tail after this seq,
-  // exclusive: every membership or health event at a greater log position
-  // (the gaps are other event kinds). A log that holds this seq under another
-  // term, or no longer holds the position after it, answers one
-  // SnapshotRequired and ends the stream, never a silent skip or replay; a
-  // synced standby behind it holds the stream and delivers as it applies.
+  // exclusive: every membership or health event, and with `with_needs` every
+  // generation's needs, at a greater log position (a needs event carries its
+  // generation's position; the gaps are other event kinds). A log that holds
+  // this seq under another term, or no longer holds the position after it,
+  // answers one SnapshotRequired and ends the stream, never a silent skip or
+  // replay (replicas match by position and term: the replication contract's
+  // rejoin check); a synced standby behind it holds the stream and delivers
+  // as it applies.
   // membership_epoch moves only on a membership change and is no resume point.
   uint64 resume_seq = 2;
   bool with_needs = 3;
@@ -338,8 +341,8 @@ message WorkerEvent {
   // The replication log position of the event: the leader assigns it, the
   // batch carries it and a standby adopts it, so every replica numbers the
   // event alike. Every page of one snapshot carries the position the snapshot
-  // is consistent with (GetSnapshot's replication_seq); the tail starts after
-  // it.
+  // is consistent with, filtered by `models` or not (the position GetSnapshot's
+  // replication_seq names on a complete one); the tail starts after it.
   uint64 seq = 1;
   uint64 membership_epoch = 2;
   oneof event {
