@@ -464,7 +464,7 @@ pub struct Engine {
     needs: Needs,
     /// The needs of every binding that covers a phase, its profile's stages
     /// and its sessions rule, folded per phase ([`Self::needs_for_phase`]),
-    /// indexed by [`PHASES`].
+    /// indexed by [`slot`].
     phase_needs: [Needs; PHASES.len()],
     sessions: SessionTable,
     assignment: AssignmentStages,
@@ -472,6 +472,29 @@ pub struct Engine {
 
 /// Every phase, in the order [`Engine::phase_needs`] keeps them.
 const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+
+/// A phase's slot in [`Engine::phase_needs`]: total, so no read falls back
+/// to another phase's needs; [`PHASES`] lists the phases in this order.
+const fn slot(phase: Phase) -> usize {
+    match phase {
+        Phase::Single => 0,
+        Phase::Prefill => 1,
+        Phase::Decode => 2,
+        Phase::Encode => 3,
+    }
+}
+
+// `PHASES` and `slot` agree on every phase's slot, or the crate does not build.
+const _: () = {
+    let mut i = 0;
+    while i < PHASES.len() {
+        assert!(
+            slot(PHASES[i]) == i,
+            "PHASES and slot disagree on a phase's slot"
+        );
+        i += 1;
+    }
+};
 
 /// What a binding's sessions rule reads beyond its profile's stages: the
 /// key under the view's headers, and the per-key counts its assignment and
@@ -530,7 +553,7 @@ impl Engine {
         // phase and adds nothing (the gateway's own document binds every
         // model's pair phases before its catch-all for the regular ones).
         let mut phase_needs = [Needs::default(); PHASES.len()];
-        for (slot, phase) in PHASES.into_iter().enumerate() {
+        for phase in PHASES {
             for binding in bindings
                 .iter()
                 .filter(|b| b.phases.is_empty() || b.phases.contains(&phase))
@@ -538,7 +561,7 @@ impl Engine {
                 if let Some(profile) =
                     profile_index(binding, phase).and_then(|i| profiles.get(usize::from(i)))
                 {
-                    phase_needs[slot] = phase_needs[slot]
+                    phase_needs[slot(phase)] = phase_needs[slot(phase)]
                         .or(profile.needs())
                         .or(session_needs(binding));
                 }
@@ -551,7 +574,7 @@ impl Engine {
         // resolves to ([`Self::decide_pair`]), not by the first binding that
         // covers the decode phase: the decode slot also carries the decode
         // profile of every pair binding a prefill lookup can reach.
-        let decode_slot = PHASES.iter().position(|p| *p == Phase::Decode).unwrap_or(0);
+        let decode_slot = slot(Phase::Decode);
         for binding in bindings
             .iter()
             .filter(|b| b.phases.is_empty() || b.phases.contains(&Phase::Prefill))
@@ -626,7 +649,7 @@ impl Engine {
     /// covers the phase: the host's answer to "does any regular placement
     /// read the request text" and its kin, read at apply.
     pub fn needs_for_phase(&self, phase: Phase) -> Needs {
-        self.phase_needs[PHASES.iter().position(|p| *p == phase).unwrap_or(0)]
+        self.phase_needs[slot(phase)]
     }
 
     pub fn profiles(&self) -> &[Profile] {
