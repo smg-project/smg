@@ -609,6 +609,17 @@ pub(crate) fn mm_image_wire_cap_over(
     model_id: &str,
     pools: &[RoutingPool],
 ) -> Option<usize> {
+    image_wire_cap_over(registry, model_id, pools, mm_rdma_exporter().is_some())
+}
+
+/// [`mm_image_wire_cap_over`] with the RDMA lane's liveness given, so a test
+/// reads both states of the process-wide exporter.
+fn image_wire_cap_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+    rdma_lane_live: bool,
+) -> Option<usize> {
     let workers: Vec<Arc<dyn Worker>> = pools
         .iter()
         .flat_map(|pool| {
@@ -619,36 +630,44 @@ pub(crate) fn mm_image_wire_cap_over(
                 .collect::<Vec<_>>()
         })
         .collect();
-    (!workers.is_empty() && workers.iter().all(pixels_ride_in_the_message))
-        .then_some(WIRE_MESSAGE_CAP)
+    (!workers.is_empty()
+        && workers
+            .iter()
+            .all(|worker| pixels_ride_in_the_message(worker, rdma_lane_live)))
+    .then_some(WIRE_MESSAGE_CAP)
 }
 
 /// Whether `worker` takes a request's pixel tensors inline in the Generate
 /// message the gateway encodes: a gRPC worker whose runtime reads them from
-/// the message, SGLang always, vLLM and TokenSpeed on the inline transport
-/// (the per-worker override or the router default, read as the SHM path
-/// reads it). A TRT-LLM worker takes the files' bytes, a ZMQ wire has no such
-/// framing, and `shm`, `auto` on a shared `/dev/shm` and `rdma` with a live
-/// exporter carry the tensors beside the message.
-fn pixels_ride_in_the_message(worker: &Arc<dyn Worker>) -> bool {
+/// the message. SGLang always does. TokenSpeed stages every encoder input
+/// over the RDMA lane whenever the process-wide exporter is live
+/// (`rdma_lane_live`: the dispatch's `into_proto(true)` and the EPD encode
+/// stage read no per-worker mode); otherwise it and vLLM follow the
+/// transport mode (the per-worker override or the router default, read as
+/// the SHM path reads it): `inline` rides in the message, and so does `rdma`
+/// (vLLM never pulls RDMA, and TokenSpeed without a live exporter falls back
+/// to inline); `shm`, and `auto` on a shared `/dev/shm`, send a handle
+/// instead. A TRT-LLM worker takes the files' bytes and a ZMQ wire has no
+/// such framing.
+fn pixels_ride_in_the_message(worker: &Arc<dyn Worker>, rdma_lane_live: bool) -> bool {
     let spec = &worker.metadata().spec;
     if spec.connection_mode != ConnectionMode::Grpc {
         return false;
     }
     match spec.runtime_type {
         RuntimeType::Sglang => true,
+        RuntimeType::TokenSpeed if rdma_lane_live => false,
         RuntimeType::Vllm | RuntimeType::TokenSpeed => match spec
             .multimodal_tensor_transport
             .unwrap_or_else(|| mm_transport_defaults().mode)
         {
-            TransportMode::Inline => true,
+            TransportMode::Inline | TransportMode::Rdma => true,
             TransportMode::Shm => !mm_shm_dev_writable(),
             TransportMode::Auto => {
                 !(mm_shm_dev_writable()
                     && local_shm_namespace_id()
                         .is_some_and(|local| worker_matches_shm_namespace(worker, local)))
             }
-            TransportMode::Rdma => mm_rdma_exporter().is_none(),
         },
         RuntimeType::Trtllm
         | RuntimeType::Mlx
@@ -1144,7 +1163,7 @@ mod tests {
         };
 
         let pools = Mode::Regular.multimodal_wire_pools();
-        let fleet = |specs: Vec<WorkerSpec>| {
+        let fleet = |specs: Vec<WorkerSpec>, rdma_lane_live: bool| {
             let registry = WorkerRegistry::new();
             for spec in specs {
                 registry
@@ -1157,7 +1176,7 @@ mod tests {
                     ))
                     .expect("register");
             }
-            mm_image_wire_cap_over(&registry, "qwen3-vl", pools)
+            image_wire_cap_over(&registry, "qwen3-vl", pools, rdma_lane_live)
         };
         let grpc = |url: &str, runtime: RuntimeType, transport: Option<TransportMode>| WorkerSpec {
             connection_mode: ConnectionMode::Grpc,
@@ -1165,56 +1184,88 @@ mod tests {
             multimodal_tensor_transport: transport,
             ..WorkerSpec::new(url)
         };
-        assert_eq!(
-            fleet(vec![
+        let inline_fleet = || {
+            vec![
                 grpc(
                     "grpc://inline-1:8000",
                     RuntimeType::Vllm,
-                    Some(TransportMode::Inline)
+                    Some(TransportMode::Inline),
                 ),
                 grpc(
                     "grpc://inline-2:8000",
                     RuntimeType::TokenSpeed,
-                    Some(TransportMode::Inline)
+                    Some(TransportMode::Inline),
                 ),
                 grpc("grpc://inline-3:8000", RuntimeType::Sglang, None),
-            ]),
+            ]
+        };
+        assert_eq!(
+            fleet(inline_fleet(), false),
             Some(WIRE_MESSAGE_CAP),
             "an inline gRPC fleet keeps the bound"
         );
-        if mm_shm_dev_writable() {
-            assert_eq!(
-                fleet(vec![
+        assert_eq!(
+            fleet(inline_fleet(), true),
+            None,
+            "a live RDMA exporter takes every TokenSpeed input over NIXL, whatever the worker's mode"
+        );
+        assert_eq!(
+            fleet(
+                vec![
                     grpc(
                         "grpc://inline-1:8000",
                         RuntimeType::Vllm,
-                        Some(TransportMode::Inline)
+                        Some(TransportMode::Inline),
                     ),
-                    grpc(
-                        "grpc://shm-1:8000",
-                        RuntimeType::Vllm,
-                        Some(TransportMode::Shm)
-                    ),
-                ]),
+                    grpc("grpc://rdma-1:8000", RuntimeType::Vllm, Some(TransportMode::Rdma)),
+                ],
+                true,
+            ),
+            Some(WIRE_MESSAGE_CAP),
+            "vLLM never pulls RDMA: its pixels ride inline under a live exporter and the rdma mode alike"
+        );
+        if mm_shm_dev_writable() {
+            assert_eq!(
+                fleet(
+                    vec![
+                        grpc(
+                            "grpc://inline-1:8000",
+                            RuntimeType::Vllm,
+                            Some(TransportMode::Inline)
+                        ),
+                        grpc(
+                            "grpc://shm-1:8000",
+                            RuntimeType::Vllm,
+                            Some(TransportMode::Shm)
+                        ),
+                    ],
+                    false
+                ),
                 None,
                 "one worker on the SHM transport drops it"
             );
         }
         assert_eq!(
-            fleet(vec![grpc("grpc://trt-1:8000", RuntimeType::Trtllm, None)]),
+            fleet(
+                vec![grpc("grpc://trt-1:8000", RuntimeType::Trtllm, None)],
+                false
+            ),
             None,
             "a TRT-LLM pool takes the files' bytes"
         );
         assert_eq!(
-            fleet(vec![WorkerSpec {
-                connection_mode: ConnectionMode::Zmq,
-                runtime_type: RuntimeType::Vllm,
-                ..WorkerSpec::new("ipc:///vllm-1")
-            }]),
+            fleet(
+                vec![WorkerSpec {
+                    connection_mode: ConnectionMode::Zmq,
+                    runtime_type: RuntimeType::Vllm,
+                    ..WorkerSpec::new("ipc:///vllm-1")
+                }],
+                false
+            ),
             None,
             "a ZMQ wire has no such framing"
         );
-        assert_eq!(fleet(vec![]), None, "no candidate, no bound");
+        assert_eq!(fleet(vec![], false), None, "no candidate, no bound");
     }
 
     /// The dtype is resolved over the pools a mode's request can reach:
