@@ -103,11 +103,14 @@ fn a_single_scan_file_ending_in_a_comment_is_served_as_the_reference_serves_it()
 
 /// A progressive file is read through to its end marker before its first
 /// row, so the reference loader refuses it with a comment in place of the
-/// marker, and so does this path: the library's warned frame is not kept,
-/// and the fallback decoder never reads the file. A copy of the ramp whose
-/// frame marker is rewritten to the progressive one stands in for a
-/// progressive file: the readers go by the markers, and the refusal before
-/// the fallback decoder is told from the decoders' own by its message.
+/// marker, and so does this path. The copy of the ramp below stands in by
+/// its markers alone: its frame marker is rewritten to the progressive one
+/// over a baseline scan, which the library refuses outright as a bad
+/// progression (no frame, no warning), and the fallback arm's walk then
+/// refuses the file before the fallback decoder; a real progressive file
+/// ending in a comment is the warned case the walk refuses as well. The
+/// refusal before the fallback decoder is told from the decoders' own by
+/// its message.
 #[test]
 fn a_progressive_file_ending_in_a_comment_is_refused() {
     let mut jpeg = ramp_jpeg();
