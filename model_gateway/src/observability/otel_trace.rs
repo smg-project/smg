@@ -121,8 +121,10 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         .with_protocol(opentelemetry_otlp::Protocol::Grpc)
         .build()
         .map_err(|e| {
-            // Logger may not be initialized yet during OTEL setup; use stderr
-            #[expect(clippy::print_stderr)]
+            #[expect(
+                clippy::print_stderr,
+                reason = "the logger may not be up during the OTEL setup"
+            )]
             {
                 eprintln!("[tracing] Failed to create OTLP exporter: {e}");
             }
@@ -163,8 +165,10 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
     // so any thread that loads ENABLED with Acquire will see the initialized state.
     ENABLED.store(true, Ordering::Release);
 
-    // Logger may not be fully initialized yet during OTEL setup; use stderr
-    #[expect(clippy::print_stderr)]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the logger may not be up during the OTEL setup"
+    )]
     {
         eprintln!("[tracing] OpenTelemetry initialized successfully");
     }
@@ -249,7 +253,7 @@ pub fn shutdown_otel() {
         // provider directly (its inner state is shared with the global provider).
         if let Some(provider) = PROVIDER.get() {
             if let Err(e) = provider.shutdown_with_timeout(OTEL_SHUTDOWN_TIMEOUT) {
-                #[expect(clippy::print_stderr)]
+                #[expect(clippy::print_stderr, reason = "the logger may be gone at teardown")]
                 {
                     eprintln!("[tracing] Failed to shut down OpenTelemetry: {e}");
                 }
@@ -257,8 +261,7 @@ pub fn shutdown_otel() {
         }
         // Use Release to ensure shutdown completes before flag is cleared
         ENABLED.store(false, Ordering::Release);
-        // Logger may already be shut down during process teardown; use stderr
-        #[expect(clippy::print_stderr)]
+        #[expect(clippy::print_stderr, reason = "the logger may be gone at teardown")]
         {
             eprintln!("[tracing] OpenTelemetry shut down");
         }

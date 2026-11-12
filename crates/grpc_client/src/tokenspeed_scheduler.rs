@@ -24,7 +24,10 @@ use crate::{
     BoxedTraceInjector,
 };
 
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod tokenspeed_proto {
     #![allow(
         clippy::all,

@@ -530,7 +530,10 @@ fn json_whitespace_trimmed(bytes: &[u8]) -> &[u8] {
 /// `true` when a boolean is `false`; used to drop default-`false` flags from the
 /// serialized map to match the sparse `omit_defaults` wire shape. Takes `&bool`
 /// because serde's `skip_serializing_if` requires a by-reference predicate.
-#[expect(clippy::trivially_copy_pass_by_ref)]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if takes a by-reference predicate"
+)]
 fn is_false(v: &bool) -> bool {
     !*v
 }

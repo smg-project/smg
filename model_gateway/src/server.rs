@@ -2018,7 +2018,10 @@ pub fn run(
     // Driven from the runtime: on a current-thread runtime nothing else polls
     // the exporter's connection while the shutdown waits for the export.
     if let Err(e) = runtime.block_on(runtime.spawn_blocking(otel_trace::shutdown_otel)) {
-        #[expect(clippy::print_stderr)]
+        #[expect(
+            clippy::print_stderr,
+            reason = "close_logging above stopped the writers; stderr is the one channel left"
+        )]
         {
             eprintln!("[tracing] OpenTelemetry shutdown task failed: {e}");
         }

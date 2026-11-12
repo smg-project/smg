@@ -269,7 +269,6 @@ impl std::fmt::Debug for OracleConnectionManager {
     }
 }
 
-#[async_trait]
 impl Manager for OracleConnectionManager {
     type Type = Connection;
     type Error = oracle::Error;
@@ -290,13 +289,8 @@ impl Manager for OracleConnectionManager {
         }
     }
 
-    #[expect(clippy::manual_async_fn)]
-    fn recycle(
-        &self,
-        conn: &mut Connection,
-        _: &Metrics,
-    ) -> impl std::future::Future<Output = RecycleResult<Self::Error>> + Send {
-        async move { conn.ping().map_err(RecycleError::Backend) }
+    async fn recycle(&self, conn: &mut Connection, _: &Metrics) -> RecycleResult<Self::Error> {
+        conn.ping().map_err(RecycleError::Backend)
     }
 }
 
