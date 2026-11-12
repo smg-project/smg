@@ -149,8 +149,9 @@ exit 97
 
     def visible(self, pid: int) -> None:
         if self.real_holder:
-            # This exact positive supplies its own Popen PID explicitly.
-            self.process(pid, "sleep 300", marker=THIS_JOB, device="/dev/nvidia0")
+            # Register its own Popen PID without a device fd: only the
+            # process-table kill may end this positive, as on main.
+            self.process(pid, "sleep 300", marker=THIS_JOB, device=None)
         (self.state / "visible_pid").write_text(str(pid))
 
     def listed_app(
