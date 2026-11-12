@@ -117,23 +117,38 @@ fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
 /// (`Worker::max_running_requests`) prefers them.
 pub(crate) const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
+/// The labels that name a model's context window (one spelling per engine
+/// family's model info), in the order the card's read
+/// (`create_worker::card_from_labels`) prefers them.
+pub(crate) const CONTEXT_WINDOW_LABELS: [&str; 5] = [
+    "context_length",
+    "max_context_length",
+    "max_model_len",
+    "max_total_tokens",
+    "max_seq_len",
+];
+
 /// A worker's labels after a merge: `current` (the discovered labels at
 /// registration, the worker's own on a label update) with `by_hand` (the
 /// spec's own labels, the request's) on top. A window the operator set by
-/// hand is the worker's only window: a window under the other name is
-/// dropped, since the reader prefers `max_num_seqs` to `max_running_requests`
-/// and would otherwise take the engine's figure over the operator's, on
-/// every worker, expanded per rank or not. Registration, the admin label
-/// update and its early cap check all merge through here.
+/// hand is the worker's only window of its kind: the running window
+/// (`WINDOW_LABELS`) and the context window (`CONTEXT_WINDOW_LABELS`) each
+/// have a spelling per engine family and a reader that prefers one spelling
+/// to another, so the engine's figure under another spelling, which the
+/// reader would take over the operator's, on every worker, expanded per rank
+/// or not, is dropped. Registration, the admin label update, its early cap
+/// check and a refresh (`refreshed_labels`) all merge through here.
 pub(crate) fn merge_labels(
     current: &HashMap<String, String>,
     by_hand: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut labels = current.clone();
-    if WINDOW_LABELS.iter().any(|key| by_hand.contains_key(*key)) {
-        for key in WINDOW_LABELS {
-            if !by_hand.contains_key(key) {
-                labels.remove(key);
+    for family in [&WINDOW_LABELS[..], &CONTEXT_WINDOW_LABELS[..]] {
+        if family.iter().any(|key| by_hand.contains_key(*key)) {
+            for key in family {
+                if !by_hand.contains_key(*key) {
+                    labels.remove(*key);
+                }
             }
         }
     }

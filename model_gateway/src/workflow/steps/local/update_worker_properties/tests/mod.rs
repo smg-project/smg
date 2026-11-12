@@ -3,7 +3,7 @@ mod label_refresh;
 use std::{collections::HashMap, time::Duration};
 
 use engine_zmq_client::{
-    mock_engine::{connect_to_frontend, default_ready_response},
+    mock_engine::{connect_to_frontend, default_ready_response, MockEngine},
     EngineId,
 };
 use openai_protocol::{
@@ -1089,6 +1089,170 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
     // it will never use.
     assert!(old.http_client.cell_is_empty());
     assert!(new.http_client.cell_is_empty());
+}
+
+/// A ZMQ worker whose link is up against a mock engine that advertised
+/// `max_model_len` at its handshake: `recorded` is what registration read
+/// from the model's files, `by_hand` the operator's own labels on top. The
+/// engine and its socket directory ride along to stay alive.
+async fn zmq_worker_with_its_link(
+    max_model_len: u64,
+    recorded: HashMap<String, String>,
+    by_hand: HashMap<String, String>,
+) -> (
+    Arc<dyn Worker>,
+    Arc<BackendClient>,
+    MockEngine,
+    tempfile::TempDir,
+) {
+    use engine_zmq_client::protocol::handshake::EngineCoreReadyResponse;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+    let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+    let ready = EngineCoreReadyResponse {
+        max_model_len,
+        ..default_ready_response()
+    };
+    let (client, engine) = tokio::join!(
+        ZmqEngineClient::connect(
+            &handshake,
+            &input,
+            &output,
+            1,
+            "m".to_string(),
+            EosTokenIds::default(),
+            RuntimeType::Vllm,
+            Duration::from_secs(10)
+        ),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
+    );
+    let engine = engine.expect("mock engine");
+    let client = Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
+    let mut labels = recorded.clone();
+    labels.extend(by_hand);
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(ep("ts0.ipc"))
+            .connection_mode(ConnectionMode::Zmq)
+            .runtime_type(RuntimeType::Vllm)
+            .zmq_handshake_address(handshake)
+            .model(ModelCard::new("m"))
+            .labels(labels)
+            .discovered_labels(recorded)
+            .status(WorkerStatus::Ready)
+            .build(),
+    );
+    worker
+        .as_any()
+        .downcast_ref::<BasicWorker>()
+        .expect("BasicWorker")
+        .backend_client
+        .load_full()
+        .set(Arc::clone(&client))
+        .ok()
+        .expect("cell empty");
+    (worker, client, engine, dir)
+}
+
+/// A ZMQ worker's label refresh (the connect signal's, once its handshake is
+/// in) reads the window the link learned there: the rebuilt card carries it
+/// for admission to read, what registration recorded stays, and the live
+/// link is kept.
+#[tokio::test]
+async fn a_zmq_refresh_gives_the_card_the_handshake_window() {
+    use crate::workflow::steps::local::RediscoverLabelsStep;
+
+    let recorded = HashMap::from([(
+        "constrained_decoding_start".to_string(),
+        "first_token".to_string(),
+    )]);
+    let (worker, client, _engine, _dir) =
+        zmq_worker_with_its_link(4096, recorded, HashMap::new()).await;
+    assert_eq!(
+        worker.context_length("m"),
+        None,
+        "registration read no window"
+    );
+
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let mut ctx = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
+    ctx.data.config.labels = None;
+    ctx.data.refresh_discovered_labels = true;
+    step_succeeds(RediscoverLabelsStep.execute(&mut ctx).await);
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
+
+    let updated = ctx.data.updated_workers.as_ref().expect("updated workers");
+    assert_eq!(updated.len(), 1);
+    assert_eq!(
+        updated[0].context_length("m"),
+        Some(4096),
+        "the card carries the handshake window"
+    );
+    let labels = &updated[0].metadata().spec.labels;
+    assert_eq!(
+        labels.get("max_context_length").map(String::as_str),
+        Some("4096")
+    );
+    assert_eq!(
+        labels.get("constrained_decoding_start").map(String::as_str),
+        Some("first_token"),
+        "what registration recorded stays"
+    );
+    let new = updated[0]
+        .as_any()
+        .downcast_ref::<BasicWorker>()
+        .expect("BasicWorker");
+    let adopted = new
+        .backend_client
+        .load_full()
+        .get()
+        .cloned()
+        .expect("replacement must inherit the connected client");
+    assert!(Arc::ptr_eq(&adopted, &client), "the live link is kept");
+}
+
+/// A context window the operator set by hand on a ZMQ worker stays its only
+/// window when the handshake names a wider one under the name the reader
+/// prefers: the refresh merges as registration does (`merge_labels`), the
+/// handshake's figure is not added beside the operator's limit, and the
+/// worker is kept as it is.
+#[tokio::test]
+async fn a_zmq_refresh_keeps_the_window_the_operator_set() {
+    use crate::workflow::steps::local::RediscoverLabelsStep;
+
+    let recorded = HashMap::from([(
+        "constrained_decoding_start".to_string(),
+        "first_token".to_string(),
+    )]);
+    let by_hand = HashMap::from([("max_model_len".to_string(), "2048".to_string())]);
+    let (worker, _client, _engine, _dir) = zmq_worker_with_its_link(4096, recorded, by_hand).await;
+
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let mut ctx = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
+    ctx.data.config.labels = None;
+    ctx.data.refresh_discovered_labels = true;
+    step_succeeds(RediscoverLabelsStep.execute(&mut ctx).await);
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
+
+    let updated = ctx.data.updated_workers.clone().unwrap_or_default();
+    let after = updated
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Arc::clone(&worker));
+    let labels = &after.metadata().spec.labels;
+    assert_eq!(
+        labels.get("max_context_length"),
+        None,
+        "the handshake's figure is not added beside the operator's limit"
+    );
+    assert_eq!(
+        labels.get("max_model_len").map(String::as_str),
+        Some("2048")
+    );
+    assert!(
+        updated.is_empty(),
+        "nothing changed: the worker is kept as it is"
+    );
 }
 
 /// An HTTP worker's replacement must adopt the same shared client — a
