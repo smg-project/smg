@@ -552,11 +552,12 @@ mod tests {
         }
     }
 
-    /// A checkpoint renamed or re-quantized under another name or organisation reads with its
-    /// group's table once the group lists it under `also`: names whose template renders the same
-    /// text as the primary's and whose tokenizer files are the primary's.
+    /// A checkpoint published under another name or organisation than its group's primary reads
+    /// with the group's table once the group lists it under `also`: names whose template renders
+    /// the same text as the primary's and whose tokenizer files are the primary's or a re-save of
+    /// them.
     #[test]
-    fn a_renamed_or_requantized_checkpoint_listed_by_its_group_resolves_to_the_groups_table() {
+    fn a_checkpoint_a_group_lists_under_also_resolves_to_the_groups_table() {
         for (model, table) in [
             ("moonshotai/Kimi-K3.1-Pro", Table::KimiK3),
             ("nvidia/Kimi-K3.1-Pro-NVFP4", Table::KimiK3),
