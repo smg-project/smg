@@ -30,7 +30,7 @@ use crate::{
     eos::EosTokenIds,
     fanout::fan_out_n,
     multimodal,
-    stream::{poll_mapped, MappedGenerateStream, StreamState},
+    stream::{finish, poll_mapped, FinishParts, MappedGenerateStream, StreamState},
     structured_outputs::{
         refuse_unenforceable_constraint, ConstraintRef, StructuredOutputsBackendConfig,
         StructuredOutputsSupport,
@@ -152,60 +152,20 @@ impl VllmGenerateStream {
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
     }
+}
 
-    /// Whether the engine already finished this choice and its terminal
-    /// `Complete` is parked behind the chunk just yielded (the finish tick
-    /// carried new tokens). A frontend that matched a stop on that chunk must
-    /// not synthesize its own `Complete`: the accumulated state has already
-    /// been drained into the parked one.
-    pub fn has_parked_complete(&self) -> bool {
-        self.pending.is_some()
+impl finish::Parts for VllmGenerateStream {
+    fn parked(&self) -> Option<&vllm::GenerateResponse> {
+        self.pending.as_ref()
     }
 
-    /// End this choice now on a frontend-matched string stop: the terminal
-    /// `Complete` built from the accumulated state, exactly as if the engine
-    /// had reported `stop` with that string. The engine-side request is
-    /// aborted when the stream is dropped, so the caller drops it next.
-    pub fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
-        self.complete_with_finish(
-            "stop".to_string(),
-            Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
-                matched,
-            )),
-        )
-    }
-
-    /// End this choice as aborted: the engine's own parked `Complete` when it
-    /// already finished, else the terminal `Complete` the Python servicer
-    /// yields after an `Abort` RPC (`finish_reason = "abort"`).
-    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        if let Some(parked) = self.pending.take() {
-            return parked;
+    fn finish_parts(&mut self) -> FinishParts<'_> {
+        FinishParts {
+            state: &mut self.state,
+            index: self.index,
+            pending: &mut self.pending,
+            input_logprobs_emitted: &mut self.input_logprobs_emitted,
         }
-        self.complete_with_finish("abort".to_string(), None)
-    }
-
-    fn complete_with_finish(
-        &mut self,
-        finish_reason: String,
-        matched: Option<vllm::generate_complete::MatchedStop>,
-    ) -> vllm::GenerateResponse {
-        let mut pending = None;
-        // No new tokens on a frontend finish, so `emit_tick` yields the
-        // `Complete` directly and parks nothing.
-        let mut response = self.state.emit_tick(
-            self.index,
-            Vec::new(),
-            None,
-            Some((finish_reason, matched)),
-            &mut pending,
-        );
-        self.state.attach_input_logprobs(
-            &mut self.pending,
-            &mut self.input_logprobs_emitted,
-            &mut response,
-        );
-        response
     }
 }
 
