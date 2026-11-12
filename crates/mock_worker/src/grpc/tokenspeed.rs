@@ -401,8 +401,7 @@ const SHM_FEATURE_DTYPES: [&str; 3] = ["bfloat16", "float16", "float32"];
 /// opened. On the scheduler's feature the dtype is one of
 /// [`SHM_FEATURE_DTYPES`]; the encoder's feature and a side tensor keep their
 /// wire dtype, one the wire does not know passing as the inline reader passes
-/// it.
-/// On both the byte length is the dtype's width over the shape
+/// it. On every role the byte length is the dtype's width over the shape
 /// (`_feature_from_proto` and `_tensor_from_proto` in tokenspeed/servicer.py)
 /// and the name is a bare segment name once a leading slash is stripped, no
 /// slash, dot entry or NUL inside (`validated_shm_name` in mm_shm.py). The
