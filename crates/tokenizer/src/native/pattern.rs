@@ -2079,7 +2079,9 @@ fn classes_before_space(node: &Node, classes: &[Class]) -> Vec<usize> {
 /// Whether a match of `node` can read a space anywhere but at its first
 /// position, the join of a letter run aside (its letter and mark classes
 /// hold no space); `at_start` says the node stands where the match begins,
-/// so a space it reads first is the match's first character.
+/// so a space it reads first is the match's first character; it holds on
+/// across nodes that consume nothing only (a node that may match empty but
+/// may also consume moves the start).
 fn reads_space_beyond_start(node: &Node, classes: &[Class], at_start: bool) -> bool {
     let space = |class: &usize| classes[*class].contains(' ');
     match node {
@@ -2093,7 +2095,7 @@ fn reads_space_beyond_start(node: &Node, classes: &[Class], at_start: bool) -> b
             let mut at_start = at_start;
             nodes.iter().any(|node| {
                 let reads = reads_space_beyond_start(node, classes, at_start);
-                at_start = at_start && can_match_empty(node);
+                at_start = at_start && matches!(node, Node::NotAhead(_) | Node::NotAheadSeq { .. });
                 reads
             })
         }
@@ -3598,6 +3600,8 @@ mod tests {
             r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|[^\s\p{L}\p{N}]+ ?| ?\p{L}+|\s+";
         const PREFIX: &str = r"x (?:ab*(?: ab*)*)+| a[ a]{998}| (?:ab*(?: ab*)*)+";
         const START_ONLY: &str = r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}";
+        const DIGIT_OPT_SPACE: &str = r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\p{N}? |\s+";
+        const PREFIX_OPT: &str = r" [ ac]{999}|x? a+|(?:ab*(?: ab*)*)+";
         for (pattern, before, reads) in [
             (JOINED, ' ', true),
             (JOINED, '\t', true),
@@ -3616,6 +3620,11 @@ mod tests {
             (PREFIX, 'z', false),
             (START_ONLY, ' ', false),
             (START_ONLY, 'a', false),
+            (DIGIT_OPT_SPACE, '1', true),
+            (DIGIT_OPT_SPACE, 'a', false),
+            (PREFIX_OPT, 'x', true),
+            (PREFIX_OPT, 'c', true),
+            (PREFIX_OPT, 'z', false),
         ] {
             let parsed = Pattern::parse(pattern).expect("parses");
             assert_eq!(

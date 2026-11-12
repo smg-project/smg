@@ -1685,16 +1685,18 @@ fn a_joined_letter_run_encodes_as_the_library_does() {
 /// (the text lands on the letter after it, where the run begins, the window
 /// reads ` b` instead), or at a space some other alternative reads after
 /// the character before it inside one match (`\p{N}+ ?` takes `1 `,
-/// `[^\s\p{L}\p{N}]+ ?` takes `, `, a literal prefix takes `x `; the text
-/// lands on the letter after the space the same way): the check starts its
+/// `[^\s\p{L}\p{N}]+ ?` takes `, `, a literal prefix takes `x `, an optional
+/// digit or prefix before the space the same; the text lands on the letter
+/// after the space the same way): the check starts its
 /// window at a space after a character that is neither whitespace, nor one
 /// a run reaches the space from, nor one such an alternative reads before a
 /// space, and refuses a candidate without one in reach. The two patterns,
-/// the family's and three with such an alternative, on a text that is one
+/// the family's and five with such an alternative, on a text that is one
 /// run, on prose with a comma, on runs after two spaces and after a line
 /// break with a space, on prose joined by a period and two spaces, on lines
-/// indented by four spaces, and on runs after `1 `, after `, ` and after a
-/// literal prefix: the pool's units hold the whole text's pieces, and the
+/// indented by four spaces, and on runs after `1 `, after `, `, after a
+/// literal prefix and after an optional one: the pool's units hold the
+/// whole text's pieces, and the
 /// pool's ids are the serial encode's and the library's.
 #[test]
 fn a_space_joined_run_is_never_cut_by_the_pool() {
@@ -1711,6 +1713,12 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
     let digit_space = format!("{}1 b{}", "c".repeat(31_000), " b".repeat(20_000));
     let comma_space = format!("{}, b{}", "c".repeat(31_000), " b".repeat(20_000));
     let prefix_run = format!("{}x {}", "z".repeat(31_767), "a ".repeat(20_000));
+    let prefix_opt = format!(
+        "{}x {}c {}",
+        "z".repeat(31_767),
+        "a".repeat(230),
+        "a ".repeat(20_000)
+    );
     for (index, pattern) in [
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}",
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\s+",
@@ -1718,6 +1726,8 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}+ ?| ?\p{L}+|\s+",
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|[^\s\p{L}\p{N}]+ ?| ?\p{L}+|\s+",
         r"x (?:ab*(?: ab*)*)+| a[ a]{998}| (?:ab*(?: ab*)*)+",
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\p{N}? |\s+",
+        r" [ ac]{999}|x? a+|(?:ab*(?: ab*)*)+",
     ]
     .into_iter()
     .enumerate()
@@ -1745,6 +1755,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
             digit_space.as_str(),
             comma_space.as_str(),
             prefix_run.as_str(),
+            prefix_opt.as_str(),
         ] {
             let whole: Vec<String> = {
                 let mut out = Vec::new();
