@@ -4217,9 +4217,9 @@ mod response_conversation {
 
     use crate::common::ConversationRef;
 
-    /// The object the public API writes; its schema is the field's.
-    #[derive(Serialize, schemars::JsonSchema)]
-    pub(super) struct ResponseConversation<'a> {
+    /// The object the public API writes.
+    #[derive(Serialize)]
+    struct ResponseConversation<'a> {
         /// The id of the conversation the response is linked to.
         id: &'a str,
     }
@@ -4287,9 +4287,12 @@ pub struct ResponsesResponse {
 
     /// Conversation this response is linked to, if any, by its id. Written
     /// as the public API writes it, `{"id": ...}`; a bare id, as the crate
-    /// wrote it before, still reads.
+    /// wrote it before, still reads. The schema takes both shapes, as the
+    /// reader does: a response stored before the object was written is
+    /// served back with the bare id, and a client generated from the schema
+    /// reads it too.
     #[serde(default, with = "response_conversation")]
-    #[schemars(with = "Option<response_conversation::ResponseConversation<'static>>")]
+    #[schemars(with = "Option<ConversationRef>")]
     pub conversation: Option<String>,
 
     /// Response status

@@ -73,7 +73,8 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A Response linked to a conversation writes it as the public API does, `{"id": "conv_..."}`
   (`ResponseConversation`), where the crate wrote the bare id, and reads either shape: the crate
   refused a Response carrying the object with ``invalid type: map, expected a string``. The field
-  keeps the id alone (`Option<String>`), so code that reads it is unchanged.
+  keeps the id alone (`Option<String>`), so code that reads it is unchanged, and its schema takes
+  both shapes, so a client generated from it also reads a response stored with the bare id.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
