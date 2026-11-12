@@ -225,7 +225,7 @@ pub(crate) fn extract_tools_from_response_tools(
         .flat_map(|tool| match tool {
             ResponseTool::Function(ft) => vec![Tool {
                 tool_type: "function".to_string(),
-                function: ft.function.clone(),
+                function: ft.chat_function(),
             }],
             ResponseTool::Custom(ct) => vec![Tool {
                 tool_type: "function".to_string(),
@@ -236,7 +236,7 @@ pub(crate) fn extract_tools_from_response_tools(
                 .iter()
                 .map(|member| {
                     let mut function = match member {
-                        NamespaceTool::Function(ft) => ft.function.clone(),
+                        NamespaceTool::Function(ft) => ft.chat_function(),
                         NamespaceTool::Custom(ct) => custom_tool_as_function(ct),
                     };
                     function.name = format!("{}.{}", namespace.name, function.name);
@@ -1146,6 +1146,44 @@ mod tests {
             .expect("alias must stop resolving with no workers behind it");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+    /// The public API's function-tool keys say how the API calls a tool, not
+    /// what the model calls, so the chat template's copy of a function tool,
+    /// alone or in a namespace, carries none of them.
+    #[test]
+    fn the_chat_templates_function_tools_leave_out_the_apis_tool_keys() {
+        let function = serde_json::json!({
+            "type": "function", "name": "lookup", "parameters": {},
+            "async": true, "defer_loading": true,
+            "output_schema": {"type": "object"}, "allowed_callers": ["direct"]
+        });
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                function.clone(),
+                {"type": "namespace", "name": "weather", "description": "Weather tools",
+                 "tools": [function]}
+            ]
+        }))
+        .unwrap();
+        let tools = extract_tools_from_response_tools(request.tools.as_deref());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lookup", "weather.lookup"]
+        );
+        for tool in &tools {
+            assert!(
+                tool.function.extra.is_empty(),
+                "{}: {:?}",
+                tool.function.name,
+                tool.function.extra
+            );
+        }
+    }
+
     #[test]
     fn namespace_function_identity_roundtrips_and_preserves_literal_names() {
         let mut request: ResponsesRequest = namespace_test_request();

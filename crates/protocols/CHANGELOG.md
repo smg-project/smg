@@ -70,6 +70,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses function tool declared with `async`, `defer_loading`, `output_schema` or
+  `allowed_callers`, and a custom tool declared with `async` or `allowed_callers`, as the public
+  API's tools take them, parse and are forwarded as given. The crate refused each as an unknown
+  field. `FunctionTool::chat_function` leaves the four keys out of the copy a chat template
+  renders. Breaking: `CustomTool` gains `r#async: Option<bool>` and
+  `allowed_callers: Option<Vec<String>>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

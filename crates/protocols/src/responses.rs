@@ -531,16 +531,49 @@ pub struct FunctionTool {
     pub function: Function,
 }
 
+impl FunctionTool {
+    /// The public API's function-tool keys beyond the function object's own
+    /// (`FunctionTool` in the spec): how the API calls the tool rather than
+    /// what the model calls. They are kept in [`Function::extra`] and
+    /// forwarded as given.
+    pub const TOOL_KEYS: &'static [&'static str] =
+        &["async", "defer_loading", "output_schema", "allowed_callers"];
+
+    /// The function object a chat template is handed: the tool's function
+    /// without [`Self::TOOL_KEYS`], which describe the call, not the function.
+    pub fn chat_function(&self) -> Function {
+        let mut function = self.function.clone();
+        function
+            .extra
+            .retain(|key, _| !Self::TOOL_KEYS.contains(&key.as_str()));
+        function
+    }
+}
+
 /// A function tool rejects keys outside its schema, as the sibling tool
 /// structs do with `deny_unknown_fields`. The function object collects such
 /// keys in [`Function::extra`] (the chat API keeps them for the template), and
 /// serde does not support `deny_unknown_fields` on a struct that flattens a
-/// struct with a flattened map of its own, so the check is made here.
+/// struct with a flattened map of its own, so the check is made here. The
+/// public API's own tool keys ([`FunctionTool::TOOL_KEYS`]) stay in `extra`.
 impl<'de> Deserialize<'de> for FunctionTool {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        const FIELDS: &[&str] = &["name", "description", "parameters", "strict"];
+        const FIELDS: &[&str] = &[
+            "name",
+            "description",
+            "parameters",
+            "strict",
+            "async",
+            "defer_loading",
+            "output_schema",
+            "allowed_callers",
+        ];
         let function = Function::deserialize(deserializer)?;
-        if let Some(key) = function.extra.keys().next() {
+        if let Some(key) = function
+            .extra
+            .keys()
+            .find(|key| !FunctionTool::TOOL_KEYS.contains(&key.as_str()))
+        {
             return Err(serde::de::Error::unknown_field(key, FIELDS));
         }
         Ok(Self { function })
@@ -691,6 +724,13 @@ pub struct CustomTool {
     /// Optional input-format constraint — `text` (unconstrained) or
     /// `grammar` (Lark / regex production).
     pub format: Option<CustomToolInputFormat>,
+    /// Whether the tool's response may come back asynchronously rather than
+    /// on the next response creation.
+    #[serde(rename = "async")]
+    pub r#async: Option<bool>,
+    /// The contexts the tool may be invoked from (`CallableToolAllowedCaller`:
+    /// `direct`, `programmatic`), forwarded as given.
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 /// Input-format constraint applied to a [`CustomTool`].

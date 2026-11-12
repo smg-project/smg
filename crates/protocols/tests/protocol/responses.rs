@@ -294,6 +294,51 @@ fn test_responses_request_explicit_top_p_preserved() {
     assert_eq!(request.top_p, Some(0.9));
 }
 
+/// The public API's function tool takes `async`, `defer_loading`,
+/// `output_schema` and `allowed_callers` beside the function object's own
+/// keys: a request declaring them parses and writes them back for the upstream
+/// as sent, the chat template's copy leaves them out, and a key outside the
+/// spec is still refused. A custom tool takes `async` and `allowed_callers`
+/// too.
+#[test]
+fn a_function_tool_keeps_the_public_apis_tool_keys() {
+    let tool = json!({
+        "type": "function",
+        "name": "lookup",
+        "parameters": {"type": "object", "properties": {}},
+        "strict": true,
+        "async": true,
+        "defer_loading": true,
+        "output_schema": {"type": "object"},
+        "allowed_callers": ["direct", "programmatic"]
+    });
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.6", "input": "hi", "tools": [tool.clone()]
+    }))
+    .expect("a function tool with the spec's tool keys parses");
+    assert_eq!(serde_json::to_value(&request).unwrap()["tools"][0], tool);
+    let Some(ResponseTool::Function(function_tool)) =
+        request.tools.as_deref().and_then(<[_]>::first)
+    else {
+        panic!("a function tool: {:?}", request.tools);
+    };
+    assert!(function_tool.chat_function().extra.is_empty());
+
+    let refused = serde_json::from_value::<ResponsesRequest>(json!({
+        "model": "gpt-5.6", "input": "hi",
+        "tools": [{"type": "function", "name": "lookup", "parameters": null, "not_a_tool_key": 1}]
+    }));
+    assert!(refused.is_err(), "a key outside the spec is refused");
+
+    let custom =
+        json!({"type": "custom", "name": "shell", "async": false, "allowed_callers": ["direct"]});
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.6", "input": "hi", "tools": [custom.clone()]
+    }))
+    .expect("a custom tool with async and allowed_callers parses");
+    assert_eq!(serde_json::to_value(&request).unwrap()["tools"][0], custom);
+}
+
 #[test]
 fn test_require_approval_string_round_trip() {
     let tool: McpTool = serde_json::from_value(json!({
