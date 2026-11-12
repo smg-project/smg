@@ -8,7 +8,7 @@
 use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
-use llm_tokenizer::registry::TokenizerRegistry;
+use llm_tokenizer::{registry::TokenizerRegistry, traits::Tokenizer};
 use openai_protocol::completion::CompletionRequest;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg::{
@@ -26,7 +26,7 @@ use smg_data_connector::{
 use smg_mcp::{McpConfig, McpOrchestrator};
 use tool_parser::ParserFactory as ToolParserFactory;
 
-use crate::common::ensure_tokenizer_cached;
+use crate::common::scripted_tokenizer::ScriptedTokenizer;
 
 const MODEL: &str = "test-model";
 
@@ -72,15 +72,13 @@ async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
         .build_unchecked();
 
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    // Blocking download helper; must run off the async runtime.
-    let tokenizer_path = tokio::task::spawn_blocking(ensure_tokenizer_cached)
-        .await
-        .expect("tokenizer download");
-    let tokenizer_source = tokenizer_path.to_string_lossy().to_string();
+    // The test pins where a prompt array ends up, not a vocabulary: the
+    // harness's scripted tokenizer encodes any prompt, where a hub download
+    // made a host without egress fail the test on head and base alike.
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ScriptedTokenizer::new("ok"));
     tokenizer_registry
-        .load("test-tokenizer", MODEL, &tokenizer_source, || async {
-            llm_tokenizer::factory::create_tokenizer_from_file(&tokenizer_source)
-                .map_err(|e| e.to_string())
+        .load("test-tokenizer", MODEL, "scripted", || async move {
+            Ok(tokenizer)
         })
         .await
         .expect("load tokenizer");
