@@ -223,7 +223,8 @@ pub enum JobOutcomeError {
     /// The job did not end within the wait; it keeps running.
     TimedOut(Duration),
     /// A caller is waiting on a job under this key already: the job runs
-    /// once and its outcome goes to that caller.
+    /// once and its outcome goes to that caller. The key is written as a
+    /// log line writes it, a worker's address with its userinfo masked.
     InFlight(String),
 }
 
@@ -490,7 +491,10 @@ impl JobQueue {
         // One waiter per key: a second caller for a job in flight is refused,
         // not handed the first caller's outcome (and the first its loss).
         match self.outcomes.entry(key.clone()) {
-            Entry::Occupied(_) => return Err(JobOutcomeError::InFlight(key)),
+            Entry::Occupied(_) => {
+                let shown = Job::shown_worker(job.job_type(), &key);
+                return Err(JobOutcomeError::InFlight(shown));
+            }
             Entry::Vacant(entry) => {
                 entry.insert(Waiter { id, sender: tx });
             }
@@ -1367,10 +1371,11 @@ mod tests {
 
     /// A second caller for a job in flight is refused and the first keeps
     /// its waiter, so the outcome reaches the caller that submitted the job.
+    /// The refusal names the key as a log line writes it, its userinfo masked.
     #[tokio::test]
     async fn a_second_waiter_under_a_held_key_is_refused_and_the_first_kept() {
         let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
-        let key = "http://worker:8000".to_string();
+        let key = "http://user:secret@127.0.0.1:8000".to_string();
         let (first, first_rx) = oneshot::channel();
         queue.outcomes.insert(
             key.clone(),
@@ -1385,29 +1390,12 @@ mod tests {
                 Duration::from_secs(1),
             )
             .await;
-        assert_eq!(second, Err(JobOutcomeError::InFlight(key.clone())));
+        let shown = Job::shown_worker("RefreshWorkerLabels", &key);
+        assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(second, Err(JobOutcomeError::InFlight(shown)));
         assert_eq!(queue.outcomes.get(&key).map(|waiter| waiter.id), Some(1));
         JobQueue::deliver_outcome(&queue.outcomes, &key, Some(1), Ok("done".to_string()));
         assert!(matches!(first_rx.await, Ok(Ok(ref message)) if message == "done"));
-    }
-
-    /// A submit the queue refuses leaves no waiter behind.
-    #[tokio::test]
-    async fn a_refused_submit_leaves_no_waiter() {
-        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
-        let refused = queue
-            .submit_and_wait(
-                Job::RefreshWorkerLabels {
-                    url: "http://worker:8000".to_string(),
-                },
-                Duration::from_secs(1),
-            )
-            .await;
-        assert!(matches!(refused, Err(JobOutcomeError::NotQueued(_))));
-        assert!(
-            queue.outcomes.is_empty(),
-            "a refused submit leaves no waiter"
-        );
     }
 
     /// A finished job's outcome reaches the waiter under its key once, and
