@@ -1166,14 +1166,19 @@ impl NativeEncoder {
                  normalizer",
             ));
         }
+        // The tokens matched after the Replace are matched on the raw text
+        // here; one whose strip takes whitespace would take a raw space,
+        // which the reference, matching the normalized piece, sees as the
+        // word marker and leaves to the text.
         if replaces
-            && normalized
-                .iter()
-                .any(|token| token.content.contains([' ', WORD_MARKER]))
+            && normalized.iter().any(|token| {
+                token.content.contains([' ', WORD_MARKER]) || token.lstrip || token.rstrip
+            })
         {
             return Err(Declined::from(
                 "a byte-fallback vocabulary with an added token matched after the Replace \
-                 normalizer that holds a space or the word marker",
+                 normalizer that holds a space or the word marker, or takes the whitespace \
+                 beside it",
             ));
         }
         let chars = CharSymbols::from_model(

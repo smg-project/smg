@@ -287,8 +287,10 @@ struct Shape {
     ignore_merges: bool,
     special: &'static [&'static str],
     added: &'static [(&'static str, bool)],
-    /// Added tokens with `lstrip` / `rstrip`: content, lstrip, rstrip.
-    stripped: &'static [(&'static str, bool, bool)],
+    /// Added tokens with `lstrip` / `rstrip`: content, lstrip, rstrip, and
+    /// whether the token is special (matched on the raw text; a plain one
+    /// is matched after normalization).
+    stripped: &'static [(&'static str, bool, bool, bool)],
 }
 
 fn shapes() -> Vec<Shape> {
@@ -618,9 +620,9 @@ fn shapes() -> Vec<Shape> {
             special: &["<|endoftext|>"],
             added: &[("<think>", false)],
             stripped: &[
-                ("<|end|>", false, true),
-                ("<|user|>", false, true),
-                ("<|dummy_0|>", true, true),
+                ("<|end|>", false, true, true),
+                ("<|user|>", false, true, false),
+                ("<|dummy_0|>", true, true, false),
             ],
         },
     ]
@@ -651,8 +653,10 @@ fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
                 .added
                 .iter()
                 .map(|(s, normalized)| AddedToken::from(*s, false).normalized(*normalized))
-                .chain(shape.stripped.iter().map(|(s, lstrip, rstrip)| {
-                    AddedToken::from(*s, false).lstrip(*lstrip).rstrip(*rstrip)
+                .chain(shape.stripped.iter().map(|(s, lstrip, rstrip, special)| {
+                    AddedToken::from(*s, *special)
+                        .lstrip(*lstrip)
+                        .rstrip(*rstrip)
                 })),
         )
         .expect("added tokens");
@@ -1248,7 +1252,7 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             .iter()
             .copied()
             .chain(shape.added.iter().map(|(s, _)| *s))
-            .chain(shape.stripped.iter().map(|(s, _, _)| *s))
+            .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
             .collect();
         let mut compared = 0;
         for _ in 0..3 {
@@ -1580,7 +1584,7 @@ fn ids_match_tokenizers_on_random_text_for_every_shape() {
             .iter()
             .copied()
             .chain(shape.added.iter().map(|(s, _)| *s))
-            .chain(shape.stripped.iter().map(|(s, _, _)| *s))
+            .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
             .collect();
         for round in 0..2000 {
             let text = random_text(&mut state, 1 + round % 40, &added);
@@ -3109,7 +3113,7 @@ fn a_template_post_processor_frames_the_ids_on_request() {
         .iter()
         .copied()
         .chain(shape.added.iter().map(|(s, _)| *s))
-        .chain(shape.stripped.iter().map(|(s, _, _)| *s))
+        .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
         .collect();
     for (name, post_processor) in forms {
         let mut tokenizer = tokenizer_of(shape, &mut state);
@@ -4410,7 +4414,18 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
     assert_eq!(
         declined(&tokenizer),
         "a byte-fallback vocabulary with an added token matched after the Replace normalizer \
-         that holds a space or the word marker"
+         that holds a space or the word marker, or takes the whitespace beside it"
+    );
+    // A token that takes the whitespace beside it, matched after the Replace:
+    // its strip would take a raw space the reference sees as the marker.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[0], &mut state);
+    tokenizer
+        .add_tokens([AddedToken::from("<x>", false).normalized(true).rstrip(true)])
+        .expect("added token");
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with an added token matched after the Replace normalizer \
+         that holds a space or the word marker, or takes the whitespace beside it"
     );
     // The same token under Metaspace is matched on the same text either way.
     let mut tokenizer = sentencepiece_tokenizer(&shapes[2], &mut state);
