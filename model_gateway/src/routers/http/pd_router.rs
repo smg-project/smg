@@ -3567,13 +3567,21 @@ mod tests {
         );
     }
 
-    /// A frame delimiter cut across two chunks (`\n\n` after its first byte,
-    /// `\r\n\r\n` after `\r\n`): the look-back over the held bytes finds it
-    /// on the second chunk and the frame is merged whole.
+    /// A frame delimiter cut across two chunks (`\n\n` and `\r\r` after
+    /// their first byte, `\r\n\r\n` after any of its first three bytes): the
+    /// look-back over the held bytes finds it on the second chunk and the
+    /// frame is merged whole. The cut after the third byte needs all three
+    /// held bytes, so a shorter look-back is red here.
     #[test]
     fn a_delimiter_cut_across_chunks_completes_its_frame_on_the_second() {
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}";
-        for (delimiter, cut) in [("\n\n", 1), ("\r\n\r\n", 2)] {
+        for (delimiter, cut) in [
+            ("\n\n", 1),
+            ("\r\r", 1),
+            ("\r\n\r\n", 1),
+            ("\r\n\r\n", 2),
+            ("\r\n\r\n", 3),
+        ] {
             let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
             let (head, tail) = delimiter.split_at(cut);
             let first = merge.step(Bytes::from(format!("{body}{head}")));
