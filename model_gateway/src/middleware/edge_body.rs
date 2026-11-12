@@ -33,7 +33,10 @@
 
 use std::{
     pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+    },
     task::{ready, Context, Poll},
     time::Instant,
 };
@@ -46,7 +49,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 
 use super::{
     logging::SpanDuty,
-    metrics::{BodyFailure, BodyProgress, ResponseOutcome},
+    metrics::{BodyProgress, ResponseOutcome},
     sse_keepalive::KeepAlive,
 };
 use crate::observability::{
@@ -79,18 +82,28 @@ pub(crate) struct BodyDuties {
     /// The request span, open until the body ends, with the client-close
     /// line the access log owes if the body is dropped first.
     pub(crate) span: Option<SpanDuty>,
-    /// The producer's word on a streamed body that tells the client of a
-    /// failure and then ends as planned: read at the body's end, so the
-    /// response counts as what the client read (see [`BodyFailure`]).
+    /// The response's cell, when the body's producer holds it for its word
+    /// on a streamed body that tells the client of a failure and then ends
+    /// as planned (see [`BodyFailure`]): set by [`take`](Self::take), read
+    /// at the body's end, so the response counts as what the client read.
     pub(crate) failure: Option<BodyFailure>,
 }
 
-/// The response extension that carries [`BodyDuties`] out to the metrics
-/// layer. `http::Extensions` holds `Clone` values only, so the duties, none
-/// of them clonable, travel in a shared cell; the metrics layer takes them
-/// out before the response reaches the server.
+/// The one shared cell of a response: the [`BodyDuties`] on their way out to
+/// the metrics layer, and the producer's word on the body ([`BodyFailure`]).
+/// `http::Extensions` holds `Clone` values only, so the duties, none of them
+/// clonable, travel behind a lock, and the metrics layer takes them out
+/// before the response reaches the server; the word is an atomic the
+/// producer sets from the body and the edge reads at the body's end.
+#[derive(Default)]
+struct DutyCell {
+    duties: Mutex<BodyDuties>,
+    failed: AtomicBool,
+}
+
+/// The response extension that carries the [`DutyCell`].
 #[derive(Clone, Default)]
-struct DutySlot(Arc<Mutex<BodyDuties>>);
+struct DutySlot(Arc<DutyCell>);
 
 impl BodyDuties {
     /// Hands the edge's body wrapper a duty through `response`'s extensions:
@@ -99,21 +112,71 @@ impl BodyDuties {
         let slot = response
             .extensions_mut()
             .get_or_insert_default::<DutySlot>();
-        fill(&mut slot.0.lock().unwrap_or_else(PoisonError::into_inner));
+        fill(&mut slot.0.duties.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
     /// Takes the duties handed over for `response`; none when no layer
-    /// inside had one.
+    /// inside had one. A cell the body's producer still holds, for its word,
+    /// stays shared and comes along as the duties' `failure`.
     pub(crate) fn take(response: &mut Response) -> Self {
         let Some(DutySlot(cell)) = response.extensions_mut().remove::<DutySlot>() else {
             return Self::default();
         };
         match Arc::try_unwrap(cell) {
-            Ok(duties) => duties.into_inner().unwrap_or_else(PoisonError::into_inner),
+            Ok(cell) => cell
+                .duties
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
             Err(shared) => {
-                std::mem::take(&mut *shared.lock().unwrap_or_else(PoisonError::into_inner))
+                let mut duties = std::mem::take(
+                    &mut *shared.duties.lock().unwrap_or_else(PoisonError::into_inner),
+                );
+                duties.failure = Some(BodyFailure(shared));
+                duties
             }
         }
+    }
+}
+
+/// The word of a streamed body's producer that the body told the client of a
+/// failure on its way out: the error event a stream the worker failed ends
+/// with, before its `[DONE]`. Such a body ends with its own last frame, so
+/// the frames alone say it went out in full; counted by them, a stream the
+/// engine cut was a plain 200. The word lives in the response's one cell,
+/// with no allocation of its own: the producer builds the cell with its
+/// body, puts it on the response ([`carry`](Self::carry)) for the layers
+/// outside to hand their duties into, and tells the word from the body; the
+/// edge reads it once the body has ended, and the response then counts as
+/// its head's status with [`BODY_FAILED_CODE`], what the client read. A body
+/// with no producer's word is counted by its frames alone.
+///
+/// [`BODY_FAILED_CODE`]: super::metrics::BODY_FAILED_CODE
+#[derive(Clone, Default)]
+pub(crate) struct BodyFailure(Arc<DutyCell>);
+
+impl BodyFailure {
+    /// Makes the cell this word lives in `response`'s one: the layers
+    /// outside hand their duties into it, the edge reads the word from it.
+    /// A duty handed inside before this moves over.
+    pub(crate) fn carry(&self, response: &mut Response) {
+        let inside = response
+            .extensions_mut()
+            .insert(DutySlot(Arc::clone(&self.0)));
+        if let Some(DutySlot(inside)) = inside {
+            let handed =
+                std::mem::take(&mut *inside.duties.lock().unwrap_or_else(PoisonError::into_inner));
+            *self.0.duties.lock().unwrap_or_else(PoisonError::into_inner) = handed;
+        }
+    }
+
+    /// The producer's word: the body ended with the client told of a failure.
+    pub(crate) fn tell(&self) {
+        self.0.failed.store(true, Ordering::Release);
+    }
+
+    /// Whether the producer told of a failure.
+    pub(crate) fn told(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
     }
 }
 
@@ -145,7 +208,8 @@ pub(crate) struct EdgeBody {
     span: Option<SpanDuty>,
     permit: Option<Box<dyn Permit>>,
     keep_alive: Option<KeepAlive>,
-    /// The producer's word on how the body ended, when it gives one.
+    /// The response's cell, when the body's producer holds it for its word
+    /// on how the body ended.
     failure: Option<BodyFailure>,
     /// Whether a frame was ever asked for. A body dropped before any poll is
     /// one the server never meant to send (the answer to a HEAD request), not
@@ -625,5 +689,43 @@ mod tests {
             vec![line(Level::INFO, "finished processing request")]
         );
         drop(body);
+    }
+
+    /// The producer's word and the duties share the response's one cell,
+    /// whichever reached the response first: the duties come out at the
+    /// edge with the word's cell, and the word the body tells is the word
+    /// the edge reads.
+    #[test]
+    fn the_producers_word_and_the_duties_share_one_cell() {
+        for duty_first in [true, false] {
+            let mut response = Response::new(Body::empty());
+            let head_at = Instant::now();
+            let word = BodyFailure::default();
+            if duty_first {
+                BodyDuties::hand(&mut response, |duties| duties.head_at = Some(head_at));
+                word.carry(&mut response);
+            } else {
+                word.carry(&mut response);
+                BodyDuties::hand(&mut response, |duties| duties.head_at = Some(head_at));
+            }
+            let mut duties = BodyDuties::take(&mut response);
+            assert_eq!(duties.head_at, Some(head_at), "duty first: {duty_first}");
+            let edge = duties.failure.take().expect("the cell comes along");
+            assert!(!edge.told(), "duty first: {duty_first}");
+            word.tell();
+            assert!(edge.told(), "duty first: {duty_first}");
+        }
+    }
+
+    /// A response whose producer gave no word hands the edge its duties
+    /// alone: nothing to read at the body's end.
+    #[test]
+    fn a_response_without_a_producers_word_hands_the_edge_no_cell() {
+        let mut response = Response::new(Body::empty());
+        let head_at = Instant::now();
+        BodyDuties::hand(&mut response, |duties| duties.head_at = Some(head_at));
+        let duties = BodyDuties::take(&mut response);
+        assert_eq!(duties.head_at, Some(head_at));
+        assert!(duties.failure.is_none());
     }
 }
