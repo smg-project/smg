@@ -822,7 +822,14 @@ impl KvEventMonitor {
     /// member of, or the reservation of a removal under way.
     #[cfg(test)]
     async fn slot_ids(&self, worker_url: &str) -> (Option<u64>, Option<u64>) {
-        match self.subscriptions.lock().await.workers.get(worker_url) {
+        let subs = self.subscriptions.lock().await;
+        Self::ids_under(&subs, worker_url)
+    }
+
+    /// [`Self::slot_ids`] under a lock the caller holds.
+    #[cfg(test)]
+    fn ids_under(subs: &Subscriptions, worker_url: &str) -> (Option<u64>, Option<u64>) {
+        match subs.workers.get(worker_url) {
             Some(Slot::Member { engine, .. }) => (Some(*engine), None),
             Some(Slot::Removing(held)) => (None, Some(held.id)),
             None => (None, None),
@@ -1025,8 +1032,18 @@ mod tests {
 
     /// A gRPC worker at [`REFUSING_URL`].
     fn refusing_grpc_worker() -> Arc<dyn Worker> {
+        refusing_grpc_worker_at(REFUSING_URL)
+    }
+
+    /// The replacement test's address, another closed port: its registry
+    /// registrations publish the address's series, which the late-write
+    /// test's retirement assertions on [`REFUSING_URL`] must not see.
+    const REPLACED_URL: &str = "grpc://127.0.0.1:3";
+
+    /// A gRPC worker at `url`, a closed port.
+    fn refusing_grpc_worker_at(url: &str) -> Arc<dyn Worker> {
         Arc::new(
-            BasicWorkerBuilder::new(REFUSING_URL)
+            BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
                 .connection_mode(ConnectionMode::Grpc)
                 .runtime_type(RuntimeType::TokenSpeed)
@@ -1451,65 +1468,103 @@ mod tests {
         monitor.stop().await;
     }
 
-    /// The restart of a membership started for another object reserves the
-    /// slot on the turn of the lock that found it: before the removal has
-    /// ended, the slot holds that removal's reservation and no membership,
-    /// and a further add for the URL waits on the reservation instead of
-    /// removing by URL, so a membership started in between is never the one
-    /// a stale restart ends.
+    /// The restart takes the membership it found under the URL on the lock
+    /// turn that found it. Made on a later turn, by URL, the removal would
+    /// take whatever membership sat there by then, and between the two
+    /// turns another add can run. The test holds the lock when the restart
+    /// is first polled and queues a read of the slot behind the restart's
+    /// turn: the lock is fair, so the read runs the moment that turn ends,
+    /// before any later turn, and finds the reservation. The rest is the
+    /// race run to its end: a third object replaces the second while the
+    /// restart waits for the old removal, the resumed restart reads the
+    /// registry on its next turn and takes nothing, and the third's add
+    /// starts its own membership.
     #[traced_test]
     #[tokio::test]
-    async fn a_restart_reserves_the_slot_before_it_waits_for_the_old_task() {
+    async fn a_restart_reserves_the_slot_on_its_own_lock_turn() {
         let monitor = Arc::new(KvEventMonitor::new());
-        let url = REFUSING_URL;
-        let first = refusing_grpc_worker();
+        let registry = Arc::new(WorkerRegistry::new());
+        monitor.set_worker_registry(&registry);
+        let url = REPLACED_URL;
+        let first = refusing_grpc_worker_at(url);
+        registry
+            .register(Arc::clone(&first))
+            .expect("the first registration under the address");
         monitor
             .on_worker_added(&first, SubscriptionKind::Loads)
             .await;
         let (active, removing) = monitor.slot_ids(url).await;
         assert!(active.is_some(), "the first add put the worker on a stream");
         assert_eq!(removing, None);
-        let old = Arc::downgrade(&first);
         drop(first);
 
-        let second = refusing_grpc_worker();
-        let third = refusing_grpc_worker();
+        // The second replaces the first in place. Polled against a held
+        // lock, its restart queues for its first turn, and a read of the
+        // slot queues right behind it.
+        let second = refusing_grpc_worker_at(url);
+        registry.register_or_replace(Arc::clone(&second));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let mut restart = std::pin::pin!(monitor.on_worker_added(&second, SubscriptionKind::Loads));
+        let mut read = std::pin::pin!(monitor.subscriptions.lock());
+        let held = monitor.subscriptions.lock().await;
+        assert!(
+            std::future::Future::poll(restart.as_mut(), &mut cx).is_pending(),
+            "the restart queues for the held lock"
+        );
+        assert!(
+            std::future::Future::poll(read.as_mut(), &mut cx).is_pending(),
+            "the read queues behind the restart"
+        );
+        drop(held);
+        assert!(
+            std::future::Future::poll(restart.as_mut(), &mut cx).is_pending(),
+            "the restart's first turn ends in its wait for the old removal"
+        );
         {
-            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-            let mut restart =
-                std::pin::pin!(monitor.on_worker_added(&second, SubscriptionKind::Loads));
-            assert!(
-                std::future::Future::poll(restart.as_mut(), &mut cx).is_pending(),
-                "the restart waits for the old object's removal to end"
-            );
-            let (active, removing) = monitor.slot_ids(url).await;
+            let subs = read.await;
+            let (active, reserved) = KvEventMonitor::ids_under(&subs, url);
             assert_eq!(
                 active, None,
                 "no membership holds the slot through the wait"
             );
-            let reserved =
-                removing.expect("the removal's reservation holds the slot through the wait");
-            let mut later =
-                std::pin::pin!(monitor.on_worker_added(&third, SubscriptionKind::Loads));
             assert!(
-                std::future::Future::poll(later.as_mut(), &mut cx).is_pending(),
-                "an add on a reserved slot waits for the removal under way"
-            );
-            assert_eq!(
-                monitor.slot_ids(url).await,
-                (None, Some(reserved)),
-                "the waiting add removes nothing"
+                reserved.is_some(),
+                "the turn that found the membership left its reservation"
             );
         }
         assert!(logs_contain(
             "Restarting KV event subscription for a re-registered worker"
         ));
-        wait_until(
-            "the old task ends on its own and releases its object",
-            || old.upgrade().is_none(),
+
+        // A third object replaces the second while the restart waits. The
+        // restart's next turn (queued on the lock since its first) reads
+        // the registry first and ends with nothing taken: no stream for an
+        // object the registry no longer holds, the slot left to the third's
+        // add.
+        let third = refusing_grpc_worker_at(url);
+        registry.register_or_replace(Arc::clone(&third));
+        assert!(
+            std::future::Future::poll(restart.as_mut(), &mut cx).is_ready(),
+            "the resumed restart ends for an object the registry no longer holds"
+        );
+        assert!(logs_contain(
+            "no KV event stream for a worker the registry no longer holds"
+        ));
+
+        // The third's add waits out the removal under way and puts its
+        // object on a membership of its own.
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            monitor.on_worker_added(&third, SubscriptionKind::Loads),
         )
-        .await;
-        monitor.stop().await;
+        .await
+        .expect("the third add ends once the old removal has");
+        let (active, removing) = monitor.slot_ids(url).await;
+        assert!(active.is_some(), "the third add put the worker on a stream");
+        assert_eq!(removing, None);
+        tokio::time::timeout(Duration::from_secs(30), monitor.stop())
+            .await
+            .expect("the stop ends the stream left");
     }
 
     /// The add that restarts a membership waits for the old object's
