@@ -2778,9 +2778,7 @@ async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_str
         .await
         .expect("the iteration dispatches");
     match execution_result {
-        crate::routers::grpc::context::ExecutionResult::Single { mut stream, .. } => {
-            while stream.next().await.is_some() {}
-        }
+        ExecutionResult::Single { mut stream, .. } => while stream.next().await.is_some() {},
         _ => panic!("a regular worker answers with one stream"),
     }
     assert_eq!(
