@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
-import signal
 import subprocess
 import time
 from pathlib import Path
@@ -38,6 +38,41 @@ class Guard:
         self.proc.mkdir()
         self.bin = tmp_path / "bin"
         shutil.copytree(SHIMS, self.bin)
+        # All cleanup signals and package/network commands stay inside this
+        # fixture, including shell-builtin kill and xargs' external kill.
+        smi = self.bin / "nvidia-smi"
+        smi.write_text(
+            smi.read_text().replace('"/proc/$1/stat"', '"$CI_GPU_GUARD_PROC_ROOT/$1/stat"')
+        )
+        self.signals = self.state / "signals"
+        self.apt_calls = self.state / "apt-calls"
+        self.network_calls = self.state / "network-calls"
+        scripts = {
+            "kill": """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_SMI_STATE/signals"
+for pid in "$@"; do
+    case "$pid" in *[!0-9]*|'') continue ;; esac
+    if [ -f "$CI_GPU_GUARD_PROC_ROOT/$pid/stat" ]; then
+        printf '%s (fixture) Z 0\n' "$pid" > "$CI_GPU_GUARD_PROC_ROOT/$pid/stat"
+    fi
+done
+""",
+            "apt-get": """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_SMI_STATE/apt-calls"
+exit 97
+""",
+            "sudo": '#!/bin/bash\nexec "$@"\n',
+            "fuser": "#!/bin/bash\nexit 1\n",
+            "curl": '#!/bin/bash\nprintf "curl %s\\n" "$*" >> "$FAKE_SMI_STATE/network-calls"\nexit 98\n',
+            "wget": '#!/bin/bash\nprintf "wget %s\\n" "$*" >> "$FAKE_SMI_STATE/network-calls"\nexit 98\n',
+        }
+        for name, source in scripts.items():
+            executable = self.bin / name
+            executable.write_text(source)
+            executable.chmod(0o755)
+        self.apt_root = tmp_path / "empty-apt"
+        self.apt_root.mkdir()  # no apt.conf.d: the old mirror helper returns without a probe
+        self.bootstrap = tmp_path / "guard-isolation.sh"
 
     def busy(self, mib: int = 80327, cards: tuple[int, ...] = (0, 1)) -> None:
         (self.state / "used").write_text("".join(f"{card} {mib}\n" for card in cards))
@@ -63,6 +98,7 @@ class Guard:
         (with a job marker or not) and, when ``device`` is given, an fd on it."""
         directory = self.proc / str(pid)
         (directory / "fd").mkdir(parents=True)
+        (directory / "stat").write_text(f"{pid} (fixture) S 0\n")
         (directory / "cmdline").write_bytes(command.replace(" ", "\0").encode() + b"\0")
         environ = {"HOME": "/home/runner"}
         if marker:
@@ -86,6 +122,19 @@ class Guard:
             "RUNNER_NAME": "runner-new",
             "E2E_JOB_MARKER": THIS_JOB,
         }
+        original_hook = os.environ.get("BASH_ENV")
+        self.bootstrap.write_text(
+            (f"source {shlex.quote(original_hook)}\n" if original_hook else "")
+            + f'kill() {{ {shlex.quote(str(self.bin / "kill"))} "$@"; }}\n'
+            + """command() {
+    if [ "${1-}" = -v ]; then
+        case " ${FAKE_GUARD_MISSING_TOOLS:-} " in *" ${2-} "*) return 1 ;; esac
+    fi
+    builtin command "$@"
+}
+"""
+        )
+        env.update(BASH_ENV=str(self.bootstrap), CI_APT_ROOT=str(self.apt_root))
         started = time.monotonic()
         result = subprocess.run(
             ["bash", str(SCRIPT), "nuke_gpus"], env=env, capture_output=True, text=True, timeout=120
@@ -169,20 +218,17 @@ def test_full_cards_that_never_drain_fail_after_the_window_naming_an_outside_hol
 
 
 def test_a_visible_holder_is_ended_and_the_cards_pass(guard: Guard) -> None:
-    holder = subprocess.Popen(["sleep", "300"])
-    try:
-        guard.busy()
-        guard.visible(holder.pid)
-        result = guard.run(wait=30)
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert holder.wait(timeout=10) == -signal.SIGKILL
-        assert f" {holder.pid} " in result.stdout  # the process table listed it
-        assert error_lines(result.stdout) == []
-        assert result.elapsed < 10
-    finally:
-        if holder.poll() is None:
-            holder.kill()
-            holder.wait()
+    pid = 4242
+    guard.process(pid, "python -m fixture.engine", marker=THIS_JOB, device="/dev/nvidia0")
+    guard.busy()
+    guard.visible(pid)
+    result = guard.run(wait=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (guard.proc / str(pid) / "stat").read_text() == f"{pid} (fixture) Z 0\n"
+    assert f"-9 {pid}" in guard.signals.read_text().splitlines()
+    assert f" {pid} " in result.stdout  # the process table listed it
+    assert error_lines(result.stdout) == []
+    assert result.elapsed < 10
 
 
 def test_a_holder_in_this_job_view_is_named_with_the_job_that_started_it(guard: Guard) -> None:
@@ -365,3 +411,26 @@ echo() {
     )
     lines = result.stdout.splitlines()
     assert lines[lines.index(error) + 1 :] == ["GPU 0: 80327 MiB used", "GPU 1: 80327 MiB used"]
+
+
+@pytest.mark.parametrize("fuser_present", [True, False], ids=["fuser-present", "no-holder-tools"])
+def test_cleanup_needs_no_apt_even_when_lsof_is_missing(guard: Guard, monkeypatch, fuser_present):
+    # Keep an executable lsof trap so old-code control runs cannot fall through
+    # to a host utility, while command -v models its absence on the real runner.
+    missing = "lsof" if fuser_present else "lsof fuser"
+    monkeypatch.setenv("FAKE_GUARD_MISSING_TOOLS", missing)
+    result = guard.run(wait=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not guard.apt_calls.exists(), "cleanup attempted a forbidden runtime apt install"
+    assert not guard.network_calls.exists(), "cleanup attempted a forbidden network probe"
+    assert error_lines(result.stdout) == []
+
+
+def test_cleanup_records_only_scratch_device_holders_without_signalling(guard: Guard):
+    guard.process(4242, "python -m fixture.engine", marker=THIS_JOB, device="/dev/nvidia0")
+    guard.process(4243, "python -m fixture.other", marker=OLD_JOB, device="/dev/nvidia1")
+    guard.process(4244, "python -m fixture.cpu", marker=THIS_JOB, device=None)
+    result = guard.run(wait=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert guard.signals.read_text().splitlines() == ["-9", "-9 4242 4243"]
+    assert " S " in (guard.proc / "4244" / "stat").read_text()
