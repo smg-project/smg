@@ -1647,6 +1647,10 @@ struct IntegrationArgs {
     #[arg(long, env = "ATP_POOL_TIMEOUT_SECS", help_heading = "Oracle Database")]
     oracle_pool_timeout_secs: Option<u64>,
 
+    /// Bound in seconds on each call to the Oracle store (pool wait, connect and the statement); a call past it is answered 503 storage_unavailable (default: 5)
+    #[arg(long, env = "ATP_OP_TIMEOUT_SECS", help_heading = "Oracle Database")]
+    oracle_op_timeout_secs: Option<u64>,
+
     // ==================== PostgreSQL Database ====================
     /// PostgreSQL database connection URL (env: SMG_POSTGRES_DB_URL; or a
     /// file holding it, --postgres-db-url-file). The flag beats the
@@ -2518,10 +2522,17 @@ mod tests {
             "postgres://u:p@h:5432/d",
             "--redis-url",
             "redis://h:6379",
+            "--oracle-dsn",
+            "tcps://h:1522/s",
+            "--oracle-user",
+            "u",
+            "--oracle-password",
+            "p",
         ];
         let args = cli_args_from(&stores);
         assert_eq!(args.build_postgres_config(None).unwrap().op_timeout_secs, 5);
         assert_eq!(args.build_redis_config(None).unwrap().op_timeout_secs, 5);
+        assert_eq!(args.build_oracle_config(None).unwrap().op_timeout_secs, 5);
 
         let mut argv = stores.to_vec();
         argv.extend([
@@ -2529,6 +2540,8 @@ mod tests {
             "12",
             "--redis-op-timeout-secs",
             "3",
+            "--oracle-op-timeout-secs",
+            "7",
         ]);
         let args = cli_args_from(&argv);
         assert_eq!(
@@ -2536,6 +2549,7 @@ mod tests {
             12
         );
         assert_eq!(args.build_redis_config(None).unwrap().op_timeout_secs, 3);
+        assert_eq!(args.build_oracle_config(None).unwrap().op_timeout_secs, 7);
 
         let mut argv = stores.to_vec();
         argv.extend([
@@ -2543,11 +2557,15 @@ mod tests {
             "0",
             "--redis-op-timeout-secs",
             "0",
+            "--oracle-op-timeout-secs",
+            "0",
         ]);
         let args = cli_args_from(&argv);
         let err = args.build_postgres_config(None).unwrap_err().to_string();
         assert!(err.contains("op_timeout_secs"), "{err}");
         let err = args.build_redis_config(None).unwrap_err().to_string();
+        assert!(err.contains("op_timeout_secs"), "{err}");
+        let err = args.build_oracle_config(None).unwrap_err().to_string();
         assert!(err.contains("op_timeout_secs"), "{err}");
     }
 
