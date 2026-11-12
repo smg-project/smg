@@ -3567,6 +3567,18 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
+    /// A Prefill admission refusal (the queue full, or a queued request that
+    /// waited out its admission timeout) is this process's own backpressure:
+    /// the retry layer does not replay it on another pair, where a plain
+    /// retryable answer, such as a worker's 503, is replayed.
+    #[test]
+    fn a_prefill_admission_refusal_is_not_retried() {
+        assert!(!PDRouter::should_retry_pd_response(&prefill_queue_full()));
+        assert!(!PDRouter::should_retry_pd_response(&prefill_queue_timeout()));
+        let worker_refusal = error::service_unavailable("worker_unavailable", "a worker is down");
+        assert!(PDRouter::should_retry_pd_response(&worker_refusal));
+    }
+
     /// A side that does not answer within the request's timeout ends the
     /// request, on the concurrent dispatch shape and on the sequential one:
     /// one attempt on the pair, the 504 `call_upstream_timeout` to the client
