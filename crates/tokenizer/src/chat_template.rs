@@ -21,7 +21,7 @@ use chrono::{
 use minijinja::{
     machinery::{
         ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
-        parse, WhitespaceConfig,
+        parse, tokenize, Token, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
     value::{DynObject, Enumerator, Kwargs, Object, ObjectRepr, ValueKind},
@@ -105,7 +105,9 @@ pub enum ThinkingToggle {
 }
 
 /// Detect whether the chat template supports a thinking/reasoning toggle
-/// and what its default value is.
+/// and what its default value is. A `thinking` variable counts where the
+/// template's code reads it (`mentions_thinking_variable`), not where its
+/// prose prints the word.
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
     if template.contains("think_begin_token")
         && template.contains("no_think")
@@ -171,8 +173,13 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 /// thinking ...`, `thinking is ...`, `thinking == ...`, `set thinking ...`).
 /// The word must stand alone: `clear_thinking is defined` (GLM-5.3) or
 /// `thinking_mode`/`thinking_budget` name other variables, and a template
-/// that only reads those has no thinking switch.
+/// that only reads those has no thinking switch. Only the template's code
+/// is read (`jinja_code`): the MiniMax M3.1 template prints the prose
+/// "When thinking is enabled" from a string literal and branches on no
+/// variable, so it has no switch either.
 fn mentions_thinking_variable(template: &str) -> bool {
+    let code = jinja_code(template);
+    let template = code.as_str();
     template.match_indices("thinking").any(|(start, matched)| {
         let before = &template[..start];
         let after = &template[start + matched.len()..];
@@ -187,6 +194,35 @@ fn mentions_thinking_variable(template: &str) -> bool {
             || after.starts_with(" ==")
             || ((before.ends_with("if ") || before.ends_with("set ")) && after.starts_with(' '))
     })
+}
+
+/// The template's code with everything else blanked to spaces: the text the
+/// template prints (the data outside the blocks and inside a `{% raw %}`
+/// block) and the string literals; the comments never reach the lexer's
+/// tokens. Built from minijinja's own tokenizer, so a block ends where the
+/// lexer ends it (a nested dict literal's `}}` does not close a `{{ }}`
+/// block). A word of the result is a variable, a keyword or an operator the
+/// template evaluates; the words a template prints are not in it. A template
+/// the lexer refuses is read whole, as the detector read every template
+/// before this view.
+fn jinja_code(template: &str) -> String {
+    let mut code = vec![b' '; template.len()];
+    for item in tokenize(template, false, SyntaxConfig, WhitespaceConfig::default()) {
+        match item {
+            Ok((Token::TemplateData(_) | Token::Str(_) | Token::String(_), _)) => {}
+            Ok((_, span)) => {
+                let (start, end) = (span.start_offset as usize, span.end_offset as usize);
+                if let (Some(from), Some(to)) = (
+                    template.as_bytes().get(start..end),
+                    code.get_mut(start..end),
+                ) {
+                    to.copy_from_slice(from);
+                }
+            }
+            Err(_) => return template.to_string(),
+        }
+    }
+    String::from_utf8(code).unwrap_or_else(|_| template.to_string())
 }
 
 /// Detect the content format expected by a Jinja2 chat template
