@@ -12,6 +12,10 @@ use openai_protocol::worker::TagVocabulary;
 
 use super::Grammar;
 
+mod lark;
+
+pub use self::lark::{AddedTokens, Inexpressible, Lark};
+
 /// The grammar backend a worker's engine compiles constraints on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GrammarBackend {

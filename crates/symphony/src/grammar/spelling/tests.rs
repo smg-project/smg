@@ -25,7 +25,7 @@ fn tool(name: &str, parameters: serde_json::Value) -> Tool {
     }
 }
 
-fn tools() -> Vec<Tool> {
+pub(super) fn tools() -> Vec<Tool> {
     vec![
         tool(
             "get_weather",
@@ -37,7 +37,7 @@ fn tools() -> Vec<Tool> {
 
 /// Every registry table's forced tag, `auto` tag and JSON answer, for both bounds on the calls
 /// and every start: the grammars the gateway sends.
-fn every_grammar() -> Vec<(String, Grammar)> {
+pub(super) fn every_grammar() -> Vec<(String, Grammar)> {
     let tools = tools();
     let schema = Arc::new(json!({"type": "object", "properties": {"answer": {"type": "string"}}}));
     let mut grammars = Vec::new();
