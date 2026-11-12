@@ -3851,6 +3851,13 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
         r"a split pattern with the end anchor, which the file's own encoder reads as the end of the text only: [a-z]+|\s+$|\s"
     );
     assert!(NativeEncoder::from_ranks(&ranks, r"[a-z]+|\s", &[]).is_ok());
+    // The digit-grouping lookahead parses, but its word boundary reads the
+    // Hugging Face engine's word class, not the one the file's own encoder
+    // reads (`1234²` would cut apart).
+    assert_eq!(
+        declined(&ranks, r"\d{1,3}(?=(?:\d{3})*\b)|[a-z]+|\s", &[]),
+        r"a split pattern with the digit-grouping lookahead, whose word boundary the file's own encoder reads with another word class: \d{1,3}(?=(?:\d{3})*\b)|[a-z]+|\s"
+    );
     assert_eq!(
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),
         "special token \"\" without content"

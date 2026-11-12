@@ -392,7 +392,11 @@ pub(super) enum Node {
     /// holds a multiple of `size` characters and the word boundary holds
     /// after it (the text ends there, or the next character is outside
     /// the `word` class), or when the boundary holds at the position
-    /// itself (see [`Op::GroupsAhead`]).
+    /// itself (see [`Op::GroupsAhead`]). The boundary at the position reads
+    /// the character before it, so the node stands only behind an atom
+    /// that must consume in its alternative ([`groups_ahead_leads`]): the
+    /// character it reads is one the match consumed, inside any unit of
+    /// the thread pool as in the whole text.
     GroupsAhead {
         class: usize,
         size: u32,
@@ -462,6 +466,9 @@ pub(crate) struct Pattern {
     part: Option<chain::Part>,
     /// Whether the pattern holds the end anchor (see [`Self::end_anchored`]).
     end_anchored: bool,
+    /// Whether the pattern holds the digit-grouping lookahead (see
+    /// [`Self::reads_word_boundary`]).
+    reads_word_boundary: bool,
 }
 
 /// The matcher of a pattern: a hand-written scanner for the two template
@@ -551,7 +558,7 @@ impl Pattern {
         if parser.chars.next().is_some() {
             return None;
         }
-        if can_match_empty(&root) {
+        if can_match_empty(&root) || groups_ahead_leads(&root, true) {
             return None;
         }
         first_sets(&mut root, &parser.classes);
@@ -567,6 +574,7 @@ impl Pattern {
         };
         let part = chain::Part::recognize(&root);
         let end_anchored = holds_end(&root);
+        let reads_word_boundary = holds_groups_ahead(&root);
         let mut program = Vec::new();
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
@@ -578,6 +586,7 @@ impl Pattern {
             matcher,
             part,
             end_anchored,
+            reads_word_boundary,
         })
     }
 
@@ -605,6 +614,14 @@ impl Pattern {
     /// (see `NativeEncoder::stable_cut`).
     pub(super) fn end_anchored(&self) -> bool {
         self.end_anchored
+    }
+
+    /// Whether the pattern holds the digit-grouping lookahead, whose word
+    /// boundary reads the Hugging Face engine's word class: a file whose own
+    /// encoder reads `\b` with another class is declined on its path (see
+    /// `NativeEncoder::from_ranks`).
+    pub(super) fn reads_word_boundary(&self) -> bool {
+        self.reads_word_boundary
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
@@ -1395,6 +1412,41 @@ fn can_match_empty(node: &Node) -> bool {
         Node::Concat(nodes) => nodes.iter().all(can_match_empty),
         Node::Alt { alternatives, .. } => alternatives.iter().any(can_match_empty),
         Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => true,
+    }
+}
+
+/// Whether a [`Node::GroupsAhead`] under `node` can be evaluated at the
+/// start of a match (`leading` says nothing that must consume stands before
+/// `node` in its alternative): its word boundary would read the character
+/// before the match, which a unit of the thread pool does not hold where the
+/// whole text does, so such a pattern declines.
+fn groups_ahead_leads(node: &Node, leading: bool) -> bool {
+    match node {
+        Node::GroupsAhead { .. } => leading,
+        Node::Concat(nodes) => {
+            let mut leading = leading;
+            nodes.iter().any(|node| {
+                let leads = groups_ahead_leads(node, leading);
+                leading = leading && can_match_empty(node);
+                leads
+            })
+        }
+        Node::Alt { alternatives, .. } => alternatives
+            .iter()
+            .any(|alternative| groups_ahead_leads(alternative, leading)),
+        Node::Repeat { node, .. } => groups_ahead_leads(node, leading),
+        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+    }
+}
+
+/// Whether `node` holds the digit-grouping lookahead anywhere.
+fn holds_groups_ahead(node: &Node) -> bool {
+    match node {
+        Node::GroupsAhead { .. } => true,
+        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+        Node::Repeat { node, .. } => holds_groups_ahead(node),
+        Node::Concat(nodes) => nodes.iter().any(holds_groups_ahead),
+        Node::Alt { alternatives, .. } => alternatives.iter().any(holds_groups_ahead),
     }
 }
 
@@ -2308,6 +2360,15 @@ mod tests {
             r"(?=(?:\d{0})*\b)",
             r"\d(?=(?:\d{3})*\b)?",
             r"(?i:\d(?=(?:\d{3})*\b))",
+            // the lookahead at a match's start: its boundary would read the
+            // character before the match, which a unit of the pool lacks
+            r"(?=(?:\d{3})*\b)\d",
+            r"(?=(?:\d{3})*\b) [a-z]+|[a-z]+",
+            r"\d?(?=(?:\d{3})*\b)\d",
+            r"\d*(?=(?:\d{3})*\b)\d",
+            r"(?:\d|(?=(?:\d{3})*\b))\d",
+            r"\d|(?=(?:\d{3})*\b)\d",
+            r"(?:(?=(?:\d{3})*\b)\d)?\d",
             r"\p{Hiragana}",
             r"a{3,1}",
             r"[z-a]",

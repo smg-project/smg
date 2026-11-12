@@ -1621,6 +1621,16 @@ impl NativeEncoder {
                  end of the text only: {pattern}"
             )));
         }
+        // The file's own encoder reads the word boundary with another word
+        // class (the UTS#18 set, without the other numbers such as `²`),
+        // where the subset reads it as the Hugging Face engine does: a
+        // pattern with the digit-grouping lookahead is declined on this path.
+        if parsed.reads_word_boundary() {
+            return Err(Declined::from(format!(
+                "a split pattern with the digit-grouping lookahead, whose word boundary the file's \
+                 own encoder reads with another word class: {pattern}"
+            )));
+        }
         if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
             return Err(Declined::from(format!(
                 "special token {content:?} without content"
@@ -2114,8 +2124,11 @@ impl NativeEncoder {
     /// that is not whitespace, where the patterns, run over the text around
     /// it, cut cleanly ([`Self::piece_starts_at`]). No piece spans such a
     /// point (letters, digits and punctuation stop at the space, a whitespace
-    /// run cannot start before it) and the patterns have no lookbehind, so
-    /// the pieces of the two halves are the pieces of the whole. `None` when
+    /// run cannot start before it) and the patterns read nothing before a
+    /// match's start (the digit-grouping lookahead's word boundary reads the
+    /// character before it, one its match consumed: the parser declines the
+    /// lookahead where it could lead a match), so the pieces of the two
+    /// halves are the pieces of the whole. `None` when
     /// the text has no such point past `from`, or when
     /// [`MAX_REJECTED_CUT_CANDIDATES`] candidates past `from` failed the
     /// check: a stretch without candidates (a blob, a table of numbers) costs
