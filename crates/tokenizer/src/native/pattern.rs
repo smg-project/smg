@@ -458,7 +458,12 @@ pub(super) enum Node {
     /// `second`, taken whole. It stands at the end of its alternative or
     /// before the negative lookahead over its own unit
     /// ([`unit_run_misplaced`]): there the engine's greedy repeat never has
-    /// a unit to give back, so the longest run is the match.
+    /// a unit to give back, so the longest run is the match. The classes may
+    /// share characters: every way of cutting a run into units ends at the
+    /// same place, since a character outside `second` is covered only by a
+    /// pair that starts on it, and a lone `second` wherever one fits is the
+    /// most units, so the run's end and its count against `min` are the
+    /// engine's whichever way it backtracks.
     UnitRun {
         first: usize,
         second: usize,
@@ -1143,6 +1148,15 @@ impl Pattern {
                     }
                 }
                 Op::UnitRun { first, second, min } => {
+                    // A lone `second` is tried before a pair, the reverse of
+                    // the engine's `X?Y`: every cutting of a run into units
+                    // ends at the same place (a character outside `second`
+                    // is covered only by a pair that starts on it) and the
+                    // lone character wherever one fits is the most units, so
+                    // the end and the count against `min` are the engine's
+                    // whichever way it backtracks, the classes sharing
+                    // characters or not (`Node::UnitRun`; the direct test's
+                    // `(?:[ab]?[bc]){3,}` row pins it).
                     let mut count = 0u32;
                     let mut p = pos;
                     loop {
