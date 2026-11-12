@@ -1335,7 +1335,7 @@ that role on the text path, and where its
 frontend dispatches to the encoders the plan ends its shapes with one image
 through them (the prompt the model's chat template renders around the
 engine's own minimal warm-up image; a template without an image placeholder
-leaves the side out, a side the encoders cannot serve yet is a logged step), so
+leaves the media step out, a media step the encoders cannot serve yet is a logged step), so
 the scheduler's first media forward is paid before SERVING too; under
 data parallelism the servicer routes a request by load, not by rank, so each
 prefill shape warms one rank and the log says so),
