@@ -625,17 +625,6 @@ impl KvEventMonitor {
     }
 
     /// Stop all subscriptions and clean up.
-    /// The ids under a URL's slot: the active subscription's, or the
-    /// reservation's of a removal under way.
-    #[cfg(test)]
-    async fn slot_ids(&self, worker_url: &str) -> (Option<u64>, Option<u64>) {
-        match self.worker_handles.lock().await.get(worker_url) {
-            Some(Slot::Active(sub)) => (Some(sub.id), None),
-            Some(Slot::Removing(held)) => (None, Some(held.id)),
-            None => (None, None),
-        }
-    }
-
     pub async fn stop(&self) {
         let subscriptions: Vec<(String, WorkerSubscription)> = {
             let mut handles = self.worker_handles.lock().await;
@@ -674,6 +663,17 @@ impl KvEventMonitor {
 
         self.indexers.clear();
         self.block_sizes.clear();
+    }
+
+    /// The ids under a URL's slot: the active subscription's, or the
+    /// reservation's of a removal under way.
+    #[cfg(test)]
+    async fn slot_ids(&self, worker_url: &str) -> (Option<u64>, Option<u64>) {
+        match self.worker_handles.lock().await.get(worker_url) {
+            Some(Slot::Active(sub)) => (Some(sub.id), None),
+            Some(Slot::Removing(held)) => (None, Some(held.id)),
+            None => (None, None),
+        }
     }
 
     /// Get the indexer for a model (used by `CacheAwarePolicy` for queries).

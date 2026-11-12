@@ -934,8 +934,9 @@ impl AppContextBuilder {
     /// cache-aware policy streams its KV events into the model's index, every
     /// other gRPC worker streams its load records alone, so load-aware
     /// routing prices a worker by a record at the engine's cadence rather
-    /// than by the last poll (the `UpdatePoliciesStep` picks the kind per
-    /// worker; HTTP and ZMQ workers are never subscribed). The monitor itself
+    /// than by the last poll (`start_kv_stream` picks the kind per worker,
+    /// for a registration and for an update that rebuilt the worker alike;
+    /// HTTP and ZMQ workers are never subscribed). The monitor itself
     /// is cheap (empty maps) and stays dormant until workers are added; a
     /// model without an events subscription has no index and no index
     /// gauges.
