@@ -1221,7 +1221,7 @@ fn classify_frame(frame: &[u8]) -> Frame<'_> {
 
 /// Position and length of the first frame delimiter at or after `from`:
 /// `\r\n\r\n`, `\n\n` or `\r\r`.
-fn find_frame_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+pub(crate) fn find_frame_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     (from..buf.len()).find_map(|i| {
         if buf[i..].starts_with(b"\r\n\r\n") {
             Some((i, 4))

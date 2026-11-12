@@ -1569,7 +1569,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_messages_thread_turns_total",
-        "Message-thread turns on the Messages route, by op (create, continue) and outcome (stored: the answer is kept under its id; reissued: kept under a fresh id, the answer's id being a stored turn's; unstored: answered, not kept; not_found, mismatch: a continue refused before the model ran)"
+        "Message-thread turns on the Messages route, by op (create, continue) and outcome (stored: the answer is kept under its id; reissued: kept under a fresh id, the answer's id being a stored turn's; unstored: answered, not kept, a stream cut before its message_stop among them; not_found, mismatch: a continue refused before the model ran)"
     );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
