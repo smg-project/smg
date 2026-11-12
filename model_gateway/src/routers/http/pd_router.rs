@@ -2211,6 +2211,9 @@ impl PDRouter {
         capacity: Option<&PrefillSelectionContext<'_>>,
     ) -> Result<PdPair, Box<PairFailure>> {
         let pairs = self.pd_pairs(model_id);
+        let has_capacity = |worker: &Arc<dyn Worker>| {
+            capacity.is_none_or(|capacity| capacity.has_capacity(worker))
+        };
         placement::place_pair_through_engine(
             &self.worker_registry,
             &self.policy_registry,
@@ -2219,7 +2222,7 @@ impl PDRouter {
             &pairs,
             None,
             false,
-            capacity,
+            &has_capacity,
             inputs,
         )
         .map(|pair| (pair.prefill, pair.decode))

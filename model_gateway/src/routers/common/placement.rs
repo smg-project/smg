@@ -1835,9 +1835,11 @@ pub(crate) fn commit_pair(
 
 /// [`select_pair`] through the policy engine inside the admission callback,
 /// as the routers run it under `--policy-engine engine`: the decision over
-/// the window as the lock reads it (`capacity`, `None` with admission off),
-/// its commit under the same hold, and one re-decision with the ids a
-/// refused commit missed before the at-capacity verdict queues the request.
+/// the window as the lock reads it (`has_capacity`: the routers' read of the
+/// admission context, every prefill open with admission off), its commit
+/// under the same hold, and one re-decision with the ids a refused commit
+/// missed before the at-capacity verdict queues the request. The window is
+/// read again at each step, never remembered from the one before.
 #[expect(
     clippy::too_many_arguments,
     reason = "the engine seam threads every routing input plus the window"
@@ -1850,11 +1852,9 @@ pub(crate) fn place_pair_through_engine(
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     homogeneous_runtime: bool,
-    capacity: Option<&PrefillSelectionContext<'_>>,
+    has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
-    let has_capacity =
-        |worker: &Arc<dyn Worker>| capacity.is_none_or(|capacity| capacity.has_capacity(worker));
     let decide = |excluded: &[WorkerId]| {
         decide_pair(
             registry,
@@ -1864,7 +1864,7 @@ pub(crate) fn place_pair_through_engine(
             pairs,
             wire,
             homogeneous_runtime,
-            &has_capacity,
+            has_capacity,
             inputs,
             excluded,
         )
@@ -1875,7 +1875,7 @@ pub(crate) fn place_pair_through_engine(
         decider,
         model_id,
         decide(&[])?,
-        &has_capacity,
+        has_capacity,
         &mut missed,
     ) {
         Ok(pair) => return Ok(pair),
@@ -1889,7 +1889,7 @@ pub(crate) fn place_pair_through_engine(
         decider,
         model_id,
         decide(&missed)?,
-        &has_capacity,
+        has_capacity,
         &mut Vec::new(),
     )
 }
@@ -1936,6 +1936,7 @@ pub(crate) fn retain_decodes_with_a_room(
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::{Cell, RefCell},
         collections::{BTreeMap, HashMap},
         sync::Mutex,
         time::Duration,
@@ -2251,6 +2252,89 @@ mod tests {
         assert_eq!(pair.decode.url(), "grpc://d:1");
         assert_eq!(decider.decisions(), 2, "one re-decision");
         assert!(missed.is_empty(), "a committed pair leaves no miss behind");
+    }
+
+    /// The seam the routers call, with the window closing between the
+    /// decision and the commit. The prelude reads the window once and the
+    /// engine's view once per prefill, so its fourth read is the first
+    /// commit's, and that read finds the decided prefill's window closed:
+    /// the commit refuses, the miss is recorded, the one re-decision pairs
+    /// the other prefill, and one call places the pair with two decisions.
+    #[test]
+    fn the_seam_re_decides_once_when_the_window_closes_before_the_commit() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let reads = Cell::new(0_u32);
+        let closed: RefCell<Option<String>> = RefCell::new(None);
+        let has_capacity = |worker: &Arc<dyn Worker>| {
+            reads.set(reads.get() + 1);
+            if reads.get() == 4 {
+                *closed.borrow_mut() = Some(worker.url().to_string());
+            }
+            closed.borrow().as_deref() != Some(worker.url())
+        };
+        let pair = place_pair_through_engine(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &has_capacity,
+            PlacementInputs::default(),
+        )
+        .expect("the re-decision pairs the other prefill");
+        let closed = closed
+            .borrow()
+            .clone()
+            .expect("the first commit read the window");
+        assert_ne!(
+            pair.prefill.url(),
+            closed,
+            "the closed prefill is not paired"
+        );
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+        assert_eq!(decider.decisions(), 2, "one re-decision");
+    }
+
+    /// A window that closes between the prelude's read and the engine's:
+    /// the prelude saw a prefill with capacity, the engine's capacity filter
+    /// then empties the pool, and the host's verdict is still the one the
+    /// request waits on (`pair_shed` maps the capacity shed to it).
+    #[test]
+    fn a_capacity_shed_past_the_prelude_is_the_at_capacity_verdict() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let first_read = Cell::new(true);
+        let has_capacity = |_: &Arc<dyn Worker>| first_read.replace(false);
+        let shed = place_pair_through_engine(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &has_capacity,
+            PlacementInputs::default(),
+        )
+        .err()
+        .expect("the engine shed the pool on its capacity filter");
+        assert_eq!(shed.role, WorkerRole::Prefill);
+        assert!(matches!(shed.verdict, PlacementFailure::PrefillAtCapacity));
+        assert_eq!(decider.decisions(), 1, "the engine decided once");
     }
 
     /// A prefill pool the window admits nothing of waits for a slot (the
@@ -5105,5 +5189,50 @@ mod tests {
             "no fallback outside the host's veto"
         );
         assert_eq!(decider.decisions(), 5, "one re-decision, never a second");
+    }
+
+    /// The commit re-reads the decode partner's liveness as it re-reads the
+    /// prefill's window. With one prefill the window's third read is the
+    /// first commit's; the decided decode goes down at that read, the
+    /// commit misses the pair, and the re-decision finds no open partner
+    /// left: the seam refuses with the decode role's unavailability, as
+    /// `pair_shed` maps a decode side with nothing open. A commit that only
+    /// checks the partner exists places the request on the dead decode.
+    #[test]
+    fn the_commit_refuses_a_decode_partner_that_died_after_the_decision() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let decode = registry
+            .get_by_url("grpc://d:1")
+            .expect("the decode registers");
+        let reads = Cell::new(0_u32);
+        let has_capacity = |_: &Arc<dyn Worker>| {
+            reads.set(reads.get() + 1);
+            if reads.get() == 3 {
+                decode.set_status(WorkerStatus::NotReady);
+            }
+            true
+        };
+        let refused = place_pair_through_engine(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &has_capacity,
+            PlacementInputs::default(),
+        )
+        .err()
+        .expect("no live decode is left for the pair");
+        assert!(reads.get() >= 3, "the commit read the window");
+        assert_eq!(refused.role, WorkerRole::Decode);
+        assert!(matches!(refused.verdict, PlacementFailure::Unavailable));
     }
 }

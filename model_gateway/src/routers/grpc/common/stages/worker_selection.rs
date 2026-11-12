@@ -1894,6 +1894,9 @@ impl WorkerSelectionStage {
         demand: PairDemands,
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
         let pairs = self.pd_pairs(model_id);
+        let has_capacity = |worker: &Arc<dyn Worker>| {
+            capacity.is_none_or(|capacity| capacity.has_capacity(worker))
+        };
         let pair = Self::with_pd_pair_inputs(model_id, inputs, wire, demand, &pairs, |inputs| {
             placement::place_pair_through_engine(
                 &self.worker_registry,
@@ -1903,7 +1906,7 @@ impl WorkerSelectionStage {
                 &pairs,
                 wire,
                 true,
-                capacity,
+                &has_capacity,
                 inputs,
             )
         })?;
