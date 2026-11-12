@@ -1313,11 +1313,9 @@ mod tests {
     /// 8, 3.x takes 8, 12 and 16) and its frame grown to 1024x1024, which the
     /// frame header alone would read and serve from the 4 MiB class.
     #[test]
-    #[expect(clippy::print_stderr)]
     fn a_header_the_library_cannot_read_takes_no_buffer() {
         use crate::buffer_pool::{self, BufferPool};
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the unreadable-header test");
+        if !crate::test_support::turbojpeg_or_skip("the unreadable-header test") {
             return;
         }
         let mut jpeg = unequal_sampling_cmyk_jpeg();
@@ -1752,11 +1750,9 @@ mod tests {
     /// answers `None` with no buffer taken, where the frame header alone
     /// would serve the 4 MiB class.
     #[test]
-    #[expect(clippy::print_stderr)]
     fn a_two_component_frame_takes_no_buffer() {
         use crate::buffer_pool::{self, BufferPool};
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the two-component test");
+        if !crate::test_support::turbojpeg_or_skip("the two-component test") {
             return;
         }
         let jpeg = two_component_jpeg();
