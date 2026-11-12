@@ -3557,4 +3557,114 @@ mod tests {
             });
         });
     }
+
+    /// A rank worker re-registered under its URL while its sibling streams:
+    /// the old object's membership ends on the engine's stream (its blocks
+    /// out of the index, the object released) and the new object joins that
+    /// stream as a late rank, so the engine starts over from zero for its
+    /// rank alone, counted as the joiner's resync; the sibling keeps its
+    /// blocks, skips the replay up to its cursor and takes what follows,
+    /// and the rank's replayed batches are indexed under the new object
+    /// (the index hands a freed id out again, so the id itself says nothing).
+    #[test]
+    fn a_rank_re_registered_beside_a_streaming_sibling_rejoins_its_engines_stream() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                // The first stream moves both cursors to 1; the stream after
+                // the re-registration replays both ranks from the start, goes
+                // past rank 0's cursor and brings rank 1 a second batch.
+                let steps = std::collections::VecDeque::from([
+                    Step::Stays(vec![Ok(ranked_batch_at(0, 1)), Ok(ranked_batch_at(1, 1))]),
+                    Step::Stays(vec![
+                        Ok(ranked_batch_at(0, 1)),
+                        Ok(ranked_batch_at(1, 1)),
+                        Ok(ranked_batch_at(1, 2)),
+                        Ok(ranked_batch_at(0, 2)),
+                    ]),
+                ]);
+                let (addr, server) = serve(Subscribe::Sequence {
+                    calls: Arc::clone(&calls),
+                    steps: Arc::new(Mutex::new(steps)),
+                })
+                .await;
+                let first = rank_worker(addr, 0, 2);
+                let second = rank_worker(addr, 1, 2);
+                let monitor = KvEventMonitor::new();
+                monitor
+                    .on_worker_added(&first, SubscriptionKind::Events)
+                    .await;
+                monitor
+                    .on_worker_added(&second, SubscriptionKind::Events)
+                    .await;
+                let index = monitor
+                    .get_indexer(UNKNOWN_MODEL_ID)
+                    .expect("the model's index");
+                wait_until("the engine's stream delivers both ranks' first batches", || {
+                    [&first, &second].into_iter().all(|worker| {
+                        index
+                            .worker_id(worker.url())
+                            .is_some_and(|id| index.worker_block_count(id) == 1)
+                    })
+                })
+                .await;
+                assert_eq!(calls.lock().unwrap().len(), 1);
+
+                // The registry replaced rank 1's object under its URL.
+                let replacement = rank_worker(addr, 1, 2);
+                monitor
+                    .on_worker_added(&replacement, SubscriptionKind::Events)
+                    .await;
+                wait_until("the engine resubscribes for the re-registered rank", || {
+                    calls.lock().unwrap().len() == 2
+                })
+                .await;
+                assert_eq!(
+                    calls.lock().unwrap()[1].start_sequence_number,
+                    0,
+                    "the stream after the re-registration starts from zero"
+                );
+                wait_until(
+                    "rank 1's replayed batches land under the new object and rank 0 goes past its cursor",
+                    || {
+                        index
+                            .worker_id(replacement.url())
+                            .is_some_and(|id| index.worker_block_count(id) == 2)
+                            && index
+                                .worker_id(first.url())
+                                .is_some_and(|id| index.worker_block_count(id) == 2)
+                    },
+                )
+                .await;
+                wait_until("the old object is released", || {
+                    Arc::strong_count(&second) == 1
+                })
+                .await;
+                assert_eq!(
+                    engine_members(&monitor, first.base_url()).await,
+                    Some(2)
+                );
+                assert_eq!(
+                    resyncs(&handle, replacement.url(), Some("rank_joined")),
+                    1.0,
+                    "the restart is the re-registered rank's resync"
+                );
+                assert_eq!(
+                    resyncs(&handle, first.url(), None),
+                    0.0,
+                    "the sibling keeps its blocks: the replay below its cursor is no restart"
+                );
+                monitor.stop().await;
+                server.abort();
+            });
+        });
+    }
 }
