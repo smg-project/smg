@@ -342,8 +342,8 @@ impl std::fmt::Display for WorkerServiceError {
                 write!(
                     f,
                     "Worker at URL '{url}' with ID {id} is being removed; its removal drains \
-                    it for up to {drain_secs}s before the URL is free. Retry once \
-                    GET /workers/{id} answers 404."
+                    it for {drain_secs}s, the worker's configured drain, before the URL is \
+                    free. Retry once GET /workers/{id} answers 404."
                 )
             }
             Self::CreateInProgress { url, worker_id } => {
@@ -1101,7 +1101,8 @@ mod tests {
         assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
         let message = body["error"].as_str().expect("a message");
         assert!(
-            message.contains("is being removed") && message.contains("up to 7s"),
+            message.contains("is being removed")
+                && message.contains("for 7s, the worker's configured drain"),
             "the refusal names the removal and its drain: {message}"
         );
         assert!(
