@@ -402,6 +402,15 @@ pub(super) enum Node {
         size: u32,
         word: usize,
     },
+    /// `([class])\1*` or `([class])\1+`, the capture read back at once: one
+    /// character of the class, then that same character while it repeats,
+    /// `at_least` characters in all. Taken only as the last atom of a
+    /// top-level alternative, where the engine's greedy backreference has
+    /// nothing after it to give characters back to.
+    RunOfOne {
+        class: usize,
+        at_least: u32,
+    },
 }
 
 /// The characters a match of a node can begin with: a table of the ASCII
@@ -510,6 +519,10 @@ enum Op {
         size: u32,
         word: usize,
     },
+    /// One character of the class, then the same character while it repeats
+    /// (`at_least` in all); nothing follows it in its alternative, so the run
+    /// is taken whole and leaves no choice.
+    RunOfOne { class: usize, at_least: u32 },
     /// A choice: the ops that follow are tried first; `next` is where to go
     /// when they fail (the following alternative's `Split`, the op after an
     /// optional group, or [`NO_NEXT`] for the last alternative). `first`
@@ -593,7 +606,7 @@ impl Pattern {
         if parser.chars.next().is_some() {
             return None;
         }
-        if can_match_empty(&root) || groups_ahead_leads(&root, true) {
+        if can_match_empty(&root) || groups_ahead_leads(&root, true) || misplaced_run(&root, true) {
             return None;
         }
         first_sets(&mut root, &parser.classes);
@@ -883,6 +896,27 @@ impl Pattern {
                         true
                     }
                 }
+                Op::RunOfOne { class, at_least } => match next_char(text, pos) {
+                    Some((c, len)) if self.classes[class].contains(c) => {
+                        let mut count = 1u32;
+                        let mut p = pos + len;
+                        while let Some((d, n)) = next_char(text, p) {
+                            if d != c {
+                                break;
+                            }
+                            p += n;
+                            count += 1;
+                        }
+                        if count < at_least {
+                            true
+                        } else {
+                            pos = p;
+                            pc += 1;
+                            false
+                        }
+                    }
+                    _ => true,
+                },
                 Op::Split { next, first } => {
                     let excluded = match next_char(text, pos) {
                         Some((c, _)) => !self.firsts[first].may_start(c),
@@ -1434,6 +1468,10 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             size: *size,
             word: *word,
         }),
+        Node::RunOfOne { class, at_least } => program.push(Op::RunOfOne {
+            class: *class,
+            at_least: *at_least,
+        }),
     }
 }
 
@@ -1441,7 +1479,11 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
 /// alternation on a path leaves one until the path is done or backs off.
 fn choices(node: &Node) -> usize {
     match node {
-        Node::Class(_) | Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => 0,
+        Node::Class(_)
+        | Node::NotAhead(_)
+        | Node::End
+        | Node::GroupsAhead { .. }
+        | Node::RunOfOne { .. } => 0,
         Node::ClassRepeat { possessive, .. } => usize::from(!*possessive),
         Node::Repeat { node, max, .. } => {
             if *max == 0 {
@@ -1516,6 +1558,7 @@ fn can_match_empty(node: &Node) -> bool {
         Node::Concat(nodes) => nodes.iter().all(can_match_empty),
         Node::Alt { alternatives, .. } => alternatives.iter().any(can_match_empty),
         Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => true,
+        Node::RunOfOne { .. } => false,
     }
 }
 
@@ -1539,7 +1582,11 @@ fn groups_ahead_leads(node: &Node, leading: bool) -> bool {
             .iter()
             .any(|alternative| groups_ahead_leads(alternative, leading)),
         Node::Repeat { node, .. } => groups_ahead_leads(node, leading),
-        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::End
+        | Node::RunOfOne { .. } => false,
     }
 }
 
@@ -1547,7 +1594,11 @@ fn groups_ahead_leads(node: &Node, leading: bool) -> bool {
 fn holds_groups_ahead(node: &Node) -> bool {
     match node {
         Node::GroupsAhead { .. } => true,
-        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::End
+        | Node::RunOfOne { .. } => false,
         Node::Repeat { node, .. } => holds_groups_ahead(node),
         Node::Concat(nodes) => nodes.iter().any(holds_groups_ahead),
         Node::Alt { alternatives, .. } => alternatives.iter().any(holds_groups_ahead),
@@ -1562,10 +1613,34 @@ fn holds_end(node: &Node) -> bool {
         Node::Class(_)
         | Node::ClassRepeat { .. }
         | Node::NotAhead(_)
-        | Node::GroupsAhead { .. } => false,
+        | Node::GroupsAhead { .. }
+        | Node::RunOfOne { .. } => false,
         Node::Repeat { node, .. } => holds_end(node),
         Node::Concat(nodes) => nodes.iter().any(holds_end),
         Node::Alt { alternatives, .. } => alternatives.iter().any(holds_end),
+    }
+}
+
+/// Whether a [`Node::RunOfOne`] sits anywhere but at the end of a top-level
+/// alternative (`last` says the node ends one): there the engine's greedy
+/// backreference could give characters back to what follows, which the run
+/// never does, so such a pattern declines.
+fn misplaced_run(node: &Node, last: bool) -> bool {
+    match node {
+        Node::RunOfOne { .. } => !last,
+        Node::Concat(nodes) => nodes
+            .iter()
+            .enumerate()
+            .any(|(i, node)| misplaced_run(node, last && i + 1 == nodes.len())),
+        Node::Alt { alternatives, .. } => alternatives
+            .iter()
+            .any(|alternative| misplaced_run(alternative, last)),
+        Node::Repeat { node, .. } => misplaced_run(node, false),
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::End
+        | Node::GroupsAhead { .. } => false,
     }
 }
 
@@ -1617,6 +1692,7 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
             nullable: true,
             ..First::default()
         },
+        Node::RunOfOne { class, .. } => classes[*class].first(),
     }
 }
 
@@ -1778,7 +1854,9 @@ impl Parser<'_> {
                 max,
                 possessive,
             },
-            Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => return None,
+            Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } | Node::RunOfOne { .. } => {
+                return None
+            }
             // A possessive group would need the engine's rule for the choices
             // inside it (an atomic group): declined.
             _ if possessive => return None,
@@ -1842,8 +1920,9 @@ impl Parser<'_> {
     }
 
     fn parse_group(&mut self) -> Option<Node> {
-        if self.chars.next()? != '?' {
-            return None;
+        let first = self.chars.next()?;
+        if first != '?' {
+            return self.parse_repeated_character(first);
         }
         match self.chars.next()? {
             ':' => {
@@ -1923,6 +2002,33 @@ impl Parser<'_> {
             }
         };
         Some(Node::GroupsAhead { class, size, word })
+    }
+
+    /// A capturing group read back at once, `([class])\1*` or `([class])\1+`
+    /// (a run of one repeated character, as a parse family's punctuation
+    /// stage writes it): the group holds one class, the backreference follows
+    /// it with its quantifier, and nothing else may follow in the alternative
+    /// (`Pattern::parse` checks the placement). Every other capture or
+    /// backreference, and the shape under `(?i:)`, declines.
+    fn parse_repeated_character(&mut self, first: char) -> Option<Node> {
+        if self.case_insensitive {
+            return None;
+        }
+        let class = match first {
+            '\\' => self.parse_escape_as_class()?,
+            '[' => self.parse_class_body()?,
+            _ => return None,
+        };
+        if self.chars.next()? != ')' || self.chars.next()? != '\\' || self.chars.next()? != '1' {
+            return None;
+        }
+        let at_least = match self.chars.next()? {
+            '*' => 1,
+            '+' => 2,
+            _ => return None,
+        };
+        let class = self.add_class(class);
+        Some(Node::RunOfOne { class, at_least })
     }
 
     /// A group whose alternatives are each one character of a class
@@ -2201,7 +2307,11 @@ mod tests {
     /// characters, the joiners as code-point escapes.
     const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 20] = [
+    /// A parse family's punctuation stage: a bracket, or a capturing group
+    /// of one punctuation character read back at once (a run of it).
+    const PUNCTUATION_RUNS: &str = r#"[\(\)\[\]\{\}]|([!"\#\$%\&'\*\+,\-\./:;<=>\?\\\^_`\|\~])\1*"#;
+
+    const PATTERNS: [&str; 21] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -2222,6 +2332,7 @@ mod tests {
         END_LETTERS,
         END_GROUP,
         DIGIT_GROUPS,
+        PUNCTUATION_RUNS,
     ];
 
     /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
@@ -2508,6 +2619,21 @@ mod tests {
             r"\s+$|^a",
             r"a$?",
             r"(?:a|$)",
+            // a capture or a backreference outside the one shape taken
+            r"(a)\1*",
+            r"([ab])\1",
+            r"([ab])\1?",
+            r"([ab])\2*",
+            r"([ab]|c)\1*",
+            r"(\p{L}\p{M})\1*",
+            r"\1",
+            r"([ab])\1*+",
+            r"(?i:([ab])\1*)",
+            // the run with something after it in its alternative
+            r"([ab])\1*c",
+            r"([ab])\1*|c([ab])\1*d",
+            r"(?:([ab])\1*)?",
+            r"(?:x([ab])\1*)y",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
@@ -2624,6 +2750,53 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// A capturing group read back at once is a run of one repeated
+    /// character, cut as the engine's greedy backreference cuts it; the run
+    /// may end a top-level alternative anywhere in the alternation.
+    #[test]
+    fn a_repeated_character_run_is_cut_as_the_engine_cuts_it() {
+        fn runs(pattern: &str, text: &str) -> Vec<(usize, usize)> {
+            Pattern::parse(pattern)
+                .expect("parses")
+                .find_iter(text)
+                .collect()
+        }
+        for (pattern, text) in [
+            (PUNCTUATION_RUNS, "a...b, c!!!d (()) ... ,,,. .,"),
+            (PUNCTUATION_RUNS, "..."),
+            (PUNCTUATION_RUNS, ".a.a."),
+            (PUNCTUATION_RUNS, "[[]]{}()"),
+            (
+                PUNCTUATION_RUNS,
+                "---\\\\ ``` ~~ || ^^ __ // :: ;; << == >> ?? ** ++ ,, '' \"\" ## $$ %% && ..",
+            ),
+            (PUNCTUATION_RUNS, "a\u{0301}..\u{0301}.\u{00e9}"),
+            (r"([ab])\1*", "aaabbbab"),
+            (r"([ab])\1+", "aaabbbab"),
+            (r"x|([ab])\1*", "xaaxbb"),
+            (r"(?:x|([ab])\1*)", "xaaxbb"),
+            (r"(\p{L})\1*", "aa\u{00e9}\u{00e9}bb ccc"),
+            (r"(\s)\1+", "a  b \t\t c"),
+        ] {
+            assert_eq!(
+                runs(pattern, text),
+                oracle_matches(pattern, text),
+                "{pattern} on {text:?}"
+            );
+        }
+        assert_eq!(
+            runs(r"([ab])\1*", "aaabbbab"),
+            vec![(0, 3), (3, 6), (6, 7), (7, 8)]
+        );
+        assert_eq!(runs(r"([ab])\1+", "aaabbbab"), vec![(0, 3), (3, 6)]);
+        let parsed = Pattern::parse(PUNCTUATION_RUNS).expect("parses");
+        assert!(matches!(parsed.matcher, Matcher::Program));
+        assert!(parsed
+            .program
+            .iter()
+            .any(|op| matches!(op, Op::RunOfOne { at_least: 1, .. })));
     }
 
     #[test]
