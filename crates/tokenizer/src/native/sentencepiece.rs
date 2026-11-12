@@ -1,11 +1,13 @@
 //! A sentencepiece-style vocabulary with byte fallback on the native encode
 //! path (Gemma, Llama 2 and their kin). Such a vocabulary has no `ByteLevel`
 //! stage: the spaces of the text become the word marker U+2581 (a `Replace`
-//! normalizer, or the `Metaspace` pre-tokenizer of the Llama class, which
-//! also prepends the marker by its scheme), the text between two added
-//! tokens is one word of the model, and the model's `merge_word` makes a
-//! symbol of each character the vocabulary has and of each byte (`<0xHH>`)
-//! of one it has not, then merges. This module gives that word pieces: a cut
+//! normalizer, alone or after a `Prepend` normalizer that puts the marker
+//! before every text between added tokens, or the `Metaspace`
+//! pre-tokenizer of the Llama class, which also prepends the marker by its
+//! scheme), the text between two added tokens is one word of the model,
+//! and the model's `merge_word` makes a symbol of each character the
+//! vocabulary has and of each byte (`<0xHH>`) of one it has not, then
+//! merges. This module gives that word pieces: a cut
 //! between two adjacent bytes that no vocabulary token holds adjacent can
 //! never be crossed by a merge (a merge's product is a vocabulary token, and
 //! it would hold the pair), so the pieces merge on their own to the ids of
@@ -195,8 +197,9 @@ impl CharSymbols {
     }
 
     /// Whether the word marker goes before a text: one that starts a text
-    /// between added tokens (`starts_text`), under the `Always` scheme; the
-    /// one at the start of the input (`at_input_start`), under `First`.
+    /// between added tokens (`starts_text`), under the `Always` scheme and
+    /// the `Prepend` normalizer (`Every`); the one at the start of the
+    /// input (`at_input_start`), under `First`.
     pub(super) fn prepends(&self, starts_text: bool, at_input_start: bool) -> bool {
         match self.marker {
             Marker::Never => false,
