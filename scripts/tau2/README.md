@@ -20,7 +20,7 @@ Two arms expose an identical OpenAI `/v1` endpoint. The same `tau2` CLI is point
 
 | file | what |
 |---|---|
-| `launch_arms.sh` | bring up one arm (`a` = pure vLLM, `b` = vLLM gRPC worker + SMG gateway); prints its base_url on stdout; `stop` tears down all arms via pidfiles. Fully env-parameterised. |
+| `launch_arms.sh` | bring up one arm (`a` = pure vLLM, `b` = vLLM gRPC worker + SMG gateway); prints its base_url on stdout. AMD uses owned sessions and completion receipts; NVIDIA retains its existing launcher and cleanup. Fully env-parameterised. |
 | `run_ab.py` | point `tau2 run` at both arms (one domain at a time), read back `results.json`, compute pass^1 and pass^k per domain, emit a markdown + JSON comparison table, and apply a regression gate. Arms must already be serving. |
 
 ## Quick start (manual, e.g. on a GPU box)
@@ -32,6 +32,9 @@ cd ~/tau/tau2-bench && uv sync
 ~/vllm-env/bin/pip install ninja          # then ensure ~/vllm-env/bin is on PATH
 
 # 1) bring up both arms (here: Qwen3.8-27B, TP=2, one arm per GPU pair)
+# Admission and approved paid-policy setup are separate prerequisites.
+export TAU2_SCOPE="manual-$(date +%s)-$$"
+export TAU2_RUN_DIR="${TMPDIR:-/tmp}/$TAU2_SCOPE"  # separate directory per comparison
 export TAU2_MODEL=Qwen/Qwen3.8-27B VLLM_BIN=~/vllm-env/bin/vllm \
        VLLM_PYTHON=~/vllm-env/bin/python SMG_LAUNCH="$HOME/smg/target/ci/smg launch" \
        TAU2_TP=2 TAU2_MAX_MODEL_LEN=16384 PATH=~/vllm-env/bin:$PATH
@@ -59,7 +62,7 @@ python scripts/tau2/run_ab.py \
 bash launch_arms.sh stop
 ```
 
-Key env knobs for `launch_arms.sh`: `TAU2_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `TAU2_TP` (tensor-parallel size — match the GPU count), `TAU2_MAX_MODEL_LEN`, `TAU2_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `TAU2_VLLM_EXTRA` for extra vLLM flags, and `TAU2_ARM_A_PORT` / `TAU2_ARM_B_GRPC_PORT` / `TAU2_ARM_B_GW_PORT` / `TAU2_ARM_B_METRICS_PORT` to pin ports (default: OS-assigned free ports, so concurrent arms/jobs on one host don't collide).
+Key env knobs for `launch_arms.sh`: `TAU2_GPU` (selected vendor device list, e.g. `0,1`), `TAU2_TP` (tensor-parallel size — match the GPU count), `TAU2_MAX_MODEL_LEN`, `TAU2_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `TAU2_VLLM_EXTRA` for extra vLLM flags, and `TAU2_ARM_A_PORT` / `TAU2_ARM_B_GRPC_PORT` / `TAU2_ARM_B_GW_PORT` / `TAU2_ARM_B_METRICS_PORT` to pin ports (default: OS-assigned free ports, so concurrent arms/jobs on one host don't collide).
 
 `run_ab.py` exits non-zero if the candidate's overall pass^k drops more than `--tolerance` (default 2pp) below the baseline. Use `--max-concurrency N` to run N tau2 simulations per arm in parallel (the lever that keeps large runs within a time budget).
 
@@ -271,3 +274,66 @@ A timeout or HTTP error from the exact uncharged loopback agent remains a
 simulation/quality failure, without halting the shared paid ledger. Unknown
 clients, redirects outside the fixed request contract, and paid request failures
 still halt it and make budget acceptance fail independently of quality tolerance.
+
+### Optional AMD native arms (source capability, off by default)
+
+`SMG_RUN_AMD_TAU2=true` adds `qwen3.8-amd` to the existing matrix. This is
+independent of ordinary AMD PR enablement. It uses the existing digest-pinned
+vLLM 0.31.0 ROCm image and `ci_setup_vllm_rocm_image.sh`, retaining
+`Qwen/Qwen3.8-27B`, concurrent TP2 arms (0,1 and 2,3), REST vLLM baseline and
+raw-token vLLM gRPC plus SMG candidate, the original parsers, retail/airline/
+telecom, 30 tasks per domain and two trials. AMD model/parser/task/timeout
+overrides that change this comparison are rejected. NVIDIA rows retain their
+native commands and package setup. No CUDA engine-wheel override runs on AMD.
+
+The AMD runner selector must resolve to the installed host preclaim service
+with a complete **390-minute** envelope: preparation15 + job360 + cleanup10 +
+margin5. That service owns the existing `/run/lock/amd-ci-gpu.lock` through the
+whole Worker and cleanup, checks the daily 05:00–06:30 UTC Router window and
+its profile expiry. A temporary mixed profile expires within24h; enabling the
+workflow does not extend it or establish permanent Sunday routing. The job
+creates no second host lock and never invokes GPU nuke/unknown-process cleanup
+on AMD. Opt-in does not grant runner maintenance, GPU admission or paid budget.
+
+On AMD, `launch_arms.sh` delegates to `native_arms.py`. Every AMD a/b/stop invocation
+requires the same absolute `TAU2_RUN_DIR` and nonempty unique `TAU2_SCOPE`.
+The workflow uses run ID, attempt and matrix name for both, including its
+independent always-cleanup step. The directory is private0700, refuses symlinks
+and foreign scope, and records only owned session supervisor identities
+(PID/start time/PGID/session, UID and random invocation cookie). The supervisor
+outlives an engine leader and reaps its session descendants before recording
+completion. Cleanup sends no signal if identity/cookie ownership is uncertain;
+missing/incomplete receipts fail the job. Linux pidfds pin each owner/member
+before identity checks and signal delivery; there is no numeric-PID signal fallback. TERM and KILL cleanup are finite;
+logs require no tail process. Startup failure, cancellation and timeout also
+clean already-started arms. This is process ownership, not proof of reclaimed
+GPU memory or escaped native processes; host preclaim remains the final
+full-Worker cleanup boundary. Unique scope directories are not reused across
+jobs. Sequential NVIDIA a-stop-b remains supported within one scope.
+
+NVIDIA keeps the original launch commands, PID files, process-group teardown
+and existing host-lock/recovery path. A failed stop retains a failing job status
+while that existing NVIDIA fallback still runs. AMD ownership refusal never
+enters the NVIDIA fallback. The pidfd and receipt guarantees above apply to the
+AMD helper; restoring the NVIDIA path does not establish new ownership guarantees
+or grant permission to clean processes outside its existing resource scope.
+
+Result uploads stage the current summary, JSON comparison, expected-task manifest,
+transcripts and available budget files under one workspace directory. This avoids
+the container runner's partial translation of a multi-line upload path and retains
+available diagnostics after a failed run; unrelated caches are not included.
+
+AMD selects each disjoint physical list through `HIP_VISIBLE_DEVICES`, rejects
+inherited nonempty HIP/ROCR/CUDA visibility to avoid double mapping, and checks
+unique numeric IDs and TP count before spawn. Actual ROCm ordinal isolation,
+exact model/quantization/parser/kernel support, endpoint/tool/reasoning output,
+GPU memory cleanup and quality parity still require admitted runtime testing
+on this exact image; CPU command capture cannot establish them. The other
+scheduled/manual models have no AMD capability claim from this batch.
+
+Existing task manifests/seed300, trial coverage, same-policy paid ledger across
+both arms/domains, request guards and final hard budget gate remain mandatory.
+Public provider facts have been collected separately; execution still needs
+approved call/USD/output/scope bounds and paid/GPU authorization. No provider
+call, GPU test or quality score is authorized by this source feature. A source
+review, command fixture or passing CPU workflow is not sustained CI acceptance.
