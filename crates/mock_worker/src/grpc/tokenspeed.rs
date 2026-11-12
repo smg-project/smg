@@ -331,8 +331,19 @@ fn check_encoder_input(item: &ts::MultimodalItem, what: &str) -> Result<bool, St
     let Some(tensor) = &item.encoder_input else {
         return Ok(false);
     };
-    read_tensor(tensor, what, "encoder_input")?;
+    read_tensor(tensor, TensorRole::Feature, what, "encoder_input")?;
     Ok(true)
+}
+
+/// What an item's tensor is to the engine servicer, which reads an SHM
+/// feature with a dtype rule of its own and a side tensor through its
+/// generic path.
+#[derive(Clone, Copy)]
+enum TensorRole {
+    /// The item's encoder input.
+    Feature,
+    /// A model-specific tensor beside it.
+    Side,
 }
 
 /// An item's tensor read as the engine reads it: an inline payload through
@@ -340,22 +351,40 @@ fn check_encoder_input(item: &ts::MultimodalItem, what: &str) -> Result<bool, St
 /// refuses, and an SHM handle with the servicer's checks (the gateway hands
 /// the gRPC wire SHM handles under its shm transport); `name` is the field in
 /// the refusal.
-fn read_tensor(tensor: &ts::TensorData, what: &str, name: &str) -> Result<(), Status> {
+fn read_tensor(
+    tensor: &ts::TensorData,
+    role: TensorRole,
+    what: &str,
+    name: &str,
+) -> Result<(), Status> {
     let read = match &tensor.payload {
-        Some(ts::tensor_data::Payload::Shm(handle)) => read_shm_handle(tensor, handle),
+        Some(ts::tensor_data::Payload::Shm(handle)) => read_shm_handle(tensor, role, handle),
         _ => wire_tensor_tokenspeed(tensor.clone()).map(|_| ()),
     };
     read.map_err(|error| Status::invalid_argument(format!("mock-worker: {what}'s {name}: {error}")))
 }
 
+/// The dtypes the engine servicer takes for an SHM feature; any other is
+/// refused before the handle is read.
+const SHM_FEATURE_DTYPES: [&str; 3] = ["bfloat16", "float16", "float32"];
+
 /// The engine servicer's reading of an SHM handle, the segment itself never
-/// opened: the offset is zero, the byte length is the dtype's width over the
-/// shape (a dtype the wire does not know passes, as the inline reader passes
-/// it), and the name is a bare segment name once a leading slash is stripped
-/// (no slash, dot entry or NUL inside).
-fn read_shm_handle(tensor: &ts::TensorData, handle: &common::ShmHandle) -> Result<(), String> {
-    if handle.offset != 0 {
-        return Err(format!("TensorData.shm offset {} is not 0", handle.offset));
+/// opened: a feature's dtype is one of [`SHM_FEATURE_DTYPES`] (a side tensor
+/// keeps its wire dtype, one the wire does not know passing as the inline
+/// reader passes it), the byte length is the dtype's width over the shape,
+/// and the name is a bare segment name once a leading slash is stripped (no
+/// slash, dot entry or NUL inside). The offset is free: the servicer reads a
+/// handle with one through its generic tensor path.
+fn read_shm_handle(
+    tensor: &ts::TensorData,
+    role: TensorRole,
+    handle: &common::ShmHandle,
+) -> Result<(), String> {
+    if matches!(role, TensorRole::Feature) && !SHM_FEATURE_DTYPES.contains(&tensor.dtype.as_str()) {
+        return Err(format!(
+            "unsupported TensorData dtype for an SHM feature: {:?} (one of {SHM_FEATURE_DTYPES:?})",
+            tensor.dtype
+        ));
     }
     if let Some(width) = tensor_dtype_width(&tensor.dtype) {
         let expected = tensor
@@ -426,7 +455,7 @@ fn check_media_items(
             }
         }
         for (key, tensor) in &item.model_specific_tensors {
-            read_tensor(tensor, &what, key)?;
+            read_tensor(tensor, TensorRole::Side, &what, key)?;
         }
         let spans = item
             .placeholders
@@ -872,9 +901,10 @@ mod tests {
     }
 
     /// An item's tensors are read as the engine reads them: an inline payload
-    /// whose bytes match the dtype and shape, or an SHM handle with a zero
-    /// offset, that byte length and a bare name, the encoder input and the
-    /// model-specific tensors alike.
+    /// whose bytes match the dtype and shape, or an SHM handle with that byte
+    /// length, a bare name and, for the feature, one of the servicer's three
+    /// dtypes (an offset is free), the encoder input and the model-specific
+    /// tensors alike.
     #[tokio::test]
     async fn a_tensor_is_read_as_the_wire_reads_it() {
         let (service, _stop) = service(65_367);
@@ -892,30 +922,36 @@ mod tests {
                 && status.message().contains("byte length 15"),
             "{status:?}"
         );
-        let shm = |name: &str, offset: u64, nbytes: u64| {
+        let shm = |name: &str, offset: u64, nbytes: u64, dtype: &str| {
             let mut item = image_item(1, 2);
-            item.encoder_input.as_mut().expect("the feature").payload =
-                Some(ts::tensor_data::Payload::Shm(common::ShmHandle {
-                    name: name.to_string(),
-                    offset,
-                    nbytes,
-                    ..Default::default()
-                }));
+            let feature = item.encoder_input.as_mut().expect("the feature");
+            feature.dtype = dtype.to_string();
+            feature.payload = Some(ts::tensor_data::Payload::Shm(common::ShmHandle {
+                name: name.to_string(),
+                offset,
+                nbytes,
+                ..Default::default()
+            }));
             item
         };
-        let mut stream = service
-            .generate(Request::new(with_items(
-                request("ts-mm-shm", &PROMPT),
-                vec![shm("smg-mm-1", 0, 16)],
-            )))
-            .await
-            .expect("an SHM handle the servicer would accept is accepted")
-            .into_inner();
-        assert!(stream.next().await.is_some(), "the answer streams");
+        for handle in [
+            shm("smg-mm-1", 0, 16, "float32"),
+            shm("smg-mm-1", 8, 16, "float32"),
+        ] {
+            let mut stream = service
+                .generate(Request::new(with_items(
+                    request("ts-mm-shm", &PROMPT),
+                    vec![handle],
+                )))
+                .await
+                .expect("an SHM handle the servicer would accept is accepted")
+                .into_inner();
+            assert!(stream.next().await.is_some(), "the answer streams");
+        }
         for (handle, refusal) in [
-            (shm("smg-mm-1", 0, 15), "byte length 15"),
-            (shm("smg-mm-1", 8, 16), "offset 8"),
-            (shm("../smg-mm-1", 0, 16), "name"),
+            (shm("smg-mm-1", 0, 15, "float32"), "byte length 15"),
+            (shm("../smg-mm-1", 0, 16, "float32"), "name"),
+            (shm("smg-mm-1", 0, 32, "int64"), "dtype"),
         ] {
             let status = refused(
                 &service,
