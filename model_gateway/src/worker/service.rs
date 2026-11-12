@@ -12,7 +12,8 @@ use axum::{
     Json,
 };
 use openai_protocol::worker::{
-    WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerUpdateRequest,
+    WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
+    WorkerUpdateRequest,
 };
 use serde_json::json;
 use smg_auth::AuditResource;
@@ -255,6 +256,13 @@ pub enum WorkerServiceError {
     BadRequest { message: String },
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
+    /// A worker at this URL is being removed: its removal drains it for
+    /// `drain_secs` before the URL is free (a POST inside that window)
+    RemovalInProgress {
+        url: String,
+        worker_id: WorkerId,
+        drain_secs: u64,
+    },
     /// A create for this URL is still in flight (concurrent POST)
     CreateInProgress { url: String, worker_id: WorkerId },
     /// A discovery provider owns the worker (a PUT, or a PATCH of labels, of a
@@ -279,6 +287,9 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => "BAD_REQUEST",
             Self::BadRequest { .. } => "BAD_REQUEST",
             Self::Conflict { .. } => "WORKER_ALREADY_EXISTS",
+            // The worker is still registered at the URL while it drains: the
+            // code the window answered before; the message says what holds.
+            Self::RemovalInProgress { .. } => "WORKER_ALREADY_EXISTS",
             Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
             Self::DiscoveryOwned { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
@@ -293,6 +304,7 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::RemovalInProgress { .. } => StatusCode::CONFLICT,
             Self::CreateInProgress { .. } => StatusCode::CONFLICT,
             Self::DiscoveryOwned { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
@@ -319,6 +331,19 @@ impl std::fmt::Display for WorkerServiceError {
                     f,
                     "Worker already exists at URL '{url}' with ID {id}. \
                     Use PUT /workers/{id} to replace or PATCH /workers/{id} to update."
+                )
+            }
+            Self::RemovalInProgress {
+                url,
+                worker_id,
+                drain_secs,
+            } => {
+                let id = worker_id.as_str();
+                write!(
+                    f,
+                    "Worker at URL '{url}' with ID {id} is being removed; its removal drains \
+                    it for up to {drain_secs}s before the URL is free. Retry once \
+                    GET /workers/{id} answers 404."
                 )
             }
             Self::CreateInProgress { url, worker_id } => {
@@ -354,11 +379,24 @@ impl std::error::Error for WorkerServiceError {}
 
 impl IntoResponse for WorkerServiceError {
     fn into_response(self) -> Response {
+        // A registration refused for a removal in progress says when to
+        // retry: the drain window, a second at least.
+        let retry_after = if let Self::RemovalInProgress { drain_secs, .. } = &self {
+            Some(http::HeaderValue::from((*drain_secs).max(1)))
+        } else {
+            None
+        };
         let error = WorkerErrorResponse {
             error: self.to_string(),
             code: self.error_code().to_string(),
         };
-        (self.status_code(), Json(error)).into_response()
+        let mut response = (self.status_code(), Json(error)).into_response();
+        if let Some(retry_after) = retry_after {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, retry_after);
+        }
+        response
     }
 }
 
@@ -546,12 +584,23 @@ impl WorkerService {
         let queue = self.get_job_queue()?;
 
         // Reserve (or retrieve) a stable ID for the 202 response.
-        // If this URL already has an active worker, reject with 409.
+        // If this URL already has an active worker, reject with 409. A worker
+        // its removal is draining holds the URL for the drain window; that
+        // answer says so and when to retry, instead of offering a PUT or a
+        // PATCH of a worker that is leaving.
         let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
-        if self.worker_registry.get(&worker_id).is_some() {
-            return Err(WorkerServiceError::Conflict {
-                url: worker_url,
-                worker_id,
+        if let Some(existing) = self.worker_registry.get(&worker_id) {
+            return Err(if existing.status() == WorkerStatus::Draining {
+                WorkerServiceError::RemovalInProgress {
+                    url: worker_url,
+                    worker_id,
+                    drain_secs: existing.metadata().health_config.drain_settle_secs,
+                }
+            } else {
+                WorkerServiceError::Conflict {
+                    url: worker_url,
+                    worker_id,
+                }
             });
         }
 
@@ -972,6 +1021,102 @@ mod tests {
 
         // The 202 was never sent, so nothing may keep the URL reserved (#1533).
         assert!(registry.get_url_by_id(&reserved).is_none());
+    }
+
+    /// The status, the body and the Retry-After header of an error's answer.
+    async fn answer(err: WorkerServiceError) -> (StatusCode, serde_json::Value, Option<String>) {
+        let response = err.into_response();
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(http::header::RETRY_AFTER)
+            .map(|value| value.to_str().expect("a visible header").to_string());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("a JSON body"),
+            retry_after,
+        )
+    }
+
+    /// A registration of a URL whose worker is being removed is refused for
+    /// the drain window under the code it had, with an answer that says what
+    /// holds: the removal in progress, the drain, when to retry, and a
+    /// Retry-After of the drain. A live worker's refusal keeps its hint to
+    /// replace or update it.
+    #[tokio::test]
+    async fn create_worker_names_the_removal_in_progress_of_a_draining_worker() {
+        use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "grpc://10.0.0.8:8000";
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 7,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(Arc::clone(&worker)).unwrap();
+        let id = registry.reserve_id_for_url(url);
+
+        let (status, body, retry_after) = answer(
+            service
+                .create_worker(worker_spec(url))
+                .await
+                .expect_err("a live worker holds the URL"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
+        let message = body["error"].as_str().expect("a message");
+        assert!(
+            message.contains(&format!("Use PUT /workers/{}", id.as_str())),
+            "a live worker's refusal hints at the replacement: {message}"
+        );
+        assert_eq!(retry_after, None, "a live worker's refusal has no retry");
+
+        worker.set_status(WorkerStatus::Draining);
+        let (status, body, retry_after) = answer(
+            service
+                .create_worker(worker_spec(url))
+                .await
+                .expect_err("a draining worker holds the URL for its drain"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
+        let message = body["error"].as_str().expect("a message");
+        assert!(
+            message.contains("is being removed") && message.contains("up to 7s"),
+            "the refusal names the removal and its drain: {message}"
+        );
+        assert!(
+            message.contains(&format!("GET /workers/{} answers 404", id.as_str())),
+            "the refusal says when to retry: {message}"
+        );
+        assert!(
+            !message.contains("PUT"),
+            "no replacement of a worker that is leaving: {message}"
+        );
+        assert_eq!(
+            retry_after.as_deref(),
+            Some("7"),
+            "Retry-After carries the drain window"
+        );
     }
 
     /// A registration whose labels or fields the routers could not read is
