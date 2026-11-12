@@ -61,7 +61,7 @@ pub(crate) async fn add_wasm_module(
         return no_job_queue();
     };
 
-    let mut status = StatusCode::OK;
+    let mut failures = Vec::new();
     let mut modules = config.modules.clone();
 
     for module in &mut modules {
@@ -79,8 +79,7 @@ pub(crate) async fn add_wasm_module(
             Err(e) => {
                 let (failure, text) = add_failure(&e, module_uuid);
                 module.add_result = Some(WasmModuleAddResult::Error(text));
-                // The answer carries the highest status among the modules' failures.
-                status = status.max(failure);
+                failures.push(failure);
             }
         }
     }
@@ -92,7 +91,11 @@ pub(crate) async fn add_wasm_module(
             Some(WasmModuleAddResult::Error(_)) | None => None,
         })
         .collect();
-    let response = (status, Json(WasmModuleAddResponse { modules })).into_response();
+    let response = (
+        load_status(failures),
+        Json(WasmModuleAddResponse { modules }),
+    )
+        .into_response();
     if added.is_empty() {
         return response;
     }
@@ -172,6 +175,13 @@ fn job_refusal_parts(error: &JobOutcomeError) -> (StatusCode, &'static str) {
 fn job_refusal(error: JobOutcomeError) -> Response {
     let (status, code) = job_refusal_parts(&error);
     refusal(status, code, error.to_string())
+}
+
+/// The answer's status for a load's module failures: the highest among
+/// them, so one module refused by the queue (503) beside one that failed
+/// to load (400) answers 503; a load with no failure answers 200.
+fn load_status(failures: impl IntoIterator<Item = StatusCode>) -> StatusCode {
+    failures.into_iter().fold(StatusCode::OK, StatusCode::max)
 }
 
 /// The status and the result text of a module whose add job did not end
@@ -288,6 +298,28 @@ mod tests {
         ];
         for (error, status, text) in cases {
             assert_eq!(add_failure(&error, uuid), (status, text), "{error}");
+        }
+    }
+
+    /// A load's answer carries the highest status among its modules'
+    /// failures, whichever order they failed in, and 200 when every module
+    /// was added.
+    #[test]
+    fn a_loads_answer_carries_the_highest_status_among_its_modules_failures() {
+        let cases = [
+            (
+                vec![StatusCode::BAD_REQUEST, StatusCode::GATEWAY_TIMEOUT],
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                vec![StatusCode::SERVICE_UNAVAILABLE, StatusCode::BAD_REQUEST],
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (vec![StatusCode::BAD_REQUEST], StatusCode::BAD_REQUEST),
+            (vec![], StatusCode::OK),
+        ];
+        for (failures, status) in cases {
+            assert_eq!(load_status(failures.clone()), status, "{failures:?}");
         }
     }
 }
