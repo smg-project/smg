@@ -1269,6 +1269,67 @@ mod tests {
         assert_eq!(request.messages.len(), 1);
     }
 
+    /// A stored answer that carries an MCP exchange (the `mcp_tool_use` and
+    /// `mcp_tool_result` blocks the MCP loop writes beside its text) is read
+    /// back as the assistant's turn, blocks and all, so the thread continues.
+    #[tokio::test]
+    async fn a_stored_mcp_exchange_is_continued() {
+        let threads = MessageThreads::new();
+        let (_, turn) = accepted(
+            threads
+                .resolve(
+                    request(json!({
+                        "messages": [{"role": "user", "content": "look it up"}],
+                        "thread": {"type": "create"}
+                    })),
+                    None,
+                )
+                .await,
+        );
+        let answered = threads
+            .stored(
+                turn.expect("a turn"),
+                answer(
+                    "msg_mcp",
+                    json!([
+                        {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
+                        {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}], "is_error": false},
+                        {"type": "text", "text": "it is 42"}
+                    ]),
+                ),
+            )
+            .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let (rebuilt, turn) = accepted(
+            threads
+                .resolve(
+                    request(json!({
+                        "messages": [{"role": "user", "content": "thanks"}],
+                        "thread": {"type": "continue", "previous_message_id": "msg_mcp"}
+                    })),
+                    None,
+                )
+                .await,
+        );
+        assert!(turn.is_some());
+        assert_eq!(rebuilt.messages.len(), 3);
+        assert_eq!(rebuilt.messages[1].role, Role::Assistant);
+        let InputContent::Blocks(blocks) = &rebuilt.messages[1].content else {
+            panic!("blocks");
+        };
+        assert!(
+            matches!(
+                &blocks[..],
+                [
+                    InputContentBlock::McpToolUse(mcp_use),
+                    InputContentBlock::McpToolResult(result),
+                    InputContentBlock::Text(text)
+                ] if mcp_use.id == "mcptoolu_1" && result.tool_use_id == "mcptoolu_1" && text.text == "it is 42"
+            ),
+            "{blocks:?}"
+        );
+    }
+
     /// A continue request becomes the whole conversation: the create turn's
     /// `system` and `tools`, every turn's messages and answer, then the new
     /// messages; the answer the client gets is the router's, byte for byte.
