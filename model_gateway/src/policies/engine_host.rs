@@ -692,24 +692,27 @@ impl Decider {
         self.explain.find(id)
     }
 
-    /// The `profile` label of a decision: the deciding profile's name, or
-    /// `none` for a binding miss.
-    fn profile_label(&self, profile: u16) -> &'static str {
-        self.profile_labels
-            .get(usize::from(profile))
-            .copied()
-            .unwrap_or(NO_PROFILE_LABEL)
+    /// The deciding profile's name; none for a binding miss.
+    fn profile_label(&self, profile: u16) -> Option<&'static str> {
+        self.profile_labels.get(usize::from(profile)).copied()
     }
 
-    /// What every decision leaves behind: one count under
-    /// `smg_policy_decisions_total`, and, for a request that asked for its
-    /// trace (or a process that captures every one), its record in the ring
-    /// and in the request's routing evidence, where the trace header names
-    /// the decision id `Explain` is asked with. An untraced decision costs
-    /// the count and one capture check.
+    /// What every decision leaves behind, the encode items' included: one
+    /// count under `smg_policy_decisions_total` (`model` and `tried` are the
+    /// request's), and, for a request that asked for its trace (or a
+    /// process that captures every one), its record in the ring and in the
+    /// request's routing evidence, where the trace header names the
+    /// decision id `Explain` is asked with. An untraced decision costs the
+    /// count and one capture check. A binding miss counts under the `none`
+    /// label and reaches the prediction as `null`, as the record renders it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the count and the record read the request's two fields beside the decision's four"
+    )]
     fn observe(
         &self,
-        request: &HostRequest<'_>,
+        model: &str,
+        tried: usize,
         phase: Phase,
         decision: &Decision,
         id: LeaseId,
@@ -719,7 +722,12 @@ impl Decider {
         let trace = decision.trace();
         let profile = self.profile_label(trace.profile);
         let outcome = outcome_label(decision);
-        Metrics::record_policy_decision(request.model, profile, outcome, POLICY_MODE);
+        Metrics::record_policy_decision(
+            model,
+            profile.unwrap_or(NO_PROFILE_LABEL),
+            outcome,
+            POLICY_MODE,
+        );
         if !cache_trace::enabled() {
             return;
         }
@@ -737,14 +745,14 @@ impl Decider {
             at_unix_micros: unix_micros(),
             // The exact name: the ring is bounded, so it needs no label interning,
             // whose cap folds unseen names into `other`.
-            model: Arc::from(request.model),
+            model: Arc::from(model),
             phase,
             profile: trace.profile,
             outcome,
             stage: trace.stage,
             survivors: trace.survivors,
             pool_size: u32::try_from(pool_size).unwrap_or(u32::MAX),
-            tried: u8::try_from(request.tried.len()).unwrap_or(u8::MAX),
+            tried: u8::try_from(tried).unwrap_or(u8::MAX),
             excluded: u8::try_from(excluded).unwrap_or(u8::MAX),
             seed: trace.seed,
             generation: trace.generation,
@@ -1027,7 +1035,8 @@ impl Decider {
             };
             let decision = self.engine.decide(&facts, &pool, candidates, &cx, scratch);
             self.observe(
-                request,
+                request.model,
+                request.tried.len(),
                 request.phase,
                 &decision,
                 id,
@@ -1049,7 +1058,8 @@ impl Decider {
     /// lands on its key's ring owner and equal items share an encoder;
     /// `excluded` are the ids a commit of an item just refused, for the one
     /// re-decision of that item. The decisions come back in the keys' order
-    /// with their leases.
+    /// with their leases, each observed as a single decision is (its count,
+    /// and its record under capture).
     pub fn decide_encode_items(
         &self,
         request: &EncodeRequest<'_>,
@@ -1110,6 +1120,15 @@ impl Decider {
                     };
                     let decision = self.engine.decide(&facts, &pool, candidates, &cx, scratch);
                     let id = LeaseId(first + item as u64);
+                    self.observe(
+                        request.model,
+                        0,
+                        Phase::Encode,
+                        &decision,
+                        id,
+                        encoders.len(),
+                        excluded.len(),
+                    );
                     (decision, self.lease(id, now, 0, session_key))
                 })
                 .collect()
@@ -1254,7 +1273,8 @@ impl Decider {
             )
         });
         self.observe(
-            request,
+            request.model,
+            request.tried.len(),
             Phase::Prefill,
             &decision,
             id,

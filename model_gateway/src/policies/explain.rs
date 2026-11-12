@@ -206,12 +206,14 @@ pub(crate) fn respond(context: &AppContext, id: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use smg_policy_controller::fingerprint;
+
     use super::*;
     use crate::{
         config::{PolicyConfig, RoutingKeyOverrideConfig},
         observability::cache_trace,
         policies::{
-            engine_host::{Decider, HostRequest},
+            engine_host::{Decider, EncodeRequest, HostRequest},
             test_support,
         },
     };
@@ -298,6 +300,82 @@ mod tests {
         let address = picked.map(|target| workers[target.position as usize].url().to_owned());
         assert_eq!(rendered["targets"][0]["worker"], json!(address));
         assert_eq!(rendered["top"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// An encode item's decision is observed as a single decision is: it
+    /// counts under `smg_policy_decisions_total` with its outcome, and under
+    /// capture its record is read back by its lease's id with the encode
+    /// phase and its target; an item shed over an empty pool leaves its
+    /// count and its record too.
+    #[tokio::test]
+    async fn an_encode_items_decision_leaves_its_count_and_its_record() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let decider = Decider::from_configs_with_encode(
+            &round_robin,
+            &round_robin,
+            &round_robin,
+            Some(&PolicyConfig::ConsistentHashing),
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("the encode side is carried");
+        let encoders = test_support::make_workers(&["http://e0:8000", "http://e1:8000"]);
+        let every = |_: &Arc<dyn Worker>| true;
+        let request = EncodeRequest {
+            model: "m-explain-encode",
+            pairs_with_prefill: &every,
+            vision_capable: &every,
+            images: 0,
+        };
+        let keys = [fingerprint(b"item-a")];
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (picked, shed) = cache_trace::scope(true, async {
+            metrics::with_local_recorder(&recorder, || {
+                (
+                    decider.decide_encode_items(&request, &encoders, &keys, &[]),
+                    decider.decide_encode_items(&request, &[], &keys, &[]),
+                )
+            })
+        })
+        .await;
+
+        let (decision, lease) = &picked[0];
+        let record = decider
+            .explain(lease.id.0)
+            .expect("the encode item's decision is in the ring");
+        assert_eq!(record.phase, Phase::Encode);
+        assert_eq!(record.outcome, "pick");
+        assert_eq!(record.pool_size, 2);
+        let picked_target = decision
+            .pick()
+            .and_then(|pick| pick.targets.first())
+            .map(|target| target.id);
+        assert_eq!(
+            record.targets.first().map(|target| target.id),
+            picked_target
+        );
+        assert_eq!(
+            render(&record, decider.engine(), &encoders)["phase"],
+            "encode"
+        );
+        let (_, lease) = &shed[0];
+        let record = decider
+            .explain(lease.id.0)
+            .expect("the shed item's decision is in the ring");
+        assert_eq!(record.phase, Phase::Encode);
+        assert_eq!(record.outcome, "no_endpoints");
+
+        let rendered = handle.render();
+        for outcome in ["pick", "no_endpoints"] {
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with("smg_policy_decisions_total{model=\"m-explain-encode\",")
+                        && line.contains(&format!("outcome=\"{outcome}\""))
+                        && line.ends_with(" 1")
+                }),
+                "one {outcome} count for the encode item in:\n{rendered}"
+            );
+        }
     }
 
     #[test]
