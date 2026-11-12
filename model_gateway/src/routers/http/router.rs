@@ -2157,10 +2157,12 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     // and replayed.
     // The worker's side failing under the call is the upstream's failure
     // (502), as the disaggregated routers answer their start failures and
-    // the capped body read answers a body that ended early: the connect
+    // the capped body read answers a body over its limit: the connect
     // refused, the connection reset or closed before the head (the client
     // files it as a request fault), the answer that did not decode or ended
-    // before it was whole (its decode fault). The gateway's own side keeps
+    // before it was whole (its decode fault; no route hands this conversion
+    // a body-read fault today, the relay's own reads answer those under
+    // their codes). The gateway's own side keeps
     // the 500: a builder fault, a redirect it did not follow, the request
     // body it was forwarding failing under the send (the client's body
     // fault; an inbound abort is answered before it). Every code stays what
@@ -5358,8 +5360,11 @@ mod tests {
     }
 
     /// A worker whose body ends before the length its head announced: the
-    /// client files the read as a decode fault; the answer is the upstream's
-    /// failure.
+    /// client files the read as a decode fault, and the conversion answers
+    /// it as the upstream's failure. No route hands the conversion a
+    /// body-read fault today (the relay's own reads answer under their codes;
+    /// see `a_proxied_get_whose_body_is_cut_short_is_an_upstream_failure`):
+    /// the case pins the arm for a caller that will.
     #[tokio::test]
     async fn a_body_cut_short_is_an_upstream_failure() {
         let addr = spawn_short_body_stub().await;
@@ -5408,8 +5413,9 @@ mod tests {
         );
     }
 
-    /// A worker's 200 that is not the JSON the route asked for: the answer
-    /// is the upstream's failure, as an answer over the payload limit is.
+    /// A worker's 200 that is not the JSON the route asked for, handed to
+    /// the conversion: the upstream's failure, as an answer over the payload
+    /// limit is. As above, no route reaches this arm today.
     #[tokio::test]
     async fn an_answer_that_does_not_decode_is_an_upstream_failure() {
         let (addr, _accepted) = flaky_upstream(0).await;
