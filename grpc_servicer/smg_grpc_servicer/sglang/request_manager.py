@@ -793,8 +793,21 @@ class GrpcRequestManager:
                 getattr(state, name).extend(column[batch_index])
 
     async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
-        """Handle batch generation output from scheduler."""
-        rows, prompts, cached = self.output_adapter.read(batch_out)
+        """Deliver generation output, terminating affected requests on invalid batches."""
+        try:
+            rows, prompts, cached = self.output_adapter.read(batch_out)
+        except Exception as exc:
+            # Dropping a rejected terminal batch would leave consumers waiting
+            # forever. The batch cannot be split reliably after normalization
+            # fails, so terminate every active member and stop remaining decode.
+            logger.exception("Failed to normalize scheduler generation output")
+            reason = {"type": "abort", "message": str(exc), "status_code": 500}
+            for rid in batch_out.rids:
+                self.output_adapter.forget(rid)
+                state = self.rid_to_state.get(rid)
+                if state is not None and not state.finished:
+                    await self.abort_request(rid, finished_reason=reason)
+            return
         # Collect all queue.put() tasks for parallel execution
         put_tasks = []
         cleanup_tasks = []
