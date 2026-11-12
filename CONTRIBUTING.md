@@ -166,11 +166,25 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD weekly and opt-in PR benchmarks (require `SMG_RUN_AMD_LEGS=true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
 | `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
-| `SMG_RUN_AMD_GO_LEGS` | `false` | Opt in to AMD Go SDK e2e; also requires `SMG_RUN_AMD_LEGS=true` and, for same-repository PRs, `SMG_RUN_AMD_ON_PRS=true`. Fork PRs are excluded because the container inherits the runner's HF token. Keep off until the SGLang ROCm environment, Go FFI and model, shared-host admission, and execution budget are qualified and approved |
+| `SMG_RUN_AMD_GO_LEGS` | `false` | Opt in to AMD Go SDK e2e; also requires `SMG_RUN_AMD_LEGS=true` and, for same-repository PRs, `SMG_RUN_AMD_ON_PRS=true`. See the qualification and runner trust requirements below |
 | `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep off until the native environment, performance budget and shared-host admission are qualified |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
+
+The AMD Go same-repository condition is an eligibility filter in this workflow.
+A fork that changes the workflow can remove it; it does not isolate inherited
+runner HF credentials. That trust boundary must come from admission outside
+PR-controlled code, such as reviewed fork-run approval, or from runners without
+those credentials for untrusted jobs. Labels and this condition alone do not
+establish that boundary.
+
+For an approved first qualification, after the native environment and Go FFI
+checks pass, the normal Go job may be enabled to qualify its original Llama
+model and all 23 test methods. Keep the original assertions and expected-failure
+rules. Require actual model results and complete owned cleanup before accepting
+GPU coverage or steady rollout. Shared-host admission, lease, time windows and
+approved CI limits still apply to this first run.
 
 ### Container-mode GPU runners
 
