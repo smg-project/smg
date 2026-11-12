@@ -193,3 +193,186 @@ def test_both_original_asymmetric_param_markers_require_verified_read_source(mon
     for row in rows.values():
         assert row.marks[0].name == "skipif"
         assert row.marks[0].args == (not verified,)
+
+
+def _first_read_attempt(monkeypatch):
+    import os
+
+    sweep = _sweep(monkeypatch, "vllm", "moriio", "amd")
+    monkeypatch.setenv(constants.ENV_VLLM_MORIIO_MODE, "read")
+    monkeypatch.setenv(constants.ENV_VLLM_MORIIO_BACKEND, "rdma")
+    verifier = sweep._moriio_read_image_verifier()
+    exports = verifier._qualification_exports(
+        "example.invalid/read@sha256:" + "a" * 64,
+        dict(verifier.SOURCE_SHA256),
+        dict(os.environ),
+    )
+    for name, value in exports.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(verifier, "verify_installed", lambda: dict(verifier.SOURCE_SHA256))
+    monkeypatch.setattr(sweep, "_moriio_read_image_verifier", lambda: verifier)
+    return sweep, verifier
+
+
+def test_first_verified_strict_read_attempt_reaches_original_restart_oracles(monkeypatch):
+    sweep, _ = _first_read_attempt(monkeypatch)
+    assert sweep._moriio_holds_memory_of("prefill") is False
+    assert sweep._moriio_holds_memory_of("decode") is False
+
+
+@pytest.mark.parametrize(
+    "bad", ["no_intent", "bare_flag", "old_image", "source", "auto_xgmi", "xgmi", "write", "vendor"]
+)
+def test_first_attempt_does_not_bypass_legacy_restart_protection(monkeypatch, bad):
+    sweep, verifier = _first_read_attempt(monkeypatch)
+    if bad == "no_intent":
+        monkeypatch.delenv(verifier.QUALIFICATION_ENV)
+    elif bad == "bare_flag":
+        monkeypatch.setenv(verifier.QUALIFICATION_ENV, "1")
+    elif bad == "old_image":
+        monkeypatch.setenv(
+            "MORIIO_READ_IMAGE", "example.invalid/old@sha256:" + verifier.OLD_IMAGE_DIGEST
+        )
+    elif bad == "source":
+
+        def wrong_source():
+            raise ValueError("source mismatch")
+
+        monkeypatch.setattr(verifier, "verify_installed", wrong_source)
+    elif bad == "auto_xgmi":
+        monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
+    elif bad == "xgmi":
+        monkeypatch.setenv(constants.ENV_VLLM_MORIIO_BACKEND, "xgmi")
+    elif bad == "write":
+        monkeypatch.setenv(constants.ENV_VLLM_MORIIO_MODE, "write")
+    else:
+        monkeypatch.setenv(constants.ENV_GPU_VENDOR, "nvidia")
+    assert sweep._moriio_holds_memory_of("prefill") is (bad != "write")
+    assert sweep._moriio_holds_memory_of("decode") is (bad == "write")
+
+
+def _reclaim_workers():
+    from types import SimpleNamespace
+
+    victim = SimpleNamespace(gpu_ids=[2, 3], _gpu_mem_baseline={2: 100, 3: 200}, process=None)
+    mover = SimpleNamespace(gpu_ids=[4], process=SimpleNamespace(pid=123), is_alive=lambda: True)
+    return victim, mover
+
+
+def test_strict_reclaim_waits_for_every_victim_gpu_with_one_total_budget(monkeypatch):
+    sweep, _ = _first_read_attempt(monkeypatch)
+    victim, mover = _reclaim_workers()
+    clock = [0.0]
+    calls = []
+    readings = iter([{2: 164, 3: 265}, {2: 164, 3: 264}])
+    monkeypatch.setattr(sweep.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        sweep.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+
+    def read(gpu_ids, timeout):
+        calls.append((list(gpu_ids), timeout))
+        return next(readings)
+
+    monkeypatch.setattr(sweep.process_utils, "gpu_memory_used_mib", read)
+    sweep._assert_strict_read_gpu_reclaimed(victim, "prefill", [mover])
+    assert calls == [([2, 3], 30.0), ([2, 3], 29.5)]
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [
+        None,
+        {},
+        {2: 100},
+        {2: 100, 3: None},
+        {2: 100, 3: True},
+        {2: 100, 3: -1},
+        {2: 100, 3: 200, 4: 0},
+    ],
+)
+@pytest.mark.parametrize("stage", ["baseline", "final"])
+def test_strict_reclaim_rejects_missing_partial_or_invalid_all_gpu_readings(
+    monkeypatch, reading, stage
+):
+    sweep, _ = _first_read_attempt(monkeypatch)
+    victim, mover = _reclaim_workers()
+    if stage == "baseline":
+        victim._gpu_mem_baseline = reading
+    monkeypatch.setattr(sweep.process_utils, "gpu_memory_used_mib", lambda *args, **kwargs: reading)
+    with pytest.raises(AssertionError, match="baseline|readback"):
+        sweep._assert_strict_read_gpu_reclaimed(victim, "prefill", [mover])
+
+
+def test_strict_reclaim_held_allocation_expires_without_reloading_model(monkeypatch):
+    sweep, _ = _first_read_attempt(monkeypatch)
+    victim, mover = _reclaim_workers()
+    clock = [0.0]
+    monkeypatch.setattr(sweep.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        sweep.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    monkeypatch.setattr(
+        sweep.process_utils, "gpu_memory_used_mib", lambda *args, **kwargs: {2: 165, 3: 200}
+    )
+    with pytest.raises(AssertionError, match="30 seconds"):
+        sweep._assert_strict_read_gpu_reclaimed(victim, "prefill", [mover])
+    assert clock[0] == 30.0
+
+
+@pytest.mark.parametrize("changed", ["dead", "pid", "gpu"])
+def test_strict_reclaim_requires_same_live_mover_identity(monkeypatch, changed):
+    sweep, _ = _first_read_attempt(monkeypatch)
+    victim, mover = _reclaim_workers()
+
+    def read(*args, **kwargs):
+        if changed == "dead":
+            mover.is_alive = lambda: False
+        elif changed == "pid":
+            mover.process.pid += 1
+        else:
+            mover.gpu_ids = [5]
+        return {2: 100, 3: 200}
+
+    monkeypatch.setattr(sweep.process_utils, "gpu_memory_used_mib", read)
+    with pytest.raises(AssertionError, match="mover"):
+        sweep._assert_strict_read_gpu_reclaimed(victim, "prefill", [mover])
+
+
+@pytest.mark.parametrize("role,intent", [("decode", True), ("prefill", False)])
+def test_reclaim_measurement_does_not_touch_legacy_or_decode_paths(monkeypatch, role, intent):
+    sweep, verifier = _first_read_attempt(monkeypatch)
+    victim, mover = _reclaim_workers()
+    if not intent:
+        monkeypatch.delenv(verifier.QUALIFICATION_ENV)
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("non-qualifying path must not read GPU memory")
+
+    monkeypatch.setattr(sweep.process_utils, "gpu_memory_used_mib", unexpected_read)
+    sweep._assert_strict_read_gpu_reclaimed(victim, role, [mover])
+
+
+@pytest.mark.parametrize("raw", [True, 12.5])
+def test_reclaim_consumer_rejects_invalid_raw_smi_before_integer_conversion(monkeypatch, raw):
+    import json
+    import subprocess
+
+    sweep, _ = _first_read_attempt(monkeypatch)
+    victim, mover = _reclaim_workers()
+    victim.gpu_ids = [0]
+    victim._gpu_mem_baseline = {0: 100}
+
+    def fake_smi(cmd, **kwargs):
+        if cmd[0] == "nvidia-smi":
+            raise FileNotFoundError("fake AMD-only tool")
+        data = (
+            [{"gpu": 0, "node_id": 2}]
+            if cmd[1] == "list"
+            else [{"gpu": 0, "mem_usage": {"used_vram": raw}}]
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(data))
+
+    monkeypatch.setattr(sweep.process_utils.subprocess, "run", fake_smi)
+    with pytest.raises(AssertionError, match="readback"):
+        sweep._assert_strict_read_gpu_reclaimed(victim, "prefill", [mover])

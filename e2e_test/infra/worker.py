@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import IO, Any
 
 import yaml
@@ -63,6 +65,17 @@ from .process_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _moriio_read_image_verifier():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci_moriio_read_image.py"
+    spec = importlib.util.spec_from_file_location("_worker_moriio_read_image", path)
+    if spec is None or spec.loader is None:
+        raise OSError(f"Cannot load READ source verifier: {path}")
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    return verifier
+
 
 # How much of a log line the failure text of a dead worker quotes.
 LOG_EXCERPT_CHARS = 300
@@ -218,7 +231,29 @@ class Worker:
         )
         logger.debug("Command: %s", " ".join(cmd))
 
-        self._gpu_mem_baseline = gpu_memory_used_mib(self.gpu_ids)
+        strict_read = (
+            self.engine == "vllm"
+            and self.effective_kv_backend() == "moriio"
+            and os.environ.get("E2E_MORIIO_READ_QUALIFICATION")
+            and _moriio_read_image_verifier().qualification_attempt(dict(os.environ))
+        )
+        self._gpu_mem_baseline = (
+            gpu_memory_used_mib(self.gpu_ids, timeout=30.0)
+            if strict_read
+            else gpu_memory_used_mib(self.gpu_ids)
+        )
+        if strict_read and (
+            not self.gpu_ids
+            or any(type(gpu) is not int or gpu < 0 for gpu in self.gpu_ids)
+            or len(set(self.gpu_ids)) != len(self.gpu_ids)
+            or not isinstance(self._gpu_mem_baseline, dict)
+            or set(self._gpu_mem_baseline) != set(self.gpu_ids)
+            or any(type(gpu) is not int for gpu in self._gpu_mem_baseline)
+            or any(type(value) is not int or value < 0 for value in self._gpu_mem_baseline.values())
+        ):
+            raise ValueError(
+                "Strict READ requires a complete validated all-GPU baseline before spawn"
+            )
         self.process = self._spawn_process(cmd, env)
         # The launcher leads a session of its own (``start_new_session``), so
         # its pid is its group's id. Kept here: ``os.getpgid`` has no answer
@@ -1107,6 +1142,16 @@ class Worker:
 
         if self.extra_env:
             env.update(self.extra_env)
+        if (
+            self.engine == "vllm"
+            and self.effective_kv_backend() == "moriio"
+            and os.environ.get("E2E_MORIIO_READ_QUALIFICATION")
+            and _moriio_read_image_verifier().qualification_attempt(dict(os.environ))
+        ):
+            # Validate the original invocation, not an individual negative
+            # protocol worker's intentional WRITE override. Change only the
+            # native route knob after extra_env, preserving that error oracle.
+            env["MORI_DISABLE_AUTO_XGMI"] = "1"
         return env
 
     def read_log(self) -> str:

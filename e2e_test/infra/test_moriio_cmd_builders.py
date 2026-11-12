@@ -154,3 +154,114 @@ def test_the_engine_advertises_the_moriio_host_and_gets_no_nixl_port():
 
     assert env["VLLM_HOST_IP"] == "10.0.0.7"
     assert "VLLM_NIXL_SIDE_CHANNEL_PORT" not in env
+
+
+def _qualified_read_invocation(monkeypatch):
+    from infra import worker as worker_module
+
+    verifier = worker_module._moriio_read_image_verifier()
+    invocation = {
+        "E2E_RUNTIME": "vllm",
+        "E2E_GPU_VENDOR": "amd",
+        "E2E_KV_BACKEND": "",
+        "E2E_VLLM_KV_BACKEND": "moriio",
+        "E2E_VLLM_MORIIO_MODE": "read",
+        "E2E_VLLM_MORIIO_BACKEND": "rdma",
+    }
+    image = "example.invalid/read@sha256:" + "a" * 64
+    invocation.update(
+        verifier._qualification_exports(image, dict(verifier.SOURCE_SHA256), invocation)
+    )
+    for name, value in invocation.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(verifier, "verify_installed", lambda: dict(verifier.SOURCE_SHA256))
+    monkeypatch.setattr(worker_module, "_moriio_read_image_verifier", lambda: verifier)
+    return verifier
+
+
+@pytest.mark.parametrize("role", [WorkerType.PREFILL, WorkerType.DECODE])
+def test_verified_invocation_keeps_strict_route_after_worker_overrides(monkeypatch, role):
+    _qualified_read_invocation(monkeypatch)
+    worker = _worker(role)
+    worker.extra_env = {
+        "MORI_DISABLE_AUTO_XGMI": "0",
+        "E2E_VLLM_MORIIO_MODE": "write",  # An intentional wrong-protocol worker remains wrong.
+        "SMG_PAIRING_PROTOCOL": "different-protocol",
+    }
+    env = worker._build_env()
+    assert env["MORI_DISABLE_AUTO_XGMI"] == "1"
+    assert env["E2E_VLLM_MORIIO_MODE"] == "write"
+    assert env["SMG_PAIRING_PROTOCOL"] == "different-protocol"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"E2E_MORIIO_READ_QUALIFICATION": ""},
+        {"E2E_VLLM_MORIIO_MODE": "write"},
+        {"E2E_VLLM_MORIIO_BACKEND": "xgmi"},
+        {"E2E_GPU_VENDOR": "nvidia"},
+    ],
+)
+def test_unqualified_worker_route_and_mode_keep_their_original_values(monkeypatch, override):
+    _qualified_read_invocation(monkeypatch)
+    for name, value in override.items():
+        monkeypatch.setenv(name, value)
+    worker = _worker(WorkerType.PREFILL)
+    worker.extra_env = {"MORI_DISABLE_AUTO_XGMI": "0"}
+    env = worker._build_env()
+    assert env["MORI_DISABLE_AUTO_XGMI"] == "0"
+    config = _kv_config(worker)["kv_connector_extra_config"]
+    assert config["read_mode"] is (override.get("E2E_VLLM_MORIIO_MODE") != "write")
+    assert config["backend"] == override.get("E2E_VLLM_MORIIO_BACKEND", "rdma")
+
+
+def test_worker_does_not_accept_intent_after_installed_source_changes(monkeypatch):
+    verifier = _qualified_read_invocation(monkeypatch)
+
+    def wrong_source():
+        raise ValueError("installed source changed after preflight")
+
+    monkeypatch.setattr(verifier, "verify_installed", wrong_source)
+    with pytest.raises(ValueError, match="source changed"):
+        _worker(WorkerType.PREFILL)._build_env()
+
+
+@pytest.mark.parametrize("raw", [True, 12.5, -1, "01", None, 12, "12"])
+def test_first_attempt_baseline_uses_actual_strict_parser_before_any_spawn(monkeypatch, raw):
+    from types import SimpleNamespace
+
+    from infra import worker as worker_module
+
+    _qualified_read_invocation(monkeypatch)
+    worker = _worker(WorkerType.PREFILL)
+    calls = []
+    monkeypatch.setattr(worker, "_build_cmd", lambda: ["fixture-no-server"])
+
+    def fake_smi(cmd, **kwargs):
+        if cmd[0] == "nvidia-smi":
+            raise FileNotFoundError("fake AMD-only tool")
+        data = (
+            [{"gpu": 0, "node_id": 2}]
+            if cmd[1] == "list"
+            else [{"gpu": 0, "mem_usage": {"used_vram": {"value": raw}}}]
+        )
+        import subprocess
+
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(data))
+
+    def spawn(cmd, env):
+        calls.append((cmd, env))
+        return SimpleNamespace(pid=123)
+
+    monkeypatch.setattr(process_utils.subprocess, "run", fake_smi)
+    monkeypatch.setattr(worker_module, "gpu_memory_used_mib", process_utils.gpu_memory_used_mib)
+    monkeypatch.setattr(worker, "_spawn_process", spawn)
+    if type(raw) is int and raw >= 0 or raw == "12":
+        worker.start(wait_ready=False)
+        assert worker._gpu_mem_baseline == {0: 12}
+        assert len(calls) == 1
+    else:
+        with pytest.raises(ValueError, match="validated all-GPU baseline"):
+            worker.start(wait_ready=False)
+        assert calls == []

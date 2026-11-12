@@ -242,7 +242,10 @@ jobs:
         if: inputs.engine == 'vllm' && inputs.gpu_vendor == 'amd'
         env:
           MORIIO_READ_IMAGE: ${{ inputs.container_image }}
-        run: python3 scripts/ci_moriio_read_image.py verify --image "$MORIIO_READ_IMAGE"
+          E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
+        # Only successful source verification can export first-qualification
+        # intent and strict RDMA into the following pytest step's environment.
+        run: python3 scripts/ci_moriio_read_image.py verify --image "$MORIIO_READ_IMAGE" --qualification-env "$GITHUB_ENV"
 
       # The servicer's engine-gated unit tests (importorskip("vllm"),
       # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real

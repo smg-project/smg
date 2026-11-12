@@ -86,20 +86,90 @@ def verify_installed() -> dict[str, str]:
     return verify_source_root(root)
 
 
+# This is invocation intent from the successful source preflight, not a claim
+# that GPU transfers, MR lifetime or the held-peer restart has already passed.
+QUALIFICATION_ENV = "E2E_MORIIO_READ_QUALIFICATION"
+
+
+def _qualification_lane(env: dict[str, str]) -> bool:
+    backend = (
+        env.get("E2E_KV_BACKEND", "").strip().lower()
+        or env.get("E2E_VLLM_KV_BACKEND", "nixl").lower()
+    )
+    return (
+        env.get("E2E_RUNTIME", "").strip().lower() == "vllm"
+        and env.get("E2E_GPU_VENDOR", "").strip().lower() == "amd"
+        and backend == "moriio"
+        and (env.get("E2E_VLLM_MORIIO_MODE", "").strip().lower() or "read") == "read"
+        and (env.get("E2E_VLLM_MORIIO_BACKEND", "").strip().lower() or "rdma") == "rdma"
+    )
+
+
+def _qualification_exports(
+    image: str, observed: dict[str, str], env: dict[str, str]
+) -> dict[str, str]:
+    if not _qualification_lane(env):
+        return {}
+    image = read_image(image)
+    if observed != SOURCE_SHA256:
+        raise ValueError("First READ qualification requires the verified source cohort")
+    receipt = {
+        "purpose": "first-strict-rdma-read-qualification-attempt",
+        "image": image,
+        "source_sha256": observed,
+    }
+    return {
+        "MORIIO_READ_IMAGE": image,
+        "MORI_DISABLE_AUTO_XGMI": "1",
+        QUALIFICATION_ENV: json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+    }
+
+
+def qualification_attempt(env: dict[str, str]) -> bool:
+    raw = env.get(QUALIFICATION_ENV, "")
+    if not raw or not _qualification_lane(env) or env.get("MORI_DISABLE_AUTO_XGMI") != "1":
+        return False
+    # A bare flag is insufficient: match the captured image and recheck the
+    # effective installed source, including the existing anti-shadow check.
+    receipt = json.loads(raw)
+    expected = {
+        "purpose": "first-strict-rdma-read-qualification-attempt",
+        "image": read_image(env.get("MORIIO_READ_IMAGE", "")),
+        "source_sha256": SOURCE_SHA256,
+    }
+    if receipt != expected or verify_installed() != SOURCE_SHA256:
+        raise ValueError("First READ qualification receipt/source mismatch")
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("image", "verify"))
     parser.add_argument("--image", required=True)
+    parser.add_argument("--qualification-env", type=Path)
     args = parser.parse_args()
+    if args.qualification_env and args.command != "verify":
+        parser.error("--qualification-env requires verify")
     try:
+        if args.qualification_env:
+            # Clear inherited intent even when this invocation fails or is not
+            # applicable. Actions reads this file after the step completes.
+            with args.qualification_env.open("a") as output:
+                output.write(f"{QUALIFICATION_ENV}=\n")
         if args.command == "image":
             print(read_image(args.image))
         elif needs_read_preflight(dict(os.environ)):
             read_image(args.image)
+            observed = verify_installed()
+            if args.qualification_env:
+                exports = _qualification_exports(args.image, observed, dict(os.environ))
+                with args.qualification_env.open("a") as output:
+                    for name, value in exports.items():
+                        output.write(f"{name}={value}\n")
             print(
                 json.dumps(
                     {
-                        "reviewed_READ_source_sha256": verify_installed(),
+                        "reviewed_READ_source_sha256": observed,
                         "scope": "Source cohort only; not native ABI or GPU qualification",
                     }
                 )

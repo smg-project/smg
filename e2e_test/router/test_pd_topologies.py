@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -63,7 +64,15 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
-from infra import ConnectionMode, Gateway, WorkerType, cleanup_pool, start_workers, stop_workers
+from infra import (
+    ConnectionMode,
+    Gateway,
+    WorkerType,
+    cleanup_pool,
+    process_utils,
+    start_workers,
+    stop_workers,
+)
 from infra.constants import (
     DEFAULT_STARTUP_TIMEOUT,
     get_gpu_vendor,
@@ -150,14 +159,92 @@ def _moriio_asymmetric_tp_supported() -> bool:
 def _moriio_holds_memory_of(role: str) -> bool:
     """Whether the other role keeps a stopped ``role`` worker's GPU memory in use.
 
-    On one node the role that moves the KV (decode in READ, prefill in WRITE)
-    keeps the memory of each worker it moved KV with until it exits itself,
-    over RDMA as over XGMI, so a worker restarted on that GPU fails vLLM's
-    startup memory check.
+    Preserve the legacy #60425 protection. Its v0.31/MoRI1.0 observation is
+    not a result for the reviewed f9 strict-RDMA cohort. Only a successful
+    preflight's first-qualification invocation may attempt those original
+    restart oracles; this does not assert that MR release already works.
     """
     if not _moriio_lane():
         return False
+    if os.environ.get("E2E_MORIIO_READ_QUALIFICATION"):
+        try:
+            if _moriio_read_image_verifier().qualification_attempt(dict(os.environ)):
+                return False
+        except (ValueError, OSError, importlib.metadata.PackageNotFoundError):
+            # Missing, forged or stale intent never relaxes the legacy skip.
+            pass
     return role == ("prefill" if vllm_moriio_mode() == "read" else "decode")
+
+
+def _assert_strict_read_gpu_reclaimed(victim, role: str, movers) -> None:
+    """Measure allocation release, not MR count or DMA quiescence, before reload."""
+    if role != "prefill" or not os.environ.get("E2E_MORIIO_READ_QUALIFICATION"):
+        return
+    if not _moriio_read_image_verifier().qualification_attempt(dict(os.environ)):
+        return
+    gpu_ids = list(victim.gpu_ids)
+    assert gpu_ids and all(type(gpu) is int and gpu >= 0 for gpu in gpu_ids), (
+        "strict READ reclaim needs valid victim GPU IDs"
+    )
+    assert len(set(gpu_ids)) == len(gpu_ids), "duplicate victim GPU IDs"
+
+    def complete_reading(reading):
+        return (
+            isinstance(reading, dict)
+            and all(type(gpu) is int for gpu in reading)
+            and set(reading) == set(gpu_ids)
+            and all(type(value) is int and value >= 0 for value in reading.values())
+        )
+
+    baseline = victim._gpu_mem_baseline
+    assert complete_reading(baseline), f"missing/invalid all-GPU baseline: {baseline!r}"
+    baseline = dict(baseline)
+    movers = list(movers)
+    assert movers, "strict READ reclaim needs a live decode mover"
+    identities = []
+    for mover in movers:
+        assert mover.is_alive(), "decode mover exited before reclaim measurement"
+        pid = mover.process.pid
+        assert type(pid) is int and pid > 0, "invalid decode mover PID"
+        identities.append((mover, pid, tuple(mover.gpu_ids)))
+
+    def assert_same_movers():
+        for mover, pid, gpus in identities:
+            assert mover.is_alive() and mover.process.pid == pid, (
+                "decode mover exited/replaced during reclaim measurement"
+            )
+            assert tuple(mover.gpu_ids) == gpus, "decode mover GPU assignment changed"
+        assert list(victim.gpu_ids) == gpu_ids, "victim GPU assignment changed"
+
+    deadline = time.monotonic() + 30.0
+    while True:
+        assert_same_movers()
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "strict READ GPU allocation reclaim exceeded 30 seconds"
+        final = process_utils.gpu_memory_used_mib(gpu_ids, timeout=remaining)
+        assert_same_movers()
+        logger.info(
+            "strict READ allocation reclaim (not MR/DMA proof): %s",
+            json.dumps(
+                {
+                    "role": role,
+                    "victim_gpu_ids": gpu_ids,
+                    "victim_pid": victim.process.pid if victim.process else None,
+                    "baseline_mib": baseline,
+                    "final_mib": final,
+                    "movers": [{"pid": pid, "gpu_ids": gpus} for _, pid, gpus in identities],
+                    "slack_mib": 64,
+                },
+                sort_keys=True,
+            ),
+        )
+        assert complete_reading(final), f"missing/invalid all-GPU final readback: {final!r}"
+        assert time.monotonic() < deadline, "strict READ GPU readback exceeded 30 seconds"
+        if all(final[gpu] <= baseline[gpu] + 64 for gpu in gpu_ids):
+            return
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f"strict READ GPU allocation still held: {final!r} vs {baseline!r}"
+        time.sleep(min(0.5, remaining))
 
 
 _MORIIO_HELD_MEMORY = (
@@ -1012,16 +1099,19 @@ class TestPDTopology:
         peers = {w.base_url for w in workers[:-1]}
 
         victim.stop()
-        _wait_for_status(gateway, victim.base_url, "unhealthy", timeout=30.0)
-        before = len(_pairs_logged())
-        for i in range(6):
-            _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
-        pairs = _wait_for_pairs(before + 6)[before:]
-        used = {p for p, _ in pairs} if role == "prefill" else {d for _, d in pairs}
-        assert victim.base_url not in used, f"gateway kept routing to the dead {role} worker"
-        assert used <= peers, f"unknown {role} workers in placement: {used - peers}"
+        try:
+            _wait_for_status(gateway, victim.base_url, "unhealthy", timeout=30.0)
+            before = len(_pairs_logged())
+            for i in range(6):
+                _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
+            pairs = _wait_for_pairs(before + 6)[before:]
+            used = {p for p, _ in pairs} if role == "prefill" else {d for _, d in pairs}
+            assert victim.base_url not in used, f"gateway kept routing to the dead {role} worker"
+            assert used <= peers, f"unknown {role} workers in placement: {used - peers}"
 
-        victim.start(timeout=_RESTART_TIMEOUT)
+            _assert_strict_read_gpu_reclaimed(victim, role, gateway.decode_workers)
+        finally:
+            victim.start(timeout=_RESTART_TIMEOUT)
         # start() blocked on the worker's own health; the gateway's monitor
         # notices within a few of its 1 s intervals.
         _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
@@ -1197,6 +1287,7 @@ class TestPDTopology:
                 f"no_{role}_servers",
                 f"{role}_unavailable",
             ), f"outage answer carried an unexpected code: {code!r} {resp.text[:200]}"
+            _assert_strict_read_gpu_reclaimed(victim, role, gateway.decode_workers)
         finally:
             # Whatever the verdict, the class's later tests need the pool back.
             victim.start(timeout=_RESTART_TIMEOUT)

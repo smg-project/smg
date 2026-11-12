@@ -83,9 +83,44 @@ The first normal full-suite run supplies qualification results; passing that
 same suite beforehand is not an activation prerequisite. The existing full
 file, original model, assertions, 170-minute job / 150-minute test limits and
 390-minute host lifecycle remain intact. Record every executed and skipped case
-and the actual native transport: configured RDMA can select XGMI for local peers.
-Source qualification does not lift the retained peer-memory restart skips.
+and the actual native transport. In the pinned MoRI 1.2.3.post1 source, automatic
+XGMI creation/fallback requires `MORI_DISABLE_AUTO_XGMI` to begin with `0`;
+unset or `1` does not automatically create XGMI. Explicit XGMI remains explicit.
+Source verification alone does not lift the retained peer-memory restart skips;
+the explicit first-qualification path below may attempt the original READ oracles.
 Native peer-generation retirement, same-GPU restart/MR lifetime, real RDMA and
 full-weight SMG PD acceptance remain explicit gaps until their original
 contracts are demonstrated. A green run containing those skips cannot close
 those gaps.
+
+
+## First held-peer restart qualification
+
+After the mandatory installed-source and immutable-image preflight succeeds,
+only the AMD vLLM MoRI READ/RDMA invocation receives an internal qualification
+receipt through Actions' environment file. It identifies the captured image and
+the reviewed two-source cohort and sets `MORI_DISABLE_AUTO_XGMI=1`. Pytest and
+workers recheck the receipt against the effective installed source; a bare flag,
+stale image, source shadow or invalid receipt cannot relax the legacy skip.
+This is intent to attempt the first original restart tests, not evidence that
+GPU transfer, MR release or restart has already passed.
+
+For that invocation, the final worker environment keeps strict RDMA even when a
+worker-specific environment requests automatic XGMI. Intentional WRITE or
+pairing-protocol mismatches in negative cases remain unchanged. Legacy WRITE,
+explicit XGMI, other vendors and unchecked sources retain their protections.
+The original same-GPU victim restart, six survivor requests, prompt 503/error
+code and rejoin assertions stay in the full sweep. Their first actual results
+must determine whether additional native peer retirement is needed; they are
+not prior-pass prerequisites for selecting this qualification attempt.
+
+The strict READ held-prefill attempt additionally measures every victim GPU after
+stop and before reloading on those same GPUs. All baseline and final readings must
+be present, with allocation at most baseline + 64 MiB within a total 30 seconds,
+while the decode movers remain alive with unchanged PIDs and GPU assignments.
+Failure still restarts the victim through the existing cleanup path. This is an
+allocation-reclaim oracle, not a native MR count or proof of DMA quiescence.
+
+The CPU planner fails the whole selected matrix when the requested READ image or
+RDMA inputs are invalid. Other rows in that same plan are not dispatched around
+a failed READ input check.
