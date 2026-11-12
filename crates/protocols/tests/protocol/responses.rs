@@ -439,6 +439,36 @@ fn test_file_search_tool_round_trip_hybrid_weights_omitted() {
     assert_eq!(serialized, payload);
 }
 
+/// The preview web search tool as the public API declares it: the dated
+/// `web_search_preview_2025_03_11` type reads as the preview tool and is
+/// written under the canonical `web_search_preview`, and the tool's
+/// `search_content_types` is kept.
+#[test]
+fn the_web_search_preview_tool_takes_its_dated_type_and_content_types() {
+    for tool_type in ["web_search_preview", "web_search_preview_2025_03_11"] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "input": "news today",
+            "tools": [{
+                "type": tool_type,
+                "search_context_size": "low",
+                "search_content_types": ["text", "image"]
+            }]
+        }))
+        .unwrap_or_else(|e| panic!("{tool_type}: {e}"));
+        let written = serde_json::to_value(&request).expect("serialize the request");
+        assert_eq!(
+            written["tools"][0],
+            json!({
+                "type": "web_search_preview",
+                "search_context_size": "low",
+                "search_content_types": ["text", "image"]
+            }),
+            "{tool_type}"
+        );
+    }
+}
+
 // ------------------------------------------------------------------
 // T3: non-preview web_search tool + WebSearchCall.results
 // ------------------------------------------------------------------
