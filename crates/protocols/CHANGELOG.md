@@ -53,6 +53,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
+  body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
+  key was left out, so a client generated from the public schema, which marks it required, read a
+  choice it does not expect. A choice with log probabilities is written as before.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
