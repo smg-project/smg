@@ -3,7 +3,10 @@
 //! processor's key, the request's digest), early, before either scheduler
 //! waits for its KV peer. A failed check leaves the original reference
 //! request untouched so its worker can process it.
-use prost::Message;
+use prost::{
+    bytes::{buf::UninitSlice, BufMut},
+    Message,
+};
 use sha2::{Digest, Sha256};
 
 use super::{Batch, Kept};
@@ -77,12 +80,98 @@ pub fn request_digest(req: &GenerateRequest) -> Vec<u8> {
     }
     if let Some(mm) = &req.mm_inputs {
         // Reference requests have no tensor map, so serialization is canonical.
-        field(&mut hash, &mm.encode_to_vec());
+        message_field(&mut hash, mm.as_ref());
     }
     if let Some(pd) = &req.disaggregated_params {
         field(&mut hash, &pd.encode_to_vec());
     }
     hash.finalize().to_vec()
+}
+
+/// Hash the same length-prefixed protobuf bytes without allocating a media-sized buffer.
+fn message_field(hash: &mut Sha256, message: &impl Message) {
+    let len = message.encoded_len();
+    hash.update((len as u64).to_le_bytes());
+    // Keep the contiguous encoder for small metadata; streaming pays off on media payloads.
+    if len < 64 * 1024 {
+        let mut encoded = Vec::with_capacity(len);
+        message.encode_raw(&mut encoded);
+        hash.update(encoded);
+        return;
+    }
+    let mut output = DigestBuffer {
+        hash,
+        scratch: [0; 1024],
+        buffered: 0,
+        written: 0,
+    };
+    message.encode_raw(&mut output);
+    output.flush();
+}
+
+/// Buffer small protobuf fields while hashing large media references directly.
+struct DigestBuffer<'a> {
+    hash: &'a mut Sha256,
+    scratch: [u8; 1024],
+    buffered: usize,
+    written: usize,
+}
+
+impl DigestBuffer<'_> {
+    /// Hash pending bytes before reusing the scratch buffer or finishing the message.
+    fn flush(&mut self) {
+        self.hash.update(&self.scratch[..self.buffered]);
+        self.buffered = 0;
+    }
+}
+
+// SAFETY: chunk_mut exposes initialized scratch space. Advancing consumes only that
+// space, and the remaining capacity decreases by every byte accepted by the sink.
+#[expect(
+    unsafe_code,
+    reason = "BufMut requires an unsafe implementation; this sink only exposes initialized, bounds-checked scratch bytes"
+)]
+unsafe impl BufMut for DigestBuffer<'_> {
+    /// Report the sink's total remaining capacity across future flushes.
+    fn remaining_mut(&self) -> usize {
+        usize::MAX - self.written
+    }
+
+    /// Commit bytes from the current scratch chunk, flushing it once full.
+    unsafe fn advance_mut(&mut self, count: usize) {
+        assert!(count <= self.scratch.len() - self.buffered);
+        assert!(count <= self.remaining_mut());
+        self.buffered += count;
+        self.written += count;
+        if self.buffered == self.scratch.len() {
+            self.flush();
+        }
+    }
+
+    /// Expose the writable tail of the initialized scratch buffer.
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        let len = (self.scratch.len() - self.buffered).min(self.remaining_mut());
+        UninitSlice::new(&mut self.scratch[self.buffered..self.buffered + len])
+    }
+
+    /// Keep short fields in order and hash large slices directly after pending bytes.
+    fn put_slice(&mut self, bytes: &[u8]) {
+        assert!(bytes.len() <= self.remaining_mut());
+        self.written += bytes.len();
+        if bytes.len() >= self.scratch.len() {
+            self.flush();
+            self.hash.update(bytes);
+        } else {
+            if bytes.len() > self.scratch.len() - self.buffered {
+                self.flush();
+            }
+            self.scratch[self.buffered..self.buffered + bytes.len()].copy_from_slice(bytes);
+            self.buffered += bytes.len();
+            if self.buffered == self.scratch.len() {
+                self.flush();
+            }
+        }
+    }
 }
 
 /// Limit reuse to tokenized, single-choice PD requests with immutable media references.
@@ -188,6 +277,29 @@ mod tests {
             DisaggregatedParams, PlaceholderRange, SamplingParams, TensorData, TokenizedInput,
         },
     };
+
+    /// Check both encoding paths against the previous length-prefixed digest.
+    #[test]
+    fn media_digest_matches_length_prefixed_protobuf() {
+        // Small, large and many short references exercise both paths and buffer flushes.
+        for urls in [
+            vec!["https://example.test/image.png".into()],
+            vec!["A".repeat(64 * 1024)],
+            (0..2048).map(|i| "x".repeat(i % 1000)).collect(),
+        ] {
+            let mm = MultimodalInputs {
+                image_urls: urls,
+                ..Default::default()
+            };
+            let bytes = mm.encode_to_vec();
+            let mut expected = Sha256::new();
+            expected.update((bytes.len() as u64).to_le_bytes());
+            expected.update(bytes);
+            let mut actual = Sha256::new();
+            message_field(&mut actual, &mm);
+            assert_eq!(actual.finalize(), expected.finalize());
+        }
+    }
 
     #[test]
     /// Mixed references must fall back to processing on both PD sides.
