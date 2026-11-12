@@ -547,7 +547,7 @@ where
 {
     type Response = Response;
     type Error = S::Error;
-    type Future = DutyFuture<Instrumented<S::Future>, RecordDuty>;
+    type Future = RequestTraceFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -603,6 +603,10 @@ where
         )
     }
 }
+
+/// The request-span layer's future: the route's future under the request's
+/// span, with the span's record as its duty.
+pub type RequestTraceFuture<F> = DutyFuture<Instrumented<F>, RecordDuty>;
 
 /// What the request-span layer holds for a request between its first line
 /// and the route's answer: the response line of the access log and the
