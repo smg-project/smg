@@ -1550,6 +1550,90 @@ mod tests {
         }
     }
 
+    /// The chat stream's error event after a partial message and an open
+    /// call ends the response as failed: the terminal event is
+    /// `response.failed` with the event's error, and the stored record reads
+    /// failed as well, its partial message and its call still in progress,
+    /// the same error on it. A record that read as ended or incomplete would
+    /// hide the failure from a later read of the response.
+    #[tokio::test]
+    async fn an_upstream_error_event_fails_the_responses_stream_and_its_record() {
+        let frames = vec![
+            chat_event(
+                json!({"role":"assistant","content":"Part","tool_calls":[{
+                    "index":0,"id":"call_test","type":"function",
+                    "function":{"name":"lookup","arguments":"{\"city\":"}
+                }]}),
+                None,
+            ),
+            "data: {\"error\":{\"message\":\"engine unavailable\",\"type\":\"internal_error\"}}\n\n"
+                .into(),
+            "data: [DONE]\n\n".into(),
+        ];
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let response_storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(true),
+                ..Default::default()
+            },
+            None,
+            response_storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                events.push(serde_json::from_str(data).unwrap());
+            }
+        }
+        let terminal = events.last().expect("a terminal event");
+        assert_eq!(terminal["type"], "response.failed", "{terminal}");
+        assert_eq!(terminal["response"]["status"], "failed");
+        assert_eq!(
+            terminal["response"]["error"]["message"],
+            "engine unavailable"
+        );
+        assert!(!events.iter().any(|e| e["type"] == "response.completed"));
+        let id = terminal["response"]["id"]
+            .as_str()
+            .expect("the response id");
+        let stored = response_storage
+            .get_response(&smg_data_connector::ResponseId::from(id))
+            .await
+            .unwrap()
+            .expect("the failed response is stored");
+        let record = &stored.raw_response;
+        assert_eq!(record["status"], "failed", "{record}");
+        assert_eq!(record["error"], terminal["response"]["error"]);
+        let item = |kind: &str| {
+            record["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == kind)
+                .unwrap_or_else(|| panic!("a stored {kind} item: {record}"))
+                .clone()
+        };
+        let message = item("message");
+        assert_eq!(message["status"], "in_progress", "{message}");
+        assert_eq!(message["content"][0]["text"], "Part");
+        let call = item("function_call");
+        assert_eq!(call["status"], "in_progress", "{call}");
+        assert_eq!(call["arguments"], "{\"city\":");
+    }
+
     /// A stream that fails after a message and a call were partly streamed
     /// closes both (in progress) before `response.failed`, and the stored
     /// object carries the same items under the same ids with the same error,
