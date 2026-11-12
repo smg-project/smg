@@ -141,6 +141,12 @@ fn a_connection_beyond_the_bound_is_closed_without_a_response_and_counted() {
         rejected_before + 1.0,
         "the third connection's refusal: {rejected_before} -> {rejected}"
     );
+    // The refusal's WARN names this listener and its flag: the accept site
+    // passes the listener, and a swapped argument there names the other one.
+    let refusal = "the data listener's connection limit (--max-connections) is reached";
+    if let Err(log) = log_with_line(&gateway.log, refusal, EXIT_TIMEOUT) {
+        panic!("the refusal does not name the data listener and its flag\n{log}");
+    }
     // The two within the bound are untouched.
     assert!(answered_200(keep_alive_get(&mut first, "/health")));
     assert!(answered_200(keep_alive_get(&mut second, "/health")));
