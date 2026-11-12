@@ -182,14 +182,18 @@ pub(crate) fn check_image_size_feature_budget(
 pub(crate) const WIRE_MESSAGE_CAP: usize = u32::MAX as usize;
 
 /// Hold a batch of images to the wire's own cap before any of the batch is
-/// decoded or any tensor built: the pixel tensors they would put in one
+/// decoded or any tensor built, where the caller resolved one (`cap`:
+/// [`WIRE_MESSAGE_CAP`] where the pixels ride inline in the gateway's own
+/// gRPC message, `None` where they travel beside it or the caller cannot
+/// tell, and then nothing is refused here: the framing itself answers a
+/// message it cannot carry): the pixel tensors they would put in one
 /// Generate request, planned from the size each header promised through the
 /// processor's own size-to-elements rule (`image_input_elements`) at the
 /// width the wire writes an element in (`wire_dtype`; when the plan does not
 /// know it yet, the processor's own bytes for one that emits pixel bytes and
 /// the narrowest float width the engines take, two bytes, otherwise, so the
 /// bound refuses only what no serialization could carry), must stay within
-/// [`WIRE_MESSAGE_CAP`]. The message's other fields are not counted: a
+/// the cap. The message's other fields are not counted: a
 /// request the pixels alone leave within the cap by a hair is refused by the
 /// framing itself, as the request's own size. An image the processor plans
 /// no element count for is not counted either.
@@ -197,7 +201,11 @@ pub(crate) fn check_image_wire_cap(
     processor: &dyn VisionPreProcessor,
     images: &[Arc<ImageFrame>],
     wire_dtype: Option<EncoderDtype>,
+    cap: Option<usize>,
 ) -> Result<(), MediaConnectorError> {
+    let Some(cap) = cap else {
+        return Ok(());
+    };
     let element_size = wire_dtype.map_or_else(
         || if processor.emits_pixel_bytes() { 1 } else { 2 },
         EncoderDtype::element_size,
@@ -211,11 +219,8 @@ pub(crate) fn check_image_wire_cap(
         .fold(0usize, |total, elements| {
             total.saturating_add(elements.saturating_mul(element_size))
         });
-    if bytes > WIRE_MESSAGE_CAP {
-        return Err(MediaConnectorError::PixelsOverWireCap {
-            bytes,
-            limit: WIRE_MESSAGE_CAP,
-        });
+    if bytes > cap {
+        return Err(MediaConnectorError::PixelsOverWireCap { bytes, limit: cap });
     }
     Ok(())
 }
@@ -412,7 +417,13 @@ mod tests {
     #[test]
     fn a_batch_whose_pixels_would_not_fit_one_message_is_refused_before_preprocessing() {
         let one_over = |width: u32, height: u32, dtype: Option<EncoderDtype>| {
-            check_image_wire_cap(&PixelCounted, &[header_only(width, height)], dtype).unwrap_err()
+            check_image_wire_cap(
+                &PixelCounted,
+                &[header_only(width, height)],
+                dtype,
+                Some(WIRE_MESSAGE_CAP),
+            )
+            .unwrap_err()
         };
         let error = one_over(32_768, 32_768, Some(EncoderDtype::Float32));
         assert_eq!(
@@ -442,14 +453,30 @@ mod tests {
             (46_340, 46_340, None),
         ] {
             assert!(
-                check_image_wire_cap(&PixelCounted, &[header_only(width, height)], dtype).is_ok(),
+                check_image_wire_cap(
+                    &PixelCounted,
+                    &[header_only(width, height)],
+                    dtype,
+                    Some(WIRE_MESSAGE_CAP),
+                )
+                .is_ok(),
                 "{width}x{height} {dtype:?}"
             );
         }
         // The batch is summed: two images within the cap each, over it together.
         let pair = [header_only(32_767, 32_768), header_only(1, 32_768)];
-        assert!(check_image_wire_cap(&PixelCounted, &pair, Some(EncoderDtype::Float32)).is_err());
-        assert!(check_image_wire_cap(&PixelCounted, &pair, Some(EncoderDtype::BFloat16)).is_ok());
-        assert!(check_image_wire_cap(&PixelCounted, &[], Some(EncoderDtype::Float32)).is_ok());
+        let cap = Some(WIRE_MESSAGE_CAP);
+        assert!(
+            check_image_wire_cap(&PixelCounted, &pair, Some(EncoderDtype::Float32), cap).is_err()
+        );
+        assert!(
+            check_image_wire_cap(&PixelCounted, &pair, Some(EncoderDtype::BFloat16), cap).is_ok()
+        );
+        assert!(check_image_wire_cap(&PixelCounted, &[], Some(EncoderDtype::Float32), cap).is_ok());
+        // No bound where the pixels travel beside the message: nothing is
+        // refused here, the framing of the hop that carries them answers.
+        assert!(
+            check_image_wire_cap(&PixelCounted, &pair, Some(EncoderDtype::Float32), None).is_ok()
+        );
     }
 }

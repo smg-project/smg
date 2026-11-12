@@ -59,6 +59,11 @@ struct PlanContext<'a> {
     model_config: &'a MultimodalModelConfig,
     vision_processors: Arc<VisionProcessors>,
     image_wire_dtype: Option<EncoderDtype>,
+    /// The byte bound the images' pixel tensors must fit before any is
+    /// decoded, when the caller knows they ride inline in the gateway's own
+    /// gRPC message (see [`check_image_wire_cap`]); `None` where they travel
+    /// beside it, and the framing of that hop answers.
+    image_wire_cap: Option<usize>,
     transparency: TransparencyPolicy,
     /// The engine's per-item bound in feature tokens, when known (see
     /// [`super::encoder_budget`]): held to on an image's header size before
@@ -214,6 +219,7 @@ pub(crate) async fn process_multimodal_plan(
     tokenizer_id: &str,
     tokenizer_source: &str,
     image_wire_dtype: Option<EncoderDtype>,
+    image_wire_cap: Option<usize>,
     transparency: TransparencyPolicy,
     encoder_budget: Option<usize>,
 ) -> Result<MultimodalOutput> {
@@ -265,6 +271,7 @@ pub(crate) async fn process_multimodal_plan(
         model_config: &model_config,
         vision_processors,
         image_wire_dtype,
+        image_wire_cap,
         transparency,
         encoder_budget,
     };
@@ -593,7 +600,8 @@ fn intermediate_of(
 /// or any tensor built; the counts the preprocessing produces are held to
 /// the same budget in [`prepared_part`]. A batch whose pixel tensors could
 /// not ride in one message to the engine is refused at the same point, on
-/// the same sizes, as the request's own ([`check_image_wire_cap`]).
+/// the same sizes, as the request's own, where the caller knows they ride
+/// inline in the gateway's own message ([`check_image_wire_cap`]).
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
@@ -601,8 +609,13 @@ async fn preprocess_modality(
     if let MediaBatch::Images(images) = media {
         if let Ok(processor) = ctx.vision_processors.image() {
             check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
-            check_image_wire_cap(processor.as_ref(), images, ctx.image_wire_dtype)
-                .map_err(llm_multimodal::MultiModalError::Media)?;
+            check_image_wire_cap(
+                processor.as_ref(),
+                images,
+                ctx.image_wire_dtype,
+                ctx.image_wire_cap,
+            )
+            .map_err(llm_multimodal::MultiModalError::Media)?;
         }
     }
     if let Some(preprocessed) = cached_images(media, ctx).await? {
