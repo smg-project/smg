@@ -40,13 +40,11 @@
 //! look the same from here, a request's future dropped without a response.
 
 use std::{
-    future::Future,
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
     time::Instant,
 };
 
@@ -57,11 +55,11 @@ use axum::{
 };
 use http_body::Body as _;
 use openai_protocol::validated::RejectionCode;
-use pin_project_lite::pin_project;
 use tokio::task::futures::TaskLocalFuture;
 use tower::{Layer, Service};
 
 use super::{
+    duty::{Duty, DutyFuture},
     edge_body::{BodyDuties, EdgeBody},
     request_start::{clock_now, RequestStarted},
 };
@@ -217,7 +215,7 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = HttpMetricsFuture<TaskLocalFuture<RequestStarted, S::Future>>;
+    type Future = HttpMetricsFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -248,45 +246,30 @@ where
         // route's own with the edge's duty beside it, not a box around both.
         // The call runs under the stamp's sync scope and the future under
         // its scoped future: the layers inside read the stamp from both.
-        HttpMetricsFuture {
-            inner: started.scope(started.sync_scope(|| self.inner.call(req))),
-            duty: Some(EdgeDuty {
+        DutyFuture::new(
+            started.scope(started.sync_scope(|| self.inner.call(req))),
+            EdgeDuty {
                 method,
                 start,
                 tracker,
                 outcome,
                 guard,
-            }),
-        }
+            },
+        )
     }
 }
 
-pin_project! {
-    /// The metrics layer's future: the route's future, then the edge's
-    /// bookkeeping of the answer (the duration, the response head counted,
-    /// the one body wrapper). `duty` is what the edge holds for the request
-    /// until the route answers, taken at the answer.
-    pub struct HttpMetricsFuture<F> {
-        #[pin]
-        inner: F,
-        duty: Option<EdgeDuty>,
-    }
-
-    impl<F> PinnedDrop for HttpMetricsFuture<F> {
-        fn drop(this: Pin<&mut Self>) {
-            // Dropped with the duty still held: the route never answered.
-            if let Some(duty) = this.project().duty.take() {
-                duty.unanswered();
-            }
-        }
-    }
-}
+/// The metrics layer's future: the route's future with the request's start
+/// in its task local, with the edge's bookkeeping as its duty.
+pub type HttpMetricsFuture<F> = DutyFuture<TaskLocalFuture<RequestStarted, F>, EdgeDuty>;
 
 /// What the metrics layer holds for a request between its arrival and the
-/// route's answer. Dropped with the future before the answer, it counts the
-/// request as closed by the client and releases its in-flight guard, with
-/// the gauge set from the tracker as at every other release (`unanswered`).
-struct EdgeDuty {
+/// route's answer: the edge's bookkeeping of the answer (the duration, the
+/// response head counted, the one body wrapper). Dropped with the future
+/// before the answer, it counts the request as closed by the client and
+/// releases its in-flight guard, with the gauge set from the tracker as at
+/// every other release (`unanswered`).
+pub struct EdgeDuty {
     method: &'static str,
     start: Instant,
     tracker: Arc<InFlightRequestTracker>,
@@ -294,25 +277,7 @@ struct EdgeDuty {
     guard: InFlightGuard,
 }
 
-impl<F, E> Future for HttpMetricsFuture<F>
-where
-    F: Future<Output = Result<Response, E>>,
-{
-    type Output = Result<Response, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let answer = ready!(this.inner.poll(cx));
-        Poll::Ready(match this.duty.take() {
-            Some(duty) => duty.answered(answer),
-            // A poll after the answer breaks the caller's contract; the
-            // route's word to it passes through.
-            None => answer,
-        })
-    }
-}
-
-impl EdgeDuty {
+impl Duty for EdgeDuty {
     /// The route answered: the response head is counted and the body wrapped
     /// once; an error of the inner service releases the guard and counts
     /// nothing.

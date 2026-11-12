@@ -8,6 +8,7 @@ pub mod auth;
 pub mod body_limit;
 pub mod body_timeout;
 pub mod concurrency;
+pub mod duty;
 pub mod edge_body;
 pub mod inert;
 pub mod logging;
