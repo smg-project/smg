@@ -606,7 +606,7 @@ pub(crate) async fn execute_sequential_pd(
     // requests don't pollute success metrics; captured here before use of mode.
     let kv_connector_label = plan.mode.metrics_label();
     let (prefill_request, mut decode_request) = plan.requests(proto_request, workers);
-    let sides = PdSides::of(workers, ledger, &prefill_request);
+    let sides = PdSides::of(workers, ledger, &prefill_request, plan.streaming);
 
     let PrefillHarvest {
         stream: prefill_stream,
@@ -979,17 +979,33 @@ async fn sequential_decode_side(
     // transfer; aborting decode mid-transfer on a client disconnect can
     // crash or leak on the engine side. Defer the abort until the first
     // decode response proves the handoff finished (see the parallel PD
-    // path for the same invariant). The side is tracked on its worker here,
+    // path for the same invariant). A non-streaming request's first decode
+    // response is its whole answer, so a client that left would hold the
+    // decode engine for the answer's length (the house cap at most); its
+    // wait is bounded instead by the pair's decode bound
+    // (`liveness::decode_side_bound`, the bound a streaming side's first
+    // token is judged by), taken as the estimate of the handoff's length
+    // and counted from the drop: a shorter protection window than the cap,
+    // by design. A plain side has no silence verdict of its own, and a
+    // streaming side keeps the cap. The side is tracked on its worker here,
     // before its first item is waited for: its responses are the worker's
     // progress, it joins no pile (its silence is bounded per request), and
     // the worker's breaker success is sampled at the side's first response
     // (`ProtoStream::tracked_decode_side`), never at the dispatch; the
     // attribution stage leaves a side tracked here as it is.
-    let mut decode_stream = match &decode_worker {
-        Some(worker) => decode_stream
-            .defer_abort_until_first_item()
-            .tracked_decode_side(Arc::clone(worker)),
+    let plain_decode_bound = if plan.streaming {
+        None
+    } else {
+        worker_prefilling_before_decode(workers, handed_off, plan.relay_kv_params)
+            .and_then(|worker| liveness::decode_side_bound(worker, sides.prompt_tokens))
+    };
+    let decode_stream = match plain_decode_bound {
+        Some(bound) => decode_stream.defer_abort_within(bound),
         None => decode_stream.defer_abort_until_first_item(),
+    };
+    let mut decode_stream = match &decode_worker {
+        Some(worker) => decode_stream.tracked_decode_side(Arc::clone(worker)),
+        None => decode_stream,
     };
     // Without a bound nothing is pulled ahead and the side counts as answered,
     // as before; a first item that is a failure, or an end with nothing on

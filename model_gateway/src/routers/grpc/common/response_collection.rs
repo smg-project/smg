@@ -325,6 +325,7 @@ mod tests {
     use std::{
         net::TcpListener,
         sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
     };
 
     use axum::http::StatusCode;
@@ -350,6 +351,10 @@ mod tests {
         fn defer_abort_until_first_item(self) -> Self {
             self
         }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
+            self
+        }
     }
 
     /// A stream the engine ends with `status` before any response.
@@ -363,6 +368,10 @@ mod tests {
         fn mark_completed(&mut self) {}
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }
@@ -392,6 +401,10 @@ mod tests {
         fn defer_abort_until_first_item(self) -> Self {
             self
         }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
+            self
+        }
     }
 
     /// A stream that yields one `Complete`, then the engine's report.
@@ -416,6 +429,10 @@ mod tests {
         fn mark_completed(&mut self) {}
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }
