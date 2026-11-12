@@ -235,6 +235,13 @@ impl Completion {
                 signal: StepResult::Skip,
                 state: None,
             },
+            // Cancelled between attempts: the step's record says so, where
+            // its last attempt left it running or retrying. A waiter reading
+            // the cancelled workflow sees no step still on its task then.
+            Err(WorkflowError::Cancelled(_)) => Self {
+                signal: StepResult::Failure,
+                state: Some((StepStatus::Cancelled, None)),
+            },
             Ok(StepResult::Failure) | Err(_) => match on_failure {
                 FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => Self {
                     signal: StepResult::Failure,
@@ -1365,9 +1372,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// Waits for the workflow to reach a terminal status and returns that
-    /// state, its step states included, read before the terminal cleanup.
-    /// The timeout is an error and leaves a still-running workflow to the
-    /// periodic cleanup.
+    /// state, its step states included, read before the terminal cleanup. A
+    /// cancellation is written at once while a step past its cancel read is
+    /// still on its task, so a cancelled workflow is terminal here only once
+    /// no step reads running or retrying: that step's own end is in the
+    /// state (succeeded or failed), and a step cancelled before its next
+    /// attempt reads cancelled. The timeout is an error and leaves a
+    /// still-running workflow to the periodic cleanup.
     pub async fn wait_for_terminal_state(
         &self,
         instance_id: WorkflowInstanceId,
@@ -1394,7 +1405,15 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .get_status(instance_id)
                 .await
                 .map_err(|e| format!("Failed to get workflow status: {e:?}"))?;
+            let step_on_its_task = state
+                .step_states
+                .values()
+                .any(|step| matches!(step.status, StepStatus::Running | StepStatus::Retrying));
             match state.status {
+                WorkflowStatus::Cancelled if step_on_its_task => {
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
+                }
                 WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
                     self.state_store.cleanup_if_terminal(instance_id).await;
                     return Ok(state);

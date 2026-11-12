@@ -1,6 +1,9 @@
 //! Unified worker registration step.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use tracing::debug;
@@ -24,7 +27,7 @@ use crate::{
 pub struct RegisterWorkersStep;
 
 /// The step's id in the registration DAGs.
-const REGISTER_WORKERS_STEP: &str = "register_workers";
+pub(crate) const REGISTER_WORKERS_STEP: &str = "register_workers";
 
 /// Whether the registry step of `state` completed: the registration's workers
 /// are in the registry, whatever the workflow did after it (a cancellation or
@@ -34,6 +37,30 @@ pub fn registered_in<D: WorkflowData>(state: &WorkflowState<D>) -> bool {
         .step_states
         .get(&StepId::new(REGISTER_WORKERS_STEP))
         .is_some_and(|step| step.status == StepStatus::Succeeded)
+}
+
+/// The registration's workers that are the registry's entries under their
+/// URLs now, by id and revision: what a removal queued for this registration
+/// may take. A worker registered or replaced since is not among them, and a
+/// registration whose registry step the state does not record as succeeded
+/// (a cancellation written while the step ran) is still read from the
+/// registry itself.
+pub fn registered_entries<D: WorkerRegistrationData>(
+    registry: &WorkerRegistry,
+    state: &WorkflowState<D>,
+) -> HashMap<String, u64> {
+    state
+        .context
+        .data
+        .get_actual_workers()
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| {
+            let id = registry.get_id_by_url(worker.url())?;
+            let entry = registry.get(&id)?;
+            Arc::ptr_eq(&entry, worker).then(|| (id.as_str().to_string(), entry.revision()))
+        })
+        .collect()
 }
 
 fn step_failed(message: String) -> WorkflowError {
@@ -287,6 +314,49 @@ mod tests {
         worker_at("http://worker:8080", model_id)
     }
 
+    /// The registry names what a registration left in it: its own workers
+    /// while they are the entries under their URLs, by id and revision, and
+    /// nothing once a worker under the URL is another one.
+    #[test]
+    fn the_registry_names_what_a_registration_left_in_it() {
+        use openai_protocol::worker::WorkerSpec;
+        use wfaas::{WorkflowId, WorkflowInstanceId};
+
+        use crate::{
+            app_context::testing::app_context_for_tests, config::RouterConfig,
+            worker::WorkerRegistry, workflow::steps::create_worker_workflow_data,
+        };
+        let url = "http://worker:8080";
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+        let id = registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new(url),
+            WorkerRegistrationMode::CreateOnly,
+            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None),
+        );
+        data.actual_workers = Some(vec![Arc::clone(&worker)]);
+        let state = WorkflowState::new(
+            WorkflowInstanceId::new(),
+            WorkflowId::new("worker_registration"),
+            data,
+        );
+        assert_eq!(
+            registered_entries(&registry, &state),
+            HashMap::from([(id.as_str().to_string(), worker.revision())]),
+            "the registration's worker is the entry under its URL"
+        );
+        registry.remove(&id);
+        let other: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+        registry.register(other).expect("another worker registers");
+        assert!(
+            registered_entries(&registry, &state).is_empty(),
+            "the worker under the URL is not this registration's"
+        );
+    }
+
     /// A terminal state says whether its registry step landed: the step's
     /// record reads `Succeeded` once the workers are in the registry, whatever
     /// the workflow's own status became after it; no record, or a step that
@@ -319,7 +389,7 @@ mod tests {
             !registered_in(&state),
             "no record of the step, nothing landed"
         );
-        let step = StepId::new("register_workers");
+        let step = StepId::new(REGISTER_WORKERS_STEP);
         for status in [
             StepStatus::Pending,
             StepStatus::Running,
