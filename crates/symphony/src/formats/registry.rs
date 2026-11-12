@@ -552,9 +552,9 @@ mod tests {
         }
     }
 
-    /// The renamed and re-quantized checkpoints of the last two months read with their groups'
-    /// tables once their groups list them: names whose template renders the same text as the
-    /// primary's and whose tokenizer files are the primary's.
+    /// A checkpoint renamed or re-quantized under another name or organisation reads with its
+    /// group's table once the group lists it under `also`: names whose template renders the same
+    /// text as the primary's and whose tokenizer files are the primary's.
     #[test]
     fn a_renamed_or_requantized_checkpoint_listed_by_its_group_resolves_to_the_groups_table() {
         for (model, table) in [
@@ -565,6 +565,8 @@ mod tests {
             ("nvidia/DeepSeek-V4.1-Flash-1017-NVFP4", Table::DeepSeekV4_1),
             ("microsoft/UserRepGen-4B", Table::Qwen3Tagged),
             ("nvidia/Qwen3.8-Flash-Next-FP4-Local", Table::Qwen3Tagged),
+            ("microsoft/AesCode-8B", Table::Qwen3),
+            ("microsoft/AesCode-32B", Table::Qwen3),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");

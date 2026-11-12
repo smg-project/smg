@@ -236,7 +236,7 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-224 groups, 403 checkpoints, newest first.
+224 groups, 405 checkpoints, newest first.
 12 ready, 159 replaying a recorded set, 4 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
@@ -359,7 +359,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-10-16 | [caprl-internvl3.5-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/caprl-internvl3.5-8b) | internlm/CapRL-InternVL3.5-8B |  | — | 328,662 | pending | none |
 | 2025-10-13 | [deep-ignorance-unfiltered-instruct-test](https://github.com/smg-project/bellwether/tree/main/fixtures/deep-ignorance-unfiltered-instruct-test) | EleutherAI/deep-ignorance-unfiltered-instruct-test | deep-ignorance-e2e-strong-filter-instruct-test, deep-ignorance-e2e-strong-filter-instruct-test-v2, deep-ignorance-strong-filter-pt-weak-filter-anneal-instruct-test, deep-ignorance-strong-filter-pt-weak-filter-anneal-instruct-test-v2 | — | 273,678 | pending | none |
 | 2025-10-12 | [llama-3.3-nemotron-70b-reward-principle](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.3-nemotron-70b-reward-principle) | nvidia/Llama-3.3-Nemotron-70B-Reward-Principle | Llama-3.3-Nemotron-70B-Edit, Llama-3.3-Nemotron-70B-Feedback | `json` | 458,185 | replaying the set | `json`, none |
-| 2025-10-11 | [qwen3-vl-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-8b-instruct) | Qwen/Qwen3-VL-8B-Instruct | BAAI/RoboBrain2.5-4B, lightonai/OriOn-Qwen, lightonai/OriOn-Qwen-SR1, nvidia/Cosmos-Reason2-32B, Qwen3-VL-2B-Instruct, Qwen3-VL-32B-Instruct, Qwen3-VL-4B-Instruct, tencent/WeVisDoc-2B, tencent/WeVisDoc-4B | `qwen3` | 576,772 | replaying the set | `qwen`, `qwen3` |
+| 2025-10-11 | [qwen3-vl-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-8b-instruct) | Qwen/Qwen3-VL-8B-Instruct | BAAI/RoboBrain2.5-4B, lightonai/OriOn-Qwen, lightonai/OriOn-Qwen-SR1, microsoft/AesCode-32B, microsoft/AesCode-8B, nvidia/Cosmos-Reason2-32B, Qwen3-VL-2B-Instruct, Qwen3-VL-32B-Instruct, Qwen3-VL-4B-Instruct, tencent/WeVisDoc-2B, tencent/WeVisDoc-4B | `qwen3` | 576,772 | replaying the set | `qwen`, `qwen3` |
 | 2025-10-11 | [qwen3-vl-8b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-8b-thinking) | Qwen/Qwen3-VL-8B-Thinking | Qwen3-VL-2B-Thinking, Qwen3-VL-32B-Thinking, Qwen3-VL-4B-Thinking | `qwen3` | 554,276 | replaying the set | `qwen`, `qwen3` |
 | 2025-10-08 | [functiongemma-270m-it](https://github.com/smg-project/bellwether/tree/main/fixtures/functiongemma-270m-it) | google/functiongemma-270m-it |  | `function_gemma` | 246,750 | replaying the set | `json`, none |
 | 2025-10-05 | [ai21-jamba-reasoning-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/ai21-jamba-reasoning-3b) | ai21labs/AI21-Jamba-Reasoning-3B |  | `qwen3` | 12,885 | replaying the set | none |

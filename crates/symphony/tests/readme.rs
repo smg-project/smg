@@ -2248,6 +2248,8 @@ const GROUPS: &[Group] = &[
             "BAAI/RoboBrain2.5-4B",
             "lightonai/OriOn-Qwen",
             "lightonai/OriOn-Qwen-SR1",
+            "microsoft/AesCode-32B",
+            "microsoft/AesCode-8B",
             "nvidia/Cosmos-Reason2-32B",
             "Qwen3-VL-2B-Instruct",
             "Qwen3-VL-32B-Instruct",
