@@ -2172,6 +2172,10 @@ mod request_contract_tests {
             error.contains("invalid_type") && error.contains("tools[0].function.parameters"),
             "{error}"
         );
+        assert!(
+            error.contains("expected an object, but got a string instead"),
+            "{error}"
+        );
         let empty = request(json!({"tools": [{"type": "function", "function": {"name": "f"}}]}));
         assert_eq!(rejection(&empty), None);
     }
