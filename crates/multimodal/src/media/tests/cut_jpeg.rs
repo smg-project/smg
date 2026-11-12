@@ -103,10 +103,11 @@ fn a_single_scan_file_ending_in_a_comment_is_served_as_the_reference_serves_it()
 
 /// A progressive file is read through to its end marker before its first
 /// row, so the reference loader refuses it with a comment in place of the
-/// marker, and so does this path, before either decoder. A copy of the ramp
-/// whose frame marker is rewritten to the progressive one stands in for a
+/// marker, and so does this path: the library's warned frame is not kept,
+/// and the fallback decoder never reads the file. A copy of the ramp whose
+/// frame marker is rewritten to the progressive one stands in for a
 /// progressive file: the readers go by the markers, and the refusal before
-/// the decoders is told from the decoders' own by its message.
+/// the fallback decoder is told from the decoders' own by its message.
 #[test]
 fn a_progressive_file_ending_in_a_comment_is_refused() {
     let mut jpeg = ramp_jpeg();
@@ -126,7 +127,7 @@ fn a_progressive_file_ending_in_a_comment_is_refused() {
     let mut comment = jpeg[..jpeg.len() - 2].to_vec();
     comment.extend([0xFF, 0xFE, 0x00, 0x04, 0xFF, 0xD9]);
     let error = decode_image_bytes(&comment, None, TransparencyPolicy::KeepAlpha)
-        .expect_err("refused before the decoders");
+        .expect_err("refused before the fallback decoder");
     assert!(
         error
             .to_string()
@@ -185,7 +186,7 @@ fn segments_libjpeg_parses_behind_a_single_scan_are_refused_as_the_reference_ref
     ];
     for file in &refused {
         let error = decode_image_bytes(file, None, TransparencyPolicy::KeepAlpha)
-            .expect_err("refused before the decoders");
+            .expect_err("refused before the fallback decoder");
         assert!(
             error
                 .to_string()
@@ -217,21 +218,21 @@ fn segments_libjpeg_parses_behind_a_single_scan_are_refused_as_the_reference_ref
     }
 }
 
-/// Behind a single-scan frame's scan libjpeg parses a table segment and
-/// refuses a malformed one, where the walk reads the segment's length
-/// alone, so a table there is refused before either decoder, end marker or
-/// not. The reference loader (Pillow 12.3 with its bundled libjpeg-turbo)
-/// refuses a Huffman table of length 3, one of length 4 with two zero
-/// bytes, one with a table index of 5 and a quantization table of length 3
-/// with an index of 5, each behind a warned or a cut scan and before the
-/// end marker, and loads the file's own Huffman table copied there, an
-/// empty table of length 2 and a restart interval of length 4: those are
-/// the documented residual, refused here where the loader serves them. A
-/// clean scan followed by a valid table and the marker warns the library
-/// of nothing, so with the library it is served as the loader serves it,
-/// without the reading; without the library the reading refuses it.
+/// Behind a single-scan frame's scan libjpeg parses a table segment and refuses
+/// a malformed one, where the walk reads the segment's length alone, so a table
+/// there is refused before the fallback decoder, end marker or not. The
+/// reference loader (Pillow 12.3 with its bundled libjpeg-turbo) refuses a
+/// Huffman table of length 3, one of length 4 with two zero bytes, one with a
+/// table index of 5 and a quantization table of length 3 with an index of 5,
+/// each behind a warned or a cut scan and before the end marker, and loads the
+/// file's own Huffman table copied there, an empty table of length 2 and a
+/// restart interval of length 4: those are the documented residual, refused
+/// here where the loader serves them. A clean scan followed by a valid table
+/// and the marker warns the library of nothing, so with the library it is
+/// served as the loader serves it, without the reading; without the library the
+/// reading refuses it.
 #[test]
-fn a_table_behind_a_single_scan_frames_scan_is_refused_before_the_decoders() {
+fn a_table_behind_a_single_scan_frames_scan_is_refused_before_the_fallback_decoder() {
     let jpeg = ramp_jpeg();
     let scan = scan_header(&jpeg);
     let length = usize::from(u16::from_be_bytes([jpeg[scan + 2], jpeg[scan + 3]]));
@@ -262,7 +263,7 @@ fn a_table_behind_a_single_scan_frames_scan_is_refused_before_the_decoders() {
         for scan in [warned, half] {
             let file = [scan, table, marker].concat();
             let error = decode_image_bytes(&file, None, TransparencyPolicy::KeepAlpha)
-                .expect_err("refused before the decoders");
+                .expect_err("refused before the fallback decoder");
             assert!(
                 error
                     .to_string()
