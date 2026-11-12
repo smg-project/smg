@@ -6,7 +6,7 @@
 //! resolves it to, as every serving route reads it. The management routes
 //! refuse in the control plane's envelope (`{"error", "code"}`), the shape
 //! the worker routes use; an empty or whitespace name or source is refused
-//! up front, before the load job the registry's own check would fail.
+//! up front, before a load job is queued for it.
 
 use std::sync::Arc;
 
@@ -235,8 +235,9 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         );
     }
 
-    // An empty source is refused too: nothing loads from it, and the job the
-    // gateway would queue could only end as failed.
+    // An empty or whitespace source is refused up front too: nothing loads
+    // from it, and the job the gateway would otherwise queue would fail its
+    // local load and fall back to a worker fetch under the request's name.
     if request.source.trim().is_empty() {
         return refusal(
             StatusCode::BAD_REQUEST,

@@ -2,9 +2,9 @@
 //! (`{"error", "code"}`, the shape the worker routes answer): an unknown
 //! tokenizer is a 404, a name in use a 409, a body the type does not take a
 //! 400, an empty or whitespace name or source a 400 up front. A loaded
-//! tokenizer keeps its answer shape; a
-//! model alias tokenizes as the model it names; a load that fails stays
-//! readable under its id as `failed`, with the error.
+//! tokenizer keeps its answer shape; a model alias tokenizes as the model it
+//! names; a load that fails stays readable under its id as `failed`, with the
+//! error.
 
 use std::{sync::Arc, time::Duration};
 
