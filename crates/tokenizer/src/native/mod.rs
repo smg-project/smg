@@ -874,6 +874,9 @@ pub(crate) struct NativeEncoder {
     /// check every encode under it starts with (see [`Self::in_form`]; the
     /// NFKC form has no quick check and reads the library's).
     nfc_quick: Option<NfcQuick>,
+    /// Whether a stage holds the end anchor `$`: such a text is never cut
+    /// into units for the thread pool (see [`Self::stable_cut`]).
+    end_anchored: bool,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
     /// Added tokens matched after normalization (`normalized: true`).
@@ -1008,6 +1011,7 @@ impl NativeEncoder {
         };
         let chain = chain::Scanner::recognize(&stages);
         Ok(Self {
+            end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
             nfc_quick: (normalizer == Normalizer::Nfc).then(NfcQuick::read),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
@@ -1068,6 +1072,7 @@ impl NativeEncoder {
             "the native encode path takes the byte-fallback vocabulary from character symbols"
         );
         Ok(Self {
+            end_anchored: false,
             normalizer: Normalizer::None,
             nfc_quick: None,
             raw_added: AddedTokens::build(&raw)?,
@@ -1623,6 +1628,7 @@ impl NativeEncoder {
             raw_added: AddedTokens::build(specials)?,
             normalized_added: None,
             nfc_quick: None,
+            end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
             stages,
             chain,
             frame: Frame::default(),
@@ -2088,7 +2094,9 @@ impl NativeEncoder {
             let bytes = text.as_bytes();
             return (from.max(1)..text.len()).find(|&p| chars.cuts_at(bytes, p));
         }
-        if self.stages.is_empty() {
+        // A stage that reads the end of the text (`$`) would read the
+        // window's end as one: no cut, the text stays one unit.
+        if self.stages.is_empty() || self.end_anchored {
             return None;
         }
         let bytes = text.as_bytes();

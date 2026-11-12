@@ -6,11 +6,12 @@
 //! code points, a group of single-character alternatives (read as the class
 //! of their union), greedy `?` `*` `+` `{m,n}` and the possessive `?+` `*+`
 //! `++` on a class, a case-insensitive group of literal alternatives (or a
-//! class of letters) for the English clitics, and the lookahead `(?!\S)`.
-//! This module parses that
-//! subset and matches it the way the engine behind `tokenizers`' `Split`
-//! does: leftmost-first alternation, greedy quantifiers that back off one
-//! repetition at a time. The engine also yields empty matches, and `Split`
+//! class of letters) for the English clitics, the lookahead `(?!\S)` and
+//! the end anchor `$` (the engine's end of line: the end of the text, or
+//! before a newline). This module parses that subset and matches it the
+//! way the engine behind `tokenizers`' `Split` does: leftmost-first
+//! alternation, greedy quantifiers that back off one repetition at a
+//! time. The engine also yields empty matches, and `Split`
 //! cuts the text at them; this matcher does not reproduce that, so a pattern
 //! that can match the empty string is declined like everything else outside
 //! the subset, and the caller keeps the `tokenizers` pipeline for it.
@@ -375,6 +376,9 @@ pub(super) enum Node {
     },
     /// `(?!...)` over one class: succeeds when the next character is not in it.
     NotAhead(usize),
+    /// `$`: succeeds at the end of the text and before a newline (the
+    /// engine's end of line, in its default syntax).
+    End,
 }
 
 /// The characters a match of a node can begin with: a table of the ASCII
@@ -437,6 +441,8 @@ pub(crate) struct Pattern {
     /// What the pattern is as a stage of a three-stage chain, when it is
     /// one (see [`chain`]).
     part: Option<chain::Part>,
+    /// Whether the pattern holds the end anchor (see [`Self::end_anchored`]).
+    end_anchored: bool,
 }
 
 /// The matcher of a pattern: a hand-written scanner for the two template
@@ -470,6 +476,8 @@ enum Op {
     },
     /// Succeeds when the next character is not in the class.
     NotAhead(usize),
+    /// Succeeds at the end of the text and before a newline (`$`).
+    End,
     /// A choice: the ops that follow are tried first; `next` is where to go
     /// when they fail (the following alternative's `Split`, the op after an
     /// optional group, or [`NO_NEXT`] for the last alternative). `first`
@@ -533,6 +541,7 @@ impl Pattern {
             },
         };
         let part = chain::Part::recognize(&root);
+        let end_anchored = holds_end(&root);
         let mut program = Vec::new();
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
@@ -543,6 +552,7 @@ impl Pattern {
             firsts,
             matcher,
             part,
+            end_anchored,
         })
     }
 
@@ -560,6 +570,13 @@ impl Pattern {
     /// the pattern cuts a text and its byte-level image at the same places.
     pub(super) fn within_printable_ascii(&self) -> bool {
         self.classes.iter().all(Class::within_printable_ascii)
+    }
+
+    /// Whether the pattern holds the end anchor `$`: it reads the end of
+    /// the text it runs over, so a text it cuts is never split into units
+    /// (see `NativeEncoder::stable_cut`).
+    pub(super) fn end_anchored(&self) -> bool {
+        self.end_anchored
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
@@ -679,6 +696,14 @@ impl Pattern {
                         false
                     }
                 },
+                Op::End => {
+                    if pos == text.len() || text.as_bytes()[pos] == b'\n' {
+                        pc += 1;
+                        false
+                    } else {
+                        true
+                    }
+                }
                 Op::Split { next, first } => {
                     let excluded = match next_char(text, pos) {
                         Some((c, _)) => !self.firsts[first].may_start(c),
@@ -1224,6 +1249,7 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             }
         }
         Node::NotAhead(class) => program.push(Op::NotAhead(*class)),
+        Node::End => program.push(Op::End),
     }
 }
 
@@ -1231,7 +1257,7 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
 /// alternation on a path leaves one until the path is done or backs off.
 fn choices(node: &Node) -> usize {
     match node {
-        Node::Class(_) | Node::NotAhead(_) => 0,
+        Node::Class(_) | Node::NotAhead(_) | Node::End => 0,
         Node::ClassRepeat { possessive, .. } => usize::from(!*possessive),
         Node::Repeat { node, max, .. } => {
             if *max == 0 {
@@ -1300,7 +1326,19 @@ fn can_match_empty(node: &Node) -> bool {
         Node::Repeat { node, min, .. } => *min == 0 || can_match_empty(node),
         Node::Concat(nodes) => nodes.iter().all(can_match_empty),
         Node::Alt { alternatives, .. } => alternatives.iter().any(can_match_empty),
-        Node::NotAhead(_) => true,
+        Node::NotAhead(_) | Node::End => true,
+    }
+}
+
+/// Whether `node` holds the end anchor anywhere: such a pattern reads the
+/// end of the text it runs over.
+fn holds_end(node: &Node) -> bool {
+    match node {
+        Node::End => true,
+        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) => false,
+        Node::Repeat { node, .. } => holds_end(node),
+        Node::Concat(nodes) => nodes.iter().any(holds_end),
+        Node::Alt { alternatives, .. } => alternatives.iter().any(holds_end),
     }
 }
 
@@ -1348,7 +1386,7 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
                 .iter()
                 .fold(First::default(), |all, first| all.or(*first))
         }
-        Node::NotAhead(_) => First {
+        Node::NotAhead(_) | Node::End => First {
             nullable: true,
             ..First::default()
         },
@@ -1513,7 +1551,7 @@ impl Parser<'_> {
                 max,
                 possessive,
             },
-            Node::NotAhead(_) => return None,
+            Node::NotAhead(_) | Node::End => return None,
             // A possessive group would need the engine's rule for the choices
             // inside it (an atomic group): declined.
             _ if possessive => return None,
@@ -1570,7 +1608,8 @@ impl Parser<'_> {
                 let class = self.parse_escape_as_class()?;
                 Some(Node::Class(self.add_class(class)))
             }
-            '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | ')' | '|' | ']' => None,
+            '$' => Some(Node::End),
+            '.' | '^' | '*' | '+' | '?' | '{' | '}' | ')' | '|' | ']' => None,
             literal => Some(Node::Class(self.literal_class(literal))),
         }
     }
@@ -1888,7 +1927,7 @@ mod tests {
     /// characters, the joiners as code-point escapes.
     const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 16] = [
+    const PATTERNS: [&str; 19] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -1905,7 +1944,19 @@ mod tests {
         POSSESSIVE_CLITIC_CLASS,
         CLITIC_CLASS,
         JOINED_LETTERS,
+        END_SPACES,
+        END_LETTERS,
+        END_GROUP,
     ];
+
+    /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
+    /// run that ends the text or stands before a newline.
+    const END_SPACES: &str = r"\s+$";
+    /// A letter run at the end beside one anywhere: the anchored alternative
+    /// is tried first and backs off to the other.
+    const END_LETTERS: &str = r"[a-z]+$|[a-z]+";
+    /// The anchor after a group whose alternatives nest a prefix.
+    const END_GROUP: &str = r" ?(?:ab|b)$| ?[a-z]+";
 
     /// Characters that exercise every class the patterns use: ASCII of all
     /// kinds, spaces and line breaks of several scripts, letters with and
@@ -2115,7 +2166,6 @@ mod tests {
         for pattern in [
             r"a.b",
             r"^a",
-            r"a$",
             r"(a)",
             r"a*?",
             r"a+?",
@@ -2154,6 +2204,10 @@ mod tests {
             r"(?i:ss)",
             r"(?i:'st)",
             r"(?i:fi|fl|ff)",
+            r"$",
+            r"^a",
+            r"a$?",
+            r"(?:a|$)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
