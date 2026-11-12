@@ -7,7 +7,10 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        StatusCode,
+    },
     Router,
 };
 use serde_json::{json, Value};
@@ -16,6 +19,7 @@ use tower::ServiceExt;
 
 use super::messages_streaming_test::parse_sse_events;
 use crate::common::{
+    metrics_capture::{self, render_after},
     mock_worker::{
         set_request_recorder, HealthStatus, MockWorkerConfig, RequestRecorder, WorkerType,
     },
@@ -43,8 +47,12 @@ async fn post_raw_with(
     if let Some(beta) = beta {
         req = req.header("anthropic-beta", beta);
     }
+    // A client sends the body's length; without one every request is
+    // buffered for want of a length and never reaches the raw body path.
+    let body = serde_json::to_string(payload).unwrap();
     let req = req
-        .body(Body::from(serde_json::to_string(payload).unwrap()))
+        .header(CONTENT_LENGTH, body.len())
+        .body(Body::from(body))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
@@ -373,4 +381,97 @@ async fn test_v1_messages_thread_streamed_create_is_continued() {
     );
     assert_eq!(messages[2]["content"], "second");
     ctx.shutdown().await;
+}
+
+/// A thread turn is buffered for the thread layer on the raw body path too:
+/// with router retries off and a body over the buffered size, a request
+/// streams to its worker unread, while a turn under the threads beta is
+/// read here, stored under its id and continued. The body-path counter
+/// names the reason.
+#[test]
+fn test_v1_messages_thread_turn_is_buffered_on_the_raw_body_path() {
+    let rendered = render_after(|| async {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18969, Arc::clone(&recorder));
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .disable_retries()
+            .max_buffered_request_bytes(256)
+            .host("127.0.0.1")
+            .port(3003)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let workers = vec![MockWorkerConfig {
+            port: 18969,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }];
+        let ctx = AppTestContext::new_with_config(config, workers).await;
+        let app = ctx.create_app();
+
+        let first = "x".repeat(1024);
+        let (status, created) = post(
+            &app,
+            "/v1/messages",
+            &json!({
+                "model": "mock-model",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": first}],
+                "thread": {"type": "create"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let id = created["id"].as_str().expect("the answer's id").to_string();
+
+        let (status, answer) = post(
+            &app,
+            "/v1/messages",
+            &json!({
+                "model": "mock-model",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "second"}],
+                "thread": {"type": "continue", "previous_message_id": id}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+
+        let bodies = recorder.bodies();
+        assert_eq!(bodies.len(), 2, "one request per turn reaches the backend");
+        let sent = &bodies[1];
+        assert!(sent.get("thread").is_none(), "{sent}");
+        assert_eq!(
+            sent["messages"].as_array().map(Vec::len),
+            Some(3),
+            "the continue carries the rebuilt conversation: {sent}"
+        );
+        ctx.shutdown().await;
+    });
+
+    let family = "smg_router_request_body_path";
+    assert_eq!(
+        metrics_capture::sample(
+            &rendered,
+            family,
+            "total",
+            &["path=\"buffered\"", "reason=\"message_thread\""]
+        ),
+        Some(2.0),
+        "both turns were buffered for the thread layer:\n{rendered}"
+    );
+    assert_eq!(
+        metrics_capture::sample(&rendered, family, "total", &["path=\"streamed\""]),
+        None,
+        "no turn streamed past the thread layer:\n{rendered}"
+    );
 }
