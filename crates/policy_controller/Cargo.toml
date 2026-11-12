@@ -48,5 +48,9 @@ harness = false
 name = "contention"
 harness = false
 
+[[bench]]
+name = "store"
+harness = false
+
 [lints]
 workspace = true
