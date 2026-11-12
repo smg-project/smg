@@ -1757,3 +1757,50 @@ async fn a_cancelled_workflow_s_terminal_state_waits_for_a_step_past_its_cancel_
         "the step after the cancellation did not run"
     );
 }
+
+/// A step whose attempt skips.
+struct AttemptSkipStep;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for AttemptSkipStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        Ok(StepResult::Skip)
+    }
+}
+
+/// A step that skips in its attempt is recorded as skipped, as one its
+/// `run_if` gate skipped is: its record does not keep the running status
+/// its attempt began with, which a waiter on a cancelled workflow would
+/// take for a step still on its task.
+#[tokio::test]
+async fn a_step_that_skips_in_its_attempt_reads_skipped() {
+    let engine = WorkflowEngine::<TestWorkflowData>::new();
+    let workflow = WorkflowDefinition::new("attempt_skip_workflow", "Attempt Skip")
+        .add_step(StepDefinition::new(
+            "skipping_step",
+            "Step that skips in its attempt",
+            Arc::new(AttemptSkipStep),
+        ))
+        .add_step(
+            StepDefinition::new("next_step", "Step after it", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["skipping_step"]),
+        );
+    let instance_id = started(&engine, workflow).await.unwrap();
+    let state = engine
+        .wait_for_terminal_state(instance_id, "attempt skip", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(
+        state.step_states[&StepId::new("skipping_step")].status,
+        StepStatus::Skipped,
+        "the attempt's skip is the step's record"
+    );
+    assert_eq!(
+        state.step_states[&StepId::new("next_step")].status,
+        StepStatus::Succeeded
+    );
+}
