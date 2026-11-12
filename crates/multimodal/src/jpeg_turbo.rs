@@ -67,6 +67,12 @@ type TjDecompress2 = unsafe extern "C" fn(
     c_int,
 ) -> c_int;
 type TjDestroy = unsafe extern "C" fn(TjHandle) -> c_int;
+type TjGetErrorCode = unsafe extern "C" fn(TjHandle) -> c_int;
+/// `tjGetErrorCode`'s reading of a call that returned -1 (`enum TJERR`): a
+/// warning was raised during the call, and a fatal error may still have
+/// followed it (`TurboJpeg::warned`), or `TJERR_FATAL` (1), a fatal error
+/// with no warning before it.
+const TJERR_WARNING: c_int = 0;
 
 /// Resolved TurboJPEG entry points. Holds the loaded `Library` so the function
 /// pointers stay valid for the process lifetime.
@@ -76,6 +82,27 @@ struct TurboJpeg {
     header: TjDecompressHeader3,
     decompress: TjDecompress2,
     destroy: TjDestroy,
+    /// TurboJPEG 2.0 and later; a 1.x library has no such reading, and every
+    /// non-zero return is a failure with it.
+    error_code: Option<TjGetErrorCode>,
+}
+
+impl TurboJpeg {
+    /// Whether the last call on `handle` raised a warning: the library notes
+    /// a defect in the data (stray bytes before a marker, a corrupt scan, a
+    /// scan ending early) as a warning, reads or writes past it and returns
+    /// -1 at its end. The reading is a flag the call sets at its first
+    /// warning and never clears, so a fatal error that follows a warning in
+    /// the same call reads as a warning too: the caller checks the frame
+    /// itself. A 1.x library, without the reading, warns of nothing.
+    ///
+    /// # Safety
+    /// `handle` is a live handle of this library, and the call read is the
+    /// last one made on it.
+    unsafe fn warned(&self, handle: TjHandle) -> bool {
+        self.error_code
+            .is_some_and(|code| unsafe { code(handle) } == TJERR_WARNING)
+    }
 }
 
 // The function pointers are plain C entry points with no shared mutable state;
@@ -100,7 +127,7 @@ fn load_turbojpeg() -> Option<TurboJpeg> {
 /// `None` when none does: the seam a test uses to stand in a loader that
 /// finds nothing, without touching the process-wide binding.
 fn load_turbojpeg_from(candidates: &[&str]) -> Option<TurboJpeg> {
-    // SAFETY: loading a system shared library by name; we only resolve the four
+    // SAFETY: loading a system shared library by name; we only resolve the five
     // documented TurboJPEG symbols below and keep the handle for their lifetime.
     let lib = candidates
         .iter()
@@ -109,12 +136,19 @@ fn load_turbojpeg_from(candidates: &[&str]) -> Option<TurboJpeg> {
     // signature documented by the TurboJPEG API. We copy the bare function
     // pointers out (dropping the borrowing `Symbol`s) and keep `lib` alive in
     // the returned struct, so the pointers remain valid.
-    let (init, header, decompress, destroy) = unsafe {
+    let (init, header, decompress, destroy, error_code) = unsafe {
         let init: Symbol<TjInitDecompress> = lib.get(b"tjInitDecompress\0").ok()?;
         let header: Symbol<TjDecompressHeader3> = lib.get(b"tjDecompressHeader3\0").ok()?;
         let decompress: Symbol<TjDecompress2> = lib.get(b"tjDecompress2\0").ok()?;
         let destroy: Symbol<TjDestroy> = lib.get(b"tjDestroy\0").ok()?;
-        (*init, *header, *decompress, *destroy)
+        let error_code: Option<Symbol<TjGetErrorCode>> = lib.get(b"tjGetErrorCode\0").ok();
+        (
+            *init,
+            *header,
+            *decompress,
+            *destroy,
+            error_code.map(|symbol| *symbol),
+        )
     };
     Some(TurboJpeg {
         _lib: lib,
@@ -122,6 +156,7 @@ fn load_turbojpeg_from(candidates: &[&str]) -> Option<TurboJpeg> {
         header,
         decompress,
         destroy,
+        error_code,
     })
 }
 
@@ -471,6 +506,60 @@ struct FrameHeader {
     components: u8,
 }
 
+/// The first marker segment of `bytes` whose marker `wanted` accepts: the
+/// marker, its payload and the offset of what follows the segment. Fill bytes,
+/// stray bytes before a marker and a stuffed zero (`FF 00`; defects both
+/// decoders warn of and read past, one byte at a time) and the standalone
+/// markers (the restart markers, SOI and TEM) are stepped over. The walk ends at the end of the image, at a segment cut short, and
+/// at the scan header unless that is the segment wanted, since no marker walk
+/// crosses the entropy-coded data behind it.
+fn segment(bytes: &[u8], wanted: impl Fn(u8) -> bool) -> Option<(u8, &[u8], usize)> {
+    if !is_jpeg(bytes) {
+        return None;
+    }
+    let mut at = 2;
+    loop {
+        // Stray bytes before a marker are stepped over to the next 0xFF, as
+        // libjpeg's marker reader does.
+        at += bytes.get(at..)?.iter().position(|&byte| byte == 0xFF)?;
+        let marker = *bytes.get(at + 1)?;
+        match marker {
+            // A fill byte before the next marker.
+            0xFF => at += 1,
+            // A stuffed zero: no marker. libjpeg discards the pair and scans
+            // on from the next byte, so a marker inside what a length behind
+            // the pair would span is the one it reads; the walk does the same.
+            0x00 => at += 2,
+            // Standalone markers: the restart markers, SOI and TEM.
+            0xD0..=0xD8 | 0x01 => at += 2,
+            // The end of the image.
+            0xD9 => return None,
+            _ => {
+                let length = usize::from(u16::from_be_bytes([
+                    *bytes.get(at + 2)?,
+                    *bytes.get(at + 3)?,
+                ]));
+                // The length counts its own two bytes.
+                let end = at + 2 + length;
+                let payload = bytes.get(at + 4..end)?;
+                if wanted(marker) {
+                    return Some((marker, payload, end));
+                }
+                if marker == 0xDA {
+                    return None;
+                }
+                at = end;
+            }
+        }
+    }
+}
+
+/// Whether `marker` opens a frame header: SOF0 to SOF15, less DHT, JPG and
+/// DAC, which share the range.
+fn is_frame_header(marker: u8) -> bool {
+    matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC)
+}
+
 /// The frame header of a JPEG, read from its marker segments. The TurboJPEG
 /// header call reports the same when it can classify the frame's sampling;
 /// libjpeg-turbo 2.x refuses a frame whose components are sampled unlike each
@@ -479,52 +568,232 @@ struct FrameHeader {
 /// frame, so this reader stands in for the call. `None` when the scan or the
 /// end of the image comes before a frame header, or a segment is cut short.
 fn frame_header(bytes: &[u8]) -> Option<FrameHeader> {
-    if !is_jpeg(bytes) {
-        return None;
-    }
-    let mut at = 2;
+    let (_, payload, _) = segment(bytes, is_frame_header)?;
+    let (&[_precision, h0, h1, w0, w1, components], _) = payload.split_first_chunk::<6>()?;
+    let (height, width) = (u16::from_be_bytes([h0, h1]), u16::from_be_bytes([w0, w1]));
+    (width > 0 && height > 0).then(|| FrameHeader {
+        width: i32::from(width),
+        height: i32::from(height),
+        components,
+    })
+}
+
+/// Where a JPEG's data ends, read behind the scan header as libjpeg reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// At the end-of-image marker.
+    Marker,
+    /// Behind a segment libjpeg reads past, with no marker after it: the
+    /// entropy-coded data ended at that segment's marker.
+    Segment,
+    /// With no marker behind the scan header: in the entropy-coded data, or
+    /// in bytes behind it that hold no marker.
+    Data,
+    /// At a marker libjpeg refuses behind a scan, at a segment with a length
+    /// libjpeg refuses, or with no scan header.
+    Refused,
+}
+
+/// Where a JPEG's data ends and what the walk to it stepped over: a scan
+/// header, which libjpeg refuses behind a single-scan frame's scan, and a
+/// table segment (DHT, DAC, DQT, DRI), which libjpeg parses there and
+/// refuses when malformed, where the walk only steps over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanEnd {
+    end: End,
+    scan_header: bool,
+    table: bool,
+}
+
+/// Where a JPEG's data ends, read behind the scan header as libjpeg reads it:
+/// a stuffed byte (`FF 00`), fill bytes, restart markers and TEM are data; a
+/// segment behind a scan (a table, the restart interval, the line count, an
+/// application segment, a comment, the next scan's header) is stepped over
+/// by its length, so a marker inside its payload is not the image's, and
+/// the data may end inside it; the scan header and the tables among them
+/// are noted, since libjpeg parses those where it skips the rest; a marker
+/// libjpeg refuses there (a second start of image, a frame header, a
+/// reserved marker) fails the file, so no marker behind it is the end
+/// either. Bytes after the end marker, a common appendage, do not matter; a
+/// marker inside a segment before the scan (an embedded thumbnail's) does
+/// not count. One pass over the data, no allocation.
+fn scan_end(bytes: &[u8]) -> ScanEnd {
+    let mut tail = ScanEnd {
+        end: End::Refused,
+        scan_header: false,
+        table: false,
+    };
+    let Some((_, _, mut at)) = segment(bytes, |marker| marker == 0xDA) else {
+        return tail;
+    };
+    tail.end = End::Data;
     loop {
-        let (&0xFF, &marker) = (bytes.get(at)?, bytes.get(at + 1)?) else {
-            return None;
+        let Some(next) = bytes
+            .get(at..)
+            .and_then(|rest| rest.iter().position(|&byte| byte == 0xFF))
+        else {
+            return tail;
+        };
+        at += next;
+        let Some(&marker) = bytes.get(at + 1) else {
+            return tail;
         };
         match marker {
-            // A fill byte before the next marker.
+            // A fill byte before a marker.
             0xFF => at += 1,
-            // Standalone markers: the restart markers, SOI and TEM.
-            0xD0..=0xD8 | 0x01 => at += 2,
-            // The scan or the end of the image, with no frame header before it.
-            0xD9 | 0xDA => return None,
-            _ => {
-                let length = usize::from(u16::from_be_bytes([
-                    *bytes.get(at + 2)?,
-                    *bytes.get(at + 3)?,
-                ]));
-                // The length counts its own two bytes.
-                let payload = bytes.get(at + 4..at + 2 + length)?;
-                // SOF0 to SOF15 carry the frame header; DHT, JPG and DAC share
-                // the range.
-                if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
-                    let (&[_precision, h0, h1, w0, w1, components], _) =
-                        payload.split_first_chunk::<6>()?;
-                    let (height, width) =
-                        (u16::from_be_bytes([h0, h1]), u16::from_be_bytes([w0, w1]));
-                    return (width > 0 && height > 0).then(|| FrameHeader {
-                        width: i32::from(width),
-                        height: i32::from(height),
-                        components,
-                    });
+            // A stuffed zero, TEM or a restart marker: the decoder's data.
+            0x00 | 0x01 | 0xD0..=0xD7 => at += 2,
+            0xD9 => {
+                tail.end = End::Marker;
+                return tail;
+            }
+            // The segments libjpeg reads behind a scan: the Huffman and
+            // arithmetic tables (DHT, DAC), the quantization tables (DQT),
+            // the restart interval (DRI), the line count (DNL), the next
+            // scan's header (SOS), application segments and comments. The
+            // length counts its own two bytes.
+            0xC4 | 0xCC | 0xDA..=0xDD | 0xE0..=0xEF | 0xFE => {
+                tail.end = End::Segment;
+                let (Some(&high), Some(&low)) = (bytes.get(at + 2), bytes.get(at + 3)) else {
+                    return tail;
+                };
+                let length = usize::from(u16::from_be_bytes([high, low]));
+                match marker {
+                    // The next scan's header: libjpeg parses it and refuses a
+                    // length short of its own bytes; whether a second scan is
+                    // refused depends on the frame, the caller's to read.
+                    0xDA => {
+                        if length < 2 {
+                            tail.end = End::Refused;
+                            return tail;
+                        }
+                        tail.scan_header = true;
+                    }
+                    // A table or the restart interval: libjpeg parses it and
+                    // refuses a length short of its own bytes (the restart
+                    // interval's is four).
+                    0xC4 | 0xCC | 0xDB | 0xDD => {
+                        if length < 2 || (marker == 0xDD && length != 4) {
+                            tail.end = End::Refused;
+                            return tail;
+                        }
+                        tail.table = true;
+                    }
+                    // An application segment, a comment or the line count:
+                    // skipped by the length past its own two bytes, nothing
+                    // for a shorter one.
+                    _ => {}
                 }
-                at += 2 + length;
+                at += 2 + length.max(2);
+            }
+            // A second start of image, a frame header or a reserved
+            // marker: libjpeg fails the file.
+            _ => {
+                tail.end = End::Refused;
+                return tail;
             }
         }
     }
 }
 
+/// Whether a JPEG is decoded in one scan: a sequential frame (not a
+/// progressive one) whose first scan names every component. libjpeg reads
+/// such a file row by row and the reference decoder serves the rows as they
+/// come; a progressive or multi-scan file is read through to its end marker
+/// before the first row.
+fn single_scan(bytes: &[u8]) -> bool {
+    let Some((marker, frame, _)) = segment(bytes, is_frame_header) else {
+        return false;
+    };
+    // SOF2, SOF6, SOF10 and SOF14 are the progressive frames.
+    if matches!(marker, 0xC2 | 0xC6 | 0xCA | 0xCE) {
+        return false;
+    }
+    let Some((_, scan, _)) = segment(bytes, |marker| marker == 0xDA) else {
+        return false;
+    };
+    // The frame's component count is the sixth byte of its header, the
+    // scan's the first of its own.
+    frame
+        .get(5)
+        .is_some_and(|count| scan.first() == Some(count))
+}
+
+/// Whether the reference decoder serves a frame from a file that ends as
+/// this one does, read without a decode. The decoder ignores a missing
+/// end-of-image marker once every row is out, and a single-scan file's rows
+/// are out once a marker ends its entropy-coded data; it refuses a file
+/// whose entropy-coded data runs out (a scan cut short, or a bare end with
+/// nothing behind it: it asks for bytes past the end and finds none), a
+/// marker libjpeg refuses, and a progressive or multi-scan file that does
+/// not reach its end marker, since it reads those through to the marker
+/// before the first row. A second scan header behind a single-scan frame's
+/// scan is refused by libjpeg when it reaches it, end marker or not. Behind
+/// such a scan libjpeg parses a table segment and refuses a malformed one,
+/// which the walk does not tell, so a table there is refused, end marker or
+/// not. Three files the reference serves are refused here: a single-scan
+/// file whose entropy-coded data is followed by bytes holding no marker
+/// (the walk cannot tell them from the data, and whether the decoder's read
+/// past the data was satisfied is the decoder's to know); one whose data is
+/// followed by a valid table, with or without the end marker behind it (a
+/// layout no encoder writes: the table serves no later scan); and one with
+/// a restart interval whose scan data holds a reserved marker, which
+/// libjpeg resyncs past at the next restart boundary where the walk reads
+/// a marker it refuses.
+pub(crate) fn end_is_served(bytes: &[u8]) -> bool {
+    let tail = scan_end(bytes);
+    match tail.end {
+        End::Marker => !((tail.scan_header || tail.table) && single_scan(bytes)),
+        End::Segment => !tail.scan_header && !tail.table && single_scan(bytes),
+        End::Data | End::Refused => false,
+    }
+}
+
+/// The pattern a frame's last row carries into the library's decode and is
+/// read for after a -1 with a warning: the library writes the frame top to
+/// bottom, so a last row still holding it means a fatal error ended the write
+/// short of the frame's end. Two bytes alternate, so a buffer the pool handed
+/// over filled with one byte never reads as written; a real last row that
+/// happens to match falls back to the pure-Rust decoder, the safe side.
+const SENTINEL_ROW: [u8; 2] = [0x5A, 0xA5];
+
+fn write_sentinel(row: &mut [u8]) {
+    for (byte, pattern) in row.iter_mut().zip(SENTINEL_ROW.iter().cycle()) {
+        *byte = *pattern;
+    }
+}
+
+fn holds_sentinel(row: &[u8]) -> bool {
+    row.iter()
+        .zip(SENTINEL_ROW.iter().cycle())
+        .all(|(byte, pattern)| byte == pattern)
+}
+
+/// The frame taken when the header call read the frame and refused only its
+/// sampling: the library's own dimensions, filled before the refusal, and
+/// the component count from the marker reader, whose frame must be the one
+/// the library read (the dimensions agree). A file whose markers read two
+/// ways would size the buffer by a frame the library never writes, and the
+/// sentinel in the decode would prove nothing. Four components decode as
+/// CMYK and three as RGB; the decoder has no colour conversion for any other
+/// count.
+fn fallback_frame(w: c_int, h: c_int, frame: Option<FrameHeader>) -> Option<(c_int, c_int, bool)> {
+    let frame = frame?;
+    (matches!(frame.components, 3 | 4) && (frame.width, frame.height) == (w, h)).then_some((
+        w,
+        h,
+        frame.components == 4,
+    ))
+}
+
 /// Decode a JPEG to an RGB8 `DynamicImage` via libjpeg-turbo (PIL-compatible
 /// defaults). A CMYK or YCCK JPEG is decompressed to CMYK, the only output
-/// TurboJPEG offers for it, and converted with [`pil_cmyk_to_rgb`]. Returns
-/// `None` on any failure — including libturbojpeg not being available at
-/// runtime — so the caller can fall back to the pure-Rust decoder.
+/// TurboJPEG offers for it, and converted with [`pil_cmyk_to_rgb`]. A frame
+/// the library finished with a warning (a defect in the data it decoded past)
+/// is returned as the reference decoder returns it, unless the file ends
+/// where that decoder refuses it (`end_is_served`). Returns `None` on
+/// any failure — including libturbojpeg not being available at runtime — so
+/// the caller can fall back to the pure-Rust decoder.
 pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
     if !is_jpeg(bytes) {
         return None;
@@ -545,9 +814,13 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
     //   what matters. It is the sole alias passed to the decoder; with
     //   `pitch=0` (=> `w*channels`) the decoder writes at most `w*h*channels`
     //   bytes, so no out-of-bounds write occurs. The image is built only after
-    //   `rc == 0` confirms a successful, complete write, which covers every
-    //   byte of the buffer (its contents before the write are a previous
-    //   frame's, not zeros).
+    //   the write is known complete, which covers every byte of the buffer
+    //   (its contents before the write are a previous frame's, not zeros):
+    //   `rc == 0`, or -1 with the library's warning reading and the frame's
+    //   last row overwritten. The reading alone proves nothing: a fatal error
+    //   after a warning in the same call keeps it, and leaves by a long jump
+    //   before the write reaches the end of the frame, so the sentinel
+    //   written into the last row before the call stays there.
     unsafe {
         let handle = (tj.init)();
         if handle.is_null() {
@@ -563,6 +836,15 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
             &mut subsamp,
             &mut colorspace,
         );
+        // A header the call read in full but warned about (stray bytes before
+        // a marker, most often) has its dimensions, sampling and colorspace
+        // filled: the decode goes on to meet the same defect and keeps its
+        // frame, as the reference decoder does. A header the call refused
+        // after a warning reads as warned too (the flag stays set), and is
+        // told apart by the sampling it left unclassified: such a frame takes
+        // the arms below. The reading comes before any other call on the
+        // handle.
+        let warned_header = hdr != 0 && subsamp >= 0 && tj.warned(handle);
         // The header call fills the dimensions once it has read the frame,
         // before it classifies the sampling; a header it could not read
         // leaves them at zero (3.x reports -1), and the file falls back as
@@ -575,22 +857,20 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
         // (YCbCr, grayscale, RGB) comes out as RGB. When the call read the
         // frame and refused only its sampling (libjpeg-turbo 2.x on
         // components sampled unlike each other), the frame header supplies
-        // the component count, and four components mean CMYK: the decoder
+        // the component count (its frame the one the call read: the
+        // dimensions agree), and four components mean CMYK: the decoder
         // takes the frame the call would not classify. The call writes that
-        // refusal into the sampling before it throws; a failure with the
-        // sampling known is a header warning, and the decode would end in the
-        // same warning, so the file falls back at once. A frame of two or of
+        // refusal into the sampling before it throws. A frame of two or of
         // five and more components is refused on its sampling too, and the
         // decoder has no colour conversion for it: three and four components
-        // alone take the fallback.
-        let (w, h, cmyk) = if hdr == 0 {
+        // alone take the fallback. Any other failure of the call is fatal,
+        // and the file falls back.
+        let (w, h, cmyk) = if hdr == 0 || warned_header {
             (w, h, colorspace == TJCS_CMYK || colorspace == TJCS_YCCK)
         } else if subsamp < 0 {
-            match frame_header(bytes) {
-                Some(frame) if matches!(frame.components, 3 | 4) => {
-                    (frame.width, frame.height, frame.components == 4)
-                }
-                _ => {
+            match fallback_frame(w, h, frame_header(bytes)) {
+                Some(frame) => frame,
+                None => {
                     (tj.destroy)(handle);
                     return None;
                 }
@@ -610,6 +890,11 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
             }
         };
         let mut buf = crate::buffer_pool::take(nbytes);
+        // The frame's last row carries a sentinel into the call: the library
+        // writes the frame top to bottom, so the row is overwritten only when
+        // the write reached the end of the frame (`kept` below).
+        let last_row = nbytes - wu * channels;
+        write_sentinel(&mut buf[last_row..]);
         let rc = (tj.decompress)(
             handle,
             bytes.as_ptr(),
@@ -621,17 +906,35 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
             pixel_format,
             0, // default flags: accurate IDCT + fancy upsampling (matches Pillow)
         );
+        // A -1 after the whole frame is written is a warning: the library
+        // noted a defect in the data (stray bytes before a marker, a corrupt
+        // scan) and went on, and the reference decoder serves the same pixels
+        // from the same library, so the frame is kept when the file ends
+        // where that decoder serves it (`end_is_served`) and the last row was
+        // written. Not kept: a file cut short (the library fills the rest of
+        // the frame and warns of the premature end, where the reference
+        // decoder refuses the file), a fatal error, which reads as a warning
+        // when a warning came first and leaves the sentinel in the last row,
+        // and a library without the reading; the buffer goes back, so the
+        // next request's take is warm, and the file falls back.
+        let kept = rc == 0
+            || (tj.warned(handle) && end_is_served(bytes) && !holds_sentinel(&buf[last_row..]));
         (tj.destroy)(handle);
-        if rc != 0 {
-            // A failed decode (the library reports a warning the same way, and
-            // a corrupt-data warning is common) hands its buffer back, so the
-            // next request's take is warm.
+        if !kept {
             crate::buffer_pool::recycle(buf);
             return None;
         }
         let rgb = if cmyk { cmyk_to_rgb_like_pil(buf) } else { buf };
         RgbImage::from_raw(w as u32, h as u32, rgb).map(DynamicImage::ImageRgb8)
     }
+}
+
+/// Whether the library found reads a call's warning (`tjGetErrorCode`,
+/// TurboJPEG 2.0 and later), so a frame it decoded with a warning is kept:
+/// a 1.x library falls back on every -1 and keeps none.
+#[cfg(test)]
+pub(crate) fn turbojpeg_reads_warnings() -> bool {
+    turbojpeg().is_some_and(|tj| tj.error_code.is_some())
 }
 
 #[cfg(test)]
@@ -922,6 +1225,88 @@ mod tests {
         );
     }
 
+    /// The hand-built file with two frame headers, read two ways: a stuffed
+    /// zero (`FF 00`) followed by a length, the real frame header, the head of
+    /// an APP1 segment, four zero bytes and a second frame header, 17 columns
+    /// wide, then the tables and the scan. libjpeg discards the stuffed zero
+    /// and reads the real header, then skips the APP1 segment, which spans
+    /// the second; a walk that took the stuffed zero for a segment would skip
+    /// the real header by the length behind it, land in the APP1 payload and
+    /// read the second.
+    fn two_frame_jpeg() -> Vec<u8> {
+        let plain = unequal_sampling_cmyk_jpeg();
+        // SOI and the quantization table are 71 bytes; the 22-byte frame
+        // header follows.
+        let (head, rest) = plain.split_at(71);
+        let (frame, tail) = rest.split_at(22);
+        let mut wide = frame.to_vec();
+        wide[8] = 0x11;
+        let mut jpeg = head.to_vec();
+        jpeg.extend([0xFF, 0x00, 0x00, 0x1E]);
+        jpeg.extend_from_slice(frame);
+        jpeg.extend([0xFF, 0xE1, 0x00, 0x1C, 0, 0, 0, 0]);
+        jpeg.extend_from_slice(&wide);
+        jpeg.extend_from_slice(tail);
+        jpeg
+    }
+
+    /// The reader steps over a stuffed zero as libjpeg does and reads the
+    /// frame header the library reads: 16 columns, not the 17 of the header
+    /// behind the APP1 segment.
+    #[test]
+    fn the_reader_steps_over_a_stuffed_zero_as_libjpeg_does() {
+        assert_eq!(
+            frame_header(&two_frame_jpeg()),
+            Some(FrameHeader {
+                width: 16,
+                height: 8,
+                components: 4
+            })
+        );
+    }
+
+    /// The two-frame file decodes to the frame the library reads, pixel for
+    /// pixel the plain file's: the library warns of the stray bytes and the
+    /// decode is kept, in a buffer the size of the frame it wrote. A buffer
+    /// sized by the second header (17 columns) would have its last row
+    /// reached by the library's 16-column rows and its tail never written.
+    #[test]
+    fn a_two_frame_file_decodes_the_frame_the_library_reads() {
+        if !crate::test_support::warned_decode_or_skip("the two-frame test") {
+            return;
+        }
+        let plain = decode_jpeg_rgb(&unequal_sampling_cmyk_jpeg())
+            .expect("the plain file decodes")
+            .to_rgb8();
+        let two = decode_jpeg_rgb(&two_frame_jpeg())
+            .expect("the two-frame file decodes, as the reference decoder decodes it")
+            .to_rgb8();
+        assert_eq!((two.width(), two.height()), (16, 8));
+        assert_eq!(two.as_raw(), plain.as_raw());
+    }
+
+    /// The fallback frame is the library's dimensions with the reader's
+    /// component count, and only when the reader saw the frame the library
+    /// read: a reader frame of other dimensions, of two or five components,
+    /// or none at all takes no buffer.
+    #[test]
+    fn the_fallback_frame_needs_the_reader_to_see_the_library_frame() {
+        let frame = |width, height, components| {
+            Some(FrameHeader {
+                width,
+                height,
+                components,
+            })
+        };
+        assert_eq!(fallback_frame(16, 8, frame(16, 8, 4)), Some((16, 8, true)));
+        assert_eq!(fallback_frame(16, 8, frame(16, 8, 3)), Some((16, 8, false)));
+        assert_eq!(fallback_frame(16, 8, frame(17, 8, 4)), None);
+        assert_eq!(fallback_frame(16, 8, frame(16, 9, 4)), None);
+        assert_eq!(fallback_frame(16, 8, frame(16, 8, 2)), None);
+        assert_eq!(fallback_frame(16, 8, frame(16, 8, 5)), None);
+        assert_eq!(fallback_frame(16, 8, None), None);
+    }
+
     /// A header the library cannot read leaves the dimensions unset, and the
     /// decode answers `None` without taking a buffer: the hand-built file with
     /// its precision set to 9 bits (no build reads it: 2.x wants its compiled
@@ -957,57 +1342,392 @@ mod tests {
     /// A header the library read but warned about is not the sampling
     /// refusal: the fixture with two stray bytes between its frame header and
     /// the next segment ("extraneous bytes before marker") fails the header
-    /// call with its dimensions and sampling filled, and its decode would end
-    /// in the same warning. The file falls back at once with no buffer taken:
-    /// its frame is grown to 1024x1024, which the fallback would serve from
-    /// the 4 MiB class.
+    /// call with its dimensions and sampling filled, and the decode, which
+    /// ends in the same warning, serves the fixture's pixels (the reference
+    /// decoder's, pinned by the parity test).
     #[test]
-    #[expect(clippy::print_stderr)]
-    fn a_header_with_a_warning_takes_no_buffer() {
-        use crate::buffer_pool::{self, BufferPool};
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the warned-header test");
+    fn a_header_with_a_warning_decodes_through_the_library() {
+        if !crate::test_support::warned_decode_or_skip("the warned-header test") {
             return;
         }
         let mut jpeg = fixture("ycck_adobe_16x16_420.jpg");
-        assert!(
-            decode_jpeg_rgb(&jpeg).is_some(),
-            "the fixture itself decodes"
-        );
         // SOI, APP14 and two quantization tables are 156 bytes; the frame
-        // header follows (marker, length, precision, height, width) and ends
-        // at 178, where the first Huffman table begins.
+        // header follows and ends at 178, where the first Huffman table
+        // begins.
         assert_eq!(
             jpeg[178..180],
             [0xFF, 0xC4],
             "the fixture's first Huffman table"
         );
-        jpeg[161..165].copy_from_slice(&[0x04, 0x00, 0x04, 0x00]);
         jpeg.splice(178..178, [0x00, 0x00]);
+        let image = decode_jpeg_rgb(&jpeg).expect("a warned header decodes through the library");
         assert_eq!(
-            frame_header(&jpeg).map(|frame| (frame.width, frame.height)),
-            Some((1024, 1024)),
-            "the frame header reads the grown frame"
+            fnv1a(image.to_rgb8().as_raw()),
+            0xea4a51922fe8487c,
+            "the fixture's pixels"
         );
-        static MINE: BufferPool = BufferPool::new();
-        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
-        assert!(decoded.is_none(), "a warned header falls back");
-        assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
     }
 
-    /// A frame of two components is refused on its sampling like the
-    /// four-component file, and the decoder has no colour conversion for it:
-    /// the hand-built file cut to two components and grown to 1024x1024
-    /// answers `None` with no buffer taken, where the frame header alone
-    /// would serve the 4 MiB class.
+    /// A decode the library finished with a warning is served: `small.jpg`
+    /// with two stray bytes before its scan header ("extraneous bytes before
+    /// marker") decodes to the clean file's pixels, the reference decoder's,
+    /// where it fell back to the pure-Rust decoder before.
     #[test]
-    #[expect(clippy::print_stderr)]
-    fn a_two_component_frame_takes_no_buffer() {
-        use crate::buffer_pool::{self, BufferPool};
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the two-component test");
+    fn a_frame_the_library_finished_with_a_warning_is_kept() {
+        if !crate::test_support::warned_decode_or_skip("the warned-decode test") {
             return;
         }
+        let clean = fixture("small.jpg");
+        let reference = decode_jpeg_rgb(&clean)
+            .expect("the clean fixture decodes")
+            .to_rgb8();
+        assert_eq!(
+            fnv1a(reference.as_raw()),
+            0x4ee5fa805d60fea5,
+            "the reference decoder's pixels for the clean file"
+        );
+        let mut jpeg = clean;
+        // The scan header sits at 609, behind the four Huffman tables.
+        assert_eq!(jpeg[609..611], [0xFF, 0xDA], "the fixture's scan header");
+        jpeg.splice(609..609, [0x12, 0x34]);
+        let warned = decode_jpeg_rgb(&jpeg)
+            .expect("the warned decode is kept")
+            .to_rgb8();
+        assert!(
+            warned.as_raw() == reference.as_raw(),
+            "the warned decode's pixels are the clean file's"
+        );
+    }
+
+    /// A corrupt scan the library decodes past (one flipped byte, which ends
+    /// in "extraneous bytes before marker 0xd9") is served with the reference
+    /// decoder's pixels: `small.jpg` with its byte at 703 flipped, whose
+    /// decode by PIL 12.3 on libjpeg-turbo hashes as pinned.
+    #[test]
+    fn a_corrupt_scan_decodes_to_the_reference_decoders_pixels() {
+        if !crate::test_support::warned_decode_or_skip("the corrupt-scan test") {
+            return;
+        }
+        let mut jpeg = fixture("small.jpg");
+        assert_eq!(jpeg[703], 0x80, "the byte flipped");
+        jpeg[703] ^= 0x5A;
+        let image = decode_jpeg_rgb(&jpeg).expect("the warned decode is kept");
+        assert_eq!(
+            fnv1a(image.to_rgb8().as_raw()),
+            0x39c68f06e78f04df,
+            "not the reference decoder's pixels"
+        );
+    }
+
+    /// A file whose data ends before its end-of-image marker is not served
+    /// from the frame the library filled (the reference decoder refuses the
+    /// file): `large.jpg` without its last two bytes answers `None`, and the
+    /// buffer taken for it goes back to its class.
+    #[test]
+    fn a_frame_cut_before_its_end_marker_is_not_kept() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !crate::test_support::turbojpeg_or_skip("the cut-file test") {
+            return;
+        }
+        let jpeg = fixture("large.jpg");
+        let cut = &jpeg[..jpeg.len() - 2];
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(cut));
+        assert!(decoded.is_none(), "a cut file is not served");
+        assert_eq!(MINE.held(), 64 << 20, "the buffer went back to its class");
+    }
+
+    /// A single-scan file whose end marker is replaced by a comment segment,
+    /// its payload the marker's two bytes, is served with the clean file's
+    /// pixels, as the reference decoder serves it: the comment's marker
+    /// ended the entropy-coded data with every row out, and the library's
+    /// warned frame is kept.
+    #[test]
+    fn a_single_scan_file_ending_in_a_comment_is_kept() {
+        if !crate::test_support::warned_decode_or_skip("the comment-tail test") {
+            return;
+        }
+        let clean = fixture("small.jpg");
+        let reference = decode_jpeg_rgb(&clean)
+            .expect("the clean fixture decodes")
+            .to_rgb8();
+        let mut jpeg = clean[..clean.len() - 2].to_vec();
+        jpeg.extend([0xFF, 0xFE, 0x00, 0x04, 0xFF, 0xD9]);
+        let served = decode_jpeg_rgb(&jpeg)
+            .expect("the comment tail is served")
+            .to_rgb8();
+        assert!(
+            served.as_raw() == reference.as_raw(),
+            "the served pixels are the clean file's"
+        );
+    }
+
+    /// The reading of where the data ends: at the marker as the last two
+    /// bytes or behind an appendage; in the data when the last two bytes are
+    /// gone, the marker is cut in two, a byte follows a cut scan, or the only
+    /// marker sits inside a segment before the scan; behind a comment whose
+    /// payload holds the marker's two bytes, read by its length as libjpeg
+    /// reads it, with or without a byte after it, and behind a comment cut
+    /// inside its length; at the marker behind a comment with another
+    /// payload, and behind a comment or an application segment whose length
+    /// is short of its own two bytes, stepped over as nothing; a crossed
+    /// scan header and a crossed table noted; refused at a marker libjpeg
+    /// refuses, at a table or a restart interval with a length libjpeg
+    /// refuses, and for no JPEG at all.
+    #[test]
+    fn scan_end_reads_the_data_behind_the_scan() {
+        let jpeg = unequal_sampling_cmyk_jpeg();
+        let plain = |end: End| ScanEnd {
+            end,
+            scan_header: false,
+            table: false,
+        };
+        assert_eq!(scan_end(&jpeg), plain(End::Marker));
+        let mut appended = jpeg.clone();
+        appended.extend([0x00, 0x11, 0x22]);
+        assert_eq!(
+            scan_end(&appended),
+            plain(End::Marker),
+            "bytes after the marker"
+        );
+        assert_eq!(
+            scan_end(&jpeg[..jpeg.len() - 2]),
+            plain(End::Data),
+            "the marker gone"
+        );
+        assert_eq!(
+            scan_end(&jpeg[..jpeg.len() - 1]),
+            plain(End::Data),
+            "the marker cut in two"
+        );
+        let mut cut = jpeg[..jpeg.len() - 2].to_vec();
+        cut.push(0x00);
+        assert_eq!(scan_end(&cut), plain(End::Data), "a byte after a cut scan");
+        // Stray bytes before the scan header, which the decoders warn of and
+        // read past, are stepped over on the way to the scan; the same file
+        // cut before its marker is still cut.
+        let mut stray = appended.clone();
+        let scan = stray
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0xDA])
+            .expect("the scan header");
+        stray.splice(scan..scan, [0x12, 0x34]);
+        assert_eq!(
+            scan_end(&stray),
+            plain(End::Marker),
+            "stray bytes before the scan header"
+        );
+        assert_eq!(
+            scan_end(&stray[..stray.len() - 5]),
+            plain(End::Data),
+            "the stray file cut before its marker"
+        );
+        // A marker inside an application segment before the scan (an embedded
+        // thumbnail's end) is not the image's.
+        let mut thumbnail = jpeg[..jpeg.len() - 2].to_vec();
+        thumbnail.splice(2..2, [0xFF, 0xE1, 0x00, 0x04, 0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&thumbnail),
+            plain(End::Data),
+            "a marker inside a segment before the scan"
+        );
+        let mut comment = jpeg[..jpeg.len() - 2].to_vec();
+        comment.extend([0xFF, 0xFE, 0x00, 0x04, 0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&comment),
+            plain(End::Segment),
+            "the marker bytes inside a comment's payload"
+        );
+        comment.push(0x00);
+        assert_eq!(
+            scan_end(&comment),
+            plain(End::Segment),
+            "the same with a trailing byte"
+        );
+        let mut short = jpeg[..jpeg.len() - 2].to_vec();
+        short.extend([0xFF, 0xFE, 0x00]);
+        assert_eq!(
+            scan_end(&short),
+            plain(End::Segment),
+            "a comment cut inside its length"
+        );
+        let mut commented = jpeg[..jpeg.len() - 2].to_vec();
+        commented.extend([0xFF, 0xFE, 0x00, 0x04, 0x61, 0x62, 0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&commented),
+            plain(End::Marker),
+            "a comment before the marker"
+        );
+        let mut nothing = jpeg[..jpeg.len() - 2].to_vec();
+        nothing.extend([0xFF, 0xFE, 0x00, 0x01, 0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&nothing),
+            plain(End::Marker),
+            "a comment short of its own two bytes skips nothing"
+        );
+        let mut empty = jpeg[..jpeg.len() - 2].to_vec();
+        empty.extend([0xFF, 0xE1, 0x00, 0x00, 0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&empty),
+            plain(End::Marker),
+            "an application segment with a zero length skips nothing"
+        );
+        // The scan header and the tables are noted when crossed.
+        let header = &jpeg[scan..scan + 2 + 14];
+        assert_eq!(&header[..2], [0xFF, 0xDA], "the fixture's scan header");
+        let mut second = jpeg[..jpeg.len() - 2].to_vec();
+        second.extend_from_slice(header);
+        assert_eq!(
+            scan_end(&second),
+            ScanEnd {
+                end: End::Segment,
+                scan_header: true,
+                table: false
+            },
+            "a second scan header, nothing behind it"
+        );
+        second.extend([0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&second),
+            ScanEnd {
+                end: End::Marker,
+                scan_header: true,
+                table: false
+            },
+            "a second scan header before the marker"
+        );
+        let mut table = jpeg[..jpeg.len() - 2].to_vec();
+        table.extend([0xFF, 0xDD, 0x00, 0x04, 0x00, 0x10]);
+        assert_eq!(
+            scan_end(&table),
+            ScanEnd {
+                end: End::Segment,
+                scan_header: false,
+                table: true
+            },
+            "a restart interval behind the scan"
+        );
+        let mut refused = jpeg[..jpeg.len() - 2].to_vec();
+        refused.extend([0xFF, 0x02, 0x00, 0x04, 0x61, 0x62, 0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&refused),
+            plain(End::Refused),
+            "a marker libjpeg refuses behind the scan"
+        );
+        let mut bad_table = jpeg[..jpeg.len() - 2].to_vec();
+        bad_table.extend([0xFF, 0xC4, 0x00, 0x01, 0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&bad_table).end,
+            End::Refused,
+            "a table length libjpeg refuses"
+        );
+        let mut bad_interval = jpeg[..jpeg.len() - 2].to_vec();
+        bad_interval.extend([0xFF, 0xDD, 0x00, 0x03, 0x00, 0xFF, 0xD9]);
+        assert_eq!(
+            scan_end(&bad_interval).end,
+            End::Refused,
+            "a restart interval length libjpeg refuses"
+        );
+        assert_eq!(scan_end(b"not a jpeg"), plain(End::Refused));
+    }
+
+    /// The frame read for its scan count: a sequential frame whose first
+    /// scan names every component is one scan; a progressive frame, a first
+    /// scan naming fewer components than the frame, and a file with no scan
+    /// header are not.
+    #[test]
+    fn single_scan_reads_the_frame_and_its_first_scan() {
+        let jpeg = unequal_sampling_cmyk_jpeg();
+        assert!(single_scan(&jpeg));
+        let frame = jpeg
+            .windows(2)
+            .position(|pair| pair[0] == 0xFF && is_frame_header(pair[1]))
+            .expect("the frame header");
+        let mut progressive = jpeg.clone();
+        progressive[frame + 1] = 0xC2;
+        assert!(!single_scan(&progressive), "a progressive frame");
+        let scan = jpeg
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0xDA])
+            .expect("the scan header");
+        let mut partial = jpeg.clone();
+        partial[scan + 4] -= 1;
+        assert!(!single_scan(&partial), "a first scan short of a component");
+        assert!(!single_scan(&jpeg[..scan]), "no scan header");
+    }
+
+    /// The reference decoder's rule over the end of a file: served at the
+    /// marker; behind a comment, served when the frame is one scan and not
+    /// when it is progressive; not served in the data, behind zero bytes in
+    /// place of the marker, or at a refused marker. A second scan header or
+    /// a table behind a single-scan frame's scan is not served, marker or no
+    /// marker, where a progressive frame's is.
+    #[test]
+    fn end_is_served_follows_the_reference_decoders_rule() {
+        let jpeg = unequal_sampling_cmyk_jpeg();
+        assert!(end_is_served(&jpeg));
+        let scan = jpeg
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0xDA])
+            .expect("the scan header");
+        let header = jpeg[scan..scan + 2 + 14].to_vec();
+        let mut second = jpeg[..jpeg.len() - 2].to_vec();
+        second.extend_from_slice(&header);
+        assert!(
+            !end_is_served(&second),
+            "a second scan header behind a single-scan frame's scan"
+        );
+        second.extend([0xFF, 0xD9]);
+        assert!(!end_is_served(&second), "the same before the marker");
+        let frame = second
+            .windows(2)
+            .position(|pair| pair[0] == 0xFF && is_frame_header(pair[1]))
+            .expect("the frame header");
+        second[frame + 1] = 0xC2;
+        assert!(
+            end_is_served(&second),
+            "a progressive frame's second scan header before the marker"
+        );
+        let mut table = jpeg[..jpeg.len() - 2].to_vec();
+        table.extend([0xFF, 0xDD, 0x00, 0x04, 0x00, 0x10]);
+        assert!(!end_is_served(&table), "a table behind the scan, no marker");
+        table.extend([0xFF, 0xD9]);
+        assert!(
+            !end_is_served(&table),
+            "a table behind a single-scan frame's scan, before the marker"
+        );
+        let frame = table
+            .windows(2)
+            .position(|pair| pair[0] == 0xFF && is_frame_header(pair[1]))
+            .expect("the frame header");
+        table[frame + 1] = 0xC2;
+        assert!(
+            end_is_served(&table),
+            "a progressive frame's table before the marker"
+        );
+        let mut comment = jpeg[..jpeg.len() - 2].to_vec();
+        comment.extend([0xFF, 0xFE, 0x00, 0x04, 0xFF, 0xD9]);
+        assert!(
+            end_is_served(&comment),
+            "a single-scan file ending in a comment"
+        );
+        let frame = comment
+            .windows(2)
+            .position(|pair| pair[0] == 0xFF && is_frame_header(pair[1]))
+            .expect("the frame header");
+        comment[frame + 1] = 0xC2;
+        assert!(!end_is_served(&comment), "the same file progressive");
+        assert!(!end_is_served(&jpeg[..jpeg.len() - 2]), "the marker gone");
+        let mut padded = jpeg[..jpeg.len() - 2].to_vec();
+        padded.extend([0; 64]);
+        assert!(!end_is_served(&padded), "zero bytes in place of the marker");
+        let mut refused = jpeg[..jpeg.len() - 2].to_vec();
+        refused.extend([0xFF, 0x02, 0x00, 0x04, 0x61, 0x62, 0xFF, 0xD9]);
+        assert!(!end_is_served(&refused), "a marker libjpeg refuses");
+    }
+
+    /// The hand-built file cut to two components and grown to 1024x1024.
+    fn two_component_jpeg() -> Vec<u8> {
         let mut jpeg = unequal_sampling_cmyk_jpeg();
         // The frame header at 71: its length 20 becomes 14, the count 4
         // becomes 2, the height and width grow, and the third and fourth
@@ -1023,6 +1743,23 @@ mod tests {
         jpeg[134] = 0x0A;
         jpeg[135] = 2;
         jpeg.drain(140..144);
+        jpeg
+    }
+
+    /// A frame of two components is refused on its sampling like the
+    /// four-component file, and the decoder has no colour conversion for it:
+    /// the hand-built file cut to two components and grown to 1024x1024
+    /// answers `None` with no buffer taken, where the frame header alone
+    /// would serve the 4 MiB class.
+    #[test]
+    #[expect(clippy::print_stderr)]
+    fn a_two_component_frame_takes_no_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !turbojpeg_available() {
+            eprintln!("libturbojpeg not found: skipping the two-component test");
+            return;
+        }
+        let jpeg = two_component_jpeg();
         assert_eq!(
             frame_header(&jpeg),
             Some(FrameHeader {
@@ -1039,6 +1776,87 @@ mod tests {
             "two components decode through no path here"
         );
         assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
+    }
+
+    /// A fatal error after a warning in the decode call is not kept, though
+    /// the library's reading says warning for the whole call: `large.jpg`
+    /// with two stray bytes before its scan header (the warning) and its
+    /// first quantization table renumbered 3 (table 0, which every component
+    /// names, is then undefined: a fatal error at the start of the decode,
+    /// before any row is written) answers `None`, and the buffer goes back
+    /// to its class instead of being served with another frame's bytes.
+    #[test]
+    fn a_fatal_error_after_a_warning_in_the_decode_is_not_kept() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !crate::test_support::warned_decode_or_skip("the warned-then-fatal decode test") {
+            return;
+        }
+        let mut jpeg = fixture("large.jpg");
+        assert_eq!(
+            jpeg[20..25],
+            [0xFF, 0xDB, 0x00, 0x43, 0x00],
+            "the fixture's first quantization table, number 0"
+        );
+        jpeg[24] = 0x03;
+        assert_eq!(jpeg[609..611], [0xFF, 0xDA], "the fixture's scan header");
+        jpeg.splice(609..609, [0x12, 0x34]);
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
+        assert!(
+            decoded.is_none(),
+            "a frame the library never wrote is not served"
+        );
+        assert_eq!(MINE.held(), 64 << 20, "the buffer went back to its class");
+    }
+
+    /// The same through the header call: the two-component file with two
+    /// stray bytes before its first Huffman table warns, then has its
+    /// sampling refused after the dimensions are filled, so the call reads
+    /// as warned with the sampling unclassified; the frame takes the
+    /// component arm and no buffer, instead of a decode that fails before
+    /// any row is written and a buffer served whole.
+    #[test]
+    fn a_warned_header_with_the_sampling_refused_takes_no_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+        if !crate::test_support::turbojpeg_or_skip("the warned-then-refused header test") {
+            return;
+        }
+        let mut jpeg = two_component_jpeg();
+        assert_eq!(jpeg[87..89], [0xFF, 0xC4], "the first Huffman table");
+        jpeg.splice(87..87, [0x12, 0x34]);
+        static MINE: BufferPool = BufferPool::new();
+        let decoded = buffer_pool::with_pool(&MINE, || decode_jpeg_rgb(&jpeg));
+        assert!(
+            decoded.is_none(),
+            "two components decode through no path here"
+        );
+        assert_eq!(MINE.held(), 0, "no buffer was taken for the frame");
+    }
+
+    /// A file with stray bytes before its scan header and bytes after its
+    /// end-of-image marker, which the reference decoder loads, is served
+    /// with the clean file's pixels: the marker walk steps over the stray
+    /// bytes on its way to the scan, behind which the marker is found.
+    #[test]
+    fn a_warned_file_with_an_appendage_is_kept() {
+        if !crate::test_support::warned_decode_or_skip("the warned-appendage test") {
+            return;
+        }
+        let clean = fixture("small.jpg");
+        let reference = decode_jpeg_rgb(&clean)
+            .expect("the clean fixture decodes")
+            .to_rgb8();
+        let mut jpeg = clean;
+        assert_eq!(jpeg[609..611], [0xFF, 0xDA], "the fixture's scan header");
+        jpeg.splice(609..609, [0x12, 0x34]);
+        jpeg.extend([0x00, 0x11, 0x22]);
+        let warned = decode_jpeg_rgb(&jpeg)
+            .expect("the warned file with an appendage is kept")
+            .to_rgb8();
+        assert!(
+            warned.as_raw() == reference.as_raw(),
+            "the warned decode's pixels are the clean file's"
+        );
     }
 
     /// The policy reads its two values in any case and spacing, names an

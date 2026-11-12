@@ -4890,7 +4890,11 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// (PIL's defaults, accurate IDCT and fancy upsampling, so the pixels match an
 /// engine that decodes with PIL bit for bit; the pure-Rust decoder differs by
 /// a few levels, which the vision encoder amplifies), everything else and any
-/// turbojpeg failure through the `image` crate; then the long-side cap.
+/// turbojpeg failure through the `image` crate; then the long-side cap. A
+/// JPEG that ends where the reference loader refuses it (its entropy-coded
+/// data runs out, a progressive file misses its end marker, or a second
+/// scan header or a table follows a single-scan frame's scan) is refused
+/// before either decoder sees it (`jpeg_turbo::end_is_served`).
 ///
 /// CMYK and YCCK JPEGs follow the same rule: with libjpeg-turbo they are
 /// decompressed as CMYK and converted with PIL's arithmetic
@@ -4922,33 +4926,57 @@ pub(crate) fn decode_image_bytes(
             // libjpeg-turbo yields pixels only; the tag comes from the header.
             oriented(image, jpeg_orientation(bytes))
         }
-        None => match crate::webp_native::decode_webp(bytes) {
-            Some(image) => {
-                // libwebp yields pixels only; the tag comes from the file's
-                // metadata chunk, read as the fallback decoder reads it.
-                oriented(image, webp_orientation(bytes))
+        None => {
+            // A JPEG that ends where the reference loader refuses it (a scan
+            // cut short, a bare end with no marker behind it, a progressive
+            // file short of its end marker: "image file is truncated"; a
+            // second scan header or a malformed table behind a single-scan
+            // frame's scan, end marker or not: "broken data stream") is
+            // refused here: the library did not keep a frame for it above,
+            // and the decoder below would serve one with the rest filled in.
+            // A valid table there is refused with the malformed ones, which
+            // the reading does not tell apart. A single-scan file ending in
+            // a comment or another skipped segment, which the loader serves,
+            // passes; the decoder below reads to the end marker and fails it
+            // on its own. The reading waits until here: a file the library
+            // decoded clean reached a real end marker and pays no walk over
+            // its data.
+            if crate::jpeg_turbo::is_jpeg(bytes) && !crate::jpeg_turbo::end_is_served(bytes) {
+                return Err(MediaConnectorError::Image(image::ImageError::Decoding(
+                    image::error::DecodingError::new(
+                        image::error::ImageFormatHint::Exact(image::ImageFormat::Jpeg),
+                        "the data behind the scan header ends in a form this decoder refuses",
+                    ),
+                )));
             }
-            None => {
-                let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
-                    .with_guessed_format()
-                    .map_err(MediaConnectorError::Io)?
-                    .into_decoder()?;
-                // `ImageReader::decode` reserves the decoded buffer against the
-                // crate's allocation limit (512 MiB by default) before it
-                // decodes; `into_decoder` does not, so the reservation is made
-                // here. A file whose header declares more than the limit (a
-                // decompression bomb, or a JPEG the turbojpeg path handed over
-                // for its size) is refused without the allocation.
-                let mut limits = image::Limits::default();
-                limits.reserve(decoder.total_bytes())?;
-                decoder.set_limits(limits)?;
-                let orientation = decoder
-                    .orientation()
-                    .unwrap_or(image::metadata::Orientation::NoTransforms);
-                let image = image::DynamicImage::from_decoder(decoder)?;
-                oriented(image, orientation)
+            match crate::webp_native::decode_webp(bytes) {
+                Some(image) => {
+                    // libwebp yields pixels only; the tag comes from the file's
+                    // metadata chunk, read as the fallback decoder reads it.
+                    oriented(image, webp_orientation(bytes))
+                }
+                None => {
+                    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+                        .with_guessed_format()
+                        .map_err(MediaConnectorError::Io)?
+                        .into_decoder()?;
+                    // `ImageReader::decode` reserves the decoded buffer against the
+                    // crate's allocation limit (512 MiB by default) before it
+                    // decodes; `into_decoder` does not, so the reservation is made
+                    // here. A file whose header declares more than the limit (a
+                    // decompression bomb, or a JPEG the turbojpeg path handed over
+                    // for its size) is refused without the allocation.
+                    let mut limits = image::Limits::default();
+                    limits.reserve(decoder.total_bytes())?;
+                    decoder.set_limits(limits)?;
+                    let orientation = decoder
+                        .orientation()
+                        .unwrap_or(image::metadata::Orientation::NoTransforms);
+                    let image = image::DynamicImage::from_decoder(decoder)?;
+                    oriented(image, orientation)
+                }
             }
-        },
+        }
     };
     image = clip_sixteen_bit_grey(image, bytes);
     image = narrow_sixteen_bit_colour(image);
