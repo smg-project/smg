@@ -70,6 +70,16 @@ const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}
 /// into groups of three from its end, the first group taking the
 /// remainder.
 const DIGIT_GROUPS: &str = r"\d{1,3}(?=(?:\d{3})*\b)";
+/// The digit stages of a 200k byte-level family, between its `Digits` split
+/// and its letter template: a digit run cut into pieces of at most 510 from
+/// its end, a piece's first one or two digits cut off when groups of three
+/// fill the rest, then groups of three from the piece's start. `\A`, `\z`
+/// and `\G` read the bounds of the piece a stage runs over and where the
+/// search in it began. Then the family's runs of several scripts.
+const WIDE_DIGIT_GROUPS: &str = r"\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510}";
+const DIGIT_GROUP_HEAD: &str = r"\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)";
+const DIGIT_GROUPS_FROM_THE_START: &str = r"\A\p{Nd}{3}|\G\p{Nd}{3}";
+const SCRIPT_RUNS: &str = r"(?:[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\uf900-\uFAFF\uFF65-\uFF9F\u2F00-\u2FDF]+|[\u0E00-\u0E7F]+|[\u0E80-\u0EFF]+|[\u1780-\u17FF]+|[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]+|[\uAC00-\uD7AF\u1100-\u11FF]+)";
 
 const POOL: &[char] = &[
     'a',
@@ -441,6 +451,29 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[("\u{FB01}le", true), ("<tool_call>", false)],
+        },
+        // `Digits` runs, the three anchored digit stages over them, the runs
+        // of several scripts, the letter template with its own symbols, and
+        // the `ByteLevel` map without its regex.
+        Shape {
+            name: "digit-runs-then-anchored-digit-stages",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+                split(WIDE_DIGIT_GROUPS, SplitDelimiterBehavior::Isolated, false),
+                split(DIGIT_GROUP_HEAD, SplitDelimiterBehavior::Isolated, false),
+                split(
+                    DIGIT_GROUPS_FROM_THE_START,
+                    SplitDelimiterBehavior::Isolated,
+                    false,
+                ),
+                split(SCRIPT_RUNS, SplitDelimiterBehavior::Isolated, false),
+                split(DEEPSEEK, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[("<think>", false)],
         },
         // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
         // split on ASCII digits after the map (the reference cuts the mapped
@@ -814,6 +847,36 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         r"a split pattern outside the supported regex subset: \w+|\s+"
     );
+    // A pattern anchored to its text in the first stage (a unit of the pool
+    // would be its text), and one over more than digits after a stage (the
+    // pool's cut check runs it over a window, not over pieces).
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(
+            DIGIT_GROUPS_FROM_THE_START,
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a first split pattern anchored to its text (\A, \z or \G)"
+    );
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        PreTokenizerWrapper::Digits(Digits::new(false)),
+        split(
+            r"\A[a-z]+|\G\p{Nd}{3}",
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a split pattern anchored to its text (\A, \z or \G) over more than decimal digits"
+    );
     // A post-processor of another kind, and a model that is not BPE.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_post_processor(Some(BertProcessing::new(
@@ -1139,6 +1202,75 @@ fn long_text(state: &mut u64, added: &[&str], bytes: usize) -> String {
         }
     }
     text
+}
+
+/// The anchored digit stages cut digit runs as the library does: runs of
+/// every length around the stages' group sizes, in the digits of two scripts
+/// and beside the other numbers the `Digits` split takes with them, in one
+/// piece; and a long text of such runs on the thread pool, whose units are
+/// cut between the first stage's pieces, so a later stage sees the same piece
+/// bounds (`\A`, `\z`) and search starts (`\G`) in a unit as in the whole.
+#[test]
+fn anchored_digit_stages_cut_digit_runs_as_the_library_does() {
+    let mut state = 0xA11C_0DE5_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "digit-runs-then-anchored-digit-stages")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let model = tokenizer.get_model();
+    let reference = |text: &str| {
+        tokenizer
+            .encode(text, false)
+            .expect("encode")
+            .get_ids()
+            .to_vec()
+    };
+    let digits = "0123456789".repeat(160);
+    let mut long = String::new();
+    for len in [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 509, 510, 511, 512, 513, 1019, 1020, 1021, 1022,
+        1531,
+    ] {
+        let run = &digits[..len];
+        let arabic = "\u{663}".repeat(len);
+        for text in [
+            run.to_owned(),
+            format!("total {run} units"),
+            format!("{run}\n{run}"),
+            format!("x{run}, {run}."),
+            format!("{run}\u{B2} {arabic}"),
+            format!("{arabic}\u{2460}{run}"),
+        ] {
+            assert_eq!(
+                native.encode(Some(model), &text, false),
+                Ok(reference(&text)),
+                "{len} digits in {:?}",
+                &text[..text.len().min(32)]
+            );
+            long.push_str(&text);
+            long.push_str(" word ");
+        }
+    }
+    while long.len() < 4 * PARALLEL_CHUNK_BYTES {
+        long.push_str(&long_text(&mut state, &[], PARALLEL_CHUNK_BYTES));
+        long.push_str(&digits[..1 + (pseudo_random(&mut state) % 1100) as usize]);
+    }
+    let units = native.units(&long, true, true);
+    assert!(
+        units.as_slice().len() > 2,
+        "{} units",
+        units.as_slice().len()
+    );
+    let pooled = native
+        .encode_with(Some(model), &long, true, false)
+        .expect("pooled");
+    let serial = native
+        .encode_with(Some(model), &long, false, false)
+        .expect("serial");
+    assert_eq!(pooled, serial, "the pool changed the ids");
+    assert_eq!(pooled, reference(&long), "against the reference");
 }
 
 #[test]
@@ -3953,6 +4085,12 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
     assert_eq!(
         declined(&ranks, r"\d{1,3}(?=(?:\d{3})*\b)|[a-z]+|\s", &[]),
         r"a split pattern with the digit-grouping lookahead, whose word boundary the file's own encoder reads with another word class: \d{1,3}(?=(?:\d{3})*\b)|[a-z]+|\s"
+    );
+    // The anchors parse, but this path's one stage runs over a unit of the
+    // pool as over the text between two specials.
+    assert_eq!(
+        declined(&ranks, r"\A[a-z]+|\G\d{3}|\s", &[]),
+        r"a split pattern anchored to its text (\A, \z or \G): \A[a-z]+|\G\d{3}|\s"
     );
     assert_eq!(
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),

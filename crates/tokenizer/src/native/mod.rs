@@ -1655,6 +1655,15 @@ impl NativeEncoder {
                  own encoder reads with another word class: {pattern}"
             )));
         }
+        // The one stage of this path runs over a unit of the thread pool as
+        // over the text between two specials, and would read the unit's
+        // bounds as the text's: a pattern anchored to its text is declined
+        // on this path (see `Self::check_anchors`).
+        if parsed.anchored() {
+            return Err(Declined::from(format!(
+                "a split pattern anchored to its text (\\A, \\z or \\G): {pattern}"
+            )));
+        }
         if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
             return Err(Declined::from(format!(
                 "special token {content:?} without content"
@@ -1752,7 +1761,9 @@ impl NativeEncoder {
             })?;
         let mut stages = Vec::with_capacity(items.len());
         for split in &items[..at] {
-            stages.push(Self::split_stage(split)?);
+            let stage = Self::split_stage(split)?;
+            Self::check_anchors(&stage, stages.is_empty())?;
+            stages.push(stage);
         }
         if items[at].get("use_regex").and_then(Value::as_bool) == Some(true) {
             stages.push(Stage {
@@ -1773,9 +1784,39 @@ impl NativeEncoder {
                     "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII",
                 ));
             }
+            Self::check_anchors(&stage, stages.is_empty())?;
             stages.push(stage);
         }
         Ok(stages)
+    }
+
+    /// A stage anchored to its text (`\A`, `\z` or `\G`) reads the bounds of
+    /// the piece the stage before it cut, and where its search in that piece
+    /// began, as the reference runs it ([`Self::pieces`] runs every stage
+    /// over the pieces of the one before). Two things keep it honest: the
+    /// first stage runs over a unit of the thread pool as over the text, and
+    /// would read the unit's bounds as the text's; and the pool's cut check
+    /// runs every stage over a window of the text instead of over pieces
+    /// ([`Self::piece_starts_at`]), which stays right only when the stage's
+    /// matches are runs of decimal digits, which neither span nor start at a
+    /// cut candidate (a space). An anchored first stage and an anchored stage
+    /// over anything but decimal digits decline.
+    fn check_anchors(stage: &Stage, first: bool) -> Result<(), Declined> {
+        if !stage.pattern.anchored() {
+            return Ok(());
+        }
+        if first {
+            return Err(Declined::from(
+                "a first split pattern anchored to its text (\\A, \\z or \\G)",
+            ));
+        }
+        if !stage.pattern.decimal_digits_only() {
+            return Err(Declined::from(
+                "a split pattern anchored to its text (\\A, \\z or \\G) over more than decimal \
+                 digits",
+            ));
+        }
+        Ok(())
     }
 
     /// One `Split` as a stage: a regex or a literal the pattern engine takes,
