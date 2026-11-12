@@ -587,6 +587,28 @@ pub(crate) enum ExecutionPlanKind {
     EncodePrefillDecode,
 }
 
+/// The mode's settings for the request a stage builds: which execution plan
+/// it becomes, and whether the prefill-decode metadata is injected into it.
+/// Read once off the mode by the pipeline and held by every request-building
+/// stage as one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanSettings {
+    pub inject_pd_metadata: bool,
+    pub plan_kind: ExecutionPlanKind,
+}
+
+impl PlanSettings {
+    /// The mode-bearing part of a stage's descriptor in the pipeline parity
+    /// test: one form for every stage that holds the settings.
+    #[cfg(test)]
+    pub(crate) fn signature(self) -> String {
+        format!(
+            "inject_pd_metadata={}, {:?}",
+            self.inject_pd_metadata, self.plan_kind
+        )
+    }
+}
+
 impl ExecutionPlan {
     /// Whether a retry of this plan would replay a replica-bound encode
     /// handoff: under a push handoff (`handoff`, the selected runtime's
