@@ -1505,8 +1505,9 @@ mod tests {
     /// A caller whose wait ended leaves the key free: a second wait under
     /// the same key is taken, carries the next waiter id, and is answered
     /// with its own job's outcome once the dispatcher runs; a wait cancelled
-    /// while the queue is full frees the key the same way. The dispatcher's
-    /// one permit is held until the end, so the queued jobs wait.
+    /// while the queue is full frees the key the same way. The test holds
+    /// the dispatcher's one permit, so the queued jobs wait, and lets go of
+    /// it once the second wait holds the key.
     #[tokio::test]
     async fn a_second_wait_under_a_freed_key_is_taken_and_answered_with_its_own_outcome() {
         use crate::app_context::testing::app_context_for_tests;
