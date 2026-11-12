@@ -1550,7 +1550,8 @@ struct ModelArgs {
 
     /// Most stored responses the memory history backend keeps; the oldest go
     /// first, on every write (memory backend only; a stored response takes
-    /// about 12 KB).
+    /// about 12 KB). The Messages thread store keeps that many turns under
+    /// every history backend, the oldest evicted first.
     #[arg(long, default_value_t = 10_000, help_heading = "Backend")]
     history_memory_max_responses: usize,
 
@@ -1564,7 +1565,8 @@ struct ModelArgs {
     /// on every write; 0 keeps a record until a count bound drops it. A
     /// conversation is kept that long after its last use (created, read or
     /// updated); a background response still running is not dropped by a
-    /// count bound.
+    /// count bound. The Messages thread store keeps a turn that long after it
+    /// was written, under every history backend.
     #[arg(long, default_value_t = 86_400, help_heading = "Backend")]
     history_memory_retention_secs: u64,
 

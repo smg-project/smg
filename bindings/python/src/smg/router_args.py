@@ -2757,7 +2757,8 @@ class RouterArgs:
             help=(
                 "Most stored responses the memory history backend keeps; the oldest go"
                 " first, on every write (memory backend only; a stored response takes"
-                " about 12 KB)."
+                " about 12 KB). The Messages thread store keeps that many turns under"
+                " every history backend, the oldest evicted first."
             ),
         )
         backend_group.add_argument(
@@ -2779,7 +2780,8 @@ class RouterArgs:
                 " on every write; 0 keeps a record until a count bound drops it. A"
                 " conversation is kept that long after its last use (created, read or"
                 " updated); a background response still running is not dropped by a"
-                " count bound."
+                " count bound. The Messages thread store keeps a turn that long after it"
+                " was written, under every history backend."
             ),
         )
 
