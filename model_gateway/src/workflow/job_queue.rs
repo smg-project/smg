@@ -2793,4 +2793,154 @@ mod tests {
             "the outcome does not name the removal: {failure}"
         );
     }
+
+    /// What `a_delete_setting` builds: the context, its queue and registry,
+    /// the worker under the URL and that worker's id.
+    type DeleteSetting = (
+        Arc<AppContext>,
+        Arc<JobQueue>,
+        Arc<crate::worker::WorkerRegistry>,
+        Arc<dyn crate::worker::Worker>,
+        WorkerId,
+    );
+
+    /// A running queue over live engines, a registry, and a worker under
+    /// `url` with no drain window, the setting a DELETE's kept removal runs in.
+    fn a_delete_setting(url: &str) -> DeleteSetting {
+        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+            workflow::WorkflowEngines,
+        };
+        let router_config = RouterConfig::default();
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        assert!(
+            context
+                .workflow_engines
+                .set(WorkflowEngines::new(&router_config))
+                .is_ok(),
+            "the engines are set once"
+        );
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        assert!(
+            context.worker_job_queue.set(Arc::clone(&queue)).is_ok(),
+            "the queue is set once"
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("served"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 0,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let id = registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        (context, queue, registry, worker, id)
+    }
+
+    /// A DELETE's removal kept behind a removal in flight removes the worker
+    /// the DELETE saw once it runs: the worker a guarded cleanup skipped as
+    /// replaced since its snapshot leaves through the DELETE's own removal.
+    #[tokio::test]
+    async fn a_kept_delete_removal_removes_the_worker_the_delete_saw() {
+        let url = "http://10.0.0.9:8000";
+        let (context, queue, registry, _worker, id) = a_delete_setting(url);
+        queue.hold_url_for_tests(url, "RemoveWorker");
+        context
+            .worker_service
+            .delete_worker(id.as_str())
+            .await
+            .expect("the DELETE is admitted");
+        assert!(
+            queue.kept_for(url),
+            "the DELETE's removal waits for the holder"
+        );
+        JobQueue::record_job_completion(
+            "RemoveWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "the kept removal ran");
+        assert!(
+            registry.get_by_url(url).is_none(),
+            "the DELETE's removal removed the worker it saw"
+        );
+    }
+
+    /// A DELETE's removal kept behind a removal in flight is pinned to the
+    /// worker the DELETE saw: a PUT that replaces the worker before the kept
+    /// removal runs keeps its worker, as the removal step's guard reads.
+    #[tokio::test]
+    async fn a_kept_delete_removal_skips_a_worker_replaced_since_the_delete() {
+        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+        use crate::worker::{BasicWorkerBuilder, Worker, WorkerType};
+        let url = "http://10.0.0.10:8000";
+        let (context, queue, registry, first, id) = a_delete_setting(url);
+        queue.hold_url_for_tests(url, "RemoveWorker");
+        context
+            .worker_service
+            .delete_worker(id.as_str())
+            .await
+            .expect("the DELETE is admitted");
+        assert!(
+            queue.kept_for(url),
+            "the DELETE's removal waits for the holder"
+        );
+        // The PUT lands before the kept removal runs.
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("served"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 0,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        assert!(
+            registry.replace_claiming_local(&id, Arc::clone(&replacement), first.revision()),
+            "the PUT replaces the worker"
+        );
+        JobQueue::record_job_completion(
+            "RemoveWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "the kept removal ran");
+        let standing = registry
+            .get_by_url(url)
+            .expect("the PUT's worker stays under the URL");
+        assert!(
+            !Arc::ptr_eq(&standing, &first),
+            "the worker standing is the PUT's, not the one the DELETE saw"
+        );
+    }
 }
