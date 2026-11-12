@@ -77,10 +77,10 @@ struct Entry {
     expires_at_micros: u64,
     recovery: Recovery,
     /// The pin a decision's claim wrote before its commit; `WorkerId(0)`
-    /// when none stands. The claiming decision's dispatch to it confirms it,
-    /// that decision's dispatch elsewhere withdraws it, and no other dispatch
-    /// touches it; a claim whose commit never comes stands until the TTL
-    /// sweeps the key.
+    /// when none stands. Any dispatch to it confirms it (the key was served
+    /// there), the claiming decision's dispatch elsewhere withdraws it while
+    /// it stands unconfirmed, and no other dispatch elsewhere touches it; a
+    /// claim whose commit never comes stands until the TTL sweeps the key.
     claim: WorkerId,
 }
 
@@ -185,8 +185,8 @@ impl SessionTable {
     /// the newcomer among them is the claim to follow instead, when it is
     /// among this decision's survivors; the pin of record is returned. The
     /// claim is the one pin made before a commit, and it is marked as such:
-    /// the claiming decision's own dispatch confirms it or withdraws it
-    /// (`dispatched`), the TTL sweeps it otherwise.
+    /// any dispatch to it confirms it, the claiming decision's own dispatch
+    /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
     pub(crate) fn claim(&self, key: u64, seen: Pins, target: WorkerId) -> Claim {
         if key == 0 || target == WorkerId(0) {
             return Claim::Standing(target);
@@ -215,24 +215,28 @@ impl SessionTable {
     /// decision's `verdict`: the pin follows the rule. The preferred pin
     /// taken, or the failover taken while the preferred one was unroutable,
     /// leaves the pins as they are; a respill, and a worker outside the pins,
-    /// move them by the key's recovery rule. A claiming decision settles its
-    /// own claim first.
+    /// move them by the key's recovery rule. A dispatch to the claimed worker
+    /// confirms the claim first; the claiming decision's commit elsewhere
+    /// withdraws it.
     pub(crate) fn dispatched(&self, key: u64, verdict: SessionVerdict, target: WorkerId) {
         if key == 0 || target == WorkerId(0) {
             return;
         }
         let mut shard = self.shard(key).lock();
         let entry = shard.entry(key).or_default();
-        // The decision that claimed settles its own claim and no other
-        // dispatch touches it: confirmed on the claimed worker, withdrawn when
-        // this commit landed elsewhere. An older request's commit on the
-        // owner leaves a retry's claim standing for the retries after it.
+        // A dispatch to the claimed worker confirms the claim, whichever
+        // decision commits there: the key was served on it, so a pin another
+        // request already used is never withdrawn. Only the claiming
+        // decision's commit elsewhere withdraws a claim still unconfirmed; an
+        // older request's commit on the owner leaves a retry's claim standing
+        // for the retries after it.
+        if entry.claim != WorkerId(0) && entry.claim == target {
+            entry.claim = WorkerId(0);
+        }
         if let SessionVerdict::Claimed(claimed) = verdict {
-            if entry.claim == claimed {
+            if claimed != WorkerId(0) && entry.claim == claimed {
                 entry.claim = WorkerId(0);
-                if claimed != target {
-                    entry.withdraw(claimed);
-                }
+                entry.withdraw(claimed);
             }
         }
         if entry.pins[0] == target {
@@ -577,6 +581,51 @@ mod tests {
             table.pins(2),
             Some([WorkerId(5), WorkerId(4)]),
             "a confirmed claim served: the normal rule moves it"
+        );
+    }
+
+    #[test]
+    fn a_pin_another_request_already_used_survives_the_claimants_commit_elsewhere() {
+        // X claims A for a fresh key; Y finds A pinned and commits there; A
+        // goes unroutable and X's own commit lands on B. A was served, so it
+        // stays: [A, B], and the recovered A keeps the key.
+        let table = SessionTable::new(RULE.sweep_micros);
+        let seen = table.lookup(1, 0, &ORIGINAL);
+        assert_eq!(table.claim(1, seen, WorkerId(1)), Claim::Made(WorkerId(1)));
+        table.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
+        table.dispatched(1, SessionVerdict::Claimed(WorkerId(1)), WorkerId(2));
+        assert_eq!(
+            table.pins(1),
+            Some([WorkerId(1), WorkerId(2)]),
+            "a pin another request already used survives the claimant's commit elsewhere"
+        );
+        assert_eq!(table.lookup(1, 10, &ORIGINAL), [WorkerId(1), WorkerId(2)]);
+        // Under the latest-first recovery the alternate leads and A stays the
+        // failover instead of vanishing.
+        let table = SessionTable::new(RULE.sweep_micros);
+        let seen = table.lookup(2, 0, &RULE);
+        assert_eq!(table.claim(2, seen, WorkerId(1)), Claim::Made(WorkerId(1)));
+        table.dispatched(2, SessionVerdict::Pinned, WorkerId(1));
+        table.dispatched(2, SessionVerdict::Claimed(WorkerId(1)), WorkerId(2));
+        assert_eq!(table.pins(2), Some([WorkerId(2), WorkerId(1)]));
+    }
+
+    #[test]
+    fn a_commit_elsewhere_by_another_request_leaves_the_claim_unconfirmed() {
+        // The owner is pinned; a retry claims C; an older request commits on
+        // the owner (not on C): the claim stands unconfirmed, so the retry's
+        // own commit on D still withdraws C.
+        let table = SessionTable::new(RULE.sweep_micros);
+        table.lookup(1, 10, &ORIGINAL);
+        table.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
+        let seen = table.lookup(1, 20, &ORIGINAL);
+        assert_eq!(table.claim(1, seen, WorkerId(2)), Claim::Made(WorkerId(2)));
+        table.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
+        table.dispatched(1, SessionVerdict::Claimed(WorkerId(2)), WorkerId(3));
+        assert_eq!(
+            table.pins(1),
+            Some([WorkerId(1), WorkerId(3)]),
+            "a commit elsewhere by another request confirms nothing"
         );
     }
 
