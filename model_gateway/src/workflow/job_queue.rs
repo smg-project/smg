@@ -355,24 +355,26 @@ impl JobQueue {
         (queue_depth, available_permits)
     }
 
-    /// Submit unless a job for this URL is already pending or processing.
-    /// Returns `Ok(false)` when an earlier submission is still in flight. The
-    /// status-map entry is taken atomically, so concurrent callers enqueue
-    /// exactly one job per URL (#1533).
-    pub async fn submit_if_idle(&self, job: Job) -> Result<bool, String> {
+    /// Claim the URL of `job` for it, unless a job of its type is already
+    /// pending or processing there, in which case `false`. The status-map
+    /// entry is taken atomically, so of concurrent callers exactly one holds
+    /// the claim and enqueues, with [`Self::submit_claimed`] (#1533); what
+    /// that caller does between the two (a `POST` reserves the worker id its
+    /// 202 names) is behind the claim, so a caller refused here does none of
+    /// it.
+    pub fn claim_if_idle(&self, job: &Job) -> bool {
+        Self::claim(&self.status_map, job.worker_url(), job.job_type())
+    }
+
+    /// Submit a job whose URL the caller claimed with [`Self::claim_if_idle`].
+    /// A failed submission owns no job, so its claim must not block the next
+    /// one; only its own entry goes.
+    pub async fn submit_claimed(&self, job: Job) -> Result<(), String> {
         let worker_url = job.worker_url().to_string();
         let job_type = job.job_type();
-        if !Self::claim(&self.status_map, &worker_url, job_type) {
-            return Ok(false);
-        }
-        self.submit_inner(job, true, None)
-            .await
-            .map(|()| true)
-            .inspect_err(|_| {
-                // A failed submission owns no job, so its claim must not block the
-                // next one; only its own entry goes.
-                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
-            })
+        self.submit_inner(job, true, None).await.inspect_err(|_| {
+            Self::record_own_status(&self.status_map, &worker_url, job_type, None);
+        })
     }
 
     /// Only an in-flight job of the same type counts: the status map is keyed
@@ -552,7 +554,7 @@ impl JobQueue {
     }
 
     /// `submit`, with the pending status written over this job's own claim
-    /// alone when `claimed` ([`Self::submit_if_idle`],
+    /// alone when `claimed` ([`Self::submit_claimed`],
     /// [`Self::submit_unless_in_flight`]): a job of another type that took the
     /// URL during the wait for a slot keeps its entry, where a plain submission
     /// writes its own over whatever is there. `waiter` is the id of the caller
@@ -2149,50 +2151,22 @@ mod tests {
         assert!(marks.is_empty());
     }
 
-    /// A POST refused by the queue's claim met a registration that is not a
-    /// POST's (a startup or discovery one, which reserves nothing; a POST's
-    /// would have left its reservation for the POST to find first) and
-    /// releases the reservation it made: no id outlives the refusal for a
-    /// DELETE to find.
-    #[tokio::test]
-    async fn a_post_refused_for_a_registration_of_another_kind_leaves_no_reservation() {
-        use crate::worker::{service::WorkerServiceError, WorkerRegistry, WorkerService};
-        let registry = Arc::new(WorkerRegistry::new());
-        let url = "grpc://10.0.0.5:8000";
-        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
-        // The discovery registration's claim, as `submit_if_idle` takes it
-        // before its job is queued.
-        assert!(JobQueue::claim(&queue.status_map, url, "AddWorker"));
-        let held = Arc::new(std::sync::OnceLock::new());
-        held.set(queue).ok();
-        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
-        let err = service
-            .create_worker(WorkerSpec::new(url))
-            .await
-            .expect_err("the discovery registration is in flight");
-        let WorkerServiceError::CreateInProgress { worker_id, .. } = err else {
-            panic!("expected CreateInProgress, got {err:?}");
-        };
-        assert_eq!(worker_id, None, "no id of a POST's is in flight to poll");
-        assert_eq!(
-            registry.get_id_by_url_or_reservation(url),
-            None,
-            "the refused POST's reservation outlived the refusal"
-        );
-    }
-
     /// A submission that fails must not leave its claim behind, or the next
     /// create for the URL would be told a job is in flight when none is (#1533).
     #[tokio::test]
-    async fn failed_submit_if_idle_releases_its_claim() {
+    async fn a_failed_claimed_submission_releases_its_claim() {
         let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
         let job = || Job::AddWorker {
             config: Box::new(WorkerSpec::new("http://w:8000")),
             registration_mode: WorkerRegistrationMode::CreateOnly,
         };
-        assert!(queue.submit_if_idle(job()).await.is_err());
-        // Before the rollback this returned Ok(false): a 202 with no job behind it.
-        assert!(queue.submit_if_idle(job()).await.is_err());
+        assert!(queue.claim_if_idle(&job()));
+        assert!(queue.submit_claimed(job()).await.is_err());
+        // Before the rollback the claim stayed: a 202 with no job behind it.
+        assert!(
+            queue.claim_if_idle(&job()),
+            "a failed submission left its claim"
+        );
     }
 
     /// The queue channel and dispatch semaphore are sized from the config,

@@ -3643,21 +3643,3 @@ fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
         );
     });
 }
-
-/// Of two reservations of one URL only the first is fresh: the second finds
-/// the first's id, and a release makes the URL fresh again.
-#[test]
-fn reserving_an_id_for_a_url_is_fresh_once_until_released() {
-    let registry = WorkerRegistry::new();
-    let (first, fresh) = registry.reserve_or_find_id_for_url("http://w:8000");
-    assert!(fresh);
-    let (second, fresh_again) = registry.reserve_or_find_id_for_url("http://w:8000");
-    assert_eq!(second, first);
-    assert!(
-        !fresh_again,
-        "the second caller found the first's reservation"
-    );
-    registry.release_reservation("http://w:8000");
-    let (_, fresh_after_release) = registry.reserve_or_find_id_for_url("http://w:8000");
-    assert!(fresh_after_release);
-}

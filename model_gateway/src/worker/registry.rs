@@ -1867,18 +1867,6 @@ impl WorkerRegistry {
         self.url_to_id.entry(url.to_string()).or_default().clone()
     }
 
-    /// Reserves an id for `url` as [`Self::reserve_id_for_url`] does, and says
-    /// whether this call made the reservation (`true`) or found one, or a live
-    /// worker's mapping, already there. One entry operation, so of two callers
-    /// racing for one URL exactly one reads `true`: a `POST` refused after
-    /// reserving releases only what it made itself.
-    pub fn reserve_or_find_id_for_url(&self, url: &str) -> (WorkerId, bool) {
-        match self.url_to_id.entry(url.to_string()) {
-            Entry::Occupied(entry) => (entry.get().clone(), false),
-            Entry::Vacant(entry) => (entry.insert(WorkerId::default()).clone(), true),
-        }
-    }
-
     /// Drop a reservation from [`Self::reserve_id_for_url`] whose worker never
     /// registered, so a failed AddWorker does not orphan the entry (#1533).
     /// A URL that already has a live worker is left untouched.
