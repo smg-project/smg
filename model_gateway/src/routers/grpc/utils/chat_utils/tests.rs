@@ -1,6 +1,9 @@
 use std::{future::Future, sync::mpsc};
 
-use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
+use llm_tokenizer::{
+    chat_template::{ChatTemplateContentFormat, ThinkingKeyName},
+    traits::RendererCapabilities,
+};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
@@ -1116,7 +1119,16 @@ fn tool_choice_none_renders_the_tools_as_auto_does() {
 /// `build_chat_template_kwargs` with the profile the request's model
 /// derives, as the preparation stage carries it.
 fn kwargs_for(request: &ChatCompletionRequest) -> HashMap<String, Value> {
-    build_chat_template_kwargs(request, ProviderProfile::for_model(&request.model))
+    build_chat_template_kwargs(request, ProviderProfile::for_model(&request.model), None)
+}
+
+/// `kwargs_for` under a template that reads the `thinking_mode` switch.
+fn kwargs_for_switch(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    build_chat_template_kwargs(
+        request,
+        ProviderProfile::for_model(&request.model),
+        Some(ThinkingKeyName::ThinkingMode),
+    )
 }
 
 fn effort_request(reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -1303,24 +1315,31 @@ fn minimax_effort_none_switches_thinking_off_and_renders_no_effort() {
         Some(&json!("high"))
     );
 
-    // The template's own switch sent as a kwarg ranks above the typed toggle
-    // and the effort, as the template renders it: no effort tag beside its
-    // disabled branch, the level beside its enabled one.
+    // The template's own switch sent as a kwarg counts where the template
+    // reads that key, ranking above the typed toggle and the effort as the
+    // template renders it: no effort tag beside its disabled branch, the
+    // level beside its enabled one. A template without the switch (the key
+    // undetected) keeps the effort: the kwarg is inert there.
     let mut request = minimax(None, Some("high"));
     request.chat_template_kwargs = Some(HashMap::from([(
         "thinking_mode".to_string(),
         json!("disabled"),
     )]));
-    let kwargs = kwargs_for(&request);
+    let kwargs = kwargs_for_switch(&request);
     assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
     assert_eq!(kwargs.get("thinking_mode"), Some(&json!("disabled")));
+    assert_eq!(
+        kwargs_for(&request).get(REASONING_EFFORT_KEY),
+        Some(&json!("high")),
+        "a template without the switch keeps the effort"
+    );
     let mut request = minimax(Some(json!({"type": "disabled"})), Some("minimal"));
     request.chat_template_kwargs = Some(HashMap::from([(
         "thinking_mode".to_string(),
         json!("enabled"),
     )]));
     assert_eq!(
-        kwargs_for(&request).get(REASONING_EFFORT_KEY),
+        kwargs_for_switch(&request).get(REASONING_EFFORT_KEY),
         Some(&json!("low"))
     );
 }
@@ -2472,7 +2491,7 @@ fn resolved_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
 #[test]
 fn the_render_reads_the_carried_profile_not_the_model() {
     let effort_kwarg = |request: &ChatCompletionRequest, provider: ProviderProfile| {
-        build_chat_template_kwargs(request, provider)
+        build_chat_template_kwargs(request, provider, None)
             .get(REASONING_EFFORT_KEY)
             .cloned()
     };

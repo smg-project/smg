@@ -751,7 +751,8 @@ pub fn resolve_user_thinking(
 /// (`ProviderProfile::template_reasoning_effort`, written over any entry
 /// under that key whatever its type, the entry removed when the profile hands
 /// none, given the thinking preference the render resolves: the template's
-/// own switch among the kwargs, else `template_thinking`), the kwargs as they
+/// own switch among the kwargs where the template reads that key, else
+/// `template_thinking`), the kwargs as they
 /// are when the request carries no field, and `template_thinking`: the typed
 /// toggle or the profile's reading of the effort. `None` for every other
 /// renderer.
@@ -766,9 +767,15 @@ fn rendered_thinking_mode(
         return tokenizer.native_thinking_mode(kwargs, template_thinking);
     }
     let mut as_rendered = kwargs.cloned().unwrap_or_default();
-    let thinking = provider
-        .thinking_from_template_kwargs(kwargs)
-        .or(template_thinking);
+    // The template's own switch counts where the template reads that key, as
+    // the render gates it.
+    let explicit = matches!(
+        tokenizer.thinking_key_name(),
+        Some(ThinkingKeyName::ThinkingMode)
+    )
+    .then(|| provider.thinking_from_template_kwargs(kwargs))
+    .flatten();
+    let thinking = explicit.or(template_thinking);
     match provider.template_reasoning_effort(reasoning_effort, thinking) {
         Some(effort) => {
             as_rendered.insert(

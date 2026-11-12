@@ -236,8 +236,11 @@ impl ProviderProfile {
     /// (the templates' own tri-state switch; `adaptive` or any other value
     /// leaves the default); `None` under every other profile, whose
     /// templates' switches the gateway reads from the template text instead.
-    /// The render and the parser's arming let this explicit switch rank
-    /// above the typed toggle and the effort, as the template does.
+    /// The gateway applies it where the template reads that key (its detected
+    /// thinking key is `thinking_mode`), as the backed plan and the parser do
+    /// for the mode: there the explicit switch ranks above the typed toggle
+    /// and the effort, as the template renders it; elsewhere it is inert and
+    /// the typed toggle and the effort decide.
     pub fn thinking_from_template_kwargs(
         self,
         kwargs: Option<&HashMap<String, serde_json::Value>>,

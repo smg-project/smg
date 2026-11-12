@@ -605,14 +605,16 @@ impl ChatCompletionRequest {
     /// The `reasoning_effort` the prompt is rendered with: the effective
     /// effort as the model's provider profile hands it to the template
     /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
-    /// preference the prompt renders with: the template's own switch sent in
-    /// `chat_template_kwargs` ([`ProviderProfile::thinking_from_template_kwargs`],
-    /// which the template lets win), else [`Self::template_thinking_for`].
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    /// The gateway's kwargs merge adds the template's own switch sent in
+    /// `chat_template_kwargs` where the template reads that key
+    /// ([`ProviderProfile::thinking_from_template_kwargs`] under the detected
+    /// thinking key, which this crate cannot know).
     pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
-        let thinking = provider
-            .thinking_from_template_kwargs(self.chat_template_kwargs.as_ref())
-            .or_else(|| self.template_thinking_for(provider));
-        provider.template_reasoning_effort(self.effective_reasoning_effort(), thinking)
+        provider.template_reasoning_effort(
+            self.effective_reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
     }
 
     /// Whether `continue_final_message` applies: it is set and the request
@@ -1676,8 +1678,9 @@ mod tests {
     /// The effort the template renders is the profile's second reading of
     /// the field: the value as sent under the default profile; under MiniMax
     /// a level the contract names only (`minimal` as `low`), and none while
-    /// thinking is off, whether the typed toggle, the effort or the template's
-    /// own `thinking_mode` switch sent as a kwarg says so.
+    /// thinking is off (the typed toggle or the effort; the template's own
+    /// switch sent as a kwarg is the gateway's to apply, see
+    /// [`thinking_from_template_kwargs_reads_the_minimax_switch`]).
     #[test]
     fn template_reasoning_effort_follows_the_profile() {
         let request = |fields: Value| -> ChatCompletionRequest {
@@ -1725,25 +1728,10 @@ mod tests {
                 None,
                 Some("none"),
             ),
-            // The template's own switch sent as a kwarg ranks above the typed
-            // toggle and the effort, as the template renders it.
+            // A kwarg switch is not this method's to read: the gateway applies
+            // it where the template reads that key.
             (
                 json!({"reasoning_effort": "high", "chat_template_kwargs": {"thinking_mode": "disabled"}}),
-                None,
-                Some("high"),
-            ),
-            (
-                json!({"reasoning_effort": "minimal", "chat_template_kwargs": {"thinking_mode": "enabled"}}),
-                Some("low"),
-                Some("minimal"),
-            ),
-            (
-                json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}, "chat_template_kwargs": {"thinking_mode": "enabled"}}),
-                Some("high"),
-                Some("high"),
-            ),
-            (
-                json!({"reasoning_effort": "high", "chat_template_kwargs": {"thinking_mode": "adaptive"}}),
                 Some("high"),
                 Some("high"),
             ),
@@ -1760,6 +1748,34 @@ mod tests {
                 "generic {fields}"
             );
         }
+    }
+
+    /// The template's own `thinking_mode` switch sent as a kwarg, read by the
+    /// profile that knows its templates' key; the gateway applies it where the
+    /// template reads that key.
+    #[test]
+    fn thinking_from_template_kwargs_reads_the_minimax_switch() {
+        let kwargs = |mode: &str| {
+            std::collections::HashMap::from([("thinking_mode".to_string(), json!(mode))])
+        };
+        let minimax = ProviderProfile::Minimax;
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("enabled"))),
+            Some(true)
+        );
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("disabled"))),
+            Some(false)
+        );
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("adaptive"))),
+            None
+        );
+        assert_eq!(minimax.thinking_from_template_kwargs(None), None);
+        assert_eq!(
+            ProviderProfile::Generic.thinking_from_template_kwargs(Some(&kwargs("disabled"))),
+            None
+        );
     }
 
     #[test]
