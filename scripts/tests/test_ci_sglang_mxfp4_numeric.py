@@ -78,9 +78,158 @@ def test_numeric_is_failclosed_in_same_final_environment_job_after_downloads():
     assert names.index("Download models") < index
     assert names.index("Download extra models") < index < names.index("Run E2E tests")
     assert "python3 -I -B scripts/ci_sglang_mxfp4_numeric.py" in step["run"]
-    assert (
-        "--snapshot /models/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee"
-        in step["run"]
-    )
+    assert "--snapshot" not in step["run"]
     assert "--output e2e-logs/gptoss-mxfp4-numeric" in step["run"]
     assert "||" not in step["run"]
+
+
+@pytest.fixture
+def checkpoint_layout(numeric, tmp_path, monkeypatch):
+    import base64
+    import hashlib
+    import zlib
+
+    fixtures = load(
+        "checkpoint_metadata_fixtures", Path(__file__).with_name("test_ci_sglang_mxfp4_fallback.py")
+    )
+    root = tmp_path / "models"
+    snapshot = root / "hub/models--openai--gpt-oss-20b/snapshots" / numeric.REVISION
+    snapshot.mkdir(parents=True)
+    for name, packed in fixtures._ORIGINAL_METADATA_ZLIB.items():
+        (snapshot / name).write_bytes(zlib.decompress(base64.b64decode(packed)))
+    index = json.loads((snapshot / "model.safetensors.index.json").read_bytes())
+    for name in set(index["weight_map"].values()):
+        (snapshot / name).write_bytes(b"canonical-fixture-not-real-weights")
+    reference = snapshot.parents[1] / "refs/main"
+    reference.parent.mkdir()
+    reference.write_text(numeric.REVISION)
+    alias = root / numeric.MODEL
+    alias.parent.mkdir()
+    monkeypatch.setenv("ROUTER_LOCAL_MODEL_PATH", str(root))
+    monkeypatch.setenv("HF_HOME", str(root))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    patch = ROOT / "scripts/patches/sglang-0.5.21-gptoss-gfx942.patch"
+    added = "\n".join(
+        line[1:]
+        for line in patch.read_text().splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    helpers = added[
+        added.index("_GPTOSS_REVISION =") : added.index("def _validate_gfx942_gptoss_bf16_runtime")
+    ]
+    sdk = tmp_path / "sdk"
+    source = sdk / "srt/layers/quantization/mxfp4.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(helpers)
+    pins = {
+        "sdk_files": {
+            "srt/layers/quantization/mxfp4.py": hashlib.sha256(source.read_bytes()).hexdigest()
+        }
+    }
+    return root, snapshot, alias, sdk, pins
+
+
+def test_numeric_and_worker_choose_the_same_copy_instead_of_decoy_snapshot(
+    numeric, checkpoint_layout
+):
+    import hashlib
+    import shutil
+
+    root, snapshot, alias, sdk, pins = checkpoint_layout
+    shutil.copytree(snapshot, alias)
+    shard = next(alias.glob("*.safetensors"))
+    shard.write_bytes(b"selected-copy-fixture-not-real-weights")
+    chosen = numeric.worker_checkpoint()
+    assert chosen["worker_model_path"] == str(alias)
+    checked = numeric.identity_validator(sdk, pins)(chosen["checkpoint_path"])
+    assert checked["resolved_path"] == str(alias)
+    actual = numeric.checkpoint_file(
+        Path(checked["resolved_path"]), shard.name, Path(checked["repository"])
+    )
+    assert actual == shard and actual != snapshot / shard.name
+    assert (
+        hashlib.sha256(actual.read_bytes()).digest()
+        != hashlib.sha256((snapshot / shard.name).read_bytes()).digest()
+    )
+    assert checked["metadata"]["config.json"]["path"] == str(alias / "config.json")
+    assert checked["metadata"]["model.safetensors.index.json"]["path"] == str(
+        alias / "model.safetensors.index.json"
+    )
+
+
+def test_numeric_accepts_symlinked_model_root_and_original_blob_links(
+    numeric, checkpoint_layout, tmp_path, monkeypatch
+):
+    root, snapshot, alias, sdk, pins = checkpoint_layout
+    alias.symlink_to(snapshot, target_is_directory=True)
+    lexical_root = tmp_path / "mounted-models"
+    lexical_root.symlink_to(root, target_is_directory=True)
+    monkeypatch.setenv("ROUTER_LOCAL_MODEL_PATH", str(lexical_root))
+    monkeypatch.setenv("HF_HOME", str(lexical_root))
+    blobs = snapshot.parents[1] / "blobs"
+    blobs.mkdir()
+    shard = next(snapshot.glob("*.safetensors"))
+    target = blobs / "original-blob-fixture"
+    shard.rename(target)
+    shard.symlink_to(target)
+    chosen = numeric.worker_checkpoint()
+    assert chosen["worker_model_path"] == str(lexical_root / numeric.MODEL)
+    checked = numeric.identity_validator(sdk, pins)(chosen["checkpoint_path"])
+    assert checked["resolved_path"] == str(snapshot)
+    assert numeric.checkpoint_file(snapshot, shard.name, Path(checked["repository"])) == target
+
+
+def test_hub_id_fallback_pins_worker_snapshot_independently_of_main_ref(numeric, checkpoint_layout):
+    root, snapshot, alias, sdk, pins = checkpoint_layout
+    assert not alias.exists()
+    chosen = numeric.worker_checkpoint()
+    assert chosen["harness_model_path"] == numeric.MODEL
+    assert chosen["worker_model_path"] == str(snapshot)
+    assert chosen["hub_main_ref"] == numeric.REVISION
+    checked = numeric.identity_validator(sdk, pins)(chosen["checkpoint_path"])
+    assert checked["resolved_path"] == str(snapshot)
+    (snapshot.parents[1] / "refs/main").write_text("0" * 40)
+    assert numeric.worker_checkpoint()["checkpoint_path"] == str(snapshot)
+    assert numeric.worker_checkpoint()["hub_main_ref"] == "0" * 40
+    (snapshot / "config.json").unlink()
+    with pytest.raises(OSError):
+        numeric.identity_validator(sdk, pins)(numeric.worker_checkpoint()["checkpoint_path"])
+
+
+def test_copy_shard_cannot_use_unrelated_model_root_file(numeric, checkpoint_layout):
+    import shutil
+
+    root, snapshot, alias, sdk, pins = checkpoint_layout
+    shutil.copytree(snapshot, alias)
+    shard = next(alias.glob("*.safetensors"))
+    shard.unlink()
+    foreign = root / "foreign.safetensors"
+    foreign.write_bytes(b"foreign-fixture")
+    shard.symlink_to(foreign)
+    with pytest.raises(ValueError, match="escapes"):
+        numeric.identity_validator(sdk, pins)(str(alias))
+    with pytest.raises(ValueError, match="escapes"):
+        numeric.checkpoint_file(alias, shard.name, snapshot.parents[1])
+
+
+def test_isolated_worker_resolution_loads_no_engine_or_infra_package(checkpoint_layout):
+    import subprocess
+    import sys
+
+    root, snapshot, alias, sdk, pins = checkpoint_layout
+    alias.symlink_to(snapshot, target_is_directory=True)
+    code = (
+        "import importlib.util,sys,json; "
+        "spec=importlib.util.spec_from_file_location('numeric',sys.argv[1]); "
+        "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m); "
+        "print(json.dumps(m.worker_checkpoint())); "
+        "assert not any(n in sys.modules for n in ('sglang','torch','infra','e2e_test.infra'))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code, str(SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["worker_model_path"] == str(alias)

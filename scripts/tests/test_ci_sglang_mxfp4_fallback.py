@@ -245,3 +245,17 @@ def test_snapshot_metadata_blob_links_are_supported(local_checkpoint):
     ns["_validate_gptoss_local_checkpoint"](alias)
     with pytest.raises(ValueError):
         ns["_validate_gptoss_local_checkpoint"](root / "unrelated/gpt-oss-20b")
+
+
+def test_engine_accepts_lexical_alias_under_symlinked_model_root(
+    local_checkpoint, tmp_path, monkeypatch
+):
+    root, snapshot, alias, ns = local_checkpoint
+    lexical = tmp_path / "mounted-model-root"
+    lexical.symlink_to(root, target_is_directory=True)
+    monkeypatch.setenv("ROUTER_LOCAL_MODEL_PATH", str(lexical))
+    checked = ns["_validate_gptoss_local_checkpoint"](lexical / "openai/gpt-oss-20b")
+    assert checked["resolved_path"] == str(snapshot)
+    assert checked["canonical_root"] == str(root)
+    assert checked["configured_root"] == str(lexical)
+    ns["_validate_gptoss_local_checkpoint"](lexical / snapshot.relative_to(root))

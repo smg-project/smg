@@ -157,7 +157,10 @@ def test_fixed_sglang_fallback_uses_generic_moe_flags_without_mutating_model_spe
             lambda path, tp, actual, extras: [path, *actual["sglang_args"], *extras],
         )
     cmd = worker._build_cmd()
-    assert "openai/gpt-oss-20b" in cmd
+    assert any(
+        "models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee" in arg
+        for arg in cmd
+    )
     assert cmd[cmd.index("--moe-runner-backend") + 1] == "triton"
     assert cmd[cmd.index("--moe-a2a-backend") + 1] == "none"
     assert spec == {"model": "openai/gpt-oss-20b", "features": ["chat"]}
@@ -182,3 +185,76 @@ def test_fixed_sglang_fallback_rejects_conflicting_explicit_backend_or_environme
     worker.extra_env = {"SGLANG_USE_AITER": "1"}
     with pytest.raises(ValueError, match="AITER"):
         worker._build_env()
+
+
+@pytest.mark.parametrize("mode", [ConnectionMode.HTTP, ConnectionMode.GRPC, ConnectionMode.ZMQ])
+@pytest.mark.parametrize("local_copy", [False, True])
+def test_gptoss_numeric_selection_matches_actual_worker_model_path(
+    monkeypatch, tmp_path, mode, local_copy
+):
+    import importlib.util
+    from pathlib import Path
+
+    root = tmp_path / "models"
+    root.mkdir()
+    monkeypatch.setenv("HF_HOME", str(root))
+    monkeypatch.setenv("ROUTER_LOCAL_MODEL_PATH", str(root))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setenv("E2E_SGLANG_GPTOSS_MXFP4_BF16", "1")
+    numeric_path = Path(__file__).parents[2] / "scripts/ci_sglang_mxfp4_numeric.py"
+    spec = importlib.util.spec_from_file_location("numeric_worker_contract", numeric_path)
+    numeric = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(numeric)
+    if local_copy:
+        (root / numeric.MODEL).mkdir(parents=True)
+    resolved = numeric.worker_checkpoint()
+    model_spec = {"model": resolved["harness_model_path"], "features": ["chat"]}
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda model: model_spec)
+    worker = Worker(model_id=numeric.MODEL, engine="sglang", port=50111, gpu_ids=[0], mode=mode)
+    if mode == ConnectionMode.ZMQ:
+        monkeypatch.setattr(
+            worker, "_build_sglang_zmq_cmd", lambda path, tp, actual, extras: ["--model-path", path]
+        )
+    cmd = worker._build_cmd()
+    assert cmd[cmd.index("--model-path") + 1] == resolved["worker_model_path"]
+    assert model_spec["model"] == resolved["harness_model_path"]
+    assert resolved["worker_model_path"] == (
+        str(root / numeric.MODEL)
+        if local_copy
+        else str(root / "hub/models--openai--gpt-oss-20b/snapshots" / numeric.REVISION)
+    )
+
+
+@pytest.mark.parametrize(
+    "extra", [["--model-path", "/foreign"], ["--revision=foreign"], ["--model", "foreign"]]
+)
+def test_gptoss_fallback_refuses_checkpoint_overrides(monkeypatch, extra):
+    monkeypatch.setenv("E2E_SGLANG_GPTOSS_MXFP4_BF16", "1")
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda model: {"model": model})
+    worker = Worker(
+        model_id="openai/gpt-oss-20b",
+        engine="sglang",
+        port=50111,
+        gpu_ids=[0],
+        mode=ConnectionMode.GRPC,
+    )
+    worker.extra_engine_args = extra
+    with pytest.raises(ValueError, match="owns its checkpoint"):
+        worker._build_cmd()
+
+
+@pytest.mark.parametrize(
+    "model,enabled",
+    [("openai/gpt-oss-20b", False), ("Qwen/Qwen3-VL-8B-Instruct", True)],
+)
+def test_non_target_workers_keep_original_model_selection(monkeypatch, model, enabled):
+    monkeypatch.setenv("E2E_SGLANG_GPTOSS_MXFP4_BF16", "1" if enabled else "0")
+    original = {"model": model, "features": ["chat"]}
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda name: original)
+    worker = Worker(
+        model_id=model, engine="sglang", port=50111, gpu_ids=[0], mode=ConnectionMode.GRPC
+    )
+    cmd = worker._build_cmd()
+    assert cmd[cmd.index("--model-path") + 1] == model
+    assert "--moe-runner-backend" not in cmd
+    assert original == {"model": model, "features": ["chat"]}

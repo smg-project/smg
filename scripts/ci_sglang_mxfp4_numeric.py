@@ -8,6 +8,7 @@ No model downloads/server/full-model load. This is not a resource controller.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
@@ -46,30 +47,95 @@ def checkpoint_keys(weight_map):
     return result
 
 
-def checkpoint_file(root, name):
+def worker_checkpoint():
+    # Evaluate only the actual harness resolver and its environment assignment.
+    # Importing infra/model_specs as a package would initialize unrelated SDKs
+    # in this -I entrypoint; these two original AST nodes need only stdlib os.
+    source = Path(__file__).parents[1] / "e2e_test/infra/model_specs.py"
+    tree = ast.parse(source.read_text())
+    nodes = [
+        node
+        for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name == "_resolve_model_path")
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "ROUTER_LOCAL_MODEL_PATH"
+                for target in node.targets
+            )
+        )
+    ]
+    if len(nodes) != 2:
+        raise ValueError("Actual worker model resolver contract changed")
+    namespace = {"os": os}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    selected = namespace["_resolve_model_path"](MODEL)
+    ref = None
+    checkpoint = Path(selected)
+    if selected == MODEL:
+        cache = Path(
+            os.environ.get("HF_HUB_CACHE") or Path(os.environ.get("HF_HOME") or "/models") / "hub"
+        )
+        repository = cache / "models--openai--gpt-oss-20b"
+        reference = repository / "refs/main"
+        # Diagnostic only: the actual worker opt-in selects the fixed revision,
+        # not floating main, even when a later download has updated this ref.
+        if reference.is_file() and reference.stat().st_size <= 128:
+            ref = reference.read_text().strip()
+        checkpoint = repository / "snapshots" / REVISION
+    worker_path = str(checkpoint)
+    return {
+        "harness_model_path": selected,
+        "worker_model_path": worker_path,
+        "checkpoint_path": str(checkpoint),
+        "resolver_source": str(source),
+        "resolver_source_sha256": sha(source),
+        "hub_main_ref": ref,
+    }
+
+
+def identity_validator(sdk, pins):
+    # Reuse the exact pinned engine validator without importing GPU modules.
+    source = sdk / "srt/layers/quantization/mxfp4.py"
+    if sha(source) != pins["sdk_files"]["srt/layers/quantization/mxfp4.py"]:
+        raise ValueError("Installed checkpoint validator source mismatch")
+    names = {"_GPTOSS_REVISION", "_GPTOSS_METADATA_SHA256", "_validate_gptoss_local_checkpoint"}
+    nodes = [
+        node
+        for node in ast.parse(source.read_text()).body
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+        )
+    ]
+    if len(nodes) != 3:
+        raise ValueError("Pinned engine checkpoint validator contract changed")
+    namespace = {"Path": Path, "os": os, "hashlib": hashlib, "json": json}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["_validate_gptoss_local_checkpoint"]
+
+
+def checkpoint_file(root, name, repository=None):
     p = Path(name)
-    if p.is_absolute() or ".." in p.parts or p.suffix != ".safetensors":
+    if p.name != name or p.suffix != ".safetensors":
         raise ValueError("Unsafe/non-safetensors checkpoint shard")
     actual = (root / p).resolve(strict=True)
-    # HF cache snapshot symlinks may resolve only within this repository cache.
-    cache = root.parent.parent.resolve(strict=True)
-    if not actual.is_relative_to(cache) or not actual.is_file():
-        raise ValueError("Checkpoint shard escapes original repository cache")
+    # A copy may read only its own shards or the same original HF blob store.
+    if repository is None and root.parent.name == "snapshots" and root.name == REVISION:
+        repository = root.parent.parent
+    if not actual.is_file() or not (
+        actual.is_relative_to(root)
+        or (repository is not None and actual.is_relative_to(repository / "blobs"))
+    ):
+        raise ValueError("Checkpoint shard escapes the selected checkpoint/original blobs")
     return actual
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    root = args.snapshot.resolve(strict=True)
-    if (
-        root.name != REVISION
-        or root.parent.name != "snapshots"
-        or root.parent.parent.name != "models--openai--gpt-oss-20b"
-    ):
-        raise ValueError("Exact original GPTOSS snapshot required")
     if args.output.exists():
         raise ValueError("Fresh output required")
     args.output.mkdir(mode=0o700)
@@ -94,6 +160,23 @@ def main():
             or os.environ.get("SGLANG_GPTOSS_MXFP4_BF16_FALLBACK") != "1"
         ):
             raise ValueError("Exact per-model reviewed fallback environment required")
+        package = importlib.util.find_spec("sglang")
+        if package is None or package.origin is None:
+            raise ValueError("Actual installed SDK required")
+        sdk = Path(package.origin).parent
+        pins = json.loads(
+            Path(__file__).with_name("ci_sglang_mxfp4_numeric_inputs.json").read_text()
+        )
+        for relative, digest in pins["sdk_files"].items():
+            actual = sdk / relative
+            record["source"][relative] = {"path": str(actual), "sha256": sha(actual)}
+            if record["source"][relative]["sha256"] != digest:
+                raise ValueError(f"Installed SDK source mismatch: {relative}")
+        selection = worker_checkpoint()
+        identity = identity_validator(sdk, pins)(selection["checkpoint_path"])
+        record["checkpoint"] = {**selection, **identity}
+        root = Path(identity["resolved_path"])
+        repository = Path(identity["repository"])
         import torch
         from safetensors import safe_open
 
@@ -109,19 +192,7 @@ def main():
             "torch": str(torch.__version__),
             "hip": torch.version.hip,
         }
-        package = importlib.util.find_spec("sglang")
-        if package is None or package.origin is None:
-            raise ValueError("Actual installed SDK required")
-        sdk = Path(package.origin).parent
-        pins = json.loads(
-            Path(__file__).with_name("ci_sglang_mxfp4_numeric_inputs.json").read_text()
-        )
-        for relative, digest in pins["sdk_files"].items():
-            actual = sdk / relative
-            record["source"][relative] = {"path": str(actual), "sha256": sha(actual)}
-            if record["source"][relative]["sha256"] != digest:
-                raise ValueError(f"Installed SDK source mismatch: {relative}")
-        config_path = root / "config.json"
+        config_path = Path(identity["metadata"]["config.json"]["path"])
         cfg = json.loads(config_path.read_text())
         quant = cfg.get("quantization_config", {})
         if cfg.get("model_type") != "gpt_oss" or quant.get("quant_method") != "mxfp4":
@@ -132,7 +203,7 @@ def main():
             or cfg.get("swiglu_limit") != CLAMP
         ):
             raise ValueError("Original alpha/clamp/activation contract changed")
-        index_path = root / "model.safetensors.index.json"
+        index_path = Path(identity["metadata"]["model.safetensors.index.json"]["path"])
         if index_path.stat().st_size > 4 * 1024**2 or config_path.stat().st_size > 1024**2:
             raise ValueError("Unexpected checkpoint metadata size")
         index = json.loads(index_path.read_text())
@@ -140,7 +211,7 @@ def main():
         tensors = {}
         for suffix, key in keys.items():
             filename = index["weight_map"][key]
-            path = checkpoint_file(root, filename)
+            path = checkpoint_file(root, filename, repository)
             with safe_open(str(path), framework="pt", device="cpu") as handle:
                 view = handle.get_slice(key)
                 shape = view.get_shape()
@@ -202,7 +273,7 @@ def main():
         from sglang.srt.layers.moe.utils import initialize_moe_config
 
         server = ServerArgs(
-            model_path=str(root),
+            model_path=selection["worker_model_path"],
             device="cuda",
             dtype="bfloat16",
             tp_size=1,

@@ -393,7 +393,6 @@ jobs:
           CUDA_VISIBLE_DEVICES: "0"
         run: |
           python3 -I -B scripts/ci_sglang_mxfp4_numeric.py \
-            --snapshot /models/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee \
             --output e2e-logs/gptoss-mxfp4-numeric
 
       # Run tests

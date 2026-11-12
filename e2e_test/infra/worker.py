@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import IO, Any
 
 import yaml
@@ -468,11 +469,30 @@ class Worker:
             if self._sglang_mxfp4_fallback():
                 configured = list(spec.get("sglang_args", [])) + list(self.extra_engine_args or [])
                 if any(
-                    arg.split("=", 1)[0] in ("--moe-runner-backend", "--moe-a2a-backend")
+                    arg.split("=", 1)[0]
+                    in (
+                        "--moe-runner-backend",
+                        "--moe-a2a-backend",
+                        "--model-path",
+                        "--model",
+                        "--revision",
+                    )
                     for arg in configured
                 ):
                     raise ValueError(
-                        "The fixed GPT-OSS fallback owns its generic Triton/none MoE flags"
+                        "The fixed GPT-OSS fallback owns its checkpoint and generic Triton/none MoE flags"
+                    )
+                if model_path == "openai/gpt-oss-20b":
+                    # The numeric preflight uses this same original revision.
+                    # A local copy/alias remains the selected model unchanged.
+                    cache = Path(
+                        os.environ.get("HF_HUB_CACHE")
+                        or Path(os.environ.get("HF_HOME") or "/models") / "hub"
+                    )
+                    model_path = str(
+                        cache
+                        / "models--openai--gpt-oss-20b/snapshots"
+                        / "6cee5e81ee83917806bbde320786a8fb61efebee"
                     )
                 spec = {
                     **spec,
