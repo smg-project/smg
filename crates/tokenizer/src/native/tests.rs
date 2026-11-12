@@ -10,12 +10,14 @@ use tokenizers::{
         wordlevel::WordLevel,
     },
     normalizers::{
-        unicode::{NFC, NFKC},
+        unicode::{NFC, NFD, NFKC},
         NormalizerWrapper, Prepend, Replace, Sequence as NormalizerSequence,
     },
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
+        digits::Digits,
         metaspace::{Metaspace, PrependScheme},
+        punctuation::Punctuation,
         sequence::Sequence,
         split::{Split, SplitPattern},
         PreTokenizerWrapper,
@@ -27,7 +29,8 @@ use tokenizers::{
         template::{SpecialToken, TemplateProcessing},
         PostProcessorWrapper,
     },
-    AddedToken, AddedVocabulary, DecoderWrapper, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
+    AddedToken, AddedVocabulary, DecoderWrapper, OffsetReferential, OffsetType, PreTokenizedString,
+    PreTokenizer, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
 };
 use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
@@ -54,6 +57,9 @@ const POSSESSIVE_CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?
 /// The same clitic class with greedy runs, a digit cap and a one-space
 /// last alternative.
 const CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s";
+/// A letter run whose class is written as an alternation of single
+/// characters, the joiners as code-point escapes.
+const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 /// The cased template without the clitic group and with one digit at a
 /// time.
 const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -121,6 +127,15 @@ const POOL: &[char] = &[
     ')',
     '€',
     '→',
+    // Punctuation beyond ASCII, for the `Punctuation` shapes: two code
+    // points where the reference's set and the engine's category differ
+    // (U+2E43 only in the category, U+166D only in the set).
+    '¿',
+    '«',
+    '…',
+    '、',
+    '\u{2E43}',
+    '\u{166D}',
     '\u{301}',
     '\u{93E}',
     '\u{E31}',
@@ -260,7 +275,7 @@ fn byte_level(use_regex: bool) -> PreTokenizerWrapper {
 
 struct Shape {
     name: &'static str,
-    nfc: bool,
+    normalizer: Normalizer,
     pre_tokenizers: Vec<PreTokenizerWrapper>,
     ignore_merges: bool,
     special: &'static [&'static str],
@@ -271,7 +286,7 @@ fn shapes() -> Vec<Shape> {
     vec![
         Shape {
             name: "qwen3.5",
-            nfc: true,
+            normalizer: Normalizer::Nfc,
             pre_tokenizers: vec![
                 split(QWEN35, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -288,7 +303,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "cl100k-ignore-merges",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(CL100K, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -299,7 +314,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "three-splits",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(DIGITS, SplitDelimiterBehavior::Isolated, false),
                 split(CJK, SplitDelimiterBehavior::Isolated, false),
@@ -316,7 +331,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "inverted-removed",
-            nfc: true,
+            normalizer: Normalizer::Nfc,
             pre_tokenizers: vec![
                 split(CASED, SplitDelimiterBehavior::Removed, true),
                 byte_level(false),
@@ -327,7 +342,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "byte-level-regex",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![byte_level(true)],
             ignore_merges: false,
             special: &["<|endoftext|>"],
@@ -335,7 +350,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "possessive-clitic-class",
-            nfc: true,
+            normalizer: Normalizer::Nfc,
             pre_tokenizers: vec![
                 split(
                     POSSESSIVE_CLITIC_CLASS,
@@ -355,7 +370,7 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             name: "clitic-class",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(CLITIC_CLASS, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -369,12 +384,96 @@ fn shapes() -> Vec<Shape> {
             ],
             added: &[("<think>", false), ("<|tool_call_start|>", false)],
         },
+        // `Digits` before the `ByteLevel` with its own regex: every numeric
+        // character its own piece, the rest cut by the byte-level pattern.
+        Shape {
+            name: "digits-then-byte-level-regex",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
+        // NFKC before the `Digits` stage and the `ByteLevel`: compatibility
+        // characters spell out first (a circled digit becomes a digit the
+        // stage then cuts).
+        Shape {
+            name: "nfkc-digits-then-byte-level-regex",
+            normalizer: Normalizer::Nfkc,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[("\u{FB01}le", true), ("<tool_call>", false)],
+        },
+        // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
+        // split on ASCII digits after the map (the reference cuts the mapped
+        // text, the native path the raw text, at the same places).
+        Shape {
+            name: "punctuation-runs-then-a-split-after-the-map",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Punctuation(Punctuation::new(
+                    SplitDelimiterBehavior::Contiguous,
+                )),
+                split(TEKKEN, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+                split("[0-9]", SplitDelimiterBehavior::Isolated, false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
+        // `Digits` in runs before a split and the `ByteLevel`.
+        Shape {
+            name: "digit-runs",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+        },
+        Shape {
+            name: "joined-letters",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(JOINED_LETTERS, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|begin_of_text|>", "<|endoftext|>"],
+            added: &[],
+        },
+        // `Punctuation` one character at a time, then the `ByteLevel` with
+        // its own regex.
+        Shape {
+            name: "punctuation-each-then-byte-level-regex",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Punctuation(Punctuation::new(
+                    SplitDelimiterBehavior::Isolated,
+                )),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+        },
         // Added tokens with a space inside, matched after normalization
         // (the default of `add_tokens`): a cut at that space would turn
         // the token into pieces.
         Shape {
             name: "normalized-words",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(CL100K, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -392,11 +491,12 @@ fn shapes() -> Vec<Shape> {
 
 fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
     let mut tokenizer = HfTokenizer::new(model(state, shape.ignore_merges));
-    if shape.nfc {
-        tokenizer
-            .with_normalizer(Some(NormalizerWrapper::NFC(NFC)))
-            .expect("normalizer");
-    }
+    let normalizer = match shape.normalizer {
+        Normalizer::None => None,
+        Normalizer::Nfc => Some(NormalizerWrapper::NFC(NFC)),
+        Normalizer::Nfkc => Some(NormalizerWrapper::NFKC(NFKC)),
+    };
+    tokenizer.with_normalizer(normalizer).expect("normalizer");
     let pre = if shape.pre_tokenizers.len() == 1 {
         shape.pre_tokenizers[0].clone()
     } else {
@@ -442,15 +542,67 @@ fn every_shape_gets_a_native_path() {
         let expected_stages = shape
             .pre_tokenizers
             .iter()
-            .filter(|p| matches!(p, PreTokenizerWrapper::Split(_)))
-            .count()
-            + usize::from(shape.name == "byte-level-regex");
+            .filter(|p| {
+                matches!(
+                    p,
+                    PreTokenizerWrapper::Split(_)
+                        | PreTokenizerWrapper::Digits(_)
+                        | PreTokenizerWrapper::Punctuation(_)
+                ) || matches!(p, PreTokenizerWrapper::ByteLevel(byte_level) if byte_level.use_regex)
+            })
+            .count();
         assert_eq!(
             native.expect("native").stages.len(),
             expected_stages,
             "{}",
             shape.name
         );
+    }
+}
+
+/// A vocabulary without a token for one byte (some files lack one for a
+/// byte no text of theirs holds) keeps its merge table: the pieces that
+/// hold the byte are the model's, every other piece merges in the table.
+#[test]
+fn a_byte_without_a_token_leaves_its_pieces_to_the_model() {
+    let mut state = 0xB17E_0000_0000_0001u64;
+    let shape = &shapes()[0];
+    let mut tokenizer = tokenizer_of(shape, &mut state);
+    // The vertical tab's token taken out, with every merge that names it
+    // (a vocabulary without the byte's token has none).
+    let gone = bytes_char()[0x0B].to_string();
+    let mut model = serde_json::to_value(tokenizer.get_model()).expect("the model as JSON");
+    let vocab = model["vocab"].as_object_mut().expect("the vocabulary");
+    assert!(vocab.remove(&gone).is_some(), "the byte's token was there");
+    let merges = model["merges"].as_array_mut().expect("the merges");
+    merges.retain(|merge| match merge {
+        Value::Array(pair) => pair.iter().all(|part| part.as_str() != Some(&gone)),
+        Value::String(line) => line.split(' ').all(|part| part != gone),
+        _ => true,
+    });
+    // Read back from text: the model's reader borrows its strings.
+    let model = serde_json::to_string(&model).expect("the model as text");
+    tokenizer.with_model(serde_json::from_str::<BPE>(&model).expect("a model without it"));
+    let native = seeded(&tokenizer);
+    assert!(native
+        .merges
+        .as_ref()
+        .is_some_and(|table| table.lacks_a_token_for(b"\x0b")));
+    for text in [
+        "plain words here",
+        "a\u{b}b",
+        " \u{b} \u{b}\u{b}x",
+        "tabs\tand\u{b}more words",
+    ] {
+        let reference = tokenizer
+            .encode(text, false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        let ids = native
+            .encode(Some(tokenizer.get_model()), text, false)
+            .unwrap_or_else(|fallback| panic!("declined {text:?} as {fallback:?}"));
+        assert_eq!(ids, reference, "{text:?}");
     }
 }
 
@@ -471,14 +623,17 @@ fn shapes_outside_the_path_are_declined() {
     ]))));
     assert_eq!(
         declined(&tokenizer),
-        "the pre-tokenizer does not end in ByteLevel without a prefix space"
+        "the pre-tokenizer has no ByteLevel without a prefix space"
     );
-    // A normalizer other than NFC.
+    // A normalizer other than NFC or NFKC.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer
-        .with_normalizer(Some(NormalizerWrapper::NFKC(NFKC)))
+        .with_normalizer(Some(NormalizerWrapper::NFD(NFD)))
         .expect("normalizer");
-    assert_eq!(declined(&tokenizer), "normalizer NFKC (only NFC or none)");
+    assert_eq!(
+        declined(&tokenizer),
+        "normalizer NFD (only NFC, NFKC or none)"
+    );
     // A split behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
@@ -489,6 +644,38 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "Split behavior Some(\"MergedWithNext\") with invert Some(false) (only Isolated, or \
              Removed inverted)"
+    );
+    // A punctuation behaviour the path does not reproduce.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        PreTokenizerWrapper::Punctuation(Punctuation::new(SplitDelimiterBehavior::Removed)),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "Punctuation behavior Some(\"Removed\") (only Isolated or Contiguous)"
+    );
+    // A split after the ByteLevel that would read the mapped text otherwise
+    // than the raw text.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        split(r"\p{N}", SplitDelimiterBehavior::Isolated, false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
+    );
+    // A `Digits` after the ByteLevel: on the mapped text it would also cut
+    // at the numeric characters the map makes of six bytes beyond ASCII.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        PreTokenizerWrapper::Digits(Digits::new(true)),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
     );
     // An added token with lstrip.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -526,8 +713,152 @@ fn shapes_outside_the_path_are_declined() {
     tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
     assert_eq!(
         declined(&tokenizer),
-        "no pre-tokenizer (the path needs ByteLevel, after any Split stages)"
+        "no pre-tokenizer (the path needs a ByteLevel without a prefix space)"
     );
+}
+
+/// The `Digits` stage holds exactly what `char::is_numeric` accepts, the
+/// reference's test, over every scalar value: the toolchain's numeric set,
+/// not the engine's `\p{N}` (another Unicode version); a toolchain bump that
+/// widens the set fails here, not in the ids.
+#[test]
+fn the_digits_stage_holds_what_is_numeric_accepts() {
+    let stage = NativeEncoder::split_stage(&serde_json::json!(
+        {"type": "Digits", "individual_digits": true}
+    ))
+    .expect("the digits stage");
+    let mut text = String::new();
+    for code in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(code) else {
+            continue;
+        };
+        text.clear();
+        text.push(c);
+        let native = stage.pattern.find_iter(&text).next() == Some((0, text.len()));
+        assert_eq!(native, c.is_numeric(), "U+{code:04X}");
+    }
+}
+
+/// Two numeric characters the regex engine's `\p{N}` table lacks (U+11DE0
+/// and U+11DE1, numeric to the toolchain), with a merge across their
+/// boundary in the vocabulary: the reference's `Digits` under
+/// `individual_digits` cuts between them, so the merge never applies, and
+/// the native stage cuts there too.
+#[test]
+fn digits_the_engine_table_lacks_are_cut_apart_before_a_merge_across_them() {
+    let mut state = 0xD161_7000_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "digits-then-byte-level-regex")
+        .expect("the shape");
+    let mut tokenizer = tokenizer_of(&shape, &mut state);
+    let table = bytes_char();
+    let mut vocab = Vocab::default();
+    let mut alphabet: Vec<char> = table.to_vec();
+    alphabet.sort_unstable();
+    for ch in alphabet {
+        let id = vocab.len() as u32;
+        vocab.insert(ch.to_string(), id);
+    }
+    // The last byte of U+11DE0 and the first byte of U+11DE1, merged.
+    let (a, b) = (table[0xA0].to_string(), table[0xF0].to_string());
+    let id = vocab.len() as u32;
+    vocab.insert(format!("{a}{b}"), id);
+    let merges: Merges = vec![(a, b)];
+    tokenizer.with_model(
+        BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .expect("bpe"),
+    );
+    let native = seeded(&tokenizer);
+    for text in [
+        "\u{11DE0}\u{11DE1}",
+        "x\u{11DE0}\u{11DE1}y",
+        "\u{11DE0} \u{11DE1}",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+/// The punctuation stage holds exactly the characters the reference's
+/// `Punctuation` pre-tokenizer cuts on: every code point of the Basic
+/// Multilingual Plane, and both edges of every range of the engine's `\p{P}`
+/// table and of the reference's set beyond it (the two sets differ, and the
+/// stage follows the reference).
+#[test]
+fn the_punctuation_stage_holds_what_the_reference_cuts_on() {
+    let stage = NativeEncoder::split_stage(&serde_json::json!(
+        {"type": "Punctuation", "behavior": "Isolated"}
+    ))
+    .expect("the punctuation stage");
+    let reference = Punctuation::new(SplitDelimiterBehavior::Isolated);
+    let edges = unicode::PUNCTUATION
+        .iter()
+        .copied()
+        .chain(
+            unicode::REFERENCE_PUNCTUATION
+                .iter()
+                .map(|&(start, end)| (u32::from(start), u32::from(end))),
+        )
+        .flat_map(|(start, end)| [start.saturating_sub(1), start, end, end + 1])
+        .filter(|&code| code > 0xFFFF);
+    let mut text = String::new();
+    for code in (0..=0xFFFFu32).chain(edges) {
+        let Some(c) = char::from_u32(code) else {
+            continue;
+        };
+        text.clear();
+        text.push(c);
+        let native = stage.pattern.find_iter(&text).next() == Some((0, text.len()));
+        let mut split = PreTokenizedString::from(format!("a{c}a").as_str());
+        reference.pre_tokenize(&mut split).expect("the reference");
+        let cuts = split
+            .get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .len()
+            == 3;
+        assert_eq!(native, cuts, "U+{code:04X}");
+    }
+}
+
+#[test]
+fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
+    // The NFKC shape on texts NFC leaves as they are: a ligature, fullwidth
+    // forms and an ideographic space, a circled digit (a digit after
+    // normalization, which the `Digits` stage then cuts), the Kelvin sign
+    // and a long s with a dot above (composed again once the s spells out),
+    // beside a text in NFKC already, a mark to compose, an added token with
+    // a ligature right after it, and the normalized added token in both its
+    // spellings next to the raw one (the library spells it `file` at load
+    // and matches it on `file` and on the ligature).
+    let mut state = 0x4E46_4B43_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "nfkc-digits-then-byte-level-regex")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "\u{FB01}ne \u{BD} \u{2460} \u{FF2B} \u{1E9B} \u{212A}",
+        "\u{FF28}\u{FF49}\u{3000}\u{FF57}\u{FF4F}\u{FF52}\u{FF4C}\u{FF44} \u{B2}\u{B3}",
+        "plain ascii, 123 and \u{6F22}\u{5B57}",
+        "e\u{301}\u{FB01}",
+        "<|im_start|>\u{FB01}<|im_end|>",
+        "file \u{FB01}le <tool_call>\u{FB01}le profile",
+        "\u{FB01}LE <tool_call>file<|im_end|>",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
 }
 
 #[test]
@@ -540,11 +871,12 @@ fn a_batch_takes_the_direct_path_input_by_input() {
         let mut texts: Vec<String> = (0..8)
             .map(|round| random_text(&mut state, 1 + round * 5, &added))
             .collect();
-        // Under an NFC shape, one input not in NFC sits in the middle of
-        // the batch: it is normalized and encoded on the direct path like
-        // its neighbours.
-        if shape.nfc {
-            texts.insert(texts.len() / 2, "e\u{301}".to_string());
+        // Under a normalizer, one input not in its form sits in the middle
+        // of the batch (a mark to compose under either form, a ligature to
+        // spell out under NFKC): it is normalized and encoded on the direct
+        // path like its neighbours.
+        if shape.normalizer != Normalizer::None {
+            texts.insert(texts.len() / 2, "e\u{301}\u{FB01}".to_string());
         }
         let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let batch = tokenizer.encode_batch(&inputs, false).expect(shape.name);
@@ -883,10 +1215,8 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
-        let mut text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
-        if shape.nfc {
-            text = nfc(&text, None).into_owned();
-        }
+        let text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
+        let text = normalize(&text, shape.normalizer, None).into_owned();
         let whole: Vec<String> = {
             let mut out = Vec::new();
             native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
@@ -1242,13 +1572,17 @@ fn marks_and_compositions_newer_than_the_library_tables_read_as_the_library_does
 }
 
 #[test]
-fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
+fn the_normalization_check_and_copy_read_every_stretch_as_the_library_does() {
     // The stretch-wise check and copy against the library's crate run over
     // the whole text, on texts that put non-ASCII runs at the start, at the
     // end, right after one ASCII character, across the eight-byte steps of
-    // the scan, next to each other, and nowhere.
-    use unicode_normalization_alignments::is_nfc as library_is_nfc;
+    // the scan, next to each other, and nowhere; for NFKC, compatibility
+    // characters among them (a ligature, a fullwidth letter and comma, the
+    // Kelvin sign, a long s with a dot above that composes again once the
+    // s spells out, a circled digit).
+    use unicode_normalization_alignments::{is_nfc as library_is_nfc, is_nfkc as library_is_nfkc};
     let library_nfc = |text: &str| -> String { text.nfc().map(|(ch, _)| ch).collect() };
+    let library_nfkc = |text: &str| -> String { text.nfkc().map(|(ch, _)| ch).collect() };
     let quick = NfcQuick::read();
     let pieces = [
         "a",
@@ -1278,40 +1612,68 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
         "、",
         "🙂",
         "\u{899}",
+        "\u{FB01}",
+        "\u{FF21}",
+        "\u{FF0C}",
+        "\u{212A}",
+        "\u{1E9B}",
+        "\u{2460}",
         "<|im_start|>",
         "\n",
     ];
     let mut state = 0x1357_9BDF_2468_ACE0u64;
-    let mut changed = 0;
+    let (mut changed, mut respelled) = (0, 0);
     for _ in 0..3000 {
         let len = (pseudo_random(&mut state) % 9) as usize;
         let text: String = (0..len)
             .map(|_| pieces[(pseudo_random(&mut state) % pieces.len() as u64) as usize])
             .collect();
         let expected = library_nfc(&text);
-        assert_eq!(is_nfc(&text), library_is_nfc(&text), "{text:?}");
+        assert_eq!(
+            is_normalized(&text, Normalizer::Nfc),
+            library_is_nfc(&text),
+            "{text:?}"
+        );
         assert_eq!(
             quick.is_nfc(&text),
             library_is_nfc(&text),
             "{text:?} (quick)"
         );
-        let normalized = nfc(&text, None);
-        assert_eq!(normalized.as_ref(), expected, "{text:?}");
+        let composed = normalize(&text, Normalizer::Nfc, None);
+        assert_eq!(composed.as_ref(), expected, "{text:?}");
         assert_eq!(
-            matches!(normalized, Cow::Borrowed(_)),
+            matches!(composed, Cow::Borrowed(_)),
             text == expected,
             "{text:?}: borrowed only when nothing changed"
         );
-        let with_quick = nfc(&text, Some(&quick));
+        let with_quick = normalize(&text, Normalizer::Nfc, Some(&quick));
         assert_eq!(with_quick.as_ref(), expected, "{text:?} (quick)");
         assert_eq!(
             matches!(with_quick, Cow::Borrowed(_)),
             text == expected,
             "{text:?}: borrowed only when nothing changed (quick)"
         );
+        let spelled = library_nfkc(&text);
+        assert_eq!(
+            is_normalized(&text, Normalizer::Nfkc),
+            library_is_nfkc(&text),
+            "{text:?} (NFKC)"
+        );
+        let compatible = normalize(&text, Normalizer::Nfkc, None);
+        assert_eq!(compatible.as_ref(), spelled, "{text:?} (NFKC)");
+        assert_eq!(
+            matches!(compatible, Cow::Borrowed(_)),
+            text == spelled,
+            "{text:?}: borrowed only when nothing changed (NFKC)"
+        );
         changed += usize::from(text != expected);
+        respelled += usize::from(spelled != expected);
     }
     assert!(changed > 150, "{changed} of 3000 texts changed");
+    assert!(
+        respelled > 150,
+        "{respelled} of 3000 texts spell differently under NFKC"
+    );
     // The shapes by name: ASCII alone, a run at the start, a mark after a
     // letter it composes with or not, the letter at an eight-byte step, a
     // run already in NFC next to one that is not.
@@ -1349,13 +1711,27 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
         ("漢字 and 漢字\u{323}\u{301}", true),
         ("漢字\u{301}\u{323}", false),
     ] {
-        assert_eq!(is_nfc(text), in_nfc, "{text:?}");
+        assert_eq!(is_normalized(text, Normalizer::Nfc), in_nfc, "{text:?}");
         assert_eq!(quick.is_nfc(text), in_nfc, "{text:?} (quick)");
-        assert_eq!(nfc(text, None).as_ref(), library_nfc(text), "{text:?}");
         assert_eq!(
-            nfc(text, Some(&quick)).as_ref(),
+            normalize(text, Normalizer::Nfc, None).as_ref(),
+            library_nfc(text),
+            "{text:?}"
+        );
+        assert_eq!(
+            normalize(text, Normalizer::Nfc, Some(&quick)).as_ref(),
             library_nfc(text),
             "{text:?} (quick)"
+        );
+        assert_eq!(
+            is_normalized(text, Normalizer::Nfkc),
+            library_is_nfkc(text),
+            "{text:?} (NFKC)"
+        );
+        assert_eq!(
+            normalize(text, Normalizer::Nfkc, None).as_ref(),
+            library_nfkc(text),
+            "{text:?} (NFKC)"
         );
     }
 }
@@ -1379,8 +1755,8 @@ fn every_shape_merges_its_misses_natively() {
 
 #[test]
 fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
-    // A vocabulary without the token of byte 0x00: the table declines the
-    // model, the path stays, and its misses take the model's own merge.
+    // A model that marks the end of a word: the table declines the model,
+    // the path stays, and its misses take the model's own merge.
     let mut state = 0x1212_3434_5656_7878u64;
     let shape = &shapes()[0];
     let mut tokenizer = tokenizer_of(shape, &mut state);
@@ -1388,9 +1764,13 @@ fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
     let mut vocab = Vocab::default();
     let mut alphabet: Vec<char> = table.to_vec();
     alphabet.sort_unstable();
-    for ch in alphabet.into_iter().filter(|&ch| ch != table[0]) {
-        let id = vocab.len() as u32;
-        vocab.insert(ch.to_string(), id);
+    for ch in alphabet {
+        // The word-final form too, so the model keeps a word's last
+        // character and the merges below fire inside the longer words.
+        for token in [ch.to_string(), format!("{ch}</w>")] {
+            let id = vocab.len() as u32;
+            vocab.insert(token, id);
+        }
     }
     let mut merges = Merges::new();
     for (a, b) in [("a", "b"), ("b", "c"), ("ab", "c"), ("a", "bc")] {
@@ -1401,8 +1781,11 @@ fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
         }
         merges.push((a.to_owned(), b.to_owned()));
     }
+    // A model that marks the end of a word: the table declines it, the
+    // model merges every piece.
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
+        .end_of_word_suffix("</w>".to_owned())
         .build()
         .expect("bpe");
     tokenizer.with_model(bpe);
@@ -2656,15 +3039,15 @@ fn the_ideograph_run_is_exact_at_its_utf8_edges() {
 #[test]
 fn the_ideograph_range_is_settled_by_the_crates_own_tables() {
     // Every code point of U+4000..=U+9FFF, read from the tables the native
-    // path normalizes with: combining class 0, no canonical decomposition,
-    // the quick check's Yes (so not the second element of any composition:
-    // those are the quick check's Maybe, by its definition), and no
-    // composition with any possible second element after it. The candidate
-    // second elements are every code point the quick check calls Maybe;
-    // three known compositions outside the range show the walk sees them;
-    // the counts are asserted at the end.
+    // path normalizes with: combining class 0, no canonical and no
+    // compatibility decomposition, the quick check's Yes (so not the second
+    // element of any composition: those are the quick check's Maybe, by its
+    // definition), and no composition with any possible second element
+    // after it. The candidate second elements are every code point the
+    // quick check calls Maybe; three known compositions outside the range
+    // show the walk sees them; the counts are asserted at the end.
     use unicode_normalization_alignments::char::{
-        canonical_combining_class, compose, decompose_canonical,
+        canonical_combining_class, compose, decompose_canonical, decompose_compatible,
     };
     let quick = |ch: char| is_nfc_quick(std::iter::once(ch));
     let seconds: Vec<char> = (0..=0x10FFFFu32)
@@ -2684,6 +3067,7 @@ fn the_ideograph_range_is_settled_by_the_crates_own_tables() {
         let mut parts = Vec::new();
         decompose_canonical(ch, |part| parts.push(part));
         assert_eq!(parts, [ch], "{ch:?}");
+        decompose_compatible(ch, |part| assert_eq!(part, ch, "{ch:?} (compatibility)"));
         assert_eq!(quick(ch), IsNormalized::Yes, "{ch:?}");
         compositions += seconds
             .iter()
@@ -2718,8 +3102,18 @@ fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
         }
     }
     assert_eq!(at, line.len());
-    assert!(is_nfc(&line));
-    assert!(matches!(nfc(&line, None), Cow::Borrowed(_)));
+    assert!(is_normalized(&line, Normalizer::Nfc));
+    assert!(matches!(
+        normalize(&line, Normalizer::Nfc, None),
+        Cow::Borrowed(_)
+    ));
+    // The full-width comma spells as "," under NFKC: the line is not in that
+    // form, and the ideograph runs around every comma are copied as they are.
+    assert!(!is_normalized(&line, Normalizer::Nfkc));
+    assert_eq!(
+        normalize(&line, Normalizer::Nfkc, None).as_ref(),
+        line.replace('，', ",")
+    );
     // The checked run ends at an ideograph, at an ASCII byte, or at the end.
     assert_eq!(checked_run("，漢".as_bytes()), 3);
     assert_eq!(checked_run("，。、漢字".as_bytes()), 9);
@@ -3100,13 +3494,19 @@ fn every_sentencepiece_shape_gets_a_native_path() {
 #[test]
 fn a_byte_level_vocabulary_with_the_byte_fallback_flag_keeps_its_path() {
     let mut state = 0xB17E_1E7E_1F1A_6000u64;
-    let shape = &shapes()[0];
-    let mut tokenizer = tokenizer_of(shape, &mut state);
-    let mut model = model(&mut state, shape.ignore_merges);
-    model.byte_fallback = true;
-    tokenizer.with_model(model);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("the byte-level path");
-    assert!(native.chars.is_none() && !native.stages.is_empty());
+    for shape in shapes() {
+        let mut tokenizer = tokenizer_of(&shape, &mut state);
+        let mut model = model(&mut state, shape.ignore_merges);
+        model.byte_fallback = true;
+        tokenizer.with_model(model);
+        let native = NativeEncoder::from_tokenizer(&tokenizer)
+            .unwrap_or_else(|declined| panic!("{}: {declined}", shape.name));
+        assert!(
+            native.chars.is_none() && !native.stages.is_empty(),
+            "{}",
+            shape.name
+        );
+    }
 }
 
 #[test]

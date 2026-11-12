@@ -606,6 +606,11 @@ pub enum InputContentBlock {
     ToolSearchToolResult(ToolSearchToolResultBlock),
     /// Tool reference block
     ToolReference(ToolReferenceBlock),
+    /// MCP tool use block (an assistant message of the MCP beta, replayed
+    /// or read back from a stored turn)
+    McpToolUse(McpToolUseBlock),
+    /// MCP tool result block (the same message, beside its use)
+    McpToolResult(McpToolResultBlock),
 }
 
 /// Whether `messages` end with an assistant message that has text and no
@@ -2938,6 +2943,36 @@ mod tests {
         );
     }
 
+    /// An assistant message carrying an MCP exchange, as the Messages API
+    /// answers one under the MCP beta, is read as input: a stored MCP turn
+    /// continues and a client's replay of it is accepted.
+    #[test]
+    fn an_mcp_exchange_is_read_as_input() {
+        let message: InputMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}]},
+                {"type": "text", "text": "it is 42"}
+            ]
+        }))
+        .expect("an MCP exchange is input");
+        let InputContent::Blocks(blocks) = &message.content else {
+            panic!("blocks");
+        };
+        assert!(matches!(
+            &blocks[..],
+            [
+                InputContentBlock::McpToolUse(mcp_use),
+                InputContentBlock::McpToolResult(result),
+                InputContentBlock::Text(_)
+            ] if mcp_use.server_name == "s" && result.tool_use_id == "mcptoolu_1"
+        ));
+        let written = serde_json::to_value(&message).expect("serializes");
+        assert_eq!(written["content"][0]["type"], "mcp_tool_use");
+        assert_eq!(written["content"][1]["type"], "mcp_tool_result");
+    }
+
     /// A content field that is neither a string nor an array of blocks, or
     /// holds a block that cannot be read, is refused with the block's own
     /// reason: the unknown `type` with the accepted ones, the missing field,
@@ -2950,12 +2985,12 @@ mod tests {
                 .to_string()
         };
         let unknown_block = refusal(json!({
-            "role": "assistant",
-            "content": [{"type": "mcp_tool_use", "id": "m1", "name": "echo", "server_name": "s", "input": {}}]
+            "role": "user",
+            "content": [{"type": "container_upload", "file_id": "file_1"}]
         }));
         assert!(
             unknown_block.starts_with(
-                "unknown variant `mcp_tool_use`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
+                "unknown variant `container_upload`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
             ),
             "{unknown_block}"
         );

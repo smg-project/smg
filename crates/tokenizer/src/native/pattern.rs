@@ -2,10 +2,12 @@
 //!
 //! The patterns in use (GPT-2, Qwen, GLM, DeepSeek, MiniMax and their kin)
 //! draw on a small regex subset: alternation, concatenation, character
-//! classes built from Unicode categories, `\s`, ranges and literals, greedy
-//! `?` `*` `+` `{m,n}` and the possessive `?+` `*+` `++` on a class, a
-//! case-insensitive group of literal alternatives (or a class of letters)
-//! for the English clitics, and the lookahead `(?!\S)`. This module parses that
+//! classes built from Unicode categories, `\s`, ranges, literals and `\uHHHH`
+//! code points, a group of single-character alternatives (read as the class
+//! of their union), greedy `?` `*` `+` `{m,n}` and the possessive `?+` `*+`
+//! `++` on a class, a case-insensitive group of literal alternatives (or a
+//! class of letters) for the English clitics, and the lookahead `(?!\S)`.
+//! This module parses that
 //! subset and matches it the way the engine behind `tokenizers`' `Split`
 //! does: leftmost-first alternation, greedy quantifiers that back off one
 //! repetition at a time. The engine also yields empty matches, and `Split`
@@ -38,6 +40,7 @@ use super::{
 pub(super) struct Class {
     negated: bool,
     categories: u16,
+    /// Code point ranges, sorted and disjoint once [`Class::finish`] has run.
     ranges: Vec<(u32, u32)>,
     /// Categories taken out of the class before any negation: the engine's
     /// intersection with a negated property class, `[...&&[^\p{Han}]]`.
@@ -208,8 +211,6 @@ fn folded_letters(class: Class) -> Option<Class> {
         let letter = char::from_u32(low).filter(char::is_ascii_alphabetic)?;
         fold_letter(&mut folded, letter);
     }
-    folded.ranges.sort_unstable();
-    folded.ranges.dedup();
     Some(folded)
 }
 
@@ -243,6 +244,19 @@ fn in_categories(categories: u16, code: u32) -> bool {
 
 impl Class {
     fn finish(mut self) -> Self {
+        // `in_ranges` binary-searches on the ends in start order: a range
+        // inside another breaks that, so the ranges are sorted here, once
+        // for every way a class is built, and the overlapping ones become
+        // one.
+        self.ranges.sort_unstable();
+        self.ranges.dedup_by(|next, kept| {
+            if next.0 <= kept.1 {
+                kept.1 = kept.1.max(next.1);
+                true
+            } else {
+                false
+            }
+        });
         let mut ascii = AsciiSet::default();
         for code in 0u32..128 {
             if self.contains_slow(code) {
@@ -302,6 +316,17 @@ impl Class {
     /// Whether the class may hold a character beyond ASCII.
     pub(super) fn may_hold_beyond_ascii(&self) -> bool {
         self.first().non_ascii
+    }
+
+    /// Whether every character the class can hold is printable ASCII
+    /// (U+0021..=U+007E): no category, no negation, every range within.
+    pub(super) fn within_printable_ascii(&self) -> bool {
+        !self.negated
+            && self.categories == 0
+            && self
+                .ranges
+                .iter()
+                .all(|&(start, end)| start >= 0x21 && end <= 0x7E)
     }
 
     /// The characters the class may hold, exact below U+0080 and one bit for
@@ -529,6 +554,12 @@ impl Pattern {
     /// What the pattern is as a stage of a three-stage chain, if anything.
     pub(super) fn part(&self) -> Option<&chain::Part> {
         self.part.as_ref()
+    }
+
+    /// Whether every class of the pattern is within printable ASCII, so that
+    /// the pattern cuts a text and its byte-level image at the same places.
+    pub(super) fn within_printable_ascii(&self) -> bool {
+        self.classes.iter().all(Class::within_printable_ascii)
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
@@ -1551,7 +1582,10 @@ impl Parser<'_> {
         match self.chars.next()? {
             ':' => {
                 let inner = self.parse_alternation()?;
-                (self.chars.next()? == ')').then_some(inner)
+                if self.chars.next()? != ')' {
+                    return None;
+                }
+                Some(self.single_characters(inner))
             }
             'i' => {
                 if self.chars.next()? != ':' {
@@ -1584,17 +1618,64 @@ impl Parser<'_> {
         }
     }
 
+    /// A group whose alternatives are each one character of a class
+    /// (`(?:\p{L}|\p{M}|\u200C|\u200D)`) is the class of their union: the
+    /// engine matches one character of whichever alternative, as it matches
+    /// one character of the class, so the group then repeats as a class does
+    /// and a letter run the hub files write this way stays native. Any other
+    /// group stays as parsed, as does one under `(?i:)`, a negated alternative
+    /// or an intersection (their union is not the union of the ranges).
+    fn single_characters(&mut self, inner: Node) -> Node {
+        let Node::Alt { alternatives, .. } = &inner else {
+            return inner;
+        };
+        // The alternatives' classes are the last ones added, in order; the
+        // union takes their place.
+        let Some(first) = self.classes.len().checked_sub(alternatives.len()) else {
+            return inner;
+        };
+        if self.case_insensitive {
+            return inner;
+        }
+        for (i, alternative) in alternatives.iter().enumerate() {
+            match alternative {
+                Node::Class(index)
+                    if *index == first + i
+                        && !self.classes[*index].negated
+                        && self.classes[*index].without == 0 => {}
+                _ => return inner,
+            }
+        }
+        let mut class = Class::default();
+        for member in &self.classes[first..] {
+            class.categories |= member.categories;
+            class.ranges.extend_from_slice(&member.ranges);
+        }
+        self.classes.truncate(first);
+        Node::Class(self.add_class(class))
+    }
+
     /// A literal character as a class: itself, or under `(?i:)` every
     /// character the engine folds together with it.
     fn literal_class(&mut self, c: char) -> usize {
         let mut class = Class::default();
         if self.case_insensitive && c.is_ascii_alphabetic() {
             fold_letter(&mut class, c);
-            class.ranges.sort_unstable();
         } else {
             class.ranges.push((u32::from(c), u32::from(c)));
         }
         self.add_class(class)
+    }
+
+    /// The code point of a `\uHHHH` escape (four hex digits, as the engine
+    /// reads the form the hub files use for the joiners); a surrogate is no
+    /// character and declines.
+    fn code_point(&mut self) -> Option<char> {
+        let mut code = 0;
+        for _ in 0..4 {
+            code = (code << 4) | self.chars.next()?.to_digit(16)?;
+        }
+        char::from_u32(code)
     }
 
     /// An escape outside a class, as a class of its own.
@@ -1610,6 +1691,10 @@ impl Parser<'_> {
             'S' => {
                 class.categories |= CAT_SPACE;
                 class.negated = true;
+            }
+            'u' => {
+                let c = self.code_point()?;
+                class.ranges.push((u32::from(c), u32::from(c)));
             }
             other => {
                 let c = escaped_literal(other)?;
@@ -1687,6 +1772,7 @@ impl Parser<'_> {
                         continue;
                     }
                     'P' | 'S' | 'd' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
+                    'u' => self.code_point()?,
                     other => escaped_literal(other)?,
                 },
                 // An intersection with a negated property class closes the
@@ -1722,6 +1808,7 @@ impl Parser<'_> {
                         self.chars.next();
                         let end = match self.chars.next()? {
                             'p' | 's' | 'P' | 'S' => return None,
+                            'u' => self.code_point()?,
                             other => escaped_literal(other)?,
                         };
                         if end < item {
@@ -1742,7 +1829,6 @@ impl Parser<'_> {
                 class.ranges.push((u32::from(item), u32::from(item)));
             }
         }
-        class.ranges.sort_unstable();
         Some(class)
     }
 }
@@ -1798,8 +1884,11 @@ mod tests {
     /// one-space last alternative.
     const POSSESSIVE_CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
     const CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s";
+    /// A letter run whose class is written as an alternation of single
+    /// characters, the joiners as code-point escapes.
+    const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 15] = [
+    const PATTERNS: [&str; 16] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -1815,6 +1904,7 @@ mod tests {
         KIMI,
         POSSESSIVE_CLITIC_CLASS,
         CLITIC_CLASS,
+        JOINED_LETTERS,
     ];
 
     /// Characters that exercise every class the patterns use: ASCII of all
@@ -2030,7 +2120,7 @@ mod tests {
             r"a*?",
             r"a+?",
             r"(?:ab)?+",
-            r"(?:a|b)++",
+            r"(?:ab|c)++",
             r"a{1,3}+",
             r"[[:alpha:]]",
             r"[a&&b]",
@@ -2064,6 +2154,80 @@ mod tests {
             r"(?i:ss)",
             r"(?i:'st)",
             r"(?i:fi|fl|ff)",
+        ] {
+            assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn a_single_character_alternation_is_its_class() {
+        // The alternation form and the class form parse to the same cuts,
+        // and both agree with the engine, over every swept code point and
+        // over texts of letters, marks, joiners, digits and spaces.
+        let pairs = [
+            (
+                r"(?:\p{L}|\p{M}|\u200C|\u200D)+",
+                r"[\p{L}\p{M}\u200C\u200D]+",
+            ),
+            (r" ?(?:a|b|\u00E9)+|\p{N}", r" ?[ab\u00E9]+|\p{N}"),
+            (r"(?:\p{N}|[,.])+\p{L}?", r"[\p{N},.]+\p{L}?"),
+            // A range inside another: the union's ranges merge in
+            // `Class::finish`, or `d`..`z` would be read as absent.
+            (r"(?:[a-z]|c)+", r"[a-zc]+"),
+        ];
+        let mut texts: Vec<String> = code_points_swept()
+            .filter_map(char::from_u32)
+            .map(String::from)
+            .collect();
+        let pool: &[char] = &[
+            'a', 'b', '\u{E9}', '\u{E01}', '\u{301}', '\u{E31}', '\u{200C}', '\u{200D}', '1',
+            '\u{663}', ' ', ',', '.', '\n',
+        ];
+        let mut state = 0x6A09_E667_F3BC_C908u64;
+        for round in 0..2000 {
+            texts.push(
+                (0..1 + round % 16)
+                    .map(|_| pool[(pseudo_random(&mut state) % pool.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for (alternation, class) in pairs {
+            let ours = Pattern::parse(alternation).expect("the alternation parses");
+            let theirs = Pattern::parse(class).expect("the class parses");
+            let engine = SysRegex::new(alternation).expect("the engine compiles the alternation");
+            for text in &texts {
+                let cuts: Vec<(usize, usize)> = ours.find_iter(text).collect();
+                assert_eq!(
+                    cuts,
+                    theirs.find_iter(text).collect::<Vec<_>>(),
+                    "{alternation:?} on {text:?}"
+                );
+                assert_eq!(
+                    cuts,
+                    engine.find_iter(text).collect::<Vec<_>>(),
+                    "the engine on {alternation:?} {text:?}"
+                );
+            }
+        }
+        // A `\u` escape is a code point in an atom, in a class and as a
+        // range end; the other shapes stay declined.
+        let cuts = |pattern: &str, text: &str| -> Vec<(usize, usize)> {
+            Pattern::parse(pattern)
+                .expect("parses")
+                .find_iter(text)
+                .collect()
+        };
+        assert_eq!(cuts(r"\u0041+", "AAb"), oracle_matches(r"\u0041+", "AAb"));
+        assert_eq!(cuts(r"\u0041+", "AAb"), vec![(0, 2)]);
+        assert_eq!(cuts(r"[\u0041-\u0043]+", "ABCD"), vec![(0, 3)]);
+        for pattern in [
+            r"\u00",
+            r"\u00G1",
+            r"\uD800",
+            r"(?:ab|c)+",
+            r"(?:[^a]|b)+",
+            r"(?:\p{L}|\p{M}+)+",
+            r"(?i:(?:a|b)+)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
@@ -2551,7 +2715,7 @@ mod tests {
         // subset.
         for pattern in [
             r"(?:ab)++",
-            r"(?:a|b)?+",
+            r"(?:ab|c)?+",
             r"(?:'s)*+",
             r"a{2}+",
             r"a{1,3}+",
@@ -2694,7 +2858,7 @@ mod tests {
                     r"(?:\r?\n)+",
                     r"(?: ?\p{L})+",
                     r"(?:ab)*",
-                    r"(?:a|b){2,}",
+                    r"(?:ab|c){2,}",
                     r"(?:'s){1,3}",
                 ] {
                     assert!(Pattern::parse(pattern).is_none(), "{pattern}");

@@ -30,12 +30,7 @@ pub(super) struct DeepseekV41VisionSpec;
 
 impl DeepseekV41VisionSpec {
     fn image_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|id| id as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 }
 

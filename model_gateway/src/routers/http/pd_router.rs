@@ -253,6 +253,8 @@ impl PdRoute for GenerateRequest {
 
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
         match self.routing_tokens() {
+            // the generate route's validator refuses a negative `input_ids`
+            // entry before routing: the cast of a validated id cannot wrap
             Some(ids) => (None, Some(ids.iter().map(|&id| id as u32).collect())),
             None => (self.text.as_deref().map(str::to_string), None),
         }
@@ -395,9 +397,20 @@ impl PDRouter {
                         *response.headers_mut() = response_headers;
                         response
                     }
+                    // The request's own timeout running out mid-body ends the
+                    // request as it does on every other body read of these
+                    // routers (504 under its code), never as the worker's
+                    // transport failing.
+                    Err(e) if is_request_timeout(&e) => {
+                        error!("Response body read timed out: {}", e);
+                        request_timeout_response(format!(
+                            "Failed to read response body: {}",
+                            cause(&e)
+                        ))
+                    }
                     Err(e) => {
                         error!("Failed to read response body: {}", e);
-                        error::internal_error(
+                        error::bad_gateway(
                             "read_response_body_failed",
                             format!("Failed to read response body: {}", cause(&e)),
                         )
@@ -2126,23 +2139,30 @@ impl PDRouter {
         self.policy_registry.pair_needs_request_text()
     }
 
+    /// The text the placement policies read from a count request, if they
+    /// read any, with the request handed back by value: the route's local is
+    /// moved here and back, never borrowed, so it keeps no slot in the task.
+    fn count_tokens_routing_text(
+        body: CountMessageTokensRequest,
+        policies_need_text: bool,
+    ) -> (Option<String>, CountMessageTokensRequest) {
+        let text = policies_need_text.then(|| body.extract_text_for_routing());
+        (text, body)
+    }
+
     /// The count request as the prefill worker receives it (its model the
-    /// canonical one) and the text the placement policies read, if they read
-    /// any: both taken before the send, so the request itself does not ride
-    /// in the route's task across it.
+    /// canonical one), serialized once a worker is selected and admitted, so
+    /// a refusal for want of a worker or for the worker's overload serializes
+    /// nothing and the request still does not ride in the route's task across
+    /// the send.
     fn count_tokens_wire(
         mut body: CountMessageTokensRequest,
         canonical_model: Option<&str>,
-        policies_need_text: bool,
-    ) -> (Option<String>, serde_json::Result<Bytes>) {
-        let request_text = policies_need_text.then(|| body.extract_text_for_routing());
+    ) -> serde_json::Result<Bytes> {
         if let Some(canonical_model) = canonical_model {
             canonical_model.clone_into(&mut body.model);
         }
-        (
-            request_text,
-            serialize_json_sized(&body, None).map(Bytes::from),
-        )
+        serialize_json_sized(&body, None).map(Bytes::from)
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
@@ -2760,14 +2780,12 @@ impl RouterTrait for PDRouter {
         // holds the tokenizer and prompt template) and no KV handoff.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        // The request is serialized before the send and never borrowed here:
-        // a borrowed local keeps its slot in the task across the awaits that
-        // follow, a second copy of the request per count.
-        let (request_text, wire) = Self::count_tokens_wire(
-            body,
-            canonical_model.as_deref(),
-            self.policies_need_request_text(),
-        );
+        // The request is never borrowed here: a borrowed local keeps its slot
+        // in the task across the awaits that follow, a second copy of the
+        // request per count. It is moved out for its routing text, moved back,
+        // and serialized once a worker is selected and admitted.
+        let (request_text, body) =
+            Self::count_tokens_routing_text(body, self.policies_need_request_text());
         let Some(worker) = placement::select_single(
             &self.worker_registry,
             &self.policy_registry,
@@ -2790,10 +2808,6 @@ impl RouterTrait for PDRouter {
             );
         };
 
-        let body = match wire {
-            Ok(bytes) => bytes,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
         if let Some(response) = overload::shed_if_worker_overloaded(
             worker.as_ref(),
             model_id,
@@ -2801,6 +2815,10 @@ impl RouterTrait for PDRouter {
         ) {
             return response;
         }
+        let body = match Self::count_tokens_wire(body, canonical_model.as_deref()) {
+            Ok(bytes) => bytes,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
         let _load_guard = WorkerLoadGuard::with_key(
             worker.clone(),
             self.policy_registry.sticky_header_key(headers),
@@ -2939,7 +2957,7 @@ fn upstream_error_message(body: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::header::AUTHORIZATION;
+    use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH};
     use openai_protocol::model_card::ModelCard;
     use serde_json::json;
     use tokio::sync::{mpsc, oneshot};
@@ -2950,7 +2968,7 @@ mod tests {
         config::{types::PdPairingMode, PolicyConfig},
         middleware::{test_support::json_of, ReportedRefusal},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
-        routers::common::sse::SSE_CHANNEL_BUFFER,
+        routers::{common::sse::SSE_CHANNEL_BUFFER, http::test_support},
         tenant::TenantKey,
         worker::{
             circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
@@ -3446,6 +3464,70 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             vec![None, Some("Bearer callers-own-key".to_string())]
+        );
+    }
+
+    /// A worker that closes the connection after its head, before the body
+    /// it announced, failed below HTTP: the proxied GET answers a bad gateway
+    /// under the read's code, as the typed routes' buffered reads do, not a
+    /// 500 of the gateway's own.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn a_worker_that_closes_mid_body_is_proxied_as_a_bad_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n{\"partial\":")
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+
+        let response = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = json_of(response).await;
+        assert_eq!(body["error"]["code"], "read_response_body_failed", "{body}");
+    }
+
+    /// A worker whose answer's head arrives and whose body does not end within
+    /// the request's own timeout ends the proxied GET as every other body read
+    /// of these routers does: the 504 of the request's timeout, not the bad
+    /// gateway of a cut transport.
+    #[tokio::test]
+    async fn a_worker_body_the_request_timeout_cuts_is_proxied_as_the_timeout() {
+        let url = spawn_stalled_body_stub().await;
+        let client = Arc::new(
+            crate::server::http_client_builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap(),
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill)
+                .http_client(client)
+                .build(),
+        );
+
+        let response = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "call_upstream_timeout"
         );
     }
 
@@ -4050,7 +4132,7 @@ mod tests {
     }
 
     #[test]
-    fn count_tokens_wire_reads_the_text_before_the_canonical_model_goes_on_the_wire() {
+    fn count_tokens_wire_reads_the_text_then_forwards_the_canonical_model() {
         let body: CountMessageTokensRequest = serde_json::from_value(json!({
             "model": "alias",
             "messages": [{"role": "user", "content": "count me"}],
@@ -4058,17 +4140,21 @@ mod tests {
         .unwrap();
         let expected_text = body.extract_text_for_routing();
 
-        let (text, wire) = PDRouter::count_tokens_wire(body.clone(), Some("canonical"), true);
+        let (text, body) = PDRouter::count_tokens_routing_text(body, true);
         assert_eq!(text.as_deref(), Some(expected_text.as_str()));
-        let forwarded: Value = serde_json::from_slice(&wire.unwrap()).unwrap();
+        let forwarded: Value = serde_json::from_slice(
+            &PDRouter::count_tokens_wire(body.clone(), Some("canonical")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(forwarded["model"], "canonical");
 
-        let (text, wire) = PDRouter::count_tokens_wire(body, None, false);
+        let (text, body) = PDRouter::count_tokens_routing_text(body, false);
         assert!(
             text.is_none(),
             "no policy reads the text, so none is extracted"
         );
-        let forwarded: Value = serde_json::from_slice(&wire.unwrap()).unwrap();
+        let forwarded: Value =
+            serde_json::from_slice(&PDRouter::count_tokens_wire(body, None).unwrap()).unwrap();
         assert_eq!(
             forwarded["model"], "alias",
             "without a canonical model the request's own goes on the wire"
@@ -6825,6 +6911,115 @@ mod tests {
         router
             .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
             .await
+    }
+
+    /// The PD router's own streaming path takes the relay's rule: a decode
+    /// worker that declared its length and went away mid-body reaches the
+    /// client without the decode worker's `Content-Length`, with the frames
+    /// that arrived, the typed error event and `[DONE]`.
+    #[tokio::test]
+    async fn a_cut_sized_decode_stream_ends_with_its_error_event_and_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async { ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE) }),
+        );
+        let router = create_test_pd_router();
+        register_pd_pair(
+            &router,
+            spawn_stub(prefill).await,
+            test_support::spawn_sized_sse_worker_cut_after(BODY, first).await,
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("the client stream starts on the decode head");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a cut decode stream's length is not the decode worker's"
+        );
+        let bytes = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the body ends after the error event")
+        .expect("response body");
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        assert_eq!(events[0], BODY[..first].trim_end());
+        let error: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[2], "data: [DONE]");
+    }
+
+    /// With logprobs asked for, the relay re-encodes each frame with the
+    /// prefill's logprobs merged in, so a sized decode answer grows past its
+    /// declared length: the client gets the merged frame and no length.
+    #[tokio::test]
+    async fn a_sized_decode_stream_with_merged_logprobs_carries_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\
+                            \"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n";
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(json!({"meta_info": {"input_token_logprobs": [[-0.1, 1, null]]}}))
+            }),
+        );
+        let router = create_test_pd_router();
+        // The one frame is sent whole and the body closes cleanly, so the
+        // only growth is the merge's.
+        register_pd_pair(
+            &router,
+            spawn_stub(prefill).await,
+            test_support::spawn_sized_sse_worker_cut_after(BODY, BODY.len()).await,
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let mut request = streaming_chat();
+        request.logprobs = true;
+
+        let response = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            router.route_chat(None, &tenant, request, UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("the client stream starts once the prefill answered");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a merged stream's length is not the decode worker's"
+        );
+        let bytes = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the body ends at the upstream's clean close")
+        .expect("response body");
+        assert!(
+            bytes.len() > BODY.len(),
+            "the merged frames grew past the declared length"
+        );
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 1, "{body}");
+        let frame: Value = serde_json::from_str(events[0].strip_prefix("data: ").unwrap())
+            .expect("the merged frame is one data event");
+        assert_eq!(
+            frame["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
     }
 
     /// The events of an SSE body, blank-line separated.

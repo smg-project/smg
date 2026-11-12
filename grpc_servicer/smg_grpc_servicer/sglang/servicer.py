@@ -590,6 +590,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return str(obj)
 
         serializable_args = make_serializable(server_args_dict)
+        from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
+
+        serializable_args["multimodal_encoder_dtype"] = encoder_dtype(
+            None, lambda: self.model_config.dtype
+        )
         # The operator's PD pairing protocol rides with the server args, so
         # the gateway reads it as the worker's `pairing_protocol` label.
         pairing_protocol = pairing_protocol_from_env()

@@ -127,6 +127,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         [
             "least-load",
             "least-requests",
+            "fewest-sessions",
             "session-affinity",
             "prefix-affinity",
             "kv-pressure",

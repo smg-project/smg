@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_LENGTH, HeaderMap, StatusCode},
     response::Response,
 };
 use bytes::Bytes;
@@ -93,7 +93,9 @@ pub(crate) struct Relay {
     pub(crate) source: RelaySource,
     /// The worker's load, released when the body is dropped.
     pub(crate) guard: WorkerLoadGuard,
-    /// The response headers, prepared by the caller.
+    /// The response headers, prepared by the caller. Under `upstream_sse` the
+    /// relay removes the upstream's `Content-Length` from them, since it may
+    /// lengthen the body.
     pub(crate) headers: HeaderMap,
     /// How each chunk is read before it is sent.
     pub(crate) mode: ChunkMode,
@@ -111,9 +113,17 @@ where
         upstream_sse,
         source,
         guard,
-        headers,
+        mut headers,
         mut mode,
     } = relay;
+    // The relay may change an SSE body's length: re-chunking re-slices it,
+    // a decode-side hook re-encodes it, and a cut after a successful head
+    // appends the error event and the stream's end. So a streamed SSE body
+    // never carries the upstream's `Content-Length`, whichever router
+    // relays it.
+    if upstream_sse {
+        headers.remove(CONTENT_LENGTH);
+    }
     // Bounded channel applies backpressure: a slow client makes the
     // relay await on `send` instead of buffering the whole response.
     let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
@@ -281,7 +291,7 @@ mod tests {
 
     use axum::{
         body::Body,
-        http::{HeaderMap, StatusCode},
+        http::{header::CONTENT_LENGTH, HeaderMap, StatusCode},
         response::Response,
     };
     use bytes::Bytes;
@@ -329,14 +339,7 @@ mod tests {
                 .into_iter()
                 .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
         );
-        let mut body = relay_of(upstream, mode).into_body();
-        let mut frames = Vec::new();
-        while let Some(frame) = body.frame().await {
-            if let Ok(data) = frame.expect("a relayed frame").into_data() {
-                frames.push(data);
-            }
-        }
-        frames
+        frames_of(relay_of(upstream, mode).into_body()).await
     }
 
     /// An empty upstream chunk becomes no frame at all, on the plain path and
@@ -450,10 +453,13 @@ mod tests {
         frames
     }
 
-    /// The events of `frames`, blank-line separated.
+    /// The events of `frames`, blank-line separated; a final fragment without
+    /// its terminator is a failure, since a client cannot dispatch it.
     fn events_of(frames: &[Bytes]) -> Vec<String> {
-        String::from_utf8(frames.concat())
-            .expect("UTF-8 SSE")
+        let text = String::from_utf8(frames.concat()).expect("UTF-8 SSE");
+        let (events, rest) = text.rsplit_once("\n\n").unwrap_or(("", text.as_str()));
+        assert!(rest.is_empty(), "an unterminated event: {rest:?}");
+        events
             .split("\n\n")
             .filter(|event| !event.is_empty())
             .map(str::to_owned)
@@ -475,10 +481,13 @@ mod tests {
     }
 
     /// A body error as reqwest reports one: the connect to a port nobody
-    /// listens on is refused.
+    /// listens on is refused. The client takes no proxy from the
+    /// environment, so the refusal comes from the loopback socket on every
+    /// host.
     async fn upstream_error() -> reqwest::Error {
         let refused = RefusedAddress::reserve();
         crate::server::http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{}/v1/chat/completions", refused.addr()))
@@ -509,8 +518,14 @@ mod tests {
         let [.., error_event, done] = events.as_slice() else {
             panic!("{events:?}");
         };
+        let error: serde_json::Value =
+            serde_json::from_str(error_event.strip_prefix("data: ").unwrap())
+                .expect("the error event is JSON");
+        assert_eq!(error["error"]["type"], "stream_error", "{error_event}");
         assert!(
-            error_event.starts_with("data: {\"error\":"),
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Stream error: ")),
             "{error_event}"
         );
         assert_eq!(done, "data: [DONE]");
@@ -546,5 +561,37 @@ mod tests {
         let events = events_of(&[frame.into_data().expect("a data frame")]);
         assert_eq!(contents(&events), ["abcdef"], "{events:?}");
         drop(tx);
+    }
+
+    /// The relay owns the header rule for every caller: a sized SSE body
+    /// loses the upstream's `Content-Length` here, and a body that is not
+    /// SSE keeps the length its caller prepared.
+    #[tokio::test]
+    async fn a_sized_sse_bodys_content_length_leaves_with_the_relay_and_another_bodys_stays() {
+        for (upstream_sse, kept) in [(true, false), (false, true)] {
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("http://127.0.0.1:1").build());
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, "9".parse().unwrap());
+            let upstream = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from_static(
+                b"data: x\n\n",
+            ))]);
+            let response = relay_streaming_body(
+                upstream,
+                Relay {
+                    status: StatusCode::OK,
+                    upstream_sse,
+                    source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
+                    guard: WorkerLoadGuard::new(worker, None),
+                    headers,
+                    mode: ChunkMode::Plain,
+                },
+            );
+            assert_eq!(
+                response.headers().contains_key(CONTENT_LENGTH),
+                kept,
+                "upstream_sse {upstream_sse}: the upstream's Content-Length"
+            );
+        }
     }
 }

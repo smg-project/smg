@@ -72,10 +72,10 @@ fn a_rotated_key_file_is_in_force_without_a_call() {
     let addr = SocketAddr::from((IP, port));
     let gateway = Gateway::start(&args, addr, &dir.path().join("gateway.log"));
 
-    // The record says the two files are watched.
+    // The record names the two files watched.
     if let Err(log) = log_with_line(
         &gateway.log,
-        "secrets_auto_reload=\"on (2 files)\"",
+        "secrets_auto_reload=\"on (api-key-file, control-plane-api-keys-file)\"",
         EXIT_TIMEOUT,
     ) {
         panic!("the CREDENTIAL SOURCES record does not say the files are watched:\n{log}");
@@ -168,7 +168,7 @@ fn a_rotated_shared_key_leaves_the_admin_routes_too() {
     let gateway = Gateway::start(&args, addr, &dir.path().join("gateway.log"));
     if let Err(log) = log_with_line(
         &gateway.log,
-        "secrets_auto_reload=\"on (1 files)\"",
+        "secrets_auto_reload=\"on (api-key-file)\"",
         EXIT_TIMEOUT,
     ) {
         panic!("the CREDENTIAL SOURCES record does not say the file is watched:\n{log}");
@@ -185,11 +185,11 @@ fn a_rotated_shared_key_leaves_the_admin_routes_too() {
     within_ten_seconds("the serving key's reload", || {
         serving_accepts(addr, Some(ROTATED_SERVING_KEY))
     });
-    assert_eq!(
-        workers(ROTATED_SERVING_KEY),
-        Some(200),
-        "the admin routes take the rotated key"
-    );
+    // The admin fallback swaps after the serving set on the reload's thread,
+    // so the admin route is polled as the serving route was.
+    within_ten_seconds("the admin fallback's reload", || {
+        workers(ROTATED_SERVING_KEY) == Some(200)
+    });
     assert_eq!(
         workers(SERVING_KEY),
         Some(401),

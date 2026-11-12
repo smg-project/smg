@@ -118,8 +118,8 @@ fn a_connection_beyond_the_bound_is_closed_without_a_response_and_counted() {
     let window = Duration::from_secs(10);
 
     // Two connections within the bound, served and held open.
-    let mut first = served_connection(addr, window);
-    let mut second = served_connection(addr, window);
+    let mut first = served_connection(addr, window, &gateway.log);
+    let mut second = served_connection(addr, window, &gateway.log);
 
     // The third is closed without a byte of response: closed or reset, not
     // left hanging until the read times out.
@@ -141,13 +141,19 @@ fn a_connection_beyond_the_bound_is_closed_without_a_response_and_counted() {
         rejected_before + 1.0,
         "the third connection's refusal: {rejected_before} -> {rejected}"
     );
+    // The refusal's WARN names this listener and its flag: the accept site
+    // passes the listener, and a swapped argument there names the other one.
+    let refusal = "the data listener's connection limit (--max-connections) is reached";
+    if let Err(log) = log_with_line(&gateway.log, refusal, EXIT_TIMEOUT) {
+        panic!("the refusal does not name the data listener and its flag\n{log}");
+    }
     // The two within the bound are untouched.
     assert!(answered_200(keep_alive_get(&mut first, "/health")));
     assert!(answered_200(keep_alive_get(&mut second, "/health")));
 
     // A close returns its slot: a new connection is served.
     drop(first);
-    let mut fourth = served_connection(addr, window);
+    let mut fourth = served_connection(addr, window, &gateway.log);
     assert!(answered_200(keep_alive_get(&mut fourth, "/health")));
     assert!(answered_200(keep_alive_get(&mut second, "/health")));
 

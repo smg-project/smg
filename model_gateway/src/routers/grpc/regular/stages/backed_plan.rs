@@ -30,7 +30,7 @@ use crate::routers::{
         client::GenerateRequestBuildOptions,
         common::stages::helpers::{self, SamplingDefaultsMask, TagForStart},
         context::{
-            stage_output, AttemptStamp, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+            stage_output, AttemptStamp, ClientSelection, ExecutionPlan, PlanSettings,
             RequestContext, RequestType,
         },
         proto_wrapper::{MultimodalData, ProtoGenerateRequest},
@@ -70,8 +70,8 @@ pub(crate) struct Inputs<'a> {
     pub multimodal_data: Option<MultimodalData>,
     /// Which sampling knobs the client left unset, for the worker's defaults.
     pub sampling_mask: Option<SamplingDefaultsMask>,
-    pub inject_pd_metadata: bool,
-    pub plan_kind: ExecutionPlanKind,
+    /// The mode's plan settings: the plan the request becomes, the PD metadata.
+    pub settings: PlanSettings,
 }
 
 /// Build the backend `GenerateRequest` from `inputs` through `build_request`,
@@ -105,8 +105,7 @@ pub(crate) fn build(
         require_reasoning,
         multimodal_data,
         sampling_mask,
-        inject_pd_metadata,
-        plan_kind,
+        settings,
     } = inputs;
     let clients = stage_output(ctx.state.clients.as_ref(), function)?;
 
@@ -186,7 +185,12 @@ pub(crate) fn build(
         ctx.state.workers.as_ref(),
     );
 
-    helpers::finish_generate_request(ctx, &mut proto_request, inject_pd_metadata, function)?;
+    helpers::finish_generate_request(
+        ctx,
+        &mut proto_request,
+        settings.inject_pd_metadata,
+        function,
+    )?;
 
     let tool_constraint = match table_tag {
         Some(table_tag) => helpers::ToolConstraintStamp::capture_table(table_tag, &proto_request),
@@ -199,12 +203,12 @@ pub(crate) fn build(
         ),
     };
     Ok((
-        ExecutionPlan::generate(plan_kind, proto_request),
+        ExecutionPlan::generate(settings.plan_kind, proto_request),
         AttemptStamp {
             id: id_stamp,
             sampling_mask,
             sampling_baseline,
-            inject_pd_metadata,
+            inject_pd_metadata: settings.inject_pd_metadata,
             tool_constraint,
         },
     ))

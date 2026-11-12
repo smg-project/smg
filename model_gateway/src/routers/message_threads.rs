@@ -25,38 +25,49 @@
 //! A thread turn's message id is the gateway's: the request's `rid` is
 //! replaced by a fresh `msg_` id before the route (on the regular gRPC path
 //! the request id is the message id, so a client's repeated `rid` would name
-//! a stored turn, and a streamed answer is never reissued), and the client's
-//! `rid` is echoed as the answer's `request-id` header, the trace id it
-//! stays, under the request-id layer's inbound rule and where the route set
-//! none; a provider never receives `rid`, the adapter that mounts a provider
-//! router clears it. Every turn of a thread carries the token minted at its
-//! create turn (the record's `conversation_id`); a root under a reused id,
-//! written after the thread's own root was evicted, carries another, so an
-//! old child's continue onto it is the 404, never a splice of two
-//! conversations.
+//! a stored turn), and the client's `rid` is echoed as the answer's
+//! `request-id` header, the trace id it stays, under the request-id layer's
+//! inbound rule and where the route set none; a provider never receives
+//! `rid`, the adapter that mounts a provider router clears it. Every turn of
+//! a thread carries the token minted at its create turn (the record's
+//! `conversation_id`); a root under a reused id, written after the thread's
+//! own root was evicted, carries another, so an old child's continue onto it
+//! is the 404, never a splice of two conversations.
+//!
+//! A streamed answer is stored as well: the thread layer reads the events
+//! on their way to the client, takes the turn's place in the store at
+//! `message_start` (a taken id is reissued there, in the event the client
+//! reads), folds the content blocks and the final `message_delta` into the
+//! answer, and writes it whole at `message_stop`; the bytes the client reads
+//! are the router's own, except a reissued `message_start`.
 //!
 //! Best effort, as the public API's threads are: a turn that was not stored
-//! (a streamed answer, an error, an answer the gateway could not read, a
-//! write the store refused, an evicted record) makes the next continue a
-//! 404 `thread_not_found`, and the
-//! client replays the conversation in a new create request, as the public
-//! SDKs' thread helper does on its own. An id
-//! may be continued more than once (a fork); the public API's
-//! `thread_already_continued` is not answered. A continue whose rebuilt
-//! conversation breaks a request rule is the same 404: the public API's
-//! codes name no such case, and the client's replay (the whole conversation
-//! as a create request) meets the 400 that names the rule.
+//! (an error, an answer the gateway could not read, a write the store
+//! refused, a stream cut before its `message_stop`, an evicted record) makes
+//! the next continue a 404 `thread_not_found`, and the client replays the
+//! conversation in a new create request, as the public SDKs' thread helper
+//! does on its own. An id may be continued more than once (a fork); the
+//! public API's `thread_already_continued` is not answered. A continue whose
+//! rebuilt conversation breaks a request rule is the same 404: the public
+//! API's codes name no such case, and the client's replay (the whole
+//! conversation as a create request) meets the 400 that names the rule.
 
-use std::sync::Arc;
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use axum::{
     body::{to_bytes, Body, Bytes},
     http::{header, HeaderValue, StatusCode},
     response::Response,
 };
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use openai_protocol::messages::{
-    CreateMessageRequest, ErrorDetails, ErrorEnvelope, ErrorResponse, InputContent,
-    InputContentBlock, InputMessage, MessageThread, Role, SystemContent, Tool,
+    ContentBlock, ContentBlockDelta, CreateMessageRequest, ErrorDetails, ErrorEnvelope,
+    ErrorResponse, InputContent, InputContentBlock, InputMessage, Message, MessageDelta,
+    MessageDeltaUsage, MessageStreamEvent, MessageThread, Role, SystemContent, Tool,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -72,7 +83,7 @@ use crate::{
         request_id::{is_acceptable_inbound_id, REQUEST_ID},
     },
     observability::metrics::Metrics,
-    routers::error as route_error,
+    routers::{common::sse_rechunk::find_frame_end, error as route_error},
 };
 
 /// The turns the store keeps: the newest 10,000, each for an hour after it
@@ -271,14 +282,23 @@ fn fresh_thread_token() -> String {
 }
 
 /// A thread turn in flight: its op, the client's `rid` when it sent one
-/// (echoed as the answer's `request-id`, the trace id it stays) and, when
-/// its answer is read back, its record. A streamed turn carries no record:
-/// its answer is not read back, so the request is not copied for a turn
-/// that is never stored.
+/// (echoed as the answer's `request-id`, the trace id it stays), its record
+/// and whether its answer streams (a streamed answer is stored from its
+/// events as the client reads them, not read back).
 pub(crate) struct ThreadTurn {
     op: &'static str,
     trace: Option<String>,
-    record: Option<TurnRecord>,
+    record: TurnRecord,
+    streamed: bool,
+}
+
+impl ThreadTurn {
+    /// The client's `rid`, when it sent one: the trace id, and the lineage a
+    /// routing key is derived from, since the request's own `rid` is the
+    /// minted message id by the time a router reads it.
+    pub(crate) fn trace(&self) -> Option<&str> {
+        self.trace.as_deref()
+    }
 }
 
 /// What a stored turn's record holds besides the answer, taken from the
@@ -292,11 +312,42 @@ struct TurnRecord {
     thread: String,
 }
 
+impl TurnRecord {
+    /// The store's record of this turn: `answer` under `id`, the turn's
+    /// request as the record's input, the thread's token.
+    fn record(self, id: ResponseId, answer: Value) -> StoredResponse {
+        let mut record = StoredResponse::new(self.previous);
+        record.id = id;
+        record.input = self.input;
+        record.model = Some(self.model);
+        record.raw_response = answer;
+        record.tenant = self.tenant;
+        record.conversation_id = Some(self.thread);
+        record
+    }
+
+    /// The turn's place in the store while its answer streams: `id` taken,
+    /// the `message_start` message as the answer and no input yet (a
+    /// continue meanwhile is the 404); the record replaces it at
+    /// `message_stop`, a cut stream removes it.
+    fn reservation(&self, id: ResponseId, message: &Message) -> StoredResponse {
+        let mut record = StoredResponse::new(self.previous.clone());
+        record.id = id;
+        record.model = Some(self.model.clone());
+        record.raw_response = serde_json::to_value(message).unwrap_or(Value::Null);
+        record.tenant.clone_from(&self.tenant);
+        record.conversation_id = Some(self.thread.clone());
+        record
+    }
+}
+
 /// The threads of this gateway, in the store of their turns.
 pub(crate) struct MessageThreads {
     store: MemoryResponseStorage,
     /// The store's turn count, the depth a thread is read back to.
     max_turns: usize,
+    /// The bytes an answer may hold, read whole or streamed: `ANSWER_LIMIT`.
+    answer_limit: usize,
 }
 
 impl MessageThreads {
@@ -320,7 +371,15 @@ impl MessageThreads {
                 ..MemoryConfig::default()
             }),
             max_turns,
+            answer_limit: ANSWER_LIMIT,
         }
+    }
+
+    /// The threads with answers bounded at `answer_limit` bytes.
+    #[cfg(test)]
+    fn limited(mut self, answer_limit: usize) -> Self {
+        self.answer_limit = answer_limit;
+        self
     }
 
     /// The request to route and, for a thread turn, the turn to store with
@@ -344,49 +403,51 @@ impl MessageThreads {
         let model = request.model.clone();
         // The gateway mints the turn's message id: on the regular gRPC path
         // the request id is the message id, so a client's repeated rid would
-        // name a stored turn (a streamed answer is never reissued). The rid
-        // stays a trace id, echoed as the answer's request-id header.
+        // name a stored turn. The rid stays a trace id, echoed as the
+        // answer's request-id header.
         let trace = request.rid.replace(fresh_message_id());
         match thread {
             MessageThread::Create => {
-                let record = (!streamed).then(|| TurnRecord {
+                let record = TurnRecord {
                     previous: None,
                     input: TurnInput::record(&request, true),
                     model,
                     tenant,
                     thread: fresh_thread_token(),
-                });
+                };
                 Ok((
                     request,
                     Some(ThreadTurn {
                         op: "create",
                         trace,
                         record,
+                        streamed,
                     }),
                 ))
             }
             MessageThread::Continue {
                 previous_message_id,
             } => {
-                let input = (!streamed).then(|| TurnInput::record(&request, false));
+                let input = TurnInput::record(&request, false);
                 match self
                     .continue_from(&previous_message_id, tenant.as_deref(), &mut request)
                     .await
                 {
                     Ok(thread) => {
-                        let record = input.map(|input| TurnRecord {
+                        let record = TurnRecord {
                             previous: Some(ResponseId::from(previous_message_id)),
                             input,
                             model,
                             tenant,
                             thread,
-                        });
+                        };
                         Ok((
                             request,
                             Some(ThreadTurn {
                                 op: "continue",
                                 trace,
                                 record,
+                                streamed,
                             }),
                         ))
                     }
@@ -474,11 +535,12 @@ impl MessageThreads {
     }
 
     /// The answer, with the turn stored under the answer's id when it is a
-    /// complete 200 message; an id that is already a stored turn's is
-    /// reissued, in the answer and in the store. A streamed answer, an
-    /// error, an answer the gateway cannot read or a write the store refused
-    /// leaves the turn unstored and the answer as it is: the next continue
-    /// is a 404 and the client replays.
+    /// 200 message; an id that is already a stored turn's is reissued, in
+    /// the answer and in the store. A streamed answer is stored from its
+    /// events by [`StreamedTurn`] as the client reads them. An error, an
+    /// answer the gateway cannot read or a write the store refused leaves
+    /// the turn unstored and the answer as it is: the next continue is a
+    /// 404 and the client replays.
     pub(crate) async fn stored(&self, turn: ThreadTurn, response: Response) -> Response {
         let mut response = response;
         // The client's rid, the trace id, on the answer as the header the
@@ -495,12 +557,19 @@ impl MessageThreads {
             response.headers_mut().entry(&REQUEST_ID).or_insert(value);
         }
         let op = turn.op;
-        let Some(turn) = turn.record.filter(|_| response.status() == StatusCode::OK) else {
+        if response.status() != StatusCode::OK {
             Metrics::record_message_thread_turn(op, "unstored");
             return response;
-        };
+        }
+        if turn.streamed {
+            let (parts, body) = response.into_parts();
+            let streamed =
+                StreamedTurn::new(body, turn.record, op, self.store.clone(), self.answer_limit);
+            return Response::from_parts(parts, Body::new(streamed));
+        }
+        let turn = turn.record;
         let (mut parts, body) = response.into_parts();
-        let bytes = match to_bytes(body, ANSWER_LIMIT).await {
+        let bytes = match to_bytes(body, self.answer_limit).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 warn!(%error, "message thread: the answer could not be read back");
@@ -543,15 +612,9 @@ impl MessageThreads {
             warn!("message thread: the answer has no id, the turn is not stored");
             return Written::Refused;
         };
-        let mut record = StoredResponse::new(turn.previous);
-        record.id = id;
-        record.input = turn.input;
-        record.model = Some(turn.model);
-        record.raw_response = answer;
-        record.tenant = turn.tenant;
-        record.conversation_id = Some(turn.thread);
+        let record = turn.record(id, answer);
         let mut record = match self.store.store_response_if_absent(record) {
-            Ok(()) => return Written::Kept,
+            Ok(_) => return Written::Kept,
             Err(record) => *record,
         };
         let fresh = fresh_message_id();
@@ -566,7 +629,7 @@ impl MessageThreads {
             return Written::Refused;
         };
         match self.store.store_response_if_absent(record) {
-            Ok(()) => Written::Reissued(Bytes::from(bytes)),
+            Ok(_) => Written::Reissued(Bytes::from(bytes)),
             Err(record) => {
                 warn!(
                     id = %record.id.0,
@@ -578,13 +641,533 @@ impl MessageThreads {
     }
 }
 
+/// A streamed answer on its way to the client, read for its record. The turn
+/// takes its place in the store at `message_start` (under a fresh id when
+/// the event's id is a stored turn's, rewritten in the event the client
+/// reads), the content blocks and the final `message_delta` are folded as
+/// the events pass, and the whole answer replaces the place at
+/// `message_stop`. A stream that ends, fails or is dropped before that
+/// leaves no turn: the next continue is the 404. The bytes the client reads
+/// are the router's own, except a reissued `message_start`.
+struct StreamedTurn {
+    inner: Body,
+    store: MemoryResponseStorage,
+    turn: Option<TurnRecord>,
+    op: &'static str,
+    /// The bytes before the first complete event, held until it is whole: a
+    /// `message_start` may be rewritten. Empty once the stream passes.
+    held: Vec<u8>,
+    /// The bytes of the event not yet complete, parsed when it is.
+    carry: Vec<u8>,
+    /// Every byte passes as it comes: `message_start` is through, or the
+    /// stream opened with an error.
+    passing: bool,
+    /// The place taken in the store.
+    place: Option<Place>,
+    answer: Option<Assembled>,
+    /// The bytes of content an answer may retain, the bound the whole
+    /// answer is read under on the unstreamed path.
+    limit: usize,
+    /// The outcome counted, once.
+    outcome: Option<&'static str>,
+    ended: bool,
+}
+
+/// A streamed turn's place in the store: the reservation as stored, the
+/// identity the final write and the removal compare against (a place the
+/// store's bounds dropped meanwhile, and the turn that took its id since,
+/// are left alone), and whether it was taken under a fresh id.
+struct Place {
+    held: Arc<StoredResponse>,
+    reissued: bool,
+}
+
+/// The answer under construction: the `message_start` message, its content
+/// blocks by index, each tool call's input JSON as it streams, and the bytes
+/// of text, thinking, signature and input retained so far.
+struct Assembled {
+    message: Message,
+    blocks: Vec<ContentBlock>,
+    partial_json: Vec<String>,
+    retained: usize,
+}
+
+/// More content blocks than this in one answer are not followed.
+const MAX_BLOCKS: usize = 1024;
+
+/// More bytes than this without an event's end, before the first event or
+/// within one, are not a stream this gateway reads: they pass to the client
+/// as they are and the turn is not stored.
+const EVENT_LIMIT: usize = 1 << 20;
+
+impl StreamedTurn {
+    fn new(
+        inner: Body,
+        turn: TurnRecord,
+        op: &'static str,
+        store: MemoryResponseStorage,
+        limit: usize,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            op,
+            turn: Some(turn),
+            held: Vec::new(),
+            carry: Vec::new(),
+            passing: false,
+            place: None,
+            answer: None,
+            limit,
+            outcome: None,
+            ended: false,
+        }
+    }
+
+    /// The bytes the client reads for `data`: all of them, once the first
+    /// complete event is through; until then they are held.
+    fn pass(&mut self, data: Bytes) -> Option<Bytes> {
+        if self.passing {
+            self.fold(&data);
+            return Some(data);
+        }
+        self.held.extend_from_slice(&data);
+        let mut out = Vec::new();
+        while let Some(end) = event_end(&self.held) {
+            match parse_event(&self.held[..end]) {
+                Ok(Some(MessageStreamEvent::MessageStart { message })) => {
+                    let event: Vec<u8> = self.held.drain(..end).collect();
+                    out.extend_from_slice(&self.start(message, &event));
+                    self.passing = true;
+                    let rest = std::mem::take(&mut self.held);
+                    self.fold(&rest);
+                    out.extend_from_slice(&rest);
+                    break;
+                }
+                Ok(Some(MessageStreamEvent::Error { .. })) => {
+                    self.passing = true;
+                    out.append(&mut self.held);
+                    break;
+                }
+                // Nothing is recorded before `message_start`: every other
+                // event, readable or not, passes.
+                _ => out.extend(self.held.drain(..end)),
+            }
+        }
+        if !self.passing && self.held.len() > EVENT_LIMIT {
+            self.passing = true;
+            out.append(&mut self.held);
+            self.decline("no event end within the size limit");
+        }
+        (!out.is_empty()).then(|| Bytes::from(out))
+    }
+
+    /// The `message_start` bytes the client reads: the event as it came, or
+    /// rewritten with a fresh id when the message's id is a stored turn's.
+    /// The turn's place in the store is taken here.
+    fn start(&mut self, mut message: Message, event: &[u8]) -> Vec<u8> {
+        let Some(turn) = &self.turn else {
+            return event.to_vec();
+        };
+        let place = turn.reservation(ResponseId::from(message.id.as_str()), &message);
+        let mut reissued = false;
+        let held = match self.store.store_response_if_absent(place) {
+            Ok(held) => held,
+            Err(_) => {
+                let fresh = fresh_message_id();
+                debug!(
+                    taken = %message.id,
+                    fresh,
+                    "message thread: a streamed answer's id is a stored turn's; reissued"
+                );
+                message.id = fresh;
+                let place = turn.reservation(ResponseId::from(message.id.as_str()), &message);
+                let Ok(held) = self.store.store_response_if_absent(place) else {
+                    return event.to_vec();
+                };
+                reissued = true;
+                held
+            }
+        };
+        let bytes = if reissued {
+            match start_event(&message) {
+                Some(bytes) => bytes,
+                None => {
+                    self.store.remove_response_if_held(&held);
+                    return event.to_vec();
+                }
+            }
+        } else {
+            event.to_vec()
+        };
+        self.place = Some(Place { held, reissued });
+        self.answer = Some(Assembled {
+            message,
+            blocks: Vec::new(),
+            partial_json: Vec::new(),
+            retained: 0,
+        });
+        bytes
+    }
+
+    /// The events in `data` read for the record, while a place is held. Data
+    /// this gateway cannot read gives the place back: the record is the
+    /// answer the client read, or nothing.
+    fn fold(&mut self, data: &[u8]) {
+        if self.place.is_none() {
+            return;
+        }
+        self.carry.extend_from_slice(data);
+        while let Some(end) = event_end(&self.carry) {
+            let parsed = parse_event(&self.carry[..end]);
+            self.carry.drain(..end);
+            match parsed {
+                Ok(Some(event)) => self.apply(event),
+                Ok(None) => {}
+                Err(Unreadable) => self.decline("data this gateway cannot read"),
+            }
+            if self.place.is_none() {
+                self.carry.clear();
+                break;
+            }
+        }
+        if self.place.is_some() && self.carry.len() > EVENT_LIMIT {
+            self.decline("no event end within the size limit");
+            self.carry.clear();
+        }
+    }
+
+    fn apply(&mut self, event: MessageStreamEvent) {
+        let Some(answer) = &mut self.answer else {
+            return;
+        };
+        match event {
+            MessageStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => answer.start_block(index, content_block),
+            MessageStreamEvent::ContentBlockDelta { index, delta } => answer.delta(index, delta),
+            MessageStreamEvent::ContentBlockStop { index } => {
+                if answer.stop_block(index).is_err() {
+                    self.decline("a tool call's input deltas are no JSON document");
+                }
+            }
+            MessageStreamEvent::MessageDelta { delta, usage } => answer.message_delta(delta, usage),
+            MessageStreamEvent::MessageStop => self.finish(),
+            MessageStreamEvent::Error { .. } => self.give_up(),
+            MessageStreamEvent::MessageStart { .. } | MessageStreamEvent::Ping => {}
+        }
+        if self
+            .answer
+            .as_ref()
+            .is_some_and(|answer| answer.retained > self.limit)
+        {
+            self.decline("an answer over the size limit");
+        }
+    }
+
+    /// The whole answer in the turn's place, at `message_stop`. A place the
+    /// store's bounds dropped meanwhile is left to whatever took its id: the
+    /// turn is not stored.
+    fn finish(&mut self) {
+        let (Some(place), Some(turn), Some(mut answer)) =
+            (self.place.take(), self.turn.take(), self.answer.take())
+        else {
+            return;
+        };
+        answer.message.content = answer.blocks;
+        let value = match serde_json::to_value(&answer.message) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "message thread: the streamed answer does not serialize, the turn is not stored");
+                self.store.remove_response_if_held(&place.held);
+                self.count("unstored");
+                return;
+            }
+        };
+        let id = place.held.id.clone();
+        if self
+            .store
+            .replace_response_if_held(&place.held, turn.record(id, value))
+        {
+            self.count(if place.reissued { "reissued" } else { "stored" });
+        } else {
+            warn!(
+                id = %place.held.id.0,
+                "message thread: the streamed answer's place was dropped by the store's bounds, the turn is not stored"
+            );
+            self.count("unstored");
+        }
+    }
+
+    /// The place given back: an error event, a cut stream, a dropped body.
+    /// A place the store's bounds dropped meanwhile, and the turn that took
+    /// its id since, are left alone.
+    fn give_up(&mut self) {
+        if let Some(place) = self.place.take() {
+            self.store.remove_response_if_held(&place.held);
+        }
+        self.answer = None;
+        self.count("unstored");
+    }
+
+    /// The place given back for an answer this gateway declines to store:
+    /// data it cannot read, or more of it than the bounds allow. The log
+    /// says why.
+    fn decline(&mut self, why: &'static str) {
+        warn!(why, "message thread: the streamed turn is not stored");
+        self.give_up();
+    }
+
+    fn count(&mut self, outcome: &'static str) {
+        if self.outcome.is_none() {
+            self.outcome = Some(outcome);
+            Metrics::record_message_thread_turn(self.op, outcome);
+        }
+    }
+}
+
+impl Drop for StreamedTurn {
+    fn drop(&mut self) {
+        self.give_up();
+    }
+}
+
+impl HttpBody for StreamedTurn {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // `Body` is `Unpin`, and so is everything else held here.
+        let this = self.get_mut();
+        loop {
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        if let Some(out) = this.pass(data) {
+                            return Poll::Ready(Some(Ok(Frame::data(out))));
+                        }
+                    }
+                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
+                },
+                Poll::Ready(None) => {
+                    this.ended = true;
+                    this.give_up();
+                    let held = std::mem::take(&mut this.held);
+                    return if held.is_empty() {
+                        Poll::Ready(None)
+                    } else {
+                        Poll::Ready(Some(Ok(Frame::data(Bytes::from(held)))))
+                    };
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.ended = true;
+                    this.give_up();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended || (self.inner.is_end_stream() && self.held.is_empty())
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+impl Assembled {
+    fn start_block(&mut self, index: u32, block: ContentBlock) {
+        let Some(index) = slot(index) else {
+            return;
+        };
+        while self.blocks.len() < index {
+            self.blocks.push(ContentBlock::Text {
+                text: String::new(),
+                citations: None,
+            });
+            self.partial_json.push(String::new());
+        }
+        if index == self.blocks.len() {
+            self.blocks.push(block);
+            self.partial_json.push(String::new());
+        } else {
+            self.blocks[index] = block;
+            self.partial_json[index].clear();
+        }
+    }
+
+    fn delta(&mut self, index: u32, delta: ContentBlockDelta) {
+        let Some(index) = slot(index) else {
+            return;
+        };
+        let (Some(block), Some(partial)) =
+            (self.blocks.get_mut(index), self.partial_json.get_mut(index))
+        else {
+            return;
+        };
+        match (delta, block) {
+            (ContentBlockDelta::TextDelta { text: more }, ContentBlock::Text { text, .. }) => {
+                self.retained += more.len();
+                text.push_str(&more);
+            }
+            (ContentBlockDelta::InputJsonDelta { partial_json }, _) => {
+                self.retained += partial_json.len();
+                partial.push_str(&partial_json);
+            }
+            (
+                ContentBlockDelta::ThinkingDelta { thinking: more },
+                ContentBlock::Thinking { thinking, .. },
+            ) => {
+                self.retained += more.len();
+                thinking.push_str(&more);
+            }
+            (
+                ContentBlockDelta::SignatureDelta { signature: more },
+                ContentBlock::Thinking { signature, .. },
+            ) => {
+                self.retained += more.len();
+                signature.push_str(&more);
+            }
+            (
+                ContentBlockDelta::CitationsDelta { citation },
+                ContentBlock::Text { citations, .. },
+            ) => citations.get_or_insert_with(Vec::new).push(citation),
+            _ => {}
+        }
+    }
+
+    /// A tool call's input, parsed from its deltas when the block closes.
+    /// Deltas that are no JSON document make the answer unreadable.
+    fn stop_block(&mut self, index: u32) -> Result<(), Unreadable> {
+        let Some(index) = slot(index) else {
+            return Ok(());
+        };
+        let (Some(block), Some(partial)) =
+            (self.blocks.get_mut(index), self.partial_json.get_mut(index))
+        else {
+            return Ok(());
+        };
+        if partial.is_empty() {
+            return Ok(());
+        }
+        let Ok(value) = serde_json::from_str::<Value>(partial) else {
+            return Err(Unreadable);
+        };
+        match block {
+            ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. } => {
+                *input = value;
+            }
+            _ => {}
+        }
+        partial.clear();
+        Ok(())
+    }
+
+    /// The final `message_delta`: the stop and the usage of the whole answer.
+    fn message_delta(&mut self, delta: MessageDelta, usage: MessageDeltaUsage) {
+        let message = &mut self.message;
+        if delta.stop_reason.is_some() {
+            message.stop_reason = delta.stop_reason;
+        }
+        if delta.stop_sequence.is_some() {
+            message.stop_sequence = delta.stop_sequence;
+        }
+        if delta.stop_details.is_some() {
+            message.stop_details = delta.stop_details;
+        }
+        if delta.container.is_some() {
+            message.container = delta.container;
+        }
+        message.usage.output_tokens = usage.output_tokens;
+        if let Some(input_tokens) = usage.input_tokens {
+            message.usage.input_tokens = input_tokens;
+        }
+        if usage.cache_creation_input_tokens.is_some() {
+            message.usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+        }
+        if usage.cache_read_input_tokens.is_some() {
+            message.usage.cache_read_input_tokens = usage.cache_read_input_tokens;
+        }
+        if usage.server_tool_use.is_some() {
+            message.usage.server_tool_use = usage.server_tool_use;
+        }
+        if usage.output_tokens_details.is_some() {
+            message.usage.output_tokens_details = usage.output_tokens_details;
+        }
+    }
+}
+
+/// A content block's slot, for an index this gateway follows.
+fn slot(index: u32) -> Option<usize> {
+    usize::try_from(index)
+        .ok()
+        .filter(|&index| index < MAX_BLOCKS)
+}
+
+/// The end of the first complete event in `buffer` (the index after its
+/// blank line, in any of the three framings the relay reads), when there is
+/// one.
+fn event_end(buffer: &[u8]) -> Option<usize> {
+    find_frame_end(buffer, 0).map(|(at, len)| at + len)
+}
+
+/// Data this gateway cannot read as a stream event. The answer it is part
+/// of is not the one the client reads, so that answer is not stored.
+struct Unreadable;
+
+/// The event `block`'s data as the stream event it names: `Ok(None)` for a
+/// comment or a keep-alive without data, `Err` for data this gateway does
+/// not know. The one-line case, every token's, borrows its line.
+fn parse_event(block: &[u8]) -> Result<Option<MessageStreamEvent>, Unreadable> {
+    let text = std::str::from_utf8(block).map_err(|_| Unreadable)?;
+    let mut lines = text
+        .split(['\r', '\n'])
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|rest| rest.strip_prefix(' ').unwrap_or(rest));
+    let Some(first) = lines.next() else {
+        return Ok(None);
+    };
+    let parsed = match lines.next() {
+        None if first.trim().is_empty() => return Ok(None),
+        None => serde_json::from_str(first),
+        Some(second) => {
+            let mut data = String::with_capacity(block.len());
+            data.push_str(first);
+            for line in std::iter::once(second).chain(lines) {
+                data.push('\n');
+                data.push_str(line);
+            }
+            serde_json::from_str(&data)
+        }
+    };
+    parsed.map(Some).map_err(|_| Unreadable)
+}
+
+/// The `message_start` event with `message`, as the bytes of one event.
+fn start_event(message: &Message) -> Option<Vec<u8>> {
+    let data = serde_json::to_string(&MessageStreamEvent::MessageStart {
+        message: message.clone(),
+    })
+    .ok()?;
+    Some(format!("event: message_start\ndata: {data}\n\n").into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use axum::{body::Bytes, http::header, response::IntoResponse, Json};
     use futures::{stream, StreamExt};
-    use tokio::time::timeout;
     use tracing_test::traced_test;
 
     use super::*;
@@ -684,6 +1267,67 @@ mod tests {
         );
         assert!(turn.is_none());
         assert_eq!(request.messages.len(), 1);
+    }
+
+    /// A stored answer that carries an MCP exchange (the `mcp_tool_use` and
+    /// `mcp_tool_result` blocks the MCP loop writes beside its text) is read
+    /// back as the assistant's turn, blocks and all, so the thread continues.
+    #[tokio::test]
+    async fn a_stored_mcp_exchange_is_continued() {
+        let threads = MessageThreads::new();
+        let (_, turn) = accepted(
+            threads
+                .resolve(
+                    request(json!({
+                        "messages": [{"role": "user", "content": "look it up"}],
+                        "thread": {"type": "create"}
+                    })),
+                    None,
+                )
+                .await,
+        );
+        let answered = threads
+            .stored(
+                turn.expect("a turn"),
+                answer(
+                    "msg_mcp",
+                    json!([
+                        {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
+                        {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}], "is_error": false},
+                        {"type": "text", "text": "it is 42"}
+                    ]),
+                ),
+            )
+            .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let (rebuilt, turn) = accepted(
+            threads
+                .resolve(
+                    request(json!({
+                        "messages": [{"role": "user", "content": "thanks"}],
+                        "thread": {"type": "continue", "previous_message_id": "msg_mcp"}
+                    })),
+                    None,
+                )
+                .await,
+        );
+        assert!(turn.is_some());
+        assert_eq!(rebuilt.messages.len(), 3);
+        assert_eq!(rebuilt.messages[1].role, Role::Assistant);
+        let InputContent::Blocks(blocks) = &rebuilt.messages[1].content else {
+            panic!("blocks");
+        };
+        assert!(
+            matches!(
+                &blocks[..],
+                [
+                    InputContentBlock::McpToolUse(mcp_use),
+                    InputContentBlock::McpToolResult(result),
+                    InputContentBlock::Text(text)
+                ] if mcp_use.id == "mcptoolu_1" && result.tool_use_id == "mcptoolu_1" && text.text == "it is 42"
+            ),
+            "{blocks:?}"
+        );
     }
 
     /// A continue request becomes the whole conversation: the create turn's
@@ -813,8 +1457,9 @@ mod tests {
         }
     }
 
-    /// A streamed answer, an error and an answer with no id leave the turn
-    /// unstored, and the answer as it was; the next continue is the 404.
+    /// A streamed answer with no events, an error and an answer with no id
+    /// leave the turn unstored, and the answer as it was; the next continue
+    /// is the 404.
     #[tokio::test]
     async fn an_unstored_turn_cannot_be_continued() {
         let threads = MessageThreads::new();
@@ -1049,46 +1694,6 @@ mod tests {
         assert_eq!(error["error"]["details"]["error_code"], "thread_not_found");
     }
 
-    /// A streamed turn's answer is not read back, so `resolve` takes no
-    /// record of it: the request is not copied for a turn that is never
-    /// stored. An unstreamed turn's record is taken.
-    #[tokio::test]
-    async fn a_streamed_turn_takes_no_record() {
-        let threads = MessageThreads::new();
-        let create = |stream: bool| {
-            request(json!({
-                "stream": stream,
-                "messages": [{"role": "user", "content": "hi"}],
-                "thread": {"type": "create"}
-            }))
-        };
-        let (_, turn) = accepted(threads.resolve(create(true), None).await);
-        assert!(turn.expect("a turn").record.is_none(), "a streamed create");
-        let (_, turn) = accepted(threads.resolve(create(false), None).await);
-        let turn = turn.expect("a turn");
-        assert!(turn.record.is_some(), "a create");
-        threads
-            .stored(
-                turn,
-                answer("msg_root", json!([{"type": "text", "text": "x"}])),
-            )
-            .await;
-        let cont = |stream: bool| {
-            request(json!({
-                "stream": stream,
-                "messages": [{"role": "user", "content": "more"}],
-                "thread": {"type": "continue", "previous_message_id": "msg_root"}
-            }))
-        };
-        let (_, turn) = accepted(threads.resolve(cont(true), None).await);
-        assert!(
-            turn.expect("a turn").record.is_none(),
-            "a streamed continue"
-        );
-        let (_, turn) = accepted(threads.resolve(cont(false), None).await);
-        assert!(turn.expect("a turn").record.is_some(), "a continue");
-    }
-
     /// A reissued answer is serialized again under its fresh id, so the
     /// `content-length` of the answer it replaces does not go out with it.
     #[tokio::test]
@@ -1126,59 +1731,6 @@ mod tests {
         );
         let answer = body_of(reissued).await;
         assert_ne!(answer["id"], json!("msg_taken"));
-    }
-
-    /// A streamed turn goes to the client as it comes: the store reads no
-    /// stream back, and the turn stays unstored.
-    #[tokio::test]
-    async fn a_streamed_turn_is_not_read_back() {
-        let threads = MessageThreads::new();
-        let (_, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "stream": true,
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "thread": {"type": "create"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        let first = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sse\"}}\n\n";
-        let never_ending =
-            stream::iter([Ok::<_, std::io::Error>(Bytes::from(first))]).chain(stream::pending());
-        let sse = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from_stream(never_ending))
-            .expect("a response");
-        let answered = timeout(
-            Duration::from_secs(2),
-            threads.stored(turn.expect("a turn"), sse),
-        )
-        .await
-        .expect("a streamed turn is answered before its stream ends");
-        assert_eq!(answered.status(), StatusCode::OK);
-        let mut events = answered.into_body().into_data_stream();
-        let event = events
-            .next()
-            .await
-            .expect("the first event")
-            .expect("a readable event");
-        assert_eq!(event, first.as_bytes());
-        let refused = refusal(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "again"}],
-                        "thread": {"type": "continue", "previous_message_id": "msg_sse"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
     /// A thread whose create turn the store let go (the count bound reached
@@ -1328,6 +1880,624 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["m1", "a1", "m2", "a2", "m3"]);
+    }
+
+    /// A streamed answer as the router writes it: `events` as `event:` and
+    /// `data:` lines, then cut into frames at the byte offsets `cuts`.
+    fn sse(events: &[(&str, Value)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, data) in events {
+            out.extend_from_slice(format!("event: {name}\ndata: {data}\n\n").as_bytes());
+        }
+        out
+    }
+
+    fn streamed(bytes: &[u8], cuts: &[usize]) -> Response {
+        let mut frames = Vec::new();
+        let mut at = 0;
+        for &cut in cuts {
+            frames.push(Bytes::copy_from_slice(&bytes[at..cut]));
+            at = cut;
+        }
+        frames.push(Bytes::copy_from_slice(&bytes[at..]));
+        let body = Body::from_stream(stream::iter(
+            frames.into_iter().map(Ok::<_, std::io::Error>),
+        ));
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(body)
+            .expect("a response")
+    }
+
+    fn message_start(id: &str) -> (&'static str, Value) {
+        (
+            "message_start",
+            json!({"type": "message_start", "message": {
+                "id": id, "type": "message", "role": "assistant", "model": "m", "content": [],
+                "stop_reason": null, "stop_sequence": null,
+                "usage": {"input_tokens": 7, "output_tokens": 0}
+            }}),
+        )
+    }
+
+    fn text_events(id: &str, text: &str) -> Vec<(&'static str, Value)> {
+        vec![
+            message_start(id),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 3}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ]
+    }
+
+    fn create(text: &str, streamed: bool) -> CreateMessageRequest {
+        request(json!({
+            "stream": streamed,
+            "messages": [{"role": "user", "content": text}],
+            "thread": {"type": "create"}
+        }))
+    }
+
+    fn continue_from(id: &str, text: &str) -> CreateMessageRequest {
+        request(json!({
+            "messages": [{"role": "user", "content": text}],
+            "thread": {"type": "continue", "previous_message_id": id}
+        }))
+    }
+
+    /// The texts of a rebuilt conversation, one per message.
+    fn texts(request: &CreateMessageRequest) -> Vec<String> {
+        request
+            .messages
+            .iter()
+            .map(|message| match &message.content {
+                InputContent::String(text) => text.clone(),
+                InputContent::Blocks(blocks) => match &blocks[..] {
+                    [InputContentBlock::Text(text)] => text.text.clone(),
+                    other => panic!("one text block, not {other:?}"),
+                },
+            })
+            .collect()
+    }
+
+    /// A streamed create is stored from its events, cut across frames as
+    /// they come: the client reads the router's bytes unchanged, and the
+    /// continue from the `message_start` id carries the streamed text, the
+    /// stop reason and the usage of the final `message_delta`.
+    #[tokio::test]
+    async fn a_streamed_answer_is_stored_from_its_events() {
+        let threads = MessageThreads::new();
+        let bytes = sse(&text_events("msg_s1", "Hello, world"));
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let cuts = [17, 230, 231, bytes.len() - 5];
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &cuts))
+            .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        assert_eq!(
+            read.as_ref(),
+            bytes.as_slice(),
+            "the client's bytes are the router's"
+        );
+        let (rebuilt, _) = accepted(
+            threads
+                .resolve(continue_from("msg_s1", "again"), None)
+                .await,
+        );
+        assert_eq!(texts(&rebuilt), ["hi", "Hello, world", "again"]);
+        let (_, turns) = threads
+            .turns("msg_s1", None)
+            .await
+            .ok()
+            .expect("the thread");
+        let stored = &turns[0].raw_response;
+        assert_eq!(stored["stop_reason"], "end_turn");
+        assert_eq!(stored["usage"]["input_tokens"], 7);
+        assert_eq!(stored["usage"]["output_tokens"], 3);
+        assert_eq!(turns[0].input["messages"][0]["content"], "hi");
+    }
+
+    /// A streamed tool call's input is the JSON its deltas spell, parsed when
+    /// the block closes.
+    #[tokio::test]
+    async fn a_streamed_tool_call_is_stored_whole() {
+        let threads = MessageThreads::new();
+        let bytes = sse(&[
+            message_start("msg_t1"),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_1", "name": "f", "input": {}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": " [1, 2]}"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 9}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ]);
+        let (_, turn) = accepted(threads.resolve(create("call f", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+            .await;
+        to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        let (_, turns) = threads
+            .turns("msg_t1", None)
+            .await
+            .ok()
+            .expect("the thread");
+        let stored = &turns[0].raw_response;
+        assert_eq!(stored["content"][0]["type"], "tool_use");
+        assert_eq!(stored["content"][0]["input"], json!({"a": [1, 2]}));
+        assert_eq!(stored["stop_reason"], "tool_use");
+    }
+
+    /// A streamed answer whose `message_start` id is a stored turn's is
+    /// reissued in that event: the client continues under the fresh id, the
+    /// first turn keeps its own.
+    #[tokio::test]
+    async fn a_streamed_answer_under_a_stored_id_is_reissued() {
+        let threads = MessageThreads::new();
+        let (_, first) = accepted(threads.resolve(create("one", false), None).await);
+        let kept = threads
+            .stored(
+                first.expect("a turn"),
+                answer("msg_dup", json!([{"type": "text", "text": "first answer"}])),
+            )
+            .await;
+        assert_eq!(body_of(kept).await["id"], "msg_dup");
+        let bytes = sse(&text_events("msg_dup", "second answer"));
+        let (_, second) = accepted(threads.resolve(create("two", true), None).await);
+        let answered = threads
+            .stored(second.expect("a turn"), streamed(&bytes, &[40]))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        let text = std::str::from_utf8(&read).expect("utf-8");
+        let first_event = text.split("\n\n").next().expect("an event");
+        let data = first_event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("the message_start data");
+        let start: Value = serde_json::from_str(data).expect("json");
+        let fresh = start["message"]["id"].as_str().expect("an id").to_string();
+        assert_ne!(
+            fresh, "msg_dup",
+            "the colliding id is reissued in message_start"
+        );
+        assert!(text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        let (rebuilt, _) = accepted(threads.resolve(continue_from(&fresh, "three"), None).await);
+        assert_eq!(texts(&rebuilt), ["two", "second answer", "three"]);
+        let (rebuilt, _) = accepted(
+            threads
+                .resolve(continue_from("msg_dup", "more"), None)
+                .await,
+        );
+        assert_eq!(texts(&rebuilt), ["one", "first answer", "more"]);
+    }
+
+    /// A stream that ends before its `message_stop`, or that carries an error
+    /// event (here one a `message_stop` still follows), leaves no turn: the
+    /// place is given back at the stream's end, while the body is still held
+    /// (the drop guard is the other path), and the continue from its id is
+    /// the 404.
+    #[tokio::test]
+    async fn a_cut_or_failed_stream_leaves_no_turn() {
+        let threads = MessageThreads::new();
+        let mut cut = text_events("msg_cut", "half");
+        cut.truncate(3);
+        let mut failed = text_events("msg_failed", "half");
+        failed.truncate(3);
+        failed.push((
+            "error",
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "later"}}),
+        ));
+        failed.extend(text_events("msg_failed", "half").into_iter().skip(4));
+        for (id, events) in [("msg_cut", cut), ("msg_failed", failed)] {
+            let bytes = sse(&events);
+            let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+            let answered = threads
+                .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+                .await;
+            let mut data = answered.into_body().into_data_stream();
+            let mut read = Vec::new();
+            while let Some(frame) = data.next().await {
+                read.extend_from_slice(&frame.expect("the stream"));
+            }
+            assert_eq!(read.as_slice(), bytes.as_slice());
+            let kept = threads
+                .store
+                .get_response(&ResponseId::from(id))
+                .await
+                .expect("the store");
+            assert!(
+                kept.is_none(),
+                "{id}: the place is given back at the stream's end, while the body is still held"
+            );
+            drop(data);
+            let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{id}");
+        }
+    }
+
+    /// A stream with data this gateway cannot read (a content block of a
+    /// kind it does not know, a tool call whose input deltas are no JSON
+    /// document) reaches the client as it came and leaves no turn: the
+    /// record is the answer the client read or nothing, so the continue
+    /// from its id is the 404.
+    #[tokio::test]
+    async fn an_unreadable_stream_leaves_no_turn() {
+        let threads = MessageThreads::new();
+        let mut unknown_block = text_events("msg_unknown", "known");
+        unknown_block.splice(
+            4..4,
+            [
+                (
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": 1, "content_block": {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1", "content": []}}),
+                ),
+                (
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": 1}),
+                ),
+                (
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "after"}}),
+                ),
+                (
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": 2}),
+                ),
+            ],
+        );
+        let no_json = vec![
+            message_start("msg_nojson"),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_1", "name": "f", "input": {}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 9}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ];
+        for (id, events) in [("msg_unknown", unknown_block), ("msg_nojson", no_json)] {
+            let bytes = sse(&events);
+            let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+            let answered = threads
+                .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+                .await;
+            let read = to_bytes(answered.into_body(), usize::MAX)
+                .await
+                .expect("the stream");
+            assert_eq!(read.as_ref(), bytes.as_slice(), "{id}");
+            let kept = threads
+                .store
+                .get_response(&ResponseId::from(id))
+                .await
+                .expect("the store");
+            assert!(kept.is_none(), "{id}: the place is given back");
+            let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{id}");
+        }
+    }
+
+    /// A stream framed with CRLF blank lines (one of the relay's three
+    /// framings) reaches the client event by event as it comes, and is
+    /// stored whole.
+    #[tokio::test]
+    async fn a_crlf_framed_stream_passes_as_it_comes_and_is_stored() {
+        let threads = MessageThreads::new();
+        let mut bytes = Vec::new();
+        let mut cuts = Vec::new();
+        for (name, data) in &text_events("msg_crlf", "carriage") {
+            bytes.extend_from_slice(format!("event: {name}\r\ndata: {data}\r\n\r\n").as_bytes());
+            cuts.push(bytes.len());
+        }
+        cuts.pop();
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &cuts))
+            .await;
+        let mut data = answered.into_body().into_data_stream();
+        let first = data
+            .next()
+            .await
+            .expect("a frame")
+            .expect("the start event");
+        assert_eq!(
+            first.as_ref(),
+            &bytes[..cuts[0]],
+            "the first event is through on its own"
+        );
+        let mut read = first.to_vec();
+        while let Some(frame) = data.next().await {
+            read.extend_from_slice(&frame.expect("a frame"));
+        }
+        assert_eq!(read, bytes, "the client's bytes are the router's");
+        let (rebuilt, _) = accepted(
+            threads
+                .resolve(continue_from("msg_crlf", "again"), None)
+                .await,
+        );
+        assert_eq!(texts(&rebuilt), ["hi", "carriage", "again"]);
+    }
+
+    /// A body dropped before its `message_stop` (the client went away) gives
+    /// its place back: no record stays under the dropped id and the thread
+    /// cannot be continued from it.
+    #[tokio::test]
+    async fn a_dropped_stream_leaves_no_turn() {
+        let threads = MessageThreads::new();
+        let events = text_events("msg_dropped", "half");
+        let start = sse(&events[..1]).len();
+        let bytes = sse(&events);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[start]))
+            .await;
+        let mut data = answered.into_body().into_data_stream();
+        let first = data
+            .next()
+            .await
+            .expect("a frame")
+            .expect("the start event");
+        assert!(first.starts_with(b"event: message_start"), "{first:?}");
+        let reserved = threads
+            .store
+            .get_response(&ResponseId::from("msg_dropped"))
+            .await
+            .expect("the store");
+        assert!(reserved.is_some(), "the place is taken at message_start");
+        drop(data);
+        let kept = threads
+            .store
+            .get_response(&ResponseId::from("msg_dropped"))
+            .await
+            .expect("the store");
+        assert!(kept.is_none(), "the dropped place is given back");
+        let refused = refusal(
+            threads
+                .resolve(continue_from("msg_dropped", "again"), None)
+                .await,
+        );
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A streamed turn whose place the store's count bound dropped before
+    /// its `message_stop`, and whose id another turn took meanwhile, leaves
+    /// that turn alone: the streamed answer is not written over it, and the
+    /// continue from the id is the other turn's.
+    #[tokio::test]
+    async fn an_evicted_place_is_left_to_the_turn_that_took_its_id() {
+        let threads = MessageThreads::bounded(1);
+        let events = text_events("msg_evicted", "streamed");
+        let bytes = sse(&events);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(
+                turn.expect("a turn"),
+                streamed(&bytes, &[sse(&events[..1]).len()]),
+            )
+            .await;
+        let mut data = answered.into_body().into_data_stream();
+        let first = data
+            .next()
+            .await
+            .expect("a frame")
+            .expect("the start event");
+        assert!(first.starts_with(b"event: message_start"), "{first:?}");
+        let (_, other) = accepted(threads.resolve(create("other", false), None).await);
+        threads
+            .stored(
+                other.expect("a turn"),
+                answer("msg_other", json!([{"type": "text", "text": "pushes"}])),
+            )
+            .await;
+        let (_, taker) = accepted(threads.resolve(create("taker", false), None).await);
+        threads
+            .stored(
+                taker.expect("a turn"),
+                answer(
+                    "msg_evicted",
+                    json!([{"type": "text", "text": "took the id"}]),
+                ),
+            )
+            .await;
+        let mut read = first.to_vec();
+        while let Some(frame) = data.next().await {
+            read.extend_from_slice(&frame.expect("a frame"));
+        }
+        assert_eq!(read, bytes, "the client's bytes are the router's");
+        let (rebuilt, _) = accepted(
+            threads
+                .resolve(continue_from("msg_evicted", "again"), None)
+                .await,
+        );
+        assert_eq!(texts(&rebuilt), ["taker", "took the id", "again"]);
+    }
+
+    /// A stream cut after the store's count bound dropped its place, and
+    /// after another turn took the id, removes nothing: the other turn stays
+    /// and the continue from the id is its own.
+    #[tokio::test]
+    async fn a_cut_stream_leaves_an_evicted_place_to_the_turn_that_took_its_id() {
+        let threads = MessageThreads::bounded(1);
+        let events = text_events("msg_cut_evicted", "streamed");
+        let bytes = sse(&events);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(
+                turn.expect("a turn"),
+                streamed(&bytes, &[sse(&events[..1]).len()]),
+            )
+            .await;
+        let mut data = answered.into_body().into_data_stream();
+        let first = data
+            .next()
+            .await
+            .expect("a frame")
+            .expect("the start event");
+        assert!(first.starts_with(b"event: message_start"), "{first:?}");
+        let (_, other) = accepted(threads.resolve(create("other", false), None).await);
+        threads
+            .stored(
+                other.expect("a turn"),
+                answer("msg_other", json!([{"type": "text", "text": "pushes"}])),
+            )
+            .await;
+        let (_, taker) = accepted(threads.resolve(create("taker", false), None).await);
+        threads
+            .stored(
+                taker.expect("a turn"),
+                answer(
+                    "msg_cut_evicted",
+                    json!([{"type": "text", "text": "took the id"}]),
+                ),
+            )
+            .await;
+        drop(data);
+        let (rebuilt, _) = accepted(
+            threads
+                .resolve(continue_from("msg_cut_evicted", "again"), None)
+                .await,
+        );
+        assert_eq!(texts(&rebuilt), ["taker", "took the id", "again"]);
+    }
+
+    /// An answer with more content than the limit is not stored: the place
+    /// is given back as the deltas pass the bound, the client reads the
+    /// stream as it came, and the continue from its id is the 404.
+    #[tokio::test]
+    async fn an_answer_over_the_limit_leaves_no_turn() {
+        let threads = MessageThreads::new().limited(16);
+        let bytes = sse(&text_events("msg_big", "more than sixteen bytes of text"));
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        let refused = refusal(
+            threads
+                .resolve(continue_from("msg_big", "again"), None)
+                .await,
+        );
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A body with no event end within the limit is not a stream this
+    /// gateway reads. Before `message_start`, the bytes pass to the client
+    /// once they are over it, not at the body's end. After it, the place is
+    /// given back and the bytes keep passing; the continue is the 404.
+    #[tokio::test]
+    async fn a_body_without_an_event_end_passes_once_over_the_limit() {
+        let threads = MessageThreads::new();
+        let big = vec![b'x'; EVENT_LIMIT + 1];
+        let mut bytes = big.clone();
+        bytes.extend_from_slice(b"tail");
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[big.len()]))
+            .await;
+        let mut data = answered.into_body().into_data_stream();
+        let first = data.next().await.expect("a frame").expect("the held bytes");
+        assert_eq!(
+            first.len(),
+            big.len(),
+            "the held bytes pass before the body ends"
+        );
+        let mut read = first.to_vec();
+        while let Some(frame) = data.next().await {
+            read.extend_from_slice(&frame.expect("a frame"));
+        }
+        assert_eq!(read, bytes);
+
+        let start = sse(&text_events("msg_noend", "")[..1]);
+        let mut bytes = start.clone();
+        bytes.extend_from_slice(b"data: ");
+        bytes.extend_from_slice(&vec![b'y'; EVENT_LIMIT + 1]);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[start.len()]))
+            .await;
+        let mut data = answered.into_body().into_data_stream();
+        let first = data
+            .next()
+            .await
+            .expect("a frame")
+            .expect("the start event");
+        assert_eq!(first.as_ref(), start.as_slice());
+        let reserved = threads
+            .store
+            .get_response(&ResponseId::from("msg_noend"))
+            .await
+            .expect("the store");
+        assert!(reserved.is_some(), "the place is taken at message_start");
+        let second = data
+            .next()
+            .await
+            .expect("a frame")
+            .expect("the unending event");
+        assert_eq!(second.len(), bytes.len() - start.len());
+        let kept = threads
+            .store
+            .get_response(&ResponseId::from("msg_noend"))
+            .await
+            .expect("the store");
+        assert!(kept.is_none(), "the place is given back over the limit");
+        assert!(data.next().await.is_none());
+        let refused = refusal(
+            threads
+                .resolve(continue_from("msg_noend", "again"), None)
+                .await,
+        );
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
     /// A thread longer than the history store's default chain depth of 100

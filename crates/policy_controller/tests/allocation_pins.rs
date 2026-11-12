@@ -131,6 +131,39 @@ fn a_decision_after_a_soft_filter_fallback_allocates_nothing() {
 }
 
 #[test]
+fn a_round_robin_decision_over_a_changing_survivor_set_allocates_nothing() {
+    // One tried exclusion rotating through the pool makes every survivor set
+    // new to the rotation table: its claim path must not allocate.
+    let engine = engine_of("round_robin");
+    for n in [64u32, 512] {
+        let view = fleet(n);
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let mut churn = |seed: u64| {
+            let tried = [view[(seed % u64::from(n)) as usize].id];
+            let f = RequestFacts {
+                tried: &tried,
+                ..facts(seed)
+            };
+            engine
+                .decide(&f, &pool(n), &view, &cx, &mut scratch)
+                .pick()
+                .is_some()
+        };
+        // The first decisions size the scratch for the largest survivor set
+        // the pin will see (an unhealthy row excluded leaves one more
+        // survivor than a healthy one excluded).
+        assert!(churn(5) && churn(1), "round_robin churn at {n} routes");
+        let (routed, allocations) = allocations_during(|| (2..66u64).all(&mut churn));
+        assert!(routed, "round_robin churn at {n} routes");
+        assert_eq!(
+            allocations, 0,
+            "round_robin churn at {n}: a decision allocated"
+        );
+    }
+}
+
+#[test]
 fn a_decision_over_credited_rows_allocates_nothing() {
     let engine = engine_of("least_load");
     let view = fleet(512);

@@ -241,7 +241,26 @@ Called from the router Deployment template.
 - "0.0.0.0"
 - "--port"
 - {{ .Values.router.port | quote }}
+{{- /* The admin listener's values the gateway would refuse at start are
+     refused here: a host without the port, and a port another rendered
+     listener holds (the data and metrics ports; the mesh port when the
+     mesh is on). */}}
+{{- if and .Values.router.adminHost (not .Values.router.adminPort) -}}
+{{- fail "router.adminHost without router.adminPort: the gateway refuses --admin-host without --admin-port" -}}
+{{- end -}}
 {{- if .Values.router.adminPort }}
+{{- $admin := int .Values.router.adminPort -}}
+{{- $taken := "" -}}
+{{- if eq $admin (int .Values.router.port) -}}
+{{- $taken = "router.port" -}}
+{{- else if eq $admin (int .Values.router.metrics.port) -}}
+{{- $taken = "router.metrics.port" -}}
+{{- else if and .Values.router.mesh.enabled (eq $admin (int .Values.router.mesh.port)) -}}
+{{- $taken = "router.mesh.port" -}}
+{{- end -}}
+{{- if $taken -}}
+{{- fail (printf "router.adminPort %d equals %s: the gateway refuses two listeners on one port" $admin $taken) -}}
+{{- end }}
 - "--admin-port"
 - {{ .Values.router.adminPort | quote }}
 {{- with .Values.router.adminHost }}

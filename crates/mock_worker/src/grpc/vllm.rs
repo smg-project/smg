@@ -103,19 +103,27 @@ impl VllmEngine for MockScheduler {
         };
         let params = req.sampling_params.unwrap_or_default();
         // The pair's rendezvous on this wire is the connector's parameters,
-        // opaque to the mock: present in either form, or absent.
+        // opaque to the mock: present in either form, or absent. A typed
+        // pair that names no host or port is carried, not absent: the check
+        // reports it under its own field, not as a missing JSON form.
         let rendezvous = if req
             .kv_transfer_params_json
             .as_deref()
             .is_some_and(|json| !json.is_empty())
-            || req
-                .kv_transfer_params
-                .as_ref()
-                .is_some_and(|params| !params.remote_host.is_empty() && params.remote_port > 0)
         {
             Rendezvous::Opaque
         } else {
-            Rendezvous::None
+            match req.kv_transfer_params {
+                Some(params) if !params.remote_host.is_empty() && params.remote_port > 0 => {
+                    Rendezvous::Opaque
+                }
+                Some(params) => Rendezvous::Emptied {
+                    field: "kv_transfer_params",
+                    host: params.remote_host,
+                    port: params.remote_port,
+                },
+                None => Rendezvous::None,
+            }
         };
         let frames = self
             .generate_frames(GenerateInput {
@@ -908,6 +916,87 @@ mod tests {
                 "{role:?}: the JSON parameters are a rendezvous"
             );
         }
+    }
+
+    /// A typed pair that names no host or no port is refused as that pair,
+    /// not as a missing `kv_transfer_params_json`: the legacy connector path
+    /// sends the typed pair, so an unresolved bootstrap host there reads under
+    /// its own field, with the port as the wire carried it. The prefill side
+    /// takes it, as it takes a request without the parameters.
+    #[tokio::test]
+    async fn an_emptied_typed_pair_is_refused_under_its_own_field() {
+        let (decode, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Decode),
+                grpc_wire: SchedulerWire::Vllm,
+                ..Config::default()
+            },
+            65_236,
+        );
+        let mut emptied = request("vw-e1", &[1, 2, 3], false);
+        emptied.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: String::new(),
+            remote_port: 0,
+        });
+        let refused = decode
+            .generate(Request::new(emptied))
+            .await
+            .err()
+            .expect("an emptied pair, not a stream");
+        assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+        assert!(
+            refused
+                .message()
+                .contains("kv_transfer_params names no rendezvous (host \"\", port 0)"),
+            "{refused:?}"
+        );
+        let mut no_port = request("vw-e2", &[1, 2, 3], false);
+        no_port.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: "10.0.0.9".to_string(),
+            remote_port: 0,
+        });
+        let refused = decode
+            .generate(Request::new(no_port))
+            .await
+            .err()
+            .expect("no port, not a stream");
+        assert!(
+            refused.message().contains("host \"10.0.0.9\", port 0"),
+            "{refused:?}"
+        );
+        // The other half of the guard, with a port the wire's uint32 carries
+        // and an i32 would not: the refusal names it whole.
+        let mut no_host = request("vw-e4", &[1, 2, 3], false);
+        no_host.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: String::new(),
+            remote_port: 3_000_000_000,
+        });
+        let refused = decode
+            .generate(Request::new(no_host))
+            .await
+            .err()
+            .expect("no host, not a stream");
+        assert!(
+            refused.message().contains("host \"\", port 3000000000"),
+            "{refused:?}"
+        );
+        let (prefill, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Prefill),
+                grpc_wire: SchedulerWire::Vllm,
+                ..Config::default()
+            },
+            65_237,
+        );
+        let mut emptied = request("vw-e3", &[1, 2, 3], false);
+        emptied.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: String::new(),
+            remote_port: 0,
+        });
+        assert!(
+            !read_frames(&prefill, emptied).await.is_empty(),
+            "the prefill side takes an emptied pair, as it takes none"
+        );
     }
 
     /// A prefill worker answers the prompt side's completion alone and

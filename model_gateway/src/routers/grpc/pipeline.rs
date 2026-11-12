@@ -335,8 +335,7 @@ impl RequestPipeline {
             deps.prefill_admission.clone(),
         )
         .with_queue_timeout(deps.queue_timeout);
-        let plan_kind = mode.plan_kind();
-        let inject_pd_metadata = mode.inject_pd_metadata();
+        let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
         let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
@@ -364,8 +363,7 @@ impl RequestPipeline {
                     worker_selection,
                     encode,
                     request_building: Box::new(ChatGenerateRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(ChatGenerateResponseProcessingStage::new(
                         processor,
@@ -382,10 +380,7 @@ impl RequestPipeline {
                     rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(MessageRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(MessageRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(MessageResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -400,10 +395,7 @@ impl RequestPipeline {
                     rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(CompletionRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(CompletionRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(CompletionResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -421,8 +413,7 @@ impl RequestPipeline {
                     worker_selection,
                     encode: None,
                     request_building: Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(
                         harmony::stages::HarmonyResponseProcessingStage::new(),

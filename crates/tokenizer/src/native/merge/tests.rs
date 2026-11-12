@@ -706,7 +706,8 @@ fn models_the_table_cannot_stand_in_for_decline() {
             String::from_utf8_lossy(&piece)
         );
     }
-    // A byte without a token.
+    // A byte without a token: the table stands, and names the pieces that
+    // hold the byte as the model's.
     let table = bytes_char();
     let mut vocab = Vocab::default();
     for ch in table.iter().filter(|&&ch| ch != table[0x7F]) {
@@ -717,7 +718,11 @@ fn models_the_table_cannot_stand_in_for_decline() {
         .vocab_and_merges(vocab, Merges::new())
         .build()
         .expect("bpe");
-    assert_eq!(declined(missing), "byte 0x7f has no token");
+    let without = MergeTable::from_model(&ModelWrapper::BPE(missing), ByteTokens::Alphabet, None)
+        .expect("a table without the byte's token");
+    assert!(without.lacks_a_token_for(&[0x7F]));
+    assert!(without.lacks_a_token_for(b"a\x7fb"));
+    assert!(!without.lacks_a_token_for(b"ab"));
     // Not BPE at all.
     let word_level = ModelWrapper::WordLevel(WordLevel::default());
     assert_eq!(

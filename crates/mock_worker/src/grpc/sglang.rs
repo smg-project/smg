@@ -8,7 +8,7 @@
 //! The admin fan-out's flush and profile RPCs are answered by the core, the
 //! same on every wire.
 
-use std::pin::Pin;
+use std::{collections::BTreeMap, pin::Pin};
 
 use futures::{Stream, StreamExt};
 use sg::{
@@ -24,6 +24,90 @@ use crate::{engine::KvEventStream, script::MatchedStop};
 pub(super) type Server = SglangSchedulerServer<MockScheduler>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<sg::GenerateResponse, Status>> + Send>>;
 
+/// A request's media batches (`mm_inputs` and `extra_mm_inputs`, one per
+/// modality) against the shape the engine requires before it places their
+/// embeddings; the gateway builds them, so a wrong batch is a gateway
+/// regression the canned answer would otherwise hide. A reference batch
+/// (media URLs without a pixel tensor: the form the gateway hands a worker
+/// that processes media itself, resolved by the worker's processor or an
+/// encoder) is accepted as it stands, as the mock has neither. Each other
+/// batch: a known modality (image, video or audio), a video's placeholder
+/// token id, its pixel tensor (or a feature hash standing in for a validated
+/// identity), placeholder spans inside the prompt and disjoint across the
+/// request's batches, and, when the batch names its placeholder token id,
+/// that the prompt's tokens of that id are exactly the spans'. A batch
+/// without spans is left to the engine, which finds the placeholder tokens
+/// itself.
+fn check_mm_inputs(req: &sg::GenerateRequest) -> Result<(), Status> {
+    let prompt_ids = req
+        .tokenized
+        .as_ref()
+        .map_or(&[][..], |tokenized| tokenized.input_ids.as_slice());
+    let mut covered: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut claimed = Vec::new();
+    let batches = req
+        .mm_inputs
+        .iter()
+        .map(|batch| batch.as_ref())
+        .chain(req.extra_mm_inputs.iter());
+    for (index, mm) in batches.enumerate() {
+        let what = format!("media batch {index}");
+        let names_references = mm.pixel_values.is_none()
+            && !(mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty());
+        if names_references {
+            continue;
+        }
+        let modality = mm.modalities.first().map_or("", String::as_str);
+        if !matches!(modality, "image" | "video" | "audio")
+            || mm.modalities.iter().any(|name| name != modality)
+        {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} names no one known modality, got {:?}",
+                mm.modalities
+            )));
+        }
+        if modality == "video" && mm.im_token_id.is_none() {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} is a video batch without its placeholder token id"
+            )));
+        }
+        let has_tensor = mm
+            .pixel_values
+            .as_ref()
+            .is_some_and(|tensor| !tensor.data.is_empty());
+        let has_identity = mm.feature_hash.is_some()
+            && mm.image_urls.is_empty()
+            && mm.video_urls.is_empty()
+            && mm.audio_urls.is_empty();
+        if !has_tensor && !has_identity {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} carries no pixel_values and no feature hash"
+            )));
+        }
+        if mm.mm_placeholders.is_empty() {
+            continue;
+        }
+        let spans = mm
+            .mm_placeholders
+            .iter()
+            .map(|placeholder| (placeholder.offset, placeholder.length));
+        let length = super::check_placeholder_spans(
+            Some(prompt_ids),
+            spans,
+            mm.im_token_id,
+            &mut claimed,
+            &what,
+        )?;
+        if let Some(id) = mm.im_token_id {
+            *covered.entry(id).or_default() += length;
+        }
+    }
+    for (id, length) in covered {
+        super::check_placeholder_tokens(prompt_ids, id, length)?;
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl SglangScheduler for MockScheduler {
     type GenerateStream = GenStream;
@@ -35,6 +119,7 @@ impl SglangScheduler for MockScheduler {
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let req = request.into_inner();
+        check_mm_inputs(&req)?;
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
         let rendezvous = req
@@ -775,5 +860,201 @@ mod tests {
             .await
             .expect_err("a service the worker does not serve");
         assert_eq!(unknown.code(), Code::NotFound);
+    }
+
+    /// An image batch as the gateway builds it: one span over the placeholder
+    /// token 9, a pixel tensor, the token id named.
+    fn image_batch(offset: u32, length: u32) -> sg::MultimodalInputs {
+        sg::MultimodalInputs {
+            modalities: vec!["image".to_string()],
+            pixel_values: Some(sg::TensorData {
+                data: vec![0; 16].into(),
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+            }),
+            im_token_id: Some(9),
+            mm_placeholders: vec![sg::PlaceholderRange { offset, length }],
+            ..Default::default()
+        }
+    }
+
+    fn with_batch(
+        mut req: sg::GenerateRequest,
+        batch: sg::MultimodalInputs,
+    ) -> sg::GenerateRequest {
+        req.mm_inputs = Some(Box::new(batch));
+        req
+    }
+
+    async fn refused_batch(service: &MockScheduler, req: sg::GenerateRequest) -> Status {
+        match service.generate(Request::new(req)).await {
+            Err(status) => status,
+            Ok(_) => panic!("the malformed media batch was accepted"),
+        }
+    }
+
+    fn media_service(port: u16) -> (MockScheduler, tokio::sync::watch::Sender<bool>) {
+        MockScheduler::for_tests(
+            Config {
+                grpc_wire: SchedulerWire::Sglang,
+                ..Config::default()
+            },
+            port,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_media_batch_is_accepted() {
+        let (service, _stop) = media_service(65_350);
+        let frames = read_frames(
+            &service,
+            with_batch(request("sg-mm-ok", &[1, 9, 9, 2], true), image_batch(1, 2)),
+        )
+        .await;
+        assert!(!frames.is_empty(), "the answer streams");
+    }
+
+    #[tokio::test]
+    async fn a_reference_batch_is_accepted_as_the_worker_processed_form() {
+        // The gateway's media references for a worker that processes media
+        // itself: the URLs alone, no modality, no tensor, no feature hash
+        // and no spans.
+        let (service, _stop) = media_service(65_358);
+        let image = sg::MultimodalInputs {
+            image_urls: vec!["https://example.test/a.png".to_string()],
+            ..Default::default()
+        };
+        let video = sg::MultimodalInputs {
+            video_urls: vec!["https://example.test/a.mp4".to_string()],
+            ..Default::default()
+        };
+        for (id, batch) in [("sg-mm-ref-image", image), ("sg-mm-ref-video", video)] {
+            let frames = read_frames(&service, with_batch(request(id, &[1, 2], true), batch)).await;
+            assert!(!frames.is_empty(), "{id}: the answer streams");
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_placeholders_across_batches_are_refused_on_this_wire() {
+        let (service, _stop) = media_service(65_359);
+        let mut req = with_batch(
+            request("sg-mm-overlap", &[1, 9, 9, 2], true),
+            image_batch(1, 1),
+        );
+        req.extra_mm_inputs.push(image_batch(1, 1));
+        let status = refused_batch(&service, req).await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media batch 1")
+                && status
+                    .message()
+                    .contains("overlaps an earlier placeholder at token 1"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_batch_without_pixels_or_a_feature_hash_is_refused() {
+        let (service, _stop) = media_service(65_351);
+        let mut batch = image_batch(1, 2);
+        batch.pixel_values = None;
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-px", &[1, 9, 9, 2], true), batch),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media batch 0") && status.message().contains("pixel_values"),
+            "{status:?}"
+        );
+        let mut identity = image_batch(1, 2);
+        identity.pixel_values = None;
+        identity.feature_hash = Some(42);
+        service
+            .generate(Request::new(with_batch(
+                request("sg-mm-id", &[1, 9, 9, 2], true),
+                identity,
+            )))
+            .await
+            .expect("a feature hash stands in for the tensor");
+    }
+
+    #[tokio::test]
+    async fn a_media_batch_with_an_unknown_modality_is_refused() {
+        let (service, _stop) = media_service(65_352);
+        let mut batch = image_batch(1, 2);
+        batch.modalities = vec!["point_cloud".to_string()];
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-mod", &[1, 9, 9, 2], true), batch),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("known modality"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn a_video_batch_without_its_placeholder_token_id_is_refused() {
+        let (service, _stop) = media_service(65_353);
+        let mut batch = image_batch(1, 2);
+        batch.modalities = vec!["video".to_string()];
+        batch.im_token_id = None;
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-vid", &[1, 9, 9, 2], true), batch),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("placeholder token id"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placeholder_outside_the_prompt_is_refused_on_this_wire() {
+        let (service, _stop) = media_service(65_354);
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-out", &[1, 9, 9, 2], true), image_batch(3, 2)),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("outside the prompt of 4 tokens"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placeholder_that_does_not_cover_its_token_is_refused_on_this_wire() {
+        let (service, _stop) = media_service(65_355);
+        let status = refused_batch(
+            &service,
+            with_batch(
+                request("sg-mm-cover", &[1, 9, 9, 2], true),
+                image_batch(0, 2),
+            ),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("not its placeholder token 9"),
+            "{status:?}"
+        );
+        let status = refused_batch(
+            &service,
+            with_batch(
+                request("sg-mm-stray", &[1, 9, 9, 9], true),
+                image_batch(1, 2),
+            ),
+        )
+        .await;
+        assert!(
+            status.message().contains("holds 3 placeholder token(s) 9")
+                && status.message().contains("cover 2"),
+            "{status:?}"
+        );
     }
 }

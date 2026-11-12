@@ -11,11 +11,28 @@
 //! The rows carry what the built-in stages read; a field no stage reads yet
 //! (wire modes, zones, labels, the index's overlap) stays at its default
 //! until the step that feeds it. The regular placement sites decide through
-//! the host (`routers::common::placement::select_from`); the pair, encode and
-//! admission paths follow in later steps. A removed worker's rows leave the
+//! the host (`routers::common::placement::select_from`) and the encode items
+//! of an encode-prefill-decode request through [`Decider::decide_encode_items`]
+//! (the gRPC worker-selection stage); the pair and admission paths follow in
+//! later steps. A removed worker's rows leave the
 //! engine's accounting with it ([`Decider::on_worker_removed`], from the
-//! policy registry's removal path); the rest of the membership feed (added,
+//! policy registry's removal path), and its session pins go with them: a key
+//! whose owner was removed keeps its failover as the owner, a key with no pin
+//! left is placed afresh. A worker re-registered at the same address is a new
+//! id to the engine, so its old keys do not come back to it (the legacy maps
+//! pin by URL and give them back). The rest of the membership feed (added,
 //! replaced, resized, snapshot) follows in a later step.
+//!
+//! A session (the routing-key header, else the rid-derived key) is a
+//! binding's `sessions` rule in the engine: the `manual` policy pins every
+//! key, and the sticky routing-key override attaches the same rule to the
+//! default policy's binding. The host hands the engine the key under the
+//! model and phase it is for, as the legacy keyed paths namespace their pins,
+//! and the engine's session table learns the pin at the commit from the
+//! decision's own verdict, which the commit copies from the pick onto the
+//! lease (a fresh key is claimed at its decision). The in-flight cap reads
+//! the host's per-key count on each worker, the one the load guard keeps
+//! under the raw key.
 
 use std::{
     cell::RefCell,
@@ -31,15 +48,22 @@ use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::{Mutex, RwLock};
 use smg_policy_controller::{
     fingerprint,
-    spec::{BindingSpec, LeastLoadParams, ProfileSpec, ScoreSpec, ScoreStage},
-    Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId, LeaseKind,
-    Lifecycle, LoadRow, Membership, Needs, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts,
-    Role, Scratch, Side, SignalSource, SpecError, Target, WorkerId,
+    spec::{
+        BindingSpec, LeastLoadParams, PlanName, ProfileSpec, ScoreSpec, ScoreStage,
+        MANUAL_SESSION_HEADER,
+    },
+    store::{identity, identity_of},
+    Assignment, Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId,
+    LeaseKind, Lifecycle, LoadRow, MediaCounts, Membership, Needs, PairPools, Phase, PolicySpec,
+    PoolFacts, Recovery, RequestFacts, Role, Scratch, SessionVerdict, SessionsSpec, Side,
+    SignalSource, SpecError, Target, WorkerId,
 };
 use tracing::debug;
 
+use super::registry::STICKY_INFLIGHT_CAP;
 use crate::{
-    config::{PolicyConfig, PowerOfTwoLoadMetric},
+    config::{ManualAssignmentMode, PolicyConfig, PowerOfTwoLoadMetric, RoutingKeyOverrideConfig},
+    policies::{host_stores::HostStores, normalize_model_key},
     routers::common::pd_admission,
     worker::{
         expected_wait::DEFAULT_MEAN_PREFILL_TOKENS,
@@ -80,6 +104,22 @@ pub fn preset_name(config: &PolicyConfig) -> Option<&'static str> {
         } => return None,
         PolicyConfig::PowerOfTwo { .. } => "power_of_two",
         PolicyConfig::LeastLoad { .. } => "least_load",
+        PolicyConfig::Manual { .. } => "manual",
+        _ => return None,
+    })
+}
+
+/// The engine preset an encode policy configuration is served as: the three
+/// policies the encode side takes, each carried in this build; `None` for
+/// anything else. The default side keeps [`preset_name`]: the consistent
+/// hashing preset serves encode items, whose keys are content hashes, and
+/// not yet the regular path, whose keyed form (the positional target header,
+/// the implicit client keys) moves behind the view in a later step.
+pub fn encode_preset_name(config: &PolicyConfig) -> Option<&'static str> {
+    Some(match config {
+        PolicyConfig::Random => "random",
+        PolicyConfig::RoundRobin => "round_robin",
+        PolicyConfig::ConsistentHashing => "consistent_hashing",
         _ => return None,
     })
 }
@@ -161,17 +201,142 @@ fn tune(profile: &mut ProfileSpec, config: &PolicyConfig) {
             profile.score = vec![ScoreSpec::Name("least-load".into())];
             profile.pick = "count-first".into();
         }
+        // The manual policy's assignment of a new key is its profile: random
+        // draws, min_load and delegate (nothing underneath to delegate to)
+        // take the fewest requests in flight, min_group the fewest sessions.
+        PolicyConfig::Manual {
+            assignment_mode, ..
+        } => match assignment_mode {
+            ManualAssignmentMode::Random => {}
+            ManualAssignmentMode::MinLoad | ManualAssignmentMode::Delegate => {
+                profile.score = vec![ScoreSpec::Name("least-requests".into())];
+                profile.pick = "best".into();
+            }
+            ManualAssignmentMode::MinGroup => {
+                profile.score = vec![ScoreSpec::Name("fewest-sessions".into())];
+                profile.pick = "best".into();
+            }
+        },
         _ => {}
     }
 }
 
+/// The sessions rule of the default binding: the `manual` policy pins every
+/// key, recovers to its oldest pin and caps nothing; under the sticky
+/// routing-key override every other policy pins its keys at the override's
+/// assignment and in-flight cap, recovering to the latest pin under
+/// `delegate` and to the first pin under the other assignments, as the
+/// legacy override fronts a delegated pick and keeps an assigned pin's
+/// original first. A zero idle time or a zero sweep interval keeps entries
+/// for ever, as either leaves the legacy eviction thread off. The override's
+/// headers are the rule's, lowercased and each once; one on the engine's
+/// deny-list refuses the start under the engine (a session header is an
+/// allow-listed header of the view), where the legacy override takes it.
+fn sessions_of(default: &PolicyConfig, sticky: &RoutingKeyOverrideConfig) -> Option<SessionsSpec> {
+    // The schema's largest idle time or sweep is for ever, which is what a
+    // zero of either legacy setting means (the eviction thread off).
+    let lifetime = |max_idle_secs: u64, eviction_interval_secs: u64| {
+        if max_idle_secs == 0 || eviction_interval_secs == 0 {
+            (u32::MAX, u32::MAX)
+        } else {
+            let seconds = |secs: u64| u32::try_from(secs).unwrap_or(u32::MAX);
+            (seconds(max_idle_secs), seconds(eviction_interval_secs))
+        }
+    };
+    match default {
+        PolicyConfig::Manual {
+            eviction_interval_secs,
+            max_idle_secs,
+            ..
+        } => {
+            let (ttl_s, sweep_s) = lifetime(*max_idle_secs, *eviction_interval_secs);
+            Some(SessionsSpec {
+                sticky_header: MANUAL_SESSION_HEADER.into(),
+                headers: vec![],
+                ttl_s,
+                sweep_s,
+                assignment: Assignment::Delegate,
+                // The schema's largest cap is no cap, as the manual policy has none.
+                inflight_cap: u16::MAX,
+                issue_session_id: false,
+                recovery: Recovery::Original,
+            })
+        }
+        _ if sticky.enabled => {
+            let (ttl_s, sweep_s) = lifetime(sticky.max_idle_secs, sticky.eviction_interval_secs);
+            // Lowercased and each name once, in order: the registry keeps
+            // the operator's list as written, the view lists a name once.
+            let mut headers: Vec<String> = Vec::with_capacity(sticky.headers.len());
+            for header in &sticky.headers {
+                let name = header.to_ascii_lowercase();
+                if !headers.contains(&name) {
+                    headers.push(name);
+                }
+            }
+            let sticky_header = headers
+                .first()
+                .cloned()
+                .unwrap_or_else(|| MANUAL_SESSION_HEADER.into());
+            let recovery = if sticky.assignment_mode == ManualAssignmentMode::Delegate {
+                Recovery::Latest
+            } else {
+                Recovery::Original
+            };
+            Some(SessionsSpec {
+                sticky_header,
+                headers: if headers.len() > 1 { headers } else { vec![] },
+                ttl_s,
+                sweep_s,
+                assignment: assignment_of(sticky.assignment_mode),
+                inflight_cap: STICKY_INFLIGHT_CAP,
+                issue_session_id: false,
+                recovery,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The engine's assignment of a new key for the override's mode.
+fn assignment_of(mode: ManualAssignmentMode) -> Assignment {
+    match mode {
+        ManualAssignmentMode::Random => Assignment::Random,
+        ManualAssignmentMode::MinLoad => Assignment::MinLoad,
+        ManualAssignmentMode::MinGroup => Assignment::MinGroup,
+        ManualAssignmentMode::Delegate => Assignment::Delegate,
+    }
+}
+
+/// The scope a session key pins under: its model and phase, so one key is
+/// one session per model and the prefill and decode sides stick
+/// independently, as the legacy keyed paths namespace their pins.
+fn session_scope(model: &str, phase: Phase) -> u64 {
+    fingerprint(normalize_model_key(model).as_bytes())
+        ^ (phase as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+/// The number standing for a worker's incarnation until the controller's
+/// store numbers them: the handle's address, as the load feed's provenance
+/// fence reads it. A same-URL replacement is a new handle.
+pub fn incarnation(worker: &dyn Worker) -> u64 {
+    (worker as *const dyn Worker).cast::<()>().addr() as u64
+}
+
 /// The stable id of a worker in the view: its registration key (the URL)
-/// and the incarnation behind the handle, so a same-URL replacement is a new
-/// id. Until the controller's store numbers incarnations, the handle's
-/// address stands for it, as the load feed's provenance fence does.
+/// and its incarnation, under the store's identity rule, so a same-URL
+/// replacement is a new id and the host's rows carry the view's ids.
 pub fn worker_id(worker: &dyn Worker) -> WorkerId {
-    let handle = (worker as *const dyn Worker).cast::<()>().addr() as u64;
-    WorkerId(fingerprint(worker.url().as_bytes()) ^ handle.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+    identity(worker.url(), incarnation(worker))
+}
+
+/// The id of a worker handle and the worker's stable key for placement
+/// ([`Candidate::key`]), both from one pass over the registration key: the
+/// id under the store's identity rule, the key the fingerprint itself, so a
+/// ring positions the worker alike across its handles and across gateway
+/// replicas while the lifecycle still prunes by handle.
+pub fn worker_identity(worker: &dyn Worker) -> (WorkerId, u32) {
+    let stable = fingerprint(worker.url().as_bytes());
+    (identity_of(stable, incarnation(worker)), stable as u32)
 }
 
 /// Whether stages with `needs` read the request body: its text, or the
@@ -201,6 +366,9 @@ pub struct HostRequest<'a> {
     pub model: &'a str,
     /// The host's token count or estimate.
     pub prompt_tokens: u32,
+    /// The request's session key as the host resolved it (the routing-key
+    /// header, else the rid-derived key): the fact a binding's sessions rule
+    /// pins by, under the request's model and phase.
     pub session_key: Option<&'a str>,
     /// Base URLs of the workers earlier attempts dispatched to.
     pub tried: &'a [String],
@@ -212,6 +380,23 @@ pub struct HostRequest<'a> {
     /// The prefill capacity window as the host reads it, when the decision
     /// is a prefill side's; every candidate has capacity otherwise.
     pub has_capacity: Option<CapacityCheck<'a>>,
+}
+
+/// What the encode items of one request share, as the host holds it: the
+/// two predicates the rows' bits are read from, and the request's images.
+#[derive(Clone, Copy)]
+pub struct EncodeRequest<'a> {
+    pub model: &'a str,
+    /// The encoder pairs with the chosen prefill side (its runtime and,
+    /// under a push handoff, its EC roles and connector): the row's
+    /// `ec_compatible` bit, the `epd` plan's first filter.
+    pub pairs_with_prefill: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    /// The encoder has a vision encoder: the row's `vision` bit, the plan's
+    /// second filter when the request carries images.
+    pub vision_capable: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    /// The request's image items, as the view's media count; zero lifts
+    /// the plan's vision rule.
+    pub images: u16,
 }
 
 /// The engine in the gateway process with the host's feeds.
@@ -226,6 +411,10 @@ pub struct Decider {
     /// under the lock they share.
     #[cfg(test)]
     between_check_and_booking: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// The store ingress over this process's structures, handed in under
+    /// `--policy-engine engine`; nothing reads or writes through it until the
+    /// step that moves the ingestion drivers.
+    stores: RwLock<Option<Arc<HostStores>>>,
     /// The host's clock origin: every instant in the view is microseconds
     /// since it.
     origin: Instant,
@@ -235,6 +424,13 @@ pub struct Decider {
     /// (`least_load`'s setting, the scorer's default under `power_of_two`),
     /// nothing otherwise.
     mean_prompt_tokens: u32,
+    /// What the engine's stages read, from its needs at the build: the two
+    /// per-key counts are map reads per row, so a row carries them only when
+    /// a stage reads them.
+    needs: Needs,
+    /// The engine binds an encode profile: the `epd` plan decides the encode
+    /// items of an encode-prefill-decode request.
+    encode: bool,
 }
 
 impl std::fmt::Debug for Decider {
@@ -259,17 +455,43 @@ struct ViewBuild<'a> {
 impl Decider {
     /// The engine for the gateway's policy configuration: the default policy
     /// bound to every model, the prefill and decode policies under the
-    /// `pd-pair` plan with the admission filters in front of each side.
+    /// `pd-pair` plan with the admission filters in front of each side. The
+    /// default binding pins sessions when the default policy is `manual`, or
+    /// when the sticky routing-key override (`sticky`) is enabled
+    /// (`sessions_of`).
     pub fn from_configs(
         default: &PolicyConfig,
         prefill: &PolicyConfig,
         decode: &PolicyConfig,
+        sticky: &RoutingKeyOverrideConfig,
+    ) -> Result<Self, EngineHostError> {
+        Self::from_configs_with_encode(default, prefill, decode, None, sticky)
+    }
+
+    /// [`Decider::from_configs`] with the encode side of an
+    /// encode-prefill-decode deployment: the three sides under the `epd`
+    /// plan, the encode profile over the encode pool with the plan's
+    /// compatibility and vision rules in front of it. An encode policy the
+    /// encode side does not carry ([`encode_preset_name`]) is refused by
+    /// name.
+    pub fn from_configs_with_encode(
+        default: &PolicyConfig,
+        prefill: &PolicyConfig,
+        decode: &PolicyConfig,
+        encode: Option<&PolicyConfig>,
+        sticky: &RoutingKeyOverrideConfig,
     ) -> Result<Self, EngineHostError> {
         let (prefill_name, decode_name) = (
             preset_name(prefill).ok_or_else(|| unsupported(prefill))?,
             preset_name(decode).ok_or_else(|| unsupported(decode))?,
         );
-        let mut spec = PolicySpec::pair_presets(prefill_name, decode_name)?;
+        let mut spec = match encode {
+            Some(encode) => {
+                let encode_name = encode_preset_name(encode).ok_or_else(|| unsupported(encode))?;
+                PolicySpec::epd_presets(encode_name, prefill_name, decode_name)?
+            }
+            None => PolicySpec::pair_presets(prefill_name, decode_name)?,
+        };
         if let Some(profile) = spec.profiles.get_mut("prefill") {
             tune(profile, prefill);
         }
@@ -278,13 +500,30 @@ impl Decider {
         }
         spec.profiles
             .insert("default".to_string(), profile_of(default)?);
-        // The pair binding covers the two pair phases; every other phase
-        // resolves to the default profile.
+        // The plan's binding covers its phases (the pair's two, the encode
+        // phase too under `epd`); every other phase resolves to the default
+        // profile.
+        let phases = if encode.is_some() {
+            vec![Phase::Encode, Phase::Prefill, Phase::Decode]
+        } else {
+            vec![Phase::Prefill, Phase::Decode]
+        };
         for binding in &mut spec.bindings {
-            binding.matcher.phase = vec![Phase::Prefill, Phase::Decode];
+            binding.matcher.phase.clone_from(&phases);
+        }
+        let sessions = sessions_of(default, sticky);
+        if let Some(rule) = &sessions {
+            // The validator wants every header a sessions rule names in the
+            // view's list; the host feeds the key it resolved under them.
+            spec.view.headers = if rule.headers.is_empty() {
+                vec![rule.sticky_header.clone()]
+            } else {
+                rule.headers.clone()
+            };
         }
         spec.bindings.push(BindingSpec {
             profile: Some("default".to_string()),
+            sessions,
             ..BindingSpec::default()
         });
         Self::from_spec(&spec)
@@ -294,20 +533,30 @@ impl Decider {
     /// unknown prompt size is booked at the mean prefill of the profile
     /// named `default` when it prices tokens, nothing otherwise.
     pub fn from_spec(spec: &PolicySpec) -> Result<Self, EngineHostError> {
+        let engine = spec.validate()?;
         Ok(Self {
-            engine: spec.validate()?,
+            needs: engine.needs(),
+            engine,
             loads: RwLock::new(None),
             retired: Mutex::new(Retired::default()),
             #[cfg(test)]
             between_check_and_booking: Mutex::new(None),
+            stores: RwLock::new(None),
             origin: Instant::now(),
             seq: AtomicU64::new(1),
             mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
+            encode: spec.bindings.iter().any(|b| b.plan == Some(PlanName::Epd)),
         })
     }
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Whether the engine binds an encode profile, so the encode items of an
+    /// encode-prefill-decode request are its decisions.
+    pub fn serves_encode(&self) -> bool {
+        self.encode
     }
 
     /// A worker removed from the pool takes its rows in the engine's
@@ -364,6 +613,17 @@ impl Decider {
         *self.loads.write() = rx;
     }
 
+    /// Hand the engine the host's store ingress (the registry, the monitors
+    /// and the admission counters behind the store traits).
+    pub fn set_stores(&self, stores: Arc<HostStores>) {
+        *self.stores.write() = Some(stores);
+    }
+
+    /// The host's store ingress, once handed in.
+    pub fn stores(&self) -> Option<Arc<HostStores>> {
+        self.stores.read().clone()
+    }
+
     fn snapshot(&self) -> Option<Arc<LoadSnapshot>> {
         self.loads.read().as_ref().map(|rx| rx.borrow().clone())
     }
@@ -403,9 +663,11 @@ impl Decider {
                 )
             },
         );
+        let (id, key) = worker_identity(worker.as_ref());
         Candidate {
             position,
-            id: worker_id(worker.as_ref()),
+            id,
+            key,
             role,
             dp_rank: worker
                 .dp_rank()
@@ -427,9 +689,17 @@ impl Decider {
             in_flight: u32::try_from(state.load).unwrap_or(u32::MAX),
             load,
             load_sampled_at_micros,
-            session_in_flight: session_key.map_or(0, |key| {
-                u16::try_from(worker.routing_key_inflight(key)).unwrap_or(u16::MAX)
-            }),
+            session_in_flight: match session_key {
+                Some(key) if self.needs.session_in_flight => {
+                    u16::try_from(worker.routing_key_inflight(key)).unwrap_or(u16::MAX)
+                }
+                _ => 0,
+            },
+            active_sessions: if self.needs.active_sessions {
+                u16::try_from(worker.routing_key_load()).unwrap_or(u16::MAX)
+            } else {
+                0
+            },
             pair_class,
             has_capacity,
             has_room: role != Role::Decode || pd_admission::has_free_room(worker.as_ref()),
@@ -445,6 +715,7 @@ impl Decider {
             target_index: 0,
             generation: self.engine.generation(),
             session_key: session_key.hash,
+            session: SessionVerdict::None,
             issued_micros: self.micros_since_origin(now),
             tokens,
         }
@@ -467,7 +738,9 @@ impl Decider {
         // the decision outdates this lease (see `Retired`).
         let id = LeaseId(self.seq.fetch_add(1, Ordering::Relaxed));
         let snapshot = self.snapshot();
-        let session_key = request.session_key.map_or(Identity::NONE, Identity::plain);
+        let session_key = request.session_key.map_or(Identity::NONE, |key| {
+            Identity::scoped(key, session_scope(request.model, request.phase))
+        });
         let build = ViewBuild {
             snapshot: snapshot.as_deref(),
             now,
@@ -523,6 +796,81 @@ impl Decider {
                 decision,
                 self.lease(id, now, request.prompt_tokens, session_key),
             )
+        })
+    }
+
+    /// Decide the encode items of one request: one view of `encoders`, with
+    /// each row's compatibility and vision bits read through the request's
+    /// predicates, and one decision per key under the `epd` plan's encode
+    /// profile. A key is an item's content hash and travels as the
+    /// decision's session key, so under the consistent-hash preset an item
+    /// lands on its key's ring owner and equal items share an encoder;
+    /// `excluded` are the ids a commit of an item just refused, for the one
+    /// re-decision of that item. The decisions come back in the keys' order
+    /// with their leases.
+    pub fn decide_encode_items(
+        &self,
+        request: &EncodeRequest<'_>,
+        encoders: &[Arc<dyn Worker>],
+        keys: &[u64],
+        excluded: &[WorkerId],
+    ) -> Vec<(Decision, Lease)> {
+        let now = Instant::now();
+        // Numbered before the view is built, one id per item: a retirement
+        // that lands during the decisions outdates every lease of this
+        // request (see `Retired`).
+        let first = self.seq.fetch_add(keys.len() as u64, Ordering::Relaxed);
+        let snapshot = self.snapshot();
+        let build = ViewBuild {
+            snapshot: snapshot.as_deref(),
+            now,
+            session_key: None,
+        };
+        VIEW.with(|view| {
+            let mut view = view.borrow_mut();
+            let View {
+                candidates,
+                scratch,
+                ..
+            } = &mut *view;
+            candidates.clear();
+            for (position, worker) in encoders.iter().enumerate() {
+                let mut row = self.candidate(&build, position as u32, worker, true, 0);
+                row.ec_compatible = (request.pairs_with_prefill)(worker);
+                row.vision = (request.vision_capable)(worker);
+                candidates.push(row);
+            }
+            let now_micros = self.micros_since_origin(now);
+            let pool = PoolFacts {
+                pool_size: encoders.len() as u32,
+                generation: self.engine.generation(),
+                ..PoolFacts::default()
+            };
+            let cx = Constraints {
+                excluded,
+                ..Constraints::default()
+            };
+            keys.iter()
+                .enumerate()
+                .map(|(item, &key)| {
+                    let session_key = Identity::hashed(key);
+                    let facts = RequestFacts {
+                        model: request.model,
+                        session_key,
+                        phase: Phase::Encode,
+                        media: MediaCounts {
+                            images: request.images,
+                            ..MediaCounts::default()
+                        },
+                        seed: self.seed(now_micros) ^ key,
+                        now_micros,
+                        ..RequestFacts::default()
+                    };
+                    let decision = self.engine.decide(&facts, &pool, candidates, &cx, scratch);
+                    let id = LeaseId(first + item as u64);
+                    (decision, self.lease(id, now, 0, session_key))
+                })
+                .collect()
         })
     }
 
@@ -651,6 +999,7 @@ impl Decider {
                 let booked = Lease {
                     side,
                     target_index: u8::try_from(index).unwrap_or(u8::MAX),
+                    session: pick.session,
                     ..*lease
                 };
                 // A lease decided before a side's retirement books nothing
@@ -692,8 +1041,12 @@ impl Decider {
     }
 }
 
-/// How many retirements the commit remembers: a lease older than that many
-/// is past every dispatch deadline.
+/// How many retirements the commit remembers by handle. Past the cap the
+/// oldest entry leaves and its bound becomes the record's watermark: a lease
+/// decided before the oldest remembered retirement books nothing, whatever
+/// handle it names, since that handle may be one the record forgot. The
+/// dispatch itself still goes; only its accounting is skipped, and a lease
+/// that old is past every dispatch deadline.
 const RETIRED_KEPT: usize = 1024;
 
 /// The handles the membership retired (removed, or replaced at their URL),
@@ -701,28 +1054,45 @@ const RETIRED_KEPT: usize = 1024;
 /// decided before that sequence books nothing on the handle, so the rows the
 /// retirement pruned do not come back through a late dispatch; a lease
 /// decided after it books as usual, as the id may be a new handle's (the
-/// allocator reuses addresses). The oldest entry leaves at the cap.
+/// allocator reuses addresses). The entries are kept in the order of their
+/// bounds; the oldest leaves at the cap, and its bound stays as the
+/// watermark every check reads first.
 #[derive(Debug, Default)]
 struct Retired {
     bound: HashMap<WorkerId, u64>,
     order: VecDeque<WorkerId>,
+    /// The bound of the newest entry the cap dropped: the order follows the
+    /// bounds, so a lease below it is older than every retirement the record
+    /// still names.
+    watermark: u64,
 }
 
 impl Retired {
     fn retire(&mut self, id: WorkerId, next_lease: u64) {
-        if self.bound.insert(id, next_lease).is_none() {
-            self.order.push_back(id);
-            if self.order.len() > RETIRED_KEPT {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.bound.remove(&oldest);
-                }
+        // A handle retired again (a successor at the same URL can carry the
+        // same id once the allocator reuses the address) moves to the back
+        // with its new bound, so the order stays the order of the bounds.
+        if self.bound.insert(id, next_lease).is_some() {
+            if let Some(at) = self.order.iter().position(|kept| *kept == id) {
+                self.order.remove(at);
+            }
+        }
+        self.order.push_back(id);
+        if self.order.len() > RETIRED_KEPT {
+            let dropped = self
+                .order
+                .pop_front()
+                .and_then(|oldest| self.bound.remove(&oldest));
+            if let Some(bound) = dropped {
+                self.watermark = self.watermark.max(bound);
             }
         }
     }
 
-    /// Whether `lease` was decided before `id`'s retirement.
+    /// Whether `lease` was decided before `id`'s retirement, or before the
+    /// oldest retirement the record still names.
     fn predates(&self, id: WorkerId, lease: LeaseId) -> bool {
-        self.bound.get(&id).is_some_and(|&bound| lease.0 < bound)
+        lease.0 < self.watermark || self.bound.get(&id).is_some_and(|&bound| lease.0 < bound)
     }
 }
 
@@ -733,7 +1103,7 @@ impl Retired {
 /// partial report or a rank without a rate leaves it unknown (zero), and
 /// the scorer prices the worker at the fleet's nominal rate. Any other
 /// role's drain is the generation rate of the ranks with a request running.
-fn load_row(
+pub(crate) fn load_row(
     report: &WorkerLoadResponse,
     worker_type: WorkerType,
     now: Instant,
@@ -851,7 +1221,45 @@ mod tests {
     }
 
     fn decider(config: &PolicyConfig) -> Decider {
-        Decider::from_configs(config, config, config).expect("a carried policy")
+        Decider::from_configs(config, config, config, &RoutingKeyOverrideConfig::default())
+            .expect("a carried policy")
+    }
+
+    /// The default policy under the sticky routing-key override.
+    fn overridden(config: &PolicyConfig, sticky: RoutingKeyOverrideConfig) -> Decider {
+        Decider::from_configs(
+            config,
+            config,
+            config,
+            &RoutingKeyOverrideConfig {
+                enabled: true,
+                ..sticky
+            },
+        )
+        .expect("a carried policy under the override")
+    }
+
+    fn manual(assignment_mode: ManualAssignmentMode) -> PolicyConfig {
+        PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 14_400,
+            assignment_mode,
+        }
+    }
+
+    /// Decide and commit one request under `key`; the committed position.
+    fn place(decider: &Decider, workers: &[Arc<dyn Worker>], key: &str) -> usize {
+        let keyed = HostRequest {
+            session_key: Some(key),
+            ..request()
+        };
+        let (decision, lease) = decider.decide(&keyed, workers, &[]);
+        let target = decider
+            .commit(&lease, &decision, Side::Single, |t| {
+                workers[t.position as usize].is_available()
+            })
+            .expect("a target");
+        target.position as usize
     }
 
     /// The host answers its static needs (the text questions, the load
@@ -909,7 +1317,9 @@ mod tests {
         for config in &configs {
             let name = config.name();
             let legacy = PolicyFactory::create_from_config(config);
-            let Ok(decider) = Decider::from_configs(config, config, config) else {
+            let Ok(decider) =
+                Decider::from_configs(config, config, config, &RoutingKeyOverrideConfig::default())
+            else {
                 assert!(preset_name(config).is_none(), "{name} is carried");
                 continue;
             };
@@ -938,7 +1348,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(carried, 7, "the five presets, power_of_two in three forms");
+        assert_eq!(carried, 8, "the six presets, power_of_two in three forms");
     }
 
     /// A removed worker's rows leave the engine's accounting with it: work
@@ -1079,9 +1489,13 @@ mod tests {
     #[test]
     fn a_policy_the_engine_does_not_carry_is_refused_by_name() {
         let carried = PolicyConfig::Random;
-        let Err(error) =
-            Decider::from_configs(&PolicyConfig::ConsistentHashing, &carried, &carried)
-        else {
+        let sticky = RoutingKeyOverrideConfig::default();
+        let Err(error) = Decider::from_configs(
+            &PolicyConfig::ConsistentHashing,
+            &carried,
+            &carried,
+            &sticky,
+        ) else {
             panic!("a policy the engine does not carry is refused");
         };
         assert!(error.to_string().contains("consistent_hashing"), "{error}");
@@ -1089,7 +1503,7 @@ mod tests {
             load_metric: PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 64 },
         };
         assert!(preset_name(&resident).is_none());
-        let Err(error) = Decider::from_configs(&carried, &resident, &carried) else {
+        let Err(error) = Decider::from_configs(&carried, &resident, &carried, &sticky) else {
             panic!("the resident-tokens metric is refused");
         };
         assert!(error.to_string().contains("resident_tokens"), "{error}");
@@ -1865,6 +2279,123 @@ mod tests {
             );
         }
     }
+    /// A commit under a lease older than the oldest retirement the record
+    /// still names books nothing either: the record forgets a handle past
+    /// its cap, and a lease that old may name one it forgot. The dispatch
+    /// itself still goes, and a lease decided after books as usual.
+    #[test]
+    fn a_commit_under_a_lease_older_than_the_oldest_remembered_retirement_books_nothing() {
+        let config = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = decider(&config);
+        let (workers, _reports) = fed_pair(&decider);
+        let request = HostRequest {
+            prompt_tokens: decider.prompt_tokens(None),
+            ..request()
+        };
+        let book = |position: u32| {
+            let (decision, lease) = decider.decide(&request, &workers, &[]);
+            decider
+                .commit(&lease, &decision, Side::Single, |t| t.position == position)
+                .expect("the wanted worker is booked");
+        };
+        let leader = || {
+            let (decision, _) = decider.decide(&request, &workers, &[]);
+            decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .iter()
+                .next()
+                .map(|t| t.position)
+        };
+        // Two leases decided while the found worker stands...
+        let stale = [
+            decider.decide(&request, &workers, &[]),
+            decider.decide(&request, &workers, &[]),
+        ];
+        // ...its retirement, then enough others' that its entry leaves the
+        // record (the handles stay alive, so no id is reused meanwhile)...
+        decider.on_worker_removed(workers[0].as_ref());
+        let churn = pool(RETIRED_KEPT);
+        for gone in &churn {
+            decider.on_worker_removed(gone.as_ref());
+        }
+        // ...and the stale commits after it: the dispatches go, nothing is booked.
+        for (decision, lease) in &stale {
+            decider
+                .commit(lease, decision, Side::Single, |t| t.position == 0)
+                .expect("the dispatch itself proceeds");
+        }
+        book(1);
+        assert_eq!(
+            leader(),
+            Some(0),
+            "the forgotten handle reads idle: the stale leases booked nothing"
+        );
+        // A lease decided after the churn books under the same id.
+        book(0);
+        book(0);
+        assert_eq!(
+            leader(),
+            Some(1),
+            "a lease decided after the oldest remembered retirement books as usual"
+        );
+    }
+    /// The record keeps the bound of the entry it drops at the cap as its
+    /// watermark: a lease below it predates whatever handle it names, a
+    /// lease at or above it is judged by the handle's own bound alone.
+    #[test]
+    fn the_retired_record_keeps_a_watermark_past_its_cap() {
+        let mut retired = Retired::default();
+        retired.retire(WorkerId(0), 5);
+        for id in 1..=u64::try_from(RETIRED_KEPT).expect("a small cap") {
+            retired.retire(WorkerId(id), 10);
+        }
+        assert!(
+            retired.predates(WorkerId(0), LeaseId(4)),
+            "below the watermark: older than every remembered retirement"
+        );
+        assert!(
+            !retired.predates(WorkerId(0), LeaseId(5)),
+            "at the watermark, the handle forgotten: books as a new handle's"
+        );
+        assert!(
+            retired.predates(WorkerId(1), LeaseId(9)),
+            "a remembered handle keeps its own bound"
+        );
+        assert!(!retired.predates(WorkerId(1), LeaseId(10)));
+    }
+    /// A handle retired again moves to the back of the order with its new
+    /// bound, so the entry the cap drops is always the oldest retirement
+    /// still named and the watermark never jumps past a remembered bound.
+    #[test]
+    fn a_handle_retired_again_moves_behind_the_entries_it_once_preceded() {
+        let mut retired = Retired::default();
+        retired.retire(WorkerId(0), 5);
+        retired.retire(WorkerId(1), 6);
+        retired.retire(WorkerId(0), 7);
+        // 1,023 more make 1,025: the cap drops one entry, the front, which
+        // is 1's since 0 moved behind it.
+        for id in 2..=u64::try_from(RETIRED_KEPT).expect("a small cap") {
+            retired.retire(WorkerId(id), 10);
+        }
+        // An id the record never saw is judged by the watermark alone.
+        let unknown = WorkerId(u64::MAX);
+        assert!(
+            !retired.predates(unknown, LeaseId(6)),
+            "the watermark is the dropped entry's bound of 6, not the re-retired handle's 7"
+        );
+        assert!(retired.predates(unknown, LeaseId(5)));
+        assert!(
+            retired.predates(WorkerId(0), LeaseId(6)),
+            "the re-retired handle is still named, under its new bound"
+        );
+        assert!(!retired.predates(WorkerId(0), LeaseId(7)));
+    }
     /// A retirement that lands while a decision runs, after the view read
     /// the pool and before the engine decided, outdates that lease too: the
     /// lease is numbered before the view is built.
@@ -1993,5 +2524,588 @@ mod tests {
             Some(0),
             "the retired handle reads idle: the retirement waited for the booking it then pruned"
         );
+    }
+
+    /// The manual policy pins a key at its first placement and keeps it
+    /// there; an unroutable owner hands the key to a failover, and the key
+    /// returns to its first owner once that worker is back: the pin list
+    /// remembers the oldest first, as the legacy manual policy's does.
+    #[test]
+    fn the_manual_policy_pins_a_key_and_recovers_to_its_first_owner() {
+        let decider = decider(&manual(ManualAssignmentMode::MinLoad));
+        let workers = pool(3);
+        let owner = place(&decider, &workers, "s1");
+        // A vacant key would go to a lighter worker.
+        for _ in 0..3 {
+            workers[owner].increment_load();
+        }
+        for _ in 0..4 {
+            assert_eq!(place(&decider, &workers, "s1"), owner);
+        }
+        workers[owner].set_status(WorkerStatus::NotReady);
+        let failover = place(&decider, &workers, "s1");
+        assert_ne!(failover, owner);
+        for _ in 0..3 {
+            assert_eq!(place(&decider, &workers, "s1"), failover);
+        }
+        workers[owner].set_status(WorkerStatus::Ready);
+        assert_eq!(
+            place(&decider, &workers, "s1"),
+            owner,
+            "the key returns to its first owner"
+        );
+        assert_eq!(decider.engine().sessions().len(), 1);
+    }
+
+    /// Under the sticky override the pin follows the failover: once the first
+    /// owner is back the key stays where it last ran, as the legacy override
+    /// pins the newest worker first; a policy that would rotate an unpinned
+    /// key keeps the pin.
+    #[test]
+    fn the_sticky_override_keeps_a_key_on_its_latest_worker() {
+        let decider = overridden(
+            &PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                assignment_mode: ManualAssignmentMode::Delegate,
+                ..RoutingKeyOverrideConfig::default()
+            },
+        );
+        let workers = pool(3);
+        let owner = place(&decider, &workers, "s1");
+        for _ in 0..4 {
+            assert_eq!(
+                place(&decider, &workers, "s1"),
+                owner,
+                "round robin would rotate an unpinned key"
+            );
+        }
+        workers[owner].set_status(WorkerStatus::NotReady);
+        let failover = place(&decider, &workers, "s1");
+        assert_ne!(failover, owner);
+        workers[owner].set_status(WorkerStatus::Ready);
+        for _ in 0..3 {
+            assert_eq!(
+                place(&decider, &workers, "s1"),
+                failover,
+                "the latest pin leads"
+            );
+        }
+    }
+
+    /// The legacy override keeps an assigned pin's original first under
+    /// `random`, `min_load` and `min_group` (its `assign_pin`), so the key
+    /// returns to its first worker once that worker is back; only a
+    /// delegated pick fronts the latest worker.
+    #[test]
+    fn the_override_recovers_to_the_first_worker_under_every_assignment_but_delegate() {
+        for mode in [
+            ManualAssignmentMode::Random,
+            ManualAssignmentMode::MinLoad,
+            ManualAssignmentMode::MinGroup,
+        ] {
+            let decider = overridden(
+                &PolicyConfig::RoundRobin,
+                RoutingKeyOverrideConfig {
+                    assignment_mode: mode,
+                    ..RoutingKeyOverrideConfig::default()
+                },
+            );
+            let workers = pool(3);
+            let owner = place(&decider, &workers, "s1");
+            workers[owner].set_status(WorkerStatus::NotReady);
+            let failover = place(&decider, &workers, "s1");
+            assert_ne!(failover, owner, "{mode:?}");
+            workers[owner].set_status(WorkerStatus::Ready);
+            assert_eq!(
+                place(&decider, &workers, "s1"),
+                owner,
+                "{mode:?}: the first pin leads again"
+            );
+        }
+    }
+
+    /// A pin remembers two workers: with its first two owners down the key
+    /// takes a third, which replaces the oldest; with every worker back the
+    /// key is on the second owner, the oldest the list still holds.
+    #[test]
+    fn a_manual_pin_remembers_its_two_latest_workers_oldest_first() {
+        let decider = decider(&manual(ManualAssignmentMode::Random));
+        let workers = pool(3);
+        let first = place(&decider, &workers, "s1");
+        workers[first].set_status(WorkerStatus::NotReady);
+        let second = place(&decider, &workers, "s1");
+        workers[second].set_status(WorkerStatus::NotReady);
+        let third = place(&decider, &workers, "s1");
+        assert_eq!(third, 3 - first - second);
+        for worker in &workers {
+            worker.set_status(WorkerStatus::Ready);
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                place(&decider, &workers, "s1"),
+                second,
+                "the first owner left the two-slot list"
+            );
+        }
+    }
+
+    /// Without a key the manual policy places by its assignment mode:
+    /// min_load takes the fewest requests in flight, min_group the fewest
+    /// sessions in flight (a count the row carries only when a stage reads
+    /// it), and nothing is pinned.
+    #[test]
+    fn without_a_key_the_manual_policy_places_by_its_assignment_mode() {
+        let workers = pool(2);
+        for _ in 0..3 {
+            workers[0].increment_load();
+        }
+        workers[1].increment_routing_key_load("a");
+        workers[1].increment_routing_key_load("b");
+        let min_load = decider(&manual(ManualAssignmentMode::MinLoad));
+        let min_group = decider(&manual(ManualAssignmentMode::MinGroup));
+        assert!(min_group.engine().needs().active_sessions);
+        assert!(!min_load.engine().needs().active_sessions);
+        assert!(
+            !min_load.engine().needs().session_in_flight,
+            "no cap, so no per-key count is read"
+        );
+        let first = |decider: &Decider| {
+            let (decision, _) = decider.decide(&request(), &workers, &[]);
+            decision
+                .pick()
+                .and_then(|pick| pick.targets.first().map(|t| t.position))
+        };
+        for _ in 0..4 {
+            assert_eq!(first(&min_load), Some(1), "three requests run on the first");
+            assert_eq!(first(&min_group), Some(0), "two sessions run on the second");
+        }
+        assert!(min_load.engine().sessions().is_empty());
+    }
+
+    /// One key is one session per model: the same key under two models pins
+    /// independently, as the legacy override namespaces its map by model.
+    #[test]
+    fn a_session_key_is_scoped_by_its_model() {
+        let decider = overridden(
+            &PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let workers = pool(2);
+        let place_for = |model: &str| {
+            let keyed = HostRequest {
+                model,
+                session_key: Some("s1"),
+                ..HostRequest::default()
+            };
+            let (decision, lease) = decider.decide(&keyed, &workers, &[]);
+            decider
+                .commit(&lease, &decision, Side::Single, |_| true)
+                .expect("a target")
+                .position
+        };
+        let a = place_for("a");
+        let b = place_for("b");
+        assert_ne!(
+            a, b,
+            "round robin gave the second model's session the other worker"
+        );
+        for _ in 0..3 {
+            assert_eq!(place_for("a"), a);
+            assert_eq!(place_for("b"), b);
+        }
+        assert_eq!(decider.engine().sessions().len(), 2);
+    }
+
+    /// An owner over the in-flight cap: the key respills to a worker under
+    /// the cap and the pin follows it; with every worker over the cap the key
+    /// stays on its owner. The cap counts the host's in-flight requests under
+    /// the raw key, as the load guard keeps them.
+    #[test]
+    fn a_saturated_owner_respills_the_key_to_a_worker_under_the_cap() {
+        let decider = overridden(
+            &PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                assignment_mode: ManualAssignmentMode::MinLoad,
+                ..Default::default()
+            },
+        );
+        assert!(decider.engine().needs().session_in_flight);
+        let workers = pool(2);
+        let owner = place(&decider, &workers, "s1");
+        let other = 1 - owner;
+        for _ in 0..2 {
+            workers[owner].increment_routing_key_load("s1");
+        }
+        assert_eq!(
+            place(&decider, &workers, "s1"),
+            other,
+            "two of the key's requests in flight on the owner"
+        );
+        workers[owner].decrement_routing_key_load("s1");
+        workers[owner].decrement_routing_key_load("s1");
+        assert_eq!(
+            place(&decider, &workers, "s1"),
+            other,
+            "the pin followed the respill"
+        );
+        for worker in &workers {
+            for _ in 0..2 {
+                worker.increment_routing_key_load("s1");
+            }
+        }
+        assert_eq!(
+            place(&decider, &workers, "s1"),
+            other,
+            "no worker under the cap: the key stays"
+        );
+    }
+
+    /// The legacy eviction thread stays off when either of its two settings
+    /// is zero; the engine's rule keeps such entries for ever. The override's
+    /// rule carries its cap and recovers to the latest pin; without it a
+    /// policy other than manual pins nothing.
+    #[test]
+    fn a_zero_idle_or_sweep_setting_keeps_sessions_for_ever() {
+        let off = RoutingKeyOverrideConfig::default();
+        let rule = |max_idle_secs, eviction_interval_secs| {
+            sessions_of(
+                &PolicyConfig::Manual {
+                    eviction_interval_secs,
+                    max_idle_secs,
+                    assignment_mode: ManualAssignmentMode::Random,
+                },
+                &off,
+            )
+            .expect("manual pins")
+        };
+        assert_eq!(
+            (rule(0, 60).ttl_s, rule(600, 0).ttl_s),
+            (u32::MAX, u32::MAX)
+        );
+        assert_eq!(rule(600, 60).inflight_cap, u16::MAX, "no cap");
+        assert_eq!(rule(600, 60).sticky_header, MANUAL_SESSION_HEADER);
+        assert_eq!((rule(600, 60).ttl_s, rule(600, 60).sweep_s), (600, 60));
+        assert_eq!(rule(600, 60).recovery, Recovery::Original);
+        assert!(sessions_of(&PolicyConfig::RoundRobin, &off).is_none());
+        let on = RoutingKeyOverrideConfig {
+            enabled: true,
+            max_idle_secs: 0,
+            ..Default::default()
+        };
+        let rule = sessions_of(&PolicyConfig::RoundRobin, &on).expect("the override pins");
+        assert_eq!(
+            (rule.ttl_s, rule.inflight_cap, rule.recovery),
+            (u32::MAX, STICKY_INFLIGHT_CAP, Recovery::Latest)
+        );
+        let listed = RoutingKeyOverrideConfig {
+            enabled: true,
+            headers: vec![
+                "X-Routing-Key".into(),
+                "x-routing-key".into(),
+                "x-smg-routing-key".into(),
+            ],
+            assignment_mode: ManualAssignmentMode::MinLoad,
+            ..Default::default()
+        };
+        let rule = sessions_of(&PolicyConfig::RoundRobin, &listed).expect("the override pins");
+        assert_eq!(
+            rule.sticky_header, "x-routing-key",
+            "the first header, lowercase"
+        );
+        assert_eq!(
+            rule.headers,
+            ["x-routing-key", "x-smg-routing-key"],
+            "each name once after lowercasing"
+        );
+        assert!(
+            Decider::from_configs(
+                &PolicyConfig::RoundRobin,
+                &PolicyConfig::RoundRobin,
+                &PolicyConfig::RoundRobin,
+                &listed
+            )
+            .is_ok(),
+            "a repeated name is one header of the view"
+        );
+        let denied = RoutingKeyOverrideConfig {
+            headers: vec!["x-api-key".into()],
+            ..listed
+        };
+        let error = Decider::from_configs(
+            &PolicyConfig::RoundRobin,
+            &PolicyConfig::RoundRobin,
+            &PolicyConfig::RoundRobin,
+            &denied,
+        )
+        .expect_err("a denied header refuses the build")
+        .to_string();
+        assert!(
+            error.contains("x-api-key") && error.contains("deny-list"),
+            "{error}"
+        );
+        assert_eq!(
+            rule.recovery,
+            Recovery::Original,
+            "an assigned pin keeps its original first"
+        );
+    }
+
+    /// Under the override's `min_group` assignment a new key goes to the
+    /// worker with the fewest sessions in flight, not the fewest requests.
+    #[test]
+    fn the_override_under_min_group_places_a_new_key_by_the_fewest_sessions() {
+        let decider = overridden(
+            &PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                assignment_mode: ManualAssignmentMode::MinGroup,
+                ..Default::default()
+            },
+        );
+        assert!(decider.engine().needs().active_sessions);
+        let workers = pool(2);
+        for _ in 0..3 {
+            workers[1].increment_load();
+        }
+        workers[0].increment_routing_key_load("a");
+        workers[0].increment_routing_key_load("b");
+        for key in ["k1", "k2", "k3"] {
+            assert_eq!(
+                place(&decider, &workers, key),
+                1,
+                "two sessions run on the first worker, three requests on the second"
+            );
+        }
+    }
+
+    /// The per-key in-flight count is read into a row only under a rule
+    /// with a cap: the manual policy's rows carry none, the override's carry
+    /// the guard's count under the raw key.
+    #[test]
+    fn the_per_key_count_is_fed_only_under_a_rule_with_a_cap() {
+        let workers = pool(1);
+        workers[0].increment_routing_key_load("s1");
+        let row = |decider: &Decider| {
+            let build = ViewBuild {
+                snapshot: None,
+                now: Instant::now(),
+                session_key: Some("s1"),
+            };
+            decider
+                .candidate(&build, 0, &workers[0], true, 0)
+                .session_in_flight
+        };
+        assert_eq!(row(&decider(&manual(ManualAssignmentMode::Random))), 0);
+        assert_eq!(
+            row(&overridden(
+                &PolicyConfig::RoundRobin,
+                RoutingKeyOverrideConfig::default()
+            )),
+            1
+        );
+    }
+
+    /// The first target's position of every decision.
+    fn positions(decided: &[(Decision, Lease)]) -> Vec<u32> {
+        decided
+            .iter()
+            .map(|(decision, _)| {
+                decision
+                    .pick()
+                    .expect("a pick")
+                    .targets
+                    .first()
+                    .expect("a target")
+                    .position
+            })
+            .collect()
+    }
+
+    /// The encode items of one request are decided over one view of the
+    /// encoders, each by its content hash: equal hashes land on one encoder
+    /// and the same keys decide the same way later. The row bits come from
+    /// the request's predicates: when one encoder pairs with the prefill
+    /// side every item lands on it, whatever its key's owner; when one
+    /// encoder has a vision encoder every image item lands on it; an image
+    /// item over encoders without one is shed by the plan's rule, a text
+    /// item takes any encoder.
+    #[test]
+    fn encode_items_are_decided_by_their_keys_over_the_encoders_that_pair_with_the_prefill() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let decider = Decider::from_configs_with_encode(
+            &round_robin,
+            &round_robin,
+            &round_robin,
+            Some(&PolicyConfig::ConsistentHashing),
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("the encode side is carried");
+        assert!(decider.serves_encode());
+        assert!(!self::decider(&round_robin).serves_encode());
+        let encoders: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| worker_of(&format!("http://e{i}:8000"), WorkerType::Encode))
+            .collect();
+        let every = |_: &Arc<dyn Worker>| true;
+        let request = EncodeRequest {
+            model: "m",
+            pairs_with_prefill: &every,
+            vision_capable: &every,
+            images: 1,
+        };
+        // Eight keys: by the ring they spread over the four encoders.
+        let keys: Vec<u64> = (0..8u64)
+            .map(|i| fingerprint(format!("image-{}", i % 7).as_bytes()))
+            .collect();
+        let decided = decider.decide_encode_items(&request, &encoders, &keys, &[]);
+        assert_eq!(decided.len(), 8);
+        let targets: Vec<Target> = decided
+            .iter()
+            .map(|(decision, lease)| {
+                decider
+                    .commit(lease, decision, Side::Encode, |_| true)
+                    .expect("an encoder")
+            })
+            .collect();
+        assert_eq!(
+            targets[0].position, targets[7].position,
+            "equal hashes share an encoder"
+        );
+        let owners: std::collections::BTreeSet<u32> = targets.iter().map(|t| t.position).collect();
+        assert!(
+            owners.len() > 1,
+            "the keys spread over the encoders: {owners:?}"
+        );
+        assert_eq!(decider.decisions(), 8, "one decision per item");
+        let before: Vec<u32> = targets.iter().map(|t| t.position).collect();
+        let again = decider.decide_encode_items(&request, &encoders, &keys, &[]);
+        assert_eq!(positions(&again), before, "the same keys land the same way");
+
+        // One encoder pairs with the prefill side: every item lands on it,
+        // whatever its key's owner (the bit's hand-off from the predicate).
+        let only_two = encoders[2].url().to_string();
+        let pairs_two = |worker: &Arc<dyn Worker>| worker.url() == only_two;
+        let paired = EncodeRequest {
+            pairs_with_prefill: &pairs_two,
+            ..request
+        };
+        let decided = decider.decide_encode_items(&paired, &encoders, &keys, &[]);
+        assert_eq!(
+            positions(&decided),
+            vec![2; 8],
+            "only the paired encoder is taken"
+        );
+
+        // One encoder has a vision encoder: every image item lands on it.
+        let only_one = encoders[1].url().to_string();
+        let sees_one = |worker: &Arc<dyn Worker>| worker.url() == only_one;
+        let sighted = EncodeRequest {
+            vision_capable: &sees_one,
+            ..request
+        };
+        let decided = decider.decide_encode_items(&sighted, &encoders, &keys, &[]);
+        assert_eq!(
+            positions(&decided),
+            vec![1; 8],
+            "only the sighted encoder takes images"
+        );
+
+        let blind = |_: &Arc<dyn Worker>| false;
+        let no_vision = EncodeRequest {
+            vision_capable: &blind,
+            ..request
+        };
+        let shed = decider.decide_encode_items(&no_vision, &encoders, &keys[..1], &[]);
+        match &shed[0].0 {
+            Decision::Shed(shed) => assert_eq!(shed.emptied_by, "vision"),
+            other => panic!("an image over encoders without a vision encoder answered {other:?}"),
+        }
+        let text = EncodeRequest {
+            images: 0,
+            ..no_vision
+        };
+        let decided = decider.decide_encode_items(&text, &encoders, &keys[..1], &[]);
+        assert!(
+            decided[0].0.pick().is_some(),
+            "a text item takes any encoder: {:?}",
+            decided[0].0
+        );
+    }
+
+    /// A commit that refused a decision's targets re-decides with them
+    /// excluded: the excluded owner's key lands on another encoder, and the
+    /// excluded id is never among the new targets.
+    #[test]
+    fn an_excluded_encoder_passes_its_key_to_the_ring_s_next_member() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let decider = Decider::from_configs_with_encode(
+            &round_robin,
+            &round_robin,
+            &round_robin,
+            Some(&PolicyConfig::ConsistentHashing),
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("the encode side is carried");
+        let encoders: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| worker_of(&format!("http://e{i}:8000"), WorkerType::Encode))
+            .collect();
+        let pairs = |_: &Arc<dyn Worker>| true;
+        let request = EncodeRequest {
+            model: "m",
+            pairs_with_prefill: &pairs,
+            vision_capable: &pairs,
+            images: 0,
+        };
+        let keys = [fingerprint(b"image-c")];
+        let first = decider.decide_encode_items(&request, &encoders, &keys, &[]);
+        let owner = *first[0]
+            .0
+            .pick()
+            .expect("a pick")
+            .targets
+            .as_slice()
+            .first()
+            .expect("a target");
+        let again = decider.decide_encode_items(&request, &encoders, &keys, &[owner.id]);
+        let pick = again[0].0.pick().expect("a pick");
+        let next = pick.targets.as_slice().first().expect("a target");
+        assert_ne!(next.position, owner.position);
+        assert!(pick.targets.as_slice().iter().all(|t| t.id != owner.id));
+    }
+
+    #[test]
+    fn an_encode_policy_the_engine_does_not_carry_is_refused_by_name() {
+        let carried = PolicyConfig::RoundRobin;
+        let uncarried = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let Err(error) = Decider::from_configs_with_encode(
+            &carried,
+            &carried,
+            &carried,
+            Some(&uncarried),
+            &RoutingKeyOverrideConfig::default(),
+        ) else {
+            panic!("an encode policy outside the encode side's three is refused");
+        };
+        assert!(error.to_string().contains("least_load"), "{error}");
+        assert_eq!(
+            encode_preset_name(&PolicyConfig::ConsistentHashing),
+            Some("consistent_hashing")
+        );
+        assert_eq!(encode_preset_name(&PolicyConfig::Random), Some("random"));
+        assert!(
+            preset_name(&PolicyConfig::ConsistentHashing).is_none(),
+            "the regular path's keyed form waits for a later step"
+        );
+    }
+
+    #[test]
+    fn a_candidate_s_id_and_key_come_from_one_pass_over_the_url() {
+        let workers = pool(1);
+        let worker = workers[0].as_ref();
+        let (id, key) = worker_identity(worker);
+        assert_eq!(id, worker_id(worker), "the id under the store's rule");
+        assert_eq!(key, fingerprint(worker.url().as_bytes()) as u32);
     }
 }

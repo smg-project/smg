@@ -26,7 +26,9 @@ use crate::{
     },
     routers::{
         common::{
-            attempt_ledger::{mark_failed_side, mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{
+                is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+            },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
             retry::mark_non_retryable,
@@ -976,7 +978,11 @@ async fn execute_single_embed(
 
 /// What addresses both sides of a disaggregated dispatch: the pair and the
 /// request's ledger, each side's transport label, the request id both sides
-/// carry, and the prompt's size, which bounds each side's silence.
+/// carry, the prompt's size, which bounds each side's silence, and whether
+/// the client's request streams, which gives the decode side a first token
+/// to watch for (the caller's flag: the sequential shape sends its prefill
+/// request unstreamed whatever the client asked, so the prefill request
+/// cannot say).
 pub(crate) struct PdSides<'a> {
     pub(crate) workers: &'a WorkerSelection,
     pub(crate) ledger: &'a AttemptLedger,
@@ -984,6 +990,7 @@ pub(crate) struct PdSides<'a> {
     pub(crate) decode_label: &'static str,
     pub(crate) request_id: String,
     pub(crate) prompt_tokens: u64,
+    pub(crate) streaming: bool,
 }
 
 impl<'a> PdSides<'a> {
@@ -991,6 +998,7 @@ impl<'a> PdSides<'a> {
         workers: &'a WorkerSelection,
         ledger: &'a AttemptLedger,
         prefill_request: &ProtoGenerateRequest,
+        streaming: bool,
     ) -> Self {
         let (prefill_label, decode_label) = pd_side_labels(workers);
         let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
@@ -1002,6 +1010,7 @@ impl<'a> PdSides<'a> {
             decode_label,
             request_id,
             prompt_tokens,
+            streaming,
         }
     }
 }
@@ -1020,6 +1029,7 @@ async fn execute_parallel_pd(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
+    let streaming = proto_request.stream();
     let runtime = workers
         .disaggregated_runtime_type()
         .map(|r| r.as_str())
@@ -1041,7 +1051,7 @@ async fn execute_parallel_pd(
     // it on this path), so prefill duration cannot be measured — only TTFT,
     // recorded at the first decode token in streaming. prefill_start anchors it.
     let prefill_start = Instant::now();
-    let sides = PdSides::of(workers, ledger, &prefill_request);
+    let sides = PdSides::of(workers, ledger, &prefill_request, streaming);
     // The prefill side's silence is bounded from its dispatch: a call that
     // returns no stream, or a stream with nothing on it, within the bound
     // fails the attempt instead of holding the request (and the decode room
@@ -1199,6 +1209,14 @@ async fn parallel_sides_answered(
 ) -> Result<ExecutionResult, Response> {
     let workers = sides.workers;
     record_pd_dispatch_outcomes(workers, sides.ledger, &prefill_result, &decode_result);
+    // A non-streaming request's decode side has no first-token signal (its
+    // one response is its whole answer), so the wait its deferred abort
+    // makes for that response is bounded by the pair's decode bound (see
+    // below).
+    let plain_decode_bound = bound
+        .as_ref()
+        .filter(|_| !sides.streaming)
+        .map(|bound| bound.partner_bound);
 
     // Both sides are translated before either is propagated: a
     // decode-side failure is logged and counted even when the prefill
@@ -1282,10 +1300,20 @@ async fn parallel_sides_answered(
     // while it is still receiving the KV handoff from prefill — tearing
     // the request down mid-transfer can crash or leak on the engine — so
     // its abort is deferred until the first decode response (the proof
-    // the handoff completed). The prefill side keeps the immediate abort:
-    // if prefill is still running there is nothing to hand off yet, and
-    // stopping it promptly frees capacity.
-    let decode_stream = decode_stream.defer_abort_until_first_item();
+    // the handoff completed). A non-streaming request's first decode
+    // response is its whole answer, so a client that left would hold the
+    // decode engine for the answer's length (the house cap at most); its
+    // wait is bounded instead by the pair's decode bound, taken as the
+    // estimate of the handoff's length (set once the prefill side answered,
+    // after the transfer on this shape): a shorter protection window than
+    // the cap, by design. A plain side has no silence verdict of its own,
+    // and a streaming side keeps the cap. The prefill side keeps the
+    // immediate abort: if prefill is still running there is nothing to
+    // hand off yet, and stopping it promptly frees capacity.
+    let decode_stream = match plain_decode_bound {
+        Some(bound) => decode_stream.defer_abort_within(bound),
+        None => decode_stream.defer_abort_until_first_item(),
+    };
 
     Ok(ExecutionResult::PrefillDecode {
         prefill: prefill_stream,
@@ -1481,12 +1509,43 @@ fn pd_side_error(
     }
     UpstreamClass::account_dispatch_failure(side.name(), connection, error);
     account_pd_side_failure(side.name(), error);
-    start_failure_response(
+    let worker = match side {
+        PdSide::Prefill => workers.prefill_worker(),
+        PdSide::Decode => workers.decode_worker(),
+    };
+    pd_start_failure_response(side, worker, error, "execute_parallel_pd")
+}
+
+/// The client answer for a disaggregated side that failed to start, under the
+/// side's start code (see [`start_failure_response`]). A status the side's
+/// worker answered for the payload itself (its own `INTERNAL`, definitive for
+/// the retry layer) names that worker as the failed side, so the retry window
+/// closes on it alone and the answer stands when no other worker of its kind
+/// is available (see `attempt_ledger::FailedSide`): one side's own 500 is not
+/// its partner's, and a free worker of the side's kind still takes the
+/// request. Left unnamed, the definitive answer closed the window on both
+/// workers of the pair while a worker of the other kind still counted as an
+/// alternative, so the retry found no pair to admit and the client read a
+/// `no_available_workers` refusal in place of the worker's own answer. Any
+/// other status names no side and is replayed as before.
+pub(crate) fn pd_start_failure_response(
+    side: PdSide,
+    worker: Option<&Arc<dyn Worker>>,
+    error: &tonic::Status,
+    function: &'static str,
+) -> Response {
+    let mut response = start_failure_response(
         error,
-        "execute_parallel_pd",
+        function,
         side.description(SidePhase::Start),
         side.code(SidePhase::Start),
-    )
+    );
+    if is_definitive_failure(&response) {
+        if let Some(worker) = worker {
+            mark_failed_side(&mut response, worker.as_ref());
+        }
+    }
+    response
 }
 
 /// Why a PD side still dispatching is retired off the request path (see
@@ -1579,7 +1638,7 @@ pub(crate) fn retire_pd_side(
         match result {
             Ok(stream) => {
                 debug!(
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     "Aborting the room of an abandoned PD side"
@@ -1594,7 +1653,7 @@ pub(crate) fn retire_pd_side(
                 UpstreamClass::account_dispatch_failure(side.name(), connection, &error);
                 error!(
                     function = "retire_pd_side",
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     error = %error,
@@ -1603,7 +1662,7 @@ pub(crate) fn retire_pd_side(
             }
             Err(error) => {
                 debug!(
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     error = %error,
@@ -2078,8 +2137,8 @@ pub(crate) mod tests {
     use crate::{
         routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
         worker::{
-            BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
-            WorkerType,
+            test_support::no_health_check, BasicWorkerBuilder, CircuitBreakerConfig,
+            ConnectionMode, RuntimeType, Worker, WorkerType,
         },
     };
 
@@ -2416,6 +2475,105 @@ pub(crate) mod tests {
             assert!(is_retryable_response(&failed), "{reason:?}");
             assert!(!is_definitive_failure(&failed), "{reason:?}");
         }
+    }
+
+    /// A side's own `INTERNAL` before its first byte is the worker's
+    /// definitive answer for the payload, and names the side's worker as the
+    /// failed side: the retry window closes on that worker alone, its partner
+    /// stays selectable, the request moves to another worker of the side's
+    /// kind when one is available, and the answer stands when none is. A
+    /// status that is not the worker's own answer names no side and is
+    /// replayed as before.
+    #[test]
+    fn a_sides_own_500_before_its_first_byte_closes_the_window_on_its_worker_alone() {
+        use crate::routers::common::attempt_ledger::is_definitive_failure;
+
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let code = |response: &Response| {
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        // The sole prefill worker's own 500: its answer stands.
+        let ledger = AttemptLedger::default();
+        let mut answered = pd_side_error(
+            PdSide::Prefill,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::internal("engine died"),
+            &workers,
+        );
+        assert_eq!(answered.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            code(&answered).as_deref(),
+            Some("prefill_worker_failed_to_start")
+        );
+        assert!(is_definitive_failure(&answered));
+        assert!(
+            answered.extensions().get::<FailedSide>().is_some(),
+            "the side's worker is named"
+        );
+        ledger.settle(&mut answered, workers.workers(), [&prefill, &decode]);
+        assert!(
+            !ledger.admits(prefill.as_ref()),
+            "the prefill worker that answered is out"
+        );
+        assert!(ledger.admits(decode.as_ref()), "its decode partner is not");
+        assert!(
+            !is_retryable_response(&answered),
+            "no other prefill worker: the worker's own answer is the client's"
+        );
+
+        // One decode worker's own 500 with another decode worker available
+        // (ready, as the pool holds one: the ledger's alternative must be
+        // available): the request moves there, with the same prefill.
+        let other_decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-2:30000")
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let ledger = AttemptLedger::default();
+        let mut answered = pd_side_error(
+            PdSide::Decode,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::internal("engine died"),
+            &workers,
+        );
+        assert_eq!(
+            code(&answered).as_deref(),
+            Some("decode_worker_failed_to_start")
+        );
+        ledger.settle(
+            &mut answered,
+            workers.workers(),
+            [&prefill, &decode, &other_decode],
+        );
+        assert!(!ledger.admits(decode.as_ref()));
+        assert!(ledger.admits(prefill.as_ref()));
+        assert!(ledger.admits(other_decode.as_ref()));
+        assert!(
+            is_retryable_response(&answered),
+            "the other decode worker takes the request"
+        );
+
+        // A status that is not the worker's own answer names no side.
+        let refused = pd_side_error(
+            PdSide::Decode,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::unavailable("the engine is busy"),
+            &workers,
+        );
+        assert_eq!(refused.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_definitive_failure(&refused));
+        assert!(refused.extensions().get::<FailedSide>().is_none());
+        assert!(is_retryable_response(&refused));
     }
 
     #[test]

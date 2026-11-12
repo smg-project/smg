@@ -6,6 +6,9 @@
 //! `policy_engine/spec/parse_validate`. The view is built from the synthetic
 //! per-worker state of `common` the way a host reads its routing state; the
 //! decision runs with a fresh seed per iteration so the drawing pickers draw.
+//! This file is the pull-request gate's (`.github/bench-gates/policy-engine.toml`
+//! runs the whole binary three times a side): the `epd` plan's encode
+//! decisions and the ring's membership costs are the `epd` bench target.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a preset that fails to validate is a bug the unit tests catch"

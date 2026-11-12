@@ -48,6 +48,7 @@ pub(crate) enum OutputItemKind {
     Message,
     McpListTools,
     FunctionCall,
+    CustomToolCall,
     Reasoning,
 }
 
@@ -57,8 +58,17 @@ impl OutputItemKind {
             Self::Message => "msg",
             Self::McpListTools => "mcpl",
             Self::FunctionCall => "fc",
+            Self::CustomToolCall => "ctc",
             Self::Reasoning => "rs",
         }
+    }
+
+    /// A fresh id for an output item of this kind: the kind's prefix and a
+    /// unique suffix, the one shape an item id has on every path, streamed or
+    /// not. An item's id is its own; a function call's `call_id` is another
+    /// string, the one the client echoes in its `function_call_output`.
+    pub(crate) fn new_id(&self) -> String {
+        ResponseStreamEventEmitter::generate_item_id(self.id_prefix())
     }
 }
 
@@ -139,7 +149,6 @@ pub(crate) struct ResponseStreamEventEmitter {
     pub response_id: String,
     model: String,
     created_at: u64,
-    message_id: String,
     accumulated_text: String,
     has_emitted_output_item_added: bool,
     has_emitted_content_part_added: bool,
@@ -207,14 +216,11 @@ impl ResponseStreamEventEmitter {
     }
 
     pub fn new(response_id: String, model: String, created_at: u64) -> Self {
-        let message_id = format!("msg_{}", Uuid::now_v7());
-
         Self {
             sequence_number: 0,
             response_id,
             model,
             created_at,
-            message_id,
             accumulated_text: String::new(),
             has_emitted_output_item_added: false,
             has_emitted_content_part_added: false,
@@ -425,20 +431,8 @@ impl ResponseStreamEventEmitter {
             })
             .collect();
 
-        // If no items were tracked (legacy path), fall back to generic message
-        let output = if output.is_empty() {
-            vec![json!({
-                "id": std::mem::take(&mut self.message_id),
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": std::mem::take(&mut self.accumulated_text)
-                }]
-            })]
-        } else {
-            output
-        };
+        // A turn without items reads `output: []` here as it does in the
+        // stored object: no message is invented that nothing announced.
 
         // The event's status is read where the stored object and the
         // non-streaming conversion read theirs: a `length` finish is incomplete
@@ -540,6 +534,18 @@ impl ResponseStreamEventEmitter {
         event
     }
 
+    /// Close the item event sequences still open (the reasoning item, the
+    /// message, the tool calls), retaining unfinished wire statuses, so the
+    /// final object reads every streamed item under the id its events carry.
+    /// A stream that ended on a finish chunk has closed them already; one cut
+    /// short before its finish (an upstream error, a body that ended) closes
+    /// them here, before its final object is read and stored.
+    pub(crate) async fn close_items(&mut self, tx: &SseSender) -> Result<(), String> {
+        self.close_reasoning_item(tx).await?;
+        self.close_message_item(tx).await?;
+        self.close_tool_call_items(tx).await
+    }
+
     /// Close remaining item event sequences, retaining unfinished wire statuses,
     /// and emit exactly one terminal event.
     pub async fn emit_terminal(
@@ -551,9 +557,7 @@ impl ResponseStreamEventEmitter {
         if error.is_some() {
             self.finish_reason = Some("failed".into());
         }
-        self.close_reasoning_item(tx).await?;
-        self.close_message_item(tx).await?;
-        self.close_tool_call_items(tx).await?;
+        self.close_items(tx).await?;
         let event = match error {
             Some(error) => self.emit_failed(usage, error),
             None => self.emit_completed(usage),
@@ -1386,6 +1390,12 @@ impl ResponseStreamEventEmitter {
         if let Some(name) = arriving_name {
             item.name = name.to_string();
             item.custom = arriving_custom;
+            // The id was minted as a function call's before the name arrived;
+            // a custom tool's call takes its own kind's id while nothing has
+            // announced the first one (`added` waits for a name or arguments).
+            if arriving_custom && !item.added_emitted {
+                item.item_id = OutputItemKind::CustomToolCall.new_id();
+            }
         }
         if let Some(args) = args_delta {
             item.arguments.push_str(args);
@@ -2102,6 +2112,11 @@ mod process_chunk_tests {
         assert_eq!(events[2]["input"], "pwd");
         assert_eq!(output[0]["type"], "custom_tool_call");
         assert_eq!(output[0]["input"], "pwd");
+        // The item's id is a custom tool call's own, the same on the event and
+        // in the final output.
+        let id = events[0]["item"]["id"].as_str().unwrap_or_default();
+        assert!(id.starts_with("ctc_"), "{}", events[0]);
+        assert_eq!(output[0]["id"], id);
         assert_eq!(output[0]["call_id"], "call_c");
         assert_eq!(events[3]["item"], output[0]);
     }

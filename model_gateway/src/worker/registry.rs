@@ -196,6 +196,9 @@ pub(crate) struct ModelWorkerSnapshot {
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
     pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
+    /// Whether a worker of this generation serves a Harmony model, kept from
+    /// the first request's reading (see [`Self::harmony`]).
+    harmony: OnceLock<bool>,
 }
 
 impl ModelWorkerSnapshot {
@@ -204,7 +207,22 @@ impl ModelWorkerSnapshot {
             all,
             pools: std::array::from_fn(|_| OnceLock::new()),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
+            harmony: OnceLock::new(),
         }
+    }
+
+    /// Whether a worker of this membership generation serves a Harmony
+    /// model: `decide` reads the snapshot's workers on the first request
+    /// after the membership change, every request after it reads the kept
+    /// answer. A registration, a removal and a property rebuild each publish
+    /// a new snapshot, so the per-worker card scans run once, not per
+    /// request. A lazy model refresh (`Worker::set_models`) rewrites a
+    /// worker's cards in place without one and is read at the next
+    /// membership change; only external workers, which the gRPC pipeline
+    /// does not serve, are refreshed today. The rule itself stays with the
+    /// router's detector.
+    pub(crate) fn harmony(&self, decide: impl FnOnce(&[Arc<dyn Worker>]) -> bool) -> bool {
+        *self.harmony.get_or_init(|| decide(&self.all))
     }
 
     /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
@@ -1550,6 +1568,12 @@ impl WorkerRegistry {
             self.bump_global_routing_epoch();
         }
 
+        // The old instance stays alive in the handles that hold it (a load
+        // guard taken before the replacement) and writes under the URL until
+        // they go: the series store keeps its witness, so a later removal of
+        // the URL drops those writes until the old instance is gone too.
+        Metrics::worker_replaced(old_worker.url(), Arc::downgrade(&old_worker));
+
         // The replacement carries its own backend-client slot, so the old
         // instance's ZMQ handshake driver can now only hold its socket binds
         // against the new worker's connect.
@@ -1859,7 +1883,7 @@ impl WorkerRegistry {
     /// mutation lock for the whole teardown so it cannot race a
     /// concurrent `replace()`.
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
-        self.remove_inner(worker_id, None)
+        self.remove_inner(worker_id, None, None)
     }
 
     /// Core removal shared by [`Self::remove`] and [`Self::remove_remote`].
@@ -1868,10 +1892,23 @@ impl WorkerRegistry {
     /// mismatch — a lock-free pre-check alone races `replace_inner`'s
     /// promotion (check Mesh, block on the lock, promotion lands, then
     /// delete a now locally-owned worker).
+    /// Remove the worker only while its revision is still `expected_revision`,
+    /// the check and the removal under the same per-worker lock: a
+    /// replacement that landed in between keeps its successor, as
+    /// [`Self::replace_claiming_local`] keeps one for a replacement.
+    pub fn remove_if_revision(
+        &self,
+        worker_id: &WorkerId,
+        expected_revision: u64,
+    ) -> Option<Arc<dyn Worker>> {
+        self.remove_inner(worker_id, None, Some(expected_revision))
+    }
+
     fn remove_inner(
         &self,
         worker_id: &WorkerId,
         expect_origin: Option<WorkerOrigin>,
+        expected_revision: Option<u64>,
     ) -> Option<Arc<dyn Worker>> {
         // Acquire the same per-worker lock used by replace() to prevent
         // remove racing with a concurrent replace that has already snapshot
@@ -1882,6 +1919,16 @@ impl WorkerRegistry {
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = lock.lock();
+
+        if let Some(expected) = expected_revision {
+            let current = self
+                .workers
+                .get(worker_id)
+                .map(|entry| entry.value().revision());
+            if current != Some(expected) {
+                return None;
+            }
+        }
 
         if let Some(expected) = expect_origin {
             if self.origin_of(worker_id) != Some(expected) {
@@ -1919,7 +1966,7 @@ impl WorkerRegistry {
             // Retire the URL's series while the URL still maps to this id: a
             // registration of the same URL cannot slip in between and have its
             // fresh series retired under it.
-            Metrics::remove_worker_metrics(worker.url());
+            Metrics::remove_worker_metrics(worker.url(), Arc::downgrade(&worker));
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -1998,7 +2045,9 @@ impl WorkerRegistry {
     /// `None` if the id is unknown or locally owned.
     pub fn remove_remote(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         match self.origin_of(worker_id) {
-            Some(WorkerOrigin::Mesh) => self.remove_inner(worker_id, Some(WorkerOrigin::Mesh)),
+            Some(WorkerOrigin::Mesh) => {
+                self.remove_inner(worker_id, Some(WorkerOrigin::Mesh), None)
+            }
             Some(WorkerOrigin::Local) => {
                 tracing::warn!(
                     worker_id = %worker_id.as_str(),

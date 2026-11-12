@@ -97,6 +97,8 @@ interface types {
     ec-compatible: bool,
     vision: bool,
     host-local: bool,
+    active-sessions: u16,
+    key: u32,
   }
 
   /// Media on the request: counts and bytes.
@@ -276,7 +278,8 @@ interface plugin {
 ///   78 role u8 (0 single, 1 prefill, 2 decode, 3 encode); 79 source u8
 ///   (0 none, 1 events, 2 scrape, 3 relay, 4 poll); 80 bits u8 (bit 0
 ///   session-hit, 1 has-capacity, 2 has-room, 3 ec-compatible, 4 vision,
-///   5 host-local, 6 load-present); 81 to 87 zero; 88 labels u64.
+///   5 host-local, 6 load-present); 81 zero; 82 active-sessions u16;
+///   84 key u32; 88 labels u64.
 /// Request block: a 72-byte header, then the variable sections in the order
 /// below (the header carries their counts, not offsets: a reader walks the
 /// sections in order), offsets relative to the block's start:

@@ -4,11 +4,19 @@
 //! supported backend, allowing the router to work with any backend
 //! transparently.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, task::Poll, time::Instant};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 use futures::future::select_all;
 use futures_util::StreamExt;
 use smg_grpc_client::{
+    abort_on_drop::DEFERRED_ABORT_MAX_WAIT,
     mlx_engine::AbortOnDropStream as MlxStream,
     mlx_proto::{self as mlx},
     sglang_proto::{self as sglang, generate_complete::MatchedStop as SglangMatchedStop},
@@ -526,14 +534,13 @@ impl ProtoGenerateStreamChunk {
     }
 
     /// The output's logprobs, read in place on the message; `None` when the
-    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
             Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
-            Self::Trtllm(c) => {
-                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
-            }
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
             Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
@@ -769,14 +776,13 @@ impl ProtoGenerateComplete {
     }
 
     /// The output's logprobs, read in place on the message; `None` when the
-    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
             Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
-            Self::Trtllm(c) => {
-                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
-            }
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
             Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
@@ -1997,14 +2003,26 @@ impl ProtoStream {
     /// not serve disaggregated requests.
     #[must_use]
     pub fn defer_abort_until_first_item(self) -> Self {
+        self.defer_abort_within(DEFERRED_ABORT_MAX_WAIT)
+    }
+
+    /// [`Self::defer_abort_until_first_item`] with the wait for the first
+    /// response bounded by `bound` where that is shorter than the house cap
+    /// ([`DEFERRED_ABORT_MAX_WAIT`]): the bound the caller holds for the
+    /// response, a decode side's first-token bound. A side whose first
+    /// response is its whole answer (a non-streaming generation) has no
+    /// earlier signal, and a drop would otherwise hold its worker for the
+    /// answer's length, the cap at most.
+    #[must_use]
+    pub fn defer_abort_within(self, bound: Duration) -> Self {
         match self {
-            Self::Sglang(stream) => Self::Sglang(stream.defer_abort_until_first_item()),
-            Self::Vllm(stream) => Self::Vllm(stream.defer_abort_until_first_item()),
-            Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_until_first_item()),
-            Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
-            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
+            Self::Sglang(stream) => Self::Sglang(stream.defer_abort_within(bound)),
+            Self::Vllm(stream) => Self::Vllm(stream.defer_abort_within(bound)),
+            Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_within(bound)),
+            Self::Mlx(stream) => Self::Mlx(stream.defer_abort_within(bound)),
+            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_within(bound)),
             Self::Zmq(stream) => Self::Zmq(stream),
-            Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+            Self::Fanout(stream) => Self::Fanout(stream.defer_abort_within(bound)),
             Self::Tracked(stream) => {
                 let TrackedStream {
                     inner,
@@ -2016,7 +2034,7 @@ impl ProtoStream {
                     replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
-                    inner: inner.defer_abort_until_first_item(),
+                    inner: inner.defer_abort_within(bound),
                     worker,
                     prefill,
                     progress,
@@ -2028,14 +2046,14 @@ impl ProtoStream {
             Self::DecodeSide(side) => {
                 let DecodeStream { inner, prefill } = *side;
                 Self::DecodeSide(Box::new(DecodeStream {
-                    inner: inner.defer_abort_until_first_item(),
+                    inner: inner.defer_abort_within(bound),
                     prefill,
                 }))
             }
             Self::Ahead(ahead) => {
                 let AheadStream { inner, first } = *ahead;
                 Self::Ahead(Box::new(AheadStream {
-                    inner: inner.defer_abort_until_first_item(),
+                    inner: inner.defer_abort_within(bound),
                     first,
                 }))
             }
@@ -2047,7 +2065,7 @@ impl ProtoStream {
                     request_id,
                 } = *watched;
                 Self::Watched(Box::new(WatchedStream {
-                    inner: inner.map(ProtoStream::defer_abort_until_first_item),
+                    inner: inner.map(|inner| inner.defer_abort_within(bound)),
                     client,
                     client_gone,
                     request_id,
@@ -2070,6 +2088,10 @@ impl FanoutChild for ProtoStream {
 
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
+    }
+
+    fn defer_abort_within(self, bound: Duration) -> Self {
+        Self::defer_abort_within(self, bound)
     }
 
     fn apply_deadline(&mut self, deadline: RequestDeadline) {
@@ -2095,6 +2117,11 @@ pub trait FanoutChild: Send {
     /// Defer the child's abort-on-drop until its first response.
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
+
+    /// [`Self::defer_abort_until_first_item`] with the wait bounded by
+    /// `bound` where that is shorter than the house cap.
+    #[must_use]
+    fn defer_abort_within(self, bound: Duration) -> Self;
 
     /// Bound the child by the request's `deadline`, in place (see
     /// [`ProtoStream::apply_deadline`]); a child with no transport stream
@@ -2137,6 +2164,10 @@ impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
 
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
+    }
+
+    fn defer_abort_within(self, bound: Duration) -> Self {
+        Self::defer_abort_within(self, bound)
     }
 }
 
@@ -2219,6 +2250,20 @@ impl<C: FanoutChild> FanoutStream<C> {
         }
     }
 
+    /// [`Self::defer_abort_until_first_item`] with every child's wait
+    /// bounded by `bound`.
+    #[must_use]
+    pub fn defer_abort_within(self, bound: Duration) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|child| child.map(|child| child.defer_abort_within(bound)))
+                .collect(),
+            cursor: self.cursor,
+        }
+    }
+
     /// Bound every open child by the request's `deadline`, in place.
     pub fn apply_deadline(&mut self, deadline: RequestDeadline) {
         for child in self.children.iter_mut().flatten() {
@@ -2266,6 +2311,10 @@ mod fanout_tests {
         }
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }
@@ -2365,7 +2414,7 @@ mod fanout_tests {
                         .worker_type(WorkerType::Prefill)
                         .build(),
                 );
-                let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+                let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
                 let guard = if bounded {
                     let admitted = admission.admit(None, select_worker(&worker)).await.unwrap();
                     PrefillLoadGuard::Admission {
@@ -3255,5 +3304,42 @@ mod watched_tests {
         );
         assert!(matches!(stream.next().await, Some(Ok(_))));
         assert!(stream.next().await.is_none(), "the end is the end");
+    }
+}
+
+#[cfg(test)]
+mod output_logprob_tests {
+    use super::{trtllm, ProtoGenerateComplete, ProtoGenerateStreamChunk};
+
+    fn one_record() -> Vec<trtllm::TokenLogprob> {
+        vec![trtllm::TokenLogprob {
+            token_id: 7,
+            logprob: -0.5,
+            top_logprobs: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn a_trtllm_chunk_reads_an_empty_logprob_list_as_none() {
+        // The TRT-LLM wire says "no logprobs" with an empty list where the
+        // other wires leave the field absent; one record is one position.
+        let none = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
+    }
+
+    #[test]
+    fn a_trtllm_complete_reads_an_empty_logprob_list_as_none() {
+        let none = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
     }
 }

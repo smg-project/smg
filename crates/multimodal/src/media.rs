@@ -71,6 +71,9 @@ static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODE_PIXELS: OnceLock<u64> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static FFMPEG_PASSTHROUGH_FLAG: OnceLock<[&'static str; 2]> = OnceLock::new();
+/// What keeps this process from decoding video, probed once (see
+/// [`missing_video_decoder`]).
+static VIDEO_DECODER_GAP: OnceLock<Option<String>> = OnceLock::new();
 static ACTIVE_VIDEO_DECODES: AtomicUsize = AtomicUsize::new(0);
 static AVAILABLE_DECODE_CPUS: OnceLock<usize> = OnceLock::new();
 const MAX_DECODER_THREADS: usize = 8;
@@ -1338,6 +1341,74 @@ fn decode_video_with_opencv_bytes_logged(
         }
     }
     result
+}
+
+/// What keeps this process from decoding video, if anything, probed once:
+/// without the `opencv-video` feature a clip is decoded by the `ffmpeg`
+/// executable on PATH (`ffprobe` is optional: the metadata and duration
+/// probes fall back to `ffmpeg`), and `SMG_VIDEO_DECODE_BACKEND` may name a
+/// backend this build does not have. `None` when video decodes here. A
+/// gateway reads it at start-up (one log line) and refuses a video part up
+/// front, the request's own answer, instead of failing the request's decode
+/// with a server error on every clip; a worker-side pipeline reads it the
+/// same way. The binaries on PATH do not change underneath a process.
+pub fn missing_video_decoder() -> Option<&'static str> {
+    VIDEO_DECODER_GAP
+        .get_or_init(|| probe_video_decoder_gap(executable_starts))
+        .as_deref()
+}
+
+/// The probe behind [`missing_video_decoder`], with the "does this program
+/// start" question injected so a test can answer it without a PATH.
+fn probe_video_decoder_gap(starts: impl Fn(&str) -> std::io::Result<()>) -> Option<String> {
+    match video_decode_backend_override() {
+        Some("opencv") => {
+            if cfg!(feature = "opencv-video") {
+                return None;
+            }
+            return Some(
+                "SMG_VIDEO_DECODE_BACKEND=opencv requires the opencv-video feature".to_string(),
+            );
+        }
+        Some("ffmpeg") => {}
+        Some(backend) => {
+            return Some(format!(
+                "unsupported SMG_VIDEO_DECODE_BACKEND={backend}; expected auto, opencv, or ffmpeg"
+            ));
+        }
+        None => {
+            if cfg!(feature = "opencv-video") {
+                return None;
+            }
+        }
+    }
+    // ffmpeg alone decodes a clip; ffprobe is never required.
+    match starts("ffmpeg") {
+        Ok(()) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(
+            "ffmpeg executable not found; install ffmpeg to decode video_url inputs".to_string(),
+        ),
+        Err(e) => Some(format!("ffmpeg could not be started: {e}")),
+    }
+}
+
+/// Whether `program -version` starts from PATH and exits successfully (a
+/// blocking probe, run once at start-up); the error says why not, split as
+/// the decode path's own spawn is: `NotFound` apart from a binary that is
+/// there but cannot run, a non-zero exit (a missing shared library, for
+/// one) among the latter.
+fn executable_starts(program: &str) -> std::io::Result<()> {
+    let status = std::process::Command::new(program)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("exited with {status}")))
+    }
 }
 
 fn video_decode_backend_override() -> Option<&'static str> {
@@ -4819,7 +4890,11 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// (PIL's defaults, accurate IDCT and fancy upsampling, so the pixels match an
 /// engine that decodes with PIL bit for bit; the pure-Rust decoder differs by
 /// a few levels, which the vision encoder amplifies), everything else and any
-/// turbojpeg failure through the `image` crate; then the long-side cap.
+/// turbojpeg failure through the `image` crate; then the long-side cap. A
+/// JPEG that ends where the reference loader refuses it (its entropy-coded
+/// data runs out, a progressive file misses its end marker, or a second
+/// scan header or a table follows a single-scan frame's scan) is refused
+/// before either decoder sees it (`jpeg_turbo::end_is_served`).
 ///
 /// CMYK and YCCK JPEGs follow the same rule: with libjpeg-turbo they are
 /// decompressed as CMYK and converted with PIL's arithmetic
@@ -4851,33 +4926,57 @@ pub(crate) fn decode_image_bytes(
             // libjpeg-turbo yields pixels only; the tag comes from the header.
             oriented(image, jpeg_orientation(bytes))
         }
-        None => match crate::webp_native::decode_webp(bytes) {
-            Some(image) => {
-                // libwebp yields pixels only; the tag comes from the file's
-                // metadata chunk, read as the fallback decoder reads it.
-                oriented(image, webp_orientation(bytes))
+        None => {
+            // A JPEG that ends where the reference loader refuses it (a scan
+            // cut short, a bare end with no marker behind it, a progressive
+            // file short of its end marker: "image file is truncated"; a
+            // second scan header or a malformed table behind a single-scan
+            // frame's scan, end marker or not: "broken data stream") is
+            // refused here: the library did not keep a frame for it above,
+            // and the decoder below would serve one with the rest filled in.
+            // A valid table there is refused with the malformed ones, which
+            // the reading does not tell apart. A single-scan file ending in
+            // a comment or another skipped segment, which the loader serves,
+            // passes; the decoder below reads to the end marker and fails it
+            // on its own. The reading waits until here: a file the library
+            // decoded clean reached a real end marker and pays no walk over
+            // its data.
+            if crate::jpeg_turbo::is_jpeg(bytes) && !crate::jpeg_turbo::end_is_served(bytes) {
+                return Err(MediaConnectorError::Image(image::ImageError::Decoding(
+                    image::error::DecodingError::new(
+                        image::error::ImageFormatHint::Exact(image::ImageFormat::Jpeg),
+                        "the data behind the scan header ends in a form this decoder refuses",
+                    ),
+                )));
             }
-            None => {
-                let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
-                    .with_guessed_format()
-                    .map_err(MediaConnectorError::Io)?
-                    .into_decoder()?;
-                // `ImageReader::decode` reserves the decoded buffer against the
-                // crate's allocation limit (512 MiB by default) before it
-                // decodes; `into_decoder` does not, so the reservation is made
-                // here. A file whose header declares more than the limit (a
-                // decompression bomb, or a JPEG the turbojpeg path handed over
-                // for its size) is refused without the allocation.
-                let mut limits = image::Limits::default();
-                limits.reserve(decoder.total_bytes())?;
-                decoder.set_limits(limits)?;
-                let orientation = decoder
-                    .orientation()
-                    .unwrap_or(image::metadata::Orientation::NoTransforms);
-                let image = image::DynamicImage::from_decoder(decoder)?;
-                oriented(image, orientation)
+            match crate::webp_native::decode_webp(bytes) {
+                Some(image) => {
+                    // libwebp yields pixels only; the tag comes from the file's
+                    // metadata chunk, read as the fallback decoder reads it.
+                    oriented(image, webp_orientation(bytes))
+                }
+                None => {
+                    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+                        .with_guessed_format()
+                        .map_err(MediaConnectorError::Io)?
+                        .into_decoder()?;
+                    // `ImageReader::decode` reserves the decoded buffer against the
+                    // crate's allocation limit (512 MiB by default) before it
+                    // decodes; `into_decoder` does not, so the reservation is made
+                    // here. A file whose header declares more than the limit (a
+                    // decompression bomb, or a JPEG the turbojpeg path handed over
+                    // for its size) is refused without the allocation.
+                    let mut limits = image::Limits::default();
+                    limits.reserve(decoder.total_bytes())?;
+                    decoder.set_limits(limits)?;
+                    let orientation = decoder
+                        .orientation()
+                        .unwrap_or(image::metadata::Orientation::NoTransforms);
+                    let image = image::DynamicImage::from_decoder(decoder)?;
+                    oriented(image, orientation)
+                }
             }
-        },
+        }
     };
     image = clip_sixteen_bit_grey(image, bytes);
     image = narrow_sixteen_bit_colour(image);

@@ -1225,6 +1225,38 @@ def services(documents: list[dict]) -> dict[str, dict]:
 
 
 @needs_helm
+def test_an_admin_host_without_an_admin_port_is_refused_at_render():
+    """A host without the port fails at the gateway's start; the chart refuses
+    it where the values are written."""
+    assert "router.adminPort" in render_error("router.adminHost=0.0.0.0")
+
+
+LISTENER_PORT_KEYS = ("router.port", "router.metrics.port", "router.mesh.port")
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "settings, key",
+    [
+        (("router.adminPort=30000",), "router.port"),
+        (("router.adminPort=29000", "router.metrics.port=29000"), "router.metrics.port"),
+        (("router.mesh.enabled=true", "router.adminPort=39527"), "router.mesh.port"),
+    ],
+)
+def test_an_admin_port_another_listener_holds_is_refused_naming_that_listener(settings, key):
+    """A port another listener holds fails at the gateway's start; the chart
+    refuses it where the values are written and names the one key that
+    matched, so the operator reads which listener to move and not a list."""
+    error = render_error(*settings)
+    port = next(s for s in settings if s.startswith("router.adminPort=")).split("=")[1]
+    assert (
+        f"router.adminPort {port} equals {key}: the gateway refuses two listeners on one port"
+        in error
+    ), error
+    assert not any(other in error for other in LISTENER_PORT_KEYS if other != key), error
+
+
+@needs_helm
 def test_the_admin_listener_renders_its_port_and_service_only_when_set():
     """Without ``router.adminPort`` nothing names the admin listener; with it
     the pod passes the flags and carries the port, and a Service of its own
@@ -1237,7 +1269,7 @@ def test_the_admin_listener_renders_its_port_and_service_only_when_set():
 
     _, documents = render(
         "router.adminPort=9001",
-        "router.adminHost=127.0.0.1",
+        "router.adminHost=0.0.0.0",
         "router.ingress.enabled=true",
         "router.ingress.hosts[0].host=smg.example.com",
         "router.ingress.hosts[0].paths[0].path=/",
@@ -1246,7 +1278,7 @@ def test_the_admin_listener_renders_its_port_and_service_only_when_set():
     pod = router_pod(documents)
     args = pod["spec"]["containers"][0]["args"]
     assert args[args.index("--admin-port") + 1] == "9001"
-    assert args[args.index("--admin-host") + 1] == "127.0.0.1"
+    assert args[args.index("--admin-host") + 1] == "0.0.0.0"
     ports = {p["name"]: p["containerPort"] for p in pod["spec"]["containers"][0]["ports"]}
     assert ports["admin"] == 9001
     admin = services(documents)["smg-router-admin"]
@@ -1313,6 +1345,40 @@ def test_control_plane_keys_from_an_existing_secret():
         "items": [{"key": "keys.txt", "path": "keys.txt"}],
     }
     assert "checksum/control-plane" not in (pod["metadata"]["annotations"] or {})
+
+
+@needs_helm
+def test_a_custom_control_plane_secret_key_is_read_from_one_value():
+    """``auth.controlPlane.secretKey`` on the chart-managed Secret names the
+    Secret's data key, the mount's item and the file the flag reads: the three
+    render from the one value."""
+    _, documents = render(
+        f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}",
+        "auth.controlPlane.secretKey=keys.txt",
+    )
+    (secret,) = [
+        d
+        for d in documents
+        if d["kind"] == "Secret" and d["metadata"]["name"] == "smg-control-plane"
+    ]
+    assert secret["stringData"] == {"keys.txt": CONTROL_PLANE_KEYS}
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert (
+        args[args.index("--control-plane-api-keys-file") + 1] == "/etc/smg/control-plane/keys.txt"
+    )
+    (volume,) = [v for v in pod["spec"]["volumes"] if v["name"] == "control-plane"]
+    assert volume["secret"] == {
+        "secretName": "smg-control-plane",
+        "items": [{"key": "keys.txt", "path": "keys.txt"}],
+    }
+
+
+@needs_helm
+def test_an_unknown_control_plane_value_fails_the_render():
+    """The schema closes ``auth.controlPlane``: a misspelt key is refused at
+    render, where an open object would render no control-plane keys at all."""
+    assert "existingsecret" in render_error("auth.controlPlane.existingsecret=cp-keys")
 
 
 @needs_helm

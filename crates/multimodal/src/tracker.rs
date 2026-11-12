@@ -1,5 +1,6 @@
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc};
 
+use futures::FutureExt;
 use tokio::task::JoinHandle;
 
 use super::{
@@ -174,7 +175,7 @@ pub enum FetchOutcome {
     /// decode, a host the policy refuses.
     ClientFault,
     /// Not the caller's fault: a fetch that timed out, a host that failed,
-    /// a decoder this process lacks.
+    /// a decoder this process lacks, a fetch task that panicked.
     HostFault,
 }
 
@@ -605,18 +606,29 @@ impl AsyncMultiModalTracker {
                         let fetching = fetch(connector, source);
                         tokio::spawn(async move {
                             let started = std::time::Instant::now();
-                            let result = fetching.await;
+                            // A fetch that panics is reported too (the host's fault:
+                            // nobody's request), then its panic goes on to the join in
+                            // `finalize`. The future is not touched again after it,
+                            // hence the assertion.
+                            let result = AssertUnwindSafe(fetching).catch_unwind().await;
+                            let (outcome, bytes) = match &result {
+                                Ok(fetched) => (
+                                    FetchOutcome::of(fetched),
+                                    fetched.as_ref().map_or(0, fetched_bytes),
+                                ),
+                                Err(_) => (FetchOutcome::HostFault, 0),
+                            };
                             observer(
                                 &label,
                                 &FetchReport {
                                     modality,
                                     source: kind,
-                                    outcome: FetchOutcome::of(&result),
+                                    outcome,
                                     duration: started.elapsed(),
-                                    bytes: result.as_ref().map_or(0, fetched_bytes),
+                                    bytes,
                                 },
                             );
-                            result
+                            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         })
                     }
                 };
@@ -1368,5 +1380,40 @@ mod repeat_tests {
             .filter(|slot| matches!(slot, Slot::Fetch(_)))
             .count();
         assert_eq!(slots, 2);
+    }
+
+    /// A fetch whose task panics is reported once, as the host's fault with
+    /// no bytes, and the request still fails with the task's join error.
+    #[tokio::test]
+    async fn a_fetch_that_panics_is_reported_as_the_host_fault() {
+        static REPORTS: std::sync::Mutex<Vec<FetchReport>> = std::sync::Mutex::new(Vec::new());
+        fn observe(_: &str, report: &FetchReport) {
+            REPORTS.lock().expect("reports").push(*report);
+        }
+        let mut tracker = tracker().with_fetch_observer(Arc::from("m"), observe);
+        tracker.enqueue(
+            Modality::Audio,
+            None,
+            FetchSettings::Audio,
+            MediaSource::Url("https://example.test/a.wav".to_string()),
+            |_, _| {
+                std::future::poll_fn(|_| -> std::task::Poll<MultiModalResult<TrackedMedia>> {
+                    panic!("a fetch that dies")
+                })
+            },
+        );
+        let error = tracker
+            .finalize()
+            .await
+            .expect_err("the dead fetch fails the request");
+        assert!(
+            matches!(&error, MultiModalError::Join(join) if join.is_panic()),
+            "{error:?}"
+        );
+        let reports = REPORTS.lock().expect("reports").clone();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].outcome, FetchOutcome::HostFault);
+        assert_eq!(reports[0].bytes, 0);
+        assert_eq!(reports[0].modality, Modality::Audio);
     }
 }

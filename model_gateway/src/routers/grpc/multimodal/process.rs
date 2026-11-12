@@ -75,6 +75,36 @@ struct Timings {
     token_expand_ms: f64,
 }
 
+/// The refusal of a video part by a process that cannot decode video
+/// (`llm_multimodal::missing_video_decoder`): the request's own answer, a
+/// 400 under the media stage's code like a modality the model does not
+/// take, known at start-up and never a server error per request.
+#[derive(Debug)]
+pub(crate) struct VideoDecoderUnavailable {
+    pub(crate) why: &'static str,
+}
+
+impl VideoDecoderUnavailable {
+    /// Whether `error` is this refusal, at any depth of its chain.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<Self>().is_some())
+    }
+}
+
+impl std::fmt::Display for VideoDecoderUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "video input cannot be decoded by this process: {}",
+            self.why
+        )
+    }
+}
+
+impl std::error::Error for VideoDecoderUnavailable {}
+
 fn elapsed_ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
@@ -185,6 +215,13 @@ pub(crate) async fn process_multimodal_plan(
     transparency: TransparencyPolicy,
     encoder_budget: Option<usize>,
 ) -> Result<MultimodalOutput> {
+    // A video part needs a decoder this process may lack, known at
+    // start-up: refused up front, before any fetch or decode.
+    if plan.count(Modality::Video) > 0 {
+        if let Some(why) = llm_multimodal::missing_video_decoder() {
+            return Err(VideoDecoderUnavailable { why }.into());
+        }
+    }
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
     let mut timings = Timings::default();

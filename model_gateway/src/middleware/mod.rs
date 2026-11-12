@@ -8,6 +8,7 @@ pub mod auth;
 pub mod body_limit;
 pub mod body_timeout;
 pub mod concurrency;
+pub mod duty;
 pub mod edge_body;
 pub mod inert;
 pub mod logging;
@@ -41,7 +42,7 @@ pub use messages_errors::{
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use request_start::RequestStarted;
-pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};
+pub use sse_keepalive::{SseKeepAlive, SseKeepAliveLayer};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{
     ordinary_tenant_resolution_middleware, route_request_meta_middleware, RouteRequestMetaLayer,

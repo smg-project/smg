@@ -11,10 +11,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -50,7 +47,13 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
+    middleware::{
+        body_timeout::{
+            request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
+        },
+        scheduler::PreemptionGuard,
+        TenantRequestMeta,
+    },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
@@ -112,11 +115,11 @@ use crate::{
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
 const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-/// Error codes for streamed-body aborts the client caused. They carry no
-/// worker verdict: recording a circuit-breaker sample for them would let slow
-/// or oversized uploaders open a healthy worker's breaker.
-const STREAMED_BODY_STALLED: &str = "request_body_stalled";
-const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
+/// Error code of a streamed body that broke off before it was forwarded.
+/// With the middleware's `REQUEST_BODY_STALLED` and `REQUEST_BODY_TOO_LARGE`
+/// it names an abort the client caused; the three carry no worker verdict:
+/// recording a circuit-breaker sample for one would let slow or oversized
+/// uploaders open a healthy worker's breaker.
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 
 /// How a worker response body is relayed to the client. Re-chunking exists
@@ -289,7 +292,9 @@ impl Router {
                                 *response.headers_mut() = response_headers;
                                 response
                             }
-                            Err(e) => error::internal_error(
+                            // The worker's answer ended before it was whole:
+                            // the upstream's failure, under the code it had.
+                            Err(e) => error::bad_gateway(
                                 "read_response_failed",
                                 format!("Failed to read response: {}", cause(&e)),
                             ),
@@ -545,6 +550,8 @@ impl Router {
             header_utils::parse_routing_tokens_hint(headers).or_else(|| {
                 typed_req
                     .routing_tokens()
+                    // the generate route's validator refuses a negative `input_ids`
+                    // entry before routing: the cast of a validated id cannot wrap
                     .map(|ids| ids.iter().map(|&id| id as u32).collect())
             });
         let text = tokens
@@ -1086,7 +1093,7 @@ impl Router {
                             last_response = Some(response);
                         }
                         Err(e) => {
-                            last_response = Some(error::internal_error(
+                            last_response = Some(error::bad_gateway(
                                 "read_response_failed",
                                 format!("Failed to read response: {}", cause(&e)),
                             ));
@@ -1349,9 +1356,12 @@ impl Router {
     }
 
     /// Buffer a worker response body, capped at `limit` bytes; a larger body
-    /// is a misbehaving worker and yields a 502 before memory balloons. The
-    /// request's own timeout running out mid-body ends the request as it does
-    /// before the head (see [`convert_reqwest_error`]).
+    /// is a misbehaving worker and yields a 502 before memory balloons, and so
+    /// does a body the worker's connection cuts short (a close before the
+    /// announced length, a reset mid-body): the worker's transport failing
+    /// under the call, answered under its own code, never a fault of the
+    /// gateway's. The request's own timeout running out mid-body ends the
+    /// request as it does before the head (see [`convert_reqwest_error`]).
     async fn read_worker_body_capped<S>(mut stream: S, limit: usize) -> Result<Bytes, Response>
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
@@ -1367,7 +1377,7 @@ impl Router {
                     )));
                 }
                 Err(e) => {
-                    return Err(error::internal_error(
+                    return Err(error::bad_gateway(
                         "read_response_body_failed",
                         format!("Failed to get response body: {}", cause(&e)),
                     ));
@@ -1477,10 +1487,6 @@ impl Router {
             let rechunker = rechunk
                 .filter(|_| upstream_sse)
                 .map(|policy| SseRechunker::with_observer(policy, NoopObserver));
-            if rechunker.is_some() {
-                // Re-chunking changes the body length.
-                response_headers.remove(CONTENT_LENGTH);
-            }
             let mut response = relay_streaming_body(
                 res.bytes_stream(),
                 Relay {
@@ -1577,13 +1583,7 @@ impl Router {
                     timeout_secs,
                     "Streamed request body stalled waiting on the client; aborting dispatch"
                 );
-                return error::create_error(
-                    StatusCode::REQUEST_TIMEOUT,
-                    STREAMED_BODY_STALLED,
-                    format!(
-                        "No request body bytes arrived from the client for {timeout_secs} seconds"
-                    ),
-                );
+                return request_body_stalled_response(timeout_secs);
             }
         };
 
@@ -1596,7 +1596,7 @@ impl Router {
                 );
                 return error::create_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    STREAMED_BODY_TOO_LARGE,
+                    REQUEST_BODY_TOO_LARGE,
                     format!("Request body exceeded {} bytes", self.max_payload_size),
                 );
             }
@@ -2153,25 +2153,34 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     // The timeouts left here are not the request's own (the connect timeout,
     // a timeout below the client): the worker's failure, answered as before
     // and replayed.
+    // The worker's side failing under the call is the upstream's failure
+    // (502), as the disaggregated routers answer their start failures and
+    // the capped body read answers a body over its limit: the connect
+    // refused, the connection reset or closed before the head (the client
+    // files it as a request fault), the answer that did not decode or ended
+    // before it was whole (its decode fault; no route hands this conversion
+    // a body-read fault today, the relay's own reads answer those under
+    // their codes). The gateway's own side keeps the 500: a builder fault,
+    // a redirect it did not follow. A body the gateway forwards does not
+    // fail the send on its own: the one route that streams one answers its
+    // inbound fault and its cap (400, 413) before this conversion, and
+    // every other route sends a buffered body; were such a fault to arrive,
+    // the client files it as a request fault too (its body kind is the
+    // response body's read), not as the gateway's. Every code stays what
+    // it was, and the retry layer replays a 502 as it replayed the 500.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
     } else if e.is_timeout() {
         (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
     } else if e.is_connect() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_connection_failed",
-        )
+        (StatusCode::BAD_GATEWAY, "call_upstream_connection_failed")
     } else if e.is_builder() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "call_upstream_builder_error",
         )
     } else if e.is_request() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_request_error",
-        )
+        (StatusCode::BAD_GATEWAY, "call_upstream_request_error")
     } else if e.is_redirect() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2183,10 +2192,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
             "call_upstream_body_error",
         )
     } else if e.is_decode() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_decode_error",
-        )
+        (StatusCode::BAD_GATEWAY, "call_upstream_decode_error")
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2324,7 +2330,7 @@ impl Router {
         // status and code.
         let client_body_fault = matches!(
             error_code,
-            STREAMED_BODY_STALLED | STREAMED_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
+            REQUEST_BODY_STALLED | REQUEST_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
         );
         if !client_body_fault {
             // A streamed head's success was recorded before its relay task
@@ -2889,14 +2895,17 @@ mod tests {
         middleware::ReportedRefusal,
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         policies::as_cache_aware,
-        routers::common::{
-            body_policy::{
-                REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
-                REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
-                REASON_WASM_REQUEST_HOOK,
+        routers::{
+            common::{
+                body_policy::{
+                    REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
+                    REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                    REASON_WASM_REQUEST_HOOK,
+                },
+                request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+                test_support::fast_retry_config,
             },
-            request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
-            test_support::fast_retry_config,
+            http::test_support,
         },
         service_discovery::testing::create_test_app_context,
         worker::{
@@ -3783,9 +3792,9 @@ mod tests {
 
     /// The buffered transcription answer's outcome names the reason from
     /// what the client sees: a body the gateway could not read whole (cut
-    /// under the read) is the gateway's own 500 under its code, counted as
-    /// the worker's connection failing (`transport_disconnect`), not as the
-    /// worker-style reason of a 500; a body that arrives whole is the
+    /// under the read) is a bad gateway under the gateway's own code, counted
+    /// as the worker's connection failing (`transport_disconnect`), not as
+    /// the worker-style reason of a 502; a body that arrives whole is the
     /// worker's answer, recorded by its status.
     #[tokio::test]
     async fn a_buffered_transcription_read_failure_names_the_gateways_reason() {
@@ -3805,7 +3814,7 @@ mod tests {
         let answer =
             buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
                 .await;
-        assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&answer),
             "read_response_body_failed"
@@ -3875,8 +3884,12 @@ mod tests {
         );
     }
 
+    /// A body the engine's stream ends with an error is the worker's
+    /// transport failing under the call: a bad gateway under the read's code,
+    /// the class the over-limit body takes and the one the metrics file the
+    /// code under (`transport_disconnect`), never a 500 of the gateway's own.
     #[tokio::test]
-    async fn read_worker_body_capped_maps_read_failure_to_500() {
+    async fn read_worker_body_capped_maps_a_read_failure_to_a_bad_gateway() {
         let url = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
 
         let response = Router::read_worker_body_capped(
@@ -3886,7 +3899,57 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "read_response_body_failed"
+        );
+    }
+
+    /// Loopback engine stub whose every answer is a 200 head announcing a
+    /// 1000-byte body, twelve bytes of it, and then the closed connection: an
+    /// engine that goes away mid-answer, as the client reads it ("end of file
+    /// before message length reached").
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn spawn_close_after_headers_stub() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 1000\r\n\r\n{\"partial\":",
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An engine that closes the connection after its head and a few bytes
+    /// of the body it announced is answered the same way: a bad gateway
+    /// under the read's code, with the client's reason in the message.
+    #[tokio::test]
+    async fn a_worker_that_closes_mid_body_is_a_bad_gateway() {
+        let url = spawn_close_after_headers_stub().await;
+
+        let response = Router::read_worker_body_capped(
+            worker_body(&crate::server::http_client(), &url).await,
+            1 << 20,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"
@@ -5343,7 +5406,7 @@ mod tests {
         assert!(err.is_connect());
 
         let response = convert_reqwest_error(err);
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             response.headers()[error::HEADER_X_SMG_ERROR_CODE],
             "call_upstream_connection_failed"
@@ -5352,6 +5415,130 @@ mod tests {
             is_retryable_response(&response),
             "a connect failure before any byte is replayed, as before"
         );
+    }
+
+    /// A worker that closes the connection before any response byte: the
+    /// client files it as a request fault; the answer is the upstream's
+    /// failure, replayed on another worker as before.
+    #[tokio::test]
+    async fn a_connection_closed_before_the_head_is_an_upstream_failure() {
+        let (addr, _accepted) = flaky_upstream(usize::MAX).await;
+        let err = crate::server::http_client()
+            .post(format!("http://{addr}/generate"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_request(), "{err:?}");
+        assert!(!err.is_connect() && !err.is_timeout(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_request_error"
+        );
+        assert!(is_retryable_response(&response));
+    }
+
+    /// A worker whose body ends before the length its head announced: the
+    /// client files the read as a decode fault, and the conversion answers
+    /// it as the upstream's failure. No route hands the conversion a
+    /// body-read fault today (the relay's own reads answer under their codes;
+    /// see `a_proxied_get_whose_body_is_cut_short_is_an_upstream_failure`):
+    /// the case pins the arm for a caller that will.
+    #[tokio::test]
+    async fn a_body_cut_short_is_an_upstream_failure() {
+        let addr = spawn_short_body_stub().await;
+        let response = crate::server::http_client()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap();
+        let err = response.bytes().await.unwrap_err();
+        assert!(err.is_decode(), "{err:?}");
+        assert!(!err.is_body(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_decode_error"
+        );
+    }
+
+    /// The relay's own read of the body of a proxied GET, cut short by the
+    /// worker: the upstream's failure under the code it had.
+    #[tokio::test]
+    async fn a_proxied_get_whose_body_is_cut_short_is_an_upstream_failure() {
+        let addr = spawn_short_body_stub().await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        ));
+        let router = Router {
+            worker_registry,
+            ..create_test_regular_router()
+        };
+
+        let response = router
+            .proxy_get_request(Request::new(Body::empty()), "health")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "read_response_failed"
+        );
+    }
+
+    /// A worker's 200 that is not the JSON the route asked for, handed to
+    /// the conversion: the upstream's failure, as an answer over the payload
+    /// limit is. As above, no route reaches this arm today.
+    #[tokio::test]
+    async fn an_answer_that_does_not_decode_is_an_upstream_failure() {
+        let (addr, _accepted) = flaky_upstream(0).await;
+        let response = crate::server::http_client()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap();
+        let err = response.json::<Value>().await.unwrap_err();
+        assert!(err.is_decode(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_decode_error"
+        );
+    }
+
+    /// Accepts one connection, answers a head that announces more body than
+    /// it writes, and closes.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn spawn_short_body_stub() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 64\r\n\r\n{\"text\":")
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        addr
     }
 
     /// Loopback engine stub on `path`: answers `content_type` with `chunks`,
@@ -6557,19 +6744,17 @@ mod tests {
         drop(listener);
     }
 
-    /// A worker that answers the chat route with `body` as one sized SSE
-    /// answer: hyper writes the `Content-Length` an upstream that knows its
-    /// length would.
+    /// A worker that answers the chat route with `body` as one sized answer
+    /// under `content_type`: hyper writes the `Content-Length` an upstream
+    /// that knows its length would.
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_sized_sse_worker(body: &'static str) -> String {
+    async fn spawn_sized_worker(body: &'static str, content_type: &'static str) -> String {
         let app = axum::Router::new().route(
             "/v1/chat/completions",
-            axum::routing::post(
-                move || async move { ([(CONTENT_TYPE, "text/event-stream")], body) },
-            ),
+            axum::routing::post(move || async move { ([(CONTENT_TYPE, content_type)], body) }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6579,24 +6764,29 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// Re-slicing changes the body's length: a re-sliced stream reaches the
-    /// client without the upstream's `Content-Length` and with its text
-    /// whole, while a plain relay keeps the header with the bytes it copies.
-    #[tokio::test]
-    async fn a_re_sliced_stream_drops_the_upstreams_content_length() {
-        use openai_protocol::validated::Normalizable;
-
-        const BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+    /// A sized answer of two short deltas and `[DONE]`: the re-slicing
+    /// policy holds deltas this short and merges them, so a rechunker that
+    /// ran on the body shows in the relayed bytes.
+    const SIZED_DELTA_BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
                             \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\
                             \"finish_reason\":null}]}\n\n\
                             data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
                             \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
                             \"finish_reason\":null}]}\n\n\
                             data: [DONE]\n\n";
-        let url = spawn_sized_sse_worker(BODY).await;
+
+    /// A streamed SSE relay may change the body's length, by re-slicing it
+    /// or by ending a cut stream with its error event, so a sized upstream
+    /// answer reaches the client without the upstream's `Content-Length` on
+    /// the re-sliced path and on the plain path alike, its text whole.
+    #[tokio::test]
+    async fn a_streamed_sse_relay_drops_the_upstreams_content_length() {
+        use openai_protocol::validated::Normalizable;
+
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "text/event-stream").await;
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
         let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
-        for (model, keeps_length) in [("MiniMax-M3", false), ("served-plain-relay-model", true)] {
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
             let mut request: ChatCompletionRequest = serde_json::from_value(json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "hello"}],
@@ -6609,9 +6799,8 @@ mod tests {
                 .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
-            assert_eq!(
-                response.headers().contains_key(CONTENT_LENGTH),
-                keeps_length,
+            assert!(
+                !response.headers().contains_key(CONTENT_LENGTH),
                 "{model}: the Content-Length of a sized upstream answer"
             );
             let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -6630,6 +6819,94 @@ mod tests {
                 .collect();
             assert_eq!(text, "Hello", "{model}: the text is whole");
         }
+    }
+
+    /// A streamed answer that is not SSE is relayed byte for byte, on the
+    /// re-chunking model and the plain one alike, so a sized upstream answer
+    /// keeps the upstream's `Content-Length` and reaches the client whole.
+    /// The body carries deltas the re-slicing policy would hold and merge,
+    /// so a rechunker that ran under the wrong content type shows in the
+    /// bytes.
+    #[tokio::test]
+    async fn a_streamed_relay_keeps_the_content_length_of_a_sized_non_sse_answer() {
+        use openai_protocol::validated::Normalizable;
+
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "application/json").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|length| length.to_str().ok()),
+                Some(SIZED_DELTA_BODY.len().to_string().as_str()),
+                "{model}: the upstream's Content-Length of a sized non-SSE answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                SIZED_DELTA_BODY.as_bytes(),
+                "{model}: the bytes are whole"
+            );
+        }
+    }
+
+    /// The plain path ends a cut stream with its error event too, so a sized
+    /// upstream answer that is cut reaches the client without the upstream's
+    /// `Content-Length`: the frames that arrived, the typed error event and
+    /// `[DONE]` under no declared length the event would overrun.
+    #[tokio::test]
+    async fn a_cut_sized_stream_on_the_plain_path_ends_with_its_error_event_and_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let url = test_support::spawn_sized_sse_worker_cut_after(BODY, first).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a cut stream's length is not the upstream's"
+        );
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body ends cleanly after the error event")
+            .to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        assert_eq!(events[0], BODY[..first].trim_end());
+        let error: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[2], "data: [DONE]");
     }
 }
 

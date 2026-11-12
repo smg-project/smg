@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 
+use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 
 use super::*;
-use crate::worker::{
-    circuit_breaker::{CircuitBreakerConfig, CircuitState},
-    test_support::no_health_check,
-    BasicWorkerBuilder, WorkerLoadGuard,
+use crate::{
+    observability::worker_metrics::{self, WorkerSeriesRecorder},
+    worker::{
+        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        test_support::no_health_check,
+        BasicWorkerBuilder, WorkerLoadGuard,
+    },
 };
 
 /// A worker whose breaker opens on one failed request and would stay
@@ -1256,7 +1260,7 @@ fn remove_inner_aborts_when_origin_changed_before_lock() {
     // Models the post-promotion state: expecting Mesh, finding Local.
     assert!(
         registry
-            .remove_inner(&id, Some(WorkerOrigin::Mesh))
+            .remove_inner(&id, Some(WorkerOrigin::Mesh), None)
             .is_none(),
         "removal must abort when the origin no longer matches"
     );
@@ -3542,4 +3546,100 @@ fn clear_all_overload_flags_resets_every_model() {
     assert!(!b.is_overloaded());
     assert_eq!(registry.overloaded_worker_count("m1"), 0);
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
+}
+
+/// A removed worker's address stays retired in the series store while a
+/// handle to the worker lives (a late write of that handle lands nowhere),
+/// and the store's upkeep forgets it once the last handle is gone: the
+/// registry hands the store the removed worker's own witness.
+#[test]
+fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
+    let series = worker_metrics::installed_or_default();
+    let registry = WorkerRegistry::new();
+    let url = "http://retired-seam:8080";
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .health_config(no_health_check())
+            .build(),
+    );
+    let held = Arc::clone(&worker);
+    let id = registry.register(worker).unwrap();
+    assert!(!series.is_retired(url), "a registered address is live");
+
+    registry.remove(&id);
+    assert!(series.is_retired(url), "the removal retires the address");
+    series.run_upkeep();
+    assert!(
+        series.is_retired(url),
+        "a held worker keeps its address retired through the upkeep"
+    );
+
+    drop(held);
+    series.run_upkeep();
+    assert!(
+        !series.is_retired(url),
+        "the upkeep forgets the address once the removed worker is gone"
+    );
+}
+
+/// A worker replaced at its URL stays alive in the handles taken before the
+/// replacement (a load guard) and writes under the URL when they go: the
+/// registry hands the store its witness at the replacement, so once the URL
+/// is removed the upkeep keeps the address retired until that instance is
+/// gone too, and the guard's release lands nowhere.
+#[test]
+fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
+    let series = worker_metrics::installed_or_default();
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(series),
+    );
+    let url = "http://replaced-seam:8080";
+    let worker = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let listed = || {
+        let mut rendered = String::new();
+        series.render_into(&mut rendered);
+        rendered.lines().any(|line| {
+            line.starts_with("smg_worker_requests_active{")
+                && line.contains("worker=\"http://replaced-seam:8080\"")
+        })
+    };
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        let first = worker();
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let guard = WorkerLoadGuard::new(first, None);
+        assert!(
+            listed(),
+            "the guard's load is a series of the registered address"
+        );
+        assert!(registry.replace(&id, worker()), "a same-URL replacement");
+
+        registry.remove(&id);
+        assert!(series.is_retired(url), "the removal retires the address");
+        series.run_upkeep();
+        assert!(
+            series.is_retired(url),
+            "the replaced instance in its guard keeps the address retired"
+        );
+
+        drop(guard);
+        assert!(
+            !listed(),
+            "the guard's release after the removal lands nowhere"
+        );
+        series.run_upkeep();
+        assert!(
+            !series.is_retired(url),
+            "the upkeep forgets the address once the replaced instance is gone"
+        );
+    });
 }

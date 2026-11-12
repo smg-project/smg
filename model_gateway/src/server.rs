@@ -56,6 +56,7 @@ use wfaas::LoggingSubscriber;
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod posture;
+mod rate_limit_document;
 pub(crate) mod tls;
 
 // The HTTP client constructors and the process crypto provider they install
@@ -902,7 +903,7 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &["/config"];
+pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants"];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -961,10 +962,19 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/config", get(admin_config))
         .route("/secrets/reload", post(reload_secrets))
+        .route(
+            "/rate-limits/tenants",
+            get(rate_limit_document::get).put(rate_limit_document::put),
+        )
 }
 
 /// The gated routes by name, in the order of `gated_control_plane_routes`.
-pub const GATED_ROUTES: &[(&str, &str)] = &[("GET", "/config"), ("POST", "/secrets/reload")];
+pub const GATED_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/config"),
+    ("POST", "/secrets/reload"),
+    ("GET", "/rate-limits/tenants"),
+    ("PUT", "/rate-limits/tenants"),
+];
 
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
@@ -1057,14 +1067,14 @@ async fn v1_tokenize(
     State(state): State<Arc<AppState>>,
     Json(request): Json<TokenizeRequest>,
 ) -> Response {
-    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+    tokenize::tokenize(&state.context, request).await
 }
 
 async fn v1_detokenize(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DetokenizeRequest>,
 ) -> Response {
-    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+    tokenize::detokenize(&state.context, request).await
 }
 
 async fn v1_tokenizers_add(
@@ -2018,7 +2028,10 @@ pub fn run(
     // Driven from the runtime: on a current-thread runtime nothing else polls
     // the exporter's connection while the shutdown waits for the export.
     if let Err(e) = runtime.block_on(runtime.spawn_blocking(otel_trace::shutdown_otel)) {
-        #[expect(clippy::print_stderr)]
+        #[expect(
+            clippy::print_stderr,
+            reason = "close_logging above stopped the writers; stderr is the one channel left"
+        )]
         {
             eprintln!("[tracing] OpenTelemetry shutdown task failed: {e}");
         }
@@ -2557,23 +2570,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &config.secret_sources,
         config.router_config.api_key.as_deref(),
         &config.router_config.tenant_api_keys,
-        app_context.gateway_auth.clone(),
-        control_plane_auth_state
-            .as_ref()
-            .map(|state| state.keys.clone()),
-        control_plane_auth_state
-            .is_none()
-            .then(|| admin_auth_config.clone()),
+        crate::secrets::KeySets {
+            serving: app_context.gateway_auth.clone(),
+            control_plane: control_plane_auth_state
+                .as_ref()
+                .map(|state| state.keys.clone()),
+            admin_fallback: control_plane_auth_state
+                .is_none()
+                .then(|| admin_auth_config.clone()),
+        },
     )
     .map(Arc::new);
     // `--secrets-auto-reload`: the key files watched, a change reloading
     // them as the route does; a directory that cannot be watched refuses the
-    // start. The sources record says which it is.
+    // start. The sources record says which it is, and names the settings
+    // whose files are watched.
     let secrets_auto_reload = match (config.secrets_auto_reload, &secrets) {
         (false, _) => "off".to_string(),
         (true, Some(reloader)) => {
             crate::secrets::start_auto_reload(Arc::clone(reloader))?;
-            format!("on ({} files)", reloader.files().count())
+            let names: Vec<&str> = reloader.files().names().collect();
+            format!("on ({})", names.join(", "))
         }
         (true, None) => {
             warn!("--secrets-auto-reload is set and no key came from a file: nothing to watch");

@@ -3,10 +3,7 @@
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off TokenSpeed's `ModelConfig` and `ServerArgs`) and from the handshake.
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::ZmqEngineClient;
 use futures::StreamExt;
@@ -84,7 +81,7 @@ pub(super) async fn health_check_with(
 /// does.
 async fn probe(state: &Arc<State>) -> Result<(), Status> {
     let request = ts::GenerateRequest {
-        request_id: format!("HEALTH_CHECK_{}", probe_nanos()),
+        request_id: health_probe::probe_request_id(),
         tokenized: Some(ts::TokenizedInput {
             input_ids: vec![0],
             original_text: String::new(),
@@ -105,14 +102,6 @@ async fn probe(state: &Arc<State>) -> Result<(), Status> {
             "the probe's stream ended without an output",
         )),
     }
-}
-
-/// The probe id's suffix: nanoseconds since the epoch (the Python servicer
-/// stamps its clock the same way).
-fn probe_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos())
 }
 
 /// `GetModelInfo`: the launcher's config, with the handshake's context length

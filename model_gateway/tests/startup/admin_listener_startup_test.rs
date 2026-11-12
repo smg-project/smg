@@ -196,12 +196,18 @@ fn the_admin_listener_refuses_connections_beyond_its_bound_at_accept() {
     // at accept. Its answer proves it holds the permit before the probe: a
     // bare connect returns before the acceptor has admitted it, and the
     // `/health` connection above may still hold the permit for a moment.
-    let held = served_connection(admin, EXIT_TIMEOUT);
+    let held = served_connection(admin, EXIT_TIMEOUT, &gateway.log);
     assert_eq!(
         status_of(admin, "/health"),
         None,
         "the bound-plus-one connection was answered"
     );
+    // The refusal's WARN names this listener and its flag: the accept site
+    // passes the listener, and a swapped argument there names the other one.
+    let refusal = "the admin listener's connection limit (--admin-max-connections) is reached";
+    if let Err(log) = log_with_line(&gateway.log, refusal, EXIT_TIMEOUT) {
+        panic!("the refusal does not name the admin listener and its flag\n{log}");
+    }
     assert_eq!(status_of(data, "/health"), Some(200), "the data listener");
 
     // The permit goes with the held connection; the listener answers again.

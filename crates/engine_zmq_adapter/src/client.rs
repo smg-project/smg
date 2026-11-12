@@ -2256,19 +2256,36 @@ mod tests {
         assert_eq!(client.dialect(), ZmqDialect::Vllm);
     }
 
-    /// A `tcp://` worker serves engines on other hosts: they dial its own
-    /// address, and the INIT hands them data-plane addresses on the same
-    /// host with the ports the gateway bound.
-    #[tokio::test]
-    async fn a_tcp_worker_connects_its_engines_through_its_own_address() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
+    /// A loopback port nothing listens on at the moment of asking (bound and
+    /// released): free only until a neighbour binds it, another test's probe
+    /// or a connection's ephemeral port, so a worker told this port can
+    /// still lose it. [`connect_tcp_worker`] probes again when that happens.
+    fn probed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
-            .port();
-        let base_url = format!("tcp://127.0.0.1:{port}");
-        let (client, engine) = tokio::join!(
-            connect_with_eos(
+            .port()
+    }
+
+    /// Which side of a `tcp://` worker's start finished first.
+    enum First<W, E> {
+        Worker(W),
+        Engine(E),
+    }
+
+    /// A `tcp://` worker on a port `probe` names, with one mock engine dialing
+    /// it. The worker's handshake address is the one the engine dials, so the
+    /// test has to name the port before the worker binds it, and a port a
+    /// probe named is free only until a neighbour takes it. The worker's
+    /// connect is raced against the engine's dial: a bind that finds the port
+    /// taken ends that attempt at once, its engine dial abandoned with it,
+    /// and the next attempt starts on a fresh probe.
+    async fn connect_tcp_worker(mut probe: impl FnMut() -> u16) -> (ZmqEngineClient, MockEngine) {
+        const ATTEMPTS: usize = 8;
+        for _ in 0..ATTEMPTS {
+            let base_url = format!("tcp://127.0.0.1:{}", probe());
+            let mut worker = std::pin::pin!(connect_with_eos(
                 &base_url,
                 "m".to_string(),
                 RuntimeType::TokenSpeed,
@@ -2276,15 +2293,63 @@ mod tests {
                 1,
                 EosTokenIds::default(),
                 Duration::from_secs(10),
-            ),
-            connect_to_frontend(
+            ));
+            let mut engine = std::pin::pin!(connect_to_frontend(
                 &base_url,
                 EngineId::from_engine_index(0),
                 default_ready_response()
-            ),
+            ));
+            let first = tokio::select! {
+                worker = &mut worker => First::Worker(worker),
+                engine = &mut engine => First::Engine(engine),
+            };
+            match first {
+                First::Worker(Err(error)) if error.contains("Address already in use") => continue,
+                First::Worker(worker) => {
+                    let client = worker.expect("the tcp worker connects");
+                    let engine = engine.await.expect("mock engine connected");
+                    return (client, engine);
+                }
+                First::Engine(engine) => {
+                    let engine = engine.expect("mock engine connected");
+                    let client = worker.await.expect("the tcp worker connects");
+                    return (client, engine);
+                }
+            }
+        }
+        panic!("{ATTEMPTS} probed ports were taken before the worker could bind them");
+    }
+
+    /// A probed port a neighbour took before the worker bound it is probed
+    /// again: the worker connects on a later probe, the engine with it.
+    #[tokio::test]
+    async fn a_probed_port_a_neighbour_took_is_probed_again() {
+        let neighbour = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = neighbour.local_addr().unwrap().port();
+        let probes = std::cell::Cell::new(0);
+        let (client, _engine) = connect_tcp_worker(|| {
+            probes.set(probes.get() + 1);
+            if probes.get() == 1 {
+                taken
+            } else {
+                probed_port()
+            }
+        })
+        .await;
+        drop(neighbour);
+        assert_eq!(client.engine_count(), 1);
+        assert!(
+            probes.get() >= 2,
+            "the worker bound the port the neighbour held"
         );
-        let client = client.expect("the tcp worker connects");
-        let engine = engine.expect("mock engine connected");
+    }
+
+    /// A `tcp://` worker serves engines on other hosts: they dial its own
+    /// address, and the INIT hands them data-plane addresses on the same
+    /// host with the ports the gateway bound.
+    #[tokio::test]
+    async fn a_tcp_worker_connects_its_engines_through_its_own_address() {
+        let (client, engine) = connect_tcp_worker(probed_port).await;
         assert_eq!(client.engine_count(), 1);
         for address in engine
             .init

@@ -222,6 +222,20 @@ impl<'a> Identity<'a> {
         Self { hash, plain: None }
     }
 
+    /// A key within a scope (a model and a phase, fingerprinted by the host):
+    /// the fingerprint mixes the scope in, so one key names one session per
+    /// scope, and the plain form is kept. Never `0` for a present key.
+    pub fn scoped(key: &'a str, scope: u64) -> Self {
+        let mut h = fingerprint(key.as_bytes()) ^ scope.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        Self {
+            hash: if h == 0 { 1 } else { h },
+            plain: Some(key),
+        }
+    }
+
     pub const fn is_none(&self) -> bool {
         self.hash == 0
     }
@@ -306,6 +320,23 @@ pub struct Candidate {
     pub vision: bool,
     /// Reachable from one gateway only (a host-local wire).
     pub host_local: bool,
+    /// Session keys with a request in flight on this worker. Last because the
+    /// wire numbers its fields in the record's order and this one came after
+    /// the contract's first cut.
+    pub active_sessions: u16,
+    /// The worker's stable identity for placement: its registration key's
+    /// fingerprint (the low 32 bits), equal across the handles of one worker
+    /// and across gateway replicas, where the id is the handle's. A ring
+    /// positions a member by it, so a replaced handle keeps its
+    /// predecessor's positions and every replica agrees on a key's owner.
+    /// Two members with equal keys share positions and the lower member
+    /// index owns first: by the birthday bound, n(n - 1) / 2 over 2^32, about
+    /// one chance in 8,600 over a pool of a thousand and one in 870,000 over
+    /// a hundred; the 64-bit form waits for the candidate's byte budget.
+    /// Zero when the host carries none. Last in the record (the wire numbers
+    /// its fields in the record's order; this one came after the contract's
+    /// first cut).
+    pub key: u32,
 }
 
 /// Media on the request: counts and bytes, for workers that take media.

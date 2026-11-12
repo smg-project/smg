@@ -106,14 +106,15 @@ pub(crate) fn prepare(
     // legacy parsers here and at the two sites below, whatever the enum's
     // default.
     let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
-    let names = ctx.components.parser_resolver.names(model);
-    // A forced call's tag takes the start the model's workers name together;
-    // a JSON answer's tag and the `auto` tag take the selected worker's own
-    // start at request building.
+    // The model's workers, fetched once for the request: the cards' parser
+    // names are read among them here, and a forced call's tag takes the
+    // start they name together; a JSON answer's tag and the `auto` tag take
+    // the selected worker's own start at request building.
     let workers = ctx
         .components
         .worker_registry
         .get_by_model(&ctx.input.model_id);
+    let names = ctx.components.parser_resolver.names_among(&workers, model);
     // Which table reads the response under the parser, decided once for the
     // request: the replay, the constraint and the decoder's special tokens
     // read it here, the assignment at request building after them. A refusal

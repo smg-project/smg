@@ -49,9 +49,11 @@ pub(crate) async fn execute(router: &RouterContext, mut req_ctx: RequestContext)
     for _iteration in 0..DEFAULT_MAX_ITERATIONS {
         Metrics::record_mcp_tool_iteration(&req_ctx.model_id);
 
-        let result = mcp::IterationResult::from_message(&message);
+        let result = mcp::IterationResult::take_from(&mut message);
         match mcp::process_iteration(&result, &session, &req_ctx.model_id).await {
             mcp::ToolLoopAction::Done => {
+                // The final answer's blocks go back where the rebuild reads them.
+                message.content = result.content_blocks;
                 let final_message = mcp::rebuild_response_with_mcp_blocks(
                     message,
                     &all_mcp_calls,
@@ -63,8 +65,9 @@ pub(crate) async fn execute(router: &RouterContext, mut req_ctx: RequestContext)
                 return error::bad_gateway("mcp_tool_loop_error", msg);
             }
             mcp::ToolLoopAction::Continue(cont) => {
-                // Collect content blocks from this iteration for the final response
-                prior_content_blocks.extend(message.content.clone());
+                // This iteration's blocks, kept for the final response: moved,
+                // the message is sent no further.
+                prior_content_blocks.extend(result.content_blocks);
                 all_mcp_calls.extend(cont.mcp_calls);
                 req_ctx.request.messages.push(InputMessage {
                     role: Role::Assistant,
@@ -84,8 +87,9 @@ pub(crate) async fn execute(router: &RouterContext, mut req_ctx: RequestContext)
     }
 
     // Max iterations — check if the last response completed naturally
-    let result = mcp::IterationResult::from_message(&message);
+    let result = mcp::IterationResult::take_from(&mut message);
     if result.tool_use_blocks.is_empty() {
+        message.content = result.content_blocks;
         let final_message =
             mcp::rebuild_response_with_mcp_blocks(message, &all_mcp_calls, &prior_content_blocks);
         return (StatusCode::OK, Json(final_message)).into_response();

@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::common::{GenerationRequest, UsageInfo};
+use super::common::{routing_text_of_input, GenerationRequest, UsageInfo};
 
 // ============================================================================
 // Classify API
@@ -36,6 +36,10 @@ pub struct ClassifyRequest {
 
     /// Engine extension: request priority
     pub priority: Option<i32>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 impl GenerationRequest for ClassifyRequest {
@@ -52,15 +56,7 @@ impl GenerationRequest for ClassifyRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        match &self.input {
-            Value::String(s) => s.clone(),
-            Value::Array(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        }
+        routing_text_of_input(&self.input)
     }
 }
 

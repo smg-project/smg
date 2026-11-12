@@ -33,8 +33,9 @@
 //! one per pair, so equal ranks are one pair at two positions), until no
 //! adjacent pair is a merge: the rule both loops below apply directly. A
 //! model whose symbols are not the byte tokens (a prefix or suffix on
-//! subwords, a byte without a token) or whose merges are random (dropout)
-//! declines at load and keeps the model's merge for its misses.
+//! subwords) or whose merges are random (dropout) declines at load and
+//! keeps the model's merge for its misses; one without a token for a byte
+//! keeps its table, and the pieces that hold the byte stay the model's.
 //!
 //! A tiktoken vocabulary lists its tokens by rank and no merges: its encoder
 //! merges, at every step, the adjacent pair whose concatenation is the token
@@ -91,6 +92,10 @@ const NO_KEY: u32 = u32::MAX;
 const MAX_RANKS: usize = 1 << (u32::BITS - SHORT_KEY_BITS);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
+/// The id a byte with no token stands under in a table's byte ids: never
+/// merged (a piece that holds the byte is the model's, see
+/// [`MergeTable::lacks_a_token_for`]).
+const NO_BYTE_TOKEN: u32 = u32::MAX;
 /// Filter bits per merge of the pair table (see `MergeTable::pair_filter`),
 /// at least: two set per pair in one word, so at eight bits per merge about
 /// one pair in twenty that is no merge passes the filter (5.3 % measured on
@@ -196,8 +201,13 @@ pub(super) enum ByteTokens {
 
 /// The merges of one byte-level BPE model; see the module documentation.
 pub(super) struct MergeTable {
-    /// The id of each byte's token.
+    /// The id of each byte's token ([`NO_BYTE_TOKEN`] for a byte without one).
     byte_ids: [u32; 256],
+    /// The bytes the vocabulary has no token for, when it lacks any: a piece
+    /// that holds one is the model's to merge (see
+    /// [`Self::lacks_a_token_for`]). `None` over a complete alphabet, the
+    /// usual case.
+    missing: Option<Box<[bool; 256]>>,
     /// `hot[(a - hot_base) << HOT_SIDE_BITS | (b - hot_base)]`: the merge of
     /// the pair `(a, b)` when both ids are within [`HOT_SIDE`] of the window
     /// base, the least byte token's id ([`Merge::NONE`] for a pair that is
@@ -294,15 +304,27 @@ impl MergeTable {
             ));
         }
         let mut byte_ids = [0u32; 256];
+        let mut missing: Option<Box<[bool; 256]>> = None;
         let mut utf8 = [0u8; 4];
         for (byte, alphabet) in super::bytes_char().into_iter().enumerate() {
             let spelling = match tokens {
                 ByteTokens::Alphabet => Cow::Borrowed(&*alphabet.encode_utf8(&mut utf8)),
                 ByteTokens::Hex => Cow::Owned(format!("<0x{byte:02X}>")),
             };
-            byte_ids[byte] = model
-                .token_to_id(&spelling)
-                .ok_or_else(|| Declined::from(format!("byte {byte:#04x} has no token")))?;
+            // A byte-level vocabulary without a token for a byte (some lack
+            // one for a byte no text of theirs holds): the pieces that hold
+            // it stay the model's, every other piece merges here. The
+            // character symbols' table spells every byte it falls back to.
+            byte_ids[byte] = match model.token_to_id(&spelling) {
+                Some(id) => id,
+                None if tokens == ByteTokens::Hex => {
+                    return Err(Declined::from(format!("byte {byte:#04x} has no token")));
+                }
+                None => {
+                    missing.get_or_insert_with(|| Box::new([false; 256]))[byte] = true;
+                    NO_BYTE_TOKEN
+                }
+            };
         }
         // The merges as ids: what the file's one-pass read resolved, else
         // read back from the model (a model built in memory, a vocabulary and
@@ -326,8 +348,16 @@ impl MergeTable {
             tokens == ByteTokens::Alphabet,
         );
         table.byte_ids = byte_ids;
+        table.missing = missing;
         if tokens == ByteTokens::Alphabet {
-            table.hot_base = u64::from(byte_ids.iter().copied().min().unwrap_or(0));
+            table.hot_base = u64::from(
+                byte_ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != NO_BYTE_TOKEN)
+                    .min()
+                    .unwrap_or(0),
+            );
         }
         let mut pairs = Vec::with_capacity(merges.len());
         for (rank, &[a, b, new_id]) in merges.iter().enumerate() {
@@ -368,6 +398,7 @@ impl MergeTable {
             // a clone of the vocabulary map.
             let raws = entries_of(bpe, read)
                 .filter_map(|(id, token)| raw_of(token.as_ref()).map(|raw| (id, raw)))
+                .filter(|(_, raw)| !table.lacks_a_token_for(raw))
                 .collect();
             table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         }
@@ -505,6 +536,7 @@ impl MergeTable {
             .max(PAIR_FILTER_MIN_WORDS);
         Self {
             byte_ids: [0; 256],
+            missing: None,
             hot,
             hot_base: NO_HOT_BASE,
             buckets: vec![Bucket::EMPTY; buckets].into_boxed_slice(),
@@ -524,6 +556,7 @@ impl MergeTable {
             + size_of_val(&*self.buckets)
             + self.pair_filter_bytes()
             + self.preformed.bytes()
+            + self.missing.as_deref().map_or(0, size_of_val)
     }
 
     /// Characters of the vocabulary a piece may start from as one symbol.
@@ -536,10 +569,28 @@ impl MergeTable {
         size_of_val(&*self.pair_filter)
     }
 
-    /// The id of `byte`'s token.
+    /// The id of `byte`'s token ([`NO_BYTE_TOKEN`] for a byte without one).
     #[inline(always)]
     pub(super) fn byte_id(&self, byte: u8) -> u32 {
         self.byte_ids[usize::from(byte)]
+    }
+
+    /// Whether `piece` holds a byte the vocabulary has no token for: such a
+    /// piece is the model's to merge (the table has no id for that byte).
+    /// A table over a complete alphabet answers without a look at the piece.
+    #[inline]
+    pub(super) fn lacks_a_token_for(&self, piece: &[u8]) -> bool {
+        self.missing
+            .as_ref()
+            .is_some_and(|missing| piece.iter().any(|&byte| missing[usize::from(byte)]))
+    }
+
+    /// Bytes the vocabulary has no token for (0 over a complete alphabet),
+    /// for the load log.
+    pub(super) fn missing_bytes(&self) -> usize {
+        self.missing
+            .as_ref()
+            .map_or(0, |missing| missing.iter().filter(|&&gone| gone).count())
     }
 
     /// Pairs the table was built from (one per merge of a model; one per
@@ -703,6 +754,10 @@ impl MergeTable {
             !self.hot.is_empty(),
             "a byte-level merge on a table built for character symbols"
         );
+        debug_assert!(
+            !self.lacks_a_token_for(piece),
+            "a piece holding a byte the table has no token for is the model's"
+        );
         if piece.is_empty() {
             return;
         }
@@ -736,6 +791,10 @@ impl MergeTable {
     /// piece of a mixed unit leaves at the pays-off test.
     #[inline(never)]
     pub(super) fn merge_preformed(&self, piece: &[u8], ids: &mut Vec<u32>) -> bool {
+        debug_assert!(
+            !self.lacks_a_token_for(piece),
+            "a piece holding a byte the table has no token for is the model's"
+        );
         let pre = &self.preformed;
         if pre.is_empty() || !pre.pays_off(piece) {
             return false;

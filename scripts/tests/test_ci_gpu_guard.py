@@ -25,6 +25,10 @@ SHIMS = Path(__file__).resolve().parent / "fixtures" / "gpu_guard"
 NODE = "203.0.113.7"  # a documentation address, never a node
 THIS_JOB = "e2e-222-1-runner-new"
 OLD_JOB = "e2e-111-1-runner-old"
+# A pid no host can hold (the kernel's pid limit is 4194304 on 64-bit), so the
+# kill step, which ends every holder of a device file the scratch /proc names,
+# signals nothing of the machine the tests run on.
+GHOST = 4_194_305
 READING = re.compile(r"^gpu guard: (\d+)s: (.*)$", re.M)
 REPORT_HEADER = f"gpu guard: this job: runner 'runner-new', marker '{THIS_JOB}'"
 
@@ -331,22 +335,22 @@ def test_the_kill_step_installs_nothing() -> None:
 
 def test_a_holder_in_this_job_view_is_named_with_the_job_that_started_it(guard: Guard) -> None:
     guard.busy(cards=(0,))
-    guard.process(777, "python -m engine.server --port 1", marker=OLD_JOB, device="/dev/nvidia0")
+    guard.process(GHOST, "python -m engine.server --port 1", marker=OLD_JOB, device="/dev/nvidia0")
     guard.process(778, "bash run.sh", marker=THIS_JOB, device=None)
-    guard.listed_app(0, 777, name="python")
+    guard.listed_app(0, GHOST, name="python")
     result = guard.run(wait=1)
     assert result.returncode == 1
     assert (
-        "gpu guard: GPU 0: pid 777 (python) holds 80327 MiB; in this job's view: "
+        f"gpu guard: GPU 0: pid {GHOST} (python) holds 80327 MiB; in this job's view: "
         f"python -m engine.server --port 1 E2E_JOB_MARKER={OLD_JOB}" in result.stdout
     )
     assert (
-        "gpu guard: pid 777 holds a GPU device file: python -m engine.server --port 1 "
+        f"gpu guard: pid {GHOST} holds a GPU device file: python -m engine.server --port 1 "
         f"E2E_JOB_MARKER={OLD_JOB}" in result.stdout
     )
     assert "pid 778" not in result.stdout
     (error,) = error_lines(result.stdout)
-    assert error.endswith(", held by pid 777:")
+    assert error.endswith(f", held by pid {GHOST}:")
     assert result.stdout.splitlines()[-1] == "GPU 0: 80327 MiB used"
 
 

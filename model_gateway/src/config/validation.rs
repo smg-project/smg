@@ -12,7 +12,7 @@ use crate::{
     middleware::scheduler,
     policies::{
         cost as selection_cost,
-        engine_host::{preset_name, Decider},
+        engine_host::{encode_preset_name, preset_name, Decider},
     },
     worker::endpoint::Endpoint,
 };
@@ -489,26 +489,15 @@ pub fn available_cpus() -> usize {
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
-    /// Under `--policy-engine engine` every policy that decides (the default
-    /// and the two pair sides) is one whose stages the engine carries in
-    /// this build, and the engine itself accepts the configuration: the
-    /// decider is built once here, so a tunable the engine refuses fails
-    /// the start instead of falling back to the legacy path.
+    /// Under `--policy-engine engine` every policy that decides (the default,
+    /// the two pair sides and, under encode-prefill-decode, the encode side)
+    /// is one whose stages the engine carries in this build, and the engine
+    /// itself accepts the configuration: the decider is built once here, so
+    /// a tunable the engine refuses fails the start instead of falling back
+    /// to the legacy path.
     fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
         if config.policy_engine != PolicyEngineMode::Engine {
             return Ok(());
-        }
-        // The decider binds the default, prefill and decode profiles; an
-        // encode side has none in this build, so an encode decision would
-        // run the default profile where the legacy path hashes content. The
-        // mode is refused by name until the encode step binds its profile.
-        if matches!(config.mode, RoutingMode::EncodePrefillDecode { .. }) {
-            return Err(ConfigError::invalid_value(
-                "policy_engine",
-                "encode-prefill-decode",
-                "the policy engine carries no encode profile in this build; \
-                 encode-prefill-decode runs under --policy-engine legacy",
-            ));
         }
         let prefill = config.mode.get_prefill_policy(&config.policy);
         let decode = config.mode.get_decode_policy(&config.policy);
@@ -518,13 +507,34 @@ impl ConfigValidator {
                     "policy_engine",
                     policy.name(),
                     "the policy engine carries random, round_robin, passthrough, power_of_two \
-                     (expected_wait, requests, least_requests) and least_load in this build",
+                     (expected_wait, requests, least_requests), least_load and manual in this \
+                     build",
                 ));
             }
         }
-        Decider::from_configs(&config.policy, prefill, decode).map_err(|error| {
+        // The encode items of an encode-prefill-decode deployment: the mode's
+        // encode policy (the one default when unset), the `epd` plan's
+        // encode profile.
+        let encode = matches!(config.mode, RoutingMode::EncodePrefillDecode { .. })
+            .then(|| config.mode.get_encode_policy(&DEFAULT_ENCODE_POLICY));
+        if let Some(policy) = encode.filter(|policy| encode_preset_name(policy).is_none()) {
+            return Err(ConfigError::invalid_value(
+                "policy_engine",
+                policy.name(),
+                "the policy engine carries random, round_robin and consistent_hashing on the \
+                 encode side in this build",
+            ));
+        }
+        Decider::from_configs_with_encode(
+            &config.policy,
+            prefill,
+            decode,
+            encode,
+            &config.routing_key_override,
+        )
+        .map_err(|error| {
             let mut names = vec![config.policy.name()];
-            for policy in [prefill, decode] {
+            for policy in [prefill, decode].into_iter().chain(encode) {
                 if !names.contains(&policy.name()) {
                     names.push(policy.name());
                 }
@@ -2755,31 +2765,39 @@ mod tests {
         assert!(ConfigValidator::validate(&legacy).is_ok());
     }
 
-    /// Under `engine` the encode-prefill-decode mode is refused at start by
-    /// name: the decider binds no encode profile in this build, so an encode
-    /// decision would run the default profile; the legacy path takes it.
+    /// Under `engine` an encode-prefill-decode deployment starts: the engine
+    /// binds the mode's encode policy (consistent hashing when unset) as the
+    /// `epd` plan's encode profile, and each of the encode side's three
+    /// policies is carried; the legacy path takes it as before.
     #[test]
-    fn the_engine_switch_refuses_encode_prefill_decode_without_an_encode_profile() {
-        let config = RouterConfig {
+    fn the_engine_switch_accepts_encode_prefill_decode_with_its_encode_policy() {
+        let epd = |encode_policy: Option<PolicyConfig>| RouterConfig {
             policy_engine: PolicyEngineMode::Engine,
             mode: RoutingMode::EncodePrefillDecode {
                 encode_urls: vec![("http://encode:8000".to_string(), None)],
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                encode_policy: None,
+                encode_policy,
                 prefill_policy: None,
                 decode_policy: None,
             },
             ..Default::default()
         };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref value, .. })
-                if field == "policy_engine" && value == "encode-prefill-decode"
-        ));
+        assert!(ConfigValidator::validate(&epd(None)).is_ok());
+        for policy in [
+            PolicyConfig::Random,
+            PolicyConfig::RoundRobin,
+            PolicyConfig::ConsistentHashing,
+        ] {
+            let name = policy.name();
+            assert!(
+                ConfigValidator::validate(&epd(Some(policy))).is_ok(),
+                "{name}"
+            );
+        }
         let legacy = RouterConfig {
             policy_engine: PolicyEngineMode::Legacy,
-            ..config
+            ..epd(None)
         };
         assert!(ConfigValidator::validate(&legacy).is_ok());
     }
@@ -3699,7 +3717,13 @@ mod tests {
         assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
         assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
         assert!(!warning.contains("secret"), "{warning}");
-        for url in ["http://user:secret@worker:8000", "grpc://worker:50051"] {
+        // An `@` inside a query or fragment is no userinfo: no warning.
+        for url in [
+            "http://user:secret@worker:8000",
+            "grpc://worker:50051",
+            "grpc://worker:50051?token=a@b",
+            "grpc://worker:50051#a@b",
+        ] {
             assert_eq!(unused_credentials_warning(url), None, "{url}");
         }
 
@@ -3783,6 +3807,30 @@ mod tests {
             },
             PolicyConfig::Random,
         )
+    }
+
+    /// Under `engine` the sticky override's headers are the default
+    /// binding's sessions rule: a name repeated in another case is one
+    /// header, as under legacy; a header on the engine's deny-list refuses
+    /// the start by name, where the legacy path takes it.
+    #[test]
+    fn the_engine_switch_takes_a_repeated_routing_header_and_refuses_a_denied_one() {
+        let mut config = regular_mode_config();
+        config.policy_engine = PolicyEngineMode::Engine;
+        config.routing_key_override.enabled = true;
+        config.routing_key_override.headers =
+            vec!["X-Routing-Key".to_string(), "x-routing-key".to_string()];
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config.routing_key_override.headers = vec!["x-api-key".to_string()];
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref reason, .. })
+                if field == "policy_engine"
+                    && reason.contains("x-api-key")
+                    && reason.contains("deny-list")
+        ));
+        config.policy_engine = PolicyEngineMode::Legacy;
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

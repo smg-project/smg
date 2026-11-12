@@ -40,13 +40,8 @@
 //! look the same from here, a request's future dropped without a response.
 
 use std::{
-    future::Future,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    task::{ready, Context, Poll},
+    sync::Arc,
+    task::{Context, Poll},
     time::Instant,
 };
 
@@ -57,11 +52,11 @@ use axum::{
 };
 use http_body::Body as _;
 use openai_protocol::validated::RejectionCode;
-use pin_project_lite::pin_project;
 use tokio::task::futures::TaskLocalFuture;
 use tower::{Layer, Service};
 
 use super::{
+    duty::{Duty, DutyFuture},
     edge_body::{BodyDuties, EdgeBody},
     request_start::{clock_now, RequestStarted},
 };
@@ -104,32 +99,6 @@ pub const CLIENT_CLOSED_REQUEST_CODE: &str = "client_closed_request";
 /// The type the SSE error event gives a stream the worker failed, shared with
 /// it so the two names cannot drift apart.
 pub const BODY_FAILED_CODE: &str = STREAM_ERROR_TYPE;
-
-/// The word of a streamed body's producer that the body told the client of a
-/// failure on its way out: the error event a stream the worker failed ends
-/// with, before its `[DONE]`. Such a body ends with its own last frame, so
-/// the frames alone say it went out in full; counted by them, a stream the
-/// engine cut was a plain 200. Handed to the edge's body wrapper with the
-/// body's duties ([`BodyDuties::failure`]) and read once the body has ended:
-/// the response then counts as its head's status with [`BODY_FAILED_CODE`],
-/// what the client read. One shared flag per streamed response; a body with
-/// no producer's word is counted by its frames alone.
-///
-/// [`BodyDuties::failure`]: super::edge_body::BodyDuties::failure
-#[derive(Clone, Debug, Default)]
-pub(crate) struct BodyFailure(Arc<AtomicBool>);
-
-impl BodyFailure {
-    /// The producer's word: the body ended with the client told of a failure.
-    pub(crate) fn tell(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    /// Whether the producer told of a failure.
-    pub(crate) fn told(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
 
 /// The length a response declares for its body: its `Content-Length`, or
 /// else what the body itself knows exactly. An HTTP/1.1 server writes that
@@ -217,7 +186,7 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = HttpMetricsFuture<TaskLocalFuture<RequestStarted, S::Future>>;
+    type Future = HttpMetricsFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -248,45 +217,30 @@ where
         // route's own with the edge's duty beside it, not a box around both.
         // The call runs under the stamp's sync scope and the future under
         // its scoped future: the layers inside read the stamp from both.
-        HttpMetricsFuture {
-            inner: started.scope(started.sync_scope(|| self.inner.call(req))),
-            duty: Some(EdgeDuty {
+        DutyFuture::new(
+            started.scope(started.sync_scope(|| self.inner.call(req))),
+            EdgeDuty {
                 method,
                 start,
                 tracker,
                 outcome,
                 guard,
-            }),
-        }
+            },
+        )
     }
 }
 
-pin_project! {
-    /// The metrics layer's future: the route's future, then the edge's
-    /// bookkeeping of the answer (the duration, the response head counted,
-    /// the one body wrapper). `duty` is what the edge holds for the request
-    /// until the route answers, taken at the answer.
-    pub struct HttpMetricsFuture<F> {
-        #[pin]
-        inner: F,
-        duty: Option<EdgeDuty>,
-    }
-
-    impl<F> PinnedDrop for HttpMetricsFuture<F> {
-        fn drop(this: Pin<&mut Self>) {
-            // Dropped with the duty still held: the route never answered.
-            if let Some(duty) = this.project().duty.take() {
-                duty.unanswered();
-            }
-        }
-    }
-}
+/// The metrics layer's future: the route's future with the request's start
+/// in its task local, with the edge's bookkeeping as its duty.
+pub type HttpMetricsFuture<F> = DutyFuture<TaskLocalFuture<RequestStarted, F>, EdgeDuty>;
 
 /// What the metrics layer holds for a request between its arrival and the
-/// route's answer. Dropped with the future before the answer, it counts the
-/// request as closed by the client and releases its in-flight guard, with
-/// the gauge set from the tracker as at every other release (`unanswered`).
-struct EdgeDuty {
+/// route's answer: the edge's bookkeeping of the answer (the duration, the
+/// response head counted, the one body wrapper). Dropped with the future
+/// before the answer, it counts the request as closed by the client and
+/// releases its in-flight guard, with the gauge set from the tracker as at
+/// every other release (`unanswered`).
+pub struct EdgeDuty {
     method: &'static str,
     start: Instant,
     tracker: Arc<InFlightRequestTracker>,
@@ -294,25 +248,7 @@ struct EdgeDuty {
     guard: InFlightGuard,
 }
 
-impl<F, E> Future for HttpMetricsFuture<F>
-where
-    F: Future<Output = Result<Response, E>>,
-{
-    type Output = Result<Response, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let answer = ready!(this.inner.poll(cx));
-        Poll::Ready(match this.duty.take() {
-            Some(duty) => duty.answered(answer),
-            // A poll after the answer breaks the caller's contract; the
-            // route's word to it passes through.
-            None => answer,
-        })
-    }
-}
-
-impl EdgeDuty {
+impl Duty for EdgeDuty {
     /// The route answered: the response head is counted and the body wrapped
     /// once; an error of the inner service releases the guard and counts
     /// nothing.
@@ -904,6 +840,7 @@ mod client_closed_tests {
 
     use super::*;
     use crate::{
+        middleware::edge_body::BodyFailure,
         observability::inflight_tracker::InFlightRequestTracker, routers::error::create_error,
     };
 
@@ -1165,7 +1102,7 @@ mod client_closed_tests {
                     let failure = failure.clone();
                     async move {
                         let mut response = Response::new(body);
-                        BodyDuties::hand(&mut response, |duties| duties.failure = Some(failure));
+                        failure.carry(&mut response);
                         response
                     }
                 }),

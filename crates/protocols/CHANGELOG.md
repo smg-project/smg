@@ -4,6 +4,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ## Unreleased
 
+### Added
+
+- `ChatCompletionRequest::dynamic_tools_for`, `declares_tools_for`, `effective_tool_list_for`,
+  `shared_tool_list_for` and `callable_tools_for`: the tool-set readers under a provider profile
+  the caller derived already, beside `template_thinking_for`. The readers without the suffix
+  derive the profile from the model id as before; a serving path that derives it once per
+  request no longer derives it again at each of them.
+
 ### Changed
 
 - Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
@@ -53,6 +61,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
+  body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
+  key was left out, so a client generated from the public schema, which marks it required, read a
+  choice it does not expect. A choice with log probabilities is written as before.
+- A completion request with `"echo": null` is served, as the public API allows. The crate refused
+  it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
+  and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
@@ -92,3 +107,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
   message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
   `reasoning: AssistantReasoning`, whose `text` is that option.
+- `EmbeddingRequest` and `ClassifyRequest` keep the fields they do not model in a flattened
+  `other` map, as `ChatCompletionRequest` and `CompletionRequest` do, so the HTTP relay forwards an
+  embeddings or classify body as the client wrote it (`truncate_prompt_tokens`,
+  `add_special_tokens`, `normalize`, `priority`, `extra_body`, ...). The relay re-serializes the
+  typed body and dropped every key the types did not declare. Breaking: the two structs gain the
+  field `other: serde_json::Map<String, Value>`.

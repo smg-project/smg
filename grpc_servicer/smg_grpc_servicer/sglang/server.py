@@ -664,7 +664,7 @@ def _planned_warmup(server_args: ServerArgs, model_info: Any, channel: Any) -> A
         return None
     if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
         # This servicer's own warm-up request above carried the stand-in
-        # bootstrap already; the planned pass on a prefill or decode leg is
+        # bootstrap already; the planned pass on a prefill or decode side is
         # the Rust launcher's (this servicer's start-up is kept as it is).
         logger.info("Planned warm-up: none on a disaggregation role on this servicer")
         return None

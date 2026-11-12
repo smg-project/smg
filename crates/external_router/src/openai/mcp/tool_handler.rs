@@ -259,11 +259,11 @@ impl StreamingToolHandler {
                 // this, a mixed stream that carries a function_call the
                 // handler intercepts plus a native hosted-tool item at a
                 // different output_index could have its hosted-tool
-                // `output_item.done` suppressed via the wrong arm — the
+                // `output_item.done` suppressed via the wrong branch — the
                 // tool loop only re-emits umbrellas for items it
                 // dispatched, so routing a passthrough item through the
-                // MCP-dispatch arm would drop it permanently. The
-                // output_index match ensures the MCP-dispatch arm only
+                // MCP-dispatch branch would drop it permanently. The
+                // output_index match ensures the MCP-dispatch branch only
                 // kicks in for items tracked by `pending_calls`.
                 let belongs_to_pending_call = done_output_index
                     .is_some_and(|idx| self.pending_calls.iter().any(|c| c.output_index == idx));
@@ -277,7 +277,7 @@ impl StreamingToolHandler {
                 // the upstream envelope rather than forwarding it, so the
                 // wire order the client sees satisfies the spec invariant
                 // that `output_item.done` is the LAST event for a given
-                // item. Unlike the MCP-dispatch arm, this path does NOT
+                // item. Unlike the MCP-dispatch branch, this path does NOT
                 // kick the tool loop (there is nothing to dispatch — the
                 // item was not intercepted).
                 //
@@ -803,7 +803,7 @@ mod tests {
     // `native_passthrough_tool_call_indices`, and the matching
     // `output_item.done` returns `StreamAction::Drop` so the caller
     // drops the upstream envelope without kicking the tool loop. The
-    // R6.7b MCP-dispatch arm is untouched — both paths coexist.
+    // R6.7b MCP-dispatch branch is untouched — both paths coexist.
     // ========================================================================
 
     /// Feed an `output_item.added` for a hosted tool-call type so the
@@ -867,7 +867,7 @@ mod tests {
         // R6.7c: OpenAI cloud passthrough emits `image_generation_call`
         // directly. With R6.7b alone the mis-ordered umbrella leaked to
         // the wire because the item was not tracked in `pending_calls`.
-        // The R6.7c arm drops it based on the observed `output_item.added`.
+        // The R6.7c branch drops it based on the observed `output_item.added`.
         assert_native_passthrough_done_drops(ItemType::IMAGE_GENERATION_CALL);
     }
 
@@ -888,12 +888,12 @@ mod tests {
 
     #[test]
     fn native_passthrough_gate_coexists_with_mcp_dispatch_gate() {
-        // R6.7c invariant: both arms of the gate must fire correctly when
+        // R6.7c invariant: both branches of the gate must fire correctly when
         // a single stream carries an MCP-dispatched function_call at one
         // output_index AND a native-passthrough hosted tool-call at
         // another. The function_call's done goes through the
-        // `ExecuteTools` arm (R6.7b); the hosted tool-call's done goes
-        // through the `Drop` arm (R6.7c). Neither re-narrows the other.
+        // `ExecuteTools` branch (R6.7b); the hosted tool-call's done goes
+        // through the `Drop` branch (R6.7c). Neither re-narrows the other.
         let mut handler = StreamingToolHandler::with_starting_index(0);
 
         // MCP-dispatch path: function_call at output_index 0.
@@ -924,7 +924,7 @@ mod tests {
         );
 
         // Second done — function_call at output_index 0 should
-        // ExecuteTools (the MCP-dispatch arm). This confirms R6.7c did
+        // ExecuteTools (the MCP-dispatch branch). This confirms R6.7c did
         // not accidentally funnel the function_call into the new branch.
         let function_call_done = r#"{
           "type": "response.output_item.done",
@@ -944,10 +944,10 @@ mod tests {
                 forward_triggering_event,
             } => assert!(
                 !forward_triggering_event,
-                "MCP-dispatch arm must still suppress the upstream umbrella"
+                "MCP-dispatch branch must still suppress the upstream umbrella"
             ),
             other => panic!(
-                "function_call done must go through MCP-dispatch arm (ExecuteTools), got {other:?}"
+                "function_call done must go through the MCP-dispatch branch (ExecuteTools), got {other:?}"
             ),
         }
     }
@@ -959,7 +959,7 @@ mod tests {
         // is true) AND a native passthrough hosted-tool done arrives at
         // a different output_index, the passthrough path must still
         // Drop — `belongs_to_pending_call` for the done's own index is
-        // false, so the R6.7b arm cleanly declines and the R6.7c arm
+        // false, so the R6.7b branch cleanly declines and the R6.7c branch
         // fires.
         let mut handler = StreamingToolHandler::with_starting_index(0);
         bootstrap_function_call_added(&mut handler); // complete pending call @ idx 0
@@ -1022,7 +1022,7 @@ mod tests {
         //
         // The implementation removes the passthrough index from
         // `native_passthrough_tool_call_indices` on the first drop, so
-        // the second done falls through to the `Forward` arm.
+        // the second done falls through to the `Forward` branch.
         let mut handler = StreamingToolHandler::with_starting_index(0);
         bootstrap_native_hosted_tool_added(
             &mut handler,
