@@ -893,6 +893,35 @@ mod tests {
         assert_eq!(learned(&sizes), Some(128));
     }
 
+    /// The reconnect delay a failing stream waits doubles from the initial
+    /// delay to the cap, stays at the cap once there, and a reset returns
+    /// it to the initial delay.
+    #[test]
+    fn the_reconnect_backoff_doubles_to_its_cap_and_a_reset_starts_over() {
+        let mut backoff = Backoff::new();
+        assert_eq!(backoff.delay_ms(), INITIAL_RECONNECT_DELAY_MS);
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            backoff.grow();
+            delays.push(backoff.delay_ms());
+        }
+        assert_eq!(
+            delays,
+            [200, 400, 800, 1_600, 3_200, 5_000, 5_000, 5_000],
+            "doubled from 100 ms up to the 5 s cap, then held there"
+        );
+        assert_eq!(
+            backoff.delay(),
+            Duration::from_millis(MAX_RECONNECT_DELAY_MS)
+        );
+        backoff.reset();
+        assert_eq!(
+            backoff.delay_ms(),
+            INITIAL_RECONNECT_DELAY_MS,
+            "a reset returns the initial delay"
+        );
+    }
+
     /// What the test scheduler's `SubscribeKvEvents` does.
     enum Subscribe {
         /// Accepts the call and never answers it, as an engine still
