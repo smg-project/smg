@@ -2561,6 +2561,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "sentiment-analysis-7b",
+        model: "microsoft/Sentiment-Analysis-7B",
+        also: &[],
+        released: "2026-10-17",
+        smg: (None, None),
+        table: Some(Table::Plain),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "step-3.5-flash",
         model: "stepfun-ai/Step-3.5-Flash",
         also: &[],
