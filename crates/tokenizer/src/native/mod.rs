@@ -998,6 +998,15 @@ pub(crate) struct NativeEncoder {
     /// Whether a stage holds the end anchor `$`: such a text is never cut
     /// into units for the thread pool (see [`Self::stable_cut`]).
     end_anchored: bool,
+    /// The stages from this index on run over each piece's byte-level
+    /// image, the alphabet character of each of its bytes, rather than
+    /// over the raw text: a stage after the `ByteLevel` whose pattern can
+    /// read beyond printable ASCII cuts the image where the reference does,
+    /// which is not where it would cut the raw text (see
+    /// [`Self::pieces_in_alphabet`]). `None` when every stage runs over the
+    /// raw text. Such a text is never cut into units for the thread pool
+    /// either (see [`Self::stable_cut`]).
+    mapped_from: Option<usize>,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
     /// Added tokens matched after normalization (`normalized: true`).
@@ -1101,7 +1110,7 @@ impl NativeEncoder {
         }
         let normalizer =
             Self::normalizer_from(&serialized("normalizer", tokenizer.get_normalizer())?)?;
-        let stages = Self::stages_from(&pre_tokenizer)?;
+        let (stages, mapped_from) = Self::stages_from(&pre_tokenizer)?;
         let frame = Self::frame_from(&serialized(
             "post-processor",
             tokenizer.get_post_processor(),
@@ -1130,9 +1139,15 @@ impl NativeEncoder {
                 None
             }
         };
-        let chain = chain::Scanner::recognize(&stages);
+        // The one-pass chain scanner reads the raw text: not for stages
+        // over the image.
+        let chain = match mapped_from {
+            None => chain::Scanner::recognize(&stages),
+            Some(_) => None,
+        };
         Ok(Self {
             end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
+            mapped_from,
             nfc_quick: (normalizer == Normalizer::Nfc).then(NfcQuick::read),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
@@ -1210,6 +1225,7 @@ impl NativeEncoder {
         );
         Ok(Self {
             end_anchored: false,
+            mapped_from: None,
             normalizer: Normalizer::None,
             nfc_quick: None,
             raw_added: AddedTokens::build(&raw)?,
@@ -1819,6 +1835,7 @@ impl NativeEncoder {
             normalized_added: None,
             nfc_quick: None,
             end_anchored: false,
+            mapped_from: None,
             stages,
             chain,
             frame: Frame::default(),
@@ -1848,9 +1865,10 @@ impl NativeEncoder {
     /// The stages of a pre-tokenizer that is zero or more `Split`s (or
     /// `Digits`, a split on numeric characters, or `Punctuation`s) around
     /// one `ByteLevel` without prefix space: those before it as they are,
-    /// those after it when they cut the text where they cut its byte-level
-    /// image.
-    fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
+    /// those after it over the raw text when they cut it where they cut its
+    /// byte-level image, else over the image itself (the index of the first
+    /// of them is the second half of the answer, see `mapped_from`).
+    fn stages_from(pre_tokenizer: &Value) -> Result<(Vec<Stage>, Option<usize>), Declined> {
         if pre_tokenizer.is_null() {
             return Err(Declined::from(
                 "no pre-tokenizer (the path needs a ByteLevel without a prefix space)",
@@ -1886,22 +1904,24 @@ impl NativeEncoder {
                 digits: false,
             });
         }
-        // A stage after the `ByteLevel` cuts the mapped text. It cuts the
-        // raw text at the same places when its pattern can only ever match
-        // or reject printable ASCII characters: the map leaves those in
-        // place and takes every other byte beyond ASCII. Such a stage moves
-        // before the map; any other declines.
+        // A stage after the `ByteLevel` cuts the mapped text. When every
+        // such stage's pattern can only ever match or reject printable
+        // ASCII characters, it cuts the raw text at the same places (the
+        // map leaves those in place and takes every other byte beyond
+        // ASCII), so the stages run over the raw text as the ones before
+        // the map do. Otherwise the stages after the map run over each
+        // piece's byte-level image, from the first of them on.
+        let after = stages.len();
         for split in &items[at + 1..] {
             let stage = Self::split_stage(split)?;
-            if !stage.pattern.within_printable_ascii() {
-                return Err(Declined::from(
-                    "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII",
-                ));
-            }
             Self::check_anchors(&stage, &stages)?;
             stages.push(stage);
         }
-        Ok(stages)
+        let mapped_from = stages[after..]
+            .iter()
+            .any(|stage| !stage.pattern.within_printable_ascii())
+            .then_some(after);
+        Ok((stages, mapped_from))
     }
 
     /// A stage anchored to its text (`\A`, `\z` or `\G`) reads the bounds of
@@ -2342,8 +2362,10 @@ impl NativeEncoder {
             return (from.max(1)..text.len()).find(|&p| chars.cuts_at(bytes, p));
         }
         // A stage that reads the end of the text (`$`) would read the
-        // window's end as one: no cut, the text stays one unit.
-        if self.stages.is_empty() || self.end_anchored {
+        // window's end as one, and the cut check's window is read in the
+        // raw text while a stage over the byte-level image cuts elsewhere:
+        // no cut, the text stays one unit.
+        if self.stages.is_empty() || self.end_anchored || self.mapped_from.is_some() {
             return None;
         }
         let bytes = text.as_bytes();
@@ -2457,8 +2479,20 @@ impl NativeEncoder {
         // its static callback; any other shape walks, a lone `Removed`
         // stage among them (its matches are no pieces: the scanner loop
         // stays the loop of a stage whose matches are).
-        match (&self.chain, self.stages.as_slice()) {
-            (Some(chain), _) => {
+        match (&self.chain, self.stages.as_slice(), self.mapped_from) {
+            (_, _, Some(from)) => {
+                // The stages from `mapped_from` on run over each piece's
+                // byte-level image; a final piece is a byte range of the
+                // unit, not always a `str`.
+                let mut image = String::new();
+                let mut per_piece = |piece: &[u8]| {
+                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                        fallback = Some(declined);
+                    }
+                };
+                self.pieces_mapping(0, from, text, &mut image, &mut per_piece);
+            }
+            (Some(chain), _, None) => {
                 chain.pieces(text, &mut |start, end| {
                     if let Err(declined) =
                         self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
@@ -2467,16 +2501,18 @@ impl NativeEncoder {
                     }
                 });
             }
-            (None, [stage]) if stage.pieces.matches() => {
+            (None, [stage], None) if stage.pieces.matches() => {
                 if let Err(declined) =
                     self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
                 {
                     fallback = Some(declined);
                 }
             }
-            (None, _) => {
+            (None, _, None) => {
                 let mut per_piece = |piece: &str| {
-                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                    if let Err(declined) =
+                        self.tokenize_piece(model, piece.as_bytes(), mapped, ids, cache)
+                    {
                         fallback = Some(declined);
                     }
                 };
@@ -2512,6 +2548,89 @@ impl NativeEncoder {
         }
     }
 
+    /// [`Self::pieces`] for a chain with stages over the byte-level image
+    /// from the stage `from` on ([`Self::mapped_from`]): the stages before
+    /// it run over the raw text as there; at it each piece is mapped into
+    /// `image` once and the rest run over the image
+    /// ([`Self::pieces_in_alphabet`]). `f` takes each final piece's raw
+    /// bytes: a cut inside a multi-byte character is one the reference
+    /// makes too, so a piece is not always a `str`.
+    fn pieces_mapping<F: FnMut(&[u8])>(
+        &self,
+        depth: usize,
+        from: usize,
+        text: &str,
+        image: &mut String,
+        f: &mut F,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if depth >= from {
+            image.clear();
+            image.extend(text.bytes().map(|b| self.alphabet[usize::from(b)]));
+            self.pieces_in_alphabet(depth, image, text.as_bytes(), f);
+            return;
+        }
+        let stage = &self.stages[depth];
+        let mut cursor = 0;
+        for (start, end) in stage.pattern.find_iter(text) {
+            if stage.pieces.gaps() && cursor < start {
+                self.pieces_mapping(depth + 1, from, &text[cursor..start], image, f);
+            }
+            if stage.pieces.matches() {
+                self.pieces_mapping(depth + 1, from, &text[start..end], image, f);
+            }
+            cursor = end;
+        }
+        if stage.pieces.gaps() && cursor < text.len() {
+            self.pieces_mapping(depth + 1, from, &text[cursor..], image, f);
+        }
+    }
+
+    /// Applies the stages from `depth` on to `image`, the byte-level image
+    /// of `raw` (one alphabet character per byte, in order), calling `f`
+    /// with each final piece's raw bytes: a match's bounds in characters of
+    /// the image are its bounds in bytes of the raw text.
+    fn pieces_in_alphabet<F: FnMut(&[u8])>(
+        &self,
+        depth: usize,
+        image: &str,
+        raw: &[u8],
+        f: &mut F,
+    ) {
+        debug_assert_eq!(image.chars().count(), raw.len());
+        if raw.is_empty() {
+            return;
+        }
+        let Some(stage) = self.stages.get(depth) else {
+            f(raw);
+            return;
+        };
+        let mut cursor = 0;
+        let mut raw_cursor = 0;
+        for (start, end) in stage.pattern.find_iter(image) {
+            let raw_start = raw_cursor + image[cursor..start].chars().count();
+            let raw_end = raw_start + image[start..end].chars().count();
+            if stage.pieces.gaps() && cursor < start {
+                self.pieces_in_alphabet(
+                    depth + 1,
+                    &image[cursor..start],
+                    &raw[raw_cursor..raw_start],
+                    f,
+                );
+            }
+            if stage.pieces.matches() {
+                self.pieces_in_alphabet(depth + 1, &image[start..end], &raw[raw_start..raw_end], f);
+            }
+            cursor = end;
+            raw_cursor = raw_end;
+        }
+        if stage.pieces.gaps() && cursor < image.len() {
+            self.pieces_in_alphabet(depth + 1, &image[cursor..], &raw[raw_cursor..], f);
+        }
+    }
+
     /// Appends the ids of one piece: from the thread's cache, else from the
     /// encoder's seed, else merged over the model's merges (the whole piece
     /// looked up first under `ignore_merges`), else, for a model the merge
@@ -2535,14 +2654,14 @@ impl NativeEncoder {
     fn tokenize_piece(
         &self,
         model: Option<&ModelWrapper>,
-        piece: &str,
+        piece: &[u8],
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         // The hot path of a warm encode, and nothing else in this function:
         // the key of a short piece and the packed table's probe.
-        let vacancy = match ShortPieceKey::of(piece.as_bytes()) {
+        let vacancy = match ShortPieceKey::of(piece) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return Ok(()),
                 vacancy => vacancy,
@@ -2631,7 +2750,7 @@ impl NativeEncoder {
             },
             None => None,
         };
-        self.tokenize_piece_slow(model, &text[piece], vacancy, mapped, ids, cache)
+        self.tokenize_piece_slow(model, &text.as_bytes()[piece], vacancy, mapped, ids, cache)
     }
 
     /// [`Self::tokenize_piece_at`] for a gap between two matches of a
@@ -2658,13 +2777,12 @@ impl NativeEncoder {
     fn tokenize_piece_slow(
         &self,
         model: Option<&ModelWrapper>,
-        piece: &str,
+        bytes: &[u8],
         vacancy: Option<Vacancy>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let bytes = piece.as_bytes();
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
         if vacancy.is_none() && cacheable {
             if let Some(found) = cache.get(bytes) {

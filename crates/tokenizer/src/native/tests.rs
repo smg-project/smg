@@ -630,6 +630,42 @@ fn shapes() -> Vec<Shape> {
             added: &[],
             stripped: &[],
         },
+        // A `Digits` after the `ByteLevel` map (a `Punctuation` before it):
+        // the digits stage runs over the byte-level image, where the map's
+        // Latin-1 numerics (six bytes beyond ASCII, inside multi-byte
+        // characters too) are numeric, each a piece of its own.
+        Shape {
+            name: "punctuation-then-byte-level-regex-then-digits",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Punctuation(Punctuation::new(
+                    SplitDelimiterBehavior::Contiguous,
+                )),
+                byte_level(true),
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
+        },
+        // The same with digit runs, and a split of three digits after them.
+        Shape {
+            name: "punctuation-then-byte-level-regex-then-digit-runs-then-threes",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Punctuation(Punctuation::new(
+                    SplitDelimiterBehavior::Contiguous,
+                )),
+                byte_level(true),
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+                split("[0-9][0-9][0-9]", SplitDelimiterBehavior::Isolated, false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
+        },
         // Added tokens with a space inside, matched after normalization
         // (the default of `add_tokens`): a cut at that space would turn
         // the token into pieces.
@@ -840,39 +876,6 @@ fn shapes_outside_the_path_are_declined() {
     assert_eq!(
         declined(&tokenizer),
         "Punctuation behavior Some(\"Removed\") (only Isolated or Contiguous)"
-    );
-    // A split after the ByteLevel that would read the mapped text otherwise
-    // than the raw text.
-    let mut tokenizer = tokenizer_of(base, &mut state);
-    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-        byte_level(false),
-        split(r"\p{N}", SplitDelimiterBehavior::Isolated, false),
-    ]))));
-    assert_eq!(
-        declined(&tokenizer),
-        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
-    );
-    // A split after the ByteLevel with the end anchor: on the raw text the
-    // anchor holds before a `\n`, which the map has moved beyond ASCII.
-    let mut tokenizer = tokenizer_of(base, &mut state);
-    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-        byte_level(false),
-        split(r"[a-z]+$", SplitDelimiterBehavior::Isolated, false),
-    ]))));
-    assert_eq!(
-        declined(&tokenizer),
-        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
-    );
-    // A `Digits` after the ByteLevel: on the mapped text it would also cut
-    // at the numeric characters the map makes of six bytes beyond ASCII.
-    let mut tokenizer = tokenizer_of(base, &mut state);
-    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-        byte_level(false),
-        PreTokenizerWrapper::Digits(Digits::new(true)),
-    ]))));
-    assert_eq!(
-        declined(&tokenizer),
-        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
     );
     // An added token with single_word; one with lstrip and rstrip is taken.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -1280,6 +1283,69 @@ fn an_end_anchored_chain_keeps_a_long_text_whole() {
             Ok(reference.get_ids().to_vec()),
             "parallel {parallel}"
         );
+    }
+}
+
+/// A stage after the `ByteLevel` map whose pattern reads beyond printable
+/// ASCII (a `Digits`, each digit or each run a piece, with a split of three
+/// digits after it in one shape) runs over each piece's byte-level image, as
+/// the reference runs it: the Latin-1 numerics the map makes of six bytes
+/// beyond ASCII are pieces of their own, inside a multi-byte character too,
+/// so a piece is not always a whole character; the native path's ids are
+/// the reference's on such texts, serial and pooled, and a long text stays
+/// one unit (the cut check reads the raw text).
+#[test]
+fn a_stage_after_the_byte_level_reads_the_image() {
+    let mut state = 0x1A6E_0000_0000_0001u64;
+    for name in [
+        "punctuation-then-byte-level-regex-then-digits",
+        "punctuation-then-byte-level-regex-then-digit-runs-then-threes",
+    ] {
+        let shape = shapes()
+            .into_iter()
+            .find(|shape| shape.name == name)
+            .expect("the shape");
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        assert_eq!(native.mapped_from, Some(2), "{name}");
+        for text in [
+            "x\u{BC}y",
+            "a\u{B2}b\u{B3}c",
+            "\u{B9}\u{B2}\u{B3}",
+            "1\u{BD}2",
+            "\u{4E32}",
+            "\u{4E39}\u{4E3C}",
+            "price 1234 units",
+            "abc12345678def",
+            "a\u{B2} 123 \u{BC}",
+            "\u{E52}\u{E53}",
+            "tab\there",
+            "x, y; 1,234.5 (\u{BE})!",
+            "<|endoftext|>\u{BC}<|endoftext|>",
+        ] {
+            let reference = tokenizer.encode(text, false).expect("encode");
+            for parallel in [false, true] {
+                assert_eq!(
+                    native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                    Ok(reference.get_ids().to_vec()),
+                    "{name}: {text:?} parallel {parallel}"
+                );
+            }
+        }
+        let text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
+        assert_eq!(
+            native.stable_cut(&text, PARALLEL_CHUNK_BYTES),
+            None,
+            "{name}"
+        );
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), &text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "{name}: parallel {parallel}"
+            );
+        }
     }
 }
 
@@ -1798,10 +1864,17 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
         let mut chunked = Vec::new();
         let units = native.units(&text, true, true);
         let units = units.as_slice();
-        // An end-anchored chain takes no cut: the text stays one unit (see
-        // `an_end_anchored_chain_keeps_a_long_text_whole`).
-        if native.end_anchored {
-            assert_eq!(units.len(), 1, "{}: a cut under the end anchor", shape.name);
+        // An end-anchored chain takes no cut, nor does one with a stage over
+        // the byte-level image: the text stays one unit (see
+        // `an_end_anchored_chain_keeps_a_long_text_whole` and
+        // `a_stage_after_the_byte_level_reads_the_image`).
+        if native.end_anchored || native.mapped_from.is_some() {
+            assert_eq!(
+                units.len(),
+                1,
+                "{}: a cut under the end anchor or the image",
+                shape.name
+            );
             continue;
         }
         assert!(
