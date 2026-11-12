@@ -41,7 +41,10 @@ pub struct DecisionRecord {
     pub stage: &'static str,
     pub survivors: u32,
     pub pool_size: u32,
-    pub attempt: u8,
+    /// The distinct workers earlier attempts of the request dispatched to.
+    /// The trace header's `attempt` is the attempt's index: a lone worker
+    /// retried raises it and not this count.
+    pub tried: u8,
     /// The ids a commit of this request had refused before this decision.
     pub excluded: u8,
     pub seed: u64,
@@ -161,7 +164,7 @@ pub fn render(record: &DecisionRecord, engine: &Engine, workers: &[Arc<dyn Worke
         "stage": record.stage,
         "survivors": record.survivors,
         "pool_size": record.pool_size,
-        "attempt": record.attempt,
+        "tried": record.tried,
         "excluded": record.excluded,
         "seed": record.seed,
         "generation": record.generation,
@@ -235,7 +238,7 @@ mod tests {
             stage: "round-robin",
             survivors: 1,
             pool_size: 1,
-            attempt: 0,
+            tried: 0,
             excluded: 0,
             seed: 0,
             generation: 1,

@@ -147,6 +147,7 @@ async fn a_traced_decision_is_explained_by_the_id_its_header_names() {
     assert_eq!(record["stage"], "round-robin");
     assert_eq!(record["survivors"], 2);
     assert_eq!(record["pool_size"], 2);
+    assert_eq!(record["tried"], 0, "a first attempt tried nobody: {record}");
     assert_eq!(record["targets"][0]["worker"], worker, "{record}");
     assert_eq!(record["top"].as_array().map(Vec::len), Some(2));
 
@@ -278,5 +279,6 @@ async fn a_traced_dispatch_that_fails_is_explained_by_the_id_its_refusal_names()
     assert_eq!(record["model"], MODEL);
     assert_eq!(record["outcome"], "pick");
     assert_eq!(record["stage"], "round-robin");
+    assert_eq!(record["tried"], 1, "the first worker was tried: {record}");
     assert_eq!(record["targets"][0]["worker"], worker, "{record}");
 }

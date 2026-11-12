@@ -1345,11 +1345,15 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
             },
             "stage": {
                 "type": "string",
-                "description": "The picker or filter that settled the decision; binding for a miss"
+                "description": "The stage that settled the decision: the picker that chose for a pick, sessions when a key's pin did, the filter or picker that left nothing for a shed, none when the pool had no candidate, binding when no profile matched"
             },
             "survivors": {"type": "integer", "minimum": 0},
             "pool_size": {"type": "integer", "minimum": 0},
-            "attempt": {"type": "integer", "minimum": 0},
+            "tried": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Distinct workers earlier attempts dispatched to, not the attempt's index the trace header carries"
+            },
             "excluded": {"type": "integer", "minimum": 0},
             "seed": {"type": "integer", "minimum": 0},
             "generation": {"type": "integer", "minimum": 0},
@@ -1365,7 +1369,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         },
         "required": [
             "decision_id", "at_unix_micros", "model", "phase", "profile", "outcome", "stage", "survivors",
-            "pool_size", "attempt", "excluded", "seed", "generation", "top", "targets"
+            "pool_size", "tried", "excluded", "seed", "generation", "top", "targets"
         ]
     });
     paths.insert(
@@ -1679,6 +1683,31 @@ mod tests {
             doc["components"]["securitySchemes"][BEARER_SCHEME]["scheme"],
             json!("bearer")
         );
+    }
+
+    /// The explain record's schema requires every property it declares: the
+    /// engine fills each field of every record, so a client generated from
+    /// the document reads them without a null check, the tried count among
+    /// them.
+    #[test]
+    fn the_explain_record_requires_every_property() {
+        let doc = document_value();
+        let schema = &doc["paths"]["/policy/explain/{id}"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        let properties: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .expect("the record's properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let required: BTreeSet<&str> = schema["required"]
+            .as_array()
+            .expect("the record's required list")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(properties, required, "{schema}");
+        assert!(required.contains("tried"), "{schema}");
     }
 
     #[test]

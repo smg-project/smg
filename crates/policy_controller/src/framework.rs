@@ -771,6 +771,8 @@ impl Engine {
         }
         let key = facts.session_key.hash;
         let pins = self.sessions.lookup(key, facts.now_micros, rule);
+        #[cfg(test)]
+        tests::claim_between(&self.sessions, key, pins);
         // The first pin the filters kept, by the pins' order.
         let owner = pins
             .iter()
@@ -849,6 +851,8 @@ impl Engine {
                             dp_rank: c.dp_rank,
                             pair: None,
                         });
+                        // The claim settled the lead target, not the picker.
+                        pick.trace.stage = "sessions";
                     }
                 }
             }
@@ -1219,13 +1223,28 @@ impl Lifecycle for Engine {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
+
     use super::*;
     use crate::{
         builtins::{Best, Healthy, LeastRequests, NotTried},
-        sessions::Recovery,
+        sessions::{Pins, Recovery, SessionTable},
         spec::PolicySpec,
         view::{Health, Identity, WorkerId},
     };
+
+    /// The claim another decision lands for a key between this decision's
+    /// lookup of the pins and its own claim, when set to that key: the
+    /// window a standing claim is followed in.
+    pub(super) static CLAIM_BETWEEN: Mutex<Option<(u64, WorkerId)>> = Mutex::new(None);
+
+    pub(super) fn claim_between(sessions: &SessionTable, key: u64, seen: Pins) {
+        if let Some((claimed, worker)) = *CLAIM_BETWEEN.lock() {
+            if claimed == key {
+                sessions.claim(key, seen, worker);
+            }
+        }
+    }
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
         Candidate {
@@ -2582,6 +2601,32 @@ mod tests {
         assert_eq!(
             engine.sessions.pins(key),
             Some([WorkerId(100), WorkerId(0)])
+        );
+    }
+
+    /// Between a decision's reading of a fresh key's pins and its own claim
+    /// another decision claimed a different worker among the survivors: the
+    /// claim of record leads, the pick is a hit on it, and the trace names
+    /// the sessions stage rather than the picker that chose first.
+    #[test]
+    fn a_standing_claim_that_moves_the_lead_target_names_the_sessions_stage() {
+        let engine = session_engine(SESSIONS);
+        let key = Identity::hashed(11).hash;
+        let pool = vec![candidate(0, 1), candidate(1, 4), candidate(2, 2)];
+        *CLAIM_BETWEEN.lock() = Some((key, WorkerId(101)));
+        let decision = decide_keyed(&engine, &pool, 11, 10);
+        *CLAIM_BETWEEN.lock() = None;
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(
+            pick.targets.first().map(|t| t.id),
+            Some(WorkerId(101)),
+            "the claim of record leads"
+        );
+        assert_eq!(pick.session, SessionVerdict::Pinned, "{pick:?}");
+        assert_eq!(pick.trace.stage, "sessions", "{pick:?}");
+        assert_eq!(
+            engine.sessions.pins(key),
+            Some([WorkerId(101), WorkerId(0)])
         );
     }
 

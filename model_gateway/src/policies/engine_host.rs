@@ -744,7 +744,7 @@ impl Decider {
             stage: trace.stage,
             survivors: trace.survivors,
             pool_size: u32::try_from(pool_size).unwrap_or(u32::MAX),
-            attempt: u8::try_from(request.tried.len()).unwrap_or(u8::MAX),
+            tried: u8::try_from(request.tried.len()).unwrap_or(u8::MAX),
             excluded: u8::try_from(excluded).unwrap_or(u8::MAX),
             seed: trace.seed,
             generation: trace.generation,
