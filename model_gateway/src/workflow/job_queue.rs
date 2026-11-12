@@ -2125,7 +2125,13 @@ mod tests {
             registration_mode: mode,
         };
         for (kind, mode) in [
-            ("a PUT's", WorkerRegistrationMode::ReplaceById),
+            (
+                "a PUT's",
+                WorkerRegistrationMode::ReplaceById {
+                    worker_id: reserved.as_str().to_string(),
+                    expected_revision: 1,
+                },
+            ),
             ("a discovery", WorkerRegistrationMode::Upsert),
         ] {
             let own = JobQueue::own_mark_id(&job(mode), &registry);
@@ -2141,6 +2147,38 @@ mod tests {
         );
         assert!(JobQueue::take_mark(&marks, own.as_ref()));
         assert!(marks.is_empty());
+    }
+
+    /// A POST refused by the queue's claim met a registration that is not a
+    /// POST's (a startup or discovery one, which reserves nothing; a POST's
+    /// would have left its reservation for the POST to find first) and
+    /// releases the reservation it made: no id outlives the refusal for a
+    /// DELETE to find.
+    #[tokio::test]
+    async fn a_post_refused_for_a_registration_of_another_kind_leaves_no_reservation() {
+        use crate::worker::{service::WorkerServiceError, WorkerRegistry, WorkerService};
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.5:8000";
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        // The discovery registration's claim, as `submit_if_idle` takes it
+        // before its job is queued.
+        assert!(JobQueue::claim(&queue.status_map, url, "AddWorker"));
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+        let err = service
+            .create_worker(WorkerSpec::new(url))
+            .await
+            .expect_err("the discovery registration is in flight");
+        let WorkerServiceError::CreateInProgress { worker_id, .. } = err else {
+            panic!("expected CreateInProgress, got {err:?}");
+        };
+        assert_eq!(worker_id, None, "no id of a POST's is in flight to poll");
+        assert_eq!(
+            registry.get_id_by_url_or_reservation(url),
+            None,
+            "the refused POST's reservation outlived the refusal"
+        );
     }
 
     /// A submission that fails must not leave its claim behind, or the next
