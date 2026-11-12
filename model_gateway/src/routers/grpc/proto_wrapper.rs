@@ -526,14 +526,13 @@ impl ProtoGenerateStreamChunk {
     }
 
     /// The output's logprobs, read in place on the message; `None` when the
-    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
             Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
-            Self::Trtllm(c) => {
-                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
-            }
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
             Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
@@ -769,14 +768,13 @@ impl ProtoGenerateComplete {
     }
 
     /// The output's logprobs, read in place on the message; `None` when the
-    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
             Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
-            Self::Trtllm(c) => {
-                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
-            }
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
             Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
@@ -3255,5 +3253,42 @@ mod watched_tests {
         );
         assert!(matches!(stream.next().await, Some(Ok(_))));
         assert!(stream.next().await.is_none(), "the end is the end");
+    }
+}
+
+#[cfg(test)]
+mod output_logprob_tests {
+    use super::{trtllm, ProtoGenerateComplete, ProtoGenerateStreamChunk};
+
+    fn one_record() -> Vec<trtllm::TokenLogprob> {
+        vec![trtllm::TokenLogprob {
+            token_id: 7,
+            logprob: -0.5,
+            top_logprobs: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn a_trtllm_chunk_reads_an_empty_logprob_list_as_none() {
+        // The TRT-LLM wire says "no logprobs" with an empty list where the
+        // other wires leave the field absent; one record is one position.
+        let none = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
+    }
+
+    #[test]
+    fn a_trtllm_complete_reads_an_empty_logprob_list_as_none() {
+        let none = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
     }
 }
