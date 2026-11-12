@@ -1096,9 +1096,9 @@ enum WidthPass {
 /// a band loop sizes it once and every band reuses it, where a buffer per
 /// band was a zeroed allocation per band (and, past the sizes the allocator
 /// keeps cached pages for, one faulted in page by page: about 280 of them per
-/// 8k-class image). The kernels write only the bytes their rows cover and
-/// read zeros past them, so a buffer of the size a pass asked for keeps its
-/// zeros across the pass's bands; a size change zeroes it again.
+/// 8k-class image). The kernels write the bytes their rows cover and zero the
+/// padding they read past them at the top of every band, so the scratch only
+/// keeps the allocation: nothing a kernel reads depends on what it held.
 #[derive(Default)]
 #[cfg_attr(
     not(target_arch = "x86_64"),
@@ -1595,6 +1595,11 @@ mod avx2 {
         let scratch_len = (in_w + PADDING_PIXELS) * 4;
         let scratch = scratch.bytes(2 * scratch_len);
         let (first, second) = scratch.split_at_mut(scratch_len);
+        // The spread rows are read PADDING_PIXELS past their end as zeros;
+        // zero that padding here, so the kernel owes nothing to what the
+        // scratch held before this band.
+        first[in_w * 4..].fill(0);
+        second[in_w * 4..].fill(0);
         let mut pairs = band.chunks_exact_mut(2 * row_out);
         let mut y = y0;
         for pair in pairs.by_ref() {
@@ -1933,6 +1938,13 @@ mod avx512 {
             ROWS * (tail_len + GroupTaps::WINDOW),
             ROWS * (row_out.next_multiple_of(64) + 16),
         );
+        // Each tail row is read WINDOW bytes past its end as zeros; zero that
+        // padding here, so the kernel owes nothing to what the scratch held
+        // before this band (the sums need no zeros: the narrowing's masked
+        // store drops the lanes past the row).
+        for tail in tails.chunks_exact_mut(tail_len + GroupTaps::WINDOW) {
+            tail[tail_len..].fill(0);
+        }
         let mut blocks = band.chunks_exact_mut(ROWS * row_out);
         let mut y = y0;
         for block in blocks.by_ref() {
