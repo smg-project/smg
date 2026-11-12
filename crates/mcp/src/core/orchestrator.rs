@@ -1122,8 +1122,6 @@ impl McpOrchestrator {
         entry: &ToolEntry,
         arguments: Value,
     ) -> McpResult<CallToolResult> {
-        let server_name = entry.server_key();
-
         // One deadline for the whole call: the first attempt and a replay
         // after reconnection share the configured bound instead of each
         // starting a fresh one. Reconnection itself runs under the
@@ -1133,10 +1131,11 @@ impl McpOrchestrator {
             .call_timeout()
             .map(|bound| Instant::now() + bound);
 
-        // Capture the client instance we are about to use (to detect if it gets replaced)
+        // Capture the client the call is about to use, under the server it
+        // reaches, to tell a replacement from the one that failed.
         let initial_client = self
             .static_servers
-            .get(server_name)
+            .get(Self::target_server_key(entry))
             .map(|e| Arc::clone(&e.client));
 
         match self
@@ -1158,15 +1157,25 @@ impl McpOrchestrator {
         }
     }
 
+    /// The server a call reaches: an alias's target, else the entry's own.
+    /// The client captured before the call and the recovery after a drop
+    /// are keyed by it, as the disconnect error names it.
+    fn target_server_key(entry: &ToolEntry) -> &str {
+        match &entry.alias_target {
+            Some(alias) => alias.target.server_key(),
+            None => entry.server_key(),
+        }
+    }
+
     /// The recovery a dropped transport gets. A server that is not a static
     /// one (no entry under its key when the call began and none configured)
-    /// reached the transport through the dynamic pool: its connection is the
-    /// pool's to rebuild on the next request, so the drop is answered as the
-    /// disconnect it is, and no reconnection lock is kept under a key a
-    /// client named in its request. A static server reconnects under its
-    /// lock, one task at a time; the lock's entry leaves the map with the
-    /// last task that held it, so the map's size follows the servers
-    /// recovering, not the servers that ever dropped.
+    /// reached the transport through the dynamic pool, which this path does
+    /// not rebuild, so the drop is answered as the disconnect it is, and no
+    /// reconnection lock is kept under a key a client named in its request.
+    /// A static server reconnects under its lock, one task at a time; the
+    /// lock's entry leaves the map with the last lease out, so the map's
+    /// size follows the servers recovering, not the servers that ever
+    /// dropped.
     async fn recover_after_disconnect(
         &self,
         name: &str,
@@ -1176,48 +1185,30 @@ impl McpOrchestrator {
             return Err(McpError::ServerDisconnected(name.to_string()));
         }
 
-        // Acquire/Create the mutex for this server to prevent concurrent reconnects
-        let lock = self
-            .reconnection_locks
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .value()
-            .clone();
+        // One recovery at a time per server; the lease's drop releases the
+        // lock on every exit path, a cancelled request's included.
+        let lease = ReconnectionLockLease::take(&self.reconnection_locks, name).await;
 
-        let recovery = {
-            let _guard = lock.lock().await;
+        // A client differing from the one that failed means another task
+        // already reconnected it. Read the verdict and drop the map guard
+        // before awaiting anything.
+        let already_reconnected =
+            self.static_servers
+                .get(name)
+                .map(|current| match &initial_client {
+                    Some(initial) => !Arc::ptr_eq(initial, &current.client),
+                    None => true,
+                });
 
-            // A client differing from the one that failed means another
-            // task already reconnected it. Read the verdict and drop the
-            // map guard before awaiting anything.
-            let already_reconnected =
-                self.static_servers
-                    .get(name)
-                    .map(|current| match &initial_client {
-                        Some(initial) => !Arc::ptr_eq(initial, &current.client),
-                        None => true,
-                    });
-
-            match already_reconnected {
-                Some(true) => {
-                    debug!("Server '{}' already reconnected by another task", name);
-                    Ok(())
-                }
-                _ => self.recover_static_server(name).await,
+        let recovery = match already_reconnected {
+            Some(true) => {
+                debug!("Server '{}' already reconnected by another task", name);
+                Ok(())
             }
+            _ => self.recover_static_server(name).await,
         };
-
-        drop(lock);
-        self.release_reconnection_lock(name);
+        drop(lease);
         recovery
-    }
-
-    /// Drop a server's reconnection lock from the map once no task holds it:
-    /// a task still waiting on the lock keeps its own clone, so the entry
-    /// stays for it and leaves with the last one out.
-    fn release_reconnection_lock(&self, name: &str) {
-        self.reconnection_locks
-            .remove_if(name, |_, held| Arc::strong_count(held) == 1);
     }
 
     /// Rebuild a static server's connection. Runs under the caller's
@@ -1984,6 +1975,47 @@ mod integration_tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }
+/// A static server's reconnection lock, held for one recovery. The map's
+/// entry leaves with the last lease out, on every exit path: the release is
+/// the lease's drop, so a task dropped mid-await (a cancelled request)
+/// releases too, and a lease still waiting keeps the entry with its clone.
+struct ReconnectionLockLease<'a> {
+    locks: &'a DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    name: &'a str,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl<'a> ReconnectionLockLease<'a> {
+    /// Take the server's lock, creating its entry if no lease holds one. The
+    /// lease exists before the wait, so a waiter dropped before it acquires
+    /// still runs the release.
+    async fn take(locks: &'a DashMap<String, Arc<tokio::sync::Mutex<()>>>, name: &'a str) -> Self {
+        let mut lease = Self {
+            locks,
+            name,
+            guard: None,
+        };
+        let lock = Arc::clone(
+            locks
+                .entry(name.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .value(),
+        );
+        lease.guard = Some(lock.lock_owned().await);
+        lease
+    }
+}
+
+impl Drop for ReconnectionLockLease<'_> {
+    fn drop(&mut self) {
+        // The guard's own clone goes first; what is left is the map's entry
+        // and the clones of leases still waiting.
+        drop(self.guard.take());
+        self.locks
+            .remove_if(self.name, |_, held| Arc::strong_count(held) == 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, time::Duration};
@@ -2446,23 +2478,52 @@ mod tests {
         assert!(orchestrator.reconnection_locks.is_empty());
     }
 
-    /// A static server's reconnection lock leaves the map with the last task
-    /// that held it: a task still waiting keeps the entry, the last one out
-    /// removes it, so the map's size follows the servers recovering.
+    /// A static server's reconnection lock leaves the map with the last
+    /// lease out: a lease waiting on the first keeps the entry, the last one
+    /// removes it, and a waiter dropped before it acquires (a cancelled
+    /// request) leaves nothing behind.
     #[tokio::test]
     async fn a_reconnection_lock_leaves_the_map_with_its_last_holder() {
         let orchestrator = McpOrchestrator::new_test();
-        let waiting = orchestrator
-            .reconnection_locks
-            .entry("srv".to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .value()
-            .clone();
-        orchestrator.release_reconnection_lock("srv");
-        assert!(orchestrator.reconnection_locks.contains_key("srv"));
-        drop(waiting);
-        orchestrator.release_reconnection_lock("srv");
-        assert!(orchestrator.reconnection_locks.is_empty());
+        let locks = &orchestrator.reconnection_locks;
+
+        let first = ReconnectionLockLease::take(locks, "srv").await;
+        let mut second = Box::pin(ReconnectionLockLease::take(locks, "srv"));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        drop(first);
+        assert!(locks.contains_key("srv"), "a waiting lease keeps the entry");
+        drop(second.await);
+        assert!(locks.is_empty(), "the last lease out removes the entry");
+
+        let first = ReconnectionLockLease::take(locks, "srv").await;
+        let mut cancelled = Box::pin(ReconnectionLockLease::take(locks, "srv"));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        assert!(locks.contains_key("srv"), "the holder keeps the entry");
+        drop(first);
+        assert!(locks.is_empty(), "a cancelled waiter leaves nothing behind");
+    }
+
+    /// The client captured before a call, and the recovery after its drop,
+    /// are keyed by the server the call reaches: an alias's target, else
+    /// the entry's own server, as the disconnect error names it.
+    #[test]
+    fn a_calls_recovery_is_keyed_by_the_server_it_reaches() {
+        let plain = ToolEntry::new(
+            QualifiedToolName::new("brave", "web_search"),
+            create_test_tool("web_search"),
+        );
+        assert_eq!(McpOrchestrator::target_server_key(&plain), "brave");
+
+        let alias = ToolEntry::new(
+            QualifiedToolName::new(ALIAS_SERVER_KEY, "search"),
+            create_test_tool("web_search"),
+        )
+        .with_alias(AliasTarget {
+            target: QualifiedToolName::new("brave", "web_search"),
+            arg_mapping: None,
+        });
+        assert_eq!(McpOrchestrator::target_server_key(&alias), "brave");
     }
 
     #[test]
