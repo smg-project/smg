@@ -2162,10 +2162,13 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     // files it as a request fault), the answer that did not decode or ended
     // before it was whole (its decode fault; no route hands this conversion
     // a body-read fault today, the relay's own reads answer those under
-    // their codes). The gateway's own side keeps
-    // the 500: a builder fault, a redirect it did not follow, the request
-    // body it was forwarding failing under the send (the client's body
-    // fault; an inbound abort is answered before it). Every code stays what
+    // their codes). The gateway's own side keeps the 500: a builder fault,
+    // a redirect it did not follow. A body the gateway forwards does not
+    // fail the send on its own: the one route that streams one answers its
+    // inbound fault and its cap (400, 413) before this conversion, and
+    // every other route sends a buffered body; were such a fault to arrive,
+    // the client files it as a request fault too (its body kind is the
+    // response body's read), not as the gateway's. Every code stays what
     // it was, and the retry layer replays a 502 as it replayed the 500.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
