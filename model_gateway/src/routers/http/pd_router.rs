@@ -253,6 +253,8 @@ impl PdRoute for GenerateRequest {
 
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
         match self.routing_tokens() {
+            // the generate route's validator refuses a negative `input_ids`
+            // entry before routing: the cast of a validated id cannot wrap
             Some(ids) => (None, Some(ids.iter().map(|&id| id as u32).collect())),
             None => (self.text.as_deref().map(str::to_string), None),
         }

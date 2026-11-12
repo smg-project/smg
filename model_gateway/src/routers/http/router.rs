@@ -542,6 +542,8 @@ impl Router {
             header_utils::parse_routing_tokens_hint(headers).or_else(|| {
                 typed_req
                     .routing_tokens()
+                    // the generate route's validator refuses a negative `input_ids`
+                    // entry before routing: the cast of a validated id cannot wrap
                     .map(|ids| ids.iter().map(|&id| id as u32).collect())
             });
         let text = tokens

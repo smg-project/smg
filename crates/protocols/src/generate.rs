@@ -189,8 +189,8 @@ impl Normalizable for GenerateRequest {
 }
 
 /// Validation function for GenerateRequest: a body with no prompt at all is
-/// refused, and an empty `input_ids` is refused as the chat route refuses an
-/// empty `messages`.
+/// refused, an empty `input_ids` is refused as the chat route refuses an
+/// empty `messages`, and a negative id in `input_ids` is refused.
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
     // A body with no prompt at all is refused. `input_embeds` is a prompt on
     // the paths that forward the body as-is, and a body with both `text` and
@@ -216,6 +216,23 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
             "input_ids",
             "empty_array",
             "Invalid 'input_ids': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+        ));
+    }
+
+    // A negative id is no token. Refused here, both wires answer it the same
+    // way at the boundary: the HTTP routers key the routing tokens with a
+    // cast that would wrap it, and an engine refuses it in its own words one
+    // hop later; the gRPC stage's own check becomes a second line.
+    let negative = match &req.input_ids {
+        Some(InputIds::Single(ids)) => ids.iter().copied().find(|&id| id < 0),
+        Some(InputIds::Batch(sequences)) => sequences.iter().flatten().copied().find(|&id| id < 0),
+        None => None,
+    };
+    if let Some(id) = negative {
+        return Err(invalid_at(
+            "input_ids",
+            "integer_below_min_value",
+            format!("Invalid 'input_ids': a token id must be non-negative, but got {id} instead."),
         ));
     }
 
@@ -395,6 +412,28 @@ mod tests {
         let mut r = req();
         r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
         assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn a_negative_input_id_is_refused_single_or_batched() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Single(vec![1, -2, 3]));
+        let err = validate_generate_request(&r).expect_err("a negative id is no token");
+        assert_eq!(err.code, "integer_below_min_value");
+        assert_eq!(
+            err.params.get("field").map(ToString::to_string).as_deref(),
+            Some("\"input_ids\"")
+        );
+        assert!(
+            err.message.as_deref().unwrap_or("").contains("-2"),
+            "the message names the offending id: {err:?}"
+        );
+
+        r.input_ids = Some(InputIds::Batch(vec![vec![1], vec![2, -3]]));
+        assert!(validate_generate_request(&r).is_err());
+
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert!(validate_generate_request(&r).is_ok());
     }
 
     #[test]
