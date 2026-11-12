@@ -27,7 +27,6 @@ pub mod tls_mock_worker;
 use std::{
     collections::HashMap,
     future::Future,
-    path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
 };
@@ -770,27 +769,6 @@ pub fn create_test_context_with_mcp_config(
         )
         .await
     })
-}
-
-// Tokenizer download configuration
-const TINYLLAMA_TOKENIZER_URL: &str =
-    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
-/// Names another source of the TinyLlama tokenizer file: a mirror, or a stub
-/// standing in for the hub.
-const TINYLLAMA_TOKENIZER_URL_ENV: &str = "TINYLLAMA_TOKENIZER_URL";
-const CACHE_DIR: &str = ".tokenizer_cache";
-const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
-
-/// The TinyLlama tokenizer file, downloaded into the cache once per process
-/// unless it is there already ([`hub_fetch::cached_download`]: one download
-/// at a time, a rate-limited hub waited out, a lock a failed download left
-/// poisoned taken back). Returns the path to the cached tokenizer file.
-pub fn ensure_tokenizer_cached() -> PathBuf {
-    let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
-        .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
-    let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
-    hub_fetch::cached_download(&smg::server::blocking_http_client(), &url, &path, 100);
-    path
 }
 
 /// Waits for `done` to hold, polling it every 20 ms, within `bound`; the
