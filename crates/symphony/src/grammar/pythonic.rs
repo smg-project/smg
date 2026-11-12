@@ -17,6 +17,8 @@
 //! every keyword is. A property that pins no type, or a schema without properties, takes any text
 //! up to the call's `)`.
 
+use std::sync::Arc;
+
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
@@ -230,7 +232,7 @@ fn quoted_string() -> Grammar {
 /// A JSON string, as `tojson` writes one.
 fn json_string() -> Grammar {
     Grammar::JsonSchema {
-        schema: json!({"type": "string"}),
+        schema: Arc::new(json!({"type": "string"})),
         style: None,
         excludes: Vec::new(),
         whitespace: Whitespace::Free,
