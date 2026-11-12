@@ -37,7 +37,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]  # smg/
 _E2E_TEST = Path(__file__).resolve().parent  # e2e_test/
-_SRC = _ROOT / "bindings" / "python"
+_SRC = _ROOT / "bindings" / "python" / "src"  # the package root (maturin's python-source)
 
 # Add e2e_test to path so "from infra import ..." works
 if str(_E2E_TEST) not in sys.path:
