@@ -1244,6 +1244,62 @@ fn a_state_from_another_key_for_an_imports_address_stays_a_health_hint() {
     );
 }
 
+/// A registration of a data-parallel group's URL that lands while the
+/// group's last rank row is on its way out keeps the id it was answered:
+/// the group's reservation is retired before the row leaves, so the
+/// newcomer reserves a fresh id and nothing retires it afterwards. In
+/// that window the URL maps to nothing (not to the deleted group's id)
+/// while the row still stands, which is what refuses the create with a
+/// conflict until the row has left.
+#[test]
+fn a_registration_during_the_last_rank_rows_removal_keeps_its_reservation() {
+    let registry = WorkerRegistry::new();
+    let url = "http://10.0.0.16:8000";
+    let row = |rank: usize| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .dp_config(rank, 2)
+                .build(),
+        )
+    };
+    let group_id = registry.reserve_id_for_url(url);
+    let first = registry.register(row(0)).unwrap();
+    let last = registry.register(row(1)).unwrap();
+    registry.remove(&first);
+    let mut window = None;
+    registry.with_another_write_at_the_group_seam(
+        |registry| registry.remove(&last),
+        |registry| {
+            let lookup = registry.get_id_by_url(url);
+            let row_stands = registry.get(&last).is_some();
+            window = Some((lookup, row_stands, registry.reserve_id_for_url(url)));
+        },
+    );
+    let (lookup, row_stands, reserved) = window.expect("the newcomer ran in the window");
+    assert_ne!(
+        reserved, group_id,
+        "the deleted group's id is not answered again"
+    );
+    assert_eq!(
+        registry.reserve_id_for_url(url),
+        reserved,
+        "the newcomer's reservation survives the group's retirement"
+    );
+    assert_eq!(
+        lookup, None,
+        "the window maps the URL to nothing, not to the old id"
+    );
+    assert!(
+        row_stands,
+        "the row still stands in the window: the create is refused"
+    );
+    assert!(
+        registry.get(&last).is_none(),
+        "and the row has left after it"
+    );
+}
+
 #[test]
 fn remove_inner_aborts_when_origin_changed_before_lock() {
     // The TOCTOU guard: remove_remote's pre-check can observe Mesh,

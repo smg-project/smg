@@ -311,6 +311,16 @@ struct TransitionTestHooks {
     before_lock: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
 }
 
+/// Pauses the removal of a data-parallel group's last rank row at the seam
+/// between the base reservation's retirement and the row's departure: the
+/// removal reports in, then waits to be let go. The interleaving proof
+/// places a registration of the same URL in that window.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RemovalTestHooks {
+    at_group_seam: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
+}
+
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
@@ -372,6 +382,9 @@ pub struct WorkerRegistry {
 
     #[cfg(test)]
     transition_test_hooks: parking_lot::Mutex<TransitionTestHooks>,
+
+    #[cfg(test)]
+    removal_test_hooks: parking_lot::Mutex<RemovalTestHooks>,
 
     /// Workers indexed by worker type
     type_workers: Arc<DashMap<WorkerType, Vec<WorkerId>>>,
@@ -470,6 +483,8 @@ impl WorkerRegistry {
             hash_ring_test_hooks: parking_lot::Mutex::new(HashRingTestHooks::default()),
             #[cfg(test)]
             transition_test_hooks: parking_lot::Mutex::new(TransitionTestHooks::default()),
+            #[cfg(test)]
+            removal_test_hooks: parking_lot::Mutex::new(RemovalTestHooks::default()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::with_hasher(FxBuildHasher)),
@@ -1950,6 +1965,27 @@ impl WorkerRegistry {
             drop(entry);
             self.set_worker_overloaded(&worker, false);
             Self::demote_before_removal(&worker);
+            // A data-parallel group's registration reserved its base URL's
+            // id, the group id its Location names. The reservation leaves
+            // before the group's last rank row does: a registration of the
+            // URL that lands in between reserves a fresh id and is refused
+            // while the row stands, and nothing retires that id after it,
+            // where a retirement after the row's departure took the id a
+            // registration had just been answered.
+            if worker.is_dp_aware() {
+                let base = worker.base_url();
+                let last_row = !self.workers.iter().any(|row| {
+                    row.key() != worker_id
+                        && row.value().is_dp_aware()
+                        && row.value().base_url() == base
+                });
+                if last_row {
+                    self.url_to_id
+                        .remove_if(base, |_, id| !self.workers.contains_key(id));
+                }
+            }
+            #[cfg(test)]
+            self.pause_at_group_seam();
         }
 
         // The membership-order read guard keeps the rebuild scan from
@@ -1968,21 +2004,6 @@ impl WorkerRegistry {
             // fresh series retired under it.
             Metrics::remove_worker_metrics(worker.url(), Arc::downgrade(&worker));
             self.url_to_id.remove(worker.url());
-            // A data-parallel group's registration reserved its base URL's
-            // id, the group id its Location names; the reservation leaves
-            // with the group's last rank row, so a later registration of the
-            // URL is a new group under a new id, not the deleted one's.
-            if worker.is_dp_aware() {
-                let base = worker.base_url();
-                let last_row = !self
-                    .workers
-                    .iter()
-                    .any(|row| row.value().is_dp_aware() && row.value().base_url() == base);
-                if last_row {
-                    self.url_to_id
-                        .remove_if(base, |_, id| !self.workers.contains_key(id));
-                }
-            }
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
             self.worker_origins.remove(worker_id);
@@ -2742,6 +2763,42 @@ impl WorkerRegistry {
                 .send(())
                 .expect("the paused transition is waiting");
             paused.join().expect("the transition did not panic")
+        })
+    }
+
+    /// The pause at the group seam of a removal, when a test armed it.
+    fn pause_at_group_seam(&self) {
+        let pause = self.removal_test_hooks.lock().at_group_seam.take();
+        if let Some((reached, resume)) = pause {
+            reached.send(()).expect("removal observer is listening");
+            resume
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("test releases the paused removal");
+        }
+    }
+
+    /// Runs `removal` on its own thread and pauses it at the group seam;
+    /// `other_write` then runs on this thread, after which the removal is
+    /// let go and its result returned. No sleep determines the ordering.
+    pub(crate) fn with_another_write_at_the_group_seam<R: Send>(
+        &self,
+        removal: impl FnOnce(&WorkerRegistry) -> R + Send,
+        other_write: impl FnOnce(&WorkerRegistry),
+    ) -> R {
+        use std::time::Duration;
+
+        let (reached_tx, reached_rx) = test_mpsc::channel();
+        let (resume_tx, resume_rx) = test_mpsc::channel();
+        self.removal_test_hooks.lock().at_group_seam = Some((reached_tx, resume_rx));
+
+        std::thread::scope(|scope| {
+            let paused = scope.spawn(|| removal(self));
+            reached_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the removal reaches the group seam");
+            other_write(self);
+            resume_tx.send(()).expect("the paused removal is waiting");
+            paused.join().expect("the removal did not panic")
         })
     }
 }
