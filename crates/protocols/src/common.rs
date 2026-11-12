@@ -297,6 +297,10 @@ impl<'a> Iterator for StringOrArrayIter<'a> {
 
 impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
 /// A validation error with the public API's `code` and message.
 pub(crate) fn invalid(
     code: &'static str,
