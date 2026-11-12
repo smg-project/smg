@@ -511,6 +511,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     assert mod.source_name(repo, by_name["sigma"], by_name["kappa"]) == "kap"
     assert mod.source_name(repo, by_name["tau"], by_name["kappa"]) == "kap_alias"
     assert mod.source_name(repo, by_name["rho"], by_name["lambda"]) == "lambda"
+    assert mod.source_name(repo, by_name["omicron"], by_name["xi"]) == "xi"
     expected = {
         "omega": False,
         "sigma": True,

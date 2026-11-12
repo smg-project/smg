@@ -803,10 +803,11 @@ def source_name(repo: Repo, dependent: Component, dep: Component) -> str:
     dependency under when that key renames the package (its own ``package =``, or the
     workspace entry's), else the dependency's library name (``[lib] name``, by default the
     package name). Both manifests are read at HEAD, with the sources."""
-    key = dep.dep_key or dep.name
+    key = root_key = dep.dep_key or dep.name
     for own_key, spec in dependency_entries(manifest_at(repo, "HEAD", dependent)):
         package = spec.get("package") if isinstance(spec, dict) else None
-        if package == dep.name or (package is None and own_key == key):
+        # a rename, the root's key (a workspace entry) or a direct entry under the package name
+        if package == dep.name or (package is None and own_key in (root_key, dep.name)):
             key = own_key
     if key != dep.name:
         return key.replace("-", "_")
