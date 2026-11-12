@@ -48,6 +48,7 @@ pub type AbortOnDropStream =
 pub struct TokenSpeedSchedulerClient {
     client: tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    channel: Channel,
 }
 
 crate::impl_abort_for_drop_with_reason!(TokenSpeedSchedulerClient);
@@ -570,6 +571,32 @@ impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::Worke
             aggregate,
             sampled_at: None,
         }
+    }
+}
+
+impl TokenSpeedSchedulerClient {
+    /// `generate` with the request's large inline encoder inputs as body
+    /// frames of their own (the crate's private `framed` module): no encode
+    /// buffer of the message's size, the same message on the wire.
+    pub async fn generate_framed(
+        &self,
+        req: tokenspeed_proto::GenerateRequest,
+    ) -> Result<AbortOnDropStream, tonic::Status> {
+        let request_id = req.request_id.clone();
+        let mut carrier = Request::new(());
+        if let Err(e) = self.trace_injector.inject(carrier.metadata_mut()) {
+            tracing::warn!("Failed to inject trace context: {}", e);
+        }
+        let (metadata, _extensions, ()) = carrier.into_parts();
+        let frames = crate::framed::tokenspeed_frames(req)?;
+        let stream = crate::framed::call_with_frames::<tokenspeed_proto::GenerateResponse>(
+            self.channel(),
+            "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/Generate",
+            metadata.into_headers(),
+            frames,
+        )
+        .await?;
+        Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
     }
 }
 
