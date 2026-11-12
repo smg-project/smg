@@ -56,6 +56,7 @@ use wfaas::LoggingSubscriber;
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod posture;
+mod rate_limit_document;
 pub(crate) mod tls;
 
 // The HTTP client constructors and the process crypto provider they install
@@ -902,7 +903,7 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &["/config"];
+pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants"];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -961,10 +962,19 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/config", get(admin_config))
         .route("/secrets/reload", post(reload_secrets))
+        .route(
+            "/rate-limits/tenants",
+            get(rate_limit_document::get).put(rate_limit_document::put),
+        )
 }
 
 /// The gated routes by name, in the order of `gated_control_plane_routes`.
-pub const GATED_ROUTES: &[(&str, &str)] = &[("GET", "/config"), ("POST", "/secrets/reload")];
+pub const GATED_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/config"),
+    ("POST", "/secrets/reload"),
+    ("GET", "/rate-limits/tenants"),
+    ("PUT", "/rate-limits/tenants"),
+];
 
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
