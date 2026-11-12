@@ -7,12 +7,7 @@ use llm_tokenizer::{registry::TokenizerEntry, LoadOutcome};
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::submit_tokenizer_job::tokenizer_source;
-use crate::{
-    app_context::AppContext,
-    worker::{basic::merge_labels, Worker},
-    workflow::data::WorkerRemovalWorkflowData,
-};
+use crate::{app_context::AppContext, worker::Worker, workflow::data::WorkerRemovalWorkflowData};
 
 /// Step to release the tokenizer of a model no worker serves any more.
 ///
@@ -26,16 +21,13 @@ use crate::{
 /// both wires keeps its tokenizer until its last worker of either wire
 /// leaves (with autoload off the gateway manages none and the step skips).
 /// A model no worker serves any more loses the tokenizer registered under
-/// its id, with the multimodal config that came with it, when that
-/// tokenizer's source is the one a removed worker of the model loads it from
-/// (its labels and the router's flags, as at registration), so an operator's
-/// registration of another source under the same name stays, and so does the
-/// entry of a last worker that names no source of its own. The model's next
-/// registration loads the tokenizer again.
-/// A model a removed worker only lists keeps its entry: the operator's
-/// registration of a listed model stays, and so does a same-source entry a
-/// worker whose primary it was loaded earlier, until a worker whose primary
-/// it is leaves.
+/// its id, with the multimodal config that came with it, when a worker's
+/// registration loaded that entry (the registration workflow records the
+/// entries it loads afresh for a worker, `AppContext::worker_loaded_tokenizers`):
+/// the startup entry and an operator's registration under a model's name
+/// stay. The model's next registration loads the tokenizer again. A model a
+/// removed worker only lists keeps its entry until a worker whose primary it
+/// is leaves.
 pub struct ReleaseTokenizerStep;
 
 #[async_trait]
@@ -86,10 +78,9 @@ impl ReleaseTokenizerStep {
     /// The models whose tokenizer is to leave: the primary model of a removed
     /// worker of either wire (the registration step loads under the primary
     /// alone; a model served over both wires keeps its entry until its last
-    /// worker of either leaves), served by no worker any more, whose entry's
-    /// source is the one a removed worker of the model loads it from.
+    /// worker of either leaves), served by no worker any more, whose entry a
+    /// worker's registration loaded.
     fn candidates(app_context: &AppContext, removed: &[&Arc<dyn Worker>]) -> Vec<String> {
-        let router = &app_context.router_config;
         let mut asked: HashSet<String> = HashSet::new();
         let mut candidates = Vec::new();
         for worker in removed {
@@ -102,24 +93,11 @@ impl ReleaseTokenizerStep {
             let Some(entry) = app_context.tokenizer_registry.get_by_name(&model_id) else {
                 continue;
             };
-            let loaded_by_a_worker = removed.iter().any(|worker| {
-                worker.model_id() == model_id && {
-                    let labels = merge_labels(
-                        &worker.metadata().discovered_labels,
-                        &worker.metadata().spec.labels,
-                    );
-                    tokenizer_source(
-                        &labels,
-                        router.tokenizer_path.as_deref(),
-                        router.model_path.as_deref(),
-                    ) == Some(entry.source.as_str())
-                }
-            });
-            if !loaded_by_a_worker {
+            if !app_context.worker_loaded_tokenizers.contains(&entry.id) {
                 debug!(
                     model = %model_id,
-                    source = %entry.source,
-                    "Tokenizer of a model no worker serves kept: not the source its workers load from"
+                    tokenizer_id = %entry.id,
+                    "Tokenizer of a model no worker serves kept: no worker's registration loaded it"
                 );
                 continue;
             }
@@ -150,6 +128,7 @@ impl ReleaseTokenizerStep {
             return false;
         }
         app_context.multimodal_config_registry.remove(&entry.id);
+        app_context.worker_loaded_tokenizers.remove(&entry.id);
         info!(
             model = %model_id,
             tokenizer_id = %entry.id,
@@ -163,7 +142,10 @@ impl ReleaseTokenizerStep {
     /// serves again. When the registration's tokenizer job ran between the
     /// remove and this (the name was free, so it loaded a fresh entry under
     /// its own id), that entry stays and the removed one's multimodal config,
-    /// keyed by an id no entry has any more, goes with the removed entry.
+    /// keyed by an id no entry has any more, goes with the removed entry. Once
+    /// the load returns the put-back looks again: the worker that kept the
+    /// model served may have left while it waited (see
+    /// [`Self::release_if_unserved`]).
     async fn put_back(app_context: Arc<AppContext>, entry: TokenizerEntry) {
         let tokenizer = Arc::clone(&entry.tokenizer);
         match app_context
@@ -173,10 +155,16 @@ impl ReleaseTokenizerStep {
             })
             .await
         {
-            Ok(LoadOutcome::Loaded { .. }) => {}
-            Ok(LoadOutcome::AlreadyExists { id }) if id == entry.id => {}
+            Ok(LoadOutcome::Loaded { .. }) => {
+                Self::release_if_unserved(&app_context, &entry.name);
+            }
+            Ok(LoadOutcome::AlreadyExists { id }) if id == entry.id => {
+                Self::release_if_unserved(&app_context, &entry.name);
+            }
             Ok(LoadOutcome::AlreadyExists { .. }) => {
                 app_context.multimodal_config_registry.remove(&entry.id);
+                app_context.worker_loaded_tokenizers.remove(&entry.id);
+                Self::release_if_unserved(&app_context, &entry.name);
             }
             Err(error) => {
                 warn!(
@@ -184,6 +172,29 @@ impl ReleaseTokenizerStep {
                     "A model registered again under the release of its tokenizer could not take it back: {error}"
                 );
             }
+        }
+    }
+
+    /// The put-back's second look: the worker that kept the model served may
+    /// have left while the put-back waited on the registry's per-name lock
+    /// (that removal's release found no entry to take), so a model no worker
+    /// serves any more loses the entry under its name again, config and
+    /// record with it, when a worker's registration loaded it. The per-name
+    /// lock orders the put-back's insert before any later removal's remove,
+    /// so this look closes the window.
+    fn release_if_unserved(app_context: &Arc<AppContext>, model_id: &str) {
+        if app_context.worker_registry.contains_model(model_id) {
+            return;
+        }
+        let loaded_by_a_worker = app_context
+            .tokenizer_registry
+            .get_by_name(model_id)
+            .is_some_and(|entry| app_context.worker_loaded_tokenizers.contains(&entry.id));
+        if loaded_by_a_worker && Self::release(app_context, model_id) {
+            debug!(
+                model = %model_id,
+                "Released the tokenizer of a model whose last worker left under its put-back"
+            );
         }
     }
 }
@@ -237,8 +248,8 @@ mod tests {
         worker
     }
 
-    /// A tokenizer registered under `name` from `source`, as a worker's
-    /// registration job or the operator's `POST /v1/tokenizers` leaves it.
+    /// A tokenizer registered under `name` from `source` by no worker's
+    /// registration: the startup entry or the operator's `POST /v1/tokenizers`.
     async fn tokenizer(app_context: &AppContext, name: &str, source: &str) {
         app_context
             .tokenizer_registry
@@ -247,6 +258,22 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// A tokenizer a worker's registration loaded under `name` from `source`,
+    /// recorded as the worker's when the load is a fresh one, as the
+    /// registration workflow's load leaves it.
+    async fn worker_tokenizer(app_context: &AppContext, name: &str, source: &str) {
+        let outcome = app_context
+            .tokenizer_registry
+            .load(&TokenizerRegistry::generate_id(), name, source, || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        if let LoadOutcome::Loaded { id } = outcome {
+            app_context.worker_loaded_tokenizers.insert(id);
+        }
     }
 
     /// The removal workflow's registry steps after the drain, in the
@@ -297,6 +324,19 @@ mod tests {
         worker
     }
 
+    /// A registered worker of `model` on the HTTP wire with no label naming
+    /// a tokenizer source.
+    fn bare_http_worker(app_context: &AppContext, url: &str, model: &str) -> Arc<dyn Worker> {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model))
+                .connection_mode(ConnectionMode::Http)
+                .build(),
+        );
+        app_context.worker_registry.register(Arc::clone(&worker));
+        worker
+    }
+
     /// Lets the tasks the step spawned run to their next wait.
     async fn settle() {
         for _ in 0..16 {
@@ -313,28 +353,25 @@ mod tests {
         gate: Arc<Notify>,
         succeeds: bool,
     ) -> tokio::task::JoinHandle<Result<LoadOutcome, llm_tokenizer::LoadError>> {
-        let app_context = Arc::clone(app_context);
+        let registry = Arc::clone(&app_context.tokenizer_registry);
+        let loaded_by_workers = Arc::clone(&app_context.worker_loaded_tokenizers);
         let name = name.to_string();
+        let id = TokenizerRegistry::generate_id();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
         )]
         tokio::spawn(async move {
-            app_context
-                .tokenizer_registry
-                .load(
-                    &TokenizerRegistry::generate_id(),
-                    &name,
-                    "/tok/m",
-                    || async move {
-                        gate.notified().await;
-                        if succeeds {
-                            Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
-                        } else {
-                            Err("the source did not load".to_string())
-                        }
-                    },
-                )
+            registry
+                .load(&id.clone(), &name, "/tok/m", || async move {
+                    gate.notified().await;
+                    if succeeds {
+                        loaded_by_workers.insert(id);
+                        Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+                    } else {
+                        Err("the source did not load".to_string())
+                    }
+                })
                 .await
         })
     }
@@ -344,7 +381,7 @@ mod tests {
         let app_context = app_context();
         let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
         let second = worker(&app_context, "http://w2:8000", "m", "/tok/m");
-        tokenizer(&app_context, "m", "/tok/m").await;
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
 
         remove(&app_context, first).await;
         assert!(
@@ -359,8 +396,10 @@ mod tests {
         assert!(app_context.tokenizer_registry.is_empty());
     }
 
+    /// An operator's registration under a worker's model name: no worker's
+    /// registration loaded it, so the model's last worker leaving keeps it.
     #[tokio::test]
-    async fn an_operators_tokenizer_of_another_source_stays() {
+    async fn an_operators_tokenizer_under_a_workers_model_stays() {
         let app_context = app_context();
         let only = worker(&app_context, "http://w1:8000", "m", "/tok/m");
         tokenizer(&app_context, "m", "/tok/operator").await;
@@ -368,7 +407,7 @@ mod tests {
         remove(&app_context, only).await;
         assert!(
             app_context.tokenizer_registry.contains("m"),
-            "not the source the model's workers load from"
+            "no worker's registration loaded it"
         );
     }
 
@@ -387,8 +426,8 @@ mod tests {
                 .build(),
         );
         app_context.worker_registry.register(Arc::clone(&endpoint));
-        tokenizer(&app_context, "a", "/tok/shared").await;
-        tokenizer(&app_context, "b", "/tok/shared").await;
+        worker_tokenizer(&app_context, "a", "/tok/shared").await;
+        worker_tokenizer(&app_context, "b", "/tok/shared").await;
 
         remove(&app_context, endpoint).await;
         assert!(
@@ -414,7 +453,7 @@ mod tests {
             None,
         );
         let only = worker(&app_context, "http://w1:8000", "m", "/tok/m");
-        tokenizer(&app_context, "m", "/tok/m").await;
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
 
         remove(&app_context, only).await;
         assert!(
@@ -432,7 +471,7 @@ mod tests {
             let app_context = app_context();
             let grpc = worker(&app_context, "http://w1:8000", "m", "/tok/m");
             let http = http_worker(&app_context, "http://w2:8000", "m", "/tok/m");
-            tokenizer(&app_context, "m", "/tok/m").await;
+            worker_tokenizer(&app_context, "m", "/tok/m").await;
             let (first, last) = if grpc_first {
                 (grpc, http)
             } else {
@@ -452,25 +491,33 @@ mod tests {
         }
     }
 
-    /// A last worker that names no source of its own (no path label, no
-    /// router flag, no model id label): nothing says the entry was loaded
-    /// for it, so it stays.
+    /// The startup entry (`--model-path`, registered under the path as its
+    /// name) serves an HTTP worker whose model id is that path: no worker's
+    /// registration loaded it (an HTTP registration loads none), so the last
+    /// such worker leaving keeps it, and the worker added again finds it.
     #[tokio::test]
-    async fn a_last_worker_naming_no_source_keeps_the_entry() {
-        let app_context = app_context();
-        let only: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://w1:8000")
-                .model(ModelCard::new("m"))
-                .connection_mode(ConnectionMode::Http)
-                .build(),
+    async fn the_startup_entry_stays_when_an_http_workers_model_is_the_model_path() {
+        let app_context = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .model_path("/models/m")
+                .build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
         );
-        app_context.worker_registry.register(Arc::clone(&only));
-        tokenizer(&app_context, "m", "/tok/m").await;
+        tokenizer(&app_context, "/models/m", "/models/m").await;
+        let only = bare_http_worker(&app_context, "http://w1:8000", "/models/m");
 
         remove(&app_context, only).await;
         assert!(
-            app_context.tokenizer_registry.contains("m"),
-            "the worker names no source the entry could have come from"
+            app_context.tokenizer_registry.contains("/models/m"),
+            "the startup entry after its last HTTP worker left"
+        );
+
+        bare_http_worker(&app_context, "http://w1:8000", "/models/m");
+        assert!(
+            app_context.tokenizer_registry.get("/models/m").is_some(),
+            "the worker added again finds the startup entry"
         );
     }
 
@@ -482,7 +529,7 @@ mod tests {
     async fn a_registration_under_the_release_keeps_the_entry() {
         let app_context = app_context();
         let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
-        tokenizer(&app_context, "m", "/tok/m").await;
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
         let id = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
         remove_from_registries(&app_context, Arc::clone(&first)).await;
 
@@ -490,7 +537,7 @@ mod tests {
         assert_eq!(candidates, vec!["m".to_string()]);
         // The registration that lands now: its worker, then its tokenizer job.
         worker(&app_context, "http://w2:8000", "m", "/tok/m");
-        tokenizer(&app_context, "m", "/tok/m").await;
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
 
         assert!(!ReleaseTokenizerStep::release(&app_context, "m"));
         settle().await;
@@ -506,7 +553,7 @@ mod tests {
     async fn a_put_back_waits_out_a_competing_load_that_succeeds() {
         let app_context = app_context();
         let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
-        tokenizer(&app_context, "m", "/tok/m").await;
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
         let old = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
         app_context.multimodal_config_registry.insert(
             old.clone(),
@@ -558,7 +605,7 @@ mod tests {
     async fn a_put_back_waits_out_a_competing_load_that_fails() {
         let app_context = app_context();
         let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
-        tokenizer(&app_context, "m", "/tok/m").await;
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
         let old = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
         remove_from_registries(&app_context, Arc::clone(&first)).await;
 
@@ -597,7 +644,7 @@ mod tests {
     async fn a_fresh_load_under_the_put_back_drops_the_removed_entry_config() {
         let app_context = app_context();
         let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
-        tokenizer(&app_context, "m", "/tok/m").await;
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
         let old = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
         app_context.multimodal_config_registry.insert(
             old.clone(),
@@ -617,7 +664,7 @@ mod tests {
         // then its tokenizer job, which finds the name free); the put-back.
         let removed = app_context.tokenizer_registry.remove("m").unwrap();
         worker(&app_context, "http://w2:8000", "m", "/tok/m");
-        tokenizer(&app_context, "m", "/tok/m").await;
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
         let fresh = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
         assert_ne!(fresh, old);
         ReleaseTokenizerStep::put_back(Arc::clone(&app_context), removed).await;
@@ -628,5 +675,110 @@ mod tests {
             app_context.multimodal_config_registry.get(&old).is_none(),
             "the removed entry's config went with it"
         );
+    }
+
+    /// The worker that kept the model served leaves while the put-back waits
+    /// on the per-name lock (that removal's release finds no entry to take):
+    /// the put-back looks again once its load returns, and the registry ends
+    /// empty, the removed entry's config with it.
+    #[tokio::test]
+    async fn the_replacement_leaving_under_the_put_back_empties_the_registry() {
+        let app_context = app_context();
+        let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
+        let id = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
+        app_context.multimodal_config_registry.insert(
+            id.clone(),
+            Arc::new(MultimodalModelConfig::new(
+                serde_json::json!({}),
+                PreProcessorConfig::default(),
+                None,
+            )),
+        );
+        remove_from_registries(&app_context, Arc::clone(&first)).await;
+
+        // The release's remove; the replacement's registration, its tokenizer
+        // job holding the per-name lock; the put-back, blocked on that lock.
+        let removed = app_context.tokenizer_registry.remove("m").unwrap();
+        let second = worker(&app_context, "http://w2:8000", "m", "/tok/m");
+        let gate = Arc::new(Notify::new());
+        let competing = competing_load(&app_context, "m", Arc::clone(&gate), false);
+        settle().await;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let put_back = tokio::spawn(ReleaseTokenizerStep::put_back(
+            Arc::clone(&app_context),
+            removed,
+        ));
+        settle().await;
+        assert!(!put_back.is_finished());
+
+        // The replacement leaves while the put-back waits: its removal's
+        // release finds no entry under the name.
+        remove(&app_context, second).await;
+        assert!(!app_context.worker_registry.contains_model("m"));
+        gate.notify_one();
+        assert!(competing.await.unwrap().is_err());
+        put_back.await.unwrap();
+
+        assert!(
+            app_context.tokenizer_registry.is_empty(),
+            "the put-back's second look released the entry of a model no worker serves"
+        );
+        assert!(
+            app_context.multimodal_config_registry.get(&id).is_none(),
+            "the removed entry's config went with it"
+        );
+        assert!(!app_context.worker_loaded_tokenizers.contains(&id));
+    }
+
+    /// The same leave while the replacement's own load, which succeeds, holds
+    /// the lock: the fresh entry that load made is a worker's too, and the
+    /// put-back's second look takes it with the removed entry's config.
+    #[tokio::test]
+    async fn the_replacement_leaving_under_a_fresh_load_empties_the_registry() {
+        let app_context = app_context();
+        let first = worker(&app_context, "http://w1:8000", "m", "/tok/m");
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
+        let old = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
+        app_context.multimodal_config_registry.insert(
+            old.clone(),
+            Arc::new(MultimodalModelConfig::new(
+                serde_json::json!({}),
+                PreProcessorConfig::default(),
+                None,
+            )),
+        );
+        remove_from_registries(&app_context, Arc::clone(&first)).await;
+
+        let removed = app_context.tokenizer_registry.remove("m").unwrap();
+        let second = worker(&app_context, "http://w2:8000", "m", "/tok/m");
+        let gate = Arc::new(Notify::new());
+        let competing = competing_load(&app_context, "m", Arc::clone(&gate), true);
+        settle().await;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let put_back = tokio::spawn(ReleaseTokenizerStep::put_back(
+            Arc::clone(&app_context),
+            removed,
+        ));
+        settle().await;
+        remove(&app_context, second).await;
+        gate.notify_one();
+        let fresh = competing.await.unwrap().unwrap().id().to_string();
+        put_back.await.unwrap();
+
+        assert_ne!(fresh, old);
+        assert!(
+            app_context.tokenizer_registry.is_empty(),
+            "the fresh entry of a model no worker serves left with the put-back's second look"
+        );
+        assert!(app_context.multimodal_config_registry.get(&old).is_none());
+        assert!(!app_context.worker_loaded_tokenizers.contains(&old));
+        assert!(!app_context.worker_loaded_tokenizers.contains(&fresh));
     }
 }

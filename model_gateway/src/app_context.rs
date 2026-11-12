@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::profile::ProviderProfile;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
@@ -78,6 +79,15 @@ pub struct AppContext {
     /// operator's request), read where a request finds no tokenizer for its
     /// model.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
+    /// The ids of the tokenizer entries a worker's registration loaded:
+    /// written by the registration workflow's load, read by the removal
+    /// workflow's release step, which takes no other entry (the startup
+    /// entry and an operator's stay however their models' workers come
+    /// and go), and dropped with the entry on every removal path, the
+    /// operator's `DELETE /v1/tokenizers/{id}` included: that ends the
+    /// worker's ownership, and the model's next registration loads afresh
+    /// and records again.
+    pub worker_loaded_tokenizers: Arc<DashSet<String>>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -561,6 +571,7 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::new(TokenizerLoadFailures::new()),
+            worker_loaded_tokenizers: Arc::new(DashSet::new()),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
@@ -1657,6 +1668,7 @@ pub(crate) mod testing {
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::default(),
+            worker_loaded_tokenizers: Arc::default(),
             wasm_manager: None,
             worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
                 &router_config,

@@ -54,6 +54,11 @@ pub struct TokenizerConfigRequest {
     /// API callers should set this to true.
     #[serde(default)]
     pub fail_on_duplicate: bool,
+    /// Whether a worker's registration asked for the load: an entry it loads
+    /// afresh is the worker's, released with its model's last worker; the
+    /// startup entry's and an operator's requests leave this false.
+    #[serde(skip)]
+    pub for_worker: bool,
 }
 
 /// Configuration for removing a tokenizer
@@ -401,6 +406,9 @@ fn note_load_outcome(
                 "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
                 name, id, vocab_size
             );
+            if config.for_worker {
+                app_context.worker_loaded_tokenizers.insert(id.clone());
+            }
             hint_response_template(app_context, name, id);
         }
         LoadOutcome::AlreadyExists { id } => {
@@ -782,6 +790,7 @@ mod tests {
             chat_template_path: None,
             cache_config: None,
             fail_on_duplicate: false,
+            for_worker: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -816,6 +825,7 @@ mod tests {
             chat_template_path: None,
             cache_config: None,
             fail_on_duplicate: true,
+            for_worker: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -838,6 +848,7 @@ mod tests {
                 l1_max_memory: 0,
             }),
             fail_on_duplicate: false,
+            for_worker: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();

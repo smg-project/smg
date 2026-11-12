@@ -473,13 +473,16 @@ mod tests {
             );
             app_context.worker_registry.register(worker);
         }
-        app_context
+        let loaded = app_context
             .tokenizer_registry
             .load(&TokenizerRegistry::generate_id(), "m", "/tok/m", || async {
                 Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await
             .unwrap();
+        app_context
+            .worker_loaded_tokenizers
+            .insert(loaded.id().to_string());
 
         for (url, remaining) in [("http://w1:8000", true), ("http://w2:8000", false)] {
             let workflow = create_worker_removal_workflow();

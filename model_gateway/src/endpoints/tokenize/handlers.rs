@@ -281,6 +281,7 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         chat_template_path: request.chat_template_path.clone(),
         cache_config: None,
         fail_on_duplicate: true,
+        for_worker: false,
     };
 
     let job = Job::AddTokenizer {
@@ -340,6 +341,7 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
 
     if let Some(entry) = removed {
         context.multimodal_config_registry.remove(&entry.id);
+        context.worker_loaded_tokenizers.remove(&entry.id);
         note_tokenizer_removed(
             &context.tokenizer_load_failures,
             &context.worker_registry,
