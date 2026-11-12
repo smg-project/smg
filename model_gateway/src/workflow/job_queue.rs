@@ -733,7 +733,7 @@ impl JobQueue {
 
     /// Whether the status entry under `url` is a registration job that has
     /// not ended: queued, or running (the type name of [`Job::job_type`]).
-    fn add_worker_in_flight(&self, url: &str) -> bool {
+    pub(crate) fn add_worker_in_flight(&self, url: &str) -> bool {
         self.status_map.get(url).is_some_and(|status| {
             status.job_type == "AddWorker"
                 && matches!(status.status.as_str(), "pending" | "processing")

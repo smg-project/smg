@@ -907,12 +907,16 @@ impl WorkerService {
         if let (Some(labels), Some(worker)) = (&update.labels, &worker) {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
-        // An id with no worker behind it is a registration in flight: it is
-        // polled (GET) or ended (DELETE), not edited. An update job for it
-        // would write its status over the registration's entry in the job
-        // queue, and with it the claim that keeps a second POST of the URL
-        // off the same id.
-        if worker.is_none() {
+        let job_queue = self.get_job_queue()?;
+        // An id whose URL's registration job is still in the queue is a
+        // registration in flight: it is polled (GET) or ended (DELETE), not
+        // edited. An update job for it would write its status over the
+        // registration's entry in the job queue, and with it the claim that
+        // keeps a second POST of the URL off the same id. An id with no
+        // worker under its URL and no such job is a completed data-parallel
+        // group (its ranks stand under the rank URLs, the POST's id maps to
+        // the base), whose update reaches every rank through the URL.
+        if worker.is_none() && job_queue.add_worker_in_flight(&url) {
             return Err(WorkerServiceError::CreateInProgress {
                 url,
                 worker_id: Some(worker_id),
@@ -924,7 +928,6 @@ impl WorkerService {
             update: Box::new(update),
         };
 
-        let job_queue = self.get_job_queue()?;
         job_queue
             .submit(job)
             .await
@@ -1237,6 +1240,85 @@ mod tests {
             matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
             "a second POST was admitted beside the registration: {err:?}"
         );
+    }
+
+    /// A successful data-parallel POST leaves its id mapped to the base URL,
+    /// the ranks registered under the rank URLs and no job in flight: a PATCH
+    /// by that id is admitted and reaches every rank, as before the in-flight
+    /// guard, which read the empty base as a registration in flight and
+    /// refused the group's PATCH on every try.
+    #[tokio::test]
+    async fn a_patch_of_a_completed_data_parallel_group_by_its_post_id_reaches_every_rank() {
+        use crate::workflow::{steps::local::find_workers_by_url, WorkflowEngines};
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "http://10.0.0.6:8000";
+        let router_config = RouterConfig::default();
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        assert!(
+            context
+                .workflow_engines
+                .set(WorkflowEngines::new(&router_config))
+                .is_ok(),
+            "the engines are set once"
+        );
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        assert!(
+            context.worker_job_queue.set(Arc::clone(&queue)).is_ok(),
+            "the queue is set once"
+        );
+        // The group as its POST leaves it: the id reserved for the base URL,
+        // the ranks registered under the rank URLs, the job over.
+        let id = registry.reserve_id_for_url(url);
+        for rank in 0..2 {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("served"))
+                .dp_config(rank, 2)
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("a rank registers");
+        }
+        assert!(
+            registry.get_by_url(url).is_none(),
+            "nothing stands under the base URL itself"
+        );
+        assert_eq!(find_workers_by_url(&registry, url).len(), 2);
+
+        let patch: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"tier": "a"}})).expect("an update");
+        let updated = context
+            .worker_service
+            .update_worker(id.as_str(), patch)
+            .await
+            .expect("the group's PATCH is admitted");
+        assert_eq!(updated.worker_id, id);
+
+        // The update job reaches both ranks.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ranks = find_workers_by_url(&registry, url);
+            if ranks.len() == 2
+                && ranks.iter().all(|worker| {
+                    worker
+                        .metadata()
+                        .spec
+                        .labels
+                        .get("tier")
+                        .map(String::as_str)
+                        == Some("a")
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the update did not reach every rank: {:?}",
+                queue.get_status(url)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// The status, the body and the Retry-After header of an error's answer.
