@@ -28,6 +28,7 @@ use common::{
 };
 use openai_protocol::model_card::ModelCard;
 use smg::{
+    config::PolicyConfig,
     middleware::TenantRequestMeta,
     routers::RouterTrait,
     tenant::TenantKey,
@@ -217,6 +218,7 @@ fn tenant() -> TenantRequestMeta {
 async fn one_chat(
     router: &dyn RouterTrait,
     streamed: bool,
+    headers: Option<&http::HeaderMap>,
 ) -> (http::StatusCode, String, Duration) {
     let request = serde_json::from_value(serde_json::json!({
         "model": MODEL,
@@ -226,12 +228,12 @@ async fn one_chat(
     }))
     .unwrap();
     let started = Instant::now();
-    let response =
-        tokio::time::timeout(CASE_CAP, router.route_chat(None, &tenant(), request, MODEL))
-            .await
-            .expect(
-                "the request must be answered within the case cap, not held to the decode call",
-            );
+    let response = tokio::time::timeout(
+        CASE_CAP,
+        router.route_chat(headers, &tenant(), request, MODEL),
+    )
+    .await
+    .expect("the request must be answered within the case cap, not held to the decode call");
     let status = response.status();
     let bytes = tokio::time::timeout(
         CASE_CAP,
@@ -287,7 +289,7 @@ fn held_prefill_failure_case(streamed: bool) {
     let rendered = render_after(|| async move {
         let (router, workers) = build_pd_router(&prefill, &decode).await;
 
-        let (status, body, elapsed) = one_chat(router.as_ref(), streamed).await;
+        let (status, body, elapsed) = one_chat(router.as_ref(), streamed, None).await;
 
         assert_eq!(
             status,
@@ -361,7 +363,7 @@ fn a_prefill_that_answers_before_the_decode_call_returns_is_read_in_full() {
     render_after(|| async move {
         let (router, workers) = build_pd_router(&prefill, &decode).await;
 
-        let (status, body, elapsed) = one_chat(router.as_ref(), false).await;
+        let (status, body, elapsed) = one_chat(router.as_ref(), false, None).await;
 
         assert_eq!(status, http::StatusCode::OK, "{body}");
         let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
@@ -380,4 +382,82 @@ fn a_prefill_that_answers_before_the_decode_call_returns_is_read_in_full() {
     });
     assert_eq!(prefill_calls.calls(), 1);
     assert_eq!(decode_calls.calls(), 1);
+}
+
+/// A parallel-shape PD gRPC router over `engines`, each registered with its
+/// role, with the retry loop at its defaults and the hashing policy, under
+/// which a request pins its worker by index (`x-smg-target-worker`) into the
+/// candidates placement hands the policy: the rows that read how a side's own
+/// answer meets the retry layer. The registered workers come back with the
+/// router, in registration order.
+async fn build_retrying_pd_router(
+    engines: &[(&Engine, WorkerType)],
+) -> (Box<dyn RouterTrait>, Vec<Arc<dyn Worker>>) {
+    let mut workers: Vec<Arc<dyn Worker>> = Vec::with_capacity(engines.len());
+    for (engine, worker_type) in engines {
+        let port = serve_engine((*engine).clone().into_server()).await;
+        workers.push(Arc::new(
+            grpc_worker(
+                port,
+                *worker_type,
+                RuntimeType::TokenSpeed,
+                ModelCard::new(MODEL),
+            )
+            .build(),
+        ) as Arc<dyn Worker>);
+    }
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
+        .policy(PolicyConfig::ConsistentHashing)
+        .build_unchecked();
+    let router = build_grpc_router(config, MODEL, workers.clone()).await;
+    (router, workers)
+}
+
+/// A held prefill answers its own `INTERNAL` at its stream's first item while
+/// the decode call is still pending, and another prefill worker is free: the
+/// retry takes the free prefill worker with the same decode worker and the
+/// request is answered, a 200 rather than `503 no_available_workers`. The
+/// request pins worker index 0 of the candidates, so the retry lands on the
+/// free prefill worker only because the ledger closed its window on the one
+/// that answered; without that the same index would re-pick it.
+#[test]
+fn a_held_prefills_own_500_fails_over_to_the_free_prefill_worker() {
+    let answering = Engine::new(Behaviour::FailsFirst);
+    let free = Engine::new(Behaviour::Answers(Duration::ZERO));
+    let decode = Engine::new(Behaviour::Answers(LATE_HEADERS));
+    let (answering_calls, free_calls, decode_calls) =
+        (answering.clone(), free.clone(), decode.clone());
+    render_after(|| async move {
+        // Index 0 of the candidates: on the first attempt the first prefill
+        // worker registered, the one whose first item is the failure; on the
+        // retry the free one, the other's window closed.
+        let mut pinned = http::HeaderMap::new();
+        pinned.insert("x-smg-target-worker", http::HeaderValue::from_static("0"));
+        let (router, _workers) = build_retrying_pd_router(&[
+            (&answering, WorkerType::Prefill),
+            (&free, WorkerType::Prefill),
+            (&decode, WorkerType::Decode),
+        ])
+        .await;
+
+        let (status, body, _elapsed) = one_chat(router.as_ref(), false, Some(&pinned)).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+    });
+    assert_eq!(
+        answering_calls.calls(),
+        1,
+        "the prefill worker that answered is asked once: its window closed, the pinned index moved on"
+    );
+    assert_eq!(
+        free_calls.calls(),
+        1,
+        "the free prefill worker takes the retried request"
+    );
+    assert_eq!(
+        decode_calls.calls(),
+        2,
+        "the sole decode worker stays selectable: dispatched with each attempt"
+    );
 }
