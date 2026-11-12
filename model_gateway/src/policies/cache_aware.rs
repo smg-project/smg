@@ -715,81 +715,25 @@ impl CacheAwarePolicy {
         bounds
     }
 
-    /// Initialize the trees with worker URLs (used only during initial setup)
-    /// Initializes both string trees (HTTP) and token trees (gRPC) for each model.
+    /// Give every worker a root in the two trees of its model (the string
+    /// tree for text, the token tree for tokens), so the trees route to it
+    /// before it has served a request.
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
-        // Hash mode keeps no tree state.
-        if self.config.cache_index == CacheIndexKind::Hash {
-            return;
-        }
-        // Group workers by model
-        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
-            let tree_key = normalize_model_key(worker.model_id());
-            model_workers
-                .entry(tree_key.to_string())
-                .or_default()
-                .push(worker);
-        }
-
-        // Initialize trees for each model (both string and token trees)
-        for (tree_key, model_workers) in model_workers {
-            // Initialize string tree (HTTP)
-            let string_tree = self
-                .string_trees
-                .entry(tree_key.clone())
-                .or_insert_with(|| Arc::new(Tree::new()));
-            // Initialize token tree (gRPC)
-            let token_tree = self
-                .token_trees
-                .entry(tree_key)
-                .or_insert_with(|| Arc::new(self.new_token_tree()));
-
-            for worker in model_workers {
-                string_tree.insert_text("", worker.url());
-                token_tree.insert_tokens(&[], worker.url());
-            }
+            self.add_worker(worker.as_ref());
         }
     }
 
-    /// Add a single worker to the trees (incremental update)
+    /// Give one worker its root in the two trees of its model. Hash mode
+    /// keeps no tree state.
     pub fn add_worker(&self, worker: &dyn Worker) {
         if self.config.cache_index == CacheIndexKind::Hash {
             return;
         }
-        let tree_key = normalize_model_key(worker.model_id()).to_string();
-        // Add to string tree (HTTP)
-        let string_tree = self
-            .string_trees
-            .entry(tree_key.clone())
-            .or_insert_with(|| Arc::new(Tree::new()));
-        string_tree.insert_text("", worker.url());
-        // Add to token tree (gRPC)
-        let token_tree = self
-            .token_trees
-            .entry(tree_key)
-            .or_insert_with(|| Arc::new(self.new_token_tree()));
-        token_tree.insert_tokens(&[], worker.url());
-    }
-
-    /// Add a worker by URL and model (for backward compatibility)
-    pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
-        if self.config.cache_index == CacheIndexKind::Hash {
-            return;
-        }
-        let model_id_string = model_id.to_string();
-        // Add to string tree (HTTP)
-        let string_tree = self
-            .string_trees
-            .entry(model_id_string.clone())
-            .or_insert_with(|| Arc::new(Tree::new()));
-        string_tree.insert_text("", url);
-        // Add to token tree (gRPC)
-        let token_tree = self
-            .token_trees
-            .entry(model_id_string)
-            .or_insert_with(|| Arc::new(self.new_token_tree()));
-        token_tree.insert_tokens(&[], url);
+        let tree_key = normalize_model_key(worker.model_id());
+        tree_for_model(&self.string_trees, tree_key, Tree::new).insert_text("", worker.url());
+        tree_for_model(&self.token_trees, tree_key, || self.new_token_tree())
+            .insert_tokens(&[], worker.url());
     }
 
     /// Remove a worker from the trees
@@ -868,8 +812,10 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Run cache eviction to prevent unbounded growth
-    pub fn evict_cache(&self, max_size: usize) {
+    /// Test-only: one eviction pass over every tree at `max_size`, what the
+    /// eviction task does on its interval (without the gauges it publishes).
+    #[cfg(test)]
+    pub(crate) fn evict_cache(&self, max_size: usize) {
         // Evict string trees (HTTP)
         for tree_ref in self.string_trees.iter() {
             let model_id = tree_ref.key();
