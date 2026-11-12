@@ -8,7 +8,6 @@
 use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
-use llm_tokenizer::{registry::TokenizerRegistry, traits::Tokenizer};
 use openai_protocol::completion::CompletionRequest;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg::{
@@ -26,7 +25,7 @@ use smg_data_connector::{
 use smg_mcp::{McpConfig, McpOrchestrator};
 use tool_parser::ParserFactory as ToolParserFactory;
 
-use crate::common::scripted_tokenizer::ScriptedTokenizer;
+use crate::common::mock_tokenizer_registry;
 
 const MODEL: &str = "test-model";
 
@@ -71,17 +70,11 @@ async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
         .queue_timeout_secs(60)
         .build_unchecked();
 
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     // The test pins where a prompt array ends up, not a vocabulary: the
-    // harness's scripted tokenizer encodes any prompt, where a hub download
-    // made a host without egress fail the test on head and base alike.
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ScriptedTokenizer::new("ok"));
-    tokenizer_registry
-        .load("test-tokenizer", MODEL, "scripted", || async move {
-            Ok(tokenizer)
-        })
-        .await
-        .expect("load tokenizer");
+    // harness's mock tokenizer encodes the prompts below from its own small
+    // vocabulary, without a file or the network, where a hub download made a
+    // host without egress fail the test on head and base alike.
+    let tokenizer_registry = mock_tokenizer_registry(MODEL).await;
 
     let mcp_orchestrator = Arc::new(OnceLock::new());
     mcp_orchestrator
