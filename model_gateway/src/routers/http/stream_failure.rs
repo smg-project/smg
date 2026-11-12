@@ -349,6 +349,7 @@ mod tests {
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
         let error = crate::server::http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/v1/chat/completions"))

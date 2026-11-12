@@ -41,6 +41,27 @@ pub(crate) struct ChunkStep {
     pub(crate) last: bool,
 }
 
+/// The decode side's reading of its stream: what each chunk becomes, whether
+/// it ends the relay, and what the hook still holds when the upstream ends.
+/// A closure is a hook that holds nothing.
+pub(crate) trait ChunkHook: Send {
+    /// One upstream chunk, read.
+    fn step(&mut self, chunk: Bytes) -> ChunkStep;
+
+    /// The bytes held back for a later chunk (a frame cut short of its
+    /// delimiter) when the upstream ends: sent before the stream's end or
+    /// its error event. Nothing by default.
+    fn finish(&mut self) -> Bytes {
+        Bytes::new()
+    }
+}
+
+impl<F: FnMut(Bytes) -> ChunkStep + Send> ChunkHook for F {
+    fn step(&mut self, chunk: Bytes) -> ChunkStep {
+        self(chunk)
+    }
+}
+
 /// How the relay reads each upstream chunk: as it is; through the SSE
 /// re-chunker the regular router's wire asks for; or through
 /// the decode side's hook (the prefill log-probability merge and the
@@ -49,7 +70,7 @@ pub(crate) struct ChunkStep {
 pub(crate) enum ChunkMode {
     Plain,
     Rechunk(Box<SseRechunker<NoopObserver>>),
-    Hook(Box<dyn FnMut(Bytes) -> ChunkStep + Send>),
+    Hook(Box<dyn ChunkHook>),
 }
 
 impl ChunkMode {
@@ -72,11 +93,12 @@ impl ChunkMode {
         }
     }
 
-    /// The re-chunker's tail at the stream's end, or nothing.
+    /// The re-chunker's or the hook's tail at the stream's end, or nothing.
     fn finish(&mut self) -> Bytes {
         match self {
             Self::Rechunk(rechunker) => rechunker.finish(),
-            Self::Plain | Self::Hook(_) => Bytes::new(),
+            Self::Hook(hook) => hook.finish(),
+            Self::Plain => Bytes::new(),
         }
     }
 }
@@ -178,8 +200,8 @@ where
                                 let (bytes, last) = match &mut mode {
                                     ChunkMode::Plain => (bytes, false),
                                     ChunkMode::Rechunk(rechunker) => (rechunker.feed(bytes), false),
-                                    ChunkMode::Hook(read) => {
-                                        let step = read(bytes);
+                                    ChunkMode::Hook(hook) => {
+                                        let step = hook.step(bytes);
                                         (step.bytes, step.last)
                                     }
                                 };
@@ -300,7 +322,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
-    use super::{relay_streaming_body, ChunkMode, ChunkStep, Relay};
+    use super::{relay_streaming_body, ChunkHook, ChunkMode, ChunkStep, Relay};
     use crate::{
         routers::{
             common::{sse::SSE_CHANNEL_BUFFER, sse_rechunk::SseRechunker},
@@ -357,7 +379,7 @@ mod tests {
             ]
         );
 
-        let hook: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(|bytes: Bytes| ChunkStep {
+        let hook = Box::new(|bytes: Bytes| ChunkStep {
             last: bytes.as_ref() == b"data: [DONE]\n\n",
             bytes,
         });
@@ -368,7 +390,7 @@ mod tests {
     /// The hook's `last` ends the relay: a chunk after it is not read.
     #[tokio::test]
     async fn the_hooks_last_chunk_ends_the_relay() {
-        let hook: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(|bytes: Bytes| ChunkStep {
+        let hook = Box::new(|bytes: Bytes| ChunkStep {
             last: bytes.as_ref() == b"data: [DONE]\n\n",
             bytes,
         });
@@ -384,6 +406,66 @@ mod tests {
                 Bytes::from_static(b"data: [DONE]\n\n")
             ]
         );
+    }
+
+    /// A hook that holds every chunk back for the next one: what a frame
+    /// cut across chunks needs. Its `finish` is the held chunk.
+    struct HoldsOne(Option<Bytes>);
+
+    impl ChunkHook for HoldsOne {
+        fn step(&mut self, chunk: Bytes) -> ChunkStep {
+            ChunkStep {
+                bytes: self.0.replace(chunk).unwrap_or_default(),
+                last: false,
+            }
+        }
+
+        fn finish(&mut self) -> Bytes {
+            self.0.take().unwrap_or_default()
+        }
+    }
+
+    /// What a hook still holds at a clean upstream end follows the last
+    /// chunk it let go.
+    #[tokio::test]
+    async fn the_hooks_held_tail_leaves_at_a_clean_upstream_end() {
+        let frames = frames_through(
+            vec![b"data: a\n\n", b"data: b\n\n"],
+            ChunkMode::Hook(Box::new(HoldsOne(None))),
+        )
+        .await;
+        assert_eq!(
+            frames,
+            [
+                Bytes::from_static(b"data: a\n\n"),
+                Bytes::from_static(b"data: b\n\n")
+            ]
+        );
+    }
+
+    /// What a hook still holds when the upstream is cut goes out before the
+    /// typed error event, as a re-chunker's held text does.
+    #[tokio::test]
+    async fn the_hooks_held_tail_leaves_before_a_cuts_error_event() {
+        let error = upstream_error().await;
+        let upstream = stream::iter(vec![
+            Ok(Bytes::from_static(b"data: a\n\n")),
+            Ok(Bytes::from_static(b"data: b\n\n")),
+            Err(error),
+        ]);
+        let events = events_of(
+            &frames_of(relay_of(upstream, ChunkMode::Hook(Box::new(HoldsOne(None)))).into_body())
+                .await,
+        );
+        let [first, second, error_event, done] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!((first.as_str(), second.as_str()), ("data: a", "data: b"));
+        assert!(
+            error_event.starts_with("data: {\"error\":"),
+            "{error_event}"
+        );
+        assert_eq!(done, "data: [DONE]");
     }
 
     /// A client that stops reading stops the upstream read: the relay holds

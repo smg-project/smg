@@ -682,6 +682,16 @@ impl Count<'_> {
     }
 }
 
+/// One of the words.
+fn words(words: &[&str]) -> Grammar {
+    Grammar::Or(
+        words
+            .iter()
+            .map(|word| Grammar::ConstString(word.to_string()))
+            .collect(),
+    )
+}
+
 /// `item` once or more, `separator` before every repeat: the one shape of a separated list, for
 /// the calls of a block and the members of a value alike.
 fn repeated(item: Grammar, separator: &str) -> Grammar {

@@ -5380,6 +5380,7 @@ mod tests {
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
         let err = crate::server::http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -5406,7 +5407,10 @@ mod tests {
         // A reserved port nobody listens at: the connect is refused.
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let err = crate::server::http_client()
+        let err = crate::server::http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(format!("http://{addr}/generate"))
             .send()
             .await

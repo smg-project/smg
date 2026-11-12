@@ -65,9 +65,10 @@ class RustCli:
 
 
 # Where a named CLI default is declared when the CLI sources do not declare it
-# themselves: the config types module main.rs imports its constants from. The
-# ``rust`` fixture hands their texts to the reader; a synthetic source hands its own.
-CONST_SOURCES = (MAIN_RS.parent / "config" / "types.rs",)
+# themselves: the config types and server modules main.rs imports its constants
+# from. The ``rust`` fixture hands their texts to the reader; a synthetic source
+# hands its own.
+CONST_SOURCES = (MAIN_RS.parent / "config" / "types.rs", MAIN_RS.parent / "server.rs")
 
 
 @dataclass(frozen=True)

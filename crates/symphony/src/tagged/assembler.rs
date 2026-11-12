@@ -35,10 +35,11 @@ use std::borrow::Cow;
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     ids::CallIds,
-    markers::{Piece, Scanner},
+    markers::Scanner,
     tagged::{
-        end_cut_call, held_text, take_owned,
+        end_cut_call, held_text,
         value::{json, Kind, NULL_WORDS},
+        TaggedAssembler,
     },
     Declared,
 };
@@ -185,7 +186,8 @@ impl Assembler {
 
     /// Append the next bytes of the block, push the events they complete, and return how many of
     /// the bytes were taken: all of them, since the block's calls follow one another and its
-    /// closing marker is the format's to read.
+    /// closing marker is the format's to read. The block's own feed, not the trait's: it is never
+    /// done before its close, and the region reads the count.
     pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         let scanned = self.scanner.feed(bytes);
         for piece in scanned.pieces_of_delta() {
@@ -448,21 +450,6 @@ impl Assembler {
     /// for a later event's source.
     fn drop_carried(&mut self, out: &mut Events) {
         crate::event::drop_carried(std::mem::take(&mut self.carried), out);
-    }
-
-    fn take<'d>(&mut self, piece: Piece<'d>, declared: &Declared, out: &mut Events<'d>) {
-        match piece {
-            Piece::Text(Cow::Borrowed(text)) => self.text(text, declared, out),
-            // The join's part after a hold is a copy, nobody's delta: its events go out owned.
-            Piece::Text(Cow::Owned(text)) => {
-                let mut scratch = std::mem::take(&mut self.scratch);
-                take_owned(&text, &mut scratch, out, |text, out| {
-                    self.text(text, declared, out);
-                });
-                self.scratch = scratch;
-            }
-            Piece::Marker(tag) => self.tag(tag, declared, out),
-        }
     }
 
     fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events) {
@@ -903,6 +890,29 @@ pub(crate) fn push_escaped(out: &mut String, text: &str) {
             }
             c => out.push(c),
         }
+    }
+}
+
+impl TaggedAssembler for Assembler {
+    /// The block is never done before its close: its calls follow one another.
+    fn done(&self) -> bool {
+        false
+    }
+
+    fn scanner(&mut self) -> &mut Scanner {
+        &mut self.scanner
+    }
+
+    fn scratch(&mut self) -> &mut Events<'static> {
+        &mut self.scratch
+    }
+
+    fn text<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) {
+        Assembler::text(self, text, declared, out);
+    }
+
+    fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events) {
+        Assembler::tag(self, tag, declared, out);
     }
 }
 

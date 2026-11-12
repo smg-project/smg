@@ -471,7 +471,8 @@ pub(crate) fn extract_thinking_from_kwargs(
 /// for one of its off words (which short-circuits the generic
 /// `reasoning_effort` fallback in `resolve_thinking_pref`), `None` otherwise.
 /// Mirrors the template-kwargs merge: the request-level `reasoning_effort`
-/// is written over an explicit kwargs entry.
+/// is written over an explicit kwargs entry, as sent
+/// ([`reasoning_effort_as_rendered`] names where the MiniMax render differs).
 fn extract_template_effort_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -486,11 +487,13 @@ fn extract_template_effort_thinking(
     native_effort_thinking(effort, tokenizer)
 }
 
-/// The `reasoning_effort` the template sees: the request-level field
-/// (`thinking.effort`, else the top-level field), written over a
-/// `chat_template_kwargs` entry as the engine's own server renders it, else
-/// the entry (`build_chat_template_kwargs` in `chat_utils` merges them the
-/// same way).
+/// The `reasoning_effort` a renderer with its own effort words sees: the
+/// request-level field (`thinking.effort`, else the top-level field), written
+/// over a `chat_template_kwargs` entry as the engine's own server renders it,
+/// else the entry. The render's merge (`build_chat_template_kwargs` in
+/// `chat_utils`) writes the same under every profile but MiniMax, where it
+/// writes the profile's reading of the field instead; no MiniMax template
+/// declares effort words, so the arming reads the same there.
 fn reasoning_effort_as_rendered<'a>(
     kwargs: Option<&'a std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&'a str>,
@@ -532,7 +535,7 @@ fn native_effort_thinking(effort: &str, tokenizer: &dyn Tokenizer) -> Option<boo
 /// support it, then the typed `thinking.type` toggle, then the provider
 /// profile's reading of `reasoning_effort`
 /// ([`ProviderProfile::thinking_from_reasoning_effort`]: the OpenAI mapping
-/// for every profile but MiniMax, which no effort value switches off).
+/// for every profile but MiniMax, where `none` alone switches off).
 /// The typed rank matches where K3, V3.2 and V4.1 read `params.thinking`;
 /// V4 ranks it above its native effort, so a typed `disabled` plus a native
 /// effort disagrees there.
@@ -819,6 +822,7 @@ pub fn resolve_user_thinking(
         reasoning_effort,
         thinking.or(effort_thinking),
         tokenizer,
+        provider,
     ) {
         return Some(mode);
     }
@@ -833,29 +837,48 @@ pub fn resolve_user_thinking(
 /// The mode a renderer with its own thinking rule renders for the request,
 /// asked with the inputs the render receives (`build_chat_template_kwargs`
 /// and `resolve_template_thinking` in `chat_utils` build the same for the
-/// render): the request's template kwargs with the effective `reasoning_effort`
-/// written over their entry under that key, whatever its type (the render's
-/// merge writes the request-level field over any kwargs entry), the kwargs as
-/// they are when the request carries no field, and `template_thinking`: the
-/// typed toggle or the profile's reading of the effort, as the render
-/// resolves it. `None` for every other renderer.
+/// render): the request's template kwargs with the `reasoning_effort` entry
+/// as the request's provider profile hands it to the template
+/// (`ProviderProfile::template_reasoning_effort`, written over any entry
+/// under that key whatever its type, the entry removed when the profile hands
+/// none, given the thinking preference the render resolves: the template's
+/// own switch among the kwargs where the template reads that key, else
+/// `template_thinking`), the kwargs as they
+/// are when the request carries no field, and `template_thinking`: the typed
+/// toggle or the profile's reading of the effort. `None` for every other
+/// renderer.
 fn rendered_thinking_mode(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
     template_thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
+    provider: ProviderProfile,
 ) -> Option<bool> {
-    match reasoning_effort {
+    if reasoning_effort.is_none() {
+        return tokenizer.native_thinking_mode(kwargs, template_thinking);
+    }
+    let mut as_rendered = kwargs.cloned().unwrap_or_default();
+    // The template's own switch counts where the template reads that key, as
+    // the render gates it.
+    let explicit = matches!(
+        tokenizer.thinking_key_name(),
+        Some(ThinkingKeyName::ThinkingMode)
+    )
+    .then(|| provider.thinking_from_template_kwargs(kwargs))
+    .flatten();
+    let thinking = explicit.or(template_thinking);
+    match provider.template_reasoning_effort(reasoning_effort, thinking) {
         Some(effort) => {
-            let mut as_rendered = kwargs.cloned().unwrap_or_default();
             as_rendered.insert(
                 "reasoning_effort".to_string(),
                 Value::String(effort.to_string()),
             );
-            tokenizer.native_thinking_mode(Some(&as_rendered), template_thinking)
         }
-        None => tokenizer.native_thinking_mode(kwargs, template_thinking),
+        None => {
+            as_rendered.remove("reasoning_effort");
+        }
     }
+    tokenizer.native_thinking_mode(Some(&as_rendered), template_thinking)
 }
 
 /// Check if a reasoning parser is available for the given model
@@ -2022,18 +2045,24 @@ mod tests {
         );
     }
 
-    /// The MiniMax profile reads `reasoning_effort` by its contract: no value
-    /// switches thinking off, so the parser's arming follows the template's
-    /// default as the render does; the OpenAI reading stays for every other
-    /// profile.
+    /// The MiniMax profile reads `reasoning_effort` by its contract: `none`
+    /// switches thinking off, so the parser is not armed, as the render
+    /// writes the template's off mode; `minimal` is the lowest level and a
+    /// level leaves the template's default. The OpenAI reading stays for
+    /// every other profile.
     #[test]
-    fn minimax_effort_never_switches_the_arming_off() {
+    fn minimax_effort_none_disarms_the_parser_as_everywhere() {
         // A tokenizer like the MiniMax M3 template's: the tri-state key, off by
         // default, and no native `reasoning_effort` words of its own.
         let tok = llm_tokenizer::MockTokenizer::new()
             .with_thinking_toggle(ThinkingToggle::DefaultOff)
             .with_thinking_key_name(ThinkingKeyName::ThinkingMode);
-        for effort in ["none", "minimal", "low", "high"] {
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok, ProviderProfile::Minimax),
+            Some(false),
+            "MiniMax none"
+        );
+        for effort in ["minimal", "low", "high", "max"] {
             assert_eq!(
                 resolve_user_thinking(None, Some(effort), None, &tok, ProviderProfile::Minimax),
                 None,
@@ -2091,8 +2120,7 @@ mod tests {
     /// any level, through the request: the prompt renders thinking off and
     /// the parser is not armed. The effort alone leaves the template's
     /// default; `enabled` arms. (A template with the tri-state toggle, off by
-    /// default, under the one profile whose contract reads no effort value
-    /// as off.)
+    /// default, under the MiniMax profile.)
     #[test]
     fn thinking_disabled_wins_over_reasoning_effort() {
         let tok = llm_tokenizer::MockTokenizer::new()
