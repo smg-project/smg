@@ -1472,6 +1472,71 @@ mod tests {
             .contains("media dtype"));
     }
 
+    /// The identity a worker-side prefill returns to its decode side is the
+    /// batch through the shared pixel-less rule: the expanded prompt, no
+    /// pixels, the inline grid alone of the tensors, the hashes and the
+    /// placeholders as sent. A caller that wants no identity gets none.
+    #[tokio::test]
+    async fn the_worker_side_identity_is_the_batch_without_its_pixels() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (_dir, pipeline) = vision_test_pipeline(
+            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
+            &[
+                ("<|image|>", 32000),
+                ("<|begin_of_image|>", 32001),
+                ("<|end_of_image|>", 32002),
+            ],
+        )
+        .await;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let items = [WorkerMediaItem {
+            modality: Modality::Image,
+            url: format!(
+                "data:image/png;base64,{}",
+                STANDARD.encode(png.into_inner())
+            ),
+        }];
+        let output = pipeline
+            .process(vec![1, 32000, 2], &items, true)
+            .await
+            .unwrap();
+        let batch = &output.batches[0];
+        assert!(batch.pixel_values.is_some());
+        assert!(!batch.mm_hashes.is_empty());
+        assert!(batch.model_specific_tensors.contains_key("image_grid_thw"));
+        let identity = output
+            .identity
+            .as_ref()
+            .expect("the identity the caller wanted");
+        assert_eq!(identity.prompt_token_ids, output.prompt_token_ids);
+        assert!(identity.extra_mm_inputs.is_empty());
+        let stripped = identity.mm_inputs.as_ref().expect("the batch's identity");
+        assert!(
+            stripped.pixel_values.is_none(),
+            "the identity carries no pixels"
+        );
+        let kept: Vec<&String> = stripped.model_specific_tensors.keys().collect();
+        assert_eq!(kept, ["image_grid_thw"], "the inline grid alone rides");
+        assert_eq!(stripped.mm_hashes, batch.mm_hashes);
+        assert_eq!(stripped.mm_placeholders, batch.mm_placeholders);
+        assert_eq!(stripped.im_token_id, batch.im_token_id);
+        assert_eq!(stripped.batched_keys, ["image_grid_thw"]);
+        // This family lays its pixels out flat: they are named in `flat_keys`
+        // with their sizes tensor, never in `batched_keys`, and the identity
+        // drops the entry with the pixels.
+        assert!(batch.flat_keys.contains_key("pixel_values"));
+        assert!(stripped.flat_keys.is_empty());
+
+        let output = pipeline
+            .process(vec![1, 32000, 2], &items, false)
+            .await
+            .unwrap();
+        assert!(output.identity.is_none());
+    }
+
     /// Grouped references retain per-modality anchors in interleaved prompts.
     /// Runs where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
