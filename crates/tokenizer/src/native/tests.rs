@@ -686,6 +686,17 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
     );
+    // A split after the ByteLevel with the end anchor: on the raw text the
+    // anchor holds before a `\n`, which the map has moved beyond ASCII.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        split(r"[a-z]+$", SplitDelimiterBehavior::Isolated, false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
+    );
     // A `Digits` after the ByteLevel: on the mapped text it would also cut
     // at the numeric characters the map makes of six bytes beyond ASCII.
     let mut tokenizer = tokenizer_of(base, &mut state);

@@ -566,10 +566,13 @@ impl Pattern {
         self.part.as_ref()
     }
 
-    /// Whether every class of the pattern is within printable ASCII, so that
-    /// the pattern cuts a text and its byte-level image at the same places.
+    /// Whether every class of the pattern is within printable ASCII and the
+    /// pattern holds no end anchor, so that it cuts a text and its byte-level
+    /// image at the same places: the anchor reads a `\n`, which the map moves
+    /// beyond ASCII, so on the raw text it would hold where the reference, on
+    /// the mapped text, sees the middle of a piece.
     pub(super) fn within_printable_ascii(&self) -> bool {
-        self.classes.iter().all(Class::within_printable_ascii)
+        !self.end_anchored && self.classes.iter().all(Class::within_printable_ascii)
     }
 
     /// Whether the pattern holds the end anchor `$`: it reads the end of
