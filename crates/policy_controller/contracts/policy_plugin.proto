@@ -562,7 +562,20 @@ message LifecycleEvent {
 // with a server-name pin; both streams authenticate once at open; the
 // controller is the client.
 //
-// The first frame on a Decide stream.
+// The first frame on a Decide stream and on an Observe stream. On Decide the
+// range is negotiated: the plugin answers the version it chose in
+// PluginHelloAck.protocol, fixed for that stream. One plugin (the gRPC server
+// behind its address, however many processes answer there) speaks one
+// version while any of its Decide streams (one per controller shard) stays
+// open: the first stream to settle fixes it, later Decide hellos name only
+// that version (protocol_min = protocol_max), and once the last stream closes
+// the next stream to settle fixes it anew. An ack that races the first one
+// and names another version is cancelled by the controller, its error
+// naming both. On Observe nothing answers before the Ack, so the hello
+// names the plugin's version, protocol_min = protocol_max. A plugin that
+// does not speak the one version offered ends the stream, as the server,
+// with FAILED_PRECONDITION, its message naming the offered and the spoken
+// versions.
 message PluginHello {
   uint32 protocol_min = 1;
   uint32 protocol_max = 2;
@@ -662,8 +675,10 @@ message PluginRequest {
   }
 }
 
-// The hello first, as on Decide (a plugin that refuses its version ends the
-// stream with FAILED_PRECONDITION), then the events; one Ack at the end.
+// The hello first, naming the plugin's version (PluginHello; a plugin that
+// does not speak it ends the stream with
+// FAILED_PRECONDITION naming both versions), then the events; one Ack at the
+// end.
 message ObserveRequest {
   oneof request {
     PluginHello hello = 1;
@@ -689,6 +704,7 @@ service PolicyPlugin {
   // One bidirectional stream per controller shard, pipelined, ordered per
   // decision id: view and stage set in; mask, scores and pick out.
   rpc Decide(stream PluginRequest) returns (stream PluginResponse);
-  // A client stream answered once: the lifecycle of the ids the plugin saw.
+  // A client stream answered once: the LifecycleEvent states, opened for a
+  // plugin once one of its Decide streams settled and for no other.
   rpc Observe(stream ObserveRequest) returns (Ack);
 }
