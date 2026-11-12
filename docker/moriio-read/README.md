@@ -2,7 +2,8 @@
 
 This directory preserves the successful A11 full ROCm build recipe for
 [public engine f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9](https://github.com/chunfangamd/vllm/commit/f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9).
-It is a build recipe and provenance record, not a published container image.
+The recipe and provenance records are distinct from the candidate image produced
+by the normal-main publisher described below.
 
 `Dockerfile.rocm` is byte-identical to the successful recipe: the engine's
 original Dockerfile plus `ENV MAX_JOBS=16 CMAKE_BUILD_PARALLEL_LEVEL=16` in its
@@ -71,4 +72,43 @@ separately; this build recipe does not claim that its original baked harness
 contains subsequent harness fixes. It does not establish full-weight quality,
 RDMA, heterogeneous TP, physical MR lifetime or SMG PD/normal-CI qualification.
 The local image config and Node2 OCI manifest are historical local identifiers,
-not public registry pull references. Publishing a pullable image remains open.
+not public registry pull references. Use a successful publisher artifact to
+identify an actual registry candidate; a merge alone does not prove delivery.
+
+
+## Normal-main candidate publication
+
+[CI MoRI READ Candidate Image](../../.github/workflows/ci-moriio-read-image.yml)
+runs its publisher only for a normal `smg-project/smg` push to `main` that changes
+an actual build input, the publisher or its workflow. Documentation and receipt
+changes alone do not publish. Same-repository PRs retain the broader recipe
+integrity check and 13 stdlib publisher controls without Docker or publication.
+
+The publisher builds both full targets, then exports the cached `test` target as
+`ghcr.io/smg-project/smg:ci-moriio-read-<identity>-<run>-<attempt>`.
+Find the actual candidate reference, immutable digest, completion status and
+owned cleanup result in `result.json` inside the Actions artifact
+`moriio-read-candidate-<run>-<attempt>`. `publication-metadata.json` records the
+Buildx export; `candidate-identity.json` records the registry's raw OCI
+index/manifest/config and layer descriptors. The result also records the exact
+engine source commit and exported archive hash; the three `*-material.json`
+files record the immutable dependency image metadata.
+
+This runs on the existing Docker CPU route only after actual capacity, disk,
+cgroup limits and no-GPU build-sandbox checks pass. Insufficient capacity,
+registry permission, private-package visibility, anonymous metadata access or
+owned-cleanup failure makes the operation fail. A failed operation may already
+have pushed a candidate: inspect its result and registry receipt rather than
+assuming failure means nothing was published. Main merge is not a guarantee
+that a public pullable image exists.
+
+Every output is an **unqualified candidate**. Binding its immutable digest to
+`SMG_AMD_MORIIO_READ_IMAGE` requires a separately reviewed first-qualification
+operation, preserving the full original SMG READ/RDMA suite, real model weights,
+all topologies and assertions, effective installed-source preflight, device/NIC
+requirements and shared-node admission/cleanup. That first run can establish
+qualification; prior success of the same not-yet-enabled path is not required.
+Only its actual complete results can support a qualified SMG PD claim. The
+historical four DUMMY/xGMI passes above do not qualify a newly built digest or
+replace this full READ/RDMA operation. No variable or deployment changes are
+performed by the publisher.

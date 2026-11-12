@@ -4,7 +4,10 @@ on:
   push:
     branches: [main]
     paths:
-      - 'docker/moriio-read/**'
+      - 'docker/moriio-read/Dockerfile.rocm'
+      - 'docker/moriio-read/bake.hcl'
+      - 'docker/moriio-read/upstream-bake.hcl'
+      - 'docker/moriio-read/source.git_archival.txt'
       - 'scripts/ci_moriio_image_publication.py'
       - '.github/workflows/ci-moriio-read-image.yml'
   pull_request:
@@ -12,6 +15,7 @@ on:
     paths:
       - 'docker/moriio-read/**'
       - 'scripts/ci_moriio_image_publication.py'
+      - 'scripts/tests/test_ci_moriio_image_publication.py'
       - '.github/workflows/ci-moriio-read-image.yml'
 
 permissions:
@@ -34,6 +38,8 @@ jobs:
           persist-credentials: false
       - name: Check exact recipe without Docker, credentials or engine imports
         run: python3 -I -B scripts/ci_moriio_image_publication.py --check
+      - name: Check publisher contracts without Docker or network
+        run: python3 -I -B -m unittest discover -s scripts/tests -p test_ci_moriio_image_publication.py -v
 
   publish-candidate:
     needs: [recipe-check]

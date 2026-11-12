@@ -5,8 +5,8 @@
       "sha256": "46afee050d39a25e462136494b054297e47515cfac87857863b2e6c0afe6336a"
     },
     "README.md": {
-      "bytes": 4232,
-      "sha256": "79ad74ce2a01a5248079b820b84e12ff44a52632123d921bdc49f92ff14a0e55"
+      "bytes": 6687,
+      "sha256": "dfab7a83c0bf458c79126f36fb455abe015db6046133db60046e6d2957e2ffb7"
     },
     "bake.hcl": {
       "bytes": 1791,
