@@ -3,10 +3,17 @@
 //!
 //! The arrival stamps and the read budget are on tokio's clock, as the
 //! keep-alive timer and the held worker's silence are. A test that pauses
-//! the clock from the response headers on ([`stream_paused_from_the_headers`])
-//! reads the gateway's timers as exact instants; on the wall clock tokio's
-//! `Instant` is the system's.
-use std::{sync::Arc, time::Duration};
+//! the clock from the response headers on ([`stream_paused_from_the_headers`],
+//! [`stream_to_end_paused_through`]) reads the gateway's timers as exact
+//! instants with no wall time spent; on the wall clock tokio's `Instant` is
+//! the system's.
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -142,6 +149,75 @@ pub async fn stream_paused_from_the_headers(
     tokio::time::pause();
     let slack = sent.elapsed();
     (read(path, response, budget).await.0, slack)
+}
+
+/// How long before the engine's silence ends the clock resumes, on the
+/// arrival clock. The engine's frames cross a real socket, which a paused
+/// clock's auto-advance walks past: it polls I/O once and, with nothing
+/// ready yet, moves on to the next timer, so a frame written at the end of
+/// the silence would be read at whatever timer comes next. Resumed in time,
+/// the runtime waits for the socket as on the wall clock.
+pub const RESUME_MARGIN: Duration = Duration::from_millis(100);
+
+/// What [`stream_to_end_paused_through`] read.
+#[derive(Debug)]
+pub struct PausedRead {
+    pub arrivals: Vec<Arrival>,
+    /// Whether the body closed within the budget.
+    pub eof: bool,
+    /// The request's wall duration before the pause: a timer the gateway or
+    /// the engine armed before the headers is due that much earlier than
+    /// the arrival clock says, at most.
+    pub slack: Duration,
+    /// When the clock resumed, on the arrival clock: arrivals before it were
+    /// read on the paused clock, exact to the timer wheel's millisecond, and
+    /// arrivals after it on the wall clock.
+    pub resumed_at: Duration,
+}
+
+/// [`stream_to_end`] with tokio's clock paused from the response headers
+/// through the engine's `silence` (which started at the request, up to the
+/// slack before the arrival clock) and resumed [`RESUME_MARGIN`] before it
+/// ends: the gateway's timers in the silence are read as exact instants
+/// with no wall time spent, the engine's frames on the wall clock. Needs a
+/// current-thread runtime, as `tokio::time::pause` does.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test helper: the resume task is done or aborted before the read returns"
+)]
+pub async fn stream_to_end_paused_through(
+    app: &Router,
+    path: &str,
+    body: serde_json::Value,
+    budget: Duration,
+    silence: Duration,
+) -> PausedRead {
+    let sent = Instant::now();
+    let response = send(app, path, body).await;
+    tokio::time::pause();
+    let slack = sent.elapsed();
+    let resumed_at = silence.saturating_sub(slack + RESUME_MARGIN);
+    let resume_at = Instant::now() + resumed_at;
+    let resumed = Arc::new(AtomicBool::new(false));
+    let resumer = tokio::spawn({
+        let resumed = Arc::clone(&resumed);
+        async move {
+            tokio::time::sleep_until(resume_at).await;
+            tokio::time::resume();
+            resumed.store(true, Ordering::SeqCst);
+        }
+    });
+    let (arrivals, eof) = read(path, response, budget).await;
+    if !resumed.load(Ordering::SeqCst) {
+        resumer.abort();
+        tokio::time::resume();
+    }
+    PausedRead {
+        arrivals,
+        eof,
+        slack,
+        resumed_at,
+    }
 }
 
 #[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]

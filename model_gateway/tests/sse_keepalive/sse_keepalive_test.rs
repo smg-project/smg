@@ -8,11 +8,18 @@
 //! through the silence and none once deltas flow: an SSE comment on the
 //! OpenAI-shaped endpoints, the `ping` event on the Messages API. With the
 //! interval at zero nothing is sent, as before.
+//!
+//! The clock pauses once each response's headers are in (the request and
+//! its hops to the engine run on the wall clock, as the default test's doc
+//! says) and resumes a margin before the engine speaks, as its frames cross
+//! a real socket: the keep-alive timer is tokio's, so the runtime advances
+//! to it with no wall time spent and the tests read its frames as exact
+//! instants instead of judging on windows.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use support::{app, stream, stream_to_end, Arrival, MODEL};
+use support::{app, stream_to_end_paused_through, Arrival, MODEL};
 
 use crate::support;
 
@@ -20,7 +27,11 @@ const COMMENT: &str = ": ping\n\n";
 const PING: &str = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
 /// The engine's silence before its first token.
 const SILENCE: Duration = Duration::from_millis(3500);
+/// The keep-alive interval the tests configure.
+const INTERVAL: Duration = Duration::from_secs(1);
 const BUDGET: Duration = Duration::from_secs(20);
+/// The timer wheel's resolution: a timer fires on its deadline's millisecond.
+const WHEEL: Duration = Duration::from_millis(1);
 
 /// A streaming endpoint: its path, request, keep-alive frame and the frame
 /// that ends the stream.
@@ -117,28 +128,56 @@ fn keep_alives<'a>(arrivals: &'a [Arrival], keep_alive: &str) -> Vec<&'a Arrival
 
 #[tokio::test]
 async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_silence() {
-    let (app, server) = app(SILENCE, Some(1)).await;
+    let (app, server) = app(SILENCE, Some(INTERVAL.as_secs())).await;
     for endpoint in endpoints() {
-        let (arrivals, eof) =
-            stream_to_end(&app, endpoint.path, endpoint.body.clone(), BUDGET).await;
-        let (silence, flowing) = split_at_first_engine_frame(&arrivals, endpoint.keep_alive);
-        let during = keep_alives(silence, endpoint.keep_alive);
-        assert!(
-            (2..=4).contains(&during.len()),
-            "{}: {} keep-alive frames during a {SILENCE:?} silence at a 1 s interval: {arrivals:#?}",
+        let read = stream_to_end_paused_through(
+            &app,
             endpoint.path,
-            during.len()
+            endpoint.body.clone(),
+            BUDGET,
+            SILENCE,
+        )
+        .await;
+        let arrivals = &read.arrivals;
+        let (silence, flowing) = split_at_first_engine_frame(arrivals, endpoint.keep_alive);
+        let during = keep_alives(silence, endpoint.keep_alive);
+        // One keep-alive per whole interval of the silence: every one due
+        // before the clock resumed is in, read exact on the paused clock,
+        // and the silence holds no more than its length allows.
+        let at_least = read.resumed_at.as_millis() / INTERVAL.as_millis();
+        let at_most = SILENCE.as_millis() / INTERVAL.as_millis();
+        assert!(
+            (at_least..=at_most).contains(&(during.len() as u128)),
+            "{}: {} keep-alive frames during a {SILENCE:?} silence at a {INTERVAL:?} interval (the \
+             clock resumed at {:?}, slack {:?}): {arrivals:#?}",
+            endpoint.path,
+            during.len(),
+            read.resumed_at,
+            read.slack
         );
-        // Each one an interval after the previous frame, whatever it was.
+        // Each one read on the paused clock an interval after the previous
+        // frame, whatever it was, on the timer wheel's millisecond.
         for pair in silence.windows(2) {
-            if pair[1].text() == endpoint.keep_alive {
+            if pair[1].text() == endpoint.keep_alive && pair[1].at < read.resumed_at {
                 let gap = pair[1].at.saturating_sub(pair[0].at);
                 assert!(
-                    gap >= Duration::from_millis(900),
-                    "{}: a keep-alive {gap:?} after the previous frame: {arrivals:#?}",
+                    gap >= INTERVAL && gap <= INTERVAL + WHEEL,
+                    "{}: a keep-alive {gap:?} after the previous frame, not {INTERVAL:?}: {arrivals:#?}",
                     endpoint.path
                 );
             }
+        }
+        // The first one interval after the headers, where the timer was
+        // armed at most `slack` before the clock paused.
+        if read.resumed_at >= INTERVAL {
+            let first = during.first().map_or(Duration::ZERO, |arrival| arrival.at);
+            assert!(
+                first <= INTERVAL + WHEEL && first + read.slack >= INTERVAL,
+                "{}: the first keep-alive at {first:?}, not one interval after the headers (slack \
+                 {:?}): {arrivals:#?}",
+                endpoint.path,
+                read.slack
+            );
         }
         assert!(
             keep_alives(flowing, endpoint.keep_alive).is_empty(),
@@ -147,9 +186,10 @@ async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_sile
         );
         let whole: String = arrivals.iter().map(Arrival::text).collect();
         assert!(
-            eof && whole.contains(endpoint.end),
-            "{}: the stream ends as before and the body closes (eof={eof}): {whole:?}",
-            endpoint.path
+            read.eof && whole.contains(endpoint.end),
+            "{}: the stream ends as before and the body closes (eof={}): {whole:?}",
+            endpoint.path,
+            read.eof
         );
         // Every data line is still whole JSON (or the terminator): no
         // keep-alive landed inside a frame.
@@ -169,18 +209,29 @@ async fn an_interval_of_zero_sends_nothing_through_the_silence() {
     let (app, server) = app(SILENCE, Some(0)).await;
     let endpoints = endpoints();
     let chat = &endpoints[0];
-    let arrivals = stream(&app, chat.path, chat.body.clone(), BUDGET).await;
+    let read =
+        stream_to_end_paused_through(&app, chat.path, chat.body.clone(), BUDGET, SILENCE).await;
+    let arrivals = &read.arrivals;
     assert!(
-        keep_alives(&arrivals, chat.keep_alive).is_empty(),
+        keep_alives(arrivals, chat.keep_alive).is_empty(),
         "a keep-alive with the interval at zero: {arrivals:#?}"
     );
-    // The engine's frames are the first on the stream, after a silence in
-    // which a 1 s interval would have sent three keep-alive frames.
+    // The engine's frames are the first on the stream, at the end of its
+    // silence (started at the request, up to `slack` before the arrival
+    // clock), through which a 1 s interval would have sent three keep-alive
+    // frames.
+    let first = arrivals
+        .first()
+        .map_or(Duration::ZERO, |arrival| arrival.at);
     assert!(
-        arrivals
-            .first()
-            .is_some_and(|arrival| arrival.at >= Duration::from_secs(1)),
-        "nothing before the engine's first frame with the keep-alive off: {arrivals:#?}"
+        first + read.slack + WHEEL >= SILENCE,
+        "the engine's first frame at {first:?}, before the end of its {SILENCE:?} silence (slack \
+         {:?}): {arrivals:#?}",
+        read.slack
+    );
+    assert!(
+        read.eof,
+        "the stream ends as before and the body closes: {arrivals:#?}"
     );
     server.abort();
 }
