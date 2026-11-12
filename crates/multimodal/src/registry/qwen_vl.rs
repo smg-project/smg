@@ -45,12 +45,7 @@ pub(super) struct QwenVLVisionSpec;
 
 impl QwenVLVisionSpec {
     fn pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 
     /// A checkpoint serves video when its config names the video placeholder's
@@ -63,12 +58,7 @@ impl QwenVLVisionSpec {
     }
 
     fn video_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["video_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "video_token_id".to_string(),
-            })
+        metadata.config_token_id("video_token_id")
     }
 }
 

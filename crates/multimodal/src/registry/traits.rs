@@ -197,6 +197,17 @@ impl<'a> ModelMetadata<'a> {
         Self::find_value(self.config, path).and_then(|value| value.as_u64().map(|v| v as u32))
     }
 
+    /// The token id a config field names, or the error naming the field: the
+    /// placeholder and delimiter ids a registry entry reads from its model
+    /// config.
+    pub fn config_token_id(&self, field: &str) -> RegistryResult<TokenId> {
+        self.config_u32(&[field])
+            .map(|id| id as TokenId)
+            .ok_or_else(|| ModelRegistryError::MissingConfigField {
+                field: field.to_string(),
+            })
+    }
+
     pub fn config_model_type(&self) -> Option<&str> {
         Self::find_value(self.config, &["model_type"]).and_then(Value::as_str)
     }
@@ -1031,5 +1042,23 @@ mod tests {
                 Err(ModelRegistryError::UnsupportedModality { spec: "hooked", .. })
             ));
         }
+    }
+
+    #[test]
+    fn config_token_id_reads_the_field_or_names_it_in_the_error() {
+        let config = json!({ "image_token_id": 151655 });
+        let encoding = TestTokenizer::new(&[]);
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &encoding,
+            config: &config,
+        };
+        assert_eq!(metadata.config_token_id("image_token_id").unwrap(), 151655);
+        assert_eq!(
+            metadata.config_token_id("video_token_id").unwrap_err(),
+            ModelRegistryError::MissingConfigField {
+                field: "video_token_id".to_string(),
+            }
+        );
     }
 }
