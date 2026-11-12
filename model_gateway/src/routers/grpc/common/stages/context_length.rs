@@ -415,23 +415,18 @@ mod tests {
         .is_ok());
     }
 
-    /// A default applied at ingress is subject to the selected worker's window.
+    /// An omitted Flash budget leaves a smaller worker window available.
     #[test]
-    fn glm53_flash_chat_default_obeys_the_worker_window() {
+    fn glm53_flash_chat_omitted_budget_preserves_the_worker_window() {
         let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "glm-5.3-flash",
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
         request.normalize();
+        assert_eq!(request.output_token_cap(), None);
         let request = RequestType::Chat(Arc::new(request));
-        assert_rejected(enforce_output_budget(
-            &request,
-            &single(Some(65_535)),
-            MODEL,
-            None,
-        ));
-        assert!(enforce_output_budget(&request, &single(Some(65_536)), MODEL, None).is_ok());
+        assert!(enforce_output_budget(&request, &single(Some(32_768)), MODEL, None).is_ok());
     }
 
     #[test]

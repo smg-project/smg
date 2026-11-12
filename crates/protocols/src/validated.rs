@@ -1682,24 +1682,24 @@ mod tests {
         const ALIAS: &str = "opaque-glm-flash-budget-test";
         ProviderProfile::register_model_aliases([(ALIAS, "zai-org/GLM-5.3-Flash")]);
 
-        for (model, defaults_to) in [
-            ("glm-5.3-flash", Some(65_536)),
-            ("zai-org/GLM-5.3-Flash-FP8", Some(65_536)),
-            ("glm53flash", None),
-            (ALIAS, Some(65_536)),
-            ("glm-5.3", None),
-            ("glm-5.2", None),
-            ("glm-5.3-flashlight", None),
-            ("glm-5.3-flash2", None),
-            ("local-model", None),
+        for (model, flash) in [
+            ("glm-5.3-flash", true),
+            ("zai-org/GLM-5.3-Flash-FP8", true),
+            ("glm53flash", false),
+            (ALIAS, true),
+            ("glm-5.3", false),
+            ("glm-5.2", false),
+            ("glm-5.3-flashlight", false),
+            ("glm-5.3-flash2", false),
+            ("local-model", false),
         ] {
             let mut body = json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "hello"}]
             });
             let request = chat_request(&body.to_string()).await.unwrap();
-            assert_eq!(request.output_token_cap(), defaults_to, "{model}");
-            if defaults_to.is_none() {
+            assert_eq!(request.output_token_cap(), None, "{model}");
+            if !flash {
                 body["max_completion_tokens"] = json!(163_840);
                 let request = chat_request(&body.to_string()).await.unwrap();
                 assert_eq!(request.output_token_cap(), Some(163_840), "{model}");
@@ -1713,8 +1713,12 @@ mod tests {
                     .await
                     .unwrap()
                     .output_token_cap(),
-                Some(65_536)
+                None
             );
+
+            let mut minimum_only = body.clone();
+            minimum_only["min_tokens"] = json!(65_537);
+            assert!(chat_request(&minimum_only.to_string()).await.is_ok());
 
             for fields in [
                 json!({"max_tokens": 1}),

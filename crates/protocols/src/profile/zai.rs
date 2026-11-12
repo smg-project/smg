@@ -14,8 +14,9 @@
 //! the vendor fetches the file itself and no self-hosted engine does, and
 //! validation runs before the backend is known; a pass-through for an
 //! upstream z.ai proxy would need the backend at validation time.
-//! Flash Chat uses the hosted API output budget (64K default, 128K maximum),
-//! also for self-hosted workers. The worker context window is checked separately.
+//! Flash Chat caps explicit output budgets at the hosted API maximum (128K),
+//! also for self-hosted workers. An omitted budget stays unset so the backend
+//! can fit it to the remaining context window. Worker window checks still apply.
 
 use serde_json::Value;
 
@@ -46,7 +47,6 @@ const GLM53_FLASH_MARKERS: [&str; 5] = [
 ];
 
 // Hosted API budgets: https://docs.z.ai/guides/overview/concept-param#max-tokens
-const FLASH_DEFAULT_OUTPUT_TOKENS: u32 = 65_536;
 const FLASH_MAX_OUTPUT_TOKENS: u32 = 131_072;
 
 /// The vendor switch that selects greedy decoding when explicitly false.
@@ -114,7 +114,7 @@ fn glm53_level(effort: &str) -> Option<&'static str> {
     }
 }
 
-/// Apply GLM request defaults and normalize Flash sampling and output budgets before validation.
+/// Apply GLM request defaults and normalize Flash sampling before validation.
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     let flash = is_glm53_flash(&req.model);
     if flash || is_series(&req.model, &DEFAULTS_MARKERS) {
@@ -122,9 +122,6 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
         req.top_p.get_or_insert(DEFAULT_TOP_P);
     }
     if flash {
-        if req.output_token_cap().is_none() {
-            req.max_completion_tokens = Some(FLASH_DEFAULT_OUTPUT_TOKENS);
-        }
         if req.other.get(DO_SAMPLE).and_then(Value::as_bool) == Some(false) {
             req.temperature = Some(0.0);
             req.top_p = Some(1.0);
