@@ -264,9 +264,10 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
 #[test]
 fn a_gateway_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear() {
     let store = MemoryStore::new();
+    // A registered worker: the health writers refuse an id without a row.
+    let id = ready(&store, "http://v:8000");
     let health: &dyn HealthSink = &store;
     let (g1, g2) = (GatewayId(1), GatewayId(2));
-    let id = WorkerId(5);
     let now = Instant::now();
     health.gateway_veto(g1, id, Some(now + Duration::from_secs(60)));
     assert!(health.vetoed(g1, id, now));
@@ -290,6 +291,63 @@ fn a_gateway_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear()
         !health.completed_ok_since(g1, id, now),
         "one gateway's dispatch keeps the worker routable for that gateway alone"
     );
+}
+
+#[test]
+fn a_removed_worker_leaves_the_health_tables_and_takes_no_late_write() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://d:8000");
+    let health: &dyn HealthSink = &store;
+    let (g1, g2) = (GatewayId(1), GatewayId(2));
+    let now = Instant::now();
+    health.gateway_veto(g1, id, Some(now + Duration::from_secs(60)));
+    health.gateway_veto(g2, id, Some(now + Duration::from_secs(1)));
+    health.completed(g1, id, TransportClass::Ok, now);
+    assert_eq!(store.health_entries(), 3);
+    let revision = WorkersStore::get(&store, id).expect("the row").revision;
+    store.remove(id, revision).expect("removed");
+    assert!(
+        !health.vetoed(g1, id, now),
+        "a standing veto on a removed worker is gone with it"
+    );
+    assert!(
+        !health.completed_ok_since(g1, id, now),
+        "and so is its completed dispatch"
+    );
+    assert_eq!(store.health_entries(), 0);
+    // A gateway's in-flight work on the worker ends after the removal: a
+    // late completion and a late veto write nothing under the gone id.
+    health.completed(g2, id, TransportClass::Ok, now + Duration::from_secs(2));
+    health.gateway_veto(g2, id, Some(now + Duration::from_secs(90)));
+    assert!(
+        !health.completed_ok_since(g2, id, now),
+        "a completion after the removal books nothing"
+    );
+    assert!(
+        !health.vetoed(g2, id, now + Duration::from_secs(3)),
+        "a veto after the removal masks nothing"
+    );
+    assert_eq!(store.health_entries(), 0, "and the tables stay empty");
+}
+
+#[test]
+fn a_replaced_incarnation_leaves_the_health_tables_with_its_row() {
+    let store = MemoryStore::new();
+    let old = ready(&store, "http://w:8000");
+    let health: &dyn HealthSink = &store;
+    let g = GatewayId(1);
+    let now = Instant::now();
+    health.gateway_veto(g, old, Some(now + Duration::from_secs(60)));
+    health.completed(g, old, TransportClass::Ok, now);
+    assert_eq!(store.health_entries(), 2);
+    let new = store.upsert(facts("http://w:8000", 2)).id();
+    assert_ne!(old, new, "a new incarnation under the key");
+    assert!(
+        !health.vetoed(g, old, now),
+        "the old incarnation's veto left with its row"
+    );
+    assert!(!health.completed_ok_since(g, old, now));
+    assert_eq!(store.health_entries(), 0, "and the new id starts clean");
 }
 
 /// A poll's row stands in for a silent rank's sample but never for its
