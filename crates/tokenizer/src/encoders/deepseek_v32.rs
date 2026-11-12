@@ -17,8 +17,8 @@ use serde_json::Value;
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, find_last_user_index,
-        push_tools_and_response_format, to_json, tool_schemas, Turn, ASSISTANT, BOS, DSML, EOS,
-        THINKING_END, THINKING_START, USER,
+        push_tools_and_response_format, render_system_message, to_json, tool_schemas, Turn,
+        ASSISTANT, BOS, DSML, EOS, THINKING_END, THINKING_START, USER,
     },
     marks, RendererProfile,
 };
@@ -210,7 +210,7 @@ fn render_message(
     let opens_thinking = equals_last_user(index, last_user_idx) && thinking_mode.is_thinking();
 
     match turn.role {
-        "system" => render_system(&mut prompt, &turn),
+        "system" => render_system_message(&mut prompt, &turn, render_tools),
         "developer" => render_developer(&mut prompt, &turn, opens_thinking)?,
         "user" => render_user(&mut prompt, turn.content, opens_thinking),
         "tool" => {
@@ -242,18 +242,6 @@ fn thinking_token(opens_thinking: bool) -> &'static str {
     } else {
         THINKING_END
     }
-}
-
-/// A system message: its content (`system_msg_template` is "{content}"),
-/// then the tools and the response format it carries.
-fn render_system(prompt: &mut String, turn: &Turn<'_>) {
-    prompt.push_str(turn.content);
-    push_tools_and_response_format(
-        prompt,
-        turn.tools.as_deref(),
-        turn.response_format,
-        render_tools,
-    );
 }
 
 /// A developer message: a user message made of the tools and the response
