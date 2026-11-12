@@ -1763,6 +1763,41 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
     }
 }
 
+/// Without a letter run joined by spaces among the stages, the cut check's
+/// window starts at the nearest space back, however far: a text whose spaces
+/// stand further apart than the check's reach keeps its pool cuts, and the
+/// pool's ids are the serial encode's and the library's.
+#[test]
+fn sparse_spaces_keep_the_pool_cuts_without_a_joined_run() {
+    let mut state = 0x5350_4152_5345_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "cl100k-ignore-merges")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let text = format!("{} ", "x".repeat(2_099)).repeat(48);
+    let units = native.units(&text, true, true);
+    assert!(
+        units.as_slice().len() > 1,
+        "{} unit: the sparse spaces lost the cuts",
+        units.as_slice().len()
+    );
+    let pooled = native
+        .encode_with(Some(tokenizer.get_model()), &text, true, false)
+        .expect("pooled");
+    let serial = native
+        .encode_with(Some(tokenizer.get_model()), &text, false, false)
+        .expect("serial");
+    assert_eq!(pooled, serial, "the pool changed the ids");
+    let reference = tokenizer
+        .encode(text.as_str(), false)
+        .expect("encode")
+        .get_ids()
+        .to_vec();
+    assert_eq!(pooled, reference, "against the reference");
+}
+
 #[test]
 fn a_merged_with_next_split_glues_each_match_to_the_text_after_it() {
     // The merged-line-breaks shape on texts with line breaks between words,

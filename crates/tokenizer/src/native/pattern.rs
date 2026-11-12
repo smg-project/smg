@@ -909,6 +909,16 @@ impl Pattern {
         })
     }
 
+    /// Whether the pattern holds a letter run joined by spaces (an
+    /// [`Op::JoinedRun`] whose join class holds the space): the thread
+    /// pool's cut check then chooses its window's start with care
+    /// (`NativeEncoder::window_start`).
+    pub(super) fn joins_with_space(&self) -> bool {
+        self.program
+            .iter()
+            .any(|op| matches!(*op, Op::JoinedRun { join, .. } if self.classes[join].contains(' ')))
+    }
+
     /// This pattern matched by its program alone, the scanner set aside: the
     /// tests hold the two against each other.
     #[cfg(test)]
