@@ -56,7 +56,7 @@ fn health(c: &mut Criterion) {
             let id = ids[turn % ids.len()];
             turn += 1;
             sink.completed(black_box(gateway), black_box(id), TransportClass::Ok, now);
-        })
+        });
     });
     group.bench_function("gateway_veto", |b| {
         b.iter(|| {
@@ -67,14 +67,14 @@ fn health(c: &mut Criterion) {
                 black_box(id),
                 Some(now + Duration::from_secs(60)),
             );
-        })
+        });
     });
     group.bench_function("vetoed", |b| {
         b.iter(|| {
             let id = ids[turn % ids.len()];
             turn += 1;
             black_box(sink.vetoed(black_box(gateway), black_box(id), now))
-        })
+        });
     });
     group.finish();
 }
@@ -99,9 +99,11 @@ fn remove(c: &mut Criterion) {
             },
             |(store, id, revision)| {
                 black_box(store.remove(black_box(id), revision).expect("removed"));
+                // Returned, so criterion drops the store outside the timed section.
+                store
             },
             BatchSize::SmallInput,
-        )
+        );
     });
     group.finish();
 }
