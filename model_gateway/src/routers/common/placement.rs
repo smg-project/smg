@@ -1542,7 +1542,7 @@ pub(crate) fn pair_decider<'a>(
 }
 
 /// A pair placement decided through the engine, as [`decide_pair`] hands it
-/// to [`commit_pair`] across the admission lock.
+/// to [`commit_pair`] under the same hold of the admission lock.
 #[expect(
     clippy::large_enum_variant,
     reason = "the decided side carries the engine's decision by value across the one hop from the decision to the commit; boxing it would cost one allocation per pair placement"
@@ -1575,12 +1575,14 @@ pub(crate) struct PairDecision {
 /// [`select_pair`] through the policy engine, the decision half: the prelude
 /// settles what membership and availability settle, then one pair decision
 /// over the open prefills with their capacity bits (`has_capacity`: the
-/// admission window as the decision reads it, with no lock held) and their
-/// open partners with their room bits; `excluded` are the ids a commit of
-/// this request just refused, for the one re-decision. A prefill picker that
-/// declines a lifted pool all over the thresholds is steered by the
-/// least-loaded default, as the legacy path steers it. Runs as
-/// `acquire_prefill_decided`'s `decide`, outside the admission lock.
+/// admission window as the lock reads it) and their open partners with
+/// their room bits; `excluded` are the ids a commit of this request just
+/// refused, for the one re-decision. A prefill picker that declines a
+/// lifted pool all over the thresholds is steered by the least-loaded
+/// default, as the legacy path steers it. Runs inside the admission
+/// callback, under the lock, as the legacy selection does: an open pool
+/// with no capacity is the at-capacity verdict before any engine call, so
+/// a newcomer behind the queue builds no view and moves no policy state.
 #[expect(
     clippy::too_many_arguments,
     reason = "the engine seam threads every routing input plus the window"
@@ -1619,6 +1621,17 @@ pub(crate) fn decide_pair(
             pair_runtime,
         } => (live, open, pair_runtime),
     };
+    // The at-capacity verdict is the prelude's, before any engine call: no
+    // open prefill under the window means the request waits for a slot (the
+    // FIFO's own answer), with no view built and no policy state moved, which
+    // keeps capacity hidden behind the queue for the policies whose selection
+    // commits routing state.
+    if !open.iter().any(|&i| has_capacity(&pairs.prefill[i])) {
+        return Err(Box::new(PairFailure {
+            role: WorkerRole::Prefill,
+            verdict: PlacementFailure::PrefillAtCapacity,
+        }));
+    }
     let prefills: Vec<Arc<dyn Worker>> = open
         .iter()
         .map(|&i| Arc::clone(&pairs.prefill[i]))
@@ -1724,9 +1737,10 @@ fn pair_shed(
     Box::new(PairFailure { role, verdict })
 }
 
-/// [`select_pair`] through the policy engine, the commit half, as
-/// `acquire_prefill_decided`'s `commit` under the admission lock:
-/// `has_capacity` is the window as the lock reads it. The first target whose
+/// [`select_pair`] through the policy engine, the commit half, right after
+/// the decision under the same hold of the admission lock: `has_capacity`
+/// is the window re-read, since a regular or an unbounded dispatch moves a
+/// worker's load outside this lock. The first target whose
 /// prefill has capacity and is still open and whose decode partner is still
 /// open is the pair, booked on both sides, the decode at its own estimate;
 /// when every target misses, the missed ids go to
@@ -1819,47 +1833,65 @@ pub(crate) fn commit_pair(
     })
 }
 
-/// The cheap availability answer of a pair placement, for a request that may
-/// not select yet (a newcomer behind the admission queue,
-/// `acquire_prefill_decided`'s `available`): the prelude's verdict from
-/// membership and availability alone, no decision made and no policy state
-/// moved. A pool the steering default may still pair answers available; the
-/// head's own decision judges it.
-pub(crate) fn pair_available(
+/// [`select_pair`] through the policy engine inside the admission callback,
+/// as the routers run it under `--policy-engine engine`: the decision over
+/// the window as the lock reads it (`capacity`, `None` with admission off),
+/// its commit under the same hold, and one re-decision with the ids a
+/// refused commit missed before the at-capacity verdict queues the request.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the engine seam threads every routing input plus the window"
+)]
+pub(crate) fn place_pair_through_engine(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
+    decider: &Decider,
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     homogeneous_runtime: bool,
+    capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
-) -> Result<(), Box<PairFailure>> {
-    let prefill_policy = policies.get_prefill_policy();
-    match pair_prelude(
-        registry,
-        prefill_policy.as_ref(),
-        policies.pd_pairing_mode(),
+) -> Result<Pair, Box<PairFailure>> {
+    let has_capacity =
+        |worker: &Arc<dyn Worker>| capacity.is_none_or(|capacity| capacity.has_capacity(worker));
+    let decide = |excluded: &[WorkerId]| {
+        decide_pair(
+            registry,
+            policies,
+            decider,
+            model_id,
+            pairs,
+            wire,
+            homogeneous_runtime,
+            &has_capacity,
+            inputs,
+            excluded,
+        )
+    };
+    let mut missed = Vec::new();
+    let refused = match commit_pair(
+        policies,
+        decider,
         model_id,
-        pairs,
-        wire,
-        homogeneous_runtime,
-        &inputs,
+        decide(&[])?,
+        &has_capacity,
+        &mut missed,
     ) {
-        PairPrelude::Failed(failure) => Err(failure),
-        PairPrelude::AllVetoed(role) => {
-            let admitted = admitted_role_pool(pairs, wire, &inputs, role);
-            let shedding = registry.overload_shed_enabled();
-            if steerable(shedding, &admitted) {
-                Ok(())
-            } else {
-                Err(Box::new(PairFailure {
-                    role,
-                    verdict: failure_from(&admitted, model_id, shedding),
-                }))
-            }
-        }
-        PairPrelude::Open { .. } => Ok(()),
+        Ok(pair) => return Ok(pair),
+        Err(failure) => failure,
+    };
+    if missed.is_empty() {
+        return Err(refused);
     }
+    commit_pair(
+        policies,
+        decider,
+        model_id,
+        decide(&missed)?,
+        &has_capacity,
+        &mut Vec::new(),
+    )
 }
 
 /// Narrow a decode pick's candidates to the workers whose admission gate
@@ -2047,10 +2079,11 @@ mod tests {
         registry
     }
 
-    /// One pair through the engine seam as the routers run it: the decision
-    /// with `has_capacity` as the window read outside the lock, the commit
-    /// with `capacity` as the lock reads it, the misses of a refused commit
-    /// excluded from the next decision through `missed`.
+    /// One pair through the engine seam, its two halves apart: the decision
+    /// with `has_capacity` as one read of the window, the commit with
+    /// `capacity` as a later read of it (the routers take both under one
+    /// hold of the lock), the misses of a refused commit excluded from the
+    /// next decision through `missed`.
     fn decided_pair(
         registry: &WorkerRegistry,
         policies: &PolicyRegistry,
@@ -2120,6 +2153,48 @@ mod tests {
         assert_eq!(picks["grpc://d:2"], 4, "{picks:?}");
         let decider = policies.decider().expect("hosted");
         assert_eq!(decider.decisions(), 8, "one decision per pair");
+    }
+
+    /// The at-capacity verdict is the prelude's: with no open prefill under
+    /// the window the engine decides nothing (no view built, no policy state
+    /// moved) and the failure is the one the FIFO queues on; the locked
+    /// placement answers the same.
+    #[test]
+    fn a_pool_with_no_capacity_queues_before_the_engine_decides() {
+        use crate::worker::PrefillCandidateError as _;
+
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let none = |_: &Arc<dyn Worker>| false;
+        let failure = decide_pair(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &none,
+            PlacementInputs::default(),
+            &[],
+        )
+        .err()
+        .expect("no prefill has capacity");
+        assert!(
+            failure.is_at_capacity(),
+            "the verdict is the at-capacity one"
+        );
+        assert_eq!(decider.decisions(), 0, "no decision was made");
+        let mut missed = Vec::new();
+        let placed = decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+            .expect("an open pair with capacity is placed");
+        assert_eq!(placed.prefill.url(), "grpc://p:1");
+        assert_eq!(decider.decisions(), 1);
     }
 
     /// Under the switch a decode partner whose window is full is kept out of
@@ -2211,41 +2286,6 @@ mod tests {
             .expect("legacy agrees");
         assert_eq!(legacy.role, WorkerRole::Decode);
         assert!(matches!(legacy.verdict, PlacementFailure::Unavailable));
-    }
-
-    /// The availability answer of a newcomer behind the queue is the
-    /// prelude's verdict: available while a pair is open, the decode role's
-    /// unavailability when no partner is, and never a decision.
-    #[test]
-    fn pair_available_answers_the_prelude_without_a_decision() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let policies = engine_cohort_policies();
-        let pairs = pairs_of(&registry, &policies);
-        let available = || {
-            pair_available(
-                &registry,
-                &policies,
-                MODEL,
-                &pairs,
-                None,
-                true,
-                PlacementInputs::default(),
-            )
-        };
-        assert!(available().is_ok());
-        let decode = registry.get_by_url("grpc://d:1").expect("registered");
-        decode.set_status(WorkerStatus::NotReady);
-        let down = available().expect_err("no partner is open");
-        assert_eq!(down.role, WorkerRole::Decode);
-        assert!(matches!(down.verdict, PlacementFailure::Unavailable));
-        assert_eq!(
-            policies.decider().expect("hosted").decisions(),
-            0,
-            "the availability answer decides nothing"
-        );
     }
 
     /// A request the sticky routing-key override keys stays on the legacy

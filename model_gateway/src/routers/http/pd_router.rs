@@ -33,7 +33,6 @@ use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
-use smg_policy_controller::WorkerId;
 use tracing::{debug, error, warn};
 
 use super::{
@@ -84,10 +83,9 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        acquire_prefill, acquire_prefill_decided, endpoint::Endpoint, PdPairIndex, PdWire,
-        PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard,
-        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
-        UNKNOWN_MODEL_ID,
+        acquire_prefill, endpoint::Endpoint, PdPairIndex, PdWire, PrefillAcquireError,
+        PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -2169,33 +2167,29 @@ impl PDRouter {
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
-    /// the selection runs at the head of the admission queue: under the lock
-    /// on the legacy path, outside it through the policy engine
-    /// ([`Self::acquire_pd_pair_decided`]).
+    /// the selection runs at the head of the admission queue, under the lock
+    /// on both paths: the legacy policies, or the engine's decision and
+    /// commit ([`Self::place_pd_pair_through_engine`]).
     async fn select_pd_pair_with_admission(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
-        let acquired = match placement::pair_decider(&self.policy_registry, &inputs) {
-            // Boxed so the legacy branch's future keeps its size: the decided
-            // state is paid only under the switch.
-            Some(decider) => {
-                Box::pin(self.acquire_pd_pair_decided(decider, model_id, inputs, sticky_key)).await
-            }
-            None => {
-                acquire_prefill(
-                    self.prefill_admission.as_deref(),
-                    sticky_key,
-                    |(prefill, _): &PdPair| prefill,
-                    |capacity| self.select_pd_pair(model_id, inputs, capacity),
-                )
-                .await
-            }
-        };
-        let ((prefill, decode), prefill_guard) =
-            acquired.map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
+        let decider = placement::pair_decider(&self.policy_registry, &inputs);
+        let ((prefill, decode), prefill_guard) = acquire_prefill(
+            self.prefill_admission.as_deref(),
+            sticky_key,
+            |(prefill, _): &PdPair| prefill,
+            |capacity| match decider {
+                Some(decider) => {
+                    self.place_pd_pair_through_engine(decider, model_id, inputs, capacity)
+                }
+                None => self.select_pd_pair(model_id, inputs, capacity),
+            },
+        )
+        .await
+        .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
         let guards = PdLoadGuards {
             prefill: prefill_guard,
             decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
@@ -2204,65 +2198,31 @@ impl PDRouter {
     }
 
     /// [`Self::select_pd_pair`] through the policy engine under
-    /// `--policy-engine engine`: the pair decided with no lock held and
-    /// committed under the admission lock, by the request the queue lets
-    /// select (the head, or a newcomer with nobody waiting); a commit every
-    /// target of which missed re-decides once with the misses excluded. The
-    /// placement's prelude is the cheap availability answer of a newcomer
-    /// behind the queue.
-    async fn acquire_pd_pair_decided(
+    /// `--policy-engine engine`, inside the admission callback as the legacy
+    /// selection runs: the pair decided over the window as the lock reads it
+    /// and committed under the same hold, by the request the queue lets
+    /// select; a commit every target of which missed re-decides once with
+    /// the misses excluded, then the request waits for a slot.
+    fn place_pd_pair_through_engine(
         &self,
         decider: &Decider,
         model_id: &str,
         inputs: PlacementInputs<'_>,
-        sticky_key: Option<&str>,
-    ) -> Result<(PdPair, PrefillLoadGuard), PrefillAcquireError<Box<PairFailure>>> {
-        let missed: parking_lot::Mutex<Vec<WorkerId>> = parking_lot::Mutex::new(Vec::new());
-        acquire_prefill_decided(
-            self.prefill_admission.as_deref(),
-            sticky_key,
-            |(prefill, _): &PdPair| prefill,
-            || {
-                let pairs = self.pd_pairs(model_id);
-                placement::pair_available(
-                    &self.worker_registry,
-                    &self.policy_registry,
-                    model_id,
-                    &pairs,
-                    None,
-                    false,
-                    inputs,
-                )
-            },
-            |window| {
-                let pairs = self.pd_pairs(model_id);
-                let excluded = std::mem::take(&mut *missed.lock());
-                placement::decide_pair(
-                    &self.worker_registry,
-                    &self.policy_registry,
-                    decider,
-                    model_id,
-                    &pairs,
-                    None,
-                    false,
-                    &|worker| window.has_capacity(worker),
-                    inputs,
-                    &excluded,
-                )
-            },
-            |capacity, proposal| {
-                placement::commit_pair(
-                    &self.policy_registry,
-                    decider,
-                    model_id,
-                    proposal,
-                    &|worker| capacity.is_none_or(|capacity| capacity.has_capacity(worker)),
-                    &mut missed.lock(),
-                )
-                .map(|pair| (pair.prefill, pair.decode))
-            },
+        capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<PdPair, Box<PairFailure>> {
+        let pairs = self.pd_pairs(model_id);
+        placement::place_pair_through_engine(
+            &self.worker_registry,
+            &self.policy_registry,
+            decider,
+            model_id,
+            &pairs,
+            None,
+            false,
+            capacity,
+            inputs,
         )
-        .await
+        .map(|pair| (pair.prefill, pair.decode))
     }
 
     /// The pair index `model_id` routes within. Shared HTTP-transport
@@ -6257,8 +6217,8 @@ mod tests {
         router
     }
 
-    /// Under `--policy-engine engine` the pair is decided through the engine
-    /// outside the admission lock and committed under it: the admitted
+    /// Under `--policy-engine engine` the pair is decided and committed
+    /// through the engine under the admission lock: the admitted
     /// request holds its prefill seat, nobody is queued, and the next
     /// request is decided and admitted once the seat is released.
     #[tokio::test]

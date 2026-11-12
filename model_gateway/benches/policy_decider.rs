@@ -1,14 +1,12 @@
 //! The policy engine's seam under the gateway's prefill admission: the
 //! decisions per second and their latency under 64 concurrent admissions
 //! through the real prefill-admission FIFO (head-only selection, a per-worker
-//! capacity window), for three shapes:
+//! capacity window), for two shapes:
 //!
 //! - `legacy_under_lock`: today's path, the policy over worker handles inside
 //!   the admission callback (under the lock);
 //! - `engine_under_lock`: the engine's view, decision and commit inside the
-//!   same callback;
-//! - `engine_decided`: the decision outside the lock, the commit under it
-//!   (`PrefillAdmission::admit_decided`).
+//!   same callback.
 //!
 //! Sections (`PD_SECTIONS`, default all five): `fifo` (a window that never
 //! binds: the lock hold alone), `window` (a binding window: queueing and
@@ -16,7 +14,7 @@
 //! room pre-filter and the atomic claim against the engine's room bit and the
 //! claim as the commit), `pair` (the pair plan under the FIFO: the prefill
 //! selection and its partner's room under the lock against the engine's pair
-//! decision under it and outside it, prefill `i` partnered with the decodes
+//! decision under it, prefill `i` partnered with the decodes
 //! `j` where `j % prefills == i`) and `pair_all` (the same with every prefill
 //! partnered with every decode through one shared list, the homogeneous
 //! fleet's shape). Fleets from `PD_FLEETS` (default 8,64,512; the pair
@@ -49,10 +47,10 @@ use smg::{
         WorkerRole,
     },
     worker::{
-        acquire_prefill, acquire_prefill_decided,
+        acquire_prefill,
         load_state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, CapacityWindow, PrefillAdmission, PrefillCandidateError,
-        PrefillSelectionContext, Worker, WorkerType,
+        BasicWorkerBuilder, PrefillAdmission, PrefillCandidateError, PrefillSelectionContext,
+        Worker, WorkerType,
     },
 };
 use smg_policy_controller::{Decision, Lease, Phase, Side, Target, WorkerId};
@@ -367,7 +365,7 @@ fn section_prefill(
         for name in names {
             let p = Arc::new(policies(name, &[&prefills]));
             let queue = tasks.max(1);
-            for shape in ["legacy_under_lock", "engine_under_lock", "engine_decided"] {
+            for shape in ["legacy_under_lock", "engine_under_lock"] {
                 let admission = Arc::new(PrefillAdmission::new(
                     window,
                     queue,
@@ -400,7 +398,7 @@ fn section_prefill(
                             }
                         }
                     }),
-                    "engine_under_lock" => run_concurrent(tasks, per_task, move |_| {
+                    _ => run_concurrent(tasks, per_task, move |_| {
                         let admission = Arc::clone(&admission);
                         let prefills = prefills.clone();
                         let p = Arc::clone(&p);
@@ -422,44 +420,6 @@ fn section_prefill(
                                         &has,
                                         &missed.lock().unwrap().clone(),
                                     )?;
-                                    engine_prefill_commit(
-                                        &p.decider, &prefills, proposal, capacity, &c, &missed,
-                                    )
-                                },
-                            )
-                            .await;
-                            match result {
-                                Ok((_, guard)) => drop(guard),
-                                Err(_) => {
-                                    c.rejects.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }),
-                    _ => run_concurrent(tasks, per_task, move |_| {
-                        let admission = Arc::clone(&admission);
-                        let prefills = prefills.clone();
-                        let p = Arc::clone(&p);
-                        let c = Arc::clone(&c);
-                        async move {
-                            let missed: std::sync::Mutex<Vec<WorkerId>> =
-                                std::sync::Mutex::new(Vec::new());
-                            let result = acquire_prefill_decided(
-                                Some(&admission),
-                                None,
-                                |w: &Arc<dyn Worker>| w,
-                                // the pool is the model's healthy prefills
-                                || Ok(()),
-                                |window: &CapacityWindow| {
-                                    let has = |w: &Arc<dyn Worker>| window.has_capacity(w);
-                                    engine_prefill_decision(
-                                        &p.decider,
-                                        &prefills,
-                                        &has,
-                                        &missed.lock().unwrap().clone(),
-                                    )
-                                },
-                                |capacity, proposal| {
                                     engine_prefill_commit(
                                         &p.decider, &prefills, proposal, capacity, &c, &missed,
                                     )
@@ -757,7 +717,7 @@ fn section_pair(
         let partners_of = topology.partners(prefill_count, &decodes);
         for name in names {
             let p = Arc::new(policies(name, &[&prefills, &decodes]));
-            for shape in ["legacy_under_lock", "engine_under_lock", "engine_decided"] {
+            for shape in ["legacy_under_lock", "engine_under_lock"] {
                 let admission = Arc::new(PrefillAdmission::new(
                     window,
                     tasks.max(1),
@@ -799,7 +759,7 @@ fn section_pair(
                             }
                         }
                     }),
-                    "engine_under_lock" => run_concurrent(tasks, per_task, move |_| {
+                    _ => run_concurrent(tasks, per_task, move |_| {
                         let admission = Arc::clone(&admission);
                         let prefills = prefills.clone();
                         let partners_of = Arc::clone(&partners_of);
@@ -823,46 +783,6 @@ fn section_pair(
                                         &has,
                                         &missed.lock().unwrap().clone(),
                                     )?;
-                                    engine_pair_commit(
-                                        &p.decider, &prefills, proposal, capacity, &c, &missed,
-                                    )
-                                },
-                            )
-                            .await;
-                            match result {
-                                Ok((_, guard)) => drop(guard),
-                                Err(_) => {
-                                    c.rejects.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }),
-                    _ => run_concurrent(tasks, per_task, move |_| {
-                        let admission = Arc::clone(&admission);
-                        let prefills = prefills.clone();
-                        let partners_of = Arc::clone(&partners_of);
-                        let p = Arc::clone(&p);
-                        let c = Arc::clone(&c);
-                        async move {
-                            let missed: std::sync::Mutex<Vec<WorkerId>> =
-                                std::sync::Mutex::new(Vec::new());
-                            let result = acquire_prefill_decided(
-                                Some(&admission),
-                                None,
-                                |pair: &PairArms| &pair.0,
-                                // the pools are the model's healthy prefills and their partners
-                                || Ok(()),
-                                |window: &CapacityWindow| {
-                                    let has = |w: &Arc<dyn Worker>| window.has_capacity(w);
-                                    engine_pair_decision(
-                                        &p.decider,
-                                        &prefills,
-                                        &partners_of,
-                                        &has,
-                                        &missed.lock().unwrap().clone(),
-                                    )
-                                },
-                                |capacity, proposal| {
                                     engine_pair_commit(
                                         &p.decider, &prefills, proposal, capacity, &c, &missed,
                                     )
