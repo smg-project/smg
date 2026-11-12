@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Extension, Path, Query, RawQuery, Request, State},
+    extract::{Extension, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, Route},
@@ -37,7 +37,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-    validated::ValidatedJson,
+    validated::{ValidatedJson, ValidatedPath, ValidatedQuery},
     worker::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerListFormat, WorkerSpec,
         WorkerUpdateRequest,
@@ -97,6 +97,7 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         admin_json::AdminJson,
+        admin_params::{AdminPath, AdminQuery},
         endpoint::Endpoint,
         manager::{WorkerManager, WorkerManagerConfig},
         ConnectionMode,
@@ -208,7 +209,7 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
 
 async fn v1_model(
     State(state): State<Arc<AppState>>,
-    Path(model_id): Path<String>,
+    ValidatedPath(model_id): ValidatedPath<String>,
     req: Request,
 ) -> Response {
     let request_id = middleware::request_id_of(&req);
@@ -577,7 +578,7 @@ async fn v1_audio_transcriptions(
 async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::get_response(
@@ -591,7 +592,7 @@ async fn v1_responses_get(
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
     headers: HeaderMap,
 ) -> Response {
     state
@@ -603,7 +604,7 @@ async fn v1_responses_cancel(
 async fn v1_responses_delete(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::delete_response(
@@ -617,7 +618,7 @@ async fn v1_responses_delete(
 async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::list_response_input_items(
@@ -641,7 +642,7 @@ async fn v1_conversations_create(
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::get_conversation(
@@ -655,7 +656,7 @@ async fn v1_conversations_get(
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
     Json(body): Json<Value>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
@@ -671,7 +672,7 @@ async fn v1_conversations_update(
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation(
@@ -692,12 +693,12 @@ struct ListItemsQuery {
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
-    Query(ListItemsQuery {
+    ValidatedPath(conversation_id): ValidatedPath<String>,
+    ValidatedQuery(ListItemsQuery {
         limit,
         order,
         after,
-    }): Query<ListItemsQuery>,
+    }): ValidatedQuery<ListItemsQuery>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::list_conversation_items(
@@ -715,7 +716,7 @@ async fn v1_conversations_list_items(
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
     Json(body): Json<Value>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
@@ -732,7 +733,7 @@ async fn v1_conversations_create_items(
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
+    ValidatedPath((conversation_id, item_id)): ValidatedPath<(String, String)>,
     RawQuery(query): RawQuery,
 ) -> Response {
     // `include` arrives as repeated `include[]=` / `include=` pairs; each value
@@ -756,7 +757,7 @@ async fn v1_conversations_get_item(
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
+    ValidatedPath((conversation_id, item_id)): ValidatedPath<(String, String)>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation_item(
@@ -771,7 +772,7 @@ async fn v1_conversations_delete_item(
 
 async fn v1_realtime_webrtc(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<RealtimeQueryParams>,
+    ValidatedQuery(params): ValidatedQuery<RealtimeQueryParams>,
     req: Request,
 ) -> Response {
     // Model may come from query param (application/sdp) or session body
@@ -782,7 +783,7 @@ async fn v1_realtime_webrtc(
 
 async fn v1_realtime_ws(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<RealtimeQueryParams>,
+    ValidatedQuery(params): ValidatedQuery<RealtimeQueryParams>,
     req: Request,
 ) -> Response {
     let model = match params.model {
@@ -872,7 +873,7 @@ async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
 
 async fn get_loads(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListWorkersQuery>,
+    AdminQuery(query): AdminQuery<ListWorkersQuery>,
 ) -> Response {
     let snapshot = state
         .context
@@ -980,7 +981,7 @@ pub const GATED_ROUTES: &[(&str, &str)] = &[
 
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListWorkersQuery>,
+    AdminQuery(query): AdminQuery<ListWorkersQuery>,
 ) -> Response {
     let mut result = state
         .context
@@ -1000,7 +1001,7 @@ async fn list_workers_rest(
 
 async fn get_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
         Ok(mut result) => {
@@ -1016,7 +1017,7 @@ async fn get_worker(
 
 async fn delete_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
 ) -> Response {
     match state
         .context
@@ -1031,7 +1032,7 @@ async fn delete_worker(
 
 async fn update_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
     AdminJson(update): AdminJson<WorkerUpdateRequest>,
 ) -> Response {
     match state
@@ -1047,7 +1048,7 @@ async fn update_worker(
 
 async fn replace_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
     AdminJson(config): AdminJson<WorkerSpec>,
 ) -> Response {
     match state
@@ -1092,24 +1093,28 @@ async fn v1_tokenizers_list(State(state): State<Arc<AppState>>) -> Response {
 
 async fn v1_tokenizers_get(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::get_tokenizer_info(&state.context, &tokenizer_id).await
 }
 
 async fn v1_tokenizers_status(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::get_tokenizer_status(&state.context, &tokenizer_id).await
 }
 
 async fn v1_tokenizers_remove(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
+
+/// The shutdown grace in seconds a start takes when none is configured: the
+/// CLI flag's default and [`ServerConfig::minimal`]'s.
+pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 180;
 
 pub struct ServerConfig {
     /// The router configuration, which carries the listener settings too:
@@ -1158,7 +1163,7 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// A server with the listener `router_config` names and nothing else: no
     /// log file, no discovery, no mesh, no metrics endpoint, no control-plane
-    /// authentication, no secret source, a five-second shutdown grace. A
+    /// authentication, no secret source, the CLI's default shutdown grace. A
     /// library caller or a test starts from it and sets what it needs by a
     /// struct update, so a field added here with its default breaks no
     /// hand-built literal.
@@ -1171,7 +1176,7 @@ impl ServerConfig {
             service_discovery_config: None,
             mesh_discovery_config: None,
             prometheus_config: None,
-            shutdown_grace_period_secs: 5,
+            shutdown_grace_period_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
             shutdown_settle_secs: None,
             control_plane_auth: None,
             mesh_server_config: None,
@@ -4218,5 +4223,17 @@ mod tests {
             error.to_string().contains("must have a non-empty key"),
             "startup refused for another reason: {error}"
         );
+    }
+
+    /// `minimal` leaves a library caller on the CLI's shutdown grace, not a
+    /// shorter one of its own: in-flight streams get the product's drain.
+    #[test]
+    fn minimal_takes_the_default_shutdown_grace() {
+        let config = ServerConfig::minimal(RouterConfig::default());
+        assert_eq!(
+            config.shutdown_grace_period_secs,
+            DEFAULT_SHUTDOWN_GRACE_SECS
+        );
+        assert_eq!(config.shutdown_grace_period_secs, 180);
     }
 }
