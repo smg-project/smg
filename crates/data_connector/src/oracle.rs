@@ -22,6 +22,7 @@ use crate::{
     },
     config::OracleConfig,
     context::current_extra_columns,
+    factory::{contact_blocking, StoreContactError},
     oracle_migrations::ORACLE_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
     versioning::{
@@ -47,15 +48,11 @@ pub(crate) struct OracleStore {
 }
 
 impl OracleStore {
-    /// Create a connection pool, with the schema brought to this build's
-    /// shape first.
-    ///
-    /// Accepts a list of schema initializers that run on a single connection
-    /// before the pool is created, ensuring all tables exist. The database's
-    /// recorded schema version is checked against this build's migrations
-    /// before any of them runs, so a database a newer build migrated forward
-    /// is refused untouched (see [`bootstrap_oracle_schema`]).
-    pub fn new(config: &OracleConfig, init_schemas: &[SchemaInitFn]) -> Result<Self, String> {
+    /// The pool, built without a connection: the schema configuration
+    /// validated and the client configured, no round trip. The start-up
+    /// connection is [`Self::contact`]'s, the schema's bootstrap on it
+    /// [`Self::bootstrap`]'s, in that order in the factory.
+    pub fn new(config: &OracleConfig) -> Result<Self, String> {
         // Extract and validate schema config.
         // Oracle folds unquoted identifiers to uppercase, so existing tables
         // and columns are CONVERSATIONS, CONV_ID, etc.  Uppercase all
@@ -68,42 +65,17 @@ impl OracleStore {
         // Configure Oracle client (wallet env vars, etc.)
         configure_oracle_env(config)?;
 
-        // Initialize schemas using a single connection
-        let conn = connect_oracle(
-            config.external_auth,
-            &config.username,
-            &config.password,
-            &config.connect_descriptor,
-        )
-        .map_err(map_oracle_error)?;
-
-        // The recorded schema version against this build's migrations before
-        // any history table is touched; then the tables, the migrations and
-        // the indexes on the columns they added.
-        bootstrap_oracle_schema(
-            &OracleSchemaSetup {
-                conn: &conn,
-                schema: schema.as_ref(),
-                init_schemas,
-            },
-            &ORACLE_HISTORY_MIGRATIONS,
-            schema.version,
-        )?;
-
-        drop(conn);
-
         // Create connection pool
-        let config_arc = Arc::new(config.clone());
         let manager = OracleConnectionManager {
-            params: Arc::new(OracleConnectParams::from_config(&config_arc)),
+            params: Arc::new(OracleConnectParams::from_config(config)),
         };
 
         let mut builder = Pool::builder(manager)
             .max_size(config.pool_max)
             .runtime(deadpool::Runtime::Tokio1);
 
-        if config.pool_timeout_secs > 0 {
-            builder = builder.wait_timeout(Some(Duration::from_secs(config.pool_timeout_secs)));
+        if let Some(wait) = config.pool_timeout() {
+            builder = builder.wait_timeout(Some(wait));
         }
 
         let pool = builder
@@ -111,6 +83,52 @@ impl OracleStore {
             .map_err(|e| format!("Failed to build Oracle pool: {e}"))?;
 
         Ok(Self { pool, schema })
+    }
+
+    /// The start-up contact: one connection, made on a blocking thread (the
+    /// driver connects synchronously) and awaited under `bound`, the pool's
+    /// wait, so a store that accepts the connection and never answers is a
+    /// verdict at the bound instead of a start that never ends; a refused or
+    /// failed connection is a verdict at once. The connection is handed to
+    /// [`Self::bootstrap`]. The bound ends the wait, not the driver's thread,
+    /// which returns when the socket does.
+    pub(crate) async fn contact(
+        &self,
+        bound: Option<Duration>,
+    ) -> Result<Connection, StoreContactError> {
+        let params = self.pool.manager().params.clone();
+        contact_blocking(bound, move || {
+            connect_oracle(
+                params.external_auth,
+                &params.username,
+                &params.password,
+                &params.connect_descriptor,
+            )
+            .map_err(map_oracle_error)
+        })
+        .await
+    }
+
+    /// Brings the database to the schema this build expects, on the
+    /// connection the contact made: the recorded schema version against this
+    /// build's migrations before any history table is touched, then the
+    /// tables, the migrations and the indexes on the columns they added; a
+    /// database a newer build migrated forward is refused untouched (see
+    /// [`bootstrap_oracle_schema`]).
+    pub(crate) fn bootstrap(
+        &self,
+        conn: &Connection,
+        init_schemas: &[SchemaInitFn],
+    ) -> Result<(), String> {
+        bootstrap_oracle_schema(
+            &OracleSchemaSetup {
+                conn,
+                schema: self.schema.as_ref(),
+                init_schemas,
+            },
+            &ORACLE_HISTORY_MIGRATIONS,
+            self.schema.version,
+        )
     }
 
     /// Execute function with a connection from the pool
@@ -136,8 +154,8 @@ impl OracleStore {
     }
 }
 
-/// The start-up steps of [`OracleStore::new`] on its connection, in the order
-/// [`bootstrap_oracle_schema`] runs them.
+/// The start-up steps of [`OracleStore::bootstrap`] on the contact's
+/// connection, in the order [`bootstrap_oracle_schema`] runs them.
 struct OracleSchemaSetup<'a> {
     conn: &'a Connection,
     schema: &'a SchemaConfig,

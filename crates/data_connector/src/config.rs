@@ -92,6 +92,12 @@ pub struct OracleConfig {
 }
 
 impl OracleConfig {
+    /// The pool's wait for a connection, and the bound on the start-up
+    /// connection; `None` when `pool_timeout_secs` is 0 (no wait bound).
+    pub fn pool_timeout(&self) -> Option<Duration> {
+        (self.pool_timeout_secs > 0).then(|| Duration::from_secs(self.pool_timeout_secs))
+    }
+
     pub fn default_pool_min() -> usize {
         default_pool_min()
     }
