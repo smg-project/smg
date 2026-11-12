@@ -653,6 +653,28 @@ mod tests {
         );
     }
 
+    /// MiniMax-M3.1-Flash is a checkpoint of the MiniMax-M3 group: the same
+    /// tokenizer and special tokens, the same turn and tool wire (the think
+    /// tags, the separator before every tool tag, the XML call tree), so the
+    /// `minimax_m3` table reads it by its repository name as it reads the
+    /// primary's. Its template differs where no table looks: the system
+    /// block writes an effort tag and no longer branches on a thinking mode.
+    #[test]
+    fn the_minimax_m3_1_flash_checkpoint_reads_with_the_m3_table() {
+        let primary = for_model("MiniMaxAI/MiniMax-M3").expect("MiniMax-M3");
+        for model in [
+            "MiniMax-M3.1-Flash",
+            "MiniMaxAI/MiniMax-M3.1-Flash",
+            "minimaxai/minimax-m3.1-flash",
+        ] {
+            let flash = for_model(model).expect(model);
+            assert_eq!(flash.name(), "minimax_m3", "{model}");
+            assert_eq!(flash.name(), primary.name(), "{model}");
+            assert_eq!(flash.turn_opener(), primary.turn_opener(), "{model}");
+        }
+        assert!(for_model("MiniMax-M3.1").is_none());
+    }
+
     #[test]
     fn every_table_has_a_name_of_its_own_that_spells_it_back() {
         let mut seen: Vec<&str> = Vec::new();
