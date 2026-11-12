@@ -268,18 +268,23 @@ struct DispatchLane {
 const DISPATCH_LANES: usize = 8;
 
 /// Dispatches kept per rank row between reports, over its lanes: a dispatch
-/// past the bound retires a batch from the lane holding the row's oldest,
-/// so the row holds within a batch below the bound and a lane count above
-/// it, and the newest credits stay.
+/// past the bound retires the row's oldest batch, by instant across the
+/// lanes, so the row holds within a batch below the bound and a lane count
+/// above it, and the newest credits stay.
 const SINCE_REPORT_KEPT: u64 = 8_192;
 
-/// Dispatches an overflow retires, across the lanes in the order of their
-/// fronts: the locks an overflow takes beyond its own lane, and the eight
-/// front reads that order them, cost once per batch rather than once per
-/// dispatch. Eight deciders in a never-released regime paid 1.9x per
-/// decision retiring one at a time, and 2.1x retiring a batch from the
-/// oldest lane alone, whose few entries made the batch a handful.
-const RETIRE_BATCH: usize = 64;
+/// Dispatches an overflow retires, by instant across the lanes under every
+/// lane's lock: the eight locks and the merge cost once per batch rather
+/// than once per dispatch. Eight deciders in a never-released regime paid
+/// 1.9x per decision retiring one at a time, and 2.1x retiring a batch
+/// from the oldest lane alone, whose few entries made the batch a handful.
+/// Where the lanes interleave by instant the order itself has a price: the
+/// bench's `least_load_rising` row reads 1.2x the drain of one
+/// lane at this batch and 1.9x at a batch of 64 (a merge taking
+/// one lane's lock at a time read 2.8x), paid in the overflow regime
+/// alone, a rank row holding more than the bound unreleased between two
+/// load reports.
+const RETIRE_BATCH: usize = 256;
 
 /// The low bits of [`SinceReport::held`] that count requests: room for the
 /// kept dispatches, with the token-work above them.
@@ -343,10 +348,9 @@ impl SinceReport {
     }
 
     fn record(&self, at_micros: u64, tokens: u32) {
-        // Past the bound the lane holding the row's oldest gives a batch up
-        // before this dispatch lands: a lane filling after another would
-        // otherwise keep one recent credit while the other lane's older ones
-        // outlive a partial release.
+        // Past the bound the row's oldest batch retires before this dispatch
+        // lands, by instant across the lanes: the newest credits stay,
+        // whichever lane holds them, past a partial release.
         if self.held.load(Ordering::Relaxed) & REQUEST_MASK >= SINCE_REPORT_KEPT {
             self.retire_oldest_batch();
         }
@@ -369,35 +373,39 @@ impl SinceReport {
         }
     }
 
-    /// Retires [`RETIRE_BATCH`] of the row's oldest dispatches: the lanes
-    /// give their fronts up in the order of their published fronts, each
-    /// under its own lock in turn, so a dispatch never holds two lanes (the
-    /// release path holds them all, in lane order). The row's oldest instant
-    /// stays where it was: a value too low costs a release walk, never a
-    /// missed one.
+    /// Every lane's dispatches under their locks, taken in lane order: the
+    /// one order the release and the retirement share, so neither waits on
+    /// the other for a second lane.
+    fn lock_lanes(&self) -> [MutexGuard<'_, Dispatches>; DISPATCH_LANES] {
+        std::array::from_fn(|i| self.lanes[i].dispatches.lock())
+    }
+
+    /// Retires [`RETIRE_BATCH`] of the row's oldest dispatches by instant
+    /// across the lanes, under every lane's lock as the release path holds
+    /// them: one lock per lane and one subtraction from the held word per
+    /// batch. The row's oldest instant stays where it was: a value too low
+    /// costs a release walk, never a missed one.
     fn retire_oldest_batch(&self) {
-        let mut fronts: [(u64, usize); DISPATCH_LANES] = [(u64::MAX, 0); DISPATCH_LANES];
-        for (slot, (i, lane)) in fronts.iter_mut().zip(self.lanes.iter().enumerate()) {
-            *slot = (lane.oldest_micros.load(Ordering::Acquire), i);
-        }
-        fronts.sort_unstable();
-        let mut left = RETIRE_BATCH;
-        for &(front, i) in &fronts {
-            if left == 0 || front == u64::MAX {
+        let mut held_lanes = self.lock_lanes();
+        let mut retired = 0;
+        for _ in 0..RETIRE_BATCH {
+            // The lane whose front is the oldest; none when every lane is
+            // empty.
+            let oldest = held_lanes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, dispatches)| dispatches.front().map(|&(at, _)| (at, i)))
+                .min();
+            let Some((_, i)) = oldest else {
                 break;
-            }
-            let lane = &self.lanes[i];
-            let mut dispatches = lane.dispatches.lock();
-            let mut retired = 0;
-            while left > 0 {
-                let Some((_, tokens)) = dispatches.pop_front() else {
-                    break;
-                };
+            };
+            if let Some((_, tokens)) = held_lanes[i].pop_front() {
                 retired += Self::weight(tokens);
-                left -= 1;
             }
-            self.held.fetch_sub(retired, Ordering::Relaxed);
-            lane.publish_oldest(&dispatches);
+        }
+        self.held.fetch_sub(retired, Ordering::Relaxed);
+        for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
+            lane.publish_oldest(dispatches);
         }
     }
 
@@ -416,18 +424,15 @@ impl SinceReport {
     /// recomputes the row's oldest, under every lane's lock in lane order,
     /// so no dispatch lands between the lanes' reads and the store.
     fn release_through(&self, sampled_at_micros: u64) {
-        let mut held_lanes: [Option<MutexGuard<'_, Dispatches>>; DISPATCH_LANES] =
-            [const { None }; DISPATCH_LANES];
-        for (slot, lane) in held_lanes.iter_mut().zip(&self.lanes) {
-            let mut dispatches = lane.dispatches.lock();
+        let mut held_lanes = self.lock_lanes();
+        for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
             while dispatches
                 .front()
                 .is_some_and(|&(at, _)| at <= sampled_at_micros)
             {
-                self.pop_oldest(&mut dispatches);
+                self.pop_oldest(dispatches);
             }
-            lane.publish_oldest(&dispatches);
-            *slot = Some(dispatches);
+            lane.publish_oldest(dispatches);
         }
         let oldest = self
             .lanes
@@ -2141,6 +2146,53 @@ mod tests {
             ll.held_word_at(pool[0].id, 0),
             (kept as u64 * 7, kept as u64)
         );
+    }
+
+    #[test]
+    fn an_overflow_retires_the_rows_oldest_by_instant_across_interleaved_lanes() {
+        // One lane holds one old dispatch and 63 recent ones, a second the
+        // rest of the bound between them; a third lane's dispatch overflows
+        // the row. The batch is the row's 64 oldest by instant, the old one
+        // and 63 of the second lane's, so a sample past the second lane
+        // leaves the 63 recent credits and the overflowing dispatch. The
+        // first lane drained whole would have left the overflowing dispatch
+        // alone.
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool: Vec<Candidate> = vec![candidate(0, 0)];
+        pool[0].load = Some(report(0, 0));
+        pool[0].load_sampled_at_micros = 1_000;
+        let kept: Vec<u32> = vec![0];
+        let book = |lane: usize, from: u64, count: u64| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    take_lane(lane);
+                    for n in 0..count {
+                        let lease = Lease {
+                            issued_micros: from + n,
+                            tokens: 7,
+                            ..Lease::default()
+                        };
+                        ll.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+                    }
+                });
+            });
+        };
+        let recent = RETIRE_BATCH as u64 - 1;
+        book(0, 2_000, 1);
+        book(1, 3_000, SINCE_REPORT_KEPT - RETIRE_BATCH as u64);
+        book(0, 20_000, recent);
+        book(2, 30_000, 1);
+        let mut scores = vec![0.0f32; 1];
+        let mut sampled = pool.clone();
+        sampled[0].load_sampled_at_micros = 15_000;
+        ll.score(&RequestFacts::default(), &sampled, &kept, &mut scores);
+        let left = recent + 1;
+        assert_eq!(
+            ll.held(pool[0].id),
+            left as usize,
+            "the recent credits and the overflowing dispatch"
+        );
+        assert_eq!(ll.held_word_at(pool[0].id, 0), (left * 7, left));
     }
 
     #[test]
