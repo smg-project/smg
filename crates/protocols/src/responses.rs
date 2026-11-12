@@ -103,7 +103,11 @@ pub enum BuiltInToolChoiceType {
     #[serde(rename = "web_search_preview_2025_03_11")]
     WebSearchPreview20250311,
     ImageGeneration,
+    /// The GA computer tool; `computer_use` names it too, and
+    /// `computer_use_preview` the preview tool.
+    Computer,
     ComputerUsePreview,
+    ComputerUse,
     CodeInterpreter,
 }
 

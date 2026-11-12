@@ -61,6 +61,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
+  (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
+  `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

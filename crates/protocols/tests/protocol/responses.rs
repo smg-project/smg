@@ -1059,9 +1059,14 @@ fn responses_tool_choice_types_round_trip() {
             json!({"type": "image_generation"}),
             BuiltInToolChoiceType::ImageGeneration,
         ),
+        (json!({"type": "computer"}), BuiltInToolChoiceType::Computer),
         (
             json!({"type": "computer_use_preview"}),
             BuiltInToolChoiceType::ComputerUsePreview,
+        ),
+        (
+            json!({"type": "computer_use"}),
+            BuiltInToolChoiceType::ComputerUse,
         ),
         (
             json!({"type": "code_interpreter"}),
