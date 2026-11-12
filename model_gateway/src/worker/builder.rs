@@ -903,4 +903,28 @@ mod tests {
             "http://h:8000/get_server_info"
         );
     }
+
+    /// A socket address is not a base routes join to: the ZMQ adapter hashes
+    /// the exact path for its handshake port and socket files, so a trailing
+    /// slash on an `ipc://` or `tcp://` registration stays in `base_url()`,
+    /// for the worker and for a data-parallel rank of it.
+    #[test]
+    fn a_trailing_slash_on_a_socket_address_stays_in_the_base() {
+        let ipc = BasicWorkerBuilder::new("ipc:///tmp/engine/")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(ipc.url(), "ipc:///tmp/engine/");
+        assert_eq!(ipc.base_url(), "ipc:///tmp/engine/");
+
+        let rank = BasicWorkerBuilder::new("ipc:///tmp/engine/")
+            .connection_mode(ConnectionMode::Zmq)
+            .dp_config(3, 8)
+            .build();
+        assert_eq!(rank.base_url(), "ipc:///tmp/engine/");
+
+        let tcp = BasicWorkerBuilder::new("tcp://127.0.0.1:5555/")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(tcp.base_url(), "tcp://127.0.0.1:5555/");
+    }
 }
