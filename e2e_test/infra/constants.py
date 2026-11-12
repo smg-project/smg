@@ -515,6 +515,34 @@ _STARTUP_PROFILES = MappingProxyType(
             modes=frozenset({ConnectionMode.HTTP, ConnectionMode.GRPC}),
             gpu_multiplier=1,
         ),
+        "vllm-zmq1-chat": StartupProfile(
+            models=MappingProxyType(
+                {
+                    "Qwen/Qwen3-30B-A3B": (300, 1),
+                    "Qwen/Qwen3-4B-Instruct-2507": (300, 1),
+                    "Qwen/Qwen3-VL-8B-Instruct": (300, 1),
+                    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": (300, 1),
+                    "meta-llama/Llama-3.1-8B-Instruct": (300, 1),
+                    "meta-llama/Llama-3.2-1B-Instruct": (300, 1),
+                    "mistralai/Mistral-7B-Instruct-v0.3": (300, 1),
+                    "openai/gpt-oss-20b": (300, 1),
+                }
+            ),
+            lane=(
+                ("E2E_ENGINE", "vllm"),
+                (ENV_RUNTIME, "vllm"),
+                (ENV_GPU_VENDOR, "amd"),
+                ("E2E_GPU_TIER", "1"),
+                (ENV_CONNECTION_MODE, "zmq"),
+                (ENV_ZMQ_ENGINE_COUNT, "1"),
+                ("E2E_MIN_SELECTED", "202"),
+                (ENV_PARSER, ""),
+                ("E2E_SAMPLING_PROFILE", ""),
+            ),
+            max_floor=300,
+            modes=frozenset({ConnectionMode.ZMQ}),
+            gpu_multiplier=1,
+        ),
         "vllm-zmq-dp2-chat": StartupProfile(
             models=MappingProxyType(
                 {

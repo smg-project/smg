@@ -512,6 +512,7 @@ def test_profile_ci_budgets_include_startups_and_prior_test_allowance():
     workflow = Path(__file__).resolve().parents[2] / ".github/workflows/pr-test-rust.yml"
     jobs = yaml.safe_load(workflow.read_text())["jobs"]
     for profile, job, test_allowance, job_gap in [
+        ("vllm-zmq1-chat", "e2e-1gpu-chat-zmq-vllm-amd", 40, 6),
         ("vllm-zmq-dp2-chat", "e2e-2gpu-chat-zmq-dp-vllm-amd", 40, 6),
         ("vllm-4gpu-chat", "e2e-4gpu-chat-vllm-amd", 25, 5),
     ]:
@@ -1100,3 +1101,70 @@ def test_mooncake_image_guard_executes_actual_input_check(field, image, accepted
 def test_mooncake_image_guard_keeps_stock_chat_and_new_api_inputs_unchanged():
     stock = "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
     assert _run_mooncake_image_guard(stock, vllm_kv_backend="nixl").returncode == 0
+
+
+def test_zmq1_original_models_keep_frozen_worker_and_gateway_waits(monkeypatch):
+    setup = importlib.import_module("fixtures.setup_backend")
+    set_profile_lane(monkeypatch, "vllm-zmq1-chat")
+    for model in _ZMQ_DP2_MODELS:
+        assert worker_startup_timeout(model, timeout=9999) == 300
+        assert setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, model, 300) == 300
+        with pytest.raises(ValueError, match="exceeds frozen wait 300"):
+            setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, model, 301)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("E2E_ZMQ_ENGINE_COUNT", "2"),
+        ("E2E_ZMQ_ENGINE_COUNT", ""),
+        ("E2E_ENGINE", "sglang"),
+        ("E2E_RUNTIME", "sglang"),
+        ("E2E_GPU_TIER", "2"),
+        ("E2E_PARSER", "legacy"),
+        ("E2E_SAMPLING_PROFILE", "original1"),
+        (ENV_STARTUP_TIMEOUT, "301"),
+    ],
+)
+def test_zmq1_mismatched_lane_fails_before_model_lookup(monkeypatch, key, value):
+    set_profile_lane(monkeypatch, "vllm-zmq1-chat")
+    monkeypatch.setenv(key, value)
+
+    def forbidden_lookup(_model):
+        pytest.fail("invalid single-ZMQ context reached model preparation")
+
+    monkeypatch.setattr(worker_module, "get_model_spec", forbidden_lookup)
+    with pytest.raises(ValueError):
+        worker_startup_timeout(_ZMQ_DP2_MODELS[0])
+
+
+@pytest.mark.parametrize("change", ["gpu_count", "worker_count", "wire", "tp"])
+def test_zmq1_refuses_dp2_allocation_before_preparing_resources(monkeypatch, change):
+    from infra.constants import ConnectionMode
+
+    set_profile_lane(monkeypatch, "vllm-zmq1-chat")
+    kwargs = dict(
+        model_id=_ZMQ_DP2_MODELS[0],
+        engine="vllm",
+        mode=ConnectionMode.ZMQ,
+        count=1,
+        gpus=1,
+        tp=1,
+    )
+    # Positive control reaches the real validator with exactly one logical GPU.
+    worker_module.validate_startup_profile_worker(**kwargs)
+    if change == "gpu_count":
+        kwargs["gpus"] = 2
+    elif change == "worker_count":
+        kwargs["count"] = 2
+    elif change == "wire":
+        kwargs["mode"] = ConnectionMode.GRPC
+    else:
+        kwargs["tp"] = 2
+
+    def forbidden_offset():
+        pytest.fail("invalid single-ZMQ request passed validation into resource preparation")
+
+    monkeypatch.setattr(worker_module, "get_gpu_offset", forbidden_offset)
+    with pytest.raises(ValueError):
+        worker_module.start_workers(**kwargs)

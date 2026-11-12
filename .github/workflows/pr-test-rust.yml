@@ -1639,6 +1639,40 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'sglang' }}
     secrets: inherit
 
+  # AMD counterpart of the original single-GPU vLLM ZMQ chat row.
+  # A first reviewed normal CI run qualifies the unchanged suite within these caps.
+  e2e-1gpu-chat-zmq-vllm-amd:
+    name: e2e-1gpu-chat-zmq-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_ZMQ == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "vllm"
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      # Eight 300s model starts plus the original 40-minute test allowance.
+      # These engineering caps are not measured AMD duration or coverage.
+      timeout: 86
+      test_timeout: 80
+      test_dirs: "e2e_test/chat_completions"
+      min_selected: 202
+      connection_mode: "zmq"
+      zmq_engine_count: "1"
+      startup_profile: "vllm-zmq1-chat"
+      gpu_vendor: "amd"
+      container_image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   e2e-2gpu-chat-zmq-dp:
     name: e2e-2gpu-chat-zmq-dp (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -2919,7 +2953,7 @@ jobs:
     secrets: inherit
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-sglang-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-1gpu-responses-memory-core-amd, e2e-2gpu-pd-vllm-nixl-amd, e2e-2gpu-pd-vllm-mooncake-amd, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-4gpu-pd-vllm-nixl-amd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-chat-legacy-vllm-amd, e2e-1gpu-chat-symphony-sglang-amd, e2e-1gpu-chat-symphony-vllm-amd, e2e-1gpu-completions-vllm-amd, e2e-1gpu-embeddings-vllm-amd, e2e-1gpu-gateway-vllm-amd]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-zmq-vllm-amd, e2e-1gpu-chat-sglang-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-1gpu-responses-memory-core-amd, e2e-2gpu-pd-vllm-nixl-amd, e2e-2gpu-pd-vllm-mooncake-amd, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-4gpu-pd-vllm-nixl-amd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-chat-legacy-vllm-amd, e2e-1gpu-chat-symphony-sglang-amd, e2e-1gpu-chat-symphony-vllm-amd, e2e-1gpu-completions-vllm-amd, e2e-1gpu-embeddings-vllm-amd, e2e-1gpu-gateway-vllm-amd]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2982,6 +3016,7 @@ jobs:
                 exit 1 ;;
             esac
           done <<'AMD_RESULTS'
+          e2e-1gpu-chat-zmq-vllm-amd ${{ needs.e2e-1gpu-chat-zmq-vllm-amd.result }}
           e2e-1gpu-chat-sglang-amd ${{ needs.e2e-1gpu-chat-sglang-amd.result }}
           e2e-1gpu-responses-memory-core-amd ${{ needs.e2e-1gpu-responses-memory-core-amd.result }}
           e2e-2gpu-pd-vllm-nixl-amd ${{ needs.e2e-2gpu-pd-vllm-nixl-amd.result }}
@@ -3013,6 +3048,7 @@ jobs:
                 "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-zmq-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-completions-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-embeddings-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-gateway-vllm-amd.result }}" =~ $bad || \

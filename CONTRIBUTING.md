@@ -162,12 +162,13 @@ runners only has to set the variables it needs (**Settings → Secrets and varia
 | `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
 | `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD 1-GPU chat and opt-in vLLM completions, embeddings and gateway e2e jobs (require `SMG_RUN_AMD_LEGS=true`) |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
-| `SMG_RUNNER_AMD_GPU_2` | None (required) | AMD ZMQ DP2 chat opt-in route; blank disables the lane (no fallback) |
+| `SMG_RUNNER_AMD_GPU_2` | None (required) | Explicit AMD DP2 route; an existing `4-gpu-mi300x` label can carry logical two-GPU work under the full-host lease. Blank disables the lane |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` (benchmarks only) | AMD weekly and opt-in PR benchmarks (require `SMG_RUN_AMD_LEGS=true`); the opt-in TP4 lane requires a nonempty label and has no fallback |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
 | `SMG_RUN_AMD_LEGS` | `false` (when unset) | Enables AMD 1-GPU chat, nightly benchmark and automatic BFCL/PD selection; also required by both vLLM opt-ins |
 | `SMG_RUN_AMD_ON_PRS` | `false` (when unset) | Additional gate for AMD pull-request lanes; not required for push or manual runs |
+| `SMG_RUN_AMD_VLLM_ZMQ` | `false` | Original single-GPU vLLM ZMQ full-chat qualification; requires `SMG_RUN_AMD_LEGS=true`, a nonempty existing `SMG_RUNNER_AMD_GPU_1`, and `SMG_RUN_AMD_ON_PRS=true` for PRs. One engine, current parser/sampling, 86-minute job and 80-minute tests; shared-host full lifecycle admission still applies |
 | `SMG_RUN_AMD_VLLM_ZMQ_DP2` | `false` | AMD DP2 chat opt-in; requires `SMG_RUN_AMD_LEGS=true` and the AMD GPU2 label; PRs also require `SMG_RUN_AMD_ON_PRS=true` |
 | `SMG_RUN_AMD_VLLM_CHAT_TP4` | `false` | AMD TP4 chat opt-in; requires `SMG_RUN_AMD_LEGS=true` and the AMD GPU4 label; PRs also require `SMG_RUN_AMD_ON_PRS=true` |
 | `SMG_RUN_AMD_VLLM_COMPLETIONS` | `false` | Opt in to AMD vLLM completions e2e; requires `SMG_RUN_AMD_LEGS=true`, plus `SMG_RUN_AMD_ON_PRS=true` for PRs. Keep off until model/image compatibility, shared-host admission and the execution budget are qualified and approved |
