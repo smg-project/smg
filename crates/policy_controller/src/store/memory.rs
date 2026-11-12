@@ -657,10 +657,13 @@ impl KvEventSink for MemoryStore {
 
 // ----------------------------------------------------------- reservations
 
+/// A gateway's lease: the key a claim is held under.
+type LeaseKey = (GatewayId, LeaseId);
+
 #[derive(Default)]
 struct Reservations {
     held: FxHashMap<(WorkerId, ReservationKind), u32>,
-    by_lease: FxHashMap<LeaseId, Vec<(WorkerId, ReservationKind, u32)>>,
+    by_lease: FxHashMap<LeaseKey, Vec<(WorkerId, ReservationKind, u32)>>,
 }
 
 impl ReservationStore for MemoryStore {
@@ -670,7 +673,14 @@ impl ReservationStore for MemoryStore {
         self.workers.lock().rows.get(&id)?.row.facts.max_running
     }
 
-    fn try_reserve(&self, id: WorkerId, kind: ReservationKind, count: u32, lease: LeaseId) -> bool {
+    fn try_reserve(
+        &self,
+        gateway: GatewayId,
+        id: WorkerId,
+        kind: ReservationKind,
+        count: u32,
+        lease: LeaseId,
+    ) -> bool {
         // A worker the store does not know (never registered, or removed) is
         // refused before its window is read: a missing row is no live worker
         // without a bound, and a commit racing a removal gets nothing on it.
@@ -686,7 +696,7 @@ impl ReservationStore for MemoryStore {
         let mut reservations = self.reservations.lock();
         let holds_kind = reservations
             .by_lease
-            .get(&lease)
+            .get(&(gateway, lease))
             .is_some_and(|held| held.iter().any(|(_, k, _)| *k == kind));
         if holds_kind {
             return false;
@@ -699,15 +709,15 @@ impl ReservationStore for MemoryStore {
         *held = total;
         reservations
             .by_lease
-            .entry(lease)
+            .entry((gateway, lease))
             .or_default()
             .push((id, kind, count));
         true
     }
 
-    fn release(&self, lease: LeaseId) {
+    fn release(&self, gateway: GatewayId, lease: LeaseId) {
         let mut reservations = self.reservations.lock();
-        let Some(held) = reservations.by_lease.remove(&lease) else {
+        let Some(held) = reservations.by_lease.remove(&(gateway, lease)) else {
             return;
         };
         for (id, kind, count) in held {
