@@ -12,10 +12,10 @@ use crate::routers::{
     grpc::{
         common::stages::{
             helpers::{self, TagForStart},
-            BuildStage,
+            selection_context_length, BuildStage,
         },
         context::{
-            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, ExecutionPlanKind,
+            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, PlanSettings,
             PreparationOutput, RequestContext,
         },
         proto_wrapper::MultimodalData,
@@ -33,16 +33,12 @@ use crate::routers::{
 /// Builds a backend-specific proto GenerateRequest from the PreparationOutput
 /// and CreateMessageRequest sampling parameters.
 pub(crate) struct MessageRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 }
 
 impl MessageRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
     }
 }
 
@@ -61,8 +57,7 @@ fn build_messages_backed_plan(
     first_token_tag: bool,
     require_reasoning: bool,
     multimodal_data: Option<MultimodalData>,
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 ) -> Result<(ExecutionPlan, AttemptStamp), Response> {
     let sampling_mask = helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
     backed_plan::build(
@@ -81,8 +76,7 @@ fn build_messages_backed_plan(
             require_reasoning,
             multimodal_data,
             sampling_mask,
-            inject_pd_metadata,
-            plan_kind,
+            settings,
         },
         |client, request_id, processed_text, token_ids, options| {
             client.build_messages_request(
@@ -200,11 +194,17 @@ impl BuildStage for MessageRequestBuildingStage {
             first_token,
             require_reasoning,
             multimodal_data,
-            self.inject_pd_metadata,
-            self.plan_kind,
+            self.settings,
         )?;
         spec.reasoning_in_prefill = require_reasoning;
         spec.prompt_tokens = prompt_tokens;
+        // The selected worker's window, for the stop reason of a `length`
+        // finish (`MessagesResponseSpec::length_stop_reason`).
+        spec.context_window = ctx
+            .state
+            .workers
+            .as_ref()
+            .and_then(|workers| selection_context_length(workers, &ctx.input.model_id));
         spec.symphony = assignment;
         spec.parser_names.clone_from(&ctx.state.parser_names);
         Ok(BuildOutput {
@@ -220,10 +220,7 @@ impl BuildStage for MessageRequestBuildingStage {
 
     #[cfg(test)]
     fn signature(&self) -> String {
-        format!(
-            "MessageRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
-        )
+        format!("MessageRequestBuildingStage({})", self.settings.signature())
     }
 }
 
@@ -234,7 +231,7 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::{
-        context::ClientSelection,
+        context::{ClientSelection, ExecutionPlanKind},
         regular::stages::testing::{
             assert_fixed_request_plan, components, mock_backend_client, FORCED_CALL_TAG,
         },
@@ -273,8 +270,10 @@ mod tests {
             false,
             false,
             None,
-            false,
-            ExecutionPlanKind::Single,
+            PlanSettings {
+                inject_pd_metadata: false,
+                plan_kind: ExecutionPlanKind::Single,
+            },
         )
         .map_err(|refusal| refusal.status())
         .expect("built");

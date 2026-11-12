@@ -756,7 +756,11 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "deepseek-v4.1-flash",
         model: "deepseek-ai/DeepSeek-V4.1-Flash",
-        also: &["DeepSeek-V4.1-Flash-1017"],
+        also: &[
+            "DeepSeek-V4.1-Flash-1017",
+            "nvidia/DeepSeek-V4.1-Flash-1017-NVFP4",
+            "nvidia/DeepSeek-V4.1-Flash-NVFP4",
+        ],
         released: "2026-09-10",
         smg: (Some("deepseek_v41"), Some("deepseek_v41")),
         table: Some(Table::DeepSeekV4_1),
@@ -1299,7 +1303,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "kimi-k3",
         model: "moonshotai/Kimi-K3",
-        also: &[],
+        also: &["Kimi-K3.1-Pro", "nvidia/Kimi-K3.1-Pro-NVFP4"],
         released: "2026-06-13",
         smg: (Some("kimi_k3"), Some("kimi_k3")),
         table: Some(Table::KimiK3),
@@ -1638,7 +1642,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "minimax-m3",
         model: "MiniMaxAI/MiniMax-M3",
-        also: &[],
+        also: &["MiniMax-M3.1-Flash"],
         released: "2026-06-02",
         smg: (Some("minimax_m3"), Some("minimax_m3")),
         table: Some(Table::MinimaxM3),
@@ -2242,8 +2246,11 @@ const GROUPS: &[Group] = &[
         model: "Qwen/Qwen3-VL-8B-Instruct",
         also: &[
             "BAAI/RoboBrain2.5-4B",
+            "internlm/Visual-ERM",
             "lightonai/OriOn-Qwen",
             "lightonai/OriOn-Qwen-SR1",
+            "microsoft/AesCode-32B",
+            "microsoft/AesCode-8B",
             "nvidia/Cosmos-Reason2-32B",
             "Qwen3-VL-2B-Instruct",
             "Qwen3-VL-32B-Instruct",
@@ -2309,7 +2316,11 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "qwen3.5-9b",
         model: "Qwen/Qwen3.5-9B",
-        also: &["microsoft/FrogNano-4B-2609", "Qwen3.5-4B"],
+        also: &[
+            "microsoft/FrogNano-4B-2609",
+            "microsoft/UserRepGen-4B",
+            "Qwen3.5-4B",
+        ],
         released: "2026-02-27",
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
@@ -2359,7 +2370,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "qwen3.8-flash-next",
         model: "Qwen/Qwen3.8-Flash-Next",
-        also: &[],
+        also: &["nvidia/Qwen3.8-Flash-Next-FP4-Local"],
         released: "2026-08-24",
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),

@@ -34,8 +34,16 @@ SPLIT_PACKAGES = {
 INFRA_FILES = (
     "Cargo.toml",
     "Cargo.lock",
+    "rust-toolchain.toml",
     ".cargo/config.toml",
+    ".github/actions/setup-rust/action.yml",
     "scripts/ci_rust_tests.sh",
+    "scripts/ci_install_rust.sh",
+    "scripts/ci_apt_mirror.sh",
+    "scripts/ci_apt_update.sh",
+    "scripts/ci_retry.sh",
+    "scripts/ci_install_build_deps.sh",
+    "scripts/ci_install_protoc.sh",
     ".github/workflows/pr-test-rust.yml",
 )
 
@@ -194,12 +202,16 @@ class ShardTableTests(unittest.TestCase):
                     )
 
     def test_shard_filters_cover_the_build_infrastructure(self):
+        # The workflow's rust-ci filter is its own copy of this list (it comes
+        # before the rust-infra anchor, so it cannot reuse it) and the only
+        # gate for rust-lint and the aarch64 job, so it is read beside the
+        # shard filters.
         filters = path_filters()
-        for row in shard_table():
+        for name in sorted({row["filter"] for row in shard_table()} | {"rust-ci"}):
             for path in INFRA_FILES:
-                self.assertTrue(
-                    filter_matches(filters[row["filter"]], path), f"{row['filter']} misses {path}"
-                )
+                self.assertTrue(filter_matches(filters[name], path), f"{name} misses {path}")
+        missing = sorted(set(filters["rust-infra"]) - set(filters["rust-ci"]))
+        self.assertEqual(missing, [], f"rust-ci misses rust-infra patterns: {missing}")
 
     def test_shard_filters_exclude_unrelated_crates(self):
         filters = path_filters()
@@ -265,7 +277,7 @@ class ShardTableTests(unittest.TestCase):
                 {
                     "shard": "multimodal",
                     "filter": "rust-multimodal",
-                    "needs": "golden,ffmpeg",
+                    "needs": "golden,ffmpeg,turbojpeg",
                     "test_timeout": 20,
                 }
             ],

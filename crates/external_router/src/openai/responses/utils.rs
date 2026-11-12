@@ -12,15 +12,9 @@ use smg_mcp::McpToolSession;
 use tracing::warn;
 
 use super::common::parse_sse_block;
-use crate::{mcp_utils::collect_user_function_names, openai_bridge};
-
-/// Check if a JSON value is missing, null, or an empty string
-fn is_missing_or_empty(value: Option<&Value>) -> bool {
-    match value {
-        None => true,
-        Some(v) => v.is_null() || v.as_str().is_some_and(|s| s.is_empty()),
-    }
-}
+use crate::{
+    json_utils::is_missing_or_empty, mcp_utils::collect_user_function_names, openai_bridge,
+};
 
 /// Insert a string value into a JSON object if the condition is met
 fn insert_if<F>(obj: &mut Map<String, Value>, key: &str, value: &str, condition: F)

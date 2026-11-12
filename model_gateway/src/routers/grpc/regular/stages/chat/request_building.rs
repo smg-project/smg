@@ -11,7 +11,7 @@ use crate::routers::{
     grpc::{
         common::stages::helpers::{self, TagForStart},
         context::{
-            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, ExecutionPlanKind,
+            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, PlanSettings,
             PreparationOutput, RequestContext,
         },
         regular::{
@@ -27,16 +27,12 @@ use crate::routers::{
 ///
 /// Extracts chat-specific request building logic from the old unified RequestBuildingStage.
 pub(crate) struct ChatRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 }
 
 impl ChatRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
     }
 }
 
@@ -92,8 +88,7 @@ pub(crate) async fn build_chat_backed_plan(
     table_tag: Option<Arc<dyn TagForStart>>,
     first_token_tag: bool,
     id_prefix: &'static str,
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 ) -> Result<(ExecutionPlan, AttemptStamp, bool), Response> {
     let multimodal_data = helpers::assemble_prompt_media(ctx, "build_chat_backed_plan").await?;
 
@@ -125,8 +120,7 @@ pub(crate) async fn build_chat_backed_plan(
             sampling_mask: Some(helpers::SamplingDefaultsMask::from_chat_request(
                 chat_request,
             )),
-            inject_pd_metadata,
-            plan_kind,
+            settings,
         },
         |client, request_id, processed_text, token_ids, options| {
             client.build_chat_request(request_id, chat_request, processed_text, token_ids, options)
@@ -186,7 +180,7 @@ impl ChatRequestBuildingStage {
         } = reading::decide(
             ctx,
             symphony::Asks::Chat(&chat_request),
-            &chat_request.effective_tool_list(),
+            &chat_request.effective_tool_list_for(provider),
             &processed_messages.text,
             tool_constraints,
             |ctx| {
@@ -226,8 +220,7 @@ impl ChatRequestBuildingStage {
             table_tag,
             first_token,
             "chatcmpl-",
-            self.inject_pd_metadata,
-            self.plan_kind,
+            self.settings,
         )
         .await?;
 
@@ -250,10 +243,7 @@ impl ChatRequestBuildingStage {
     /// chat+generate dispatcher's own `signature`).
     #[cfg(test)]
     pub(crate) fn signature(&self) -> String {
-        format!(
-            "ChatRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
-        )
+        format!("ChatRequestBuildingStage({})", self.settings.signature())
     }
 }
 
@@ -287,7 +277,7 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::{
-        context::ClientSelection,
+        context::{ClientSelection, ExecutionPlanKind},
         proto_wrapper::ProtoRequest,
         regular::stages::testing::{
             assert_fixed_request_plan, components, mock_backend_client, FORCED_CALL_TAG,
@@ -326,8 +316,10 @@ mod tests {
             None,
             false,
             "chatcmpl-",
-            false,
-            ExecutionPlanKind::Single,
+            PlanSettings {
+                inject_pd_metadata: false,
+                plan_kind: ExecutionPlanKind::Single,
+            },
         )
         .await
         .map_err(|refusal| refusal.status())
@@ -381,8 +373,10 @@ mod tests {
                 None,
                 false,
                 "chatcmpl-",
-                false,
-                ExecutionPlanKind::Single,
+                PlanSettings {
+                    inject_pd_metadata: false,
+                    plan_kind: ExecutionPlanKind::Single,
+                },
             )
             .await
             .map_err(|refusal| refusal.status())

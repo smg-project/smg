@@ -14,7 +14,6 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use openai_protocol::profile::ProviderProfile;
 use tracing::debug;
 
 use crate::{
@@ -22,7 +21,7 @@ use crate::{
         error,
         grpc::context::{PreparationOutput, RequestType, WorkerSelection},
     },
-    worker::{ConnectionMode, Worker},
+    worker::{ConnectionMode, Worker, WorkerType},
 };
 
 /// Error code for an input that does not fit the model's window; matches the
@@ -39,43 +38,61 @@ pub(crate) struct ContextRequirements {
 }
 
 impl ContextRequirements {
-    /// [`Self::new_for`] with the provider profile derived here, as the tests ask it.
-    #[cfg(test)]
+    /// Capture exact preparation counts and the request's completion budget.
     pub(crate) fn new(prep: &PreparationOutput, request: &RequestType) -> Self {
-        Self::new_for(prep, request, None)
-    }
-
-    /// Capture exact preparation counts and the provider's output-budget rule,
-    /// with the chat model's provider profile as the request's preparation
-    /// derived it (`None` derives it here).
-    pub(crate) fn new_for(
-        prep: &PreparationOutput,
-        request: &RequestType,
-        provider: Option<ProviderProfile>,
-    ) -> Self {
         Self {
             input_tokens: prep.max_input_token_count(),
             scoring_position: matches!(prep, PreparationOutput::Decisions { .. }),
-            output_tokens: output_budget(request, provider),
+            output_tokens: output_budget(request),
         }
     }
 
     /// Unknown windows remain eligible; no character estimate or token sum is used.
     /// Direct-ZMQ workers in the shared pipeline retain post-selection validation.
+    /// A prefill worker is held to the input alone: in a disaggregated request
+    /// it runs one token (`sanitize_sampling_for_prefill`) and its decode
+    /// partner holds the completion budget, so a prefill window narrower than
+    /// the decode window must not refuse a budget the decode side can hold.
     pub(crate) fn admits(self, worker: &dyn Worker, model_id: &str) -> bool {
         if !matches!(worker.connection_mode(), ConnectionMode::Grpc) {
             return true;
         }
+        let holds_the_budget = !matches!(worker.worker_type(), WorkerType::Prefill);
         worker.context_length(model_id).is_none_or(|limit| {
             input_fits(self.input_tokens, limit, self.scoring_position)
-                && self.output_tokens.is_none_or(|tokens| tokens <= limit)
+                && (!holds_the_budget || self.output_tokens.is_none_or(|tokens| tokens <= limit))
         })
+    }
+
+    /// Whether the input fits a window of `limit` tokens: the input bound of
+    /// [`Self::admits`], for a caller judging a whole pair by its tighter window.
+    pub(crate) fn input_fits(self, limit: u32) -> bool {
+        input_fits(self.input_tokens, limit, self.scoring_position)
     }
 
     /// Preserve the existing 400 and diagnostic for a known insufficient window.
     pub(crate) fn enforce(self, limit: u32, model_id: &str) -> Result<(), Response> {
         enforce_input(self.input_tokens, limit, self.scoring_position, model_id)?;
         enforce_output(self.output_tokens, limit, model_id)
+    }
+
+    /// [`Self::enforce`] for a disaggregated pair the request did not fit:
+    /// the input against the widest window a pair offers it (`input_limit`,
+    /// the tighter of a pair's two sides), the budget against the widest
+    /// decode window (`decode_limit`); an unknown window binds nothing.
+    pub(crate) fn enforce_for_pair(
+        self,
+        input_limit: Option<u32>,
+        decode_limit: Option<u32>,
+        model_id: &str,
+    ) -> Result<(), Response> {
+        if let Some(limit) = input_limit {
+            enforce_input(self.input_tokens, limit, self.scoring_position, model_id)?;
+        }
+        if let Some(limit) = decode_limit {
+            enforce_output(self.output_tokens, limit, model_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -170,46 +187,63 @@ pub(crate) fn enforce_decisions_context_length(
     enforce_input(input_tokens, limit, true, model_id)
 }
 
-/// Reject a chat completion budget the model's window could never hold.
+/// Reject a completion budget the model's window could never hold.
 ///
-/// Only under the z.ai profile, whose vendor rejects such a request; every
-/// other profile keeps the engine's own policy (vLLM rejects at admission,
-/// SGLang clamps), as the input check above leaves `input + max_tokens`
-/// to the engine. As above, only a known window is enforced, and like the
-/// input check this runs on the gRPC pipeline only: the HTTP router forwards
-/// the body and leaves the budget to the engine. `provider` is the chat
-/// model's profile as the request's preparation derived it (`None` derives
-/// it here).
+/// A `max_tokens` (or its route's equivalent) above the window is a client
+/// mistake on every route and under every provider profile, and on a lane
+/// whose engine has no frontend of its own behind the gateway (the direct
+/// ZMQ lane, the Rust servicer) nothing after this stage refuses it: the
+/// engine runs to the window and stops with a length finish. As above, only
+/// a known window is enforced; whether `input + max_tokens` must also fit
+/// stays engine-specific (one engine refuses it, another clamps it) and with
+/// the engine.
+/// Like the input check this runs on the gRPC pipeline only: the HTTP router
+/// forwards the body and leaves the budget to the engine.
 pub(crate) fn enforce_output_budget(
     request_type: &RequestType,
     workers: &WorkerSelection,
     model_id: &str,
-    provider: Option<ProviderProfile>,
 ) -> Result<(), Response> {
-    let Some(max_tokens) = output_budget(request_type, provider) else {
+    let Some(max_tokens) = output_budget(request_type) else {
         return Ok(());
     };
-    let Some(limit) = selection_context_length(workers, model_id) else {
+    let Some(limit) = output_context_length(workers, model_id) else {
         return Ok(());
     };
     enforce_output(Some(max_tokens), limit, model_id)
 }
 
-/// Only the z.ai chat profile imposes an engine-independent output bound;
-/// `provider` is the chat model's profile as the request's preparation
-/// derived it (`None` derives it here).
-fn output_budget(request_type: &RequestType, provider: Option<ProviderProfile>) -> Option<u32> {
-    let RequestType::Chat(request) = request_type else {
-        return None;
-    };
-    if provider.unwrap_or_else(|| ProviderProfile::for_model(&request.model))
-        != ProviderProfile::Zai
-    {
-        return None;
+/// The window that holds the completion: the selected worker's, or on a
+/// disaggregated pair the decode side's (the prefill side runs one token,
+/// `sanitize_sampling_for_prefill`, whatever its own window). `None` when
+/// that side advertises none.
+fn output_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u32> {
+    match workers {
+        WorkerSelection::Single { worker } => worker.context_length(model_id),
+        WorkerSelection::Disaggregated { decode, .. } => decode.context_length(model_id),
     }
-    #[expect(deprecated, reason = "the request may predate normalization")]
-    {
-        request.max_completion_tokens.or(request.max_tokens)
+}
+
+/// The completion budget the request names, on the routes that carry one.
+fn output_budget(request_type: &RequestType) -> Option<u32> {
+    match request_type {
+        RequestType::Chat(request) => {
+            #[expect(deprecated, reason = "the request may predate normalization")]
+            {
+                request.max_completion_tokens.or(request.max_tokens)
+            }
+        }
+        RequestType::Completion(request) => request.max_tokens,
+        RequestType::Messages(request) => Some(request.max_tokens),
+        RequestType::Responses(request) => request.max_output_tokens,
+        RequestType::Generate(request) => request
+            .sampling_params
+            .as_ref()
+            .and_then(|params| params.max_new_tokens),
+        RequestType::Embedding(_)
+        | RequestType::Classify(_)
+        | RequestType::Decisions(_)
+        | RequestType::Transcription { .. } => None,
     }
 }
 
@@ -239,9 +273,10 @@ fn enforce_output(max_tokens: Option<u32>, limit: u32, model_id: &str) -> Result
 
 /// Tightest context window across the selected sides, `None` if no side
 /// advertises one. A disaggregated prompt must fit both the prefill and the
-/// decode engine, so the smaller window governs. Encode workers process media,
-/// not the token prompt, and are not consulted.
-fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u32> {
+/// decode engine, so the smaller window governs the input (the completion
+/// budget is the decode side's, `output_context_length`). Encode workers
+/// process media, not the token prompt, and are not consulted.
+pub(crate) fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u32> {
     match workers {
         WorkerSelection::Single { worker } => worker.context_length(model_id),
         WorkerSelection::Disaggregated {
@@ -347,15 +382,61 @@ mod tests {
         ))
     }
 
-    /// Selection shares both provider budget semantics and the overflow-safe
-    /// scoring boundary with the existing post-selection checks.
+    fn completion(max_tokens: u32) -> RequestType {
+        RequestType::Completion(Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL, "prompt": "hi", "max_tokens": max_tokens
+            }))
+            .expect("completion request deserializes"),
+        ))
+    }
+
+    fn messages(max_tokens: u32) -> RequestType {
+        RequestType::Messages(Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL, "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .expect("messages request deserializes"),
+        ))
+    }
+
+    fn responses(max_output_tokens: u32) -> RequestType {
+        RequestType::Responses(Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL, "input": "hi", "max_output_tokens": max_output_tokens
+            }))
+            .expect("responses request deserializes"),
+        ))
+    }
+
+    fn generate(max_new_tokens: u32) -> RequestType {
+        RequestType::Generate(Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL, "text": "hi", "sampling_params": {"max_new_tokens": max_new_tokens}
+            }))
+            .expect("generate request deserializes"),
+        ))
+    }
+
+    fn embedding() -> RequestType {
+        RequestType::Embedding(Arc::new(
+            serde_json::from_value(serde_json::json!({"model": MODEL, "input": "hi"}))
+                .expect("embedding request deserializes"),
+        ))
+    }
+
+    /// Selection shares both the budget bound and the overflow-safe scoring
+    /// boundary with the existing post-selection checks.
     #[test]
     fn context_requirements_preserve_budget_and_scoring_boundaries() {
-        for budget in [None, Some(0), Some(16), Some(u32::MAX)] {
+        for budget in [None, Some(0), Some(16)] {
             let request = chat("ordinary-model", budget);
             let requirement = ContextRequirements::new(&input(16), &request);
             assert!(requirement.enforce(16, MODEL).is_ok());
         }
+        let request = chat("ordinary-model", Some(17));
+        assert_rejected(ContextRequirements::new(&input(16), &request).enforce(16, MODEL));
         let requirement = ContextRequirements {
             input_tokens: usize::MAX,
             scoring_position: true,
@@ -371,61 +452,98 @@ mod tests {
         assert!(requirement.enforce(17, MODEL).is_ok());
     }
 
+    /// A budget the window could never hold is refused whatever the model's
+    /// provider profile: the check the z.ai profile had is every profile's.
     #[test]
-    fn a_zai_budget_beyond_the_window_is_a_400_context_length_exceeded() {
-        assert_rejected(enforce_output_budget(
-            &chat("glm-5.3-flash", Some(10_000_000)),
-            &single(Some(131_072)),
-            MODEL,
-            None,
-        ));
-        assert_rejected(enforce_output_budget(
-            &chat("zai-org/GLM-5.3-Flash", Some(131_073)),
-            &pd(Some(1_000_000), Some(131_072)),
-            MODEL,
-            None,
-        ));
+    fn a_budget_beyond_the_window_is_a_400_context_length_exceeded() {
+        for model in [
+            "glm-5.3-flash",
+            "zai-org/GLM-5.3-Flash",
+            "gpt-4o",
+            "kimi-k3",
+            "MiniMax-M3",
+        ] {
+            assert_rejected(enforce_output_budget(
+                &chat(model, Some(10_000_000)),
+                &single(Some(131_072)),
+                MODEL,
+            ));
+            assert_rejected(enforce_output_budget(
+                &chat(model, Some(131_073)),
+                &pd(Some(1_000_000), Some(131_072)),
+                MODEL,
+            ));
+        }
     }
 
     #[test]
-    fn a_zai_budget_within_the_window_or_without_a_window_passes() {
-        assert!(enforce_output_budget(
-            &chat("glm-5.3-flash", Some(131_072)),
-            &single(Some(131_072)),
-            MODEL,
-            None
-        )
-        .is_ok());
-        assert!(enforce_output_budget(
-            &chat("glm-5.3-flash", None),
-            &single(Some(131_072)),
-            MODEL,
-            None
-        )
-        .is_ok());
-        assert!(enforce_output_budget(
-            &chat("glm-5.3-flash", Some(10_000_000)),
-            &single(None),
-            MODEL,
-            None
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn other_profiles_leave_the_budget_to_the_engine() {
-        for model in ["gpt-4o", "kimi-k3", "MiniMax-M3"] {
+    fn a_budget_within_the_window_or_without_a_window_passes() {
+        for model in ["glm-5.3-flash", "gpt-4o"] {
             assert!(
-                enforce_output_budget(
-                    &chat(model, Some(10_000_000)),
-                    &single(Some(131_072)),
-                    MODEL,
-                    None
-                )
-                .is_ok(),
+                enforce_output_budget(&chat(model, Some(131_072)), &single(Some(131_072)), MODEL)
+                    .is_ok(),
+                "{model}"
+            );
+            assert!(
+                enforce_output_budget(&chat(model, None), &single(Some(131_072)), MODEL).is_ok(),
+                "{model}"
+            );
+            assert!(
+                enforce_output_budget(&chat(model, Some(10_000_000)), &single(None), MODEL).is_ok(),
                 "{model}"
             );
         }
+    }
+
+    /// A route's request with the budget it names.
+    type Budgeted = fn(u32) -> RequestType;
+
+    /// Every route that names a completion budget is bounded by the window
+    /// (the budget alone: the input's share stays with the engine); a route
+    /// without one names nothing to bound.
+    #[test]
+    fn every_route_that_names_a_budget_is_bounded_by_the_window() {
+        let routes: [(&str, Budgeted); 4] = [
+            ("completion", completion),
+            ("messages", messages),
+            ("responses", responses),
+            ("generate", generate),
+        ];
+        for (route, request) in routes {
+            assert_rejected(enforce_output_budget(
+                &request(17),
+                &single(Some(16)),
+                MODEL,
+            ));
+            assert!(
+                enforce_output_budget(&request(16), &single(Some(16)), MODEL).is_ok(),
+                "{route}: a budget that fits"
+            );
+            assert!(
+                enforce_output_budget(&request(17), &single(None), MODEL).is_ok(),
+                "{route}: an unknown window"
+            );
+        }
+        assert!(enforce_output_budget(&embedding(), &single(Some(16)), MODEL).is_ok());
+    }
+
+    #[tokio::test]
+    async fn budget_rejection_body_names_the_limit_and_the_budget() {
+        let response =
+            enforce_output_budget(&chat("any-model", Some(40)), &single(Some(16)), MODEL)
+                .expect_err("a budget beyond the window must be rejected");
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(json["error"]["code"], CONTEXT_LENGTH_EXCEEDED);
+        let message = json["error"]["message"].as_str().expect("message");
+        assert!(message.contains("16 tokens"), "{message}");
+        assert!(
+            message.contains("40 tokens for the completion"),
+            "{message}"
+        );
+        assert!(message.contains("max_tokens"), "{message}");
     }
 
     #[test]
@@ -550,5 +668,52 @@ mod tests {
         assert_rejected(enforce_context_length(&input(10), &selection, "narrow"));
         // An id no card matches falls back to the primary (first) card.
         assert!(enforce_context_length(&input(10), &selection, "unlisted").is_ok());
+    }
+
+    /// A prefill worker is held to the input alone: its decode partner holds
+    /// the completion budget. The same budget on a regular or a decode worker
+    /// with the same window is refused, and the input still binds the
+    /// prefill side.
+    #[test]
+    fn a_prefill_worker_is_held_to_the_input_alone() {
+        let requirements = ContextRequirements::new(&input(1024), &completion(8192));
+        assert!(requirements.admits(worker(WorkerType::Prefill, Some(4096)).as_ref(), MODEL));
+        assert!(!requirements.admits(worker(WorkerType::Decode, Some(4096)).as_ref(), MODEL));
+        assert!(!requirements.admits(worker(WorkerType::Regular, Some(4096)).as_ref(), MODEL));
+        assert!(requirements.admits(worker(WorkerType::Decode, Some(32768)).as_ref(), MODEL));
+        let over_long = ContextRequirements::new(&input(5000), &completion(1));
+        assert!(
+            !over_long.admits(worker(WorkerType::Prefill, Some(4096)).as_ref(), MODEL),
+            "the input still binds the prefill side"
+        );
+    }
+
+    /// On a disaggregated pair the budget is bound by the decode side's
+    /// window and the input by the tighter of the two.
+    #[test]
+    fn the_pair_budget_is_bound_by_the_decode_window() {
+        let pair = pd(Some(4096), Some(32768));
+        assert!(enforce_output_budget(&completion(8192), &pair, MODEL).is_ok());
+        assert_rejected(enforce_output_budget(&completion(40000), &pair, MODEL));
+        assert!(enforce_context_length(&input(1024), &pair, MODEL).is_ok());
+        assert_rejected(enforce_context_length(&input(5000), &pair, MODEL));
+        // The selection-time refusal of a pair nothing fits names the same windows.
+        assert_rejected(
+            ContextRequirements::new(&input(1024), &completion(40000)).enforce_for_pair(
+                Some(4096),
+                Some(32768),
+                MODEL,
+            ),
+        );
+        assert!(ContextRequirements::new(&input(1024), &completion(8192))
+            .enforce_for_pair(Some(4096), Some(32768), MODEL)
+            .is_ok());
+        assert_rejected(
+            ContextRequirements::new(&input(5000), &completion(1)).enforce_for_pair(
+                Some(4096),
+                None,
+                MODEL,
+            ),
+        );
     }
 }

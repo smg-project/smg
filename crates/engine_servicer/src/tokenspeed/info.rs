@@ -3,10 +3,7 @@
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off TokenSpeed's `ModelConfig` and `ServerArgs`) and from the handshake.
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::ZmqEngineClient;
 use futures::StreamExt;
@@ -18,7 +15,7 @@ use tonic::Status;
 use super::{generate, State};
 use crate::{
     health_probe::{self, Verdict},
-    load_report::{mean, rank_entries, rank_entry, RankFigures},
+    load_report::{mean, rank_entries, rank_entry, Capacity, RankFigures},
     proto_json::{insert_capacity, struct_from_json},
     servicer::{proto_token_ids, RequestOrigin},
 };
@@ -84,7 +81,7 @@ pub(super) async fn health_check_with(
 /// does.
 async fn probe(state: &Arc<State>) -> Result<(), Status> {
     let request = ts::GenerateRequest {
-        request_id: format!("HEALTH_CHECK_{}", probe_nanos()),
+        request_id: health_probe::probe_request_id(),
         tokenized: Some(ts::TokenizedInput {
             input_ids: vec![0],
             original_text: String::new(),
@@ -105,14 +102,6 @@ async fn probe(state: &Arc<State>) -> Result<(), Status> {
             "the probe's stream ended without an output",
         )),
     }
-}
-
-/// The probe id's suffix: nanoseconds since the epoch (the Python servicer
-/// stamps its clock the same way).
-fn probe_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos())
 }
 
 /// `GetModelInfo`: the launcher's config, with the handshake's context length
@@ -224,7 +213,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
             aggregate: Some(ts::AggregateMetrics::default()),
         });
     }
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_running_requests);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
     let (loads, aggregate) = rank_entries(
         client.get_loads().loads,
@@ -262,7 +251,7 @@ pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<ts::Sched
     if state.encode_role.is_some() {
         return None;
     }
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_running_requests);
     rank_entry(
         |index| client.rank_load(index),
         capacity.max_total_num_tokens,
@@ -271,24 +260,6 @@ pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<ts::Sched
         |load, figures| reported_entry(state, load, figures, &capacity),
         |rank| unreported_entry(state, rank, &capacity),
     )
-}
-
-/// The capacity figures every rank's entry carries: the running window and
-/// the KV capacity the servicer knows.
-struct Capacity {
-    max_running_requests: i32,
-    max_total_num_tokens: i32,
-}
-
-impl Capacity {
-    fn of(state: &State) -> Self {
-        Self {
-            max_running_requests: state
-                .shared
-                .running_window(state.model.max_running_requests),
-            max_total_num_tokens: state.shared.kv_capacity_tokens(),
-        }
-    }
 }
 
 /// A reported rank's entry: the snapshot's figures with, from this

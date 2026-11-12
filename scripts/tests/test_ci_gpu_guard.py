@@ -22,6 +22,10 @@ SHIMS = Path(__file__).resolve().parent / "fixtures" / "gpu_guard"
 NODE = "203.0.113.7"  # a documentation address, never a node
 THIS_JOB = "e2e-222-1-runner-new"
 OLD_JOB = "e2e-111-1-runner-old"
+# A pid no host can hold (the kernel's pid limit is 4194304 on 64-bit), so the
+# kill step, which ends every holder of a device file the scratch /proc names,
+# signals nothing of the machine the tests run on.
+GHOST = 4_194_305
 READING = re.compile(r"^gpu guard: (\d+)s: (.*)$", re.M)
 REPORT_HEADER = f"gpu guard: this job: runner 'runner-new', marker '{THIS_JOB}'"
 
@@ -185,24 +189,52 @@ def test_a_visible_holder_is_ended_and_the_cards_pass(guard: Guard) -> None:
             holder.wait()
 
 
+def test_a_holder_of_a_device_file_is_ended_through_proc(guard: Guard) -> None:
+    """The kill step finds the holders of a device file in /proc, as the
+    report below it does: a holder the process table never listed ends."""
+    holder = subprocess.Popen(["sleep", "300"])
+    try:
+        guard.process(holder.pid, "sleep 300", marker=THIS_JOB, device="/dev/nvidia0")
+        result = guard.run(wait=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert holder.wait(timeout=10) == -signal.SIGKILL
+        assert "No running processes found" in result.stdout
+        assert error_lines(result.stdout) == []
+        assert result.elapsed < 10
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
+
+
+def test_the_kill_step_installs_nothing() -> None:
+    """A package install inside the test step charges the mirror's speed to
+    the step's budget (8 min 23 s for lsof on a slow mirror, two jobs red):
+    the script runs no package manager and needs no lsof."""
+    commands = [
+        line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#")
+    ]
+    assert [line for line in commands if "apt-get" in line or "lsof" in line] == []
+
+
 def test_a_holder_in_this_job_view_is_named_with_the_job_that_started_it(guard: Guard) -> None:
     guard.busy(cards=(0,))
-    guard.process(777, "python -m engine.server --port 1", marker=OLD_JOB, device="/dev/nvidia0")
+    guard.process(GHOST, "python -m engine.server --port 1", marker=OLD_JOB, device="/dev/nvidia0")
     guard.process(778, "bash run.sh", marker=THIS_JOB, device=None)
-    guard.listed_app(0, 777, name="python")
+    guard.listed_app(0, GHOST, name="python")
     result = guard.run(wait=1)
     assert result.returncode == 1
     assert (
-        "gpu guard: GPU 0: pid 777 (python) holds 80327 MiB; in this job's view: "
+        f"gpu guard: GPU 0: pid {GHOST} (python) holds 80327 MiB; in this job's view: "
         f"python -m engine.server --port 1 E2E_JOB_MARKER={OLD_JOB}" in result.stdout
     )
     assert (
-        "gpu guard: pid 777 holds a GPU device file: python -m engine.server --port 1 "
+        f"gpu guard: pid {GHOST} holds a GPU device file: python -m engine.server --port 1 "
         f"E2E_JOB_MARKER={OLD_JOB}" in result.stdout
     )
     assert "pid 778" not in result.stdout
     (error,) = error_lines(result.stdout)
-    assert error.endswith(", held by pid 777:")
+    assert error.endswith(f", held by pid {GHOST}:")
     assert result.stdout.splitlines()[-1] == "GPU 0: 80327 MiB used"
 
 

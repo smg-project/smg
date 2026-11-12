@@ -35,7 +35,7 @@ use tonic::{transport::Channel, Code};
 use super::*;
 use crate::{
     kv_events,
-    testing::{servicer_config, Bounded},
+    testing::{handshake_address, servicer_config, Bounded},
 };
 
 fn model_info() -> TrtllmModelInfo {
@@ -64,12 +64,6 @@ fn config(dir: &std::path::Path, handshake: &str, model: TrtllmModelInfo) -> Trt
         servicer: servicer_config(dir, handshake),
         model,
     }
-}
-
-/// The handshake endpoint of one test: an IPC socket under its own
-/// directory, so two tests running in parallel never share one.
-fn handshake_address(dir: &std::path::Path) -> String {
-    format!("ipc://{}", dir.join("handshake").display())
 }
 
 /// The layouts the shim declares at its handshake: the field order of the
@@ -416,6 +410,64 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         .into_inner();
     assert!(!unknown.success);
     assert_eq!(unknown.message, "Request never not found");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info()).await;
+    let mut req = generate_request("r7", true);
+    req.sampling_config.as_mut().unwrap().num_return_sequences = 2;
+    let mut stream = h.client.generate(req).await.expect("generate").into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r7-1", vec![21], 1, None, None)).await;
+    assert_eq!(
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
+        vec![21]
+    );
+
+    let response = h
+        .client
+        .abort(trt::AbortRequest {
+            request_id: "r7".to_string(),
+        })
+        .await
+        .expect("abort")
+        .into_inner();
+    assert!(response.success);
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.sequence_index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.sequence_index,
+                done.finish_reason.clone(),
+                done.output_token_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

@@ -2,9 +2,15 @@
 //!
 //! The patterns in use (GPT-2, Qwen, GLM, DeepSeek, MiniMax and their kin)
 //! draw on a small regex subset: alternation, concatenation, character
-//! classes built from Unicode categories, `\s`, ranges and literals, greedy
-//! `?` `*` `+` `{m,n}`, a case-insensitive group of literal alternatives for
-//! the English clitics, and the lookahead `(?!\S)`. This module parses that
+//! classes built from Unicode categories, `\s`, ranges, literals and `\uHHHH`
+//! code points, a group of single-character alternatives (read as the class
+//! of their union), greedy `?` `*` `+` `{m,n}` and the possessive `?+` `*+`
+//! `++` on a class, a case-insensitive group of literal alternatives (or a
+//! class of letters) for the English clitics, the lookahead `(?!\S)`, the
+//! end anchor `$` (the engine's end of line: the end of the text, or
+//! before a newline), the digit class `\d` and the digit-grouping
+//! lookahead `(?=(?:\d{3})*\b)` after a digit, read as the count of the
+//! digit run ahead and the word boundary after it. This module parses that
 //! subset and matches it the way the engine behind `tokenizers`' `Split`
 //! does: leftmost-first alternation, greedy quantifiers that back off one
 //! repetition at a time. The engine also yields empty matches, and `Split`
@@ -28,7 +34,7 @@
 
 use super::{
     cased, chain,
-    scan::{Bits, Roles},
+    scan::{Bits, Roles, WordScan},
     unicode,
 };
 
@@ -37,6 +43,7 @@ use super::{
 pub(super) struct Class {
     negated: bool,
     categories: u16,
+    /// Code point ranges, sorted and disjoint once [`Class::finish`] has run.
     ranges: Vec<(u32, u32)>,
     /// Categories taken out of the class before any negation: the engine's
     /// intersection with a negated property class, `[...&&[^\p{Han}]]`.
@@ -167,6 +174,11 @@ const CAT_SPACE: u16 = 1 << 10;
 /// cuts ideograph runs out before its letter classes and takes them out of
 /// those classes).
 const CAT_HAN: u16 = 1 << 11;
+/// `\d`: the engine's decimal digits.
+const CAT_DIGIT: u16 = 1 << 12;
+/// `\w`: the engine's word characters, the class its word boundary `\b`
+/// reads on either side of a position.
+const CAT_WORD: u16 = 1 << 13;
 
 /// Pairs of ASCII letters that are the full case folding of one character
 /// (ß ẞ: ss; ﬀ: ff; ﬁ: fi; ﬂ: fl; ﬃ ﬄ: ffi, ffl; ﬅ ﬆ: st), which the engine
@@ -174,7 +186,43 @@ const CAT_HAN: u16 = 1 << 11;
 const MULTI_CHARACTER_FOLDS: [[char; 2]; 5] =
     [['s', 's'], ['s', 't'], ['f', 'f'], ['f', 'i'], ['f', 'l']];
 
-const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
+/// Adds to `class` the ASCII letter `c` in both cases and the characters
+/// beyond ASCII the engine folds together with it under `(?i:...)`.
+fn fold_letter(class: &mut Class, c: char) {
+    let lower = c.to_ascii_lowercase();
+    let upper = c.to_ascii_uppercase();
+    class.ranges.push((u32::from(lower), u32::from(lower)));
+    class.ranges.push((u32::from(upper), u32::from(upper)));
+    if let Some((_, extra)) = unicode::FOLD_EXTRA
+        .iter()
+        .find(|(letter, _)| *letter == lower as u8)
+    {
+        for &e in *extra {
+            class.ranges.push((u32::from(e), u32::from(e)));
+        }
+    }
+}
+
+/// A bracket class under `(?i:...)`: accepted when every member is an ASCII
+/// letter, each folded the way a literal letter is (the engine folds a
+/// class's members too); a range, a property, a negation or a non-ASCII
+/// member would match differently and is declined.
+fn folded_letters(class: Class) -> Option<Class> {
+    if class.negated || class.categories != 0 || class.without != 0 {
+        return None;
+    }
+    let mut folded = Class::default();
+    for &(low, high) in &class.ranges {
+        if low != high {
+            return None;
+        }
+        let letter = char::from_u32(low).filter(char::is_ascii_alphabetic)?;
+        fold_letter(&mut folded, letter);
+    }
+    Some(folded)
+}
+
+const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 14] = [
     (CAT_LETTER, unicode::LETTER),
     (CAT_MARK, unicode::MARK),
     (CAT_NUMBER, unicode::NUMBER),
@@ -187,6 +235,8 @@ const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
     (CAT_OTHER_LETTER, unicode::OTHER_LETTER),
     (CAT_SPACE, unicode::SPACE),
     (CAT_HAN, unicode::HAN),
+    (CAT_DIGIT, unicode::DIGIT),
+    (CAT_WORD, unicode::WORD),
 ];
 
 #[inline]
@@ -204,6 +254,19 @@ fn in_categories(categories: u16, code: u32) -> bool {
 
 impl Class {
     fn finish(mut self) -> Self {
+        // `in_ranges` binary-searches on the ends in start order: a range
+        // inside another breaks that, so the ranges are sorted here, once
+        // for every way a class is built, and the overlapping ones become
+        // one.
+        self.ranges.sort_unstable();
+        self.ranges.dedup_by(|next, kept| {
+            if next.0 <= kept.1 {
+                kept.1 = kept.1.max(next.1);
+                true
+            } else {
+                false
+            }
+        });
         let mut ascii = AsciiSet::default();
         for code in 0u32..128 {
             if self.contains_slow(code) {
@@ -265,6 +328,17 @@ impl Class {
         self.first().non_ascii
     }
 
+    /// Whether every character the class can hold is printable ASCII
+    /// (U+0021..=U+007E): no category, no negation, every range within.
+    pub(super) fn within_printable_ascii(&self) -> bool {
+        !self.negated
+            && self.categories == 0
+            && self
+                .ranges
+                .iter()
+                .all(|&(start, end)| start >= 0x21 && end <= 0x7E)
+    }
+
     /// The characters the class may hold, exact below U+0080 and one bit for
     /// the rest, set unless every member of the class is ASCII.
     fn first(&self) -> First {
@@ -282,11 +356,15 @@ impl Class {
 pub(super) enum Node {
     /// One character of the class.
     Class(usize),
-    /// Greedy repetition of one class character, `min..=max` times.
+    /// Greedy repetition of one class character, `min..=max` times. A
+    /// `possessive` run (`?+`, `*+`, `++`) never gives a character back once
+    /// taken: when what follows fails, the match backs off to a choice made
+    /// before the run, if there is one.
     ClassRepeat {
         class: usize,
         min: u32,
         max: u32,
+        possessive: bool,
     },
     /// Greedy repetition of a group, `min..=max` times; `first` is what the
     /// group's body can begin with ([`first_sets`] fills it).
@@ -307,6 +385,23 @@ pub(super) enum Node {
     },
     /// `(?!...)` over one class: succeeds when the next character is not in it.
     NotAhead(usize),
+    /// `$`: succeeds at the end of the text and before a newline (the
+    /// engine's end of line, in its default syntax).
+    End,
+    /// `(?=(?:\d{size})*\b)`: succeeds when the run of the class ahead
+    /// holds a multiple of `size` characters and the word boundary holds
+    /// after it (the text ends there, or the next character is outside
+    /// the `word` class), or when the boundary holds at the position
+    /// itself (see [`Op::GroupsAhead`]). The boundary at the position reads
+    /// the character before it, so the node stands only behind an atom
+    /// that must consume in its alternative ([`groups_ahead_leads`]): the
+    /// character it reads is one the match consumed, inside any unit of
+    /// the thread pool as in the whole text.
+    GroupsAhead {
+        class: usize,
+        size: u32,
+        word: usize,
+    },
 }
 
 /// The characters a match of a node can begin with: a table of the ASCII
@@ -369,6 +464,11 @@ pub(crate) struct Pattern {
     /// What the pattern is as a stage of a three-stage chain, when it is
     /// one (see [`chain`]).
     part: Option<chain::Part>,
+    /// Whether the pattern holds the end anchor (see [`Self::end_anchored`]).
+    end_anchored: bool,
+    /// Whether the pattern holds the digit-grouping lookahead (see
+    /// [`Self::reads_word_boundary`]).
+    reads_word_boundary: bool,
 }
 
 /// The matcher of a pattern: a hand-written scanner for the two template
@@ -392,10 +492,24 @@ enum Op {
     /// One character of the class.
     Char(usize),
     /// A greedy run of `min..=max` characters of the class; when what follows
-    /// fails it gives back one character at a time, down to `min`.
-    Run { class: usize, min: u32, max: u32 },
+    /// fails it gives back one character at a time, down to `min`, unless it
+    /// is `possessive`: such a run leaves no choice to come back to.
+    Run {
+        class: usize,
+        min: u32,
+        max: u32,
+        possessive: bool,
+    },
     /// Succeeds when the next character is not in the class.
     NotAhead(usize),
+    /// Succeeds at the end of the text and before a newline (`$`).
+    End,
+    /// The digit-grouping lookahead (see [`Node::GroupsAhead`]).
+    GroupsAhead {
+        class: usize,
+        size: u32,
+        word: usize,
+    },
     /// A choice: the ops that follow are tried first; `next` is where to go
     /// when they fail (the following alternative's `Split`, the op after an
     /// optional group, or [`NO_NEXT`] for the last alternative). `first`
@@ -421,6 +535,35 @@ struct Choice {
     count: u32,
 }
 
+/// The run of a class the digit-grouping lookahead measured last
+/// ([`Op::GroupsAhead`]): the position it measured from, the run's end and
+/// the count of the class's characters between. The end is the same for
+/// every position inside the run, so an evaluation nearby (a back-off of the
+/// digit run before the lookahead moves at most a few characters, the scanner
+/// moves forward one) reuses it with the count moved by the characters
+/// between, and a long digit run costs one scan instead of one per position.
+/// Keyed by the class's index: the parser gives every lookahead of a pattern
+/// the same classes, so the ops share the memo.
+#[derive(Clone, Copy)]
+struct RunMemo {
+    class: usize,
+    from: usize,
+    end: usize,
+    count: u32,
+}
+
+impl Default for RunMemo {
+    /// No run measured: a class index no pattern has, and an empty span.
+    fn default() -> Self {
+        Self {
+            class: usize::MAX,
+            from: 1,
+            end: 0,
+            count: 0,
+        }
+    }
+}
+
 /// Choices a match can hold at once: one per alternation and per run on the
 /// deepest path of the tree (four for the GPT-2 and Qwen patterns, six for the
 /// largest in use). A pattern that needs more is declined.
@@ -430,6 +573,11 @@ struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     classes: Vec<Class>,
     case_insensitive: bool,
+    /// The digit class and the word class of the first digit-grouping
+    /// lookahead, reused by every later one: the ops then read the same
+    /// classes under the same indices and share the match loop's one run
+    /// memo ([`RunMemo`] is keyed by the index).
+    groups_ahead: Option<(usize, usize)>,
 }
 
 impl Pattern {
@@ -439,12 +587,13 @@ impl Pattern {
             chars: pattern.chars().peekable(),
             classes: Vec::new(),
             case_insensitive: false,
+            groups_ahead: None,
         };
         let mut root = parser.parse_alternation()?;
         if parser.chars.next().is_some() {
             return None;
         }
-        if can_match_empty(&root) {
+        if can_match_empty(&root) || groups_ahead_leads(&root, true) {
             return None;
         }
         first_sets(&mut root, &parser.classes);
@@ -459,6 +608,8 @@ impl Pattern {
             },
         };
         let part = chain::Part::recognize(&root);
+        let end_anchored = holds_end(&root);
+        let reads_word_boundary = holds_groups_ahead(&root);
         let mut program = Vec::new();
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
@@ -469,6 +620,8 @@ impl Pattern {
             firsts,
             matcher,
             part,
+            end_anchored,
+            reads_word_boundary,
         })
     }
 
@@ -480,6 +633,30 @@ impl Pattern {
     /// What the pattern is as a stage of a three-stage chain, if anything.
     pub(super) fn part(&self) -> Option<&chain::Part> {
         self.part.as_ref()
+    }
+
+    /// Whether every class of the pattern is within printable ASCII and the
+    /// pattern holds no end anchor, so that it cuts a text and its byte-level
+    /// image at the same places: the anchor reads a `\n`, which the map moves
+    /// beyond ASCII, so on the raw text it would hold where the reference, on
+    /// the mapped text, sees the middle of a piece.
+    pub(super) fn within_printable_ascii(&self) -> bool {
+        !self.end_anchored && self.classes.iter().all(Class::within_printable_ascii)
+    }
+
+    /// Whether the pattern holds the end anchor `$`: it reads the end of
+    /// the text it runs over, so a text it cuts is never split into units
+    /// (see `NativeEncoder::stable_cut`).
+    pub(super) fn end_anchored(&self) -> bool {
+        self.end_anchored
+    }
+
+    /// Whether the pattern holds the digit-grouping lookahead, whose word
+    /// boundary reads the Hugging Face engine's word class: a file whose own
+    /// encoder reads `\b` with another class is declined on its path (see
+    /// `NativeEncoder::from_ranks`).
+    pub(super) fn reads_word_boundary(&self) -> bool {
+        self.reads_word_boundary
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
@@ -505,6 +682,7 @@ impl Pattern {
             text,
             pos: 0,
             choices: [Choice::default(); MAX_CHOICES],
+            memo: RunMemo::default(),
         }
     }
 
@@ -514,17 +692,100 @@ impl Pattern {
     /// compiled into it, where the iterator costs a call, a frame and an
     /// `Option` written to the stack per piece (measured: a tenth of the
     /// instructions of a warm long encode); the program keeps the iterator.
+    /// `words` says the scanners' run loops take their word scans: the loop
+    /// is compiled both ways, and the encoder chooses once per call on the
+    /// input's length (its `WORD_SCAN_MIN_BYTES`).
     #[inline(always)]
-    pub(crate) fn for_each_match<F: FnMut(usize, usize)>(&self, text: &str, mut f: F) {
+    pub(crate) fn for_each_match<F: FnMut(usize, usize)>(&self, text: &str, words: bool, mut f: F) {
         match &self.matcher {
-            Matcher::Template(scanner) => scanner.for_each_match(&self.classes, text, &mut f),
-            Matcher::Cased(scanner) => scanner.for_each_match(&self.classes, text, &mut f),
+            Matcher::Template(scanner) if words => {
+                scanner.for_each_match::<true, F>(&self.classes, text, &mut f);
+            }
+            Matcher::Template(scanner) => {
+                scanner.for_each_match::<false, F>(&self.classes, text, &mut f);
+            }
+            Matcher::Cased(scanner) if words => {
+                scanner.for_each_match::<true, F>(&self.classes, text, &mut f);
+            }
+            Matcher::Cased(scanner) => {
+                scanner.for_each_match::<false, F>(&self.classes, text, &mut f);
+            }
             Matcher::Program => {
                 for (start, end) in self.find_iter(text) {
                     f(start, end);
                 }
             }
         }
+    }
+
+    /// The run of `class` characters from `pos`: its end and their count,
+    /// through `memo` (see [`RunMemo`]). A position inside the run measured
+    /// last reuses that run's end, the count moved by the characters between
+    /// the two positions (forward, every character between is in the run;
+    /// backward, each is checked); any other position scans the run.
+    fn class_run(&self, text: &str, pos: usize, class: usize, memo: &mut RunMemo) -> (usize, u32) {
+        let set = &self.classes[class];
+        if memo.class == class && memo.from <= pos && pos <= memo.end {
+            let mut p = memo.from;
+            let mut between = 0u32;
+            while p < pos {
+                match next_char(text, p) {
+                    Some((_, len)) => {
+                        p += len;
+                        between += 1;
+                    }
+                    None => break,
+                }
+            }
+            if p == pos {
+                let count = memo.count - between;
+                *memo = RunMemo {
+                    class,
+                    from: pos,
+                    end: memo.end,
+                    count,
+                };
+                return (memo.end, count);
+            }
+        } else if memo.class == class && pos < memo.from && memo.from <= memo.end {
+            let mut p = pos;
+            let mut between = 0u32;
+            while p < memo.from {
+                match next_char(text, p) {
+                    Some((c, len)) if set.contains(c) => {
+                        p += len;
+                        between += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if p == memo.from {
+                let count = memo.count + between;
+                *memo = RunMemo {
+                    class,
+                    from: pos,
+                    end: memo.end,
+                    count,
+                };
+                return (memo.end, count);
+            }
+        }
+        let mut count = 0u32;
+        let mut end = pos;
+        while let Some((c, len)) = next_char(text, end) {
+            if !set.contains(c) {
+                break;
+            }
+            end += len;
+            count += 1;
+        }
+        *memo = RunMemo {
+            class,
+            from: pos,
+            end,
+            count,
+        };
+        (end, count)
     }
 
     /// The end of the match that starts exactly at `pos`, if any: the program
@@ -535,6 +796,7 @@ impl Pattern {
         text: &str,
         pos: usize,
         choices: &mut [Choice; MAX_CHOICES],
+        memo: &mut RunMemo,
     ) -> Option<usize> {
         let mut depth = 0usize;
         let mut pc = 0usize;
@@ -549,7 +811,12 @@ impl Pattern {
                     }
                     _ => true,
                 },
-                Op::Run { class, min, max } => {
+                Op::Run {
+                    class,
+                    min,
+                    max,
+                    possessive,
+                } => {
                     let class = &self.classes[class];
                     let mut count = 0u32;
                     let mut p = pos;
@@ -565,8 +832,10 @@ impl Pattern {
                     if count < min {
                         true
                     } else {
-                        choices[depth] = Choice { pc, pos: p, count };
-                        depth += 1;
+                        if !possessive {
+                            choices[depth] = Choice { pc, pos: p, count };
+                            depth += 1;
+                        }
                         pos = p;
                         pc += 1;
                         false
@@ -579,6 +848,41 @@ impl Pattern {
                         false
                     }
                 },
+                Op::End => {
+                    if pos == text.len() || text.as_bytes()[pos] == b'\n' {
+                        pc += 1;
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Op::GroupsAhead { class, size, word } => {
+                    // The engine takes the whole run of the class for the
+                    // repeated group and backs off one group at a time. A
+                    // boundary never falls between two characters of the
+                    // class (each is a word character), so it holds either
+                    // after the whole run, when the run holds a multiple of
+                    // `size` characters and ends the text or meets a
+                    // character outside the word class, or at the position
+                    // itself, between the character before it and the one
+                    // at it. The run is measured once per run, not once per
+                    // position (see [`RunMemo`]).
+                    let (end, run) = self.class_run(text, pos, class, memo);
+                    let word = &self.classes[word];
+                    let word_at =
+                        |p: usize| next_char(text, p).is_some_and(|(c, _)| word.contains(c));
+                    let word_before = text[..pos]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| word.contains(c));
+                    let after_run = run > 0 && run.is_multiple_of(size) && !word_at(end);
+                    if after_run || word_before != word_at(pos) {
+                        pc += 1;
+                        false
+                    } else {
+                        true
+                    }
+                }
                 Op::Split { next, first } => {
                     let excluded = match next_char(text, pos) {
                         Some((c, _)) => !self.firsts[first].may_start(c),
@@ -769,7 +1073,12 @@ impl Scanner {
         };
         let (digit, digit_cap) = match digits {
             Node::Class(class) => (*class, 1),
-            Node::ClassRepeat { class, min: 1, max } => (*class, *max),
+            Node::ClassRepeat {
+                class,
+                min: 1,
+                max,
+                possessive: false,
+            } => (*class, *max),
             _ => return None,
         };
         let [punct_prefix, punct_run, punct_break] = concat(punct)? else {
@@ -826,7 +1135,12 @@ impl Scanner {
     /// Compiled into its callers' loops: out of line it was a call per
     /// piece, and every value the loop keeps across a call is a spill.
     #[inline(always)]
-    fn match_at(&self, classes: &[Class], text: &str, pos: usize) -> Option<usize> {
+    fn match_at<const WORDS: bool>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        pos: usize,
+    ) -> Option<usize> {
         let (c, len) = self.roles.at(text, pos)?;
         let after = pos + len;
         // 1. A clitic: the first alternative whose characters follow in order.
@@ -845,12 +1159,20 @@ impl Scanner {
         if c & Role::WordPrefix.bit() != 0 {
             if let Some((d, n)) = self.roles.at(text, after) {
                 if d & Role::Word.bit() != 0 {
-                    return Some(self.roles.run_end(text, after + n, Role::Word.bit()));
+                    return Some(self.roles.run_end_as::<{ WordScan::LETTERS }, WORDS>(
+                        text,
+                        after + n,
+                        Role::Word.bit(),
+                    ));
                 }
             }
         }
         if c & Role::Word.bit() != 0 {
-            return Some(self.roles.run_end(text, after, Role::Word.bit()));
+            return Some(self.roles.run_end_as::<{ WordScan::LETTERS }, WORDS>(
+                text,
+                after,
+                Role::Word.bit(),
+            ));
         }
         // 3. Up to the bound of digits.
         if c & Role::Digit.bit() != 0 {
@@ -907,7 +1229,11 @@ impl Scanner {
         // 6. Whitespace before a non-space: the greedy run gives back its last
         //    character while a non-space follows it, down to one.
         if c & Role::TrailSpace.bit() != 0 {
-            let mut end = self.roles.run_end(text, after, Role::TrailSpace.bit());
+            let mut end = self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+                text,
+                after,
+                Role::TrailSpace.bit(),
+            );
             loop {
                 match self.roles.at(text, end) {
                     Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
@@ -922,7 +1248,11 @@ impl Scanner {
         }
         // 7. The whitespace run.
         if c & Role::Space.bit() != 0 {
-            return Some(self.roles.run_end(text, after, Role::Space.bit()));
+            return Some(self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+                text,
+                after,
+                Role::Space.bit(),
+            ));
         }
         None
     }
@@ -931,8 +1261,21 @@ impl Scanner {
     /// [`Pattern::for_each_match`]): a position no alternative matches at
     /// is passed over by one character, as the iterator does.
     #[inline(always)]
-    fn for_each_match<F: FnMut(usize, usize)>(&self, classes: &[Class], text: &str, f: &mut F) {
-        each_match(text, |pos| self.match_at(classes, text, pos), f);
+    fn for_each_match<const WORDS: bool, F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        f: &mut F,
+    ) {
+        // The closure stays inside the encoder's loop (the compiler's budget
+        // would leave it out of line with the word scans compiled into
+        // `match_at`, and the call per piece would be back).
+        each_match(
+            text,
+            #[inline(always)]
+            |pos| self.match_at::<WORDS>(classes, text, pos),
+            f,
+        );
     }
 }
 
@@ -973,6 +1316,7 @@ pub(super) fn repeat(node: &Node, min: u32, max: u32) -> Option<usize> {
             class,
             min: node_min,
             max: node_max,
+            possessive: false,
         } if *node_min == min && *node_max == max => Some(*class),
         _ => None,
     }
@@ -1003,10 +1347,16 @@ pub(super) fn previous_boundary(text: &str, pos: usize) -> usize {
 fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
     match node {
         Node::Class(class) => program.push(Op::Char(*class)),
-        Node::ClassRepeat { class, min, max } => program.push(Op::Run {
+        Node::ClassRepeat {
+            class,
+            min,
+            max,
+            possessive,
+        } => program.push(Op::Run {
             class: *class,
             min: *min,
             max: *max,
+            possessive: *possessive,
         }),
         Node::Repeat {
             node,
@@ -1078,6 +1428,12 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             }
         }
         Node::NotAhead(class) => program.push(Op::NotAhead(*class)),
+        Node::End => program.push(Op::End),
+        Node::GroupsAhead { class, size, word } => program.push(Op::GroupsAhead {
+            class: *class,
+            size: *size,
+            word: *word,
+        }),
     }
 }
 
@@ -1085,8 +1441,8 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
 /// alternation on a path leaves one until the path is done or backs off.
 fn choices(node: &Node) -> usize {
     match node {
-        Node::Class(_) | Node::NotAhead(_) => 0,
-        Node::ClassRepeat { .. } => 1,
+        Node::Class(_) | Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => 0,
+        Node::ClassRepeat { possessive, .. } => usize::from(!*possessive),
         Node::Repeat { node, max, .. } => {
             if *max == 0 {
                 0
@@ -1106,6 +1462,8 @@ pub(crate) struct Matches<'p, 't> {
     pos: usize,
     /// The matcher's stack, held here so that one text's matches share it.
     choices: [Choice; MAX_CHOICES],
+    /// The digit run measured last, shared by one text's matches the same way.
+    memo: RunMemo,
 }
 
 impl Iterator for Matches<'_, '_> {
@@ -1116,12 +1474,15 @@ impl Iterator for Matches<'_, '_> {
             let start = self.pos;
             let end = match &self.pattern.matcher {
                 Matcher::Template(scanner) => {
-                    scanner.match_at(&self.pattern.classes, self.text, start)
+                    scanner.match_at::<false>(&self.pattern.classes, self.text, start)
                 }
                 Matcher::Cased(scanner) => {
-                    scanner.match_at(&self.pattern.classes, self.text, start)
+                    scanner.match_at::<false>(&self.pattern.classes, self.text, start)
                 }
-                Matcher::Program => self.pattern.match_at(self.text, start, &mut self.choices),
+                Matcher::Program => {
+                    self.pattern
+                        .match_at(self.text, start, &mut self.choices, &mut self.memo)
+                }
             };
             match end {
                 Some(end) if end > start => {
@@ -1154,7 +1515,57 @@ fn can_match_empty(node: &Node) -> bool {
         Node::Repeat { node, min, .. } => *min == 0 || can_match_empty(node),
         Node::Concat(nodes) => nodes.iter().all(can_match_empty),
         Node::Alt { alternatives, .. } => alternatives.iter().any(can_match_empty),
-        Node::NotAhead(_) => true,
+        Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => true,
+    }
+}
+
+/// Whether a [`Node::GroupsAhead`] under `node` can be evaluated at the
+/// start of a match (`leading` says nothing that must consume stands before
+/// `node` in its alternative): its word boundary would read the character
+/// before the match, which a unit of the thread pool does not hold where the
+/// whole text does, so such a pattern declines.
+fn groups_ahead_leads(node: &Node, leading: bool) -> bool {
+    match node {
+        Node::GroupsAhead { .. } => leading,
+        Node::Concat(nodes) => {
+            let mut leading = leading;
+            nodes.iter().any(|node| {
+                let leads = groups_ahead_leads(node, leading);
+                leading = leading && can_match_empty(node);
+                leads
+            })
+        }
+        Node::Alt { alternatives, .. } => alternatives
+            .iter()
+            .any(|alternative| groups_ahead_leads(alternative, leading)),
+        Node::Repeat { node, .. } => groups_ahead_leads(node, leading),
+        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+    }
+}
+
+/// Whether `node` holds the digit-grouping lookahead anywhere.
+fn holds_groups_ahead(node: &Node) -> bool {
+    match node {
+        Node::GroupsAhead { .. } => true,
+        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+        Node::Repeat { node, .. } => holds_groups_ahead(node),
+        Node::Concat(nodes) => nodes.iter().any(holds_groups_ahead),
+        Node::Alt { alternatives, .. } => alternatives.iter().any(holds_groups_ahead),
+    }
+}
+
+/// Whether `node` holds the end anchor anywhere: such a pattern reads the
+/// end of the text it runs over.
+fn holds_end(node: &Node) -> bool {
+    match node {
+        Node::End => true,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::GroupsAhead { .. } => false,
+        Node::Repeat { node, .. } => holds_end(node),
+        Node::Concat(nodes) => nodes.iter().any(holds_end),
+        Node::Alt { alternatives, .. } => alternatives.iter().any(holds_end),
     }
 }
 
@@ -1202,7 +1613,7 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
                 .iter()
                 .fold(First::default(), |all, first| all.or(*first))
         }
-        Node::NotAhead(_) => First {
+        Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => First {
             nullable: true,
             ..First::default()
         },
@@ -1253,6 +1664,14 @@ impl Parser<'_> {
         self.classes.len() - 1
     }
 
+    /// The ASCII letters a class holds, in lower case, once each.
+    fn ascii_letters(&self, class: usize) -> Vec<char> {
+        let class = &self.classes[class];
+        ('a'..='z')
+            .filter(|&letter| class.contains(letter) || class.contains(letter.to_ascii_uppercase()))
+            .collect()
+    }
+
     fn parse_alternation(&mut self) -> Option<Node> {
         let mut alternatives = vec![self.parse_concat()?];
         while self.chars.peek() == Some(&'|') {
@@ -1271,7 +1690,7 @@ impl Parser<'_> {
 
     fn parse_concat(&mut self) -> Option<Node> {
         let mut nodes = Vec::new();
-        let mut previous_letter = None;
+        let mut previous_letters: Vec<char> = Vec::new();
         while let Some(&c) = self.chars.peek() {
             if c == '|' || c == ')' {
                 break;
@@ -1280,17 +1699,21 @@ impl Parser<'_> {
             // Under `(?i:)` the engine also matches a run of letters against
             // the one character whose full case folding is that run (ß and ẞ
             // for "ss", ﬁ for "fi", ﬆ for "st", ...), which a matcher that
-            // folds letter by letter cannot do: such runs are declined.
-            let letter = (self.case_insensitive
-                && c.is_ascii_alphabetic()
-                && matches!(nodes.last(), Some(Node::Class(_))))
-            .then(|| c.to_ascii_lowercase());
-            if let (Some(first), Some(second)) = (previous_letter, letter) {
-                if MULTI_CHARACTER_FOLDS.contains(&[first, second]) {
-                    return None;
-                }
+            // folds letter by letter cannot do: such runs are declined, a
+            // letter class standing for each letter it holds.
+            let letters = match nodes.last() {
+                Some(Node::Class(class)) if self.case_insensitive => self.ascii_letters(*class),
+                _ => Vec::new(),
+            };
+            let folds_as_one = previous_letters.iter().any(|&first| {
+                letters
+                    .iter()
+                    .any(|&second| MULTI_CHARACTER_FOLDS.contains(&[first, second]))
+            });
+            if folds_as_one {
+                return None;
             }
-            previous_letter = letter;
+            previous_letters = letters;
         }
         Some(if nodes.len() == 1 {
             nodes.pop()?
@@ -1325,22 +1748,40 @@ impl Parser<'_> {
                 if min > max {
                     return None;
                 }
-                return self.quantified(atom, min, max);
+                return self.quantified(atom, min, max, true);
             }
             _ => return Some(atom),
         };
         self.chars.next();
-        self.quantified(atom, min, max)
+        self.quantified(atom, min, max, false)
     }
 
-    fn quantified(&mut self, atom: Node, min: u32, max: u32) -> Option<Node> {
-        // Lazy (`??`, `*?`) and possessive (`?+`, `*+`) forms are not supported.
-        if matches!(self.chars.peek(), Some('?' | '+')) {
-            return None;
-        }
+    fn quantified(&mut self, atom: Node, min: u32, max: u32, interval: bool) -> Option<Node> {
+        // The lazy forms (`??`, `*?`, `+?`) are not supported. The possessive
+        // ones (`?+`, `*+`, `++`) are, on a class: the run is taken whole and
+        // never gives a character back, as the engine takes it. After an
+        // interval the engine reads a `+` as a second quantifier (a repeat of
+        // the interval), not as the possessive mark: declined.
+        let possessive = match self.chars.peek() {
+            Some('?') => return None,
+            Some('+') if interval => return None,
+            Some('+') => {
+                self.chars.next();
+                true
+            }
+            _ => false,
+        };
         Some(match atom {
-            Node::Class(class) => Node::ClassRepeat { class, min, max },
-            Node::NotAhead(_) => return None,
+            Node::Class(class) => Node::ClassRepeat {
+                class,
+                min,
+                max,
+                possessive,
+            },
+            Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => return None,
+            // A possessive group would need the engine's rule for the choices
+            // inside it (an atomic group): declined.
+            _ if possessive => return None,
             // A group that repeats would need the engine's rule for an empty
             // iteration and an unbounded choice stack: only the optional form
             // is accepted, longer runs stay with `tokenizers`.
@@ -1370,24 +1811,32 @@ impl Parser<'_> {
     fn parse_atom(&mut self) -> Option<Node> {
         let c = self.chars.next()?;
         // Under `(?i:...)` only ASCII letters and plain ASCII literals are
-        // folded the way the engine folds them, letter by letter; a class, an
-        // escape or a non-ASCII literal there would match differently, so it
-        // is declined (so are lookaheads and the letter runs the engine folds
-        // as one character; see `parse_group` and `parse_concat`).
-        if self.case_insensitive && (c == '[' || c == '\\' || !c.is_ascii()) {
+        // folded the way the engine folds them, letter by letter, and a class
+        // whose members are ASCII letters the same way (`folded_letters`); an
+        // escape, a non-ASCII literal or any other class there would match
+        // differently, so it is declined (so are lookaheads and the letter
+        // runs the engine folds as one character; see `parse_group` and
+        // `parse_concat`).
+        if self.case_insensitive && (c == '\\' || !c.is_ascii()) {
             return None;
         }
         match c {
             '(' => self.parse_group(),
             '[' => {
                 let class = self.parse_class_body()?;
+                let class = if self.case_insensitive {
+                    folded_letters(class)?
+                } else {
+                    class
+                };
                 Some(Node::Class(self.add_class(class)))
             }
             '\\' => {
                 let class = self.parse_escape_as_class()?;
                 Some(Node::Class(self.add_class(class)))
             }
-            '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | ')' | '|' | ']' => None,
+            '$' => Some(Node::End),
+            '.' | '^' | '*' | '+' | '?' | '{' | '}' | ')' | '|' | ']' => None,
             literal => Some(Node::Class(self.literal_class(literal))),
         }
     }
@@ -1399,7 +1848,10 @@ impl Parser<'_> {
         match self.chars.next()? {
             ':' => {
                 let inner = self.parse_alternation()?;
-                (self.chars.next()? == ')').then_some(inner)
+                if self.chars.next()? != ')' {
+                    return None;
+                }
+                Some(self.single_characters(inner))
             }
             'i' => {
                 if self.chars.next()? != ':' {
@@ -1428,8 +1880,86 @@ impl Parser<'_> {
                 let class = self.add_class(class);
                 Some(Node::NotAhead(class))
             }
+            '=' => self.parse_groups_ahead(),
             _ => None,
         }
+    }
+
+    /// `(?=(?:\d{n})*\b)`, the digit-grouping lookahead: a `Split` that cuts
+    /// a digit run into groups of `n` from its end puts it after `\d{1,n}`,
+    /// so the first group takes the remainder. Read as one op over the digit
+    /// run ahead ([`Node::GroupsAhead`]); any other positive lookahead is
+    /// outside the subset.
+    fn parse_groups_ahead(&mut self) -> Option<Node> {
+        if self.case_insensitive {
+            return None;
+        }
+        for expected in ['(', '?', ':', '\\', 'd', '{'] {
+            if self.chars.next()? != expected {
+                return None;
+            }
+        }
+        let size = self.parse_number().filter(|&size| size > 0)?;
+        for expected in ['}', ')', '*', '\\', 'b', ')'] {
+            if self.chars.next()? != expected {
+                return None;
+            }
+        }
+        // One pair of classes for every lookahead of the pattern (see
+        // `Parser::groups_ahead`).
+        let (class, word) = match self.groups_ahead {
+            Some(pair) => pair,
+            None => {
+                let class = self.add_class(Class {
+                    categories: CAT_DIGIT,
+                    ..Class::default()
+                });
+                let word = self.add_class(Class {
+                    categories: CAT_WORD,
+                    ..Class::default()
+                });
+                self.groups_ahead = Some((class, word));
+                (class, word)
+            }
+        };
+        Some(Node::GroupsAhead { class, size, word })
+    }
+
+    /// A group whose alternatives are each one character of a class
+    /// (`(?:\p{L}|\p{M}|\u200C|\u200D)`) is the class of their union: the
+    /// engine matches one character of whichever alternative, as it matches
+    /// one character of the class, so the group then repeats as a class does
+    /// and a letter run the hub files write this way stays native. Any other
+    /// group stays as parsed, as does one under `(?i:)`, a negated alternative
+    /// or an intersection (their union is not the union of the ranges).
+    fn single_characters(&mut self, inner: Node) -> Node {
+        let Node::Alt { alternatives, .. } = &inner else {
+            return inner;
+        };
+        // The alternatives' classes are the last ones added, in order; the
+        // union takes their place.
+        let Some(first) = self.classes.len().checked_sub(alternatives.len()) else {
+            return inner;
+        };
+        if self.case_insensitive {
+            return inner;
+        }
+        for (i, alternative) in alternatives.iter().enumerate() {
+            match alternative {
+                Node::Class(index)
+                    if *index == first + i
+                        && !self.classes[*index].negated
+                        && self.classes[*index].without == 0 => {}
+                _ => return inner,
+            }
+        }
+        let mut class = Class::default();
+        for member in &self.classes[first..] {
+            class.categories |= member.categories;
+            class.ranges.extend_from_slice(&member.ranges);
+        }
+        self.classes.truncate(first);
+        Node::Class(self.add_class(class))
     }
 
     /// A literal character as a class: itself, or under `(?i:)` every
@@ -1437,23 +1967,22 @@ impl Parser<'_> {
     fn literal_class(&mut self, c: char) -> usize {
         let mut class = Class::default();
         if self.case_insensitive && c.is_ascii_alphabetic() {
-            let lower = c.to_ascii_lowercase();
-            let upper = c.to_ascii_uppercase();
-            class.ranges.push((u32::from(lower), u32::from(lower)));
-            class.ranges.push((u32::from(upper), u32::from(upper)));
-            if let Some((_, extra)) = unicode::FOLD_EXTRA
-                .iter()
-                .find(|(letter, _)| *letter == lower as u8)
-            {
-                for &e in *extra {
-                    class.ranges.push((u32::from(e), u32::from(e)));
-                }
-            }
-            class.ranges.sort_unstable();
+            fold_letter(&mut class, c);
         } else {
             class.ranges.push((u32::from(c), u32::from(c)));
         }
         self.add_class(class)
+    }
+
+    /// The code point of a `\uHHHH` escape (four hex digits, as the engine
+    /// reads the form the hub files use for the joiners); a surrogate is no
+    /// character and declines.
+    fn code_point(&mut self) -> Option<char> {
+        let mut code = 0;
+        for _ in 0..4 {
+            code = (code << 4) | self.chars.next()?.to_digit(16)?;
+        }
+        char::from_u32(code)
     }
 
     /// An escape outside a class, as a class of its own.
@@ -1465,10 +1994,15 @@ impl Parser<'_> {
                 class.categories |= self.parse_property()?;
                 class.negated = true;
             }
+            'd' => class.categories |= CAT_DIGIT,
             's' => class.categories |= CAT_SPACE,
             'S' => {
                 class.categories |= CAT_SPACE;
                 class.negated = true;
+            }
+            'u' => {
+                let c = self.code_point()?;
+                class.ranges.push((u32::from(c), u32::from(c)));
             }
             other => {
                 let c = escaped_literal(other)?;
@@ -1540,12 +2074,18 @@ impl Parser<'_> {
                         first = false;
                         continue;
                     }
+                    'd' => {
+                        class.categories |= CAT_DIGIT;
+                        first = false;
+                        continue;
+                    }
                     's' => {
                         class.categories |= CAT_SPACE;
                         first = false;
                         continue;
                     }
-                    'P' | 'S' | 'd' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
+                    'P' | 'S' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
+                    'u' => self.code_point()?,
                     other => escaped_literal(other)?,
                 },
                 // An intersection with a negated property class closes the
@@ -1581,6 +2121,7 @@ impl Parser<'_> {
                         self.chars.next();
                         let end = match self.chars.next()? {
                             'p' | 's' | 'P' | 'S' => return None,
+                            'u' => self.code_point()?,
                             other => escaped_literal(other)?,
                         };
                         if end < item {
@@ -1601,7 +2142,6 @@ impl Parser<'_> {
                 class.ranges.push((u32::from(item), u32::from(item)));
             }
         }
-        class.ranges.sort_unstable();
         Some(class)
     }
 }
@@ -1652,7 +2192,16 @@ mod tests {
     /// without the ideographs, the rest as cl100k's.
     const KIMI: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 13] = [
+    /// The clitic group as a letter class with the apostrophe outside it,
+    /// and possessive runs; the same with greedy runs, a digit cap and a
+    /// one-space last alternative.
+    const POSSESSIVE_CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
+    const CLITIC_CLASS: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s";
+    /// A letter run whose class is written as an alternation of single
+    /// characters, the joiners as code-point escapes.
+    const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    const PATTERNS: [&str; 20] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -1666,7 +2215,28 @@ mod tests {
         TEKKEN,
         CASED_ONE_DIGIT,
         KIMI,
+        POSSESSIVE_CLITIC_CLASS,
+        CLITIC_CLASS,
+        JOINED_LETTERS,
+        END_SPACES,
+        END_LETTERS,
+        END_GROUP,
+        DIGIT_GROUPS,
     ];
+
+    /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
+    /// run that ends the text or stands before a newline.
+    const END_SPACES: &str = r"\s+$";
+    /// A letter run at the end beside one anywhere: the anchored alternative
+    /// is tried first and backs off to the other.
+    const END_LETTERS: &str = r"[a-z]+$|[a-z]+";
+    /// The anchor after a group whose alternatives nest a prefix.
+    const END_GROUP: &str = r" ?(?:ab|b)$| ?[a-z]+";
+    /// The digit-grouping split of the 255k command-a family, before its
+    /// cased template: a digit run ends in groups of three, the first group
+    /// taking the remainder, and a run that meets a word character stays
+    /// whole.
+    const DIGIT_GROUPS: &str = r"\d{1,3}(?=(?:\d{3})*\b)";
 
     /// Characters that exercise every class the patterns use: ASCII of all
     /// kinds, spaces and line breaks of several scripts, letters with and
@@ -1876,10 +2446,12 @@ mod tests {
         for pattern in [
             r"a.b",
             r"^a",
-            r"a$",
             r"(a)",
             r"a*?",
-            r"a++",
+            r"a+?",
+            r"(?:ab)?+",
+            r"(?:ab|c)++",
+            r"a{1,3}+",
             r"[[:alpha:]]",
             r"[a&&b]",
             r"[\p{L}&&\p{Han}]",
@@ -1889,15 +2461,34 @@ mod tests {
             r"[&&a]",
             r"[^&&a]",
             r"[\p{L}&&[^]]",
-            r"\d+",
             r"(?=a)",
+            r"\b",
+            r"(?=\d)",
+            r"(?=(?:\d{3})*)",
+            r"(?=(?:\d{3})*\b)",
+            r"(?=(?:\d{2,3})*\b)",
+            r"(?=(?:[0-9]{3})*\b)",
+            r"(?=(?:\p{N}{3})*\b)",
+            r"(?=(?:\d{3})+\b)",
+            r"(?=(?:\d{0})*\b)",
+            r"\d(?=(?:\d{3})*\b)?",
+            r"(?i:\d(?=(?:\d{3})*\b))",
+            // the lookahead at a match's start: its boundary would read the
+            // character before the match, which a unit of the pool lacks
+            r"(?=(?:\d{3})*\b)\d",
+            r"(?=(?:\d{3})*\b) [a-z]+|[a-z]+",
+            r"\d?(?=(?:\d{3})*\b)\d",
+            r"\d*(?=(?:\d{3})*\b)\d",
+            r"(?:\d|(?=(?:\d{3})*\b))\d",
+            r"\d|(?=(?:\d{3})*\b)\d",
+            r"(?:(?=(?:\d{3})*\b)\d)?\d",
             r"\p{Hiragana}",
             r"a{3,1}",
             r"[z-a]",
             r"(?:ab)+",
             r"(?: ?\p{L})*",
             r"(?:ab){2}",
-            r"(?i:[sdmt]|ll|ve|re)",
+            r"(?i:[a-z]|ll)",
             r"(?i:\p{Ll})",
             r"(?i:é)",
             r"\p{N}*",
@@ -1912,6 +2503,198 @@ mod tests {
             r"(?i:ss)",
             r"(?i:'st)",
             r"(?i:fi|fl|ff)",
+            r"$",
+            r"^\s+",
+            r"\s+$|^a",
+            r"a$?",
+            r"(?:a|$)",
+        ] {
+            assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    /// Our matches of `pattern` in `text`.
+    fn matches_of(pattern: &str, text: &str) -> Vec<(usize, usize)> {
+        Pattern::parse(pattern)
+            .expect("parses")
+            .find_iter(text)
+            .collect()
+    }
+
+    /// `\d` is the engine's decimal digit class: the digits of every
+    /// script and none of the other numbers (a superscript, a fraction, a
+    /// circled digit, a Roman numeral).
+    #[test]
+    fn the_digit_class_is_the_engines() {
+        let text = POOL.iter().collect::<String>() + "0123456789\u{663}\u{664}\u{6F4}\u{7C0}\u{969}\u{E52}\u{1D7D8}\u{2460}\u{216B}\u{B2}\u{BD}\u{2469}";
+        for pattern in [r"\d+", r"\d", r"\d{1,3}", r"[a-z]\d*", r"\d{2}|[^\d]+"] {
+            assert_eq!(
+                matches_of(pattern, &text),
+                oracle_matches(pattern, &text),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// The digit-grouping lookahead counts the digit run ahead as the
+    /// engine does: a run of a multiple of the group's size that ends the
+    /// text or meets a character outside the word class holds the
+    /// boundary, so the groups are cut from the end of the run, the first
+    /// taking the remainder; a run that meets a word character (a letter,
+    /// a mark, an underscore, a joiner, a Roman numeral) matches nowhere;
+    /// after a character outside the word class the boundary holds at the
+    /// position itself.
+    #[test]
+    fn the_digit_grouping_lookahead_counts_the_run_as_the_engine_does() {
+        let runs = [
+            "",
+            "1",
+            "12",
+            "123",
+            "1234",
+            "12345",
+            "123456",
+            "1234567",
+            "123456789012",
+            "\u{663}\u{664}\u{665}",
+            "\u{663}\u{664}\u{665}\u{666}",
+            "1\u{663}4",
+            "\u{969}\u{969}\u{969}",
+        ];
+        let prefixes = ["", "x", " ", ",", "\u{663}", "_", "\u{301}"];
+        let suffixes = [
+            "",
+            " ",
+            "a",
+            "\u{E9}",
+            "\u{301}",
+            "_",
+            ",",
+            ".",
+            "$",
+            "\u{2460}",
+            "\u{216B}",
+            "\u{B2}",
+            "\u{BD}",
+            "\u{200D}",
+            "\u{AA}",
+            "\u{2B0}",
+            "\u{4E2D}",
+            "\u{1F600}",
+            "\n",
+            "\u{A0}",
+            "\u{663}",
+        ];
+        for pattern in [
+            DIGIT_GROUPS,
+            r"\d{1,3}(?=(?:\d{2})*\b)",
+            r"\d(?=(?:\d{4})*\b)",
+            r"[,a](?=(?:\d{3})*\b)",
+            r"\d{2}(?=(?:\d{3})*\b)|\d",
+        ] {
+            for prefix in prefixes {
+                for run in runs {
+                    for suffix in suffixes {
+                        let text = format!("{prefix}{run}{suffix}{run}{suffix}");
+                        assert_eq!(
+                            matches_of(pattern, &text),
+                            oracle_matches(pattern, &text),
+                            "{pattern} on {text:?}"
+                        );
+                    }
+                }
+            }
+        }
+        for text in [
+            "12,345,678.90",
+            "1 000 000",
+            "2026-11-12T03:00Z",
+            "v1.2.3",
+            "1234abc 5678 90",
+            "123_456",
+            "007",
+            "\u{663}\u{664}\u{665}\u{666}\u{667}\u{668}\u{669} \u{661}\u{662}\u{663}",
+            "1\u{2460}2",
+            "x1_",
+            "99\n100",
+        ] {
+            assert_eq!(
+                matches_of(DIGIT_GROUPS, text),
+                oracle_matches(DIGIT_GROUPS, text),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_character_alternation_is_its_class() {
+        // The alternation form and the class form parse to the same cuts,
+        // and both agree with the engine, over every swept code point and
+        // over texts of letters, marks, joiners, digits and spaces.
+        let pairs = [
+            (
+                r"(?:\p{L}|\p{M}|\u200C|\u200D)+",
+                r"[\p{L}\p{M}\u200C\u200D]+",
+            ),
+            (r" ?(?:a|b|\u00E9)+|\p{N}", r" ?[ab\u00E9]+|\p{N}"),
+            (r"(?:\p{N}|[,.])+\p{L}?", r"[\p{N},.]+\p{L}?"),
+            // A range inside another: the union's ranges merge in
+            // `Class::finish`, or `d`..`z` would be read as absent.
+            (r"(?:[a-z]|c)+", r"[a-zc]+"),
+        ];
+        let mut texts: Vec<String> = code_points_swept()
+            .filter_map(char::from_u32)
+            .map(String::from)
+            .collect();
+        let pool: &[char] = &[
+            'a', 'b', '\u{E9}', '\u{E01}', '\u{301}', '\u{E31}', '\u{200C}', '\u{200D}', '1',
+            '\u{663}', ' ', ',', '.', '\n',
+        ];
+        let mut state = 0x6A09_E667_F3BC_C908u64;
+        for round in 0..2000 {
+            texts.push(
+                (0..1 + round % 16)
+                    .map(|_| pool[(pseudo_random(&mut state) % pool.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for (alternation, class) in pairs {
+            let ours = Pattern::parse(alternation).expect("the alternation parses");
+            let theirs = Pattern::parse(class).expect("the class parses");
+            let engine = SysRegex::new(alternation).expect("the engine compiles the alternation");
+            for text in &texts {
+                let cuts: Vec<(usize, usize)> = ours.find_iter(text).collect();
+                assert_eq!(
+                    cuts,
+                    theirs.find_iter(text).collect::<Vec<_>>(),
+                    "{alternation:?} on {text:?}"
+                );
+                assert_eq!(
+                    cuts,
+                    engine.find_iter(text).collect::<Vec<_>>(),
+                    "the engine on {alternation:?} {text:?}"
+                );
+            }
+        }
+        // A `\u` escape is a code point in an atom, in a class and as a
+        // range end; the other shapes stay declined.
+        let cuts = |pattern: &str, text: &str| -> Vec<(usize, usize)> {
+            Pattern::parse(pattern)
+                .expect("parses")
+                .find_iter(text)
+                .collect()
+        };
+        assert_eq!(cuts(r"\u0041+", "AAb"), oracle_matches(r"\u0041+", "AAb"));
+        assert_eq!(cuts(r"\u0041+", "AAb"), vec![(0, 2)]);
+        assert_eq!(cuts(r"[\u0041-\u0043]+", "ABCD"), vec![(0, 3)]);
+        for pattern in [
+            r"\u00",
+            r"\u00G1",
+            r"\uD800",
+            r"(?:ab|c)+",
+            r"(?:[^a]|b)+",
+            r"(?:\p{L}|\p{M}+)+",
+            r"(?i:(?:a|b)+)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
@@ -2059,6 +2842,83 @@ mod tests {
                 ),
                 "{pattern}"
             );
+        }
+    }
+
+    /// The run sites name the word scans their roles carry on the real
+    /// templates: the template's letter run is the letters, the cased
+    /// template's upper and lower runs are the upper-case and the lower-case
+    /// letters, and the white-space runs of both are the white space; the
+    /// digit, punctuation and line-break roles run byte by byte. A class
+    /// change that dropped a scan would keep the ids and lose the gain; it
+    /// fails here instead.
+    #[test]
+    fn the_run_sites_name_the_scans_their_roles_carry() {
+        for pattern in [CL100K, QWEN2, QWEN35, TWO_DIGITS, ANY_DIGITS] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Template(scanner) = &parsed.matcher else {
+                panic!("the template takes its scanner: {pattern}");
+            };
+            let roles = &scanner.roles;
+            assert_eq!(
+                roles.scan_of(Role::Word.bit()),
+                WordScan::LETTERS,
+                "{pattern}"
+            );
+            for role in [Role::TrailSpace, Role::Space] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::SPACES,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [Role::Digit, Role::Punct, Role::PunctBreak, Role::Break] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::NONE,
+                    "{pattern} {role:?}"
+                );
+            }
+        }
+        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Cased(scanner) = &parsed.matcher else {
+                panic!("the cased template takes its scanner: {pattern}");
+            };
+            let roles = scanner.roles();
+            for role in [cased::Role::Upper1, cased::Role::Upper2] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::UPPER,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [cased::Role::Lower1, cased::Role::Lower2] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::LOWER,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [cased::Role::TrailSpace, cased::Role::Space] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::SPACES,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [
+                cased::Role::Digit,
+                cased::Role::Punct,
+                cased::Role::PunctBreak,
+                cased::Role::Break,
+            ] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::NONE,
+                    "{pattern} {role:?}"
+                );
+            }
         }
     }
 
@@ -2280,6 +3140,106 @@ mod tests {
     }
 
     #[test]
+    fn possessive_runs_never_give_back() {
+        // `a++a` cannot match "aaa": the run takes every a and gives none
+        // back, so the alternative fails where the greedy `a+a` matches.
+        assert_eq!(oracle_matches(r"a++a", "aaa"), Vec::<(usize, usize)>::new());
+        assert_eq!(oracle_matches(r"a+a", "aaa"), vec![(0, 3)]);
+        for (pattern, text) in [
+            (r"a++a|a", "aaa b"),
+            (r"a*+a|a", "aaa"),
+            (r"a?+a|x", "aa x a"),
+            (r"[^x]?+x|x", "ax xx x"),
+            (r"\p{L}++\p{N}|\p{L}", "ab1 ab a"),
+            (r" ?[^\s\p{L}\p{N}]++[\r\n]*|\s", " !!\n ?\r\n x"),
+            (
+                POSSESSIVE_CLITIC_CLASS,
+                "it's 'S don't 'LL x'veY  a1 2,3 \n\n  x \r\n 'ſ",
+            ),
+            (
+                CLITIC_CLASS,
+                "it's 'S don't 'LL x'veY  a1234 2,3 \n\n  x \r\n 'ſ",
+            ),
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert_eq!(
+                parsed.find_iter(text).collect::<Vec<_>>(),
+                oracle_matches(pattern, text),
+                "pattern {pattern:?} text {text:?}"
+            );
+        }
+        // A possessive run holds no choice: the stack a pattern needs is
+        // counted without it.
+        let mut parser = Parser {
+            chars: "a++b+".chars().peekable(),
+            classes: Vec::new(),
+            case_insensitive: false,
+            groups_ahead: None,
+        };
+        let root = parser.parse_alternation().expect("parses");
+        assert_eq!(choices(&root), 1);
+        // The engine's possessive mark on a group, and a `+` after an
+        // interval (a second quantifier to the engine), stay outside the
+        // subset.
+        for pattern in [
+            r"(?:ab)++",
+            r"(?:ab|c)?+",
+            r"(?:'s)*+",
+            r"a{2}+",
+            r"a{1,3}+",
+            r"a{2,}+",
+        ] {
+            assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn case_insensitive_letter_classes_fold_each_letter() {
+        // The engine folds a class's members like literals: `[sdmt]` under
+        // `(?i:)` takes S, D, M, T and the long s, and nothing of ß.
+        for pattern in [
+            r"'(?i:[sdmt]|ll|ve|re)",
+            r"(?i:[sdmt])",
+            r"(?i:[kK]|x)",
+            r"(?i:[tT]|a[sd])",
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            for text in ["'S 'd 'LL 'ſ 'ß 'K '\u{212A}", "x K \u{212A} k t as AD aß"] {
+                assert_eq!(
+                    parsed.find_iter(text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, text),
+                    "pattern {pattern:?} text {text:?}"
+                );
+            }
+            let mut state = 0x5EED_0000_1234_5678u64;
+            for round in 0..500 {
+                let text = random_text(&mut state, 1 + round % 24);
+                assert_eq!(
+                    parsed.find_iter(&text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, &text),
+                    "pattern {pattern:?} text {text:?}"
+                );
+            }
+        }
+        // A class with anything but ASCII letters stays declined, and so does
+        // a letter class beside a literal letter the engine folds with one of
+        // its letters as one character.
+        for pattern in [
+            r"(?i:[a-z])",
+            r"(?i:[s\p{L}])",
+            r"(?i:[^s])",
+            r"(?i:[sé])",
+            r"(?i:[s1])",
+            r"(?i:[s\s])",
+            r"(?i:[st]s)",
+            r"(?i:f[fil])",
+            r"(?i:[sx][st])",
+        ] {
+            assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    #[test]
     fn case_insensitive_groups_decline_classes_and_non_ascii_literals() {
         // Under `(?i:)` the engine folds classes, properties and non-ASCII
         // literals as well; this matcher folds ASCII letters only, so a
@@ -2292,7 +3252,7 @@ mod tests {
         assert_eq!(oracle_matches(r"(?i:é)", "É"), vec![(0, 2)]);
         for (pattern, text) in [
             (r"(?i:[a-z]+)", "ABC \u{17F} \u{212A}"),
-            (r"(?i:[sdmt]|ll|ve|re)", "'S 'LL"),
+            (r"(?i:[s\p{Ll}]|ll)", "'S 'LL"),
             (r"(?i:\p{Ll})", "A"),
             (r"(?i:é)", "É"),
             (r"(?i:'[a-z])", "'S"),
@@ -2352,6 +3312,44 @@ mod tests {
         }
     }
 
+    /// A long digit run costs one scan whatever follows it (the memo of the
+    /// run's end moves with the match loop through back-offs and starts), and
+    /// cuts as the engine cuts it: a run that meets a letter (the boundary
+    /// fails after the run, every start backs off three times), a run that
+    /// ends the text, one that meets a space, runs of a multiple of three,
+    /// and digits of another script (two bytes each, the memo counts
+    /// characters).
+    #[test]
+    fn a_long_digit_run_is_measured_once_whatever_follows() {
+        let run = "1".repeat(4096);
+        let arabic = "\u{663}".repeat(301);
+        for pattern in [
+            DIGIT_GROUPS,
+            r"\d{2}(?=(?:\d{3})*\b)|\d|[a-z]+",
+            // two lookaheads share the classes and the memo
+            r"\d{1,3}(?=(?:\d{3})*\b)|\d{1,2}(?=(?:\d{2})*\b)|[a-z]+",
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            for text in [
+                format!("{run}a"),
+                run.clone(),
+                format!("{run} x"),
+                format!("{}a", &run[..3999]),
+                format!("{arabic}a {arabic}"),
+                format!("{run}a{}", &run[..300]),
+                "12 123 1234a 12345 123456 1234567a 1,234,567.89x".to_owned(),
+            ] {
+                let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+                assert_eq!(
+                    ours,
+                    oracle_matches(pattern, &text),
+                    "{pattern} on {} bytes",
+                    text.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn group_repeats_and_long_runs_on_a_small_stack() {
         // A group under `+`, `*` or `{n,}` is declined (its choices would
@@ -2366,7 +3364,7 @@ mod tests {
                     r"(?:\r?\n)+",
                     r"(?: ?\p{L})+",
                     r"(?:ab)*",
-                    r"(?:a|b){2,}",
+                    r"(?:ab|c){2,}",
                     r"(?:'s){1,3}",
                 ] {
                     assert!(Pattern::parse(pattern).is_none(), "{pattern}");

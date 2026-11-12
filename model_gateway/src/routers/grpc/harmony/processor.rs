@@ -26,7 +26,10 @@ use crate::{
         grpc::{
             common::{
                 response_collection, response_formatting,
-                responses::utils::{generation_failure_error, response_status},
+                responses::{
+                    streaming::OutputItemKind,
+                    utils::{generation_failure_error, response_status},
+                },
             },
             context::{DispatchMetadata, ExecutionResult},
             regular::processor::generation_start,
@@ -218,7 +221,8 @@ impl HarmonyResponseProcessor {
         // The usage from the engine's counters, built as the streamed answer
         // builds its usage chunk: with the reasoning tokens the parser
         // counted and every detail counter present as the OpenAI API sends it.
-        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let counts =
+            response_formatting::TokenCounts::of_collected(&all_responses, chat_request.choices());
         let usage = chat_usage(counts, total_reasoning_tokens);
 
         // Final ChatCompletionResponse
@@ -397,7 +401,7 @@ impl HarmonyResponseProcessor {
         // Map analysis channel → ResponseOutputItem::Reasoning
         if let Some(analysis) = parsed.analysis {
             let reasoning_item = ResponseOutputItem::new_reasoning(
-                format!("reasoning_{}", dispatch.request_id),
+                OutputItemKind::Reasoning.new_id(),
                 vec![],
                 vec![ResponseReasoningContent::ReasoningText { text: analysis }],
                 Some("completed".to_string()),
@@ -414,7 +418,7 @@ impl HarmonyResponseProcessor {
         // Map final channel → ResponseOutputItem::Message
         if !parsed.final_text.is_empty() {
             let message_item = ResponseOutputItem::Message {
-                id: format!("msg_{}", dispatch.request_id),
+                id: OutputItemKind::Message.new_id(),
                 role: "assistant".to_string(),
                 content: vec![ResponseContentPart::OutputText {
                     text: parsed.final_text,

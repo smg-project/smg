@@ -41,13 +41,37 @@ use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use super::streaming::build_sse_response_from_stream;
 use crate::{
+    middleware::edge_body::BodyFailure,
     routers::common::sse::{SseReceiver, SseSender},
     worker::GuardedStream,
 };
 
+/// How a reading ended: with its stream complete, or with the client told of
+/// a failure by the error event the stream ends with (before its `[DONE]`).
+/// The body hands the word on to the edge ([`BodyFailure`]), which then
+/// counts the response as a body that failed, what the client read, where
+/// the frames alone would say it went out in full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadingEnd {
+    Complete,
+    Failed,
+}
+
+impl ReadingEnd {
+    /// The end of a reading that told the client of `result`'s failure, if
+    /// it was one.
+    pub(crate) fn of<T, E>(result: &Result<T, E>) -> Self {
+        match result {
+            Ok(_) => Self::Complete,
+            Err(_) => Self::Failed,
+        }
+    }
+}
+
 /// The reading a streamed response's body drives: the response stage over
-/// the channel's sender, boxed once (the allocation a spawned task made).
-pub(crate) type Reading = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+/// the channel's sender, boxed once (the allocation a spawned task made),
+/// ending in its word on how the stream ended.
+pub(crate) type Reading = Pin<Box<dyn Future<Output = ReadingEnd> + Send + 'static>>;
 
 /// The channel of a body-driven stream: room for one frame. The reading
 /// parks on its second send until the body took the first, so every frame
@@ -65,6 +89,9 @@ pub(crate) struct DrivenBody {
     /// `None` once the reading ended: its last frames are the channel's.
     reading: Option<Reading>,
     rx: SseReceiver,
+    /// The reading's word when it ended failed, for the edge's count of the
+    /// response (the response's cell, shared with the edge).
+    failure: BodyFailure,
     /// The body handed its first frame out.
     first_frame_out: bool,
     /// The next poll is pending with the task woken, so the connection
@@ -77,9 +104,16 @@ impl DrivenBody {
         Self {
             reading: Some(reading),
             rx,
+            failure: BodyFailure::default(),
             first_frame_out: false,
             yield_once: false,
         }
+    }
+
+    /// The reading's word on a failure it told the client of, shared: told
+    /// when the reading ends failed, read by the edge at the body's end.
+    pub(crate) fn failure(&self) -> &BodyFailure {
+        &self.failure
     }
 
     /// `frame` on its way out: the first one is followed by a yield.
@@ -125,8 +159,13 @@ impl Stream for DrivenBody {
             // state (its engine stream, its guards, its sender).
             match reading.as_mut().poll(cx) {
                 // The reading ended: its last frames are read above, then
-                // the channel's end.
-                Poll::Ready(()) => {}
+                // the channel's end. Its word on a failure it told the
+                // client of is the edge's before those frames go out.
+                Poll::Ready(end) => {
+                    if end == ReadingEnd::Failed {
+                        this.failure.tell();
+                    }
+                }
                 // The reading parked, on the engine or on the channel, with
                 // this task's waker registered where it parked; what it
                 // wrote before parking is handed to the connection now. The
@@ -171,12 +210,35 @@ impl Drop for DrivenBody {
 /// `reading` (see [`DrivenBody`]) and owns `guards` for as long as it lives:
 /// they ride in the body's own stream ([`GuardedStream`]) and are dropped
 /// with it, with no wrapper over the body (a wrapper is a boxed
-/// `poll_frame` more on every frame out).
+/// `poll_frame` more on every frame out). The reading's word on how it
+/// ended goes to the edge in the response's cell, so a stream that told the
+/// client of a failure counts as one.
 pub(crate) fn build_sse_response_driven<G>(reading: Reading, rx: SseReceiver, guards: G) -> Response
 where
     G: Send + Unpin + 'static,
 {
-    build_sse_response_from_stream(GuardedStream::new(DrivenBody::new(reading, rx), guards))
+    build_sse_response_driven_with(reading, rx, guards, build_sse_response_from_stream)
+}
+
+/// [`build_sse_response_driven`] whose response `respond` builds from the
+/// body's guarded stream (a route that wraps the stream, as the chat route
+/// re-chunks it, builds its response here so the reading's word still
+/// reaches the edge).
+pub(crate) fn build_sse_response_driven_with<G, F>(
+    reading: Reading,
+    rx: SseReceiver,
+    guards: G,
+    respond: F,
+) -> Response
+where
+    G: Send + Unpin + 'static,
+    F: FnOnce(GuardedStream<DrivenBody, G>) -> Response,
+{
+    let body = DrivenBody::new(reading, rx);
+    let failure = body.failure().clone();
+    let mut response = respond(GuardedStream::new(body, guards));
+    failure.carry(&mut response);
+    response
 }
 
 #[cfg(test)]
@@ -195,6 +257,7 @@ mod tests {
     use tokio::sync::{oneshot, Notify};
 
     use super::*;
+    use crate::middleware::edge_body::BodyDuties;
 
     fn frame(text: &str) -> Bytes {
         Bytes::copy_from_slice(text.as_bytes())
@@ -206,6 +269,50 @@ mod tests {
             .await
     }
 
+    /// The reading's word reaches the body's failure: a reading that ends
+    /// failed tells it, before its last frames go out; one that ends
+    /// complete tells nothing.
+    #[tokio::test]
+    async fn a_reading_that_ends_failed_tells_the_bodys_failure() {
+        for (end, told) in [(ReadingEnd::Failed, true), (ReadingEnd::Complete, false)] {
+            let (tx, rx) = driven_channel();
+            let reading = async move {
+                tx.send(Ok(frame("data: {\"error\":{}}\n\n")))
+                    .await
+                    .expect("the body reads");
+                tx.send(Ok(frame("data: [DONE]\n\n")))
+                    .await
+                    .expect("the body reads");
+                end
+            };
+            let body = DrivenBody::new(Box::pin(reading), rx);
+            let failure = body.failure().clone();
+            assert!(!failure.told(), "nothing told before the reading ran");
+            assert_eq!(texts(body).await.len(), 2, "{end:?}");
+            assert_eq!(failure.told(), told, "{end:?}");
+        }
+    }
+
+    /// The response over a driven body hands the reading's word to the edge
+    /// in the response's cell, told as the reading ends.
+    #[tokio::test]
+    async fn the_driven_response_hands_the_failure_to_the_edge() {
+        let (tx, rx) = driven_channel();
+        let reading = async move {
+            let _ = tx.send(Ok(frame("data: [DONE]\n\n"))).await;
+            ReadingEnd::Failed
+        };
+        let mut response = build_sse_response_driven(Box::pin(reading), rx, ());
+        let mut duties = BodyDuties::take(&mut response);
+        let failure = duties.take_failure().expect("the failure handed over");
+        assert!(!failure.told(), "nothing told before the body is read");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("the body");
+        assert_eq!(body.as_ref(), b"data: [DONE]\n\n");
+        assert!(failure.told(), "told as the reading ended");
+    }
+
     /// The frames come out in the order the reading wrote them, and the body
     /// ends with the reading: nothing is spawned for it.
     #[tokio::test]
@@ -215,6 +322,7 @@ mod tests {
             for text in ["one", "two", "three"] {
                 tx.send(Ok(frame(text))).await.expect("the body reads");
             }
+            ReadingEnd::Complete
         };
         let body = DrivenBody::new(Box::pin(reading), rx);
         assert_eq!(texts(body).await, ["one", "two", "three"]);
@@ -232,6 +340,7 @@ mod tests {
                     .await
                     .expect("the body reads");
             }
+            ReadingEnd::Complete
         };
         let body = DrivenBody::new(Box::pin(reading), rx);
         let expected: Vec<String> = (0..count).map(|i| i.to_string()).collect();
@@ -253,6 +362,7 @@ mod tests {
                     tx.send(Ok(frame(text))).await.expect("the body reads");
                     written.fetch_add(1, Ordering::SeqCst);
                 }
+                ReadingEnd::Complete
             }
         };
         let mut body = DrivenBody::new(Box::pin(reading), rx);
@@ -317,6 +427,7 @@ mod tests {
                 tx.send(Ok(frame("first"))).await.expect("the body reads");
                 gate.notified().await;
                 tx.send(Ok(frame("second"))).await.expect("the body reads");
+                ReadingEnd::Complete
             }
         };
         let mut body = DrivenBody::new(Box::pin(reading), rx);
@@ -357,6 +468,7 @@ mod tests {
                 let closed = tx.is_closed();
                 let late_send_failed = tx.send(Ok(frame("late"))).await.is_err();
                 let _ = ended_tx.send((closed, late_send_failed));
+                ReadingEnd::Complete
             }
         };
         let mut body = DrivenBody::new(Box::pin(reading), rx);

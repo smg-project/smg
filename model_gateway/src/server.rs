@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Extension, Path, Query, RawQuery, Request, State},
+    extract::{Extension, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, Route},
@@ -37,7 +37,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-    validated::ValidatedJson,
+    validated::{ValidatedJson, ValidatedPath, ValidatedQuery},
     worker::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerListFormat, WorkerSpec,
         WorkerUpdateRequest,
@@ -56,6 +56,7 @@ use wfaas::LoggingSubscriber;
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod posture;
+mod rate_limit_document;
 pub(crate) mod tls;
 
 // The HTTP client constructors and the process crypto provider they install
@@ -80,7 +81,7 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams,
+        common::{header_utils, realtime::ws::RealtimeQueryParams},
         error as route_error,
         gateway::Gateway,
         grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
@@ -88,7 +89,7 @@ use crate::{
         RouterTrait,
     },
     server::{
-        connection_limit::ConnectionLimitAcceptor,
+        connection_limit::{BoundedListener, ConnectionLimitAcceptor},
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     },
     service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
@@ -96,6 +97,7 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         admin_json::AdminJson,
+        admin_params::{AdminPath, AdminQuery},
         endpoint::Endpoint,
         manager::{WorkerManager, WorkerManagerConfig},
         ConnectionMode,
@@ -127,14 +129,14 @@ pub struct AppState {
 
 async fn parse_function_call(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ParseFunctionCallRequest>,
+    AdminJson(req): AdminJson<ParseFunctionCallRequest>,
 ) -> Response {
     parse::parse_function_call(&state.context, &req).await
 }
 
 async fn parse_reasoning(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SeparateReasoningRequest>,
+    AdminJson(req): AdminJson<SeparateReasoningRequest>,
 ) -> Response {
     parse::parse_reasoning(&state.context, &req).await
 }
@@ -207,7 +209,7 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
 
 async fn v1_model(
     State(state): State<Arc<AppState>>,
-    Path(model_id): Path<String>,
+    ValidatedPath(model_id): ValidatedPath<String>,
     req: Request,
 ) -> Response {
     let request_id = middleware::request_id_of(&req);
@@ -223,7 +225,7 @@ async fn generate(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<GenerateRequest>,
+    ValidatedJson(body): ValidatedJson<GenerateRequest>,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -269,6 +271,13 @@ async fn v1_completions(
         .await
 }
 
+/// The native rerank route: `RerankRequest`, its `model` required and the
+/// body validated before dispatch. A regular HTTP worker serves it at its own
+/// `/v1/rerank`; the gateway reads the worker's answer in the bare-list and
+/// the `results`-object shapes of the rerank contracts and answers in its own
+/// shape (`results` of `score`, `document` and `index`, `top_k` and
+/// `return_documents` applied here). A router kind without a rerank path
+/// answers 501.
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -286,6 +295,10 @@ async fn rerank(
         .await
 }
 
+/// The OpenAI-compatible rerank route: `V1RerankReqInput` (`query`,
+/// `documents`, an optional `model`, `top_n` and `return_documents`), routed
+/// by `model` as `/v1/embeddings` is; a body without one goes to any worker,
+/// as a single-model server's client expects. The rest is the native route's.
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -449,18 +462,30 @@ fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Re
     else {
         return Ok(());
     };
-    let interleaved = headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|beta| beta.trim().starts_with("interleaved-thinking"));
+    let interleaved = header_utils::anthropic_beta_named(headers, "interleaved-thinking");
     if interleaved || *budget_tokens < body.max_tokens {
         Ok(())
     } else {
         Err(route_error::bad_request(
             "thinking_budget_exceeds_max_tokens",
             "`max_tokens` must be greater than `thinking.budget_tokens`",
+        ))
+    }
+}
+
+/// A thread turn names the message-threads beta, as the public API requires
+/// (`anthropic-beta: message-threads-2026-08-12`). That header is what tells
+/// the body layer to parse the request before the route, so a `thread` field
+/// without it is refused here with the public API's own 400 on the parsed
+/// (buffered) path. A header-less turn on the raw pass-through path never
+/// reaches this handler: it is forwarded unparsed, `thread` and all.
+fn check_thread_beta(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
+    if body.thread.is_none() || header_utils::anthropic_beta_named(headers, "message-threads") {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "thread_beta_required",
+            "`thread` requires the `anthropic-beta: message-threads-2026-08-12` header",
         ))
     }
 }
@@ -476,6 +501,9 @@ async fn v1_messages(
         return refused;
     }
     if let Err(refused) = check_thinking_budget(&headers, &body) {
+        return refused;
+    }
+    if let Err(refused) = check_thread_beta(&headers, &body) {
         return refused;
     }
     let model = body.model.clone();
@@ -550,7 +578,7 @@ async fn v1_audio_transcriptions(
 async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::get_response(
@@ -564,7 +592,7 @@ async fn v1_responses_get(
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
     headers: HeaderMap,
 ) -> Response {
     state
@@ -576,7 +604,7 @@ async fn v1_responses_cancel(
 async fn v1_responses_delete(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::delete_response(
@@ -590,7 +618,7 @@ async fn v1_responses_delete(
 async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::list_response_input_items(
@@ -614,7 +642,7 @@ async fn v1_conversations_create(
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::get_conversation(
@@ -628,7 +656,7 @@ async fn v1_conversations_get(
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
     Json(body): Json<Value>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
@@ -644,7 +672,7 @@ async fn v1_conversations_update(
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation(
@@ -665,12 +693,12 @@ struct ListItemsQuery {
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
-    Query(ListItemsQuery {
+    ValidatedPath(conversation_id): ValidatedPath<String>,
+    ValidatedQuery(ListItemsQuery {
         limit,
         order,
         after,
-    }): Query<ListItemsQuery>,
+    }): ValidatedQuery<ListItemsQuery>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::list_conversation_items(
@@ -688,7 +716,7 @@ async fn v1_conversations_list_items(
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
     Json(body): Json<Value>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
@@ -705,7 +733,7 @@ async fn v1_conversations_create_items(
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
+    ValidatedPath((conversation_id, item_id)): ValidatedPath<(String, String)>,
     RawQuery(query): RawQuery,
 ) -> Response {
     // `include` arrives as repeated `include[]=` / `include=` pairs; each value
@@ -729,7 +757,7 @@ async fn v1_conversations_get_item(
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
+    ValidatedPath((conversation_id, item_id)): ValidatedPath<(String, String)>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation_item(
@@ -744,7 +772,7 @@ async fn v1_conversations_delete_item(
 
 async fn v1_realtime_webrtc(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<RealtimeQueryParams>,
+    ValidatedQuery(params): ValidatedQuery<RealtimeQueryParams>,
     req: Request,
 ) -> Response {
     // Model may come from query param (application/sdp) or session body
@@ -755,7 +783,7 @@ async fn v1_realtime_webrtc(
 
 async fn v1_realtime_ws(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<RealtimeQueryParams>,
+    ValidatedQuery(params): ValidatedQuery<RealtimeQueryParams>,
     req: Request,
 ) -> Response {
     let model = match params.model {
@@ -812,9 +840,9 @@ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Respo
 
 async fn start_profile(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<StartProfileRequest>>,
+    body: Option<AdminJson<StartProfileRequest>>,
 ) -> Response {
-    let body = body.map_or_else(StartProfileRequest::default, |Json(body)| body);
+    let body = body.map_or_else(StartProfileRequest::default, |AdminJson(body)| body);
     WorkerManager::start_profile_all(
         &state.context.worker_registry,
         &body.options,
@@ -826,9 +854,9 @@ async fn start_profile(
 
 async fn stop_profile(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<StopProfileRequest>>,
+    body: Option<AdminJson<StopProfileRequest>>,
 ) -> Response {
-    let body = body.map_or_else(StopProfileRequest::default, |Json(body)| body);
+    let body = body.map_or_else(StopProfileRequest::default, |AdminJson(body)| body);
     WorkerManager::stop_profile_all(&state.context.worker_registry, body.url.as_deref())
         .await
         .into_response()
@@ -845,7 +873,7 @@ async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
 
 async fn get_loads(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListWorkersQuery>,
+    AdminQuery(query): AdminQuery<ListWorkersQuery>,
 ) -> Response {
     let snapshot = state
         .context
@@ -878,7 +906,7 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &["/config"];
+pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants"];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -904,7 +932,9 @@ async fn admin_config(State(state): State<Arc<AppState>>) -> Response {
 /// `POST /secrets/reload`: the keys read again from their files and put in
 /// force. The `admin` role alone. 409 when no key came from a file; 422
 /// when a file cannot be used, every set standing as it was; 200 with the
-/// files read and whether each set changed.
+/// files read and whether each set changed. The keys the gateway accepts
+/// alone: the shared key it sends upstream to its workers keeps the start's
+/// value until a restart.
 async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
     // The role is the control-plane gate's: it admits `admin` alone to a
     // POST before any handler, and the role matrix test pins this route.
@@ -935,14 +965,23 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/config", get(admin_config))
         .route("/secrets/reload", post(reload_secrets))
+        .route(
+            "/rate-limits/tenants",
+            get(rate_limit_document::get).put(rate_limit_document::put),
+        )
 }
 
 /// The gated routes by name, in the order of `gated_control_plane_routes`.
-pub const GATED_ROUTES: &[(&str, &str)] = &[("GET", "/config"), ("POST", "/secrets/reload")];
+pub const GATED_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/config"),
+    ("POST", "/secrets/reload"),
+    ("GET", "/rate-limits/tenants"),
+    ("PUT", "/rate-limits/tenants"),
+];
 
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListWorkersQuery>,
+    AdminQuery(query): AdminQuery<ListWorkersQuery>,
 ) -> Response {
     let mut result = state
         .context
@@ -962,7 +1001,7 @@ async fn list_workers_rest(
 
 async fn get_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
         Ok(mut result) => {
@@ -978,7 +1017,7 @@ async fn get_worker(
 
 async fn delete_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
 ) -> Response {
     match state
         .context
@@ -993,7 +1032,7 @@ async fn delete_worker(
 
 async fn update_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
     AdminJson(update): AdminJson<WorkerUpdateRequest>,
 ) -> Response {
     match state
@@ -1009,7 +1048,7 @@ async fn update_worker(
 
 async fn replace_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
     AdminJson(config): AdminJson<WorkerSpec>,
 ) -> Response {
     match state
@@ -1031,14 +1070,14 @@ async fn v1_tokenize(
     State(state): State<Arc<AppState>>,
     Json(request): Json<TokenizeRequest>,
 ) -> Response {
-    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+    tokenize::tokenize(&state.context, request).await
 }
 
 async fn v1_detokenize(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DetokenizeRequest>,
 ) -> Response {
-    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+    tokenize::detokenize(&state.context, request).await
 }
 
 async fn v1_tokenizers_add(
@@ -1054,24 +1093,28 @@ async fn v1_tokenizers_list(State(state): State<Arc<AppState>>) -> Response {
 
 async fn v1_tokenizers_get(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::get_tokenizer_info(&state.context, &tokenizer_id).await
 }
 
 async fn v1_tokenizers_status(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::get_tokenizer_status(&state.context, &tokenizer_id).await
 }
 
 async fn v1_tokenizers_remove(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
+
+/// The shutdown grace in seconds a start takes when none is configured: the
+/// CLI flag's default and [`ServerConfig::minimal`]'s.
+pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 180;
 
 pub struct ServerConfig {
     /// The router configuration, which carries the listener settings too:
@@ -1115,6 +1158,35 @@ pub struct ServerConfig {
     /// them as the route does. Nothing to watch without a file source; the
     /// start says so.
     pub secrets_auto_reload: bool,
+}
+
+impl ServerConfig {
+    /// A server with the listener `router_config` names and nothing else: no
+    /// log file, no discovery, no mesh, no metrics endpoint, no control-plane
+    /// authentication, no secret source, the CLI's default shutdown grace. A
+    /// library caller or a test starts from it and sets what it needs by a
+    /// struct update, so a field added here with its default breaks no
+    /// hand-built literal.
+    pub fn minimal(router_config: RouterConfig) -> Self {
+        Self {
+            router_config,
+            log_dir: None,
+            log_level: None,
+            log_json: false,
+            service_discovery_config: None,
+            mesh_discovery_config: None,
+            prometheus_config: None,
+            shutdown_grace_period_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
+            shutdown_settle_secs: None,
+            control_plane_auth: None,
+            mesh_server_config: None,
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+            secret_sources: Default::default(),
+            secret_files: Default::default(),
+            secrets_auto_reload: false,
+        }
+    }
 }
 
 /// `Router::layer` for an application-wide layer a configuration may leave
@@ -1963,7 +2035,10 @@ pub fn run(
     // Driven from the runtime: on a current-thread runtime nothing else polls
     // the exporter's connection while the shutdown waits for the export.
     if let Err(e) = runtime.block_on(runtime.spawn_blocking(otel_trace::shutdown_otel)) {
-        #[expect(clippy::print_stderr)]
+        #[expect(
+            clippy::print_stderr,
+            reason = "close_logging above stopped the writers; stderr is the one channel left"
+        )]
         {
             eprintln!("[tracing] OpenTelemetry shutdown task failed: {e}");
         }
@@ -2108,6 +2183,7 @@ fn serve_listeners(
                         .map(|acceptor| {
                             ConnectionLimitAcceptor::new(
                                 tls_acceptor(acceptor, connection_timeouts),
+                                BoundedListener::Admin,
                                 admin_max_connections,
                             )
                         })
@@ -2118,6 +2194,7 @@ fn serve_listeners(
                     axum_server::from_tcp(admin_listener)?
                         .acceptor(ConnectionLimitAcceptor::new(
                             http_acceptor(connection_timeouts),
+                            BoundedListener::Admin,
                             admin_max_connections,
                         ))
                         .handle(admin_handle)
@@ -2136,6 +2213,7 @@ fn serve_listeners(
                 .map(|acceptor| {
                     ConnectionLimitAcceptor::new(
                         tls_acceptor(acceptor, connection_timeouts),
+                        BoundedListener::Data,
                         max_connections,
                     )
                 })
@@ -2147,6 +2225,7 @@ fn serve_listeners(
             axum_server::from_tcp(listener)?
                 .acceptor(ConnectionLimitAcceptor::new(
                     http_acceptor(connection_timeouts),
+                    BoundedListener::Data,
                     max_connections,
                 ))
                 .handle(handle)
@@ -2258,6 +2337,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             )
         })
     {
+        tracing::warn!("{warning}");
+    }
+    // A credential written into a gRPC worker URL is never sent: said here,
+    // once per listed URL, where the line reaches the log (the validator runs
+    // before the subscriber exists); the add-worker route says it at
+    // registration.
+    for warning in crate::config::unused_credentials_warnings(&config.router_config.mode) {
         tracing::warn!("{warning}");
     }
     // A rank scheduler under rank expansion chooses nothing: the operator's
@@ -2473,26 +2559,45 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
-    // The reload of the keys a file gave, sharing the sets the layers read.
+    // Serving routes accept both the shared key and per-tenant keys, so the
+    // rate limiter (and anything else keyed on tenant identity) can tell
+    // tenants apart. Admin/worker-management routes must NOT accept tenant
+    // keys when falling back to simple API-key auth (no control-plane auth
+    // configured) — a tenant credential must not be able to reach
+    // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
+    let serving_auth_config = app_context.gateway_auth.clone();
+    let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
+
+    // The reload of the keys a file gave, sharing the sets the layers read:
+    // the serving set, the control-plane set, and the admin routes' fallback
+    // when no control-plane keys are configured, so a rotated shared key
+    // leaves the admin routes too.
     let secrets = crate::secrets::SecretReloader::new(
         config.secret_files.clone(),
         &config.secret_sources,
         config.router_config.api_key.as_deref(),
         &config.router_config.tenant_api_keys,
-        app_context.gateway_auth.clone(),
-        control_plane_auth_state
-            .as_ref()
-            .map(|state| state.keys.clone()),
+        crate::secrets::KeySets {
+            serving: app_context.gateway_auth.clone(),
+            control_plane: control_plane_auth_state
+                .as_ref()
+                .map(|state| state.keys.clone()),
+            admin_fallback: control_plane_auth_state
+                .is_none()
+                .then(|| admin_auth_config.clone()),
+        },
     )
     .map(Arc::new);
     // `--secrets-auto-reload`: the key files watched, a change reloading
     // them as the route does; a directory that cannot be watched refuses the
-    // start. The sources record says which it is.
+    // start. The sources record says which it is, and names the settings
+    // whose files are watched.
     let secrets_auto_reload = match (config.secrets_auto_reload, &secrets) {
         (false, _) => "off".to_string(),
         (true, Some(reloader)) => {
             crate::secrets::start_auto_reload(Arc::clone(reloader))?;
-            format!("on ({} files)", reloader.files().count())
+            let names: Vec<&str> = reloader.files().names().collect();
+            format!("on ({})", names.join(", "))
         }
         (true, None) => {
             warn!("--secrets-auto-reload is set and no key came from a file: nothing to watch");
@@ -2546,15 +2651,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 "request-id".to_string(),
             ]
         });
-
-    // Serving routes accept both the shared key and per-tenant keys, so the
-    // rate limiter (and anything else keyed on tenant identity) can tell
-    // tenants apart. Admin/worker-management routes must NOT accept tenant
-    // keys when falling back to simple API-key auth (no control-plane auth
-    // configured) — a tenant credential must not be able to reach
-    // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
-    let serving_auth_config = app_context.gateway_auth.clone();
-    let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // The admin listener's address, when the control plane has a listener of
     // its own (`--admin-port`); its bind host defaults to the data listener's.
@@ -3271,6 +3367,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
             .allow_methods([
                 http::Method::GET,
                 http::Method::POST,
+                http::Method::PUT,
                 http::Method::PATCH,
                 http::Method::DELETE,
                 http::Method::OPTIONS,
@@ -3278,18 +3375,22 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
             .allow_headers([
                 http::header::CONTENT_TYPE,
                 http::header::AUTHORIZATION,
+                http::header::IF_MATCH,
                 http::header::HeaderName::from_static("anthropic-version"),
                 http::header::HeaderName::from_static("anthropic-beta"),
                 http::header::HeaderName::from_static("traceparent"),
                 http::header::HeaderName::from_static("tracestate"),
             ])
-            // The request id under both of its names and the echoed trace
-            // context, readable by browser clients.
+            // The request id under both of its names, the echoed trace
+            // context, and the document routes' ETag and revision, readable
+            // by browser clients.
             .expose_headers([
                 http::header::HeaderName::from_static("x-request-id"),
                 http::header::HeaderName::from_static("request-id"),
                 http::header::HeaderName::from_static("traceparent"),
                 http::header::HeaderName::from_static("tracestate"),
+                http::header::ETAG,
+                rate_limit_document::REVISION_HEADER,
             ])
     };
 
@@ -3371,6 +3472,39 @@ mod tests {
         );
         assert!(check_thinking_budget(&interleaved, &request(1024, 1024)).is_ok());
         assert!(check_thinking_budget(&interleaved, &request(1024, 8192)).is_ok());
+    }
+
+    /// A `thread` field needs the message-threads beta header, as the public
+    /// API requires; a request without `thread` needs no header.
+    #[test]
+    fn a_thread_field_needs_the_message_threads_beta_header() {
+        let request = |thread: bool| -> CreateMessageRequest {
+            let mut body = serde_json::json!({
+                "model": "m", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if thread {
+                body["thread"] = serde_json::json!({"type": "create"});
+            }
+            serde_json::from_value(body).unwrap()
+        };
+        let plain = HeaderMap::new();
+        assert!(check_thread_beta(&plain, &request(false)).is_ok());
+        let refused = check_thread_beta(&plain, &request(true)).expect_err("refused");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&refused),
+            "thread_beta_required"
+        );
+
+        let mut named = HeaderMap::new();
+        named.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static(
+                "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
+            ),
+        );
+        assert!(check_thread_beta(&named, &request(true)).is_ok());
     }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
@@ -3862,6 +3996,83 @@ mod tests {
         }
     }
 
+    /// A browser client under a named origin can replace the tenant
+    /// rate-limit document: the preflight allows `PUT` and `If-Match`, and
+    /// the answer's `ETag` and revision are readable.
+    #[tokio::test]
+    async fn configured_cors_allows_the_document_write() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/admin/v1/rate-limits/tenants",
+                axum::routing::put(|| async { StatusCode::OK }),
+            )
+            .layer(
+                create_cors_layer(vec!["https://client.example".into()])
+                    .expect("a configured origin list attaches the layer"),
+            );
+        let preflight = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/admin/v1/rate-limits/tenants")
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", "PUT")
+                    .header("access-control-request-headers", "content-type,if-match")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success());
+        let listed = |name: &str| {
+            preflight.headers()[name]
+                .to_str()
+                .unwrap()
+                .split(',')
+                .map(|value| value.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            listed("access-control-allow-methods")
+                .iter()
+                .any(|m| m == "put"),
+            "PUT is not allowed"
+        );
+        assert!(
+            listed("access-control-allow-headers")
+                .iter()
+                .any(|h| h == "if-match"),
+            "If-Match is not allowed"
+        );
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri("/admin/v1/rate-limits/tenants")
+                    .header("origin", "https://client.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let exposed = response.headers()["access-control-expose-headers"]
+            .to_str()
+            .unwrap();
+        for header in ["etag", "x-smg-config-revision"] {
+            assert!(
+                exposed
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case(header)),
+                "{header} is not exposed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn plain_http_acceptor_enables_nodelay() {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -3985,29 +4196,6 @@ mod tests {
         .expect("plain HTTP response test timed out");
     }
 
-    /// Build a test server config without discovery, mesh, or authentication;
-    /// the listener is the one `router_config` names.
-    fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
-        ServerConfig {
-            router_config,
-            log_dir: None,
-            log_level: None,
-            log_json: false,
-            service_discovery_config: None,
-            mesh_discovery_config: None,
-            prometheus_config: None,
-            shutdown_grace_period_secs: 5,
-            shutdown_settle_secs: None,
-            control_plane_auth: None,
-            mesh_server_config: None,
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-            secret_sources: Default::default(),
-            secret_files: Default::default(),
-            secrets_auto_reload: false,
-        }
-    }
-
     /// `startup` must reject an invalid config even when `RouterConfig` was
     /// built directly (struct literal or `Deserialize`), not via
     /// `RouterConfigBuilder::build()` — a Rust library caller can construct
@@ -4028,12 +4216,24 @@ mod tests {
 
         // The refusal named, not any error: a listener that failed to bind
         // would also be one.
-        let error = startup(minimal_server_config(router_config))
+        let error = startup(ServerConfig::minimal(router_config))
             .await
             .expect_err("startup must validate router_config even when constructed directly");
         assert!(
             error.to_string().contains("must have a non-empty key"),
             "startup refused for another reason: {error}"
         );
+    }
+
+    /// `minimal` leaves a library caller on the CLI's shutdown grace, not a
+    /// shorter one of its own: in-flight streams get the product's drain.
+    #[test]
+    fn minimal_takes_the_default_shutdown_grace() {
+        let config = ServerConfig::minimal(RouterConfig::default());
+        assert_eq!(
+            config.shutdown_grace_period_secs,
+            DEFAULT_SHUTDOWN_GRACE_SECS
+        );
+        assert_eq!(config.shutdown_grace_period_secs, 180);
     }
 }

@@ -4,11 +4,19 @@
 //! supported backend, allowing the router to work with any backend
 //! transparently.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, task::Poll, time::Instant};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 use futures::future::select_all;
 use futures_util::StreamExt;
 use smg_grpc_client::{
+    abort_on_drop::DEFERRED_ABORT_MAX_WAIT,
     mlx_engine::AbortOnDropStream as MlxStream,
     mlx_proto::{self as mlx},
     sglang_proto::{self as sglang, generate_complete::MatchedStop as SglangMatchedStop},
@@ -42,6 +50,8 @@ mod multimodal;
 mod request;
 mod shm;
 
+pub(crate) use smg_grpc_client::media_identity::identity as vllm_mm_identity;
+
 use self::shm::vllm_mm_hash_identity;
 pub use self::{
     embed::{ProtoEmbedComplete, ProtoEmbedRequest},
@@ -61,10 +71,7 @@ pub use self::{
 pub(crate) use self::{
     multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
     request::VLLM_MROPE_GRID_KEYS,
-    shm::{
-        cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request,
-        vllm_mm_identity,
-    },
+    shm::{cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request},
 };
 
 /// Helper macro to convert input logprobs from proto types to unified type.
@@ -357,6 +364,31 @@ pub enum ProtoResponseVariant {
     None,
 }
 
+/// The wire dispatch of a counter every wire carries under one field name:
+/// the five-arm match written once, so a wire added to the wrappers is one
+/// arm here and a reader cannot forget one. The second form names the wire
+/// without the field and what it reads instead.
+macro_rules! wire_field {
+    ($on:expr, $c:ident => $read:expr) => {
+        match $on {
+            Self::Sglang($c) => $read,
+            Self::Vllm($c) => $read,
+            Self::Trtllm($c) => $read,
+            Self::Mlx($c) => $read,
+            Self::TokenSpeed($c) => $read,
+        }
+    };
+    ($on:expr, $c:ident => $read:expr, Mlx => $none:expr) => {
+        match $on {
+            Self::Sglang($c) => $read,
+            Self::Vllm($c) => $read,
+            Self::Trtllm($c) => $read,
+            Self::TokenSpeed($c) => $read,
+            Self::Mlx(_) => $none,
+        }
+    };
+}
+
 /// The accessors every engine-response wrapper answers with the same five-arm
 /// match, written once and invoked inside each wrapper's `impl` (as the engine
 /// clients invoke `impl_engine_client_basics`): the engine predicates, the chunk
@@ -412,36 +444,18 @@ macro_rules! engine_response_basics {
 
         /// Get prompt tokens
         pub fn prompt_tokens(&self) -> u32 {
-            match self {
-                Self::Sglang(c) => c.prompt_tokens,
-                Self::Vllm(c) => c.prompt_tokens,
-                Self::Trtllm(c) => c.prompt_tokens,
-                Self::Mlx(c) => c.prompt_tokens,
-                Self::TokenSpeed(c) => c.prompt_tokens,
-            }
+            wire_field!(self, c => c.prompt_tokens)
         }
 
         /// Get completion tokens (the running count on a chunk, the total on a
         /// `Complete`)
         pub fn completion_tokens(&self) -> u32 {
-            match self {
-                Self::Sglang(c) => c.completion_tokens,
-                Self::Vllm(c) => c.completion_tokens,
-                Self::Trtllm(c) => c.completion_tokens,
-                Self::Mlx(c) => c.completion_tokens,
-                Self::TokenSpeed(c) => c.completion_tokens,
-            }
+            wire_field!(self, c => c.completion_tokens)
         }
 
         /// Get cached tokens
         pub fn cached_tokens(&self) -> u32 {
-            match self {
-                Self::Sglang(c) => c.cached_tokens,
-                Self::Vllm(c) => c.cached_tokens,
-                Self::Trtllm(c) => c.cached_tokens,
-                Self::Mlx(c) => c.cached_tokens,
-                Self::TokenSpeed(c) => c.cached_tokens,
-            }
+            wire_field!(self, c => c.cached_tokens)
         }
 
         /// Get reasoning tokens.
@@ -527,14 +541,13 @@ impl ProtoGenerateStreamChunk {
     }
 
     /// The output's logprobs, read in place on the message; `None` when the
-    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
             Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
-            Self::Trtllm(c) => {
-                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
-            }
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
             Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
@@ -709,24 +722,12 @@ impl ProtoGenerateComplete {
 
     /// Get accepted speculative draft tokens.
     pub fn spec_accepted_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.spec_accepted_tokens,
-            Self::Vllm(c) => c.spec_accepted_tokens,
-            Self::Trtllm(c) => c.spec_accepted_tokens,
-            Self::TokenSpeed(c) => c.spec_accepted_tokens,
-            Self::Mlx(_) => 0,
-        }
+        wire_field!(self, c => c.spec_accepted_tokens, Mlx => 0)
     }
 
     /// Get proposed speculative draft tokens.
     pub fn spec_draft_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.spec_draft_tokens,
-            Self::Vllm(c) => c.spec_draft_tokens,
-            Self::Trtllm(c) => c.spec_draft_tokens,
-            Self::TokenSpeed(c) => c.spec_draft_tokens,
-            Self::Mlx(_) => 0,
-        }
+        wire_field!(self, c => c.spec_draft_tokens, Mlx => 0)
     }
 
     /// Get input/prompt logprobs (SGLang, vLLM, and TensorRT-LLM)
@@ -770,14 +771,13 @@ impl ProtoGenerateComplete {
     }
 
     /// The output's logprobs, read in place on the message; `None` when the
-    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
             Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
-            Self::Trtllm(c) => {
-                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
-            }
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
             Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
@@ -1132,26 +1132,22 @@ impl DispatchBooking {
 
     /// [`Self::book`] for a request dispatched at `dispatched_at`: the one
     /// instant the dispatch read, which its deadline runs from too, stamps
-    /// the prefill booking.
+    /// the prefill booking and the start of the worker's tracked run.
     pub(crate) fn book_at(
         worker: &Arc<dyn Worker>,
         prompt_tokens: u64,
         streaming: bool,
         dispatched_at: Instant,
     ) -> Self {
+        let now_ms = liveness::ms_at(dispatched_at);
         let progress = streaming.then(|| {
-            worker.note_tracked_started();
+            worker.note_tracked_started_at(now_ms);
             ProgressTicket {
                 worker: Arc::clone(worker),
             }
         });
         Self {
-            prefill: PrefillTicket::book_as_at(
-                worker,
-                prompt_tokens,
-                streaming,
-                liveness::ms_at(dispatched_at),
-            ),
+            prefill: PrefillTicket::book_as_at(worker, prompt_tokens, streaming, now_ms),
             progress,
         }
     }
@@ -1360,7 +1356,7 @@ mod tracked_tests {
     fn a_prefill_side_books_its_prompt_timed_and_joins_no_pile() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_prefill_side(Arc::clone(&worker), 4_096);
+            .tracked_prefill_side_booked(Arc::clone(&worker), PrefillTicket::book(&worker, 4_096));
         assert_eq!(worker.tracked_load(), 0, "a side is never part of a pile");
         assert_eq!(
             worker.prefill_backlog(),
@@ -1388,7 +1384,7 @@ mod tracked_tests {
         // the reader sees it once more, then the stream as it is.
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_prefill_side(Arc::clone(&worker), 16);
+            .tracked_prefill_side_booked(Arc::clone(&worker), PrefillTicket::book(&worker, 16));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         assert_eq!(
             stream.first_response_within(deadline).await.ok(),
@@ -1606,22 +1602,14 @@ impl ProtoStream {
     }
 
     /// Track this stream as the prefill side of a disaggregated dispatch to
-    /// `worker`: its `prompt_tokens` are pending prefill there until its
-    /// first response, which times the prompt's prefill for the worker's
-    /// rate (the side's first response is the end of its prefill, on either
-    /// dispatch shape), and every response is progress for the worker. The
-    /// side joins no pile: the gateway bounds its silence per request (see
-    /// [`crate::worker::liveness::prefill_side_bound`]) instead of judging the
-    /// worker by sides it cannot see progress on.
-    #[must_use]
-    pub fn tracked_prefill_side(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {
-        let prefill = PrefillTicket::book(&worker, prompt_tokens);
-        self.tracked_prefill_side_booked(worker, prefill)
-    }
-
-    /// [`Self::tracked_prefill_side`] for a side booked at its dispatch (see
-    /// [`PrefillTicket::book`]): the stream takes over the ticket, so the
-    /// first response ends the span that began before the call was polled.
+    /// `worker`, its prompt booked at the dispatch (see [`PrefillTicket::book`]):
+    /// the stream takes over the ticket, so the first response ends the span
+    /// that began before the call was polled and times the prompt's prefill
+    /// for the worker's rate (the side's first response is the end of its
+    /// prefill, on either dispatch shape), and every response is progress for
+    /// the worker. The side joins no pile: the gateway bounds its silence per
+    /// request (see [`crate::worker::liveness::prefill_side_bound`]) instead
+    /// of judging the worker by sides it cannot see progress on.
     #[must_use]
     pub(crate) fn tracked_prefill_side_booked(
         self,
@@ -2010,14 +1998,26 @@ impl ProtoStream {
     /// not serve disaggregated requests.
     #[must_use]
     pub fn defer_abort_until_first_item(self) -> Self {
+        self.defer_abort_within(DEFERRED_ABORT_MAX_WAIT)
+    }
+
+    /// [`Self::defer_abort_until_first_item`] with the wait for the first
+    /// response bounded by `bound` where that is shorter than the house cap
+    /// ([`DEFERRED_ABORT_MAX_WAIT`]): the bound the caller holds for the
+    /// response, a decode side's first-token bound. A side whose first
+    /// response is its whole answer (a non-streaming generation) has no
+    /// earlier signal, and a drop would otherwise hold its worker for the
+    /// answer's length, the cap at most.
+    #[must_use]
+    pub fn defer_abort_within(self, bound: Duration) -> Self {
         match self {
-            Self::Sglang(stream) => Self::Sglang(stream.defer_abort_until_first_item()),
-            Self::Vllm(stream) => Self::Vllm(stream.defer_abort_until_first_item()),
-            Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_until_first_item()),
-            Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
-            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
+            Self::Sglang(stream) => Self::Sglang(stream.defer_abort_within(bound)),
+            Self::Vllm(stream) => Self::Vllm(stream.defer_abort_within(bound)),
+            Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_within(bound)),
+            Self::Mlx(stream) => Self::Mlx(stream.defer_abort_within(bound)),
+            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_within(bound)),
             Self::Zmq(stream) => Self::Zmq(stream),
-            Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+            Self::Fanout(stream) => Self::Fanout(stream.defer_abort_within(bound)),
             Self::Tracked(stream) => {
                 let TrackedStream {
                     inner,
@@ -2029,7 +2029,7 @@ impl ProtoStream {
                     replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
-                    inner: inner.defer_abort_until_first_item(),
+                    inner: inner.defer_abort_within(bound),
                     worker,
                     prefill,
                     progress,
@@ -2041,14 +2041,14 @@ impl ProtoStream {
             Self::DecodeSide(side) => {
                 let DecodeStream { inner, prefill } = *side;
                 Self::DecodeSide(Box::new(DecodeStream {
-                    inner: inner.defer_abort_until_first_item(),
+                    inner: inner.defer_abort_within(bound),
                     prefill,
                 }))
             }
             Self::Ahead(ahead) => {
                 let AheadStream { inner, first } = *ahead;
                 Self::Ahead(Box::new(AheadStream {
-                    inner: inner.defer_abort_until_first_item(),
+                    inner: inner.defer_abort_within(bound),
                     first,
                 }))
             }
@@ -2060,7 +2060,7 @@ impl ProtoStream {
                     request_id,
                 } = *watched;
                 Self::Watched(Box::new(WatchedStream {
-                    inner: inner.map(ProtoStream::defer_abort_until_first_item),
+                    inner: inner.map(|inner| inner.defer_abort_within(bound)),
                     client,
                     client_gone,
                     request_id,
@@ -2083,6 +2083,10 @@ impl FanoutChild for ProtoStream {
 
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
+    }
+
+    fn defer_abort_within(self, bound: Duration) -> Self {
+        Self::defer_abort_within(self, bound)
     }
 
     fn apply_deadline(&mut self, deadline: RequestDeadline) {
@@ -2108,6 +2112,11 @@ pub trait FanoutChild: Send {
     /// Defer the child's abort-on-drop until its first response.
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
+
+    /// [`Self::defer_abort_until_first_item`] with the wait bounded by
+    /// `bound` where that is shorter than the house cap.
+    #[must_use]
+    fn defer_abort_within(self, bound: Duration) -> Self;
 
     /// Bound the child by the request's `deadline`, in place (see
     /// [`ProtoStream::apply_deadline`]); a child with no transport stream
@@ -2151,6 +2160,10 @@ impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
     }
+
+    fn defer_abort_within(self, bound: Duration) -> Self {
+        Self::defer_abort_within(self, bound)
+    }
 }
 
 type FanoutItem = Option<Result<ProtoGenerateResponse, tonic::Status>>;
@@ -2166,7 +2179,8 @@ impl<C: FanoutChild> FanoutStream<C> {
     }
 
     /// Children that have not ended yet.
-    pub fn open_children(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn open_children(&self) -> usize {
         self.children.iter().flatten().count()
     }
 
@@ -2231,6 +2245,20 @@ impl<C: FanoutChild> FanoutStream<C> {
         }
     }
 
+    /// [`Self::defer_abort_until_first_item`] with every child's wait
+    /// bounded by `bound`.
+    #[must_use]
+    pub fn defer_abort_within(self, bound: Duration) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|child| child.map(|child| child.defer_abort_within(bound)))
+                .collect(),
+            cursor: self.cursor,
+        }
+    }
+
     /// Bound every open child by the request's `deadline`, in place.
     pub fn apply_deadline(&mut self, deadline: RequestDeadline) {
         for child in self.children.iter_mut().flatten() {
@@ -2278,6 +2306,10 @@ mod fanout_tests {
         }
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }
@@ -2377,7 +2409,7 @@ mod fanout_tests {
                         .worker_type(WorkerType::Prefill)
                         .build(),
                 );
-                let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+                let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
                 let guard = if bounded {
                     let admitted = admission.admit(None, select_worker(&worker)).await.unwrap();
                     PrefillLoadGuard::Admission {
@@ -2627,7 +2659,7 @@ mod tests {
                 extra_batches: Vec::new(),
                 modality: "video".to_string(),
                 image_data: Vec::new(),
-                pixel_values: vec![0; 8],
+                pixel_values: vec![0; 8].into(),
                 pixel_values_shape: vec![2],
                 pixel_values_dtype: "float32".to_string(),
                 model_specific_tensors: HashMap::from([(
@@ -2643,7 +2675,7 @@ mod tests {
             }],
             modality: "image".to_string(),
             image_data: vec![vec![0; 2]],
-            pixel_values: vec![0; 16],
+            pixel_values: vec![0; 16].into(),
             pixel_values_shape: vec![4, 4],
             pixel_values_dtype: "float32".to_string(),
             model_specific_tensors: HashMap::from([(
@@ -2919,7 +2951,7 @@ mod tests {
     fn vllm_mm_data(modality: common::Modality) -> VllmMultimodalData {
         let is_video = modality == common::Modality::Video;
         VllmMultimodalData {
-            pixel_values: vec![0u8; 16],
+            pixel_values: vec![0u8; 16].into(),
             pixel_values_shape: vec![1, 4],
             pixel_values_dtype: "float32".to_string(),
             model_specific_tensors: HashMap::new(),
@@ -3267,5 +3299,160 @@ mod watched_tests {
         );
         assert!(matches!(stream.next().await, Some(Ok(_))));
         assert!(stream.next().await.is_none(), "the end is the end");
+    }
+}
+
+#[cfg(test)]
+mod output_logprob_tests {
+    use super::{trtllm, ProtoGenerateComplete, ProtoGenerateStreamChunk};
+
+    fn one_record() -> Vec<trtllm::TokenLogprob> {
+        vec![trtllm::TokenLogprob {
+            token_id: 7,
+            logprob: -0.5,
+            top_logprobs: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn a_trtllm_chunk_reads_an_empty_logprob_list_as_none() {
+        // The TRT-LLM wire says "no logprobs" with an empty list where the
+        // other wires leave the field absent; one record is one position.
+        let none = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
+    }
+
+    #[test]
+    fn a_trtllm_complete_reads_an_empty_logprob_list_as_none() {
+        let none = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod wire_field_tests {
+    use super::*;
+
+    /// Every wire's counters come from its own fields: the five-wire form on the
+    /// chunk and complete wrappers, and the complete wrapper's speculative pair,
+    /// zero on the wire that has none.
+    #[test]
+    fn counters_read_each_wires_own_fields() {
+        let chunks = [
+            ProtoGenerateStreamChunk::Sglang(sglang::GenerateStreamChunk {
+                prompt_tokens: 11,
+                completion_tokens: 12,
+                cached_tokens: 13,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+                prompt_tokens: 21,
+                completion_tokens: 22,
+                cached_tokens: 23,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk {
+                prompt_tokens: 31,
+                completion_tokens: 32,
+                cached_tokens: 33,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Mlx(mlx::GenerateStreamChunk {
+                prompt_tokens: 41,
+                completion_tokens: 42,
+                cached_tokens: 43,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+                prompt_tokens: 51,
+                completion_tokens: 52,
+                cached_tokens: 53,
+                ..Default::default()
+            }),
+        ];
+        for (n, chunk) in (1u32..).zip(chunks.iter()) {
+            let base = 10 * n;
+            assert_eq!(
+                (
+                    chunk.prompt_tokens(),
+                    chunk.completion_tokens(),
+                    chunk.cached_tokens()
+                ),
+                (base + 1, base + 2, base + 3)
+            );
+        }
+        let completes = [
+            ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                prompt_tokens: 11,
+                completion_tokens: 12,
+                cached_tokens: 13,
+                spec_accepted_tokens: 14,
+                spec_draft_tokens: 15,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::Vllm(Box::new(vllm::GenerateComplete {
+                prompt_tokens: 21,
+                completion_tokens: 22,
+                cached_tokens: 23,
+                spec_accepted_tokens: 24,
+                spec_draft_tokens: 25,
+                ..Default::default()
+            })),
+            ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete {
+                prompt_tokens: 31,
+                completion_tokens: 32,
+                cached_tokens: 33,
+                spec_accepted_tokens: 34,
+                spec_draft_tokens: 35,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::Mlx(mlx::GenerateComplete {
+                prompt_tokens: 41,
+                completion_tokens: 42,
+                cached_tokens: 43,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+                prompt_tokens: 51,
+                completion_tokens: 52,
+                cached_tokens: 53,
+                spec_accepted_tokens: 54,
+                spec_draft_tokens: 55,
+                ..Default::default()
+            }),
+        ];
+        for (n, complete) in (1u32..).zip(completes.iter()) {
+            let base = 10 * n;
+            assert_eq!(
+                (
+                    complete.prompt_tokens(),
+                    complete.completion_tokens(),
+                    complete.cached_tokens()
+                ),
+                (base + 1, base + 2, base + 3)
+            );
+            let speculative = if matches!(complete, ProtoGenerateComplete::Mlx(_)) {
+                (0, 0)
+            } else {
+                (base + 4, base + 5)
+            };
+            assert_eq!(
+                (
+                    complete.spec_accepted_tokens(),
+                    complete.spec_draft_tokens()
+                ),
+                speculative
+            );
+        }
     }
 }

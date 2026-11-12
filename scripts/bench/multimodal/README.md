@@ -19,7 +19,7 @@ python3 scripts/bench/multimodal/mm_baseline.py \
 |---|---|
 | `mm_baseline.py` | the entry point: resolves the classes, materializes the derived files, runs the arms, writes `table.md` and `table.json` |
 | `classes.json` | the classes: a file of the fixture repository's corpus per class, or a recipe that derives one from a corpus file where no public file of that shape exists yet |
-| `../../../crates/multimodal/examples/mm_baseline.rs` | the crate arm: decode, the gateway's frame clone, the one-pass preprocess into the wire's dtype and the move of the wire bytes, per class, on one or many threads, with digests |
+| `../../../crates/multimodal/examples/mm_baseline.rs` | the crate arm: decode, the one-pass preprocess over the borrowed frames into the wire's dtype and the move of the wire bytes, per class, on one or many threads, with digests |
 | `reference.py` | the reference arm: the engine's image loader rules and the pinned `transformers` processors on the same files, one process or many with one compute thread each |
 | `requirements.txt` | the reference arm's pins (the engine image's own) |
 | `gateway_seam.py` | the gateway seam on the CPU mock bed (`scripts/bench/grpc_stress/bed.sh`): the per-class rows under a single rate and under load, the two-hundred-request burst, the twenty-turn screenshot replay |

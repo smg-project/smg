@@ -72,9 +72,11 @@
 //! empty reasoning string for an answer without a thought is read as the reference's absent one;
 //! a case it reads differently fails the run, whatever the reference says of it, unless the case
 //! is listed in [`KNOWN_DIFFERENCES`] (a marker inside text, which each reader reads its own way:
-//! the library's reading of it is reported, not held against the parser), and a request the
-//! library refused is counted. Each set's summary line is followed by one per library that
-//! witnessed a case of it.
+//! the library's reading of it is reported, not held against the parser) or its wrong reading of
+//! the case is recorded in [`LIBRARY_DEFECTS`] (bellwether's `waivers/library_defects.toml`:
+//! reported beside the parser's reading, never held against it, and failing the run once the
+//! library reads the case as the parser does again), and a request the library refused is
+//! counted. Each set's summary line is followed by one per library that witnessed a case of it.
 //!
 //! A fourth test corrupts the recorded outputs: three seeded corruptions of every sampled case of
 //! every recorded model (a span deleted or doubled, one of the table's own markers or a cut one
@@ -195,6 +197,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen3-vl-2b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-4b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-8b-instruct", GenerationPrompt::Plain),
+    // The AesCode pair are Qwen3-VL-8B-Instruct checkpoints by their `also` names; bellwether records
+    // them as members of the Visual-ERM group, whose sets replay through that table.
+    ("aescode-8b", GenerationPrompt::Plain),
+    ("aescode-32b", GenerationPrompt::Plain),
+    // Visual-ERM is that group's bellwether primary (the AesCode pair carries its files): its sets replay
+    // under their own slug too.
+    ("visual-erm", GenerationPrompt::Plain),
     ("qwen3-vl-30b-a3b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-32b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-235b-a22b-instruct", GenerationPrompt::Plain),
@@ -249,6 +258,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen3.5-2b", GenerationPrompt::OpensTheThoughtWhenAsked),
     ("qwen3.5-4b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-9b", GenerationPrompt::OpensTheThought),
+    // UserRepGen-4B is a member of the Qwen3.5-9B group: its group's sets replay through the table
+    // its `also` name resolves to.
+    ("userrepgen-4b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-27b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-122b-a10b", GenerationPrompt::OpensTheThought),
@@ -1475,6 +1487,31 @@ const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
 /// is not this family's marker, so it stays reasoning text, as the reference says.
 const KNOWN_M3_DIFFERENCES: &[KnownDifference] = &[FENCE_PROBE];
 
+/// A case a library witness reads wrongly where the reference and the parser agree, recorded in
+/// bellwether's `waivers/library_defects.toml` with the library's version: the library's reading is
+/// reported beside the parser's and not held against it. An entry is stale when the library reads
+/// the case as the parser does again, and the run says so. `id` keeps the slug: a library's defect
+/// is one model's.
+struct LibraryDefect {
+    library: &'static str,
+    id: &'static str,
+    reason: &'static str,
+}
+
+const LIBRARY_DEFECTS: &[LibraryDefect] = &[LibraryDefect {
+    library: "deepseek-recipe",
+    id: "deepseek-v4.1-flash/parse/tau2-o4-mini-2025-04-16-telecom-workflow-default-150-10",
+    reason: "the library cuts a quoted parameter name at its first space and hands arguments that \
+             are no longer JSON; the parser and the reference keep the whole name (bellwether \
+             waivers/library_defects.toml, deepseek-recipe 0.2.0)",
+}];
+
+fn library_defect(library: &str, id: &str) -> Option<&'static LibraryDefect> {
+    LIBRARY_DEFECTS
+        .iter()
+        .find(|defect| defect.library == library && defect.id == id)
+}
+
 /// The case's id after its slug: what [`KnownDifference::id`] names.
 fn after_slug(id: &str) -> &str {
     id.split_once('/').map_or(id, |(_, rest)| rest)
@@ -2305,8 +2342,10 @@ fn parity(
             out.push_str(&format!("  {:34} {}\n", "", listed_case.reason));
         }
         // A library that read the case has to have read it as the parser did, whatever the
-        // reference says of the case; a library that refused the request read nothing, and an
-        // engine's witness reads nothing either.
+        // reference says of the case, unless its wrong reading is recorded in `LIBRARY_DEFECTS`
+        // (reported, never held against the parser, stale once it reads as the parser does); a
+        // library that refused the request read nothing, and an engine's witness reads nothing
+        // either.
         for (library, witness) in &fixture.witnesses {
             let tally = by_library.entry(library).or_default();
             match witness.said() {
@@ -2318,9 +2357,27 @@ fn parity(
                             ""
                         ));
                     }
+                    if library_defect(library, &fixture.id).is_some() {
+                        failures.push(format!(
+                            "{}: recorded as a wrong reading of {library} but read as the parser \
+                             now; remove it from LIBRARY_DEFECTS and from bellwether's \
+                             waivers/library_defects.toml",
+                            fixture.id
+                        ));
+                    }
                 }
                 Some(read) => {
                     tally.differently += 1;
+                    if let Some(defect) = library_defect(library, &fixture.id) {
+                        // The library's own wrong reading, recorded with its version: reported
+                        // beside the parser's reading, never held against the parser.
+                        out.push_str(&format!(
+                            "  {:34} {library} reads it wrongly, as recorded: {}; it read: \
+                             {read:?}\n",
+                            "", defect.reason
+                        ));
+                        continue;
+                    }
                     out.push_str(&format!(
                         "  {:34} {library} reads it differently: {read:?}\n",
                         ""
@@ -3808,6 +3865,104 @@ fn the_corpus_replay_reads_a_v3_2_set_recorded_in_chat_mode_without_the_reasonin
             );
         }
     }
+}
+
+/// The witness rule's second exception, which the sampled corpus run does not reach (the set
+/// [`LIBRARY_DEFECTS`] records lies outside the pinned sample): a one-case set under the recorded
+/// slug, written here with the recorded id and a witness of the recorded library, replayed twice.
+/// With the library reading the call's parameter under another name the case stays bitwise
+/// against the reference, nothing fails, and the report carries the recorded reason beside the
+/// library's actual reading; with the library reading the case as the parser does the run fails
+/// naming the stale entry. The prompt is stated as opening the thought when asked, so the
+/// family's expected list holds no probe and the one-case set is whole.
+#[test]
+fn a_recorded_library_defect_is_reported_and_fails_once_the_library_reads_as_the_parser() {
+    // The test drives a V4.1 DSML call through a `deepseek-recipe` witness, so it needs that
+    // entry; once the stale rule retires it, the test needs a synthetic entry of its own.
+    let defect = LIBRARY_DEFECTS
+        .iter()
+        .find(|defect| {
+            defect.library == "deepseek-recipe" && defect.id.starts_with("deepseek-v4.1-flash/")
+        })
+        .expect(
+            "no deepseek-recipe defect on deepseek-v4.1-flash is recorded; give this test a \
+             synthetic entry",
+        );
+    let (slug, _) = defect
+        .id
+        .split_once('/')
+        .expect("the recorded id carries its slug");
+    assert!(
+        MODELS.iter().any(|(recorded, _)| *recorded == slug),
+        "{slug}: not among the recorded models"
+    );
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("library-defect-replay-{}", std::process::id()));
+    let dir = root.join(slug).join("parse");
+    fs::create_dir_all(&dir).expect("the set's directory");
+    let block = concat!(
+        "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n",
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    );
+    let message = |arguments: &str| {
+        serde_json::json!({
+            "content": "Checking now.",
+            "tool_calls": [{"function": {"name": "get_weather", "arguments": arguments}}]
+        })
+    };
+    let replay = |witness_arguments: &str| {
+        let case = serde_json::json!({
+            "id": defect.id,
+            "request": {"chat_template_kwargs": {"enable_thinking": false}},
+            "reference": {
+                "text": format!("Checking now.\n\n{block}"),
+                "message": message("{\"city\": \"Paris\"}"),
+                "finish_reason": "tool_calls",
+            },
+            "witnesses": {
+                defect.library: {
+                    "message": message(witness_arguments),
+                    "finish_reason": "tool_calls",
+                }
+            },
+        });
+        fs::write(dir.join("common.jsonl"), case.to_string() + "\n").expect("the set");
+        match replay_model(&root, slug, GenerationPrompt::OpensTheThoughtWhenAsked) {
+            Replayed::Compared {
+                report, failures, ..
+            } => (report, failures),
+            Replayed::Skipped(why) => (why, vec!["the slug was skipped".to_string()]),
+        }
+    };
+    let (report, failures) = replay("{\"cit\": \"Paris\"}");
+    let (stale_report, stale_failures) = replay("{\"city\": \"Paris\"}");
+    fs::remove_dir_all(&root).expect("the tree removed");
+    assert!(
+        failures.is_empty(),
+        "the recorded wrong reading failed the run: {failures:#?}\n{report}"
+    );
+    let verdict = report
+        .lines()
+        .find(|line| line.ends_with(defect.id))
+        .map_or("not in the report", str::trim_start);
+    assert!(verdict.starts_with("bitwise"), "{verdict}\n{report}");
+    let recorded = format!(
+        "{} reads it wrongly, as recorded: {}; it read: ",
+        defect.library, defect.reason
+    );
+    assert!(
+        report.contains(&recorded) && report.contains("\\\"cit\\\""),
+        "the recorded line with the library's reading is not in the report:\n{report}"
+    );
+    let stale = format!(
+        "{}: recorded as a wrong reading of {} but read as the parser now",
+        defect.id, defect.library
+    );
+    assert!(
+        stale_failures.len() == 1 && stale_failures[0].starts_with(&stale),
+        "{stale_failures:#?}\n{stale_report}"
+    );
 }
 
 /// Spins until `ready` holds, for at most ten seconds, so that a test waiting on another thread's

@@ -232,15 +232,26 @@ class Gateway:
             self.prefill_workers = list(prefills)
             self.decode_workers = list(decodes)
             mode_args = build_epd_mode_args(encodes, prefills, decodes, encode_policy)
+            # A disaggregated gateway autoloads each worker's tokenizer after
+            # the worker reports healthy and holds `/readiness` until every one
+            # is registered. The worker count puts this launch on the
+            # readiness-aware wait of the regular branch, so a class's first
+            # request does not race that load (a 503 `tokenizer_not_ready`).
+            # A launch that names no worker (a fleet registered through the
+            # API afterwards) keeps the health wait: readiness needs each role.
+            fleet = [*encodes, *prefills, *decodes]
             self._launch(
                 mode_args=mode_args,
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,
+                num_workers=len(fleet) or None,
                 log_msg=(
                     f"EPD gateway ({len(encodes)} encode, "
                     f"{len(prefills)} prefill, {len(decodes)} decode)"
                 ),
+                worker_urls=self._fleet_urls(mode_args),
+                workers=fleet,
             )
         elif is_pd_mode:
             self.pd_mode = True
@@ -259,12 +270,18 @@ class Gateway:
             for dc in decodes:
                 mode_args += ["--decode", dc.worker_url]
 
+            # The readiness-aware wait, as for the EPD gateway above; an empty
+            # launch keeps the health wait the same way.
+            fleet = [*prefills, *decodes]
             self._launch(
                 mode_args=mode_args,
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,
+                num_workers=len(fleet) or None,
                 log_msg=f"PD gateway ({len(prefills)} prefill, {len(decodes)} decode)",
+                worker_urls=self._fleet_urls(mode_args),
+                workers=fleet,
             )
         elif is_cloud_mode:
             assert cloud_backend is not None
@@ -401,6 +418,17 @@ class Gateway:
         if not tail:
             return f"its output file {self.log_path} is empty"
         return f"last {len(tail)} lines of {self.log_path}:\n" + "\n".join(tail)
+
+    @staticmethod
+    def _fleet_urls(mode_args: list[str]) -> list[str]:
+        """The worker URLs a disaggregated launch names: the token after each
+        ``--encode``, ``--prefill`` and ``--decode`` flag, which the readiness
+        wait takes as its registration gate."""
+        return [
+            mode_args[i + 1]
+            for i, arg in enumerate(mode_args[:-1])
+            if arg in ("--encode", "--prefill", "--decode")
+        ]
 
     def _launch(
         self,

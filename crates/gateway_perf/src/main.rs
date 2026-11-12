@@ -24,7 +24,7 @@ use gateway_perf::{
     counters::perf_available,
     gate,
     live::{self, Ramp, Slo},
-    paths::{parse_paths, DEFAULT_GW_ARGS, DEFAULT_PATHS},
+    paths::{fleet_paths, DEFAULT_GW_ARGS},
     report::numbers_table,
     stamp, tokenizer,
 };
@@ -88,14 +88,14 @@ struct BedArgs {
     /// Output directory [target/gateway-perf/<stamp>]
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Mock engines behind the gateway (the decode engines of the prefill-decode fleet)
-    #[arg(long, default_value_t = 4)]
+    /// Mock engines behind the gateway (the decode engines of the prefill-decode fleet), one or more
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
     workers: u16,
-    /// The fleet behind the gateway: regular gRPC engines, or a prefill fleet and a decode fleet on the prefill-decode path
+    /// The fleet behind the gateway: regular gRPC engines, a prefill fleet and a decode fleet on the prefill-decode path, or regular HTTP engines
     #[arg(long, value_enum, default_value_t = Fleet::Grpc)]
     fleet: Fleet,
-    /// Prefill engines of the prefill-decode fleet
-    #[arg(long, default_value_t = 1)]
+    /// Prefill engines of the prefill-decode fleet (one or more)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     prefill_workers: u16,
     /// First port of the bed's block (gateway; +1 metrics, +9 admin, +10.. workers, then the prefill engines and their bootstrap ports) [a free block from 29700]
     #[arg(long, default_value_t = 0)]
@@ -123,9 +123,9 @@ struct BedArgs {
 /// The cell flags (`cpu`, `alloc`).
 #[derive(Args, Clone, Debug)]
 struct CellArgs {
-    /// Comma-separated paths
-    #[arg(long, default_value = DEFAULT_PATHS)]
-    paths: String,
+    /// Comma-separated paths [every fleet's default: chat,stream,tools,json,messages]
+    #[arg(long)]
+    paths: Option<String>,
     /// Requests per cell
     #[arg(long, default_value_t = 10_000)]
     requests: u64,
@@ -201,7 +201,7 @@ struct MemCmd {
 impl MemCmd {
     fn cell_args(&self) -> CellArgs {
         CellArgs {
-            paths: self.paths.clone(),
+            paths: Some(self.paths.clone()),
             requests: self.requests,
             repeats: self.repeats,
             rate_scale: self.rate_scale,
@@ -258,9 +258,9 @@ struct BedCmd {
     action: BedAction,
     #[command(flatten)]
     bed: BedArgs,
-    /// smoke: the paths to exercise
-    #[arg(long, default_value = DEFAULT_PATHS)]
-    paths: String,
+    /// smoke: the paths to exercise [the fleet's default]
+    #[arg(long)]
+    paths: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -418,7 +418,7 @@ fn settings(
     }
     let ports = cfg.ports();
     let paths = match cell {
-        Some(cell) => parse_paths(&cell.paths)?,
+        Some(cell) => fleet_paths(cfg.fleet, cell.paths.as_deref())?,
         None => Vec::new(),
     };
     let mut settings = Settings::new(&out, cfg, binaries, paths);
@@ -508,7 +508,8 @@ fn run_bed(cmd: &BedCmd) -> Result<i32> {
         }
         BedAction::Smoke => {
             let settings = settings(&cmd.bed, None, false, None)?;
-            cells::smoke(&settings, &parse_paths(&cmd.paths)?)
+            let paths = fleet_paths(settings.bed.fleet, cmd.paths.as_deref())?;
+            cells::smoke(&settings, &paths)
         }
     }
 }
@@ -550,7 +551,7 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Live(l) => {
             let s = settings(&l.bed, l.base.as_deref(), l.base.is_some(), None)?;
-            let spec = parse_paths(&l.path)?.remove(0);
+            let spec = fleet_paths(s.bed.fleet, Some(&l.path))?.remove(0);
             let rates = l
                 .rates
                 .split(',')
@@ -623,7 +624,7 @@ mod tests {
         };
         assert_eq!(cpu.cell.repeats, 3);
         assert_eq!(cpu.cell.requests, 10_000);
-        assert_eq!(cpu.cell.paths, DEFAULT_PATHS);
+        assert_eq!(cpu.cell.paths, None, "the fleet's default list");
         assert_eq!(cpu.bed.counters, Counters::Auto);
         assert_eq!(cpu.base.as_deref(), Some(Path::new("/b")));
         let cli = Cli::try_parse_from([
@@ -681,6 +682,35 @@ mod tests {
         };
         assert_eq!(pd.bed.fleet, Fleet::PrefillDecode);
         assert_eq!(pd.bed.prefill_workers, 2);
+        assert!(Cli::try_parse_from([
+            "gateway-perf",
+            "cpu",
+            "--base",
+            "/b",
+            "--fleet",
+            "prefill-decode",
+            "--prefill-workers",
+            "0",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["gateway-perf", "cpu", "--base", "/b", "--workers", "0"]).is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "gateway-perf",
+            "bed",
+            "smoke",
+            "--fleet",
+            "http",
+            "--paths",
+            "chat",
+        ])
+        .unwrap();
+        let Cmd::Bed(http) = cli.command else {
+            panic!("not bed")
+        };
+        assert_eq!(http.bed.fleet, Fleet::Http);
+        assert_eq!(http.paths.as_deref(), Some("chat"));
         assert!(
             Cli::try_parse_from(["gateway-perf", "cpu", "--base", "/b", "--fleet", "pd"]).is_err()
         );

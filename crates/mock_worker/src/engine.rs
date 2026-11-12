@@ -422,8 +422,6 @@ pub struct EngineParams {
     /// vLLM's `full_sequence_must_fit`). Off, the gate is skipped (the older,
     /// over-admitting behaviour).
     pub reserve_full_isl: bool,
-    /// Output tokens to generate when a request does not specify `max_new_tokens`.
-    pub max_new_default: u32,
     /// Identity used for synthetic output. Cancellation IDs and prompt-block cache keys
     /// stay unchanged; decode-block keys follow the generated output.
     pub output_seed: OutputSeed,
@@ -550,7 +548,6 @@ impl Default for EngineParams {
             prefix_cache: true,
             prefill_first: false,
             reserve_full_isl: true,
-            max_new_default: 128,
             output_seed: OutputSeed::default(),
             request_overhead_ms: 0.0,
             kv_broadcast_capacity: 1024,
@@ -580,8 +577,12 @@ pub struct NewRequest {
     /// The prompt's token ids (gRPC supplies real ids from the gateway's
     /// tokenizer; HTTP supplies synthetic ids derived from the prompt text).
     pub prompt_token_ids: Vec<u32>,
-    /// Requested output length; 0 means "use the engine default".
+    /// Requested output length. A zero generates nothing (a prefill-only
+    /// request); an omitted limit is resolved by the lane before it submits.
     pub max_new: u32,
+    /// The choice this request samples, 0 for a single one: admission salts
+    /// the output seed with it, so the n choices of one request differ.
+    pub choice: u32,
     /// Sink for this request's generation events.
     pub events: mpsc::UnboundedSender<GenEvent>,
 }
@@ -1290,6 +1291,15 @@ impl Engine {
             .collect()
     }
 
+    /// The number of cached blocks, read without copying the keys.
+    pub fn cache_len(&self) -> usize {
+        self.shared
+            .cache_mirror
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
     /// Block keys of a prompt, exactly as the engine computes them.
     pub fn block_keys(prompt_token_ids: &[u32], block_size: usize) -> Vec<u64> {
         prompt_blocks(prompt_token_ids, block_size).0
@@ -1554,9 +1564,12 @@ fn handle_msg(
             shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         }
         EngineMsg::Abort(request_id) => {
-            if let Some((tx, event)) = state.abort(&request_id, params) {
+            let aborted = state.abort(&request_id, params);
+            if !aborted.is_empty() {
                 shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
                 shared.publish(state, state.snapshot(params));
+            }
+            for (tx, event) in aborted {
                 if params.request_overhead_ms > 0.0 {
                     // Keep the terminal event behind tokens awaiting delivery.
                     let _ = shared.deliver_tx.send((Instant::now(), tx, event));
@@ -1616,6 +1629,16 @@ struct RunningReq {
     rolling_hash: u64,
     /// Output identity selected at first admission and preserved over preemption.
     token_seed: u32,
+    /// The choice this request samples (0 for a single one), carried over preemption.
+    choice: u32,
+}
+
+/// The pass that finishes a prefill samples the request's first token,
+/// unless the limit is zero: a prefill-only request finishes instead, with
+/// no output token and no slot reserved for one. Every arm that finishes a
+/// prefill asks this, and so does the admission that reserves for it.
+fn samples_first_token(max_new: u32) -> bool {
+    max_new > 0
 }
 
 impl RunningReq {
@@ -1928,35 +1951,53 @@ impl SchedulerState {
         self.running.len() + self.waiting.len()
     }
 
+    /// Remove every running or queued entry carrying `request_id` (the `n`
+    /// choices of one request share it), releasing the blocks of the running
+    /// ones, and return each entry's event sink with its `abort` completion;
+    /// empty when the engine holds none.
     fn abort(
         &mut self,
         request_id: &str,
         p: &EngineParams,
-    ) -> Option<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
-        let (events, prompt_tokens, completion_tokens, cached_tokens) = if let Some(index) =
-            self.running.iter().position(|r| r.request_id == request_id)
-        {
+    ) -> Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
+        let mut gone = Vec::new();
+        let mut index = 0;
+        while index < self.running.len() {
+            if self.running[index].request_id != request_id {
+                index += 1;
+                continue;
+            }
             let r = self.running.remove(index);
             self.release(&r, p);
-            (r.events, r.prompt_tokens, r.generated, r.cached_tokens)
-        } else {
-            let index = self
-                .waiting
-                .iter()
-                .position(|w| w.req.request_id == request_id)?;
-            let w = self.waiting.remove(index)?;
+            gone.push((r.events, r.prompt_tokens, r.generated, r.cached_tokens));
+        }
+        let mut index = 0;
+        while index < self.waiting.len() {
+            if self.waiting[index].req.request_id != request_id {
+                index += 1;
+                continue;
+            }
+            let Some(w) = self.waiting.remove(index) else {
+                break;
+            };
             let (generated, cached) = w.resume.map_or((0, 0), |r| (r.generated, r.cached_tokens));
-            (w.req.events, w.prompt_tokens, generated, cached)
-        };
-        Some((
-            events,
-            GenEvent::Done {
-                finish_reason: "abort",
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-            },
-        ))
+            gone.push((w.req.events, w.prompt_tokens, generated, cached));
+        }
+        gone.into_iter()
+            .map(
+                |(events, prompt_tokens, completion_tokens, cached_tokens)| {
+                    (
+                        events,
+                        GenEvent::Done {
+                            finish_reason: "abort",
+                            prompt_tokens,
+                            completion_tokens,
+                            cached_tokens,
+                        },
+                    )
+                },
+            )
+            .collect()
     }
 
     /// Queue a request with no oracle information (tests).
@@ -2090,7 +2131,8 @@ impl SchedulerState {
                 let completes = chunk == remaining;
                 // The chunk's blocks, plus the first output token's slot when
                 // this chunk finishes the prompt.
-                let add = chunk + u32::from(completes);
+                let add =
+                    chunk + u32::from(completes && samples_first_token(self.running[i].max_new));
                 let mut freed = Vec::new();
                 if self.ensure(i, add, p, &mut freed).is_err() {
                     continue;
@@ -2102,7 +2144,7 @@ impl SchedulerState {
                 largest_chunk = largest_chunk.max(chunk);
                 budget -= chunk;
                 let mut completed = stored;
-                if completes {
+                if completes && samples_first_token(self.running[i].max_new) {
                     // The pass that finishes a prefill samples its first token;
                     // that token adds no decode time to the pass.
                     completed.extend(self.emit_token(i, &mut sends, p));
@@ -2152,7 +2194,11 @@ impl SchedulerState {
             let remaining = prompt_len - cached;
             let chunk = remaining.min(budget);
             let completes = chunk == remaining;
-            let add = chunk + u32::from(completes);
+            // The slot of the first output token comes with the chunk that
+            // finishes the prompt, for a request that samples one; a zero
+            // limit reserves none, so nothing is left behind at its release.
+            let first = u32::from(samples_first_token(front.req.max_new));
+            let add = chunk + u32::from(completes) * first;
             // This pass's chunk is what gets allocated. Under full-ISL
             // admission the whole prompt (plus the first output token's slot)
             // must also fit in the free and evictable blocks right now: vLLM's
@@ -2160,7 +2206,7 @@ impl SchedulerState {
             // reservation, so an admitted prompt holds no more than it has
             // computed and the next chunks allocate (evict, preempt) as they run.
             let need = blocks_for(cached + add, bs) - cached_blocks as u64;
-            let need_full = blocks_for(cached + remaining + 1, bs) - cached_blocks as u64;
+            let need_full = blocks_for(cached + remaining + first, bs) - cached_blocks as u64;
             // Reference the cached prefix before making room, so the eviction
             // cannot take the very blocks this request is about to reuse.
             for k in &front.keys[..cached_blocks] {
@@ -2189,6 +2235,7 @@ impl SchedulerState {
                 request_id,
                 prompt_token_ids,
                 max_new,
+                choice,
                 events,
             } = w.req;
             let (reported_cached, generated, resumed_output, output_ids, token_seed) =
@@ -2222,14 +2269,16 @@ impl SchedulerState {
                             // and is independent of block size and the transport request ID.
                             OutputSeed::Prompt => w.rolling_hash,
                         };
+                        // A second and later choice of one request differs by its
+                        // index; the first keeps the seed as it was.
+                        let seed = if choice == 0 {
+                            seed
+                        } else {
+                            fnv_step(seed, choice)
+                        };
                         (cached, 0, 0, Vec::new(), seed as u32)
                     }
                 };
-            let resolved_max_new = if max_new == 0 {
-                p.max_new_default
-            } else {
-                max_new
-            };
             self.running.push(RunningReq {
                 request_id,
                 events,
@@ -2238,7 +2287,7 @@ impl SchedulerState {
                 prompt_tokens: w.prompt_tokens,
                 cached_tokens: reported_cached,
                 computed: cached,
-                max_new: resolved_max_new,
+                max_new,
                 generated,
                 resumed_output,
                 output_ids,
@@ -2247,6 +2296,7 @@ impl SchedulerState {
                 pending: Vec::new(),
                 rolling_hash: w.rolling_hash,
                 token_seed,
+                choice,
             });
             let idx = self.running.len() - 1;
             self.running[idx].held = self.running[idx].seq_keys[..cached_blocks].to_vec();
@@ -2256,7 +2306,7 @@ impl SchedulerState {
             prefill_tokens += chunk;
             largest_chunk = largest_chunk.max(chunk);
             budget -= chunk;
-            if completes {
+            if completes && samples_first_token(self.running[idx].max_new) {
                 completed.extend(self.emit_token(idx, &mut sends, p));
             }
             inserted.extend(completed.iter().map(|c| c.key));
@@ -2450,6 +2500,7 @@ impl SchedulerState {
                 request_id: r.request_id,
                 prompt_token_ids: seq,
                 max_new: r.max_new,
+                choice: r.choice,
                 events: r.events,
             },
             keys,
@@ -2903,6 +2954,7 @@ mod tests {
                 request_id: id.to_string(),
                 prompt_token_ids: prompt,
                 max_new,
+                choice: 0,
                 events: tx,
             },
             rx,
@@ -3080,6 +3132,141 @@ mod tests {
         );
     }
 
+    /// A zero limit is a prefill-only request: the pass that finishes its
+    /// prefill finishes the request, with no output token, `length` as the
+    /// finish reason and a zero completion count. It is not a request for
+    /// the worker's default length; that default belongs to an omitted
+    /// limit, which every submitter resolves before the engine sees it.
+    #[test]
+    fn a_zero_limit_finishes_after_the_prefill_with_no_output_token() {
+        let params = EngineParams::default();
+        let mut state = SchedulerState::new();
+        let (request, mut rx) = req("score", vec![1; 16], 0);
+        state.enqueue(request, &params);
+        for _ in 0..100 {
+            for (tx, event) in state.step(&params).sends {
+                tx.send(event).expect("the receiver is alive");
+            }
+            if let Ok(event) = rx.try_recv() {
+                match event {
+                    GenEvent::Token { token_id, .. } => {
+                        panic!("a zero limit generated token {token_id}")
+                    }
+                    GenEvent::Done {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                        ..
+                    } => {
+                        assert_eq!(finish_reason, "length");
+                        assert_eq!(prompt_tokens, 16);
+                        assert_eq!(completion_tokens, 0);
+                        assert!(state.running.is_empty(), "the request is released");
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("the zero-limit request did not finish");
+    }
+
+    /// A zero-limit prompt longer than the pass budget finishes its prefill
+    /// in a later pass, in the arm that continues a chunked prefill; that arm
+    /// samples no first token for it either: no `Token` event, `length`, a
+    /// zero completion count, in the pass that finishes the prompt.
+    #[test]
+    fn a_zero_limit_prompt_longer_than_the_budget_finishes_with_no_output_token() {
+        let p = EngineParams {
+            max_batched_tokens: 1000,
+            prefix_cache: false,
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let (r, mut rx) = req("long-score", vec![7; 2500], 0);
+        st.enqueue(r, &p);
+        for pass in 1..100 {
+            for (tx, event) in st.step(&p).sends {
+                tx.send(event).expect("the receiver is alive");
+            }
+            if let Ok(event) = rx.try_recv() {
+                match event {
+                    GenEvent::Token { token_id, .. } => {
+                        panic!("a zero limit generated token {token_id} in pass {pass}")
+                    }
+                    GenEvent::Done {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                        ..
+                    } => {
+                        assert_eq!(finish_reason, "length");
+                        assert_eq!(prompt_tokens, 2500);
+                        assert_eq!(completion_tokens, 0);
+                        assert_eq!(
+                            pass, 3,
+                            "2500 tokens at a 1000-token budget finish in the third pass"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("the long zero-limit request did not finish");
+    }
+
+    /// A zero-limit request reserves no slot for a first output token it
+    /// never samples, so after it completes the pool holds nothing of it:
+    /// a block-aligned prompt and one with a partial tail, with and without
+    /// the prefix cache.
+    #[test]
+    fn a_zero_limit_request_leaves_the_pool_as_it_found_it() {
+        for prefix_cache in [false, true] {
+            for prompt_len in [16, 12] {
+                let p = EngineParams {
+                    block_size: 16,
+                    kv_capacity_tokens: 64,
+                    prefix_cache,
+                    ..EngineParams::default()
+                };
+                let mut st = SchedulerState::new();
+                let (r, mut rx) = req("score", vec![7; prompt_len], 0);
+                st.enqueue(r, &p);
+                let mut done = false;
+                for _ in 0..200 {
+                    for (tx, event) in st.step(&p).sends {
+                        tx.send(event).expect("the receiver is alive");
+                    }
+                    match rx.try_recv() {
+                        Ok(GenEvent::Token { token_id, .. }) => {
+                            panic!("a zero limit generated token {token_id}")
+                        }
+                        Ok(GenEvent::Done {
+                            completion_tokens, ..
+                        }) => {
+                            assert_eq!(completion_tokens, 0);
+                            done = true;
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                let case = format!("prefix_cache={prefix_cache} prompt_len={prompt_len}");
+                assert!(done, "{case}: the zero-limit request finished");
+                assert!(st.is_idle(), "{case}");
+                assert_eq!(st.snapshot(&p).num_used_tokens, 0, "{case}");
+                assert_eq!(
+                    st.pool.allocated,
+                    st.pool.free_lru.len() as u64,
+                    "{case}: every block of the request is back in the free list"
+                );
+                assert!(
+                    st.pool.fits(p.capacity_blocks(), p.capacity_blocks()),
+                    "{case}: the whole capacity is available again"
+                );
+            }
+        }
+    }
+
     #[test]
     fn default_output_still_depends_on_transport_id() {
         let params = EngineParams::default();
@@ -3109,9 +3296,10 @@ mod tests {
                 assert_eq!(st.pool.allocated, 2, "a full block and a partial tail");
                 let cached = st.pool.cached();
 
-                let (_, event) = st.abort("cancelled", &p).expect("the request exists");
+                let aborted = st.abort("cancelled", &p);
+                assert_eq!(aborted.len(), 1, "the request exists");
                 assert!(matches!(
-                    event,
+                    aborted[0].1,
                     GenEvent::Done {
                         finish_reason: "abort",
                         ..
@@ -3122,7 +3310,7 @@ mod tests {
                 assert_eq!(st.pool.cached(), cached, "cached prefixes remain reusable");
                 assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
                 assert!(st.pool.fits(p.capacity_blocks(), p.capacity_blocks()));
-                assert!(st.abort("cancelled", &p).is_none());
+                assert!(st.abort("cancelled", &p).is_empty());
             }
         }
     }
@@ -3135,9 +3323,10 @@ mod tests {
         st.enqueue(r, &p);
         st.step(&p);
         st.preempt_last(&p);
-        let (_, event) = st.abort("preempted", &p).expect("the request is queued");
+        let aborted = st.abort("preempted", &p);
+        assert_eq!(aborted.len(), 1, "the request is queued");
         assert!(matches!(
-            event,
+            aborted[0].1,
             GenEvent::Done {
                 finish_reason: "abort",
                 prompt_tokens: 64,
@@ -3145,6 +3334,50 @@ mod tests {
                 ..
             }
         ));
+        assert!(st.is_idle());
+        assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
+    }
+
+    /// The `n` choices of one request share its id: an abort removes every
+    /// entry carrying it, running or queued, each with its own completion,
+    /// and leaves another request's entry alone.
+    #[test]
+    fn abort_removes_every_entry_with_the_request_id() {
+        let p = EngineParams {
+            block_size: 4,
+            max_batched_tokens: 4,
+            kv_capacity_tokens: 32,
+            ..EngineParams::default()
+        };
+        let mut st = SchedulerState::new();
+        let mut receivers = Vec::new();
+        for choice in 0..2 {
+            let (mut r, rx) = req("fanned", vec![7; 4], 100);
+            r.choice = choice;
+            st.enqueue(r, &p);
+            receivers.push(rx);
+        }
+        let (other, _rx) = req("other", vec![9; 4], 100);
+        st.enqueue(other, &p);
+        st.step(&p);
+        assert_eq!(
+            (st.running.len(), st.waiting.len()),
+            (1, 2),
+            "the budget admits one prompt per pass"
+        );
+
+        let aborted = st.abort("fanned", &p);
+        assert_eq!(aborted.len(), 2, "the running choice and the queued one");
+        assert!(aborted.iter().all(|(_, event)| matches!(
+            event,
+            GenEvent::Done {
+                finish_reason: "abort",
+                ..
+            }
+        )));
+        assert_eq!(st.in_flight(), 1, "the other request stays");
+        assert!(st.abort("fanned", &p).is_empty());
+        assert_eq!(st.abort("other", &p).len(), 1);
         assert!(st.is_idle());
         assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
     }

@@ -21,7 +21,14 @@
 //! A body that failed after its head went out (the relay's upstream stream
 //! broke mid-body) keeps the head's status, told apart by the `error_code`
 //! [`BODY_FAILED_CODE`]: counted as its head alone, a truncated answer was a
-//! complete one.
+//! complete one. So does a body whose producer told the client of a failure
+//! in the body itself and then ended it as planned (the error event a
+//! stream ends with, then `[DONE]`), whatever the failure's cause: a worker
+//! that cut the stream, a constraint the engine could not keep, a fault of
+//! the request found after the first frame, a failure in the gateway's own
+//! reading. Its producer's word reaches the edge as `BodyFailure`, and the
+//! response counts as a body that failed, as the client read it; the event's
+//! own type names the cause to the client.
 //!
 //! A body has gone out in full at its last frame, or once its data frames
 //! add up to the length the response declared (`Content-Length`): an
@@ -33,10 +40,8 @@
 //! look the same from here, a request's future dropped without a response.
 
 use std::{
-    future::Future,
-    pin::Pin,
     sync::Arc,
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
     time::Instant,
 };
 
@@ -47,11 +52,11 @@ use axum::{
 };
 use http_body::Body as _;
 use openai_protocol::validated::RejectionCode;
-use pin_project_lite::pin_project;
 use tokio::task::futures::TaskLocalFuture;
 use tower::{Layer, Service};
 
 use super::{
+    duty::{Duty, DutyFuture},
     edge_body::{BodyDuties, EdgeBody},
     request_start::{clock_now, RequestStarted},
 };
@@ -181,7 +186,7 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = HttpMetricsFuture<TaskLocalFuture<RequestStarted, S::Future>>;
+    type Future = HttpMetricsFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -212,45 +217,30 @@ where
         // route's own with the edge's duty beside it, not a box around both.
         // The call runs under the stamp's sync scope and the future under
         // its scoped future: the layers inside read the stamp from both.
-        HttpMetricsFuture {
-            inner: started.scope(started.sync_scope(|| self.inner.call(req))),
-            duty: Some(EdgeDuty {
+        DutyFuture::new(
+            started.scope(started.sync_scope(|| self.inner.call(req))),
+            EdgeDuty {
                 method,
                 start,
                 tracker,
                 outcome,
                 guard,
-            }),
-        }
+            },
+        )
     }
 }
 
-pin_project! {
-    /// The metrics layer's future: the route's future, then the edge's
-    /// bookkeeping of the answer (the duration, the response head counted,
-    /// the one body wrapper). `duty` is what the edge holds for the request
-    /// until the route answers, taken at the answer.
-    pub struct HttpMetricsFuture<F> {
-        #[pin]
-        inner: F,
-        duty: Option<EdgeDuty>,
-    }
-
-    impl<F> PinnedDrop for HttpMetricsFuture<F> {
-        fn drop(this: Pin<&mut Self>) {
-            // Dropped with the duty still held: the route never answered.
-            if let Some(duty) = this.project().duty.take() {
-                duty.unanswered();
-            }
-        }
-    }
-}
+/// The metrics layer's future: the route's future with the request's start
+/// in its task local, with the edge's bookkeeping as its duty.
+pub type HttpMetricsFuture<F> = DutyFuture<TaskLocalFuture<RequestStarted, F>, EdgeDuty>;
 
 /// What the metrics layer holds for a request between its arrival and the
-/// route's answer. Dropped with the future before the answer, it counts the
-/// request as closed by the client and releases its in-flight guard, with
-/// the gauge set from the tracker as at every other release (`unanswered`).
-struct EdgeDuty {
+/// route's answer: the edge's bookkeeping of the answer (the duration, the
+/// response head counted, the one body wrapper). Dropped with the future
+/// before the answer, it counts the request as closed by the client and
+/// releases its in-flight guard, with the gauge set from the tracker as at
+/// every other release (`unanswered`).
+pub struct EdgeDuty {
     method: &'static str,
     start: Instant,
     tracker: Arc<InFlightRequestTracker>,
@@ -258,25 +248,7 @@ struct EdgeDuty {
     guard: InFlightGuard,
 }
 
-impl<F, E> Future for HttpMetricsFuture<F>
-where
-    F: Future<Output = Result<Response, E>>,
-{
-    type Output = Result<Response, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let answer = ready!(this.inner.poll(cx));
-        Poll::Ready(match this.duty.take() {
-            Some(duty) => duty.answered(answer),
-            // A poll after the answer breaks the caller's contract; the
-            // route's word to it passes through.
-            None => answer,
-        })
-    }
-}
-
-impl EdgeDuty {
+impl Duty for EdgeDuty {
     /// The route answered: the response head is counted and the body wrapped
     /// once; an error of the inner service releases the guard and counts
     /// nothing.
@@ -868,6 +840,7 @@ mod client_closed_tests {
 
     use super::*;
     use crate::{
+        middleware::edge_body::BodyFailure,
         observability::inflight_tracker::InFlightRequestTracker, routers::error::create_error,
     };
 
@@ -1111,6 +1084,74 @@ mod client_closed_tests {
             sample("200", "stream_error"),
             "{rendered}"
         );
+    }
+
+    /// A router whose `/stream` handler hands out `body` once with the
+    /// producer's word `failure` on it, under the metrics layer.
+    fn told_stream_app(body: Body, failure: BodyFailure) -> Router {
+        let slot = Arc::new(Mutex::new(Some(body)));
+        Router::new()
+            .route(
+                "/stream",
+                get(move || {
+                    let body = slot
+                        .lock()
+                        .expect("slot")
+                        .take()
+                        .expect("handler called once");
+                    let failure = failure.clone();
+                    async move {
+                        let mut response = Response::new(body);
+                        failure.carry(&mut response);
+                        response
+                    }
+                }),
+            )
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
+    }
+
+    /// A streamed body whose producer told the client of a failure in the
+    /// body and then ended it as planned (the error event, then `[DONE]`)
+    /// counts as a body that failed, what the client read; one whose
+    /// producer told of nothing counts as it went out.
+    #[test]
+    fn a_body_whose_producer_told_of_a_failure_counts_as_a_failed_body() {
+        for (told, error_code) in [(true, "stream_error"), (false, "")] {
+            let rendered = render(|handle| async move {
+                let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+                let failure = BodyFailure::default();
+                let app =
+                    told_stream_app(Body::from_stream(ReceiverStream::new(rx)), failure.clone());
+                let response = app.oneshot(request("/stream")).await.expect("response");
+                let mut body = response.into_body();
+                tx.send(Ok(Bytes::from_static(b"data: {}\n\n")))
+                    .await
+                    .expect("send");
+                assert!(body.frame().await.expect("a frame").is_ok());
+                if told {
+                    failure.tell();
+                }
+                tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+                    .await
+                    .expect("send");
+                drop(tx);
+                assert!(body.frame().await.expect("a frame").is_ok());
+                assert!(body.frame().await.is_none(), "the body ends as planned");
+                // Counted at the end, once: the head's status, the failure
+                // named when the producer told of one.
+                assert_eq!(
+                    responses(&handle.render(), "/stream"),
+                    sample("200", error_code),
+                    "told: {told}"
+                );
+                drop(body);
+            });
+            assert_eq!(
+                responses(&rendered, "/stream"),
+                sample("200", error_code),
+                "told: {told}: {rendered}"
+            );
+        }
     }
 
     #[test]

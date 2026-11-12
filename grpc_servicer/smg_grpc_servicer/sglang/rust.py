@@ -22,14 +22,14 @@ Prefill/decode disaggregation is served as on the Python servicer: a request's
 bootstrap fields (host, port, room) ride the scheduler's own request struct
 over the wire, and the prefill side's bootstrap server starts in this process
 before the ranks, where the Python servicer starts it; the planned warm-up
-runs on a prefill or decode leg as on a single engine, its requests carrying
-the engine's stand-in bootstrap, so the leg warms up without its peer and no
+runs on a prefill or decode side as on a single engine, its requests carrying
+the engine's stand-in bootstrap, so the side warms up without its peer and no
 first request of a prompt-length class pays a kernel compile under the
-Router's prefill-liveness bound. A leg of more than one scheduler rank is
-served too: a prefill leg's request runs on the rank of its room's residue
+Router's prefill-liveness bound. A side of more than one scheduler rank is
+served too: a prefill side's request runs on the rank of its room's residue
 (``bootstrap_room % dp_size``, where SGLang's prefill side requires it and
 the decode side looks for the KV), the Router's pin yielding to it with a
-warning, and a decode leg's on its pinned rank. Multimodal inputs reach the scheduler as its
+warning, and a decode side's on its pinned rank. Multimodal inputs reach the scheduler as its
 own processor output over the wire. The language side of
 encode/prefill disaggregation (``--language-only``) is served as behind
 SGLang's own frontend: this process runs SGLang's own encoder bootstrap server
@@ -209,7 +209,7 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
     }
 
 
-def server_facts(server_args: Any) -> dict[str, Any]:
+def server_facts(server_args: Any, model_config: Any | None = None) -> dict[str, Any]:
     """``SglangGrpcServer`` keyword arguments for ``GetServerInfo`` and
     ``GetLoads``: the server args as the Router's label source (with the
     operator's pairing protocol, as the Python servicer adds it), the
@@ -229,6 +229,10 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     else:
         args_dict = dict(getattr(server_args, "__dict__", {}))
     args_dict = _json_safe(args_dict)
+    if model_config is not None:
+        from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
+
+        args_dict["multimodal_encoder_dtype"] = encoder_dtype(None, lambda: model_config.dtype)
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
@@ -452,10 +456,10 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
     processes the prompt itself, which neither servicer runs, so that launch
     must not start rather than report SERVING and refuse every image.
     Prefill/decode disaggregation is served (the wire carries the bootstrap
-    fields; :func:`start_bootstrap_server`) on a leg of any number of
-    scheduler ranks: the Rust servicer places a prefill leg's request on the
+    fields; :func:`start_bootstrap_server`) on a side of any number of
+    scheduler ranks: the Rust servicer places a prefill side's request on the
     rank of its room (``bootstrap_room % dp_size``, where the decode side looks
-    for the KV) and a decode leg's on its pinned rank. One prefill shape is
+    for the KV) and a decode side's on its pinned rank. One prefill shape is
     refused whatever its load-balance method and environment: several plain
     data-parallel replicas (``--dp-size N`` without attention DP), where every
     replica reports attention-DP rank 0 to the engine's KV sender; following
@@ -490,11 +494,11 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
         and args.attention_dp_width == 1
     ):
         raise ServicerConfigError(
-            f"a prefill leg of {args.scheduler_count} plain data-parallel replicas is not served: "
+            f"a prefill side of {args.scheduler_count} plain data-parallel replicas is not served: "
             "each replica reports attention-DP rank 0 to the engine's KV sender, which fails every "
             "request whose bootstrap_room % dp_size is not 0 when it follows the room, and "
             "registers rank 0 for the decode side's bootstrap under any other load-balance "
-            "method; run attention DP (--tp-size N --attn-dp-size N) or one rank per leg"
+            "method; run attention DP (--tp-size N --attn-dp-size N) or one rank per side"
         )
 
 
@@ -550,7 +554,9 @@ class SglangLauncher(RustLauncher):
         return default_kv_events_config(args)
 
     def facts(self, args: Any) -> dict[str, Any]:
-        return {**model_facts(args), **server_facts(args)}
+        """Share the resolved model config between model facts and the wire dtype label."""
+        model_config = _model_config(args)
+        return {**model_facts(args, model_config), **server_facts(args, model_config)}
 
     def tokenizer_dir(self, args: Any) -> str | None:
         return tokenizer_dir_for(args)
@@ -611,9 +617,11 @@ class SglangLauncher(RustLauncher):
         self.encode = EncodeDispatchBridge(args)
         logger.info(
             "Encode dispatch for the language-only worker: SGLang's own receiver in this "
-            "process, %d encoder URL(s) configured, bootstrap port %s",
+            "process, %d encoder URL(s) configured, bootstrap port %s, receiver mode %s "
+            "(http encoders take image, video and audio references; grpc takes images only)",
             len(self.encode.encoder_urls),
             getattr(args, "encoder_bootstrap_port", None),
+            self.encode.transport_mode,
         )
         return {"encode_dispatcher": self.encode}
 
@@ -624,14 +632,14 @@ class SglangLauncher(RustLauncher):
             args, handshake_port=handshake_port, encode_bridge=self.encode
         )
 
-    # The media leg's request material, built with the inputs for a
+    # The media request's material, built with the inputs for a
     # language-side worker whose frontend dispatches to the encoders; ``None``
     # on every other worker and where no prompt could be rendered.
     media: Any | None = None
 
     def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
         """The plan's inputs; on a language-side worker whose frontend
-        dispatches to the encoders, with the media leg when the model's chat
+        dispatches to the encoders, with the media request when the model's chat
         template renders an image placeholder (the text ladder never reaches
         the scheduler's media path, whose first use costs a fresh worker
         seconds once)."""

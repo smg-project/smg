@@ -1057,20 +1057,21 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
 
 /// Whether a worker's labels are re-read from its engine when it comes into
 /// service: a worker this node registered itself (a mesh import carries its
-/// owner's labels), over a transport with metadata endpoints (a ZMQ engine
-/// reports its geometry at the handshake), that is a self-hosted engine (an
-/// external provider is never read for engine metadata, at registration or
-/// later). Judged by kind, not by what registration's read returned: a read
-/// that failed leaves empty labels behind, and the first transition into
-/// service is what fills them in; an engine that offers no metadata answers
-/// a refresh with no labels, which the refresh step skips.
+/// owner's labels) that is a self-hosted engine (an external provider is
+/// never read for engine metadata, at registration or later), over a
+/// transport with metadata endpoints, or over the ZMQ wire, where the engine
+/// reports its geometry at the handshake and the worker's own link holds it
+/// for the refresh step to read. Judged by kind, not by what registration's
+/// read returned: a read that failed leaves empty labels behind, and the
+/// first transition into service is what fills them in; an engine that
+/// offers no metadata answers a refresh with no labels, which the refresh
+/// step skips.
 fn labels_follow_the_engine(
     registry: &WorkerRegistry,
     worker_id: &WorkerId,
     worker: &Arc<dyn Worker>,
 ) -> bool {
     registry.origin_of(worker_id) == Some(WorkerOrigin::Local)
-        && *worker.connection_mode() != ConnectionMode::Zmq
         && worker.metadata().spec.runtime_type != RuntimeType::External
 }
 
@@ -1080,13 +1081,17 @@ fn labels_follow_the_engine(
 /// from them (the decode admission window, multimodal placement, PD pairing),
 /// are re-read through the update workflow, which rebuilds the worker only if
 /// they changed. While another job for the worker is in flight (its
-/// registration, which just read the labels; an update) nothing is submitted:
-/// the refresh would take that job's status under the URL. A skipped or
-/// failed submission is logged; the next transition retries.
+/// registration, whose last steps run after the worker is in the registry
+/// and a handshake can complete; an update) the refresh is kept and runs
+/// when that job ends (`JobQueue::submit_or_defer`), never submitted beside
+/// it (it would take that job's status under the URL) and never dropped: a
+/// worker that stays in service has no next transition to retry on, and on
+/// the ZMQ wire this refresh is what gives it its window. A failed
+/// submission is logged; the next transition retries.
 async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue>) {
     let url = worker.url().to_string();
     match job_queue
-        .submit_unless_in_flight(Job::RefreshWorkerLabels { url: url.clone() })
+        .submit_or_defer(Job::RefreshWorkerLabels { url: url.clone() })
         .await
     {
         Ok(true) => debug!(
@@ -1095,7 +1100,7 @@ async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue
         ),
         Ok(false) => debug!(
             worker_url = %Endpoint::redacted_str(&url),
-            "A job for the worker is in flight; its label refresh waits for the next transition into service"
+            "A job for the worker is in flight; its label refresh runs when that job ends"
         ),
         Err(error) => warn!(
             worker_url = %Endpoint::redacted_str(&url),
@@ -1118,7 +1123,7 @@ async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue
 ///     came back on the same address (a restart), and without
 ///     `--remove-unhealthy-workers` this is the only way it rejoins
 ///   - Failed stays Failed on failure; Draining never transitions here
-fn compute_next_status(
+pub(crate) fn compute_next_status(
     worker: &Arc<dyn Worker>,
     probe_ok: bool,
     health_config: &HealthCheckConfig,

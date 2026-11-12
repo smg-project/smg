@@ -41,6 +41,7 @@ The gateway image is on Docker Hub, engine images are on GitHub Container Regist
 | Component | Registry | Image |
 |-----------|----------|-------|
 | Gateway | `docker.io` | `lightseekorg/smg:1.14.0` |
+| Gateway with the Slurm clients | `docker.io` | `lightseekorg/smg:<version>-slurm`, beside every release image from 1.16.0 on |
 | vLLM worker | `ghcr.io` | `smg-project/smg:1.14.0-vllm-v0.31.0` |
 | TRT-LLM worker | `ghcr.io` | `smg-project/smg:1.14.0-trtllm-1.3.0rc24` |
 | SGLang worker | `ghcr.io` | `smg-project/smg:1.14.0-sglang-v0.5.21` |
@@ -193,7 +194,7 @@ one) keeps that parser.
 |---|---|---|
 | `kubernetes` | pods matching `kubernetes.selector` in `kubernetes.namespace` (the release's by default; every namespace with `clusterWide`) | a Role, or a ClusterRole with `clusterWide`, which the chart creates |
 | `file` | the workers listed in a JSON manifest, reread when it changes | the manifest: an existing ConfigMap (`file.configMap.name`, its key `file.configMap.key`), or a path in the image (`file.path`) |
-| `slurm` | a worker on every node of each running job named in `slurm.jobNames` (or `encodeJobNames`, `prefillJobNames`, `decodeJobNames`), at `slurm.port` | an image with Slurm clients (below) |
+| `slurm` | a worker on every node of each running job named in `slurm.jobNames` (or `encodeJobNames`, `prefillJobNames`, `decodeJobNames`), at `slurm.port` | the gateway image's `-slurm` variant (below) |
 | `consul` | the instances of `consul.service` with passing health checks | Consul's address, and the ACL token and TLS files from existing Secrets |
 
 `router.serviceDiscovery.enabled` is the legacy spelling of `provider: kubernetes` and renders the arguments it always has; `router.discovery.kubernetes` takes the same settings. The chart refuses the two together, as the gateway refuses `--service-discovery` beside `--discovery-provider`. It also refuses a provider without what it cannot start without (a file provider without a manifest, Slurm without a port or a job name, Consul without a service, a Consul client certificate without its key), so the mistake surfaces at `helm install` rather than as a crash-looping pod.
@@ -204,7 +205,7 @@ Mesh without `router.mesh.peerUrls` finds its peers through Kubernetes discovery
 
 **File.** The ConfigMap is mounted whole at `/etc/smg/discovery`, not as a subPath, so the kubelet projects each update of it into the pod and the gateway's watch on that directory picks it up; the manifest path is `/etc/smg/discovery/<key>` unless `file.path` names another. The volume is optional: the gateway waits for a manifest that is not there yet, so the ConfigMap can be published after the release. The manifest format is in the gateway's file provider (`model_gateway/src/service_discovery/file.rs`); [`with-file-discovery.yaml`](examples/with-file-discovery.yaml) has an example.
 
-**Slurm.** The provider runs `squeue` and `scontrol` (Slurm 23.11 or later) in the router container, and the published gateway image has no Slurm client. It needs an image built from the gateway's with those commands and what the cluster's authentication needs, its `slurm.conf` and MUNGE, or `auth/jwt` with `SLURM_JWT` (which `router.extraEnv` can take from a Secret); the chart mounts nothing for it. The router runs as UID 65532, so set `slurm.user` to the user whose jobs are the workers. Every node of a selected job runs one server on `slurm.port`, so worker jobs should run `--exclusive`.
+**Slurm.** The provider runs `squeue` and `scontrol` (Slurm 23.11 or later) in the router container. The published gateway image has no Slurm client and refuses to start the provider, naming the missing command; its `-slurm` variant (`global.image.tag: "<version>-slurm"`, the release tag with `-slurm` appended, published beside every release image from 1.16.0 on and as `ghcr.io/smg-project/smg:nightly-slurm`) carries Ubuntu's Slurm 23.11 client package and its JWT authentication plugin. A controller accepts commands up to two major releases older than itself (three from 24.11 on), so those clients speak to a controller on 23.11, 24.05, 24.11 or 25.05; a newer cluster needs an image with its own clients. What the cluster's authentication needs still comes from the deployment: its `slurm.conf`, and a running `munged`'s socket (a sidecar or the host; the image starts none and ships no MUNGE key) or `auth/jwt` with `SLURM_JWT` (which `router.extraEnv` can take from a Secret); the chart mounts nothing for it. The router runs as UID 65532, so set `slurm.user` to the user whose jobs are the workers. Every node of a selected job runs one server on `slurm.port`, so worker jobs should run `--exclusive`.
 
 **Consul.** The ACL token and the TLS files reach the gateway through Consul's own environment variables, never as arguments. `consul.token.existingSecret` sets `CONSUL_HTTP_TOKEN` from that Secret's `consul.token.secretKey` (default `token`). `consul.tls.existingSecret` mounts the Secret's `consul.tls.secretKeys` at `/etc/smg/consul-tls` and points `CONSUL_CACERT` (`caCert`, default `ca.crt`) and, when both are set, `CONSUL_CLIENT_CERT` and `CONSUL_CLIENT_KEY` (`clientCert`, `clientKey`) at them; give `consul.address` an `https://` scheme. The gateway reads them once, at start-up, so restart the router pods after rotating either Secret.
 
@@ -239,7 +240,7 @@ An older gateway image does not know `--api-key-file`; a chart of this version w
 
 #### Control Plane
 
-`router.adminPort` starts the admin listener (`--admin-port`): the control-plane routes (the admin routes, `/workers` and `/v1/rl`) are served on that container port, with the probes, and the data port answers 404 for them. The chart renders a second Service, `<fullname>-router-admin` (`router.adminService`, ClusterIP by default), so the control plane has a name of its own inside the cluster; the ingress never names it. `router.adminHost` binds the listener on another address.
+`router.adminPort` starts the admin listener (`--admin-port`): the control-plane routes (the admin routes, `/workers` and `/v1/rl`) are served on that container port, with the probes, and the data port answers 404 for them. The chart renders a second Service, `<fullname>-router-admin` (`router.adminService`, ClusterIP by default), so the control plane has a name of its own inside the cluster; the ingress never names it. `router.adminHost` binds the listener on another address. A loopback `router.adminHost` (`127.0.0.1`, `::1`) leaves the admin Service with nowhere to send traffic: Service traffic reaches the pod IP. A host without `router.adminPort`, or an admin port equal to another listener's, is refused at render.
 
 The control-plane API keys (`auth.controlPlane`) reach the gateway as a file, like the shared key: `auth.controlPlane.apiKeys` (one `id:name:role:key` entry per line, role `admin` or `user`) is written into a chart-managed Secret, or `auth.controlPlane.existingSecret` names one, mounted at `/etc/smg/control-plane` and read with `--control-plane-api-keys-file`. A rotated `auth.controlPlane.apiKeys` rolls the router pods (`checksum/control-plane`); a rotated existing Secret needs the rollout restart described above. [`examples/with-admin-plane.yaml`](examples/with-admin-plane.yaml) sets both.
 
@@ -253,7 +254,7 @@ helm install smg deploy/helm/smg \
 
 #### Admission Config
 
-`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a scheduler ConfigMap without the scheduler enabled.
+`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a rate-limit or scheduler ConfigMap without its feature enabled.
 
 ```bash
 kubectl create configmap smg-rate-limit --from-file=rate-limit.yaml=./rate-limit.yaml
@@ -261,6 +262,8 @@ helm install smg deploy/helm/smg \
   --set router.tenantRateLimit.enabled=true \
   --set router.tenantRateLimit.configMap.name=smg-rate-limit
 ```
+
+The gateway reads both files once at start. An edit of a ConfigMap reaches the mounted file through the kubelet's symlink swap, but it takes effect on the next `kubectl rollout restart` of the router Deployment; the mounts stay whole ConfigMaps for a later file watch.
 
 #### Store URLs
 

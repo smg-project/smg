@@ -37,37 +37,62 @@ use crate::routers::grpc::{
 /// Global Harmony encoding (lazy-initialized)
 static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 
-fn reject_chat_audio(messages: &[ChatMessage]) -> Result<(), String> {
-    let has_audio = messages.iter().any(|message| match message {
+/// The text of a Responses message item's content parts as Harmony carries
+/// it: input text, output text and a refusal (losslessly text) verbatim. An
+/// image or a file part is refused by name, as chat audio is
+/// ([`reject_chat_media`]), never dropped from the prompt behind an answer
+/// that reads as if the model had seen it.
+fn harmony_text_parts(parts: &[ResponseContentPart]) -> Result<Vec<String>, String> {
+    parts
+        .iter()
+        .map(|part| match part {
+            ResponseContentPart::OutputText { text, .. }
+            | ResponseContentPart::InputText { text } => Ok(text.clone()),
+            ResponseContentPart::Refusal { refusal } => Ok(refusal.clone()),
+            ResponseContentPart::InputImage { .. } => {
+                Err("Harmony does not support \"input_image\" content parts".to_string())
+            }
+            ResponseContentPart::InputFile { .. } => {
+                Err("Harmony does not support \"input_file\" content parts".to_string())
+            }
+        })
+        .collect()
+}
+
+/// Refuses the content parts the Harmony path has no form for. It renders
+/// text only, so an audio, image or video part would be dropped behind an
+/// answer that reads as if the model had seen it; the first such part names
+/// its kind, and the regular multimodal path carries them.
+fn reject_chat_media(messages: &[ChatMessage]) -> Result<(), String> {
+    let kind = messages.iter().find_map(|message| match message {
         ChatMessage::System { content, .. }
         | ChatMessage::User { content, .. }
         | ChatMessage::Tool { content, .. }
         | ChatMessage::Developer { content, .. }
-        | ChatMessage::Root { content, .. } => content_contains_audio(content),
-        ChatMessage::Assistant { content, .. } => {
-            content.as_ref().is_some_and(content_contains_audio)
-        }
-        ChatMessage::Function { .. } => false,
+        | ChatMessage::Root { content, .. } => media_part_kind(content),
+        ChatMessage::Assistant { content, .. } => content.as_ref().and_then(media_part_kind),
+        ChatMessage::Function { .. } => None,
     });
 
-    if has_audio {
-        Err(
-            "Harmony does not support audio content parts; use the regular multimodal path"
-                .to_string(),
-        )
-    } else {
-        Ok(())
+    match kind {
+        Some(kind) => Err(format!(
+            "Harmony does not support {kind} content parts; use the regular multimodal path"
+        )),
+        None => Ok(()),
     }
 }
 
-fn content_contains_audio(content: &MessageContent) -> bool {
-    matches!(
-        content,
-        MessageContent::Parts(parts)
-            if parts
-                .iter()
-                .any(|part| matches!(part, ContentPart::AudioUrl { .. } | ContentPart::InputAudio { .. }))
-    )
+/// The kind of the first part in `content` the Harmony path has no form for.
+fn media_part_kind(content: &MessageContent) -> Option<&'static str> {
+    let MessageContent::Parts(parts) = content else {
+        return None;
+    };
+    parts.iter().find_map(|part| match part {
+        ContentPart::AudioUrl { .. } | ContentPart::InputAudio { .. } => Some("audio"),
+        ContentPart::ImageUrl { .. } => Some("image"),
+        ContentPart::VideoUrl { .. } => Some("video"),
+        ContentPart::Text { .. } | ContentPart::Refusal { .. } | ContentPart::Unknown(_) => None,
+    })
 }
 
 /// Serializes first-load attempts; a failed load leaves the cell empty so a
@@ -432,7 +457,7 @@ impl HarmonyBuilder {
         request: &ChatCompletionRequest,
     ) -> Result<HarmonyBuildOutput, String> {
         utils::validate_chat_content_parts(&request.messages)?;
-        reject_chat_audio(&request.messages)?;
+        reject_chat_media(&request.messages)?;
         let encoding = try_harmony_encoding()?;
 
         let mut all_messages = Vec::new();
@@ -802,23 +827,9 @@ impl HarmonyBuilder {
                     _ => Role::User, // Default to user for unknown roles
                 };
 
-                // Extract text from content parts. `Refusal` is losslessly
-                // representable as text and is preserved verbatim. Image /
-                // file parts are currently dropped (R1/R2/R3 will implement
-                // full media handling).
-                let text_parts: Vec<String> = content
-                    .iter()
-                    .filter_map(|part| match part {
-                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                        ResponseContentPart::InputText { text } => Some(text.clone()),
-                        ResponseContentPart::Refusal { refusal } => Some(refusal.clone()),
-                        // R1/R2/R3 will implement full media handling
-                        ResponseContentPart::InputImage { .. }
-                        | ResponseContentPart::InputFile { .. } => None,
-                    })
-                    .collect();
-
-                let text = text_parts.join("\n");
+                // The text of the content parts; an image or a file part is
+                // refused (`harmony_text_parts`).
+                let text = harmony_text_parts(content)?.join("\n");
 
                 Ok(HarmonyMessage {
                     author: Author {
@@ -937,24 +948,7 @@ impl HarmonyBuilder {
 
                 let text = match content {
                     StringOrContentParts::String(s) => s.clone(),
-                    StringOrContentParts::Array(parts) => {
-                        // Extract text from content parts. `Refusal` is
-                        // losslessly representable as text and is preserved
-                        // verbatim. Image / file parts are currently dropped
-                        // (R1/R2/R3 will implement full media handling).
-                        parts
-                            .iter()
-                            .filter_map(|part| match part {
-                                ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                                ResponseContentPart::InputText { text } => Some(text.clone()),
-                                ResponseContentPart::Refusal { refusal } => Some(refusal.clone()),
-                                // R1/R2/R3 will implement full media handling
-                                ResponseContentPart::InputImage { .. }
-                                | ResponseContentPart::InputFile { .. } => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
+                    StringOrContentParts::Array(parts) => harmony_text_parts(parts)?.join("\n"),
                 };
 
                 Ok(HarmonyMessage {
@@ -1098,7 +1092,8 @@ impl HarmonyBuilder {
                     let text = match content {
                         MessageContent::Text(text) => text.clone(),
                         MessageContent::Parts(parts) => {
-                            // For multimodal content, extract text parts
+                            // Text parts only: a media part was refused by
+                            // `reject_chat_media` before this arm.
                             parts
                                 .iter()
                                 .filter_map(|part| {
@@ -1489,6 +1484,42 @@ mod tests {
         assert!(error.contains("gRPC"));
     }
 
+    /// A Responses message item's `input_image` or `input_file` part has no
+    /// form in a Harmony prompt: the build refuses it by name, as it refuses
+    /// chat audio, instead of rendering the turn without it; a message item
+    /// and a simple input message alike.
+    #[test]
+    fn build_from_responses_refuses_image_and_file_parts() {
+        let builder = HarmonyBuilder::new();
+        let parts = [
+            (
+                json!({"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}),
+                "\"input_image\"",
+            ),
+            (
+                json!({"type": "input_file", "file_data": "JVBERi0xLjQK", "filename": "a.pdf"}),
+                "\"input_file\"",
+            ),
+        ];
+        for (part, name) in parts {
+            let inputs = [
+                json!([{"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hi"}, part.clone()
+                ]}]),
+                json!([{"role": "user", "content": [part.clone()]}]),
+            ];
+            for input in inputs {
+                let request: ResponsesRequest =
+                    serde_json::from_value(json!({"model": "gpt-oss-120b", "input": input}))
+                        .unwrap();
+                let error = builder
+                    .build_from_responses(&request)
+                    .expect_err("a media part is refused");
+                assert!(error.contains(name), "{error}");
+            }
+        }
+    }
+
     #[test]
     fn chat_audio_is_explicitly_rejected() {
         let audio_parts = [
@@ -1511,10 +1542,61 @@ mod tests {
                 content: MessageContent::Parts(vec![part]),
                 name: None,
             }];
-            let error = reject_chat_audio(&messages).expect_err("Harmony must reject chat audio");
+            let error = reject_chat_media(&messages).expect_err("Harmony must reject chat audio");
             assert!(error.contains("audio content parts"));
             assert!(error.contains("regular multimodal path"));
         }
+    }
+
+    /// The Harmony chat path renders text only: an image or a video part
+    /// is refused by name before the encoding loads, as an audio part is,
+    /// never dropped behind an answer that reads as if the model had seen it.
+    #[test]
+    fn chat_image_and_video_parts_are_refused_by_name() {
+        let cases = [
+            (
+                "image",
+                json!({"type": "image_url", "image_url": {"url": "https://example.com/dog.jpg"}}),
+            ),
+            (
+                "video",
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/clip.mp4"}}),
+            ),
+        ];
+        for (kind, part) in cases {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "gpt-oss-120b",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "What is in this?"}, part]
+                }]
+            }))
+            .unwrap();
+            let error = HarmonyBuilder::new()
+                .build_from_chat(&request)
+                .expect_err("a media part the Harmony path has no form for is refused");
+            assert!(
+                error.contains(&format!("{kind} content parts")),
+                "{kind}: the refusal names the part: {error}"
+            );
+            assert!(error.contains("regular multimodal path"), "{kind}: {error}");
+        }
+    }
+
+    /// A user turn given as parts that are all text still renders.
+    #[test]
+    fn a_text_only_parts_turn_still_renders_on_the_harmony_chat_path() {
+        let prompt = rendered_chat_prompt(json!({
+            "model": "gpt-oss-120b",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "Describe the weather."}]
+            }]
+        }));
+        assert!(
+            prompt.contains("<|start|>user<|message|>Describe the weather.<|end|>"),
+            "the text part renders as the user turn: {prompt}"
+        );
     }
 
     /// Invariant: `image_generation` must never be advertised as a

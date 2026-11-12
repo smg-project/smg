@@ -126,13 +126,19 @@ log level `warn`, as `grpc_stress/bed.sh` sets it up; 4 mock engines (`--workers
 
 ## The fleets
 
-Every path above runs on either fleet (`--fleet`, a bed flag of every mode); a run is one
-fleet, named in its setup line, and the ids of `results.json` are the same on both, so a gate
-file reads a prefill-decode run as it reads a regular one.
+Every path above runs on any fleet (`--fleet`, a bed flag of every mode), except on the HTTP
+fleet the generate paths (that wire answers `/generate` in the chat shape): the driver refuses
+them there, and each
+fleet has a default path list (`chat,stream,tools,json` on HTTP). A run is one fleet, named in its
+setup line, and the ids of `results.json` are the same on every fleet, so a gate file reads a
+prefill-decode or an HTTP run as it reads a regular one. On the HTTP wire the scripted
+text goes as one piece per word, the units that wire streams by, so a streamed answer frames one
+token at a time there too, and a path that asks for logprobs scripts one value per piece.
 
 | fleet | engines | the gateway path a cell reads |
 |---|---|---|
 | `grpc` (the default) | 4 regular gRPC engines | the gRPC regular path: one selection per request |
+| `http` | 4 regular engines on the mock's HTTP wire (`--http-count`), registered with `connection_mode: http` and no runtime (the gateway reads it at registration) | the HTTP regular path: one selection per request under the request lease, the body forwarded as JSON, the answer relayed |
 | `prefill-decode` | 1 prefill engine (`--prefill-workers`; `--worker-type prefill`, a bootstrap port the gateway probes at registration, a prompt-side answer of 1 ms from the realistic engine's admission) and 4 decode engines (`--workers`; `--worker-type decode`, `--max-running 8` and the `max_running_requests: 8` label), both registered with their roles behind one gateway in multi-router mode with `--pd-disaggregation`; the gateway's in-flight bound of 8 per prefill engine (`--prefill-max-inflight-requests-per-worker`) | the gRPC prefill-decode path: the prefill admission queue, the pair selection, the decode rooms claimed against the label's window, two dispatches per request; the scripted answer is the decode side's (the prefill side answers the prompt alone, from no script) |
 
 The prefill-decode fleet's shape is the bed script's (`FLEET=prefill-decode`; `PREFILL_WINDOW`,

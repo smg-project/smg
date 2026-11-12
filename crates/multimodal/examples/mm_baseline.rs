@@ -17,9 +17,10 @@
 //! family from), `config_dir` (the checkpoint's `config.json` and preprocessor configs)
 //! and `files` (absolute paths, one per item of the request). Every stage runs as the
 //! gateway runs it on the router placement: the header read and the decode of every
-//! frame (`ImageFrame::decode_all`), the per-frame clone the gateway makes before the
-//! processor, the processor's one-pass write in the destination's dtype (bf16 unless
-//! `--wire` says otherwise; the two-pass path where a processor has no one-pass write),
+//! frame (`ImageFrame::decode_all`), the processor's one-pass write over the frames'
+//! own decoded pixels, borrowed as the gateway borrows them, in the destination's dtype
+//! (bf16 unless `--wire` says otherwise; the two-pass path where a processor has no
+//! one-pass write),
 //! and the move of the wire bytes (`into_bytes_as`); the wire then returns to the buffer
 //! pool as a sent payload returns it (`recycled_bytes`), so a run measures the pool's
 //! steady state rather than a fresh zeroed buffer per iteration. The pool is
@@ -34,9 +35,17 @@
 //! Video decodes through the media connector under the family's own sampling rule;
 //! audio through the in-process decoder.
 //!
+//! The harness runs the gateway's allocator: jemalloc with the options the `smg`
+//! executable and both bindings export, so a cell reads the page-return policy
+//! production runs. Under the system allocator the large transient buffers of a 1080p
+//! image (about 20 MB on the torch-exact path) went back to the OS after every image
+//! and were faulted in again on the next, which charged a kernel for that policy
+//! rather than for its own work.
+//!
 //! The output is JSON Lines. The first line, `{"kind":"meta",...}`, names the
 //! architecture, the core count, the decoders found at runtime (TurboJPEG, libwebp),
-//! the crate's preprocessing pool and the vector-kernel paths this build takes. Then one
+//! the crate's preprocessing pool, the vector-kernel paths this build takes and the
+//! allocator. Then one
 //! `{"kind":"row",...}` per class: the per-item latency of every stage (median and p90
 //! over all threads' iterations), the wall time, the throughput, the process CPU time
 //! per item (every thread and the pool included), the byte counts (encoded, decoded,
@@ -87,6 +96,46 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
+
+// The gateway's allocator and its options (`SERVER_MALLOC_CONF` in the
+// gateway's metrics module, the bytes the `smg` executable and both bindings
+// export; this crate sits below the gateway, so the string is repeated here).
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; an immutable NUL-terminated byte string, read alone by jemalloc and the meta line"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 100] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
+
+/// The allocator this build runs, for the meta line.
+fn allocator() -> &'static str {
+    if cfg!(all(not(target_env = "msvc"), not(target_env = "musl"))) {
+        "jemalloc"
+    } else {
+        "system: jemalloc is not built in on this target"
+    }
+}
+
+/// The options exported to jemalloc, the bytes themselves without the NUL
+/// (`None` where jemalloc is not built in). The environment's
+/// `_RJEM_MALLOC_CONF`, read after them and winning per key, is recorded
+/// beside them so a results file names both inputs.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+fn allocator_conf() -> Option<&'static str> {
+    std::str::from_utf8(&MALLOC_CONF[..MALLOC_CONF.len() - 1]).ok()
+}
+
+/// See the jemalloc form above: nothing is exported on this target.
+#[cfg(not(all(not(target_env = "msvc"), not(target_env = "musl"))))]
+fn allocator_conf() -> Option<&'static str> {
+    None
+}
 
 const USAGE: &str = "mm_baseline: SMG's media pipeline per class, stage by stage\n\
     \n\
@@ -251,7 +300,6 @@ enum Work {
 #[derive(Clone, Copy, Default)]
 struct Sample {
     decode_ms: f64,
-    clone_ms: f64,
     preprocess_ms: f64,
     serialize_ms: f64,
     decoded_bytes: usize,
@@ -260,7 +308,7 @@ struct Sample {
 
 impl Sample {
     fn total_ms(&self) -> f64 {
-        self.decode_ms + self.clone_ms + self.preprocess_ms + self.serialize_ms
+        self.decode_ms + self.preprocess_ms + self.serialize_ms
     }
 }
 
@@ -308,12 +356,12 @@ fn process_cpu_ms() -> f64 {
 }
 
 /// The decoded frames of `files`, header read and decode included, as the gateway makes
-/// them for one request: the frames are built from the bytes, decoded together on the
-/// preprocessing pool, then each is cloned for the processor.
+/// them for one request: the frames are built from the bytes and decoded together on the
+/// preprocessing pool; the processor then borrows their pixels.
 fn decode_images(
     files: &[Bytes],
     transparency: TransparencyPolicy,
-) -> Result<(Vec<DynamicImage>, f64, f64), String> {
+) -> Result<(Vec<Arc<ImageFrame>>, f64), String> {
     let started = Instant::now();
     let mut frames = Vec::with_capacity(files.len());
     for bytes in files {
@@ -335,26 +383,19 @@ fn decode_images(
         ));
     }
     ImageFrame::decode_all(&frames).map_err(|e| e.to_string())?;
-    let decode_ms = ms(started);
-    let cloned = Instant::now();
-    let images = frames
-        .iter()
-        .map(|frame| frame.image().cloned().map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((images, decode_ms, ms(cloned)))
+    Ok((frames, ms(started)))
 }
 
 /// The gateway's `preprocess_images`: the one-pass write in the wire's dtype when the
 /// processor has one, the two-pass path otherwise.
 fn preprocess(
     processor: &dyn VisionPreProcessor,
-    images: &[DynamicImage],
+    images: &[&DynamicImage],
     wire: EncoderDtype,
 ) -> Result<PreprocessedEncoderInputs, String> {
-    let images: Vec<&DynamicImage> = images.iter().collect();
     processor
-        .preprocess_wire(&images, wire)
-        .unwrap_or_else(|| processor.preprocess(&images))
+        .preprocess_wire(images, wire)
+        .unwrap_or_else(|| processor.preprocess(images))
         .map_err(|e| e.to_string())
 }
 
@@ -424,9 +465,13 @@ fn iterate(
     let mut sample = Sample::default();
     let (inputs, started) = match work {
         Work::Images { processor, files } => {
-            let (images, decode_ms, clone_ms) = decode_images(files, transparency)?;
+            let (frames, decode_ms) = decode_images(files, transparency)?;
             sample.decode_ms = decode_ms;
-            sample.clone_ms = clone_ms;
+            // Borrowed from the frames' own cells, as the gateway's batch path borrows them.
+            let images = frames
+                .iter()
+                .map(|frame| frame.image().map_err(|e| e.to_string()))
+                .collect::<Result<Vec<&DynamicImage>, _>>()?;
             sample.decoded_bytes = images.iter().map(|image| image.as_bytes().len()).sum();
             let started = Instant::now();
             let inputs = preprocess(processor.as_ref(), &images, wire)?;
@@ -500,9 +545,12 @@ fn facts(
     // so the pool is warm before the timed loop starts.
     let facts = match work {
         Work::Images { processor, files } => {
-            let (images, _, _) = decode_images(files, transparency)?;
-            let rgb = images.first().map(|image| sha256(image.to_rgb8().as_raw()));
-            let refs: Vec<&DynamicImage> = images.iter().collect();
+            let (frames, _) = decode_images(files, transparency)?;
+            let refs = frames
+                .iter()
+                .map(|frame| frame.image().map_err(|e| e.to_string()))
+                .collect::<Result<Vec<&DynamicImage>, _>>()?;
+            let rgb = refs.first().map(|image| sha256(image.to_rgb8().as_raw()));
             let two_pass = processor.preprocess(&refs).map_err(|e| e.to_string())?;
             let u8_sha256 = match &two_pass.encoder_input {
                 EncoderInput::U8 { patches, .. } => Some(sha256(
@@ -747,7 +795,6 @@ fn run_class(
         "cpu_ms_per_item": cpu_ms / items as f64,
         "stage_ms": {
             "decode": stage_summary(&samples, |s| s.decode_ms),
-            "clone": stage_summary(&samples, |s| s.clone_ms),
             "preprocess": stage_summary(&samples, |s| s.preprocess_ms),
             "serialize": stage_summary(&samples, |s| s.serialize_ms),
             "total": stage_summary(&samples, Sample::total_ms),
@@ -771,15 +818,29 @@ fn run_class(
     }))
 }
 
-/// Whether this host resizes through the crate's AVX2 rows (`vision/torch_resample.rs`).
-fn avx2_rows() -> bool {
+/// The arm of the Pillow-exact passes (`vision/transforms.rs`) this host
+/// resizes through, decided as the crate decides it: the AVX-512 arm needs
+/// the five features its `detected` reads, else the AVX2 arm, else the
+/// portable rows (the only ones off x86-64).
+fn resample_arm() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        std::arch::is_x86_feature_detected!("avx2")
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+        {
+            "avx512"
+        } else if std::arch::is_x86_feature_detected!("avx2") {
+            "avx2"
+        } else {
+            "portable"
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        false
+        "portable"
     }
 }
 
@@ -790,10 +851,12 @@ fn meta(options: &Options) -> Value {
     };
     let vector_kernels = if cfg!(target_arch = "aarch64") {
         "aarch64: the crate's vector paths (pixel conversion, resample, orientation, RGB runs, JPEG colour conversion)"
-    } else if avx2_rows() {
-        "x86-64: the crate's AVX2 rows of the uint8 antialiased resample and the AVX2 wire formula of the pixel conversion; orientation, RGB runs and the JPEG colour conversion run scalar"
     } else {
-        "scalar: the crate has no vector path for this architecture"
+        match resample_arm() {
+            "avx512" => "x86-64: the AVX-512 arm of the Pillow-exact passes for the uint8 antialiased resample and the AVX2 wire formula of the pixel conversion; orientation, RGB runs and the JPEG colour conversion run scalar",
+            "avx2" => "x86-64: the AVX2 arm of the Pillow-exact passes for the uint8 antialiased resample and the AVX2 wire formula of the pixel conversion; orientation, RGB runs and the JPEG colour conversion run scalar",
+            _ => "scalar: the crate has no vector path for this architecture",
+        }
     };
     json!({
         "kind": "meta",
@@ -805,6 +868,9 @@ fn meta(options: &Options) -> Value {
         "libwebp_version": webp_native::webp_version(),
         "pool_threads": pool,
         "vector_kernels": vector_kernels,
+        "allocator": allocator(),
+        "allocator_conf": allocator_conf(),
+        "allocator_env": env::var("_RJEM_MALLOC_CONF").ok(),
         "wire": format!("{:?}", options.wire),
         "transparency": format!("{:?}", options.transparency),
         "threads": options.threads,

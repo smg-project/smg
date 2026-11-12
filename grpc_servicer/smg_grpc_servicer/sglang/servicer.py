@@ -227,6 +227,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Handle generation requests with streaming responses."""
         logger.info(f"Receive generation request: {request.request_id}")
 
+        response_generator = None
         try:
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
@@ -311,6 +312,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 f"{get_exception_traceback()}"
             )
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            if response_generator is not None:
+                await response_generator.aclose()
 
     async def Embed(
         self,
@@ -586,6 +590,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return str(obj)
 
         serializable_args = make_serializable(server_args_dict)
+        from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
+
+        serializable_args["multimodal_encoder_dtype"] = encoder_dtype(
+            None, lambda: self.model_config.dtype
+        )
         # The operator's PD pairing protocol rides with the server args, so
         # the gateway reads it as the worker's `pairing_protocol` label.
         pairing_protocol = pairing_protocol_from_env()

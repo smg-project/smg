@@ -1,7 +1,9 @@
 //! MiniMax M3: reasoning between `<mm:think>` and `</mm:think>`, the calls of one turn between
 //! `<tool_call>` and `</tool_call>`, each call between `<invoke name="…">` and `</invoke>` as an
 //! XML tree of arguments, everything else content, and the separator token `]<]minimax[>[` before
-//! every tag, dropped wherever it stands. As recorded for `MiniMaxAI/MiniMax-M3`.
+//! every tag, dropped wherever it stands. As recorded for `MiniMaxAI/MiniMax-M3`;
+//! `MiniMax-M3.1-Flash` reads with it (the same tokenizer and wire; its template differs only
+//! outside the wire, as `docs/tables.md` notes).
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -155,6 +157,43 @@ mod tests {
             .count()
     }
 
+    /// A `get_weather` tool declared with one argument, the city, a string.
+    fn get_weather() -> Declared {
+        declared(
+            "get_weather",
+            value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        )
+    }
+
+    /// The chat message's content, as the adapter gives the whole response.
+    fn shown(events: &[Event]) -> Option<String> {
+        chat::message(0, events).message.content
+    }
+
+    /// The stream's content deltas, joined.
+    fn streamed(events: &[Event]) -> String {
+        chat::deltas(0, events)
+            .into_iter()
+            .filter_map(|choice| choice.delta.content)
+            .collect()
+    }
+
+    /// The `Malformed` events' bytes with their reasons, in order.
+    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `inner` wrapped `times` times in objects under the key `d`.
+    fn wrapped(inner: serde_json::Value, times: usize) -> serde_json::Value {
+        (0..times).fold(inner, |value, _| value!({ "d": value }))
+    }
+
     /// Prose where the invoke has tags, before its first child or after its last: refused word by
     /// word, each word with the whitespace before it, under one counted `Malformed` event of no
     /// bytes per word, the newline after the tag the syntax read dropped as the template's; the
@@ -164,28 +203,6 @@ mod tests {
     #[test]
     fn text_where_the_syntax_has_tags_keeps_the_models_whitespace_between_its_words() {
         let prose = "please note this and that";
-        let declared = || {
-            declared(
-                "get_weather",
-                value!({"type": "object", "properties": {"city": {"type": "string"}}}),
-            )
-        };
-        let shown = |events: &[Event]| chat::message(0, events).message.content;
-        let streamed = |events: &[Event]| -> String {
-            chat::deltas(0, events)
-                .into_iter()
-                .filter_map(|choice| choice.delta.content)
-                .collect()
-        };
-        let words = |events: &[Event]| -> Vec<(String, MalformedReason)> {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                    _ => None,
-                })
-                .collect()
-        };
         let dropped = |events: &[Event]| -> Vec<String> {
             events
                 .iter()
@@ -214,11 +231,11 @@ mod tests {
             "<tool_call>\n<invoke name=\"get_weather\">\nplease note this and that\n<city>Paris</city>\n</invoke>\n</tool_call>",
             "<tool_call>\n<invoke name=\"get_weather\">\n<city>Paris</city>\nplease note this and that\n</invoke>\n</tool_call>",
         ] {
-            let whole = run_with(declared(), "", &[output]);
+            let whole = run_with(get_weather(), "", &[output]);
             assert_eq!(bytes(&whole), output);
             assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris""#, "{output:?}");
             assert_eq!(
-                words(&whole),
+                malformed(&whole),
                 vec![(String::new(), MalformedReason::TextBetweenTags); 5],
                 "{output:?}"
             );
@@ -232,14 +249,14 @@ mod tests {
             assert_eq!(streamed(&whole), "", "{output:?}");
             // A word a delta boundary cuts leaves in two pieces: the same bytes refused, joined.
             let joined = |events: &[Event]| -> String {
-                for (word, why) in words(events) {
+                for (word, why) in malformed(events) {
                     assert_eq!(why, MalformedReason::TextBetweenTags);
                     assert_eq!(word, "");
                 }
                 refused(events).concat()
             };
             for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
-                let events = run_with(declared(), "", &[&output[..cut], &output[cut..]]);
+                let events = run_with(get_weather(), "", &[&output[..cut], &output[cut..]]);
                 assert_eq!(bytes(&events), output, "cut at {cut}");
                 assert_eq!(joined(&events), prose, "cut at {cut}");
                 assert_eq!(shown(&events), None, "cut at {cut}");
@@ -249,14 +266,14 @@ mod tests {
                 .char_indices()
                 .map(|(at, c)| &output[at..at + c.len_utf8()])
                 .collect();
-            let events = run_with(declared(), "", &pieces);
+            let events = run_with(get_weather(), "", &pieces);
             assert_eq!(bytes(&events), output);
             assert_eq!(joined(&events), prose);
             assert_eq!(streamed(&events), "");
         }
         // The template's separator inside the prose keeps its place and the words their spaces.
         let output = "<tool_call><invoke name=\"get_weather\">please ]<]minimax[>[note this<city>Paris</city></invoke></tool_call>";
-        let events = run_with(declared(), "", &[output]);
+        let events = run_with(get_weather(), "", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(shown(&events), None);
         assert_eq!(refused(&events).concat(), "please note this");
@@ -275,29 +292,7 @@ mod tests {
             "<invoke name=\"get_weather\">\n<city>Rome</city>\n</invoke>\n</tool_call>"
         );
         let prose = "and also this one";
-        let declared = || {
-            declared(
-                "get_weather",
-                value!({"type": "object", "properties": {"city": {"type": "string"}}}),
-            )
-        };
-        let shown = |events: &[Event]| chat::message(0, events).message.content;
-        let streamed = |events: &[Event]| -> String {
-            chat::deltas(0, events)
-                .into_iter()
-                .filter_map(|choice| choice.delta.content)
-                .collect()
-        };
-        let words = |events: &[Event]| -> Vec<(String, MalformedReason)> {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                    _ => None,
-                })
-                .collect()
-        };
-        let whole = run_with(declared(), "", &[output]);
+        let whole = run_with(get_weather(), "", &[output]);
         assert_eq!(bytes(&whole), output);
         assert_eq!(names(&whole), ["get_weather", "get_weather"]);
         assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris"}"#);
@@ -306,11 +301,11 @@ mod tests {
             .into_iter()
             .map(|word| (word.to_string(), MalformedReason::TextBetweenCalls))
             .collect();
-        assert_eq!(words(&whole), expected);
+        assert_eq!(malformed(&whole), expected);
         assert_eq!(shown(&whole).as_deref(), Some(prose));
         assert_eq!(streamed(&whole), prose);
         for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
-            let events = run_with(declared(), "", &[&output[..cut], &output[cut..]]);
+            let events = run_with(get_weather(), "", &[&output[..cut], &output[cut..]]);
             assert_eq!(bytes(&events), output, "cut at {cut}");
             assert_eq!(
                 names(&events),
@@ -324,7 +319,7 @@ mod tests {
             .char_indices()
             .map(|(at, c)| &output[at..at + c.len_utf8()])
             .collect();
-        let events = run_with(declared(), "", &pieces);
+        let events = run_with(get_weather(), "", &pieces);
         assert_eq!(bytes(&events), output);
         assert_eq!(shown(&events).as_deref(), Some(prose));
         assert_eq!(streamed(&events), prose);
@@ -508,16 +503,11 @@ mod tests {
                 assert_eq!(bytes(&events), output);
                 assert_eq!(reasoning(&events), thought, "{prompt:?}: {pieces:?}");
                 assert_eq!(content(&events), answer, "{prompt:?}: {pieces:?}");
-                let message = chat::message(0, &events);
                 assert_eq!(
-                    message.message.content.as_deref(),
+                    shown(&events).as_deref(),
                     (!answer.trim().is_empty()).then_some(answer)
                 );
-                let streamed: String = chat::deltas(0, &events)
-                    .into_iter()
-                    .filter_map(|choice| choice.delta.content)
-                    .collect();
-                assert_eq!(streamed, answer);
+                assert_eq!(streamed(&events), answer);
             };
             check(&[output]);
             for (cut, _) in output.char_indices().skip(1) {
@@ -741,15 +731,15 @@ mod tests {
         assert_eq!(names(&events), ["add"]);
         // The tail is refused, so the call gets no close after the member it read.
         assert_eq!(arguments_of(&events, 0), r#"{"a": 1"#);
-        let malformed: Vec<&str> = events
+        let malformed_bytes: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
                 Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
-        assert_eq!(malformed, [""]);
-        let refused: Vec<&str> = events
+        assert_eq!(malformed_bytes, [""]);
+        let refused_bytes: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
@@ -759,7 +749,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(refused, [" ñ", "x"]);
+        assert_eq!(refused_bytes, [" ñ", "x"]);
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Dropped { text, .. } if text.text == "]<]minimax[>["
@@ -1032,29 +1022,6 @@ mod tests {
                 separated(&body)
             )
         };
-        let malformed = |events: &[Event]| -> Vec<(String, MalformedReason)> {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                    _ => None,
-                })
-                .collect()
-        };
-        // The bytes dropped as a malformed call's, in order; the separators among them leave
-        // as the wrapper's own drops.
-        let refused = |events: &[Event]| -> String {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Dropped {
-                        text,
-                        why: DropReason::MalformedCall,
-                    } => Some(text.text.as_ref()),
-                    _ => None,
-                })
-                .collect()
-        };
         // `inner` wrapped `times` times: in objects under the key, or in lists.
         let wrapped = |tag: &str, inner: serde_json::Value, times: usize| {
             (0..times).fold(inner, |value, _| {
@@ -1145,30 +1112,6 @@ mod tests {
                 separated(&body)
             )
         };
-        let wrapped = |inner: serde_json::Value, times: usize| {
-            (0..times).fold(inner, |value, _| value!({ "d": value }))
-        };
-        let malformed = |events: &[Event]| -> Vec<(String, MalformedReason)> {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                    _ => None,
-                })
-                .collect()
-        };
-        let refused = |events: &[Event]| -> String {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Dropped {
-                        text,
-                        why: DropReason::MalformedCall,
-                    } => Some(text.text.as_ref()),
-                    _ => None,
-                })
-                .collect()
-        };
         // `deepest - 1` elements: `deepest - 2` containers below the arguments object and a
         // leaf; its list is the last container the reader takes.
         let within = chain(deepest - 1, "[1]");
@@ -1249,30 +1192,6 @@ mod tests {
                 value!({"type": "object", "properties": {"d": nested}}),
             )
         };
-        let wrapped = |inner: serde_json::Value, times: usize| {
-            (0..times).fold(inner, |value, _| value!({ "d": value }))
-        };
-        let malformed = |events: &[Event]| -> Vec<(String, MalformedReason)> {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                    _ => None,
-                })
-                .collect()
-        };
-        let refused = |events: &[Event]| -> String {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Dropped {
-                        text,
-                        why: DropReason::MalformedCall,
-                    } => Some(text.text.as_ref()),
-                    _ => None,
-                })
-                .collect()
-        };
         // `deepest - 1` elements: the empty array is the last container the reader takes.
         let within = output(deepest - 1);
         let events = run_with(schema(deepest - 1), "", &[&within]);
@@ -1346,28 +1265,11 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&written).is_err(),
             "{written:?} reads as a whole value"
         );
-        let reported: Vec<(String, MalformedReason)> = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            reported,
+            malformed(&events),
             [(String::new(), MalformedReason::TextBetweenTags)]
         );
-        let refused: String = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Dropped {
-                    text,
-                    why: DropReason::MalformedCall,
-                } => Some(&*text.text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(refused, "junk");
+        assert_eq!(refused(&events), "junk");
         assert_eq!(ends(&events), 1);
         // The same invoke read whole closes its object.
         let clean = output.replace("junk", "");
@@ -1582,16 +1484,7 @@ mod tests {
             event,
             Event::Malformed { text, why: MalformedReason::TextBetweenTags } if text.text.is_empty()
         )));
-        let refused: String = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Dropped {
-                    text,
-                    why: DropReason::MalformedCall,
-                } => Some(&*text.text),
-                _ => None,
-            })
-            .collect();
+        let refused = refused(&events);
         assert!(
             refused.contains("17") && refused.contains("25"),
             "{refused:?}"

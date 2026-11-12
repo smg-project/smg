@@ -45,7 +45,7 @@ use crate::{
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
-                    Reading,
+                    Reading, ReadingEnd,
                 },
             },
             context,
@@ -181,11 +181,12 @@ impl HarmonyStreamingProcessor {
                 .await
                 .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                if let Err(failure) = result {
-                    utils::send_stream_failure(&tx, &failure, &source).await;
+                if let Err(failure) = &result {
+                    utils::send_stream_failure(&tx, failure, &source).await;
                 }
 
                 let _ = tx.send(Ok(SseEncoder::done())).await;
+                ReadingEnd::of(&result)
             }),
             context::ExecutionResult::PrefillDecode {
                 prefill,
@@ -208,11 +209,12 @@ impl HarmonyStreamingProcessor {
                 .await
                 .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                if let Err(failure) = result {
-                    utils::send_stream_failure(&tx, &failure, &source).await;
+                if let Err(failure) = &result {
+                    utils::send_stream_failure(&tx, failure, &source).await;
                 }
 
                 let _ = tx.send(Ok(SseEncoder::done())).await;
+                ReadingEnd::of(&result)
             }),
             context::ExecutionResult::Embedding { .. } => {
                 error!("Harmony streaming not supported for embeddings");
@@ -224,6 +226,7 @@ impl HarmonyStreamingProcessor {
                     )
                     .await;
                     let _ = tx.send(Ok(SseEncoder::done())).await;
+                    ReadingEnd::Failed
                 })
             }
             // Batch results exist only on the completions pipeline.
@@ -237,6 +240,7 @@ impl HarmonyStreamingProcessor {
                     )
                     .await;
                     let _ = tx.send(Ok(SseEncoder::done())).await;
+                    ReadingEnd::Failed
                 })
             }
         };
@@ -1004,8 +1008,9 @@ impl ResponsesDecode {
             emitter.send_event_best_effort(&event, tx).await;
             self.content_part_added = true;
         }
-        let event = emitter.emit_text_delta(text, *output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
+        emitter
+            .send_text_delta_best_effort(text, *output_index, item_id, content_index, tx)
+            .await;
         self.final_text.push_str(text);
     }
 

@@ -67,6 +67,10 @@ pub struct EngineCoreReadyResponse {
     pub dp_stats_address: Option<String>,
     /// Effective model dtype after Python vLLM resolves `--dtype`.
     pub dtype: ModelDtype,
+    /// Declared floating encoder input dtype; absent on older schedulers.
+    /// Kept separate from model dtype so silence retains the legacy media wire.
+    #[serde(default)]
+    pub multimodal_encoder_dtype: Option<String>,
     /// Python vLLM version reported by the engine process (compatibility gate).
     pub vllm_version: String,
     /// World size (TP * PP) from the parallel config.
@@ -419,5 +423,25 @@ mod tests {
         let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
         assert_eq!(resp.block_size, 64);
         assert_eq!(resp.cache_trace_epochs, vec!["capture-epoch"]);
+    }
+
+    /// The optional declaration round-trips, while older handshakes remain silent.
+    #[test]
+    fn ready_response_preserves_optional_multimodal_encoder_dtype() {
+        let ready = crate::mock_engine::default_ready_response();
+        let mut value = serde_json::to_value(ready).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("multimodal_encoder_dtype");
+        let legacy: EngineCoreReadyResponse =
+            decode_msgpack(&rmp_serde::to_vec_named(&value).unwrap()).unwrap();
+        assert_eq!(legacy.multimodal_encoder_dtype, None);
+        for dtype in ["float32", "float16", "bfloat16"] {
+            value["multimodal_encoder_dtype"] = dtype.into();
+            let decoded: EngineCoreReadyResponse =
+                decode_msgpack(&rmp_serde::to_vec_named(&value).unwrap()).unwrap();
+            assert_eq!(decoded.multimodal_encoder_dtype.as_deref(), Some(dtype));
+        }
     }
 }

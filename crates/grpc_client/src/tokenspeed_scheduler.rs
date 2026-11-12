@@ -12,10 +12,11 @@ use openai_protocol::{
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
 use crate::{
+    channel::Channel,
     request_fields::{
         body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
         stop_strings, ConstraintKind, OutputConstraint, PlainSampling,
@@ -23,7 +24,10 @@ use crate::{
     BoxedTraceInjector,
 };
 
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod tokenspeed_proto {
     #![allow(
         clippy::all,
@@ -379,10 +383,8 @@ impl TokenSpeedSchedulerClient {
         let mut constraints = Vec::new();
 
         let format = body_format(request, set_aside)?;
-        if let Some(schema) = format.schema {
-            constraints.push(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
-                schema,
-            ));
+        if let Some(constraint) = Self::constraint_of(format.format) {
+            constraints.push(constraint);
         }
 
         if let Some(ebnf) = format.ebnf {
@@ -461,6 +463,9 @@ impl TokenSpeedSchedulerClient {
             ConstraintKind::Regex => tokenspeed_proto::sampling_params::Constraint::Regex(value),
             ConstraintKind::Ebnf => {
                 tokenspeed_proto::sampling_params::Constraint::EbnfGrammar(value)
+            }
+            ConstraintKind::StructuralTag => {
+                tokenspeed_proto::sampling_params::Constraint::StructuralTag(value)
             }
         })
     }
@@ -844,6 +849,10 @@ mod constraint_mapping_tests {
             (
                 ConstraintKind::Ebnf,
                 tokenspeed_proto::sampling_params::Constraint::EbnfGrammar("v".to_string()),
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                tokenspeed_proto::sampling_params::Constraint::StructuralTag("v".to_string()),
             ),
         ] {
             assert_eq!(

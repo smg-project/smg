@@ -18,8 +18,8 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/lightseek/smg/go-grpc-sdk/internal/ffi"
-	"github.com/lightseek/smg/go-grpc-sdk/internal/proto"
+	"github.com/smg-project/smg/bindings/golang/internal/ffi"
+	"github.com/smg-project/smg/bindings/golang/internal/proto"
 )
 
 type grpcClientStream interface {

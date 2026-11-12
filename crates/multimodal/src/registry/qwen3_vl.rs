@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
+        layouts::{grid_patch_fields, grid_patch_layouts_for},
         MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{
@@ -18,21 +19,11 @@ pub(super) struct Qwen3VLVisionSpec;
 
 impl Qwen3VLVisionSpec {
     fn image_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 
     fn video_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["video_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "video_token_id".to_string(),
-            })
+        metadata.config_token_id("video_token_id")
     }
 
     fn vision_start_token_id(metadata: &ModelMetadata) -> Option<TokenId> {
@@ -418,17 +409,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         // encoder_input is patchified: [total_patches, patch_features].
         // patches_per_image tells how many patches belong to each image.
         // image_grid_thw is [num_images, 3].
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
+        grid_patch_fields()
     }
 
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
@@ -436,23 +417,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         // and `video_grid_thw` and no image tensor at all, so slicing its
         // patches by `patches_per_image` (the legacy map's one answer) fails
         // at assembly for every video; the image batch is the mirror case.
-        match modality {
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            _ => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-        }
+        grid_patch_layouts_for(modality)
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {

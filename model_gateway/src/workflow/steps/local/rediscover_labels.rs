@@ -4,15 +4,22 @@
 //! worker's engine came back into service (a restart on the same address may
 //! run with other settings), or it finished loading after the worker was
 //! registered on provisional information. The labels the engine reports now
-//! are handed to the update step, which rebuilds the worker only when they
-//! change anything. Without a refresh request the step is skipped.
+//! (at its metadata endpoints; at the handshake its link holds, for a ZMQ
+//! engine) are handed to the update step, which rebuilds the worker only
+//! when they change anything. Without a refresh request the step is skipped.
+
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::discover_engine_labels;
-use crate::{worker::ConnectionMode, workflow::data::WorkerUpdateWorkflowData};
+use crate::{
+    routers::grpc::{backend_client::BackendClient, zmq_client},
+    worker::ConnectionMode,
+    workflow::data::WorkerUpdateWorkflowData,
+};
 
 /// Step to re-read a worker's labels from its engine for a label refresh.
 pub struct RediscoverLabelsStep;
@@ -37,8 +44,35 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         let connection_mode = *worker.connection_mode();
         if connection_mode == ConnectionMode::Zmq {
             // A ZMQ engine reports its geometry at the handshake, not at an
-            // endpoint; there is nothing to re-read.
-            return Ok(StepResult::Skip);
+            // endpoint: the worker's own link holds it once the handshake is
+            // in (the refresh runs on that connect signal). Its window joins
+            // what registration read from the model's files; a link not up
+            // yet leaves the labels as they are, and the next transition
+            // into service refreshes again.
+            let Some(link) = worker.backend_client_if_initialized() else {
+                debug!(worker_url = %worker.redacted_url(), "The ZMQ link is not up; nothing to refresh");
+                return Ok(StepResult::Skip);
+            };
+            let BackendClient::Zmq(client) = link.as_ref() else {
+                return Ok(StepResult::Skip);
+            };
+            // The seed is the worker's record, kept in rank space
+            // (`report_for_rank`); the update step passes the report
+            // through that rule again, which is the identity here only
+            // because the record holds neither a running-window label
+            // (`WINDOW_LABELS`) nor a width (`DP_WIDTH_LABELS`): sampling
+            // defaults, the grammar start and the context window, which no
+            // rank shares. A record that gains a running window needs a
+            // report read in engine space instead.
+            let mut fresh = HashMap::clone(&worker.metadata().discovered_labels);
+            fresh.extend(zmq_client::link_labels(client));
+            debug!(
+                worker_url = %worker.redacted_url(),
+                labels = fresh.len(),
+                "Read the ZMQ link's handshake window for a refresh"
+            );
+            context.data.fresh_engine_labels = Some(fresh);
+            return Ok(StepResult::Success);
         }
         let spec = &worker.metadata().spec;
         // A strict read: an endpoint that fails is an error (the step retries,
@@ -116,6 +150,95 @@ mod tests {
             snapshot: None,
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    /// A ZMQ worker whose link is not up has nothing to re-read yet: the
+    /// labels stay, and the next transition into service refreshes again.
+    #[tokio::test]
+    async fn a_zmq_worker_without_its_link_is_skipped() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/engine.sock")
+                .connection_mode(ConnectionMode::Zmq)
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let mut ctx = context(worker, true);
+        assert_eq!(
+            RediscoverLabelsStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Skip
+        );
+        assert!(ctx.data.fresh_engine_labels.is_none());
+    }
+
+    /// A ZMQ worker's refresh reads the window its link learned at the
+    /// handshake and keeps what registration read from the model's files.
+    #[tokio::test]
+    async fn a_zmq_worker_reads_its_handshake_window() {
+        use std::time::Duration;
+
+        use engine_zmq_client::{
+            mock_engine::{connect_to_frontend, default_ready_response},
+            protocol::handshake::EngineCoreReadyResponse,
+            EngineId,
+        };
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |socket: &str| format!("ipc://{}", dir.path().join(socket).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let ready = EngineCoreReadyResponse {
+            max_model_len: 4096,
+            ..default_ready_response()
+        };
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Vllm,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
+        );
+        let _engine = engine.expect("mock engine");
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(ep("worker.ipc"))
+                .connection_mode(ConnectionMode::Zmq)
+                .runtime_type(RuntimeType::Vllm)
+                .backend_client(BackendClient::Zmq(client.expect("adapter connect")))
+                .discovered_labels(HashMap::from([(
+                    "constrained_decoding_start".to_string(),
+                    "first_token".to_string(),
+                )]))
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let mut ctx = context(worker, true);
+        assert_eq!(
+            RediscoverLabelsStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let fresh = ctx.data.fresh_engine_labels.expect("the link's labels");
+        assert_eq!(
+            fresh.get("max_context_length").map(String::as_str),
+            Some("4096"),
+            "the handshake's window"
+        );
+        assert_eq!(
+            fresh.get("constrained_decoding_start").map(String::as_str),
+            Some("first_token"),
+            "what registration read stays"
+        );
+        assert_eq!(
+            fresh.len(),
+            2,
+            "nothing else of the handshake's report: {fresh:?}"
+        );
     }
 
     #[tokio::test]

@@ -835,6 +835,17 @@ impl Store {
             self.marked.remove(worker);
         }
     }
+
+    /// A worker starts under `worker`: the name is known to the admin
+    /// routes, with nothing queued or filed for it and its counters at
+    /// zero, whatever a worker of that name left before.
+    fn start(&mut self, worker: &str) {
+        self.queues.remove(worker);
+        self.marked.remove(worker);
+        self.hits.remove(worker);
+        self.misses.remove(worker);
+        self.workers.insert(worker.to_string());
+    }
 }
 
 static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
@@ -858,9 +869,24 @@ pub fn active() -> bool {
 }
 
 /// A worker that started, by name (`grpc:<port>`, `http:<port>`,
-/// `zmq:<index>`): the admin routes accept it from then on.
+/// `zmq:<index>`): the admin routes accept it from then on. The name starts
+/// clean: a port a stopped worker of this process had, bound again, hands
+/// its successor no queued or filed answers and no hits or misses. The name
+/// must be one live worker's: a port is, as the bind precedes the start, and
+/// a ZMQ rank's index is the caller's to keep unique, since a second live
+/// rank of one index would start the first rank's entry clean while it
+/// still serves.
 pub fn register(worker: &str) {
-    store().workers.insert(worker.to_string());
+    store().start(worker);
+}
+
+/// The workers that started in this process, by name, sorted: every listener
+/// on every wire, canned or realistic. The admin fleet list walks them and
+/// joins the engines a realistic worker spawned.
+pub fn registered() -> Vec<String> {
+    let mut names: Vec<String> = store().workers.iter().cloned().collect();
+    names.sort();
+    names
 }
 
 type LoadedTokenizer = Result<Arc<dyn Tokenizer>, String>;
@@ -1298,6 +1324,118 @@ mod tests {
         assert!(
             store.take(worker, &script_key(&[9]), None).is_none(),
             "cleared"
+        );
+    }
+
+    /// A worker's port, bound again by a later worker of the same process,
+    /// names the same entry: the new worker starts it clean, so the counts
+    /// it reports are its own (two filed answers served and one miss read as
+    /// two hits and one miss, not the predecessor's hit on top).
+    #[test]
+    fn a_name_bound_again_starts_with_nothing_of_its_predecessor() {
+        let mut store = Store::default();
+        let worker = "grpc:19002";
+        let marked = |text: &str, id: u32| {
+            parse(&format!(
+                r#"{{"prompt_contains": "{text}", "output_ids": [{id}]}}"#
+            ))
+            .expect("an answer filed under a text")
+        };
+        let key = script_key(&[9]);
+        store.start(worker);
+        store.enqueue(
+            worker,
+            vec![
+                parse(r#"{"output_ids": [1]}"#).expect("queued"),
+                marked("quince", 4),
+            ],
+        );
+        assert!(
+            store.take(worker, &key, None).is_some(),
+            "the queued answer"
+        );
+        assert!(store.take(worker, &key, None).is_none(), "a miss");
+        let before = store.status(worker);
+        assert_eq!(
+            (
+                before["hits"].as_u64(),
+                before["misses"].as_u64(),
+                before["marked"].as_u64()
+            ),
+            (Some(1), Some(1), Some(1)),
+            "{before}"
+        );
+
+        store.start(worker);
+        let after = store.status(worker);
+        assert!(store.knows(worker), "still a worker of the process");
+        assert_eq!(
+            (after["queued"].as_u64(), after["marked"].as_u64()),
+            (Some(0), Some(0)),
+            "{after}"
+        );
+        assert_eq!(
+            (after["hits"].as_u64(), after["misses"].as_u64()),
+            (Some(0), Some(0)),
+            "{after}"
+        );
+
+        store.enqueue(worker, vec![marked("apricot", 20), marked("bramble", 30)]);
+        let ids = |answer: Option<Answer>| answer.map(|a| a.output_ids);
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say bramble"))),
+            Some(vec![30])
+        );
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say apricot"))),
+            Some(vec![20])
+        );
+        assert!(
+            store.take(worker, &key, Some("say say")).is_none(),
+            "a miss"
+        );
+        let state = store.status(worker);
+        assert_eq!(
+            (
+                state["marked"].as_u64(),
+                state["hits"].as_u64(),
+                state["misses"].as_u64()
+            ),
+            (Some(0), Some(2), Some(1)),
+            "{state}"
+        );
+    }
+
+    /// The seam the workers use: `register` starts the name clean on the
+    /// process-wide store, whatever a worker of that name left.
+    #[test]
+    fn registering_a_name_again_starts_it_clean_on_the_process_store() {
+        let worker = "grpc:19003";
+        register(worker);
+        enqueue(
+            worker,
+            vec![parse(r#"{"output_ids": [1]}"#).expect("queued")],
+        )
+        .expect("a known worker");
+        assert!(take(worker, &[9]).is_some(), "the queued answer");
+        assert!(take(worker, &[9]).is_none(), "a miss");
+        let before = status(worker).expect("a known worker");
+        assert_eq!(
+            (before["hits"].as_u64(), before["misses"].as_u64()),
+            (Some(1), Some(1)),
+            "{before}"
+        );
+
+        register(worker);
+        let after = status(worker).expect("still a known worker");
+        assert_eq!(
+            (
+                after["queued"].as_u64(),
+                after["hits"].as_u64(),
+                after["misses"].as_u64()
+            ),
+            (Some(0), Some(0), Some(0)),
+            "{after}"
         );
     }
 

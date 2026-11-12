@@ -4,10 +4,10 @@ go 1.24.0
 
 toolchain go1.24.10
 
-replace github.com/lightseek/smg/go-grpc-sdk => ../..
+replace github.com/smg-project/smg/bindings/golang => ../..
 
 require (
-	github.com/lightseek/smg/go-grpc-sdk v0.0.0-00010101000000-000000000000
+	github.com/smg-project/smg/bindings/golang v0.0.0-00010101000000-000000000000
 	github.com/valyala/fasthttp v1.52.0
 	go.uber.org/zap v1.27.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1

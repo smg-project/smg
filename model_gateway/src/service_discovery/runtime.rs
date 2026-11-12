@@ -103,7 +103,7 @@ pub async fn start_service_discovery(
         }
         RuntimeDiscoveryConfig::File(config) => Ok(file::start_file_discovery(config, app_context)),
         RuntimeDiscoveryConfig::Slurm(config) => {
-            Ok(slurm::start_slurm_discovery(config, app_context))
+            Ok(slurm::start_slurm_discovery(config, app_context)?)
         }
         RuntimeDiscoveryConfig::Consul(config) => {
             Ok(consul::start_consul_discovery(config, app_context)?)

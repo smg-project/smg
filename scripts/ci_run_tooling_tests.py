@@ -24,6 +24,7 @@ COMPONENTS = (
     ("scripts/release/release.sh", "scripts/tests/test_release_tools.py"),
     ("scripts/branch-name-check.sh", "scripts/tests/test_branch_name_check.py"),
     ("scripts/ci_version_only.py", "scripts/tests/test_ci_version_only.py"),
+    ("scripts/ci_mcp_list_tools.py", "scripts/tests/test_ci_mcp_list_tools.py"),
     ("scripts/bfcl/arm_probe.py", "scripts/tests/test_bfcl_arm_probe.py"),
     ("scripts/codex_review_post.py", "scripts/tests/test_codex_review_post.py"),
     ("scripts/codex_review_skills.py", "scripts/tests/test_codex_review_skills.py"),

@@ -325,6 +325,7 @@ mod tests {
     use std::{
         net::TcpListener,
         sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
     };
 
     use axum::http::StatusCode;
@@ -350,6 +351,10 @@ mod tests {
         fn defer_abort_until_first_item(self) -> Self {
             self
         }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
+            self
+        }
     }
 
     /// A stream the engine ends with `status` before any response.
@@ -363,6 +368,10 @@ mod tests {
         fn mark_completed(&mut self) {}
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }
@@ -392,6 +401,10 @@ mod tests {
         fn defer_abort_until_first_item(self) -> Self {
             self
         }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
+            self
+        }
     }
 
     /// A stream that yields one `Complete`, then the engine's report.
@@ -416,6 +429,10 @@ mod tests {
         fn mark_completed(&mut self) {}
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }
@@ -733,5 +750,64 @@ mod tests {
         .await;
         assert!(result.is_ok());
         assert_eq!(completions.load(Ordering::SeqCst), 0);
+    }
+
+    /// A prefill answer's prompt logprobs, scored once for the whole
+    /// request, land on every collected decode answer; a prefill that
+    /// scored nothing leaves the decode answers as the engine sent them.
+    #[test]
+    fn prefill_prompt_logprobs_land_on_every_decode_answer() {
+        let prompt_logprobs = sglang::InputLogProbs {
+            token_ids: vec![11, 12, 13],
+            token_logprobs: vec![
+                sglang::InputTokenLogProb { value: None },
+                sglang::InputTokenLogProb { value: Some(-0.25) },
+                sglang::InputTokenLogProb { value: Some(-1.5) },
+            ],
+            ..Default::default()
+        };
+        let prefill = [ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+            input_logprobs: Some(prompt_logprobs.clone()),
+            ..Default::default()
+        })];
+        let mut decodes: Vec<ProtoGenerateComplete> = (0..3)
+            .map(|_| ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default()))
+            .collect();
+
+        merge_prefill_logprobs(&prefill, &mut decodes);
+
+        for (position, decode) in decodes.iter().enumerate() {
+            assert_eq!(
+                decode.as_sglang().input_logprobs.as_ref(),
+                Some(&prompt_logprobs),
+                "decode answer {position}"
+            );
+        }
+
+        let unscored = [ProtoGenerateComplete::Sglang(
+            sglang::GenerateComplete::default(),
+        )];
+        let engine_sent = sglang::InputLogProbs {
+            token_ids: vec![11],
+            ..Default::default()
+        };
+        let mut untouched: Vec<ProtoGenerateComplete> = (0..2)
+            .map(|_| {
+                ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                    input_logprobs: Some(engine_sent.clone()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        merge_prefill_logprobs(&unscored, &mut untouched);
+
+        for (position, decode) in untouched.iter().enumerate() {
+            assert_eq!(
+                decode.as_sglang().input_logprobs.as_ref(),
+                Some(&engine_sent),
+                "untouched decode answer {position}"
+            );
+        }
     }
 }

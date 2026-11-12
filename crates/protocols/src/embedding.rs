@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::common::{GenerationRequest, UsageInfo};
+use super::common::{routing_text_of_input, GenerationRequest, UsageInfo};
 
 // ============================================================================
 // Embedding API
 // ============================================================================
 
+/// A request to the embeddings route: the model, the input (a text, texts,
+/// token ids or a batch of them) and the encoding format of the vectors.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct EmbeddingRequest {
@@ -27,6 +29,10 @@ pub struct EmbeddingRequest {
 
     /// Engine extension: request id for tracking
     pub rid: Option<String>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 impl GenerationRequest for EmbeddingRequest {
@@ -44,19 +50,12 @@ impl GenerationRequest for EmbeddingRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Best effort: extract text content for routing decisions
-        match &self.input {
-            Value::String(s) => s.clone(),
-            Value::Array(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        }
+        routing_text_of_input(&self.input)
     }
 }
 
+/// One embedding of the answer, object `embedding`: the vector and the index of
+/// the input it embeds.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EmbeddingObject {
     pub object: String, // "embedding"
@@ -64,6 +63,8 @@ pub struct EmbeddingObject {
     pub index: u32,
 }
 
+/// The answer of the embeddings route, object `list`: one embedding per input,
+/// the model and the usage.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EmbeddingResponse {
     pub object: String, // "list"

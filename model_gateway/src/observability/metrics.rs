@@ -1,6 +1,11 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use llm_tokenizer::{
@@ -13,6 +18,7 @@ use metrics_exporter_prometheus::{
 };
 use metrics_util::parse_quantiles;
 use once_cell::sync::Lazy;
+use rustc_hash::FxBuildHasher;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
@@ -23,14 +29,17 @@ use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
 use crate::{
     config::{ConfigError, ConfigResult},
     routers::grpc::regular::symphony::telemetry as symphony_telemetry,
+    worker::Worker,
 };
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
 
 /// Global string interner for metric labels.
-/// Uses DashMap for lock-free concurrent access.
-static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+/// Uses DashMap (sharded read-write locks) for concurrent access; the keys are the server's own
+/// labels, so it hashes with [`FxBuildHasher`] as the registry's maps do.
+static STRING_INTERNER: Lazy<DashMap<String, Arc<str>, FxBuildHasher>> =
+    Lazy::new(|| DashMap::with_hasher(FxBuildHasher));
 
 /// Intern a string, returning a cheaply-cloneable `Arc<str>`.
 ///
@@ -733,8 +742,11 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 
 /// Jemalloc's run-time options for a long-running gateway, for every final
 /// artifact (the `smg` executable, the Python extension, the Go FFI library)
-/// to export as
-/// `_rjem_malloc_conf` next to its `#[global_allocator]`. With the stock
+/// to export as `_rjem_malloc_conf` next to its `#[global_allocator]`. The
+/// multimodal crate's baseline harness (`crates/multimodal/examples/mm_baseline.rs`)
+/// sits below this crate and repeats the bytes by hand; the test
+/// `the_multimodal_harness_repeats_the_malloc_conf` keeps that copy equal. With
+/// the stock
 /// settings a thread's freed pages decay back to the OS only when that thread
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
@@ -771,6 +783,28 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 /// (40 % less than with neither), for ~30 MB more peak resident memory at
 /// 8 threads. Messages of 32 MiB and more (float32 tensors of 1080p-class
 /// grids and larger) keep the default behaviour.
+///
+/// The threshold keeps a tokenizer's load-time transients in the dirty cache
+/// as well, and the vocabulary's hash tables land inside them: for a
+/// vocabulary of 115k-229k tokens each table is 8.25 MiB in the 10 MiB class,
+/// its last 1.75 MiB a tail nothing writes (a 256k vocabulary's 16.5 MiB
+/// table sits in the 20 MiB class with a 3.5 MiB tail), and a tail that lands
+/// on a recycled extent an earlier transient wrote end to end stays resident
+/// for the life of the process. That is about 5 MB per loaded tokenizer on
+/// every text path, present before the first request and invisible in
+/// jemalloc's own resident count, which counts a live table's whole class
+/// whether its tail was written or not (RSS at idle after 10,000 chat
+/// requests on one binary: 129 MB under the default threshold, 134 MB at
+/// 32 MiB). No entry of this string separates the tables from the image
+/// buffers: a 1024x768 encode buffer is the same 10 MiB class in the same
+/// kind of arena. A shorter `dirty_decay_ms` leaves a live table's pages
+/// alone and purges an image buffer between requests; a threshold between
+/// the two values gives up the classes above it (a 1920x1080 image in
+/// bfloat16 is a 28 MiB-class message); an exact-class fit of dirty extents
+/// clears the tails and hands the image path fresh pages again (jemalloc
+/// merges freed large extents eagerly, and the merged run no longer fits its
+/// class). A deployment that serves text alone takes the default back with
+/// `_RJEM_MALLOC_CONF=oversize_threshold:8388608` and loses nothing.
 ///
 /// This is jemalloc's application-provided `malloc_conf` string under the
 /// vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF` environment
@@ -862,9 +896,10 @@ pub(crate) fn init_metrics() {
          request whose client closed the connection first counts as status_code 499 \
          with error_code client_closed_request, as does the rare request the server \
          dropped unanswered (a handler panic, a forced shutdown); a response whose body \
-         failed after its head (an upstream stream that broke mid-body) keeps its head's \
-         status_code with error_code stream_error, unless the head carried a gateway \
-         error code"
+         failed after its head (an upstream stream that broke mid-body, or a streamed \
+         body its producer ended with an error event, whatever the failure's cause) \
+         keeps its head's status_code with error_code stream_error, unless the head \
+         carried a gateway error code"
     );
     describe_gauge!(
         "smg_http_connections_active",
@@ -876,7 +911,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_connections_rejected_total",
-        "HTTP connections closed at accept for arriving beyond the connection limit (max_connections): nothing was read from or written to them"
+        "HTTP connections closed at accept for arriving beyond a listener's connection limit (max_connections on the data listener, admin_max_connections on the admin listener): nothing was read from or written to them"
     );
     describe_counter!(
         "smg_http_rate_limit_total",
@@ -1485,6 +1520,10 @@ pub(crate) fn init_metrics() {
         "Pixel cache lookups that had to preprocess the image, by model"
     );
     describe_counter!(
+        "smg_mm_pixel_cache_budget_bypasses_total",
+        "Image requests that bypassed the pixel cache because their working set exceeds its byte budget, by model"
+    );
+    describe_counter!(
         "smg_mm_pixel_cache_evictions_total",
         "Entries the pixel cache dropped to stay within its byte budget"
     );
@@ -1527,6 +1566,10 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_responses_not_stored_total",
         "Responses with store: true whose record or conversation linking was not written, by mode (foreground: the request was answered with the failure; background: the record keeps what it had) and step (record: nothing is stored; linking: the record is stored, its items are not in the conversation)"
+    );
+    describe_counter!(
+        "smg_messages_thread_turns_total",
+        "Message-thread turns on the Messages route, by op (create, continue) and outcome (stored: the answer is kept under its id; reissued: kept under a fresh id, the answer's id being a stored turn's; unstored: answered, not kept, a stream cut before its message_stop among them; not_found, mismatch: a continue refused before the model ran)"
     );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
@@ -2225,6 +2268,15 @@ impl Metrics {
         counter!("smg_mm_pixel_cache_misses_total", "model" => model).increment(u64::from(!hit));
     }
 
+    /// A request bypassed pixel cache lookup because its working set is too large.
+    pub fn record_mm_pixel_cache_budget_bypass(model_id: &str) {
+        counter!(
+            "smg_mm_pixel_cache_budget_bypasses_total",
+            "model" => intern_model_label(model_id)
+        )
+        .increment(1);
+    }
+
     /// The pixel cache after an insert: the entries it dropped to stay within
     /// its budget, and what it holds now.
     pub fn record_mm_pixel_cache_insert(evicted: u64, bytes: usize, entries: usize) {
@@ -2254,6 +2306,21 @@ impl Metrics {
             "smg_responses_not_stored_total",
             "mode" => mode,
             "step" => step
+        )
+        .increment(1);
+    }
+
+    /// A message-thread turn, by `op` (create, continue) and `outcome`:
+    /// `stored` (the answer is kept under its id), `reissued` (the answer's
+    /// id was a stored turn's: kept under a fresh id, in the answer too),
+    /// `unstored` (answered and not kept: a streamed answer, an error, an
+    /// answer the gateway could not read, a write the store refused),
+    /// `not_found` and `mismatch` (a continue refused before the model ran).
+    pub fn record_message_thread_turn(op: &'static str, outcome: &'static str) {
+        counter!(
+            "smg_messages_thread_turns_total",
+            "op" => op,
+            "outcome" => outcome
         )
         .increment(1);
     }
@@ -3766,14 +3833,26 @@ impl Metrics {
         handles::worker_set_changed();
     }
 
+    /// `worker`, replaced at `worker_url` by another instance, may still
+    /// write for the address from the handles that hold it (a load guard
+    /// taken before the replacement): the store keeps its witness, so a
+    /// later removal of the address drops those writes until it is gone too.
+    pub fn worker_replaced(worker_url: &str, worker: Weak<dyn Worker>) {
+        if let Some(series) = worker_metrics::installed() {
+            series.replaced(worker_url, worker);
+        }
+    }
+
     /// The registration at `worker_url` was removed: drop the address's
     /// series (every family labelled `worker`, see `worker_metrics`), so the
     /// scrape and the time-series database stop growing with pod churn, and
     /// drop the writes that arrive after the removal until the address
-    /// registers again. The interned label goes with them.
-    pub fn remove_worker_metrics(worker_url: &str) {
+    /// registers again or `worker`, the removed one, is gone from every
+    /// handle that could still write for it. The interned label goes with
+    /// them.
+    pub fn remove_worker_metrics(worker_url: &str, worker: Weak<dyn Worker>) {
         if let Some(series) = worker_metrics::installed() {
-            series.retire(worker_url);
+            series.retire(worker_url, worker);
         }
         handles::worker_set_changed();
         STRING_INTERNER.remove(worker_url);

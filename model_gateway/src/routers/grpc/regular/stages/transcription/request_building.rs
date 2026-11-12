@@ -11,7 +11,8 @@ use crate::routers::{
     grpc::{
         common::stages::BuildStage,
         context::{
-            stage_output, BuildOutput, ExecutionPlanKind, PreparationOutput, RequestContext,
+            stage_output, BuildOutput, ExecutionPlanKind, PlanSettings, PreparationOutput,
+            RequestContext,
         },
         regular::stages::chat::build_chat_backed_plan,
         spec::{ResponseSpec, TranscriptionResponseSpec},
@@ -75,8 +76,10 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             None,
             false,
             "transcription-",
-            /* inject_pd_metadata */ false,
-            ExecutionPlanKind::Single,
+            PlanSettings {
+                inject_pd_metadata: false,
+                plan_kind: ExecutionPlanKind::Single,
+            },
         )
         .await?;
 

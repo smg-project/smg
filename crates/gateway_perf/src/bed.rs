@@ -22,15 +22,17 @@ pub fn port_free(port: u16) -> bool {
 }
 
 /// The fleet behind the gateway: one fleet of regular gRPC engines (the bed as it
-/// was), or a prefill fleet and a decode fleet registered with their roles, so the
+/// was); a prefill fleet and a decode fleet registered with their roles, so the
 /// gateway serves the model on its prefill-decode path (the prefill admission queue,
-/// the pair selection, the decode rooms).
+/// the pair selection, the decode rooms); or one fleet of regular engines on the
+/// mock's HTTP wire, so the gateway serves it on its HTTP regular path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Fleet {
     #[default]
     Grpc,
     PrefillDecode,
+    Http,
 }
 
 impl Fleet {
@@ -39,6 +41,35 @@ impl Fleet {
         match self {
             Self::Grpc => "grpc",
             Self::PrefillDecode => "prefill-decode",
+            Self::Http => "http",
+        }
+    }
+
+    /// The wire the scripted engines serve, which the mock's script API keys them by
+    /// (`grpc:<port>`, `http:<port>`).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Grpc | Self::PrefillDecode => "grpc",
+            Self::Http => "http",
+        }
+    }
+
+    /// Whether the fleet's mock engines answer a path in the shape it measures: the
+    /// HTTP wire answers `/generate` in the chat shape, so the generate paths read a
+    /// gRPC fleet only.
+    pub fn serves(self, path: &str) -> bool {
+        match self {
+            Self::Grpc | Self::PrefillDecode => true,
+            Self::Http => !path.starts_with("generate"),
+        }
+    }
+
+    /// The paths a cell run drives when none are named: the same five on
+    /// every fleet, the HTTP fleet included since the mock's HTTP wire serves
+    /// the Messages route.
+    pub fn default_paths(self) -> &'static str {
+        match self {
+            Self::Grpc | Self::PrefillDecode | Self::Http => crate::paths::DEFAULT_PATHS,
         }
     }
 }
@@ -168,10 +199,11 @@ impl BedConfig {
         }
     }
 
-    /// The prefill engines the port block and the script start: none on the gRPC fleet.
+    /// The prefill engines the port block and the script start: none on the regular
+    /// fleets.
     pub fn prefill_engines(&self) -> u16 {
         match self.fleet {
-            Fleet::Grpc => 0,
+            Fleet::Grpc | Fleet::Http => 0,
             Fleet::PrefillDecode => self.prefill_workers,
         }
     }
@@ -184,6 +216,7 @@ impl BedConfig {
                 "{} prefill and {} decode scripted mock engines on the prefill-decode path",
                 self.prefill_workers, self.workers
             ),
+            Fleet::Http => format!("{} scripted mock engines on the HTTP wire", self.workers),
         }
     }
 
@@ -470,7 +503,12 @@ pub struct ScriptCounts {
 
 pub fn script_counts(bed: &Bed) -> ScriptCounts {
     match bed.admin_url() {
-        Ok(admin) => script_counts_at(admin, bed.cfg.workers, bed.cfg.ports().mock_base),
+        Ok(admin) => script_counts_at(
+            admin,
+            bed.cfg.workers,
+            bed.cfg.ports().mock_base,
+            bed.cfg.fleet.wire(),
+        ),
         Err(_) => ScriptCounts {
             unreadable: u64::from(bed.cfg.workers) + 1,
             ..ScriptCounts::default()
@@ -478,7 +516,9 @@ pub fn script_counts(bed: &Bed) -> ScriptCounts {
     }
 }
 
-pub fn script_counts_at(admin_url: &str, workers: u16, mock_base: u16) -> ScriptCounts {
+/// The counts over the `workers` engines from `mock_base` on the `wire` (the script
+/// API keys an engine `<wire>:<port>`), and the shared queue.
+pub fn script_counts_at(admin_url: &str, workers: u16, mock_base: u16, wire: &str) -> ScriptCounts {
     let timeout = Duration::from_secs(30);
     let read = |url: String| -> Option<Value> {
         http::get(&url, timeout)
@@ -488,7 +528,7 @@ pub fn script_counts_at(admin_url: &str, workers: u16, mock_base: u16) -> Script
     let count = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0);
     let mut counts = ScriptCounts::default();
     for i in 0..workers {
-        match read(format!("{admin_url}/admin/script/grpc:{}", mock_base + i)) {
+        match read(format!("{admin_url}/admin/script/{wire}:{}", mock_base + i)) {
             Some(state) => {
                 counts.hits += count(&state, "hits");
                 counts.misses += count(&state, "misses");
@@ -566,6 +606,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(&format!("port(s) [{held}")), "{err}");
+    }
+
+    #[test]
+    fn choose_ports_hands_the_scan_the_given_base_and_a_held_base_is_refused() {
+        // A base the test holds itself: the refusal is certain, and it is the scan's
+        // answer for the given base, not a block of the scan's own choice (a success on
+        // a fixed base is the probe that went red whenever another process held a port).
+        let holder = (29700..=29999)
+            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .unwrap();
+        let held = holder.local_addr().unwrap().port();
+        let mut cfg = config();
+        cfg.ports = None;
+        cfg.port_base = held;
+        let err = cfg.choose_ports().unwrap_err().to_string();
+        assert!(err.contains(&format!("port(s) [{held}")), "{err}");
+        assert_eq!(cfg.ports(), Ports::default());
     }
 
     #[test]
@@ -705,10 +762,10 @@ mod tests {
         let mut cfg = config();
         cfg.fleet = Fleet::PrefillDecode;
         cfg.prefill_workers = 2;
-        cfg.ports = None;
-        cfg.port_base = 29950;
         assert_eq!(cfg.prefill_engines(), 2);
-        cfg.choose_ports().unwrap();
+        // The block's layout, not a probe of the host's ports: the fixed-base probe went
+        // red whenever another process held a port of the block.
+        cfg.ports = Some(Ports::block(29950, cfg.workers, cfg.prefill_engines()).0);
         let bed = Bed::new(&cfg, Path::new("/h"), Path::new("/run"), true);
         let env: BTreeMap<String, String> = bed.env().into_iter().collect();
         assert_eq!(env["FLEET"], "prefill-decode");
@@ -727,6 +784,85 @@ mod tests {
         assert_eq!(grpc.prefill_engines(), 0);
         assert_eq!(grpc.engines_text(), "4 scripted mock engines");
         assert_eq!(Fleet::Grpc.as_str(), "grpc");
+    }
+
+    #[test]
+    fn choose_ports_scans_for_a_block_that_holds_the_prefill_engines_too() {
+        // No ports and no base: the scan, handed the config's own counts. A block laid
+        // out for the decode engines alone leaves the prefill bases at zero, and only
+        // the script would notice at start.
+        let mut cfg = config();
+        cfg.fleet = Fleet::PrefillDecode;
+        cfg.prefill_workers = 2;
+        cfg.ports = None;
+        cfg.choose_ports().unwrap();
+        let ports = cfg.ports();
+        assert!((29700..=29999).contains(&ports.gateway), "{ports:?}");
+        assert_eq!(ports.prefill_admin, ports.gateway + 8);
+        assert_eq!(ports.mock_base, ports.gateway + 10);
+        assert_eq!(ports.prefill_base, ports.mock_base + cfg.workers);
+        assert_eq!(
+            ports.bootstrap_base,
+            ports.prefill_base + cfg.prefill_engines()
+        );
+        // The gRPC fleet's scan reserves no prefill ports.
+        let mut grpc = config();
+        grpc.ports = None;
+        grpc.choose_ports().unwrap();
+        let ports = grpc.ports();
+        assert_eq!(ports.mock_base, ports.gateway + 10);
+        assert_eq!(
+            (
+                ports.prefill_admin,
+                ports.prefill_base,
+                ports.bootstrap_base
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn the_http_fleet_keeps_the_regular_block_and_keys_its_engines_by_the_http_wire() {
+        let mut cfg = config();
+        cfg.fleet = Fleet::Http;
+        assert_eq!(cfg.prefill_engines(), 0);
+        assert_eq!(
+            cfg.engines_text(),
+            "4 scripted mock engines on the HTTP wire"
+        );
+        assert_eq!((Fleet::Http.as_str(), Fleet::Http.wire()), ("http", "http"));
+        for path in ["generate_stream", "generate_stream_spaced_long"] {
+            assert!(!Fleet::Http.serves(path), "{path}");
+            assert!(Fleet::PrefillDecode.serves(path), "{path}");
+        }
+        for path in [
+            "chat",
+            "stream",
+            "tools",
+            "json",
+            "completion_stream",
+            "stream_logprobs",
+            "messages",
+            "messages_stream",
+            "messages_stream_spaced",
+        ] {
+            assert!(Fleet::Http.serves(path), "{path}");
+        }
+        assert_eq!(Fleet::PrefillDecode.wire(), "grpc");
+        assert!(Fleet::Http.serves("chat") && Fleet::Http.serves("completion_stream"));
+        assert!(Fleet::Http.serves("messages") && !Fleet::Http.serves("generate_stream_spaced"));
+        assert!(Fleet::Grpc.serves("messages") && Fleet::PrefillDecode.serves("messages_stream"));
+        assert_eq!(Fleet::Http.default_paths(), crate::paths::DEFAULT_PATHS);
+        assert_eq!(Fleet::Grpc.default_paths(), crate::paths::DEFAULT_PATHS);
+        assert_eq!(
+            Fleet::PrefillDecode.default_paths(),
+            crate::paths::DEFAULT_PATHS
+        );
+        let bed = Bed::new(&cfg, Path::new("/h"), Path::new("/run"), true);
+        let env: BTreeMap<String, String> = bed.env().into_iter().collect();
+        assert_eq!(env["FLEET"], "http");
+        assert_eq!(env["MOCK_BASE"], "4");
+        assert!(!env.contains_key("PREFILL_WORKERS"));
     }
 
     #[test]
@@ -761,7 +897,7 @@ mod tests {
         ]);
         let server = serve(answers, false);
         assert_eq!(
-            script_counts_at(&server.url, 2, 40),
+            script_counts_at(&server.url, 2, 40, "grpc"),
             ScriptCounts {
                 hits: 5,
                 misses: 1,
@@ -769,8 +905,23 @@ mod tests {
                 queued_left: Some(3)
             }
         );
+        // The HTTP fleet's engines are keyed by their wire: the gRPC key reads nothing.
+        assert_eq!(script_counts_at(&server.url, 2, 40, "http").unreadable, 2);
+        let http_answers = BTreeMap::from([
+            (
+                "GET /admin/script/http:40".to_string(),
+                (200, r#"{"hits": 7, "misses": 0}"#.to_string()),
+            ),
+            (
+                "GET /admin/script/all".to_string(),
+                (200, r#"{"queued": 0}"#.to_string()),
+            ),
+        ]);
+        let http_server = serve(http_answers, false);
+        let counts = script_counts_at(&http_server.url, 1, 40, "http");
+        assert_eq!((counts.hits, counts.misses, counts.unreadable), (7, 0, 0));
         let empty = serve(BTreeMap::new(), false);
-        assert_eq!(script_counts_at(&empty.url, 2, 40).unreadable, 3);
+        assert_eq!(script_counts_at(&empty.url, 2, 40, "grpc").unreadable, 3);
     }
 
     #[test]

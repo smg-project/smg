@@ -49,7 +49,7 @@
 use super::{
     pattern::{concat, plain_class, previous_boundary, repeat, Class, Node},
     scan::{Bits, Roles},
-    Stage,
+    Pieces, Stage,
 };
 
 /// A part of the template that one class fills: its bit in a character's
@@ -139,7 +139,12 @@ impl Part {
                 class: *class,
                 max: 1,
             }),
-            Node::ClassRepeat { class, min: 1, max } => Some(Self::Run {
+            Node::ClassRepeat {
+                class,
+                min: 1,
+                max,
+                possessive: false,
+            } => Some(Self::Run {
                 class: *class,
                 max: *max,
             }),
@@ -199,13 +204,17 @@ pub(super) struct Scanner {
 
 impl Scanner {
     /// The scanner of `stages`, when they are a chain of a bounded run, an
-    /// unbounded run and the template, each keeping its gaps; `None` for
-    /// every other stage list, which the stage patterns match in turn.
+    /// unbounded run and the template, each passing its matches and gaps
+    /// on; `None` for every other stage list, which the stage patterns
+    /// match in turn.
     pub(super) fn recognize(stages: &[Stage]) -> Option<Self> {
         let [first, second, third] = stages else {
             return None;
         };
-        if !(first.keep_gaps && second.keep_gaps && third.keep_gaps) {
+        if stages
+            .iter()
+            .any(|stage| stage.pieces != Pieces::MatchesAndGaps)
+        {
             return None;
         }
         let Some(Part::Run {
@@ -475,7 +484,7 @@ mod tests {
     };
 
     use super::{
-        super::{pattern::Pattern, Stage},
+        super::{pattern::Pattern, Pieces, Stage},
         *,
     };
 
@@ -490,15 +499,18 @@ mod tests {
     const TEMPLATE: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
     const GPT4: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    fn stage(pattern: &str, keep_gaps: bool) -> Stage {
+    fn stage(pattern: &str, pieces: Pieces) -> Stage {
         Stage {
             pattern: Pattern::parse(pattern).expect("parses"),
-            keep_gaps,
+            pieces,
         }
     }
 
     fn chain(patterns: &[&str]) -> Vec<Stage> {
-        patterns.iter().map(|p| stage(p, true)).collect()
+        patterns
+            .iter()
+            .map(|p| stage(p, Pieces::MatchesAndGaps))
+            .collect()
     }
 
     /// The pieces of the scanner, as byte ranges of `text`.
@@ -521,13 +533,15 @@ mod tests {
             };
             let mut cursor = 0;
             for (start, end) in stage.pattern.find_iter(text) {
-                if stage.keep_gaps && cursor < start {
+                if stage.pieces.gaps() && cursor < start {
                     walk(rest, &text[cursor..start], offset + cursor, out);
                 }
-                walk(rest, &text[start..end], offset + start, out);
+                if stage.pieces.matches() {
+                    walk(rest, &text[start..end], offset + start, out);
+                }
                 cursor = end;
             }
-            if stage.keep_gaps && cursor < text.len() {
+            if stage.pieces.gaps() && cursor < text.len() {
                 walk(rest, &text[cursor..], offset + cursor, out);
             }
         }
@@ -678,7 +692,7 @@ mod tests {
         assert_eq!(overlapping.digits, 3);
         // Fewer or more stages, the stages in another order, the GPT-4
         // family's template as the third stage, a bounded second stage, a
-        // stage that drops its gaps.
+        // stage that drops its gaps, a stage that drops its matches.
         for stages in [
             chain(&[DIGITS, TEMPLATE]),
             chain(&[TEMPLATE]),
@@ -688,9 +702,14 @@ mod tests {
             chain(&[DIGITS, RUNS, GPT4]),
             chain(&[DIGITS, r"[一-龥]{1,3}", TEMPLATE]),
             vec![
-                stage(DIGITS, true),
-                stage(RUNS, true),
-                stage(TEMPLATE, false),
+                stage(DIGITS, Pieces::MatchesAndGaps),
+                stage(RUNS, Pieces::MatchesAndGaps),
+                stage(TEMPLATE, Pieces::Matches),
+            ],
+            vec![
+                stage(DIGITS, Pieces::Gaps),
+                stage(RUNS, Pieces::MatchesAndGaps),
+                stage(TEMPLATE, Pieces::MatchesAndGaps),
             ],
         ] {
             assert!(

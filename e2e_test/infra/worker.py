@@ -21,6 +21,7 @@ import yaml
 from .constants import (
     DEFAULT_HOST,
     DEFAULT_STARTUP_TIMEOUT,
+    ENV_MOCK_WIRE,
     ENV_SHOW_WORKER_LOGS,
     ENV_VLLM_SERVICER_IMPL,
     ENV_WORKER_RUST_LOG,
@@ -748,8 +749,8 @@ class Worker:
             self.admin_port = get_open_port()
             self._admin_port_auto = True
         # The disaggregation roles are the HTTP and the gRPC workers'; the
-        # encode role is the gRPC vLLM wire's alone (the mock answers the
-        # encoder-cache handoff there); the ZMQ workers take none.
+        # encode role is a gRPC worker's, on the vLLM and the TokenSpeed wires
+        # (the mock answers each wire's media handoff); the ZMQ workers take none.
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
             if self.mode == ConnectionMode.ZMQ:
                 raise ValueError(
@@ -794,12 +795,24 @@ class Worker:
         # an encode worker also binds the bootstrap port the gateway is told
         # of, where the probe finds it; all advertise the role in their
         # server args (the HTTP workers in ``/server_info``). The encode
-        # role takes the vLLM wire whatever the lane's wire; a class's own
-        # wire still comes after, and the mock takes the last.
+        # role is the vLLM and the TokenSpeed wires': an encode worker
+        # speaks the lane's wire when it is one of those (the flag above),
+        # vllm when the lane names none, and a lane on the SGLang wire has
+        # no encode worker to give unless the class names a wire of its own
+        # (its ``--grpc-wire`` comes after, and the mock takes the last).
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
             cmd += ["--worker-type", self.worker_type.value]
             if self.worker_type == WorkerType.ENCODE:
-                cmd += ["--grpc-wire", "vllm"]
+                wire = get_mock_wire()
+                if wire == "sglang" and "--grpc-wire" not in (self.extra_engine_args or []):
+                    raise ValueError(
+                        "the mock engine's encode role is the vLLM or the TokenSpeed wire's: "
+                        f"the lane's wire ({ENV_MOCK_WIRE}={wire}) has no encode role; run the "
+                        "lane on vllm or tokenspeed, or name the class's wire in its extra "
+                        "engine arguments"
+                    )
+                if wire is None:
+                    cmd += ["--grpc-wire", "vllm"]
             if self.worker_type != WorkerType.DECODE and self.bootstrap_port is not None:
                 cmd += ["--bootstrap-base-port", str(self.bootstrap_port)]
         return cmd

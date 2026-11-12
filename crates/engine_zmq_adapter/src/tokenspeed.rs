@@ -32,14 +32,16 @@ use crate::{
     context_window::admit_prompt,
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
-    stream::{map_slim_output, poll_mapped, MappedGenerateStream, StreamState},
+    stream::{
+        finish, map_slim_output, poll_mapped, FinishParts, MappedGenerateStream, StreamState,
+    },
     structured_outputs::ConstraintRef,
 };
 
 mod mrope;
 
-use mrope::{grid_rows, GridItem, GridKind};
-pub use mrope::{qwen35_lineage, MropeLayout};
+use mrope::{flag_set, grid_rows, seconds_per_grid, GridItem, GridKind};
+pub use mrope::{qwen35_lineage, MropeLayout, OmniLayout, PositionFacts, PositionRule, RuleFamily};
 
 /// Streaming generate output for one TokenSpeed sub-request, mapping each
 /// `TokenSpeedOutput` to a vLLM-proto `GenerateResponse`, tagged with this
@@ -85,54 +87,20 @@ impl TokenSpeedGenerateStream {
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
     }
+}
 
-    /// Whether the engine already finished this choice and its terminal
-    /// `Complete` is parked behind the chunk just yielded (the finish tick
-    /// carried new tokens). A frontend that matched a stop on that chunk must
-    /// not synthesize its own `Complete`: the accumulated state has already
-    /// been drained into the parked one.
-    pub fn has_parked_complete(&self) -> bool {
-        self.pending.is_some()
+impl finish::Parts for TokenSpeedGenerateStream {
+    fn parked(&self) -> Option<&vllm::GenerateResponse> {
+        self.pending.as_ref()
     }
 
-    /// End this choice now on a frontend-matched string stop: the terminal
-    /// `Complete` built from the accumulated state, exactly as if the engine
-    /// had reported `stop` with that string. The engine-side request is
-    /// aborted when the stream is dropped, so the caller drops it next.
-    pub fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
-        self.complete_with_finish(
-            "stop".to_string(),
-            Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
-                matched,
-            )),
-        )
-    }
-
-    /// End this choice as aborted: the engine's own parked `Complete` when it
-    /// already finished, else the terminal `Complete` the Python servicer
-    /// yields after an `Abort` RPC (`finish_reason = "abort"`).
-    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        if let Some(parked) = self.pending.take() {
-            return parked;
+    fn finish_parts(&mut self) -> FinishParts<'_> {
+        FinishParts {
+            state: &mut self.state,
+            index: self.index,
+            pending: &mut self.pending,
+            input_logprobs_emitted: &mut self.input_logprobs_emitted,
         }
-        self.complete_with_finish("abort".to_string(), None)
-    }
-
-    fn complete_with_finish(
-        &mut self,
-        finish_reason: String,
-        matched: Option<vllm::generate_complete::MatchedStop>,
-    ) -> vllm::GenerateResponse {
-        let mut pending = None;
-        // No new tokens on a frontend finish, so `emit_tick` yields the
-        // `Complete` directly and parks nothing.
-        self.state.emit_tick(
-            self.index,
-            Vec::new(),
-            None,
-            Some((finish_reason, matched)),
-            &mut pending,
-        )
     }
 }
 
@@ -323,21 +291,21 @@ pub(crate) fn fan_out_tokenspeed_requests(
 
 /// What a multimodal item's `image_grid_thw` / `video_grid_thw` tensors are
 /// for the model served: the inputs of an MRoPE position table this
-/// translation computes with the engine's own rule, the inputs of one it has
-/// no rule for, or the layout of the patches a vision tower reads while the
-/// language model keeps 1-D positions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// translation computes with the engine's own rule for the family, the inputs
+/// of one it has no rule for, or the layout of the patches a vision tower
+/// reads while the language model keeps 1-D positions.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GridTensors {
-    /// The grid feeds the Qwen3.5 lineage's MRoPE positions, which this
-    /// translation computes as the engine's input processor does on the path
-    /// this wire bypasses (the `mrope` module) and ships in the request's position
-    /// slots.
-    Qwen35Positions(MropeLayout),
-    /// A Qwen3.5-lineage checkpoint whose launcher shipped no layout facts:
-    /// the rule cannot run, and a request of this lineage must never reach
-    /// the engine with empty position slots (its executor would take 1-D
-    /// positions without a word), so every multimodal item is refused.
-    Qwen35PositionsUnavailable,
+    /// The grid feeds the MRoPE positions of a family whose rule this
+    /// translation has (the Qwen3.5 lineage, Qwen3-Omni), computed as the
+    /// engine's input processor computes them on the path this wire bypasses
+    /// (the `mrope` module) and shipped in the request's position slots.
+    Computed(PositionRule),
+    /// A checkpoint of a family with a rule whose launcher shipped no layout
+    /// facts: the rule cannot run, and a request of this family must never
+    /// reach the engine with empty position slots (its executor would take
+    /// 1-D positions without a word), so every multimodal item is refused.
+    Unavailable(RuleFamily),
     /// The grid feeds MRoPE positions by a rule this wire does not have
     /// (another MRoPE family, or a model not known either way): an item that
     /// carries one is refused, since a 1-D fallback would silently degrade
@@ -350,42 +318,34 @@ pub enum GridTensors {
 }
 
 impl GridTensors {
-    /// From the facts a TokenSpeed engine declares at its handshake (the same
-    /// facts a launcher hands the Rust servicer): the layout facts travel
-    /// together, so an engine that declares only some of them declares none,
-    /// and an engine that declares nothing keeps the conservative reading
+    /// From the facts a TokenSpeed engine declares at its handshake (a subset
+    /// of the facts a launcher hands the Rust servicer: the three layout
+    /// facts, none of the Omni clock, so a Qwen3-Omni engine's items are
+    /// refused by name on this path until the handshake carries the clock);
+    /// an engine that declares nothing keeps the conservative reading
     /// ([`Self::Positions`]).
     pub fn declared(ready: &EngineCoreReadyResponse) -> Self {
-        let layout = match (
-            ready.spatial_merge_size,
-            ready.image_token_id,
-            ready.video_token_id,
-        ) {
-            (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
-                Some(MropeLayout {
-                    spatial_merge_size,
-                    image_token_id,
-                    video_token_id,
-                })
-            }
-            _ => None,
-        };
         Self::for_model(
             &ready.architectures,
             ready.model_type.as_deref().unwrap_or_default(),
             ready.mrope_positions,
-            layout,
+            PositionFacts {
+                spatial_merge_size: ready.spatial_merge_size,
+                image_token_id: ready.image_token_id,
+                video_token_id: ready.video_token_id,
+                ..PositionFacts::default()
+            },
         )
     }
 
     /// From the launcher's model facts: the checkpoint's `architectures` and
-    /// `model_type` (the engine's own dispatch picks the Qwen3.5 rule by
-    /// them, [`qwen35_lineage`]), its `mrope_positions` reading of the text
+    /// `model_type` (the engine's own dispatch picks the family's rule by
+    /// them, [`RuleFamily::of`]), its `mrope_positions` reading of the text
     /// rope config (`Some(false)` is a patch layout; `Some(true)`, and `None`
     /// for a launcher that does not say, keep the conservative reading), and
-    /// the `layout` facts the rule needs (without them a lineage checkpoint's
-    /// multimodal items are refused outright). The lineage comes first: a
-    /// lineage checkpoint takes its rule whatever `mrope_positions` says (a
+    /// the `facts` the rule reads (without the ones it needs, a family's
+    /// multimodal items are refused outright). The family comes first: a
+    /// checkpoint with a rule takes it whatever `mrope_positions` says (a
     /// `Some(false)` there would otherwise ship empty position slots, which
     /// the engine fills with 1-D positions), and the reading decides only the
     /// families without a rule.
@@ -393,10 +353,12 @@ impl GridTensors {
         architectures: &[String],
         model_type: &str,
         mrope_positions: Option<bool>,
-        layout: Option<MropeLayout>,
+        facts: PositionFacts,
     ) -> Self {
-        if qwen35_lineage(architectures, model_type) {
-            return layout.map_or(Self::Qwen35PositionsUnavailable, Self::Qwen35Positions);
+        if let Some(family) = RuleFamily::of(architectures, model_type) {
+            return family
+                .rule(facts)
+                .map_or(Self::Unavailable(family), Self::Computed);
         }
         match mrope_positions {
             Some(false) => Self::PatchLayout,
@@ -509,8 +471,8 @@ pub(crate) fn translate_request_tokenspeed_for(
     // handshake ships it) or a decode side's item (the KV comes from the
     // prefill, the item's metadata keeps the prompt the same on both
     // sides). The translator cannot tell the prefill side apart (the
-    // rendezvous rides on both legs), so a disaggregated request passes the
-    // item on either leg, as the Python servicer does; the gateway sends the
+    // rendezvous rides on both sides), so a disaggregated request passes the
+    // item on either side, as the Python servicer does; the gateway sends the
     // pixel-free clone to the decode side only. An aggregated request has
     // nowhere else to get it from.
     if let Some(mm) = multimodal_inputs.as_ref() {
@@ -759,10 +721,11 @@ pub(crate) fn rendezvous_rank(
 /// Map the proto multimodal payload onto the TokenSpeed wire structs, doing
 /// the work the engine's `InputProcessor` does on other transports but the
 /// msgpack path bypasses: derive each item's pad value from its content hash
-/// and substitute it into the placeholder ranges of `input_ids`, and, for the
-/// Qwen3.5 lineage, compute the MRoPE position table from the original ids
-/// and the items' grids ([`mrope`]). Returns the original ids (for
-/// `input_ids_unpadded`, which detokenization reads) and the wire payload.
+/// and substitute it into the placeholder ranges of `input_ids`, and, for a
+/// family whose rule this wire has, compute the MRoPE position table from the
+/// original ids and the items' grids ([`mrope`]). Returns the original ids
+/// (for `input_ids_unpadded`, which detokenization reads) and the wire
+/// payload.
 pub(crate) fn translate_tokenspeed_multimodal(
     mm: tokenspeed_proto::MultimodalInputs,
     input_ids: &mut [u32],
@@ -771,19 +734,23 @@ pub(crate) fn translate_tokenspeed_multimodal(
     if mm.items.is_empty() {
         return Err("multimodal payload carried no items".to_string());
     }
-    if grid_tensors == GridTensors::Qwen35PositionsUnavailable {
-        return Err(
-            "multimodal items of this model need its MRoPE position table, which the launcher's \
-             model facts (spatial_merge_size, image_token_id, video_token_id) did not provide; \
-             the engine would take 1-D positions silently, so the request is refused"
-                .to_string(),
-        );
-    }
+    let rule = match grid_tensors {
+        GridTensors::Computed(rule) => Some(rule),
+        GridTensors::Unavailable(family) => {
+            return Err(format!(
+                "multimodal items of this model need its MRoPE position table, which the \
+                 launcher's model facts ({}) did not provide; the engine would take 1-D \
+                 positions silently, so the request is refused",
+                family.needs()
+            ));
+        }
+        GridTensors::Positions | GridTensors::PatchLayout => None,
+    };
     let unpadded = input_ids.to_vec();
     let mut im_token_id = None;
     let mut video_token_id = None;
     let mut mm_items = Vec::with_capacity(mm.items.len());
-    let mut grids = Vec::with_capacity(mm.items.len());
+    let mut rule_inputs = Vec::with_capacity(mm.items.len());
     for item in mm.items {
         // The proto and engine modality enums disagree (proto: AUDIO=2,
         // VIDEO=3; engine: VIDEO=2, AUDIO=3) — translate, never pass through.
@@ -816,10 +783,23 @@ pub(crate) fn translate_tokenspeed_multimodal(
         // No `encoder_input`: the embedding arrives out of band (the caller
         // checks that it does, once the request's rendezvous fields are read).
         let feature = item.encoder_input.map(wire_tensor_tokenspeed).transpose()?;
-        // The position rule reads an item's grid rows off the same tensor the
-        // engine reads them from, before it joins the wire payload.
-        let grid = match grid_tensors {
-            GridTensors::Qwen35Positions(_) => GridKind::KEYS
+        // The position rule reads an item's grid rows, and the Omni rule a
+        // video's clock, off the same tensors the engine reads them from,
+        // before they join the wire payload.
+        let grid = match rule {
+            // The Omni rule reads the modality's own grid, as the engine's
+            // `_omni_media_segments` does (an image item's `video_grid_thw`
+            // is not its grid); the Qwen3.5 rule the first key an item
+            // carries, image before video, as the engine's fast path does.
+            Some(PositionRule::Qwen3Omni(_)) => match GridKind::of_modality(modality) {
+                Some(kind) => item
+                    .model_specific_tensors
+                    .get(kind.key())
+                    .map(|tensor| grid_rows(kind.key(), tensor).map(|rows| (kind, rows)))
+                    .transpose()?,
+                None => None,
+            },
+            Some(PositionRule::Qwen35(_)) => GridKind::KEYS
                 .iter()
                 .find_map(|(key, kind)| {
                     item.model_specific_tensors
@@ -827,11 +807,23 @@ pub(crate) fn translate_tokenspeed_multimodal(
                         .map(|tensor| grid_rows(key, tensor).map(|rows| (*kind, rows)))
                 })
                 .transpose()?,
-            GridTensors::Qwen35PositionsUnavailable
-            | GridTensors::Positions
-            | GridTensors::PatchLayout => None,
+            None => None,
         };
-        grids.push(grid);
+        let (seconds, audio_in_video) = match rule {
+            Some(rule) if rule.reads_video_timing() => (
+                item.model_specific_tensors
+                    .get("video_second_per_grid")
+                    .map(|tensor| seconds_per_grid("video_second_per_grid", tensor))
+                    .transpose()?,
+                item.model_specific_tensors
+                    .get("use_audio_in_video")
+                    .map(|tensor| flag_set("use_audio_in_video", tensor))
+                    .transpose()?
+                    .unwrap_or(false),
+            ),
+            _ => (None, false),
+        };
+        rule_inputs.push((grid, seconds, audio_in_video));
         let mut model_specific_data = BTreeMap::new();
         for (name, tensor) in item.model_specific_tensors {
             model_specific_data.insert(name, wire_tensor_tokenspeed(tensor)?);
@@ -847,8 +839,8 @@ pub(crate) fn translate_tokenspeed_multimodal(
             if grid_tensors == GridTensors::Positions && model_specific_data.contains_key(key) {
                 return Err(format!(
                     "multimodal item carries {key:?}: MRoPE position tensors of this model are \
-                     not derivable over the TokenSpeed ZMQ wire (the Qwen3.5 lineage's are); \
-                     use the gRPC transport for this model"
+                     not derivable over the TokenSpeed ZMQ wire (the Qwen3.5 lineage's and \
+                     Qwen3-Omni's are); use the gRPC transport for this model"
                 ));
             }
         }
@@ -862,24 +854,27 @@ pub(crate) fn translate_tokenspeed_multimodal(
             encode_handshake: None,
         });
     }
-    let (mrope_positions, mrope_position_delta, mrope_position_delta_scalar) = match grid_tensors {
-        GridTensors::Qwen35Positions(layout) => {
-            let items: Vec<GridItem<'_>> = grids
+    let (mrope_positions, mrope_position_delta, mrope_position_delta_scalar) = match rule {
+        Some(rule) => {
+            let items: Vec<GridItem<'_>> = rule_inputs
                 .into_iter()
                 .zip(&mm_items)
-                .map(|(grid, item)| GridItem {
-                    grid,
-                    offsets: &item.offsets,
-                })
+                .map(
+                    |((grid, seconds_per_grid, audio_in_video), item)| GridItem {
+                        modality: item.modality,
+                        grid,
+                        offsets: &item.offsets,
+                        seconds_per_grid,
+                        audio_in_video,
+                    },
+                )
                 .collect();
-            let table = mrope::qwen35_positions(layout, &unpadded, &items)?;
+            let table = rule.positions(&unpadded, &items)?;
             (Some(table.positions), Some(table.delta), Some(table.scalar))
         }
-        GridTensors::Qwen35PositionsUnavailable
-        | GridTensors::Positions
-        | GridTensors::PatchLayout => {
+        None => {
             // Surface the position-tensor gap in the gateway's own logs (once
-            // per process): a model outside the computed lineage receives no
+            // per process): a model outside the computed families receives no
             // mrope_positions on this wire.
             static MROPE_POSITIONS_NOTE: std::sync::Once = std::sync::Once::new();
             MROPE_POSITIONS_NOTE.call_once(|| {
@@ -1027,10 +1022,9 @@ pub fn translate_encode_request(
 /// viewing the request's bytes rather than copying them: a tensor of the
 /// auxiliary size then travels to the engine as a frame sharing that view.
 /// SHM/remote payloads never reach this translate: ZMQ assembly runs with SHM
-/// disabled and RDMA staging off.
-pub(crate) fn wire_tensor_tokenspeed(
-    tensor: tokenspeed_proto::TensorData,
-) -> Result<WireTensor, String> {
+/// disabled and RDMA staging off. The mock worker reads a request's tensors
+/// through it too, so it refuses exactly the tensors this wire refuses.
+pub fn wire_tensor_tokenspeed(tensor: tokenspeed_proto::TensorData) -> Result<WireTensor, String> {
     let bytes = match tensor.payload {
         Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => bytes,
         Some(_) => {
@@ -1061,8 +1055,9 @@ pub(crate) fn wire_tensor_tokenspeed(
 }
 
 /// Byte width of the wire dtypes the gateway emits; `None` for dtypes we do
-/// not recognize (passed through unvalidated rather than rejected).
-pub(crate) fn tensor_dtype_width(dtype: &str) -> Option<usize> {
+/// not recognize (passed through unvalidated rather than rejected). The mock
+/// worker reads an SHM handle's byte length with it.
+pub fn tensor_dtype_width(dtype: &str) -> Option<usize> {
     match dtype {
         "float64" | "int64" | "uint64" => Some(8),
         "float32" | "int32" | "uint32" => Some(4),
@@ -1158,7 +1153,7 @@ pub(crate) const BARE_ENGINE_ABORT: &str =
 /// internal, with the engine's words when the wire carries them and
 /// [`BARE_ENGINE_ABORT`] when it does not. The caller's own abort never comes
 /// this way: it is answered from the parked completion
-/// ([`TokenSpeedGenerateStream::complete_aborted`]).
+/// ([`FrontendFinish::complete_aborted`](crate::FrontendFinish::complete_aborted)).
 pub(crate) fn engine_abort(status: Option<u16>, message: Option<String>) -> tonic::Status {
     engine_abort_status(
         status,
@@ -1363,6 +1358,138 @@ mod tests {
         // Empty stop_token_ids ride as None (the normalized encoding).
         let mapped = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams::default());
         assert_eq!(mapped.stop_token_ids, None);
+    }
+
+    /// The sampling values the engine takes from this wire are the ones the
+    /// engine's in-process path derived for the same gateway request: the
+    /// servicer there forwarded the proto's set fields and the engine's
+    /// `SamplingParams.__post_init__` derived the rest (`0 <= temperature <
+    /// 1e-6` is greedy: temperature 1.0 and top_k 1; top_k 1 pins the seed to
+    /// 0; top_k -1 becomes the disabled sentinel; the stop ids are a set or
+    /// None; a negative temperature stays for the range check to refuse).
+    /// `engine_derivation` transcribes that path and every case compares the
+    /// whole wire struct against it. String stops are no sampling field: the
+    /// servicer matches them itself, so no case carries one.
+    #[test]
+    fn tokenspeed_sampling_equals_the_engine_derivation_of_the_in_process_path() {
+        use engine_zmq_client::protocol::tokenspeed::sampling::TOP_K_DISABLED;
+
+        fn engine_derivation(sp: &tokenspeed_proto::SamplingParams) -> TokenSpeedSamplingParams {
+            // The set fields as forwarded, the class defaults for the rest.
+            let mut params = TokenSpeedSamplingParams {
+                max_new_tokens: sp.max_new_tokens,
+                temperature: sp.temperature.map_or(1.0, f64::from),
+                top_p: sp.top_p.map_or(1.0, f64::from),
+                top_k: sp.top_k.unwrap_or(-1),
+                min_p: sp.min_p.map_or(0.0, f64::from),
+                frequency_penalty: sp.frequency_penalty.map_or(0.0, f64::from),
+                presence_penalty: sp.presence_penalty.map_or(0.0, f64::from),
+                repetition_penalty: sp.repetition_penalty.map_or(1.0, f64::from),
+                min_new_tokens: sp.min_new_tokens,
+                ignore_eos: sp.ignore_eos,
+                skip_special_tokens: sp.skip_special_tokens,
+                spaces_between_special_tokens: sp.spaces_between_special_tokens,
+                no_stop_trim: sp.no_stop_trim,
+                seed: sp.sampling_seed,
+                n: if sp.n == 0 { 1 } else { sp.n },
+                logit_bias: (!sp.logit_bias.is_empty()).then(|| {
+                    sp.logit_bias
+                        .iter()
+                        .map(|(token, bias)| (token.clone(), f64::from(*bias)))
+                        .collect()
+                }),
+                ..TokenSpeedSamplingParams::default()
+            };
+            // `__post_init__`.
+            let mut ids = sp.stop_token_ids.clone();
+            ids.sort_unstable();
+            ids.dedup();
+            params.stop_token_ids = (!ids.is_empty()).then_some(ids);
+            if (0.0..1e-6).contains(&params.temperature) {
+                params.temperature = 1.0;
+                params.top_k = 1;
+            }
+            if params.top_k == 1 {
+                params.seed = Some(0);
+            }
+            if params.top_k == -1 {
+                params.top_k = TOP_K_DISABLED;
+            }
+            // `normalize()`: no stop strings, so an empty list.
+            params.stop_strs = Vec::new();
+            params.stop_str_max_len = 0;
+            params.is_normalized = true;
+            params
+        }
+
+        let set = |temperature: Option<f32>, top_k: Option<i32>, seed: Option<u64>| {
+            tokenspeed_proto::SamplingParams {
+                temperature,
+                top_p: Some(1.0),
+                top_k,
+                min_p: Some(0.0),
+                frequency_penalty: Some(0.0),
+                presence_penalty: Some(0.0),
+                repetition_penalty: Some(1.0),
+                max_new_tokens: Some(64),
+                skip_special_tokens: true,
+                spaces_between_special_tokens: true,
+                sampling_seed: seed,
+                n: 1,
+                ..Default::default()
+            }
+        };
+        let cases = [
+            ("greedy by temperature 0", set(Some(0.0), Some(-1), None)),
+            (
+                "greedy by temperature 0 with a request seed",
+                set(Some(0.0), Some(-1), Some(1_234)),
+            ),
+            (
+                "greedy by a temperature under the threshold",
+                set(Some(5e-7), Some(-1), Some(9)),
+            ),
+            (
+                "greedy by temperature 0 over an explicit top_k",
+                set(Some(0.0), Some(40), None),
+            ),
+            ("greedy by top_k 1", set(Some(0.7), Some(1), Some(3))),
+            ("sampled without a seed", set(Some(0.7), Some(-1), None)),
+            ("sampled with a seed", set(Some(0.7), Some(40), Some(7))),
+            (
+                "a negative temperature, for the engine to refuse",
+                set(Some(-0.5), Some(-1), Some(7)),
+            ),
+            (
+                "the proto's unset scalars",
+                tokenspeed_proto::SamplingParams::default(),
+            ),
+            (
+                "penalties, min_p, a bias, duplicated stop ids, a minimum",
+                tokenspeed_proto::SamplingParams {
+                    min_p: Some(0.05),
+                    frequency_penalty: Some(0.5),
+                    presence_penalty: Some(0.3),
+                    repetition_penalty: Some(1.1),
+                    min_new_tokens: 2,
+                    stop_token_ids: vec![13, 7, 13],
+                    ignore_eos: true,
+                    no_stop_trim: true,
+                    logit_bias: [("42".to_string(), -100.0f32)].into(),
+                    ..set(Some(0.9), Some(-1), None)
+                },
+            ),
+        ];
+        for (name, sp) in cases {
+            let mut wire = translate_sampling_tokenspeed(sp.clone());
+            // The wire sends the stop ids as the gateway did; the engine
+            // reads them as a set, which is what the derivation holds.
+            if let Some(ids) = wire.stop_token_ids.as_mut() {
+                ids.sort_unstable();
+                ids.dedup();
+            }
+            assert_eq!(wire, engine_derivation(&sp), "{name}");
+        }
     }
 
     fn ts_tokenized_req(
@@ -2315,16 +2442,17 @@ mod tests {
         // needs MRoPE positions by a rule this wire lacks, or a launcher that
         // does not say, is refused as before.
         let outside = vec!["MuseSparkForConditionalGeneration".to_string()];
+        let no_facts = PositionFacts::default();
         assert_eq!(
-            GridTensors::for_model(&outside, "muse_spark", Some(false), None),
+            GridTensors::for_model(&outside, "muse_spark", Some(false), no_facts),
             GridTensors::PatchLayout
         );
         assert_eq!(
-            GridTensors::for_model(&outside, "muse_spark", Some(true), None),
+            GridTensors::for_model(&outside, "muse_spark", Some(true), no_facts),
             GridTensors::Positions
         );
         assert_eq!(
-            GridTensors::for_model(&outside, "muse_spark", None, None),
+            GridTensors::for_model(&outside, "muse_spark", None, no_facts),
             GridTensors::Positions
         );
         let wire = translate_for(with_grid(), GridTensors::PatchLayout)
@@ -2345,6 +2473,27 @@ mod tests {
         image_token_id: 151655,
         video_token_id: 151656,
     };
+
+    /// The same facts as a launcher ships them.
+    fn qwen35_facts() -> PositionFacts {
+        PositionFacts {
+            spatial_merge_size: Some(QWEN35.spatial_merge_size),
+            image_token_id: Some(QWEN35.image_token_id),
+            video_token_id: Some(QWEN35.video_token_id),
+            ..PositionFacts::default()
+        }
+    }
+
+    /// The engine's own Omni test facts (`test/runtime/models/test_qwen3_omni.py`):
+    /// the merge size alone, the clock left to the engine's defaults.
+    const OMNI_FACTS: PositionFacts = PositionFacts {
+        spatial_merge_size: Some(2),
+        image_token_id: None,
+        video_token_id: None,
+        position_id_per_seconds: Some(13.0),
+        seconds_per_chunk: Some(2.0),
+    };
+    const OMNI_ARCHITECTURE: &str = "Qwen3OmniMoeForConditionalGeneration";
 
     fn qwen35_grid_item(
         rows: &[[i64; 3]],
@@ -2398,18 +2547,34 @@ mod tests {
         ready.image_token_id = Some(QWEN35.image_token_id);
         assert_eq!(
             GridTensors::declared(&ready),
-            GridTensors::Qwen35PositionsUnavailable
+            GridTensors::Unavailable(RuleFamily::Qwen35)
         );
         ready.video_token_id = Some(QWEN35.video_token_id);
         assert_eq!(
             GridTensors::declared(&ready),
-            GridTensors::Qwen35Positions(QWEN35)
+            GridTensors::Computed(PositionRule::Qwen35(QWEN35))
         );
         // A model whose rope config is plain lays out patches only.
         let mut patches = default_ready_response();
         patches.architectures = vec!["Llama4ForConditionalGeneration".to_string()];
         patches.mrope_positions = Some(false);
         assert_eq!(GridTensors::declared(&patches), GridTensors::PatchLayout);
+        // A Qwen3-Omni engine: the handshake carries no clock (and, at the
+        // pinned engine, no merge size for a thinker checkpoint), so this
+        // path refuses the family's items by name rather than run its rule
+        // on a guessed clock, with or without the merge size declared.
+        let mut omni = default_ready_response();
+        omni.model_type = Some("qwen3_omni_moe".to_string());
+        omni.architectures = vec![OMNI_ARCHITECTURE.to_string()];
+        assert_eq!(
+            GridTensors::declared(&omni),
+            GridTensors::Unavailable(RuleFamily::Qwen3Omni)
+        );
+        omni.spatial_merge_size = Some(2);
+        assert_eq!(
+            GridTensors::declared(&omni),
+            GridTensors::Unavailable(RuleFamily::Qwen3Omni)
+        );
     }
 
     /// A Qwen3.5-lineage checkpoint's grid feeds the position table this
@@ -2420,23 +2585,23 @@ mod tests {
     #[test]
     fn a_qwen35_grid_feeds_the_position_table_the_engine_would_compute() {
         let lineage = vec!["Qwen3_5ForConditionalGeneration".to_string()];
-        let rule = GridTensors::for_model(&lineage, "qwen3_5", Some(true), Some(QWEN35));
-        assert_eq!(rule, GridTensors::Qwen35Positions(QWEN35));
+        let rule = GridTensors::for_model(&lineage, "qwen3_5", Some(true), qwen35_facts());
+        assert_eq!(rule, GridTensors::Computed(PositionRule::Qwen35(QWEN35)));
         // Without the layout facts the lineage's items are refused outright:
         // with or without a grid, never empty position slots for this lineage.
         assert_eq!(
-            GridTensors::for_model(&lineage, "qwen3_5", Some(true), None),
-            GridTensors::Qwen35PositionsUnavailable
+            GridTensors::for_model(&lineage, "qwen3_5", Some(true), PositionFacts::default()),
+            GridTensors::Unavailable(RuleFamily::Qwen35)
         );
         // The lineage comes first: a launcher reading `Some(false)` does not
         // send a lineage checkpoint down the patch-layout path.
         assert_eq!(
-            GridTensors::for_model(&lineage, "qwen3_5", Some(false), Some(QWEN35)),
-            GridTensors::Qwen35Positions(QWEN35)
+            GridTensors::for_model(&lineage, "qwen3_5", Some(false), qwen35_facts()),
+            GridTensors::Computed(PositionRule::Qwen35(QWEN35))
         );
         assert_eq!(
-            GridTensors::for_model(&lineage, "qwen3_5", Some(false), None),
-            GridTensors::Qwen35PositionsUnavailable
+            GridTensors::for_model(&lineage, "qwen3_5", Some(false), PositionFacts::default()),
+            GridTensors::Unavailable(RuleFamily::Qwen35)
         );
         for item in [
             ts_mm_item(b"12345678", 1, 3),
@@ -2445,8 +2610,9 @@ mod tests {
             let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
             req.tokenized.as_mut().unwrap().input_ids = vec![QWEN35.image_token_id; 9];
             req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-            let err = translate_for(req, GridTensors::Qwen35PositionsUnavailable).unwrap_err();
+            let err = translate_for(req, GridTensors::Unavailable(RuleFamily::Qwen35)).unwrap_err();
             assert!(err.contains("did not provide"), "{err}");
+            assert!(err.contains("image_token_id"), "{err}");
         }
 
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
@@ -2514,13 +2680,152 @@ mod tests {
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(b"12345678", 1, 3)],
         });
-        let wire = translate_for(req, GridTensors::Qwen35Positions(QWEN35)).expect("translated");
+        let wire = translate_for(req, GridTensors::Computed(PositionRule::Qwen35(QWEN35)))
+            .expect("translated");
         let mm = wire.multimodal_inputs.expect("mm payload");
         assert_eq!(
             i64_values(&mm.mrope_positions.expect("the table")),
             vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
         );
         assert_eq!(mm.mrope_position_delta_scalar, Some(0));
+    }
+
+    /// A Qwen3-Omni checkpoint's items feed the table the engine's Omni rule
+    /// computes: the engine's own mixed case (an audio run, an image, a
+    /// one-second-per-grid video, handed over out of order) lands in the
+    /// request's position slots, the video's `video_second_per_grid` read as
+    /// the float32 the gateway sends; without the merge size the items are
+    /// refused by the fact's name; a video that asks for its audio
+    /// interleaved is refused as the engine refuses it.
+    #[test]
+    fn a_qwen3_omni_request_carries_the_table_the_engines_omni_rule_computes() {
+        let omni = vec![OMNI_ARCHITECTURE.to_string()];
+        let rule = GridTensors::for_model(&omni, "qwen3_omni_moe", Some(true), OMNI_FACTS);
+        let GridTensors::Computed(PositionRule::Qwen3Omni(layout)) = rule else {
+            panic!("the Omni rule, got {rule:?}");
+        };
+        assert_eq!(layout.spatial_merge_size, 2);
+        assert_eq!(
+            GridTensors::for_model(
+                &omni,
+                "qwen3_omni_moe",
+                Some(true),
+                PositionFacts::default()
+            ),
+            GridTensors::Unavailable(RuleFamily::Qwen3Omni)
+        );
+        let tensor = |dtype: &str, shape: Vec<u32>, bytes: Vec<u8>| tokenspeed_proto::TensorData {
+            shape,
+            dtype: dtype.to_string(),
+            payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes.into())),
+        };
+        let grid = |rows: &[[i64; 3]]| {
+            tensor(
+                "int64",
+                vec![rows.len() as u32, 3],
+                rows.iter()
+                    .flatten()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            )
+        };
+        let item = |modality: common::Modality, hash: &[u8; 8], offset: u32, length: u32| {
+            let mut item = ts_mm_item(hash, offset, length);
+            item.modality = modality as i32;
+            item.model_specific_tensors.clear();
+            item
+        };
+        let mut video = item(common::Modality::Video, b"video-01", 15, 8);
+        video
+            .model_specific_tensors
+            .insert("video_grid_thw".to_string(), grid(&[[2, 4, 4]]));
+        video.model_specific_tensors.insert(
+            "video_second_per_grid".to_string(),
+            tensor("float32", vec![1], 1.0f32.to_le_bytes().to_vec()),
+        );
+        let audio = item(common::Modality::Audio, b"audio-01", 2, 3);
+        let mut image = item(common::Modality::Image, b"image-01", 8, 4);
+        image
+            .model_specific_tensors
+            .insert("image_grid_thw".to_string(), grid(&[[1, 4, 4]]));
+        let request = |items: Vec<tokenspeed_proto::MultimodalItem>| {
+            let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+            req.tokenized.as_mut().unwrap().input_ids = (0..25).collect();
+            req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items });
+            req
+        };
+        let wire = translate_for(request(vec![video.clone(), audio, image.clone()]), rule)
+            .expect("the Omni rule serves the items");
+        let mm = wire.multimodal_inputs.expect("mm payload");
+        let positions = mm.mrope_positions.expect("the table");
+        assert_eq!(positions.shape, vec![3, 25]);
+        let values = i64_values(&positions);
+        let (time, rest) = values.split_at(25);
+        let (height, width) = rest.split_at(25);
+        for axis in [time, height, width] {
+            assert_eq!(&axis[..8], &(0..8).collect::<Vec<i64>>()[..]);
+            assert_eq!(&axis[12..15], &[10, 11, 12]);
+            assert_eq!(&axis[23..], &[27, 28]);
+        }
+        assert_eq!(&time[8..12], &[8, 8, 8, 8]);
+        assert_eq!(&height[8..12], &[8, 8, 9, 9]);
+        assert_eq!(&width[8..12], &[8, 9, 8, 9]);
+        assert_eq!(&time[15..23], &[13, 13, 13, 13, 26, 26, 26, 26]);
+        assert_eq!(&height[15..23], &[13, 13, 14, 14, 13, 13, 14, 14]);
+        assert_eq!(&width[15..23], &[13, 14, 13, 14, 13, 14, 13, 14]);
+        assert_eq!(
+            i64_values(&mm.mrope_position_delta.expect("the delta")),
+            vec![4]
+        );
+        assert_eq!(mm.mrope_position_delta_scalar, Some(4));
+        // The side tensors ride to the engine as before.
+        assert!(mm.mm_items.iter().any(|item| item
+            .model_specific_data
+            .contains_key("video_second_per_grid")));
+
+        // The facts without the merge size: refused by the fact's name.
+        let err = translate_for(
+            request(vec![image]),
+            GridTensors::Unavailable(RuleFamily::Qwen3Omni),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("thinker_config.vision_config.spatial_merge_size"),
+            "{err}"
+        );
+
+        // The grid is the modality's own: a video item carrying only an
+        // `image_grid_thw` has no grid to the Omni rule (the engine refuses
+        // it naming the missing key), and one carrying both is laid out over
+        // its video rows, not the image rows a first-key reading would take.
+        let mut mislabelled = video.clone();
+        let rows = mislabelled
+            .model_specific_tensors
+            .remove("video_grid_thw")
+            .expect("the video grid");
+        mislabelled
+            .model_specific_tensors
+            .insert("image_grid_thw".to_string(), rows.clone());
+        let err = translate_for(request(vec![mislabelled.clone()]), rule).unwrap_err();
+        assert!(err.contains("carries no video_grid_thw"), "{err}");
+        mislabelled
+            .model_specific_tensors
+            .insert("image_grid_thw".to_string(), grid(&[[1, 8, 8]]));
+        mislabelled
+            .model_specific_tensors
+            .insert("video_grid_thw".to_string(), rows);
+        let wire = translate_for(request(vec![mislabelled]), rule).expect("the video rows");
+        let mm = wire.multimodal_inputs.expect("mm payload");
+        let values = i64_values(&mm.mrope_positions.expect("the table"));
+        assert_eq!(&values[15..23], &[15, 15, 15, 15, 28, 28, 28, 28]);
+
+        // A video that asks for its audio interleaved: the engine's refusal.
+        video.model_specific_tensors.insert(
+            "use_audio_in_video".to_string(),
+            tensor("bool", vec![1], vec![1]),
+        );
+        let err = translate_for(request(vec![video]), rule).unwrap_err();
+        assert!(err.contains("use_audio_in_video"), "{err}");
     }
 
     #[test]

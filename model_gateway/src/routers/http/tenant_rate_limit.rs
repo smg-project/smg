@@ -87,21 +87,33 @@ pub(crate) trait TenantCharge: GenerationRequest {
     }
 }
 
-/// The arguments of the assistant's tool calls in the history.
+/// What the assistant's turns in the history carry beside their content and
+/// reasoning: a refusal, and the arguments of their tool calls and of a
+/// deprecated function call, by the words of their JSON. A call's name is not
+/// counted.
 impl TenantCharge for ChatCompletionRequest {
     fn unrouted_words(&self) -> usize {
         self.messages
             .iter()
-            .filter_map(|message| match message {
+            .map(|message| match message {
                 ChatMessage::Assistant {
-                    tool_calls: Some(calls),
+                    refusal,
+                    tool_calls,
+                    function_call,
                     ..
-                } => Some(calls),
-                _ => None,
+                } => {
+                    let arguments: usize = tool_calls
+                        .iter()
+                        .flatten()
+                        .map(|call| &call.function)
+                        .chain(function_call.as_deref())
+                        .filter_map(|function| function.arguments.as_deref())
+                        .map(argument_words)
+                        .sum();
+                    arguments + refusal.as_deref().map_or(0, word_count)
+                }
+                _ => 0,
             })
-            .flatten()
-            .filter_map(|call| call.function.arguments.as_deref())
-            .map(word_count)
             .sum()
     }
 }
@@ -179,8 +191,8 @@ impl TenantCharge for GenerateRequest {
 }
 
 /// The instructions, and the function and custom tool calls in the history
-/// with their outputs. Images, files and the built-in tools' items are not
-/// counted.
+/// with their outputs, a function call's arguments by the words of their
+/// JSON. Images, files and the built-in tools' items are not counted.
 impl TenantCharge for ResponsesRequest {
     fn unrouted_words(&self) -> usize {
         let instructions = self.instructions.as_deref().map_or(0, word_count);
@@ -192,7 +204,7 @@ impl TenantCharge for ResponsesRequest {
             .map(|item| match item {
                 ResponseInputOutputItem::FunctionToolCall {
                     arguments, output, ..
-                } => word_count(arguments) + output.as_deref().map_or(0, word_count),
+                } => argument_words(arguments) + output.as_deref().map_or(0, word_count),
                 ResponseInputOutputItem::FunctionCallOutput { output, .. } => match output {
                     StringOrContentParts::String(text) => word_count(text),
                     StringOrContentParts::Array(parts) => parts
@@ -294,6 +306,22 @@ fn json_words(value: &Value) -> usize {
     }
 }
 
+/// The words of a call's arguments: of their JSON when they parse, as a tool
+/// use's input counts, since JSON written without spaces (as clients send it,
+/// and as an object-form `arguments` is kept) is one word of text. Arguments
+/// that do not parse, as a call cut off mid-way leaves them, count the runs
+/// between spaces and JSON punctuation, so a cut-off compact object still
+/// counts its keys and values.
+fn argument_words(arguments: &str) -> usize {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value) => json_words(&value),
+        Err(_) => arguments
+            .split(|c: char| c.is_whitespace() || "{}[]:,\"".contains(c))
+            .filter(|word| !word.is_empty())
+            .count(),
+    }
+}
+
 /// 1.3 tokens per word, rounded up.
 fn tokens_for_words(words: usize) -> u32 {
     (words as f64 * TOKENS_PER_WORD).ceil() as u32
@@ -309,31 +337,65 @@ pub(crate) struct TenantReservation {
     samples_per_prompt: u32,
 }
 
-/// Reserve `request`'s estimate for `tenant_meta` under `manager`, once per
-/// logical request and before any dispatch: every attempt dispatches under
-/// this one reservation. With a limiter and a tenant to charge, either the
-/// reservation or the denial, which is the request's answer, never retried;
-/// `(None, None)` for a request outside the limiter (no limiter configured,
-/// or a route that charges no tenant). `routing_text` is the request's
-/// routing text when routing already extracted it
-/// ([`TenantCharge::estimated_input_tokens`]).
-pub(crate) async fn reserve<T: TenantCharge>(
-    manager: Option<&RateLimitManager>,
-    tenant_meta: Option<&TenantRequestMeta>,
+/// What a tenant reservation charges for one request, with the limiter and
+/// the tenant it was gated on: the reserve-time estimate of the request's
+/// input tokens and the answers each prompt gets, read from the request
+/// before any dispatch ([`estimate`]), so the reservation itself borrows
+/// nothing of the request across its await and cannot be asked for with a
+/// limiter, a tenant and an estimate that were not gated together.
+#[derive(Clone, Copy)]
+pub(crate) struct TenantEstimate<'a> {
+    manager: &'a RateLimitManager,
+    tenant_meta: &'a TenantRequestMeta,
+    estimated_input_tokens: u32,
+    samples_per_prompt: u32,
+}
+
+/// The charge of `request` under the tenant rate limiter: `None` for a
+/// request outside it (no limiter configured, or a route that charges no
+/// tenant), so the estimate is read only when a reservation will use it.
+/// `routing_text` is the request's routing text when routing already
+/// extracted it ([`TenantCharge::estimated_input_tokens`]).
+pub(crate) fn estimate<'a, T: TenantCharge>(
+    manager: Option<&'a RateLimitManager>,
+    tenant_meta: Option<&'a TenantRequestMeta>,
     request: &T,
-    model_id: &str,
     routing_text: Option<&str>,
+) -> Option<TenantEstimate<'a>> {
+    Some(TenantEstimate {
+        manager: manager?,
+        tenant_meta: tenant_meta?,
+        estimated_input_tokens: request.estimated_input_tokens(routing_text),
+        samples_per_prompt: request.samples_per_prompt(),
+    })
+}
+
+/// Reserve `estimate` once per logical request, before any dispatch: every
+/// attempt dispatches under this one reservation. Either the reservation or
+/// the denial, which is the request's answer, never retried; `(None, None)`
+/// for a request outside the limiter (no estimate: no limiter configured, or
+/// a route that charges no tenant).
+pub(crate) async fn reserve(
+    estimate: Option<TenantEstimate<'_>>,
+    model_id: &str,
 ) -> (Option<TenantReservation>, Option<Response>) {
-    let (Some(manager), Some(tenant_meta)) = (manager, tenant_meta) else {
+    let Some(estimate) = estimate else {
         return (None, None);
     };
     let cell = RateLimitCell::new();
-    let estimate = request.estimated_input_tokens(routing_text);
-    match cell.reserve(manager, tenant_meta, model_id, estimate).await {
+    match cell
+        .reserve(
+            estimate.manager,
+            estimate.tenant_meta,
+            model_id,
+            estimate.estimated_input_tokens,
+        )
+        .await
+    {
         Ok(()) => (
             Some(TenantReservation {
                 cell,
-                samples_per_prompt: request.samples_per_prompt(),
+                samples_per_prompt: estimate.samples_per_prompt,
             }),
             None,
         ),
@@ -953,6 +1015,94 @@ mod tests {
         // 3 words of text and 10 of arguments: ceil(13 * 1.3).
         assert_eq!(chat.estimated_input_tokens(None), 17);
         assert_eq!(chat.estimated_input_tokens(Some("weather in Paris")), 17);
+    }
+
+    /// A refused turn's refusal and the arguments of a deprecated function
+    /// call, which the upstream reads with the rest of the history.
+    #[test]
+    fn a_chat_history_reserves_its_refusals_and_function_call_arguments() {
+        let chat: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "refusal": TEN_WORDS},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "weather",
+                    "arguments": "{\"query\": \"one two three four five six seven eight nine\"}",
+                }},
+            ],
+        }));
+        assert_eq!(chat.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text, 10 of refusal and 10 of arguments: ceil(23 * 1.3).
+        assert_eq!(chat.estimated_input_tokens(None), 30);
+        assert_eq!(chat.estimated_input_tokens(Some("weather in Paris")), 30);
+    }
+
+    /// A call's arguments count by the words of their JSON, as a tool use's
+    /// input does: written without spaces, as clients send them and as an
+    /// object-form `arguments` is kept, they are not one word. Arguments that
+    /// are not JSON, a call cut off mid-way among them, count the runs between
+    /// spaces and JSON punctuation.
+    #[test]
+    fn a_call_s_compact_json_arguments_reserve_their_words() {
+        let compact = "{\"city\":\"Paris\",\"days\":3,\"units\":\"metric\"}";
+        let chat: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": compact},
+                }]},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "weather",
+                    "arguments": {"city": "Paris", "days": 3, "units": "metric"},
+                }},
+            ],
+        }));
+        assert_eq!(chat.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text and 6 of each call's arguments (three keys, two
+        // words and a number): ceil(15 * 1.3).
+        assert_eq!(chat.estimated_input_tokens(None), 20);
+
+        let responses: ResponsesRequest = request(json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "weather in Paris"},
+                {"type": "function_call", "call_id": "c1", "name": "weather",
+                 "arguments": compact},
+            ],
+        }));
+        assert_eq!(responses.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text and 6 of arguments: ceil(9 * 1.3).
+        assert_eq!(responses.estimated_input_tokens(None), 12);
+
+        let text: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": "city Paris, three days"},
+                }]},
+            ],
+        }));
+        // Not JSON: 3 words of text and 4 of arguments: ceil(7 * 1.3).
+        assert_eq!(text.estimated_input_tokens(None), 10);
+
+        let cut_off: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Paris\",\"days\":3,\"uni"},
+                }]},
+            ],
+        }));
+        // Cut off mid-way, so not JSON: 3 words of text and 5 of arguments
+        // (`city`, `Paris`, `days`, `3`, `uni`): ceil(8 * 1.3).
+        assert_eq!(cut_off.estimated_input_tokens(None), 11);
     }
 
     /// A tool result's text, a string or text blocks, and a tool use's input.

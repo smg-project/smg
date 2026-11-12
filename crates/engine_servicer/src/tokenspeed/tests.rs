@@ -43,7 +43,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+        assert_bucket_edges, assert_golden, captured_logs, handshake_address, http_get, next_batch,
+        servicer_config, Bounded,
     },
     ServicerError,
 };
@@ -81,14 +82,6 @@ fn config(
         servicer: servicer_config(dir, handshake),
         model,
     }
-}
-
-/// The handshake endpoint of one test: an IPC socket under its own
-/// directory. A probed TCP port is not reserved, so two tests running in
-/// parallel could pick the same one and a mock engine would handshake with
-/// the other test's servicer and wait forever for its INIT.
-fn handshake_address(dir: &std::path::Path) -> String {
-    format!("ipc://{}", dir.join("handshake").display())
 }
 
 /// The handshake endpoint is free again: ZMQ unlinks the ipc socket file once
@@ -979,6 +972,75 @@ async fn string_stops_are_matched_by_the_servicer() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The servicer's own matched-stop terminal for a fan-out's second choice
+/// carries that choice's index, as the engine's completes do: the stop string
+/// matches on choice 1 while choice 0 is still open, and choice 0 then ends on
+/// the engine's own complete with index 0.
+#[tokio::test]
+async fn a_matched_stop_ends_the_second_choice_with_its_own_index() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let mut h = harness(model_info(), Some(tokenizer)).await;
+    let mut request = generate_request("r8", true, vec!["Hello world".to_string()]);
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r8-1", vec![1], 1, None, None)).await;
+    send(&mut h.engine_out, &batch("r8-1", vec![2], 2, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![1]
+    );
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![2]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (1, "stop", vec![1, 2])
+    );
+    assert_eq!(
+        done.matched_stop,
+        Some(ts::generate_complete::MatchedStop::MatchedStopStr(
+            "Hello world".to_string()
+        ))
+    );
+
+    send(
+        &mut h.engine_out,
+        &batch("r8-0", vec![30], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![30]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (0, "length", vec![30])
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    // The scheduler gets the abort for the choice the servicer ended, and
+    // only that one.
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r8-1".to_string()]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A stop string that is one token (`world` is mock token 2) also reaches
 /// the scheduler as a stop id, so it finishes on the tick the string
 /// matches; the choice ends with the scheduler's own `Complete`.
@@ -1135,6 +1197,70 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         })
         .await
         .expect("abort of an unknown id");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("r7", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r7-1", vec![21], 1, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![21]
+    );
+
+    let response = h
+        .client
+        .abort(ts::AbortRequest {
+            request_id: "r7".to_string(),
+            reason: "test".to_string(),
+        })
+        .await
+        .expect("abort")
+        .into_inner();
+    assert!(response.success);
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.index,
+                done.finish_reason.clone(),
+                done.output_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -1654,11 +1780,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .expect("subscribe")
         .into_inner();
     for expected in [0, 1] {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -1698,11 +1820,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .expect("subscribe")
         .into_inner();
     for expected in 0..=3 {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -1909,11 +2027,7 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
         .into_inner();
     let mut seen = Vec::new();
     for _ in 0..2 {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         seen.push((batch.dp_rank, batch.sequence_number));
     }
     seen.sort_unstable();
@@ -1927,11 +2041,7 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
         .send(golden::frame(b"kv", 1, &batch2))
         .await
         .expect("publish");
-    let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-        .await
-        .expect("a batch in time")
-        .expect("stream open")
-        .expect("a batch");
+    let batch = next_batch(&mut stream).await;
     assert_eq!((batch.dp_rank, batch.sequence_number), (Some(1), 1));
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
@@ -2244,6 +2354,178 @@ async fn a_qwen35_image_request_carries_the_position_table_the_engine_would_comp
     assert_eq!(status.code(), Code::InvalidArgument);
     assert!(
         status.message().contains("did not provide"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A Qwen3-Omni checkpoint's mixed request (an audio run, an image, a video
+/// timed at one second per grid, the items out of order) reaches the
+/// scheduler with the table the engine's own Omni rule writes, computed from
+/// the launcher's thinker facts; the same checkpoint without its merge size
+/// refuses the items before the scheduler, naming the fact.
+#[tokio::test]
+async fn a_qwen3_omni_request_carries_the_position_table_the_engine_would_compute() {
+    let omni = TokenSpeedModelInfo {
+        model_type: "qwen3_omni_moe".to_string(),
+        architectures: vec!["Qwen3OmniMoeForConditionalGeneration".to_string()],
+        mrope_positions: Some(true),
+        spatial_merge_size: Some(2),
+        position_id_per_seconds: Some(13.0),
+        seconds_per_chunk: Some(2.0),
+        supports_vision: true,
+        supports_multimodal: true,
+        supported_modalities: vec![1, 2, 3],
+        ..model_info()
+    };
+    let tensor = |dtype: &str, shape: Vec<u32>, bytes: Vec<u8>| ts::TensorData {
+        shape,
+        dtype: dtype.to_string(),
+        payload: Some(ts::tensor_data::Payload::Inline(bytes.into())),
+    };
+    let grid = |rows: [i64; 3]| {
+        tensor(
+            "int64",
+            vec![1, 3],
+            rows.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+    };
+    let item = |modality: common::Modality,
+                hash: u64,
+                offset: u32,
+                length: u32,
+                tensors: Vec<(&str, ts::TensorData)>| ts::MultimodalItem {
+        modality: modality as i32,
+        content_hash: hash.to_le_bytes().to_vec(),
+        encoder_input: Some(tensor(
+            "bfloat16",
+            vec![length, 4],
+            vec![0u8; length as usize * 8],
+        )),
+        model_specific_tensors: tensors
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+        placeholders: vec![ts::PlaceholderRange { offset, length }],
+        placeholder_token_id: None,
+    };
+    let mixed_request = |id: &str| {
+        let mut request = generate_request(id, false, Vec::new());
+        request.tokenized.as_mut().unwrap().input_ids = (0..25).collect();
+        request.mm_inputs = Some(ts::MultimodalInputs {
+            items: vec![
+                item(
+                    common::Modality::Video,
+                    3,
+                    15,
+                    8,
+                    vec![
+                        ("video_grid_thw", grid([2, 4, 4])),
+                        (
+                            "video_second_per_grid",
+                            tensor("float32", vec![1], 1.0f32.to_le_bytes().to_vec()),
+                        ),
+                    ],
+                ),
+                item(common::Modality::Audio, 1, 2, 3, Vec::new()),
+                item(
+                    common::Modality::Image,
+                    2,
+                    8,
+                    4,
+                    vec![("image_grid_thw", grid([1, 4, 4]))],
+                ),
+            ],
+        });
+        request
+    };
+
+    let mut h = harness(omni.clone(), None).await;
+    let mut stream = h
+        .client
+        .generate(mixed_request("omni-1"))
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    let payload = decode_value(frames[1].as_ref()).unwrap();
+    let array = payload.as_array().expect("a positional array");
+    let mm = array[22].as_array().expect("multimodal inputs");
+    let raw_view = |value: &rmpv::Value| -> Vec<u8> {
+        match value {
+            rmpv::Value::Ext(_, bytes) => bytes.clone(),
+            other => panic!("expected the raw-view ext, got {other:?}"),
+        }
+    };
+    let table = mm[3].as_array().expect("the position table tuple");
+    assert_eq!(
+        table[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![3, 25]
+    );
+    let values: Vec<i64> = raw_view(&table[2])
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
+        .collect();
+    let (time, rest) = values.split_at(25);
+    let (height, width) = rest.split_at(25);
+    // The engine's own mixed case: text, the audio run linear, the image's
+    // 2x2 at 8, text from 10, the video's two steps 13 positions apart, text
+    // from 27, a delta of 4.
+    for axis in [time, height, width] {
+        assert_eq!(&axis[..8], &(0..8).collect::<Vec<i64>>()[..]);
+        assert_eq!(&axis[12..15], &[10, 11, 12]);
+        assert_eq!(&axis[23..], &[27, 28]);
+    }
+    assert_eq!(&time[8..12], &[8, 8, 8, 8]);
+    assert_eq!(&height[8..12], &[8, 8, 9, 9]);
+    assert_eq!(&width[8..12], &[8, 9, 8, 9]);
+    assert_eq!(&time[15..23], &[13, 13, 13, 13, 26, 26, 26, 26]);
+    assert_eq!(&height[15..23], &[13, 13, 14, 14, 13, 13, 14, 14]);
+    assert_eq!(&width[15..23], &[13, 14, 13, 14, 13, 14, 13, 14]);
+    let delta = mm[4].as_array().expect("the delta tuple");
+    assert_eq!(
+        i64::from_le_bytes(raw_view(&delta[2]).as_chunks::<8>().0[0]),
+        4
+    );
+    assert_eq!(mm[5].as_i64(), Some(4));
+    send(
+        &mut h.engine_out,
+        &batch("omni-1", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // The same checkpoint whose launcher found no merge size: refused before
+    // the scheduler, by the fact's name.
+    let without_merge = TokenSpeedModelInfo {
+        spatial_merge_size: None,
+        ..omni
+    };
+    let mut h = harness(without_merge, None).await;
+    let status = h
+        .client
+        .generate(mixed_request("omni-2"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("thinker_config.vision_config.spatial_merge_size"),
         "{}",
         status.message()
     );

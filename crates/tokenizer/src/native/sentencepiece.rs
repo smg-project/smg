@@ -1,11 +1,13 @@
 //! A sentencepiece-style vocabulary with byte fallback on the native encode
 //! path (Gemma, Llama 2 and their kin). Such a vocabulary has no `ByteLevel`
 //! stage: the spaces of the text become the word marker U+2581 (a `Replace`
-//! normalizer, or the `Metaspace` pre-tokenizer of the Llama class, which
-//! also prepends the marker by its scheme), the text between two added
-//! tokens is one word of the model, and the model's `merge_word` makes a
-//! symbol of each character the vocabulary has and of each byte (`<0xHH>`)
-//! of one it has not, then merges. This module gives that word pieces: a cut
+//! normalizer, alone or after a `Prepend` normalizer that puts the marker
+//! before every text between added tokens, or the `Metaspace`
+//! pre-tokenizer of the Llama class, which also prepends the marker by its
+//! scheme), the text between two added tokens is one word of the model,
+//! and the model's `merge_word` makes a symbol of each character the
+//! vocabulary has and of each byte (`<0xHH>`) of one it has not, then
+//! merges. This module gives that word pieces: a cut
 //! between two adjacent bytes that no vocabulary token holds adjacent can
 //! never be crossed by a merge (a merge's product is a vocabulary token, and
 //! it would hold the pair), so the pieces merge on their own to the ids of
@@ -25,7 +27,10 @@ use super::{
     merge::{ByteTokens, MergeTable},
     short_pieces::ShortPieceKey,
 };
-use crate::encode_path::Declined;
+use crate::{
+    encode_path::Declined,
+    word_cache::{entries_of, ReadBpe},
+};
 
 /// The word marker of a sentencepiece vocabulary.
 pub(super) const WORD_MARKER: char = '\u{2581}';
@@ -42,7 +47,8 @@ const BRIDGE_WORDS: usize = 256 * 256 / 64;
 pub(super) const MERGE_SCRATCH_SYMBOLS: usize = 4_096;
 
 /// Where the word marker is prepended: the `Metaspace` prepend scheme
-/// (`Never` for a `Replace` normalizer too, which prepends nothing).
+/// (`Never` for a `Replace` normalizer too, which prepends nothing), or
+/// the `Prepend` normalizer (`Every`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Marker {
     Never,
@@ -51,6 +57,11 @@ pub(super) enum Marker {
     First,
     /// Before every text between added tokens.
     Always,
+    /// Before every text between added tokens, one that starts with a space
+    /// or the marker too: the `Prepend` normalizer, which prepends to the
+    /// whole normalized text where `Metaspace` prepends only to one that
+    /// does not start with the marker.
+    Every,
 }
 
 /// The symbols a piece of a byte-fallback vocabulary starts from, where its
@@ -79,7 +90,17 @@ impl CharSymbols {
     /// stand in for (the table's own declines, with the `<0xHH>` spelling of
     /// the byte tokens), a token that spells a byte token inside it (a merge
     /// could then cross a cut).
-    pub(super) fn from_model(model: &ModelWrapper, marker: Marker) -> Result<Self, Declined> {
+    ///
+    /// `read` is what the file's one-pass read saw of the model: the merge
+    /// table takes the merges from it, and the entries are read by id when
+    /// it says the ids are the range of the vocabulary (else through the
+    /// vocabulary map, as without a read); `None` for a model built in
+    /// memory.
+    pub(super) fn from_model(
+        model: &ModelWrapper,
+        marker: Marker,
+        read: Option<&ReadBpe>,
+    ) -> Result<Self, Declined> {
         let ModelWrapper::BPE(bpe) = model else {
             return Err(Declined::from("the model is not BPE"));
         };
@@ -88,7 +109,7 @@ impl CharSymbols {
                 "a byte-fallback vocabulary with ignore_merges (the whole text is looked up)",
             ));
         }
-        let merges = MergeTable::from_model(model, ByteTokens::Hex)?;
+        let merges = MergeTable::from_model(model, ByteTokens::Hex, read)?;
         let mut symbols = Self {
             ascii: [NO_ID; 128],
             beyond: FxHashMap::default(),
@@ -96,8 +117,8 @@ impl CharSymbols {
             marker,
             merges,
         };
-        for (token, id) in bpe.get_vocab() {
-            symbols.read_token(&token, id)?;
+        for (id, token) in entries_of(bpe, read) {
+            symbols.read_token(token.as_ref(), id)?;
         }
         symbols.bridge_raw_text();
         Ok(symbols)
@@ -176,14 +197,22 @@ impl CharSymbols {
     }
 
     /// Whether the word marker goes before a text: one that starts a text
-    /// between added tokens (`starts_text`), under the `Always` scheme; the
-    /// one at the start of the input (`at_input_start`), under `First`.
+    /// between added tokens (`starts_text`), under the `Always` scheme and
+    /// the `Prepend` normalizer (`Every`); the one at the start of the
+    /// input (`at_input_start`), under `First`.
     pub(super) fn prepends(&self, starts_text: bool, at_input_start: bool) -> bool {
         match self.marker {
             Marker::Never => false,
-            Marker::Always => starts_text,
+            Marker::Always | Marker::Every => starts_text,
             Marker::First => at_input_start,
         }
+    }
+
+    /// Whether the marker goes before a text that already starts with a
+    /// space or the marker (the `Prepend` normalizer puts it there;
+    /// `Metaspace` does not).
+    pub(super) fn prepends_to_a_marked_text(&self) -> bool {
+        self.marker == Marker::Every
     }
 
     /// Whether no cut goes between the raw bytes `prev` and `cur` (see the

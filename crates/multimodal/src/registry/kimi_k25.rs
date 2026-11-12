@@ -4,7 +4,10 @@ use serde_json::Value;
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        layouts::grid_thws_patch_fields, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{processors::KimiK25Processor, PreProcessorConfig, VisionPreProcessor},
 };
@@ -19,12 +22,7 @@ pub(super) struct KimiK25VisionSpec;
 impl KimiK25VisionSpec {
     /// The repeated pad token (`<|media_pad|>`) — `media_placeholder_token_id` in config.
     fn pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["media_placeholder_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "media_placeholder_token_id".to_string(),
-            })
+        metadata.config_token_id("media_placeholder_token_id")
     }
 }
 
@@ -95,14 +93,7 @@ impl ModelProcessorSpec for KimiK25VisionSpec {
         // Kimi-K2.5 uses NaViT-style patchification:
         // encoder_input is [total_patches, patch_features], split by patches_per_image.
         // grid_thws is [num_images, 3] with (temporal, height, width) grid dimensions.
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("grid_thws".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-        ])
+        grid_thws_patch_fields()
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {

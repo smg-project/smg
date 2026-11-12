@@ -4,10 +4,11 @@ use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, responses::ResponsesRequest,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
 use crate::{
+    channel::Channel,
     request_fields::{
         body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
         OutputConstraint, PlainSampling,
@@ -16,7 +17,10 @@ use crate::{
 };
 
 // Include the generated protobuf code
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod proto {
     #![allow(
         clippy::all,
@@ -343,10 +347,7 @@ impl TrtllmServiceClient {
     ) -> Result<Option<proto::GuidedDecodingParams>, String> {
         // Collect non-tool constraint (response_format, ebnf, regex)
         let format = body_format(request, set_aside)?;
-        let mut guided = format.schema.map(|schema| proto::GuidedDecodingParams {
-            guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-            guide: schema,
-        });
+        let mut guided = Self::guide_of(format.format);
 
         if guided.is_none() {
             if let Some(ebnf) = format.ebnf {
@@ -602,6 +603,9 @@ impl TrtllmServiceClient {
                 ConstraintKind::JsonSchema => proto::guided_decoding_params::GuideType::JsonSchema,
                 ConstraintKind::Regex => proto::guided_decoding_params::GuideType::Regex,
                 ConstraintKind::Ebnf => proto::guided_decoding_params::GuideType::EbnfGrammar,
+                ConstraintKind::StructuralTag => {
+                    proto::guided_decoding_params::GuideType::StructuralTag
+                }
             };
             proto::GuidedDecodingParams {
                 guide_type: guide_type as i32,
@@ -654,42 +658,8 @@ fn refuse_logit_bias(bias: Option<&HashMap<String, f32>>) -> Result<(), String> 
 // Proto → protocol type conversions (load metrics)
 // ---------------------------------------------------------------------------
 
-/// A rank's poll figures, field for field (the message mirrors the vLLM
-/// service's); the measured input capacity stays absent when the servicer
-/// reports none.
-impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
-    fn from(load: proto::SchedulerLoad) -> Self {
-        Self {
-            dp_rank: load.dp_rank,
-            num_running_reqs: load.num_running_reqs,
-            num_waiting_reqs: load.num_waiting_reqs,
-            num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
-            num_total_reqs: load.num_total_reqs,
-            num_used_tokens: load.num_used_tokens,
-            max_total_num_tokens: load.max_total_num_tokens,
-            token_usage: load.token_usage,
-            gen_throughput: load.gen_throughput,
-            prefill_throughput: load.prefill_throughput,
-            cache_hit_rate: load.cache_hit_rate,
-            utilization: load.utilization,
-            max_running_requests: load.max_running_requests,
-            ..Default::default()
-        }
-    }
-}
-
-impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
-    fn from(resp: proto::GetLoadsResponse) -> Self {
-        Self {
-            timestamp: resp.timestamp,
-            version: resp.version,
-            dp_rank_count: resp.dp_rank_count,
-            loads: resp.loads.into_iter().map(Into::into).collect(),
-            aggregate: None,
-            sampled_at: None,
-        }
-    }
-}
+// The measured input capacity stays absent when the servicer reports none.
+crate::impl_rank_load_conversions!(proto);
 
 #[cfg(test)]
 mod tests {
@@ -720,7 +690,11 @@ mod tests {
         .expect("a completion request");
         let client = TrtllmServiceClient {
             client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+                Channel::unconnected(
+                    "http://127.0.0.1:1",
+                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
+                )
+                .expect("a channel to nowhere"),
             ),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
         };
@@ -1044,7 +1018,11 @@ mod tests {
         // runtime a channel needs): the builders dial nothing.
         let client = TrtllmServiceClient {
             client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+                Channel::unconnected(
+                    "http://127.0.0.1:1",
+                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
+                )
+                .expect("a channel to nowhere"),
             ),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
         };
@@ -1144,6 +1122,10 @@ mod tests {
             (
                 ConstraintKind::Ebnf,
                 proto::guided_decoding_params::GuideType::EbnfGrammar,
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                proto::guided_decoding_params::GuideType::StructuralTag,
             ),
         ] {
             assert_eq!(

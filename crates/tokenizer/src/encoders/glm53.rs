@@ -15,7 +15,10 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::truthy;
-use crate::chat_template::{self, ChatTemplateParams};
+use crate::{
+    chat_template::{self, ChatTemplateParams},
+    json_dumps,
+};
 
 /// The current official templates identify the supported renderer revision.
 /// Other templates retain MiniJinja; checkpoint metadata alone cannot identify 5.3.
@@ -146,7 +149,7 @@ fn tool_definition(tool: &Value) -> Result<String> {
         if out.len() > 1 {
             out.push_str(", ");
         }
-        let _ = write!(out, "\"{key}\": {}", json(value)?);
+        let _ = write!(out, "\"{key}\": {}", json_dumps::to_string(value));
     }
     out.push('}');
     Ok(out)
@@ -297,7 +300,7 @@ fn tool_call(out: &mut String, call: &Value) -> Result<()> {
         if let Some(value) = value.as_str() {
             out.push_str(value);
         } else {
-            out.push_str(&json(value)?);
+            out.push_str(&json_dumps::to_string(value));
         }
         out.push_str(ARG_VALUE_CLOSE);
     }
@@ -436,10 +439,6 @@ fn render_inner(
         out.push_str(THINK_OPEN);
     }
     Ok(out)
-}
-
-fn json(value: &Value) -> Result<String> {
-    chat_template::compact_python_json(value)
 }
 
 #[cfg(test)]
@@ -627,6 +626,55 @@ mod tests {
                     (actual, expected) => panic!("native={actual:?}, jinja={expected:?}"),
                 }
             }
+        }
+    }
+
+    /// A tool schema and a history call's non-string arguments render with
+    /// Python's `json.dumps` spacing, `", "` between items and `": "` after a
+    /// key, as the engine's template writes them. The corpus test above reads
+    /// the template as its oracle, and the template shares the formatter, so
+    /// the spelling is pinned here in bytes.
+    #[test]
+    fn tool_schemas_and_call_arguments_render_with_pythons_json_spacing() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                    },
+                    "required": ["city"]
+                }
+            }
+        })];
+        let messages = vec![
+            json!({"role": "user", "content": "Weather?"}),
+            json!({"role": "assistant", "tool_calls": [{
+                "id": "a",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": {"city": "Paris", "window": {"days": 2, "hours": [6, 18]}}
+                }
+            }]}),
+            json!({"role": "tool", "tool_call_id": "a", "content": "Sunny"}),
+        ];
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        for template in [Template::Text, Template::Flash] {
+            let out = render(&messages, params(), template).unwrap();
+            assert!(
+                out.0.contains(r#""enum": ["celsius", "fahrenheit"]"#)
+                    && out.0.contains(r#"{"days": 2, "hours": [6, 18]}"#),
+                "{template:?}: {}",
+                out.0
+            );
         }
     }
 }

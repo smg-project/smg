@@ -313,3 +313,95 @@ fn answers_health(mut stream: TcpStream) -> bool {
     let read = stream.read(&mut head).unwrap_or(0);
     head[..read].starts_with(b"HTTP/1.1 200")
 }
+
+/// A connection to `addr` with the tests' read timeout; `None` when the
+/// kernel refuses it.
+pub fn connect(addr: SocketAddr) -> Option<TcpStream> {
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    Some(stream)
+}
+
+/// What a keep-alive GET for `path` got back: the response (the head and the
+/// `Content-Length` body), the connection closed or reset before a byte of
+/// response arrived, or the read timing out with the connection still open
+/// (which is not a closure, and fails a case that expects one).
+#[derive(Debug)]
+pub enum Reply {
+    Answered(String),
+    Closed,
+    TimedOut,
+}
+
+/// One keep-alive `GET path` on `stream` (no `Connection: close`), and what
+/// it got back.
+pub fn keep_alive_get<S: Read + Write>(stream: &mut S, path: &str) -> Reply {
+    let _ = stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes());
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) if bytes.is_empty() => return Reply::Closed,
+            Err(e) if bytes.is_empty() => {
+                return match e.kind() {
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                        Reply::TimedOut
+                    }
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof => Reply::Closed,
+                    _ => panic!("reading the response: {e}"),
+                };
+            }
+            Ok(0) | Err(_) => break,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(head_end) = text.find("\r\n\r\n") {
+            let content_length: usize = text[..head_end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= head_end + 4 + content_length {
+                break;
+            }
+        }
+    }
+    Reply::Answered(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether a reply is a 200.
+pub fn answered_200(reply: Reply) -> bool {
+    matches!(reply, Reply::Answered(response) if response.starts_with("HTTP/1.1 200"))
+}
+
+/// A connection the gateway serves and keeps on `addr`: connected and answered
+/// 200 on `GET /health` within `within`, retried while the gateway refuses (a
+/// permit on its way back). The read answer proves the connection holds a
+/// permit, where a bare connect returns before the acceptor has admitted it.
+/// At the deadline the panic carries the gateway's log at `log`: a leaked
+/// permit shows as its refusal lines, which the retries alone would hide.
+pub fn served_connection(addr: SocketAddr, within: Duration, log: &Path) -> TcpStream {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(mut stream) = connect(addr) {
+            if answered_200(keep_alive_get(&mut stream, "/health")) {
+                return stream;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no connection on {addr} was served within {within:?}\n{}",
+            fs::read_to_string(log).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}

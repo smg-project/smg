@@ -7,7 +7,7 @@ use ndarray::Array2;
 
 use super::qwen_vl_base::pixel_norm;
 use crate::{
-    encoder_inputs::{EncoderInput, ModelSpecificValue, PixelNorm},
+    encoder_inputs::{EncoderDtype, EncoderInput, ModelSpecificValue, PixelNorm},
     types::{Modality, RgbFrameRef},
     vision::{
         preprocessor_config::PreProcessorConfig,
@@ -26,10 +26,6 @@ const MIN_IMAGE_TOKENS: usize = 16;
 const MAX_IMAGE_TOKENS: usize = 8000;
 /// The checkpoint's own video budget, in tokens.
 const MAX_VIDEO_TOKENS: usize = 240_000;
-/// The serving engine caps a clip at this many vision tokens (the
-/// checkpoint's own budget would starve its KV cache at startup profiling);
-/// images keep the checkpoint's budget.
-const VIDEO_TOKEN_CAP: usize = 30_000;
 
 #[derive(Clone, Copy)]
 struct Params {
@@ -128,10 +124,9 @@ impl Params {
                 Ok,
             )
         };
-        // Video budgets read video-named token keys first; without them a
-        // video processor config is budgeted the way the engine's own server
-        // budgets it, and an image config (the gateway's fallback for a video
-        // when there is none) keeps the checkpoint default: its image-scale
+        // Video budgets read video-named token keys first, then the video
+        // processor config's `max_image_tokens`. An image config used as a
+        // fallback keeps the checkpoint video default: its image-scale
         // `max_image_tokens` must not silently become a clip's volume cap.
         let (min_key, max_key, max_fallback) = if video {
             (
@@ -164,6 +159,36 @@ impl Params {
             mean: triple(&config.image_mean, PreProcessorConfig::CLIP_MEAN),
             std: triple(&config.image_std, PreProcessorConfig::CLIP_STD),
         })
+    }
+
+    /// The geometry the encode works on for `frames` frames of `height` x
+    /// `width`: the budget search's target when `do_resize` is on, the source
+    /// itself otherwise, refused as the encode refuses it (a zero side, a
+    /// canvas off the factor). The count and the encode take their canvas
+    /// from here, so they agree in both modes.
+    fn input_geometry(
+        self,
+        do_resize: bool,
+        frames: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<Geometry, TransformError> {
+        let geometry = if do_resize {
+            self.geometry(frames, height, width)?
+        } else {
+            if height == 0 || width == 0 {
+                return Err(shape("GLM dimensions must be positive"));
+            }
+            Geometry {
+                target: (height, width),
+                content: (height, width),
+            }
+        };
+        let (target_h, target_w) = geometry.target;
+        if !target_h.is_multiple_of(self.factor) || !target_w.is_multiple_of(self.factor) {
+            return Err(shape("GLM canvas is not aligned to the configured factor"));
+        }
+        Ok(geometry)
     }
 
     fn geometry(
@@ -241,11 +266,8 @@ impl Params {
     }
 }
 
-/// The clip budget the serving engine's own server applies to a video
-/// processor config (one naming its `video_processor_type`): the config's
-/// `max_image_tokens` under the serving cap, the checkpoint default when the
-/// key is absent. Any other config is not a video processor's and keeps the
-/// checkpoint default.
+/// A video processor config's `max_image_tokens`, or the checkpoint video
+/// default when the key is absent or an image config is used as a fallback.
 fn video_token_budget(config: &PreProcessorConfig) -> Result<usize, TransformError> {
     if !config.extra.contains_key("video_processor_type") {
         return Ok(MAX_VIDEO_TOKENS);
@@ -253,7 +275,7 @@ fn video_token_budget(config: &PreProcessorConfig) -> Result<usize, TransformErr
     if !config.extra.contains_key("max_image_tokens") {
         return Ok(MAX_VIDEO_TOKENS);
     }
-    Ok(extra_usize(config, "max_image_tokens", MAX_VIDEO_TOKENS)?.min(VIDEO_TOKEN_CAP))
+    extra_usize(config, "max_image_tokens", MAX_VIDEO_TOKENS)
 }
 
 /// The reference's fused rescale and normalize for these settings
@@ -372,6 +394,7 @@ fn prepare<'a, F: RgbSource>(
     Ok(Cow::Owned(canvas))
 }
 
+/// Pack resized RGB frames into merged patch rows with temporal padding.
 fn encode<F: RgbSource>(
     frames: &[F],
     budget_frames: usize,
@@ -384,22 +407,13 @@ fn encode<F: RgbSource>(
         return Err(shape("GLM video frames must have identical dimensions"));
     }
     let do_resize = pixels.do_resize;
-    let geometry = if do_resize {
-        params.geometry(
-            budget_frames,
-            source_size.1 as usize,
-            source_size.0 as usize,
-        )?
-    } else {
-        Geometry {
-            target: (source_size.1 as usize, source_size.0 as usize),
-            content: (source_size.1 as usize, source_size.0 as usize),
-        }
-    };
+    let geometry = params.input_geometry(
+        do_resize,
+        budget_frames,
+        source_size.1 as usize,
+        source_size.0 as usize,
+    )?;
     let (height, width) = geometry.target;
-    if !height.is_multiple_of(params.factor) || !width.is_multiple_of(params.factor) {
-        return Err(shape("GLM canvas is not aligned to the configured factor"));
-    }
     let (grid_h, grid_w) = (height / params.patch, width / params.patch);
     let grid_t = frames.len().div_ceil(params.temporal);
     let count = product(&[grid_t, grid_h, grid_w], "GLM patch count")?;
@@ -412,6 +426,10 @@ fn encode<F: RgbSource>(
     values
         .try_reserve_exact(expected)
         .map_err(|error| shape(format!("cannot reserve GLM patch output: {error}")))?;
+    // Write bounded row slices rather than growing the Vec for each pixel.
+    // This also lets the gather loop check the RGB row's bounds once.
+    values.resize(expected, 0);
+    let mut remaining = values.as_mut_slice();
     let norm = pixels.norm;
     let filter = pixels.filter;
     let merged_patch = params.merge * params.patch;
@@ -436,10 +454,13 @@ fn encode<F: RgbSource>(
                                     let row = (y0 + merge_h * params.patch + patch_y) * width
                                         + x0
                                         + merge_w * params.patch;
-                                    let mut source = row * 3 + channel;
-                                    for _ in 0..params.patch {
-                                        values.push(raw[source]);
-                                        source += 3;
+                                    let rgb = &raw[row * 3..(row + params.patch) * 3];
+                                    let (output, rest) = remaining.split_at_mut(params.patch);
+                                    remaining = rest;
+                                    for (output, pixel) in
+                                        output.iter_mut().zip(rgb.as_chunks::<3>().0)
+                                    {
+                                        *output = pixel[channel];
                                     }
                                 }
                             }
@@ -449,7 +470,7 @@ fn encode<F: RgbSource>(
             }
         }
     }
-    debug_assert_eq!(values.len(), expected);
+    debug_assert!(remaining.is_empty());
     Ok(Patches {
         values,
         norm,
@@ -581,6 +602,21 @@ impl Glm53FlashProcessor {
         })
     }
 
+    /// The same padded canvas used by encoding, without allocating pixels.
+    fn image_elements(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        let params = self.params_for(Modality::Image)?;
+        let geometry = params.input_geometry(
+            self.pixels.do_resize,
+            params.temporal,
+            height as usize,
+            width as usize,
+        )?;
+        product(
+            &[geometry.target.0, geometry.target.1, 3, params.temporal],
+            "GLM image tensor elements",
+        )
+    }
+
     /// The budgets for a call of `modality`: this processor's own, or the
     /// error for a call of the modality it was not built for.
     fn params_for(&self, modality: Modality) -> Result<Params, TransformError> {
@@ -596,6 +632,22 @@ impl Glm53FlashProcessor {
 }
 
 impl VisionPreProcessor for Glm53FlashProcessor {
+    /// Image geometry and normalization depend only on that image's config.
+    /// Video frames, in contrast, share a clip budget and temporal grouping.
+    fn supports_per_image_preprocessing(&self) -> bool {
+        self.modality == Modality::Image
+    }
+
+    /// Image BF16 rows and metadata can be split without sharing a clip budget.
+    fn supports_bf16_batch_cache(&self) -> bool {
+        self.supports_per_image_preprocessing()
+    }
+
+    /// Estimate the exact output size using the encoder's resize and padding rules.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.image_elements(width, height).ok()
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         PreProcessorConfig::CLIP_MEAN
     }
@@ -610,6 +662,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         true
     }
 
+    /// Pack independent images into one exactly reserved tensor in request order.
     fn preprocess(
         &self,
         images: &[&DynamicImage],
@@ -619,7 +672,17 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         }
         let params = self.params_for(Modality::Image)?;
         let norm = self.pixels.norm;
+        // Plan the complete batch once instead of reallocating and copying
+        // all earlier images whenever the growing output exhausts capacity.
+        let expected = images.iter().try_fold(0usize, |total, image| {
+            total
+                .checked_add(self.image_elements(image.width(), image.height())?)
+                .ok_or_else(|| shape("GLM image batch size overflow"))
+        })?;
         let mut values = Vec::new();
+        values
+            .try_reserve_exact(expected)
+            .map_err(|error| shape(format!("cannot reserve GLM image batch: {error}")))?;
         let mut grids = Vec::with_capacity(images.len() * 3);
         let mut counts = Vec::with_capacity(images.len());
         let mut tokens = Vec::with_capacity(images.len());
@@ -659,6 +722,25 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         .with_extra("patches_per_image", ModelSpecificValue::int_1d(counts)))
     }
 
+    /// The shared batch cache also reprocesses mixed hit/miss batches. Give
+    /// that path wire storage directly so it can retain the newly seen images.
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        if self.modality != Modality::Image || dtype != EncoderDtype::BFloat16 {
+            return None;
+        }
+        Some(self.preprocess(images).and_then(|mut output| {
+            let dimensions = output.encoder_input.shape().to_vec();
+            let bytes = output.encoder_input.into_bytes_as(dtype).map_err(shape)?;
+            output.encoder_input =
+                EncoderInput::wire(bytes, dtype, dimensions, self.pixels.norm).map_err(shape)?;
+            Ok(output)
+        }))
+    }
+
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
@@ -685,9 +767,17 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         )
     }
 
+    /// The tokens of one image, counted on the canvas the encode works on
+    /// (the budget search's target, or the source itself under
+    /// `do_resize: false`); the preprocessing error for a size it refuses.
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         let params = self.params_for(Modality::Image)?;
-        let geometry = params.geometry(params.temporal, height as usize, width as usize)?;
+        let geometry = params.input_geometry(
+            self.pixels.do_resize,
+            params.temporal,
+            height as usize,
+            width as usize,
+        )?;
         Ok(
             geometry.target.0 / params.patch * (geometry.target.1 / params.patch)
                 / (params.merge * params.merge),
@@ -708,6 +798,108 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
+    use crate::test_support::{hex, lcg_bytes};
+
+    /// Cached slices must be exactly the same pixels and metadata as a batch,
+    /// including different image sizes, repeated images and custom normalization.
+    #[test]
+    fn independent_images_and_size_estimates_match_the_batch() {
+        use std::collections::HashMap;
+
+        use crate::{EncoderDtype, FieldLayout};
+
+        let layouts = HashMap::from([
+            ("image_grid_thw".to_string(), FieldLayout::Batched),
+            ("patches_per_image".to_string(), FieldLayout::Batched),
+        ]);
+        let configs = [
+            PreProcessorConfig::default(),
+            PreProcessorConfig::from_json(
+                r#"{"max_image_tokens":32,"patch_expand_factor":2,"do_normalize":false}"#,
+            ).unwrap(),
+            PreProcessorConfig::from_json(
+                r#"{"do_resize":false,"temporal_patch_size":3,"image_mean":[0.1,0.2,0.3],"image_std":[0.2,0.4,0.8]}"#,
+            ).unwrap(),
+        ];
+        let images: Vec<DynamicImage> = [(56, 112), (280, 84), (112, 56)]
+            .into_iter()
+            .map(|(w, h)| {
+                RgbImage::from_fn(w, h, |x, y| {
+                    Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+                })
+                .into()
+            })
+            .collect();
+        let refs = [&images[2], &images[0], &images[1], &images[2]];
+        for config in configs {
+            let processor = Glm53FlashProcessor::from_config_for(&config, Modality::Image).unwrap();
+            assert!(processor.supports_per_image_preprocessing());
+            assert!(processor.supports_bf16_batch_cache());
+            let parts: Vec<_> = refs
+                .iter()
+                .map(|image| {
+                    let output = processor.preprocess(&[*image]).unwrap();
+                    assert_eq!(
+                        processor.image_input_elements(image.width(), image.height()),
+                        Some(output.encoder_input.len())
+                    );
+                    output
+                })
+                .collect();
+            let joined =
+                PreprocessedEncoderInputs::concat_refs(&parts.iter().collect::<Vec<_>>(), &layouts)
+                    .unwrap();
+            let batch = processor.preprocess(&refs).unwrap();
+            let wire = processor
+                .preprocess_wire(&refs, EncoderDtype::BFloat16)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                wire.encoder_input,
+                EncoderInput::Wire {
+                    dtype: EncoderDtype::BFloat16,
+                    ..
+                }
+            ));
+            assert_eq!(
+                wire.encoder_input.write_as(EncoderDtype::BFloat16),
+                batch.encoder_input.write_as(EncoderDtype::BFloat16)
+            );
+            assert_eq!(wire.encoder_input.shape(), batch.encoder_input.shape());
+            assert_eq!(wire.feature_token_counts, batch.feature_token_counts);
+            assert_eq!(wire.item_sizes, batch.item_sizes);
+            assert!(processor
+                .preprocess_wire(&refs, EncoderDtype::Float32)
+                .is_none());
+            assert_eq!(joined.encoder_input.shape(), batch.encoder_input.shape());
+            assert_eq!(joined.feature_token_counts, batch.feature_token_counts);
+            assert_eq!(joined.item_sizes, batch.item_sizes);
+            for dtype in [
+                EncoderDtype::Uint8,
+                EncoderDtype::Float32,
+                EncoderDtype::BFloat16,
+            ] {
+                assert_eq!(
+                    joined.encoder_input.write_as(dtype),
+                    batch.encoder_input.write_as(dtype)
+                );
+            }
+            for (key, value) in &batch.model_specific {
+                assert_eq!(
+                    format!("{:?}", joined.model_specific[key]),
+                    format!("{value:?}")
+                );
+            }
+            assert_eq!(processor.image_input_elements(0, 112), None);
+            let video = Glm53FlashProcessor::from_config_for(&config, Modality::Video).unwrap();
+            assert!(!video.supports_per_image_preprocessing());
+            assert!(!video.supports_bf16_batch_cache());
+            assert_eq!(video.image_input_elements(112, 112), None);
+            assert!(video
+                .preprocess_wire(&refs, EncoderDtype::BFloat16)
+                .is_none());
+        }
+    }
 
     fn config(max_tokens: usize) -> PreProcessorConfig {
         PreProcessorConfig::from_json(&format!(
@@ -770,20 +962,29 @@ mod tests {
         .unwrap()
     }
 
-    /// A clip is budgeted the way the engine's own server budgets it: the
-    /// checkpoint's 240,000-token video budget under the 30,000-token serving
-    /// cap, which fits 32 frames of 3416x2060 on a 952x1540 canvas (68x110
-    /// patches, 16 x 34 x 55 = 29,920 tokens), the engine's own numbers for
-    /// such a clip. An image config in the video's place keeps the checkpoint
-    /// default rather than its image-scale budget, and an explicit
-    /// `max_video_tokens` stands.
+    /// A video config keeps its checkpoint's token budget. An image config
+    /// used for video keeps the video default, and explicit video token
+    /// budgets take precedence.
     #[test]
-    fn video_budget_follows_the_engines_serving_cap() {
+    fn video_budget_respects_the_checkpoint_token_budget() {
         let ppt = 2 * 28 * 28;
         let params = Params::from_config(&video_config(), true).unwrap();
-        assert_eq!(params.max_pixels, VIDEO_TOKEN_CAP * ppt);
+        assert_eq!(params.max_pixels, MAX_VIDEO_TOKENS * ppt);
         assert_eq!(params.min_pixels, 16 * ppt);
-        assert_eq!(params.geometry(32, 2060, 3416).unwrap().target, (952, 1540));
+        assert_eq!(
+            params.geometry(32, 2060, 3416).unwrap().target,
+            (2072, 3416)
+        );
+
+        for (tokens, side) in [(14_400, 3360), (40_000, 5600)] {
+            let mut config = video_config();
+            config
+                .extra
+                .insert("max_image_tokens".into(), serde_json::json!(tokens));
+            let params = Params::from_config(&config, true).unwrap();
+            assert_eq!(params.max_pixels, tokens * ppt);
+            assert_eq!(params.geometry(2, 5600, 5600).unwrap().target, (side, side));
+        }
 
         let image_fallback = Params::from_config(&config(MAX_IMAGE_TOKENS), true).unwrap();
         assert_eq!(image_fallback.max_pixels, MAX_VIDEO_TOKENS * ppt);
@@ -1037,11 +1238,12 @@ mod tests {
         let mut no_resize = config(MAX_IMAGE_TOKENS);
         no_resize.do_resize = Some(false);
         let unaligned = DynamicImage::ImageRgb8(RgbImage::from_pixel(30, 30, Rgb([1, 2, 3])));
-        let err = Glm53FlashProcessor::from_config_for(&no_resize, Modality::Image)
-            .unwrap()
-            .preprocess(&[&unaligned])
-            .unwrap_err();
+        let no_resize = Glm53FlashProcessor::from_config_for(&no_resize, Modality::Image).unwrap();
+        let err = no_resize.preprocess(&[&unaligned]).unwrap_err();
         assert!(err.to_string().contains("not aligned"), "{err}");
+        // The size-only count takes the same source canvas as the encode.
+        assert_eq!(no_resize.calculate_num_tokens(56, 56).unwrap(), 4);
+        assert!(no_resize.calculate_num_tokens(30, 30).is_err());
     }
 
     #[test]
@@ -1086,18 +1288,6 @@ mod tests {
             digest: &'static str,
             // (index, Pillow's byte, the reference's byte) where the two kernels part.
             differing: &'static [(usize, u8, u8)],
-        }
-        fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
-            let mut state = seed;
-            (0..count)
-                .map(|_| {
-                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
-                    ((state >> 16) & 0xff) as u8
-                })
-                .collect()
-        }
-        fn hex(bytes: &[u8]) -> String {
-            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
 
         let cases = [

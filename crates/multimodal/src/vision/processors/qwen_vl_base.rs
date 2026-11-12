@@ -502,6 +502,15 @@ impl QwenVLProcessorBase {
         self.config.temporal_patch_size
     }
 
+    /// Number of elements in the resized RGB patch rows of one image.
+    pub(super) fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        let (height, width) = self.smart_resize(height as usize, width as usize).ok()?;
+        height
+            .checked_mul(width)?
+            .checked_mul(3)?
+            .checked_mul(self.temporal_patch_size())
+    }
+
     /// Divide a clip's temporal patch size by `timing`'s rate for its
     /// `video_second_per_grid`, rather than by the rate it was sampled at.
     pub fn with_video_timing(mut self, timing: QwenVideoTiming) -> Self {
@@ -2177,6 +2186,39 @@ mod tests {
             .collect()
     }
 
+    /// `frames` through the borrowed-RGB video path and through the dynamic
+    /// one: the two encoder inputs agree in shape and, bit for bit, in every
+    /// value (`what` names the case in the messages). Returns the two results
+    /// for what a test reads beyond that.
+    fn rgb_video_path_matches_dynamic(
+        processor: &QwenVLProcessorBase,
+        frames: &[DynamicImage],
+        what: &str,
+    ) -> (PreprocessedEncoderInputs, PreprocessedEncoderInputs) {
+        let rgb_frames = rgb_views(frames);
+        let dynamic = processor
+            .preprocess_video(frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
+        let rgb = processor
+            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
+        assert_eq!(
+            dynamic.encoder_input.shape(),
+            rgb.encoder_input.shape(),
+            "{what}: the encoder input shapes differ"
+        );
+        let dynamic_values = dynamic.encoder_input.flat_f32().into_owned();
+        let rgb_values = rgb.encoder_input.flat_f32().into_owned();
+        for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{what}: the RGB video path diverges at index {idx}: got {got}, want {want}"
+            );
+        }
+        (dynamic, rgb)
+    }
+
     fn create_sized_pattern_frame(w: u32, h: u32, seed: u8) -> DynamicImage {
         let mut image = RgbImage::new(w, h);
         for y in 0..h {
@@ -2371,29 +2413,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let rgb_frames = rgb_views(&frames);
-
-        let dynamic = processor
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-        let rgb = processor
-            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-
-        let a = dynamic.encoder_input.flat_f32().into_owned();
-        let b = rgb.encoder_input.flat_f32().into_owned();
-        assert_eq!(
-            a.len(),
-            b.len(),
-            "resized video encoder input length differs"
-        );
-        for (idx, (&got, &want)) in a.iter().zip(b.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "resized video path diverges at index {idx}: dynamic {got} vs rgb {want}"
-            );
-        }
+        rgb_video_path_matches_dynamic(&processor, &frames, "resized video");
     }
 
     #[test]
@@ -2421,25 +2441,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let rgb_frames = rgb_views(&frames);
-
-        let dynamic = processor
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-        let rgb = processor
-            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-
-        let a = dynamic.encoder_input.flat_f32().into_owned();
-        let b = rgb.encoder_input.flat_f32().into_owned();
-        assert_eq!(a.len(), b.len());
-        for (idx, (&got, &want)) in a.iter().zip(b.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "resized padded video path diverges at index {idx}: dynamic {got} vs rgb {want}"
-            );
-        }
+        rgb_video_path_matches_dynamic(&processor, &frames, "resized padded video");
     }
 
     #[test]
@@ -2628,34 +2630,13 @@ mod tests {
             create_pattern_frame(177),
         ];
 
-        let rgb_frames = rgb_views(&frames);
-
-        let dynamic_result = processor
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-        let rgb_result = processor
-            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-
-        assert_eq!(
-            dynamic_result.encoder_input.shape(),
-            rgb_result.encoder_input.shape()
-        );
+        let (dynamic_result, rgb_result) =
+            rgb_video_path_matches_dynamic(&processor, &frames, "video");
         let mut dynamic_keys = dynamic_result.model_specific.keys().collect::<Vec<_>>();
         let mut rgb_keys = rgb_result.model_specific.keys().collect::<Vec<_>>();
         dynamic_keys.sort();
         rgb_keys.sort();
         assert_eq!(dynamic_keys, rgb_keys);
-
-        let dynamic_values = dynamic_result.encoder_input.flat_f32().into_owned();
-        let rgb_values = rgb_result.encoder_input.flat_f32().into_owned();
-        for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "RGB video patch value differs at index {idx}: got {got}, want {want}"
-            );
-        }
     }
 
     #[test]
@@ -2672,28 +2653,7 @@ mod tests {
             create_sized_pattern_frame(280, 280, 101),
         ];
 
-        let rgb_frames = rgb_views(&frames);
-
-        let dynamic_result = processor
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-        let rgb_result = processor
-            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-
-        assert_eq!(
-            dynamic_result.encoder_input.shape(),
-            rgb_result.encoder_input.shape()
-        );
-        let dynamic_values = dynamic_result.encoder_input.flat_f32().into_owned();
-        let rgb_values = rgb_result.encoder_input.flat_f32().into_owned();
-        for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "parallel RGB video patch value differs at index {idx}: got {got}, want {want}"
-            );
-        }
+        rgb_video_path_matches_dynamic(&processor, &frames, "parallel-block video");
     }
 }
 

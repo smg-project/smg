@@ -652,3 +652,308 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
         }
     }
 }
+
+/// A completion budget the window could never hold is refused at the gateway
+/// on the direct ZMQ lane too, where no engine frontend sits behind the
+/// gateway to refuse it: `400 context_length_exceeded` naming the window,
+/// the budget and the field, before the engine is asked; a budget that fits
+/// is served.
+#[tokio::test]
+#[serial]
+async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
+    const WINDOW: u32 = 64;
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines(&fixture.handshake, 1);
+    let config = grpc_router_config()
+        .regular_mode(vec![])
+        .random_policy()
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .max_concurrent_requests(64)
+        .queue_timeout_secs(60)
+        .disable_retries()
+        .build_unchecked();
+    let worker = Arc::new(
+        BasicWorkerBuilder::new(fixture.worker_url.clone())
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Zmq)
+            .runtime_type(RuntimeType::Vllm)
+            .zmq_handshake_address(fixture.handshake.clone())
+            .zmq_request_timeout(Duration::from_secs(60))
+            .model(ModelCard::new(MODEL).with_context_length(WINDOW))
+            .health_config(health_checks_off())
+            .build(),
+    );
+    let router =
+        build_grpc_router(config, MODEL, vec![Arc::clone(&worker) as Arc<dyn Worker>]).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ZMQ handshake never completed against the mock engine"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let chat = |max_tokens: u32| -> openai_protocol::chat::ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello world"}],
+            "max_tokens": max_tokens,
+        }))
+        .expect("a chat request")
+    };
+
+    let response = router
+        .route_chat(None, &test_meta(), chat(WINDOW + 1), MODEL)
+        .await;
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+        .await
+        .expect("response body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("a json error");
+    assert_eq!(json["error"]["code"], "context_length_exceeded", "{json}");
+    let message = json["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains(&format!("{WINDOW} tokens"))
+            && message.contains(&format!("{} tokens for the completion", WINDOW + 1))
+            && message.contains("max_tokens"),
+        "the refusal names the window, the budget and the field: {message}"
+    );
+
+    let response = router
+        .route_chat(None, &test_meta(), chat(WINDOW), MODEL)
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+}
+
+/// Usage over the direct ZMQ lane, on every route: the prompt count is the
+/// number of ids the gateway sent when the engine's first output carries no
+/// prefill stats (an engine's silence is not a zero), and the engine's own
+/// count once it reports one. The engine is a raw mock EngineCore answering
+/// each request with one token and a stop, with the stats or without, and
+/// the ids it was sent are read off its inbound add.
+#[tokio::test]
+#[serial]
+async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_one() {
+    use std::collections::BTreeSet;
+
+    use engine_zmq_client::{
+        mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
+        protocol::vllm::{
+            output::{
+                EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
+            },
+            stats::PrefillStats,
+        },
+        EngineId,
+    };
+    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
+    use openai_protocol::{
+        chat::ChatCompletionRequest, completion::CompletionRequest, messages::CreateMessageRequest,
+        responses::ResponsesRequest,
+    };
+
+    let fixture = zmq_fixture();
+    let config = grpc_router_config()
+        .regular_mode(vec![])
+        .random_policy()
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .max_concurrent_requests(64)
+        .queue_timeout_secs(60)
+        .disable_retries()
+        .build_unchecked();
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let worker = Arc::new(
+        BasicWorkerBuilder::new(fixture.worker_url.clone())
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Zmq)
+            .runtime_type(RuntimeType::Vllm)
+            .zmq_handshake_address(fixture.handshake.clone())
+            .zmq_request_timeout(Duration::from_secs(60))
+            .model(ModelCard::new(MODEL))
+            .health_config(health_checks_off())
+            .build(),
+    );
+    let context = common::grpc_harness::grpc_test_context_with_tokenizer(config, MODEL, tokenizer);
+    let (engine, router) = tokio::join!(
+        connect_to_frontend(
+            &fixture.handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response(),
+        ),
+        async {
+            let context = context.await;
+            let router = common::grpc_harness::grpc_router(
+                &context,
+                vec![Arc::clone(&worker) as Arc<dyn Worker>],
+            )
+            .await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "ZMQ handshake never completed against the mock engine"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            router
+        },
+    );
+    let (mut input, mut output) = engine.expect("the mock engine connects").split();
+    // The engine's whole answer to a request: one token and the stop, the
+    // prefill stats as the case says.
+    let answer = |request_id: &str, reported: Option<u32>| {
+        EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: request_id.into(),
+                new_token_ids: vec![1],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                prefill_stats: reported.map(|num_prompt_tokens| PrefillStats {
+                    num_prompt_tokens,
+                    num_computed_tokens: num_prompt_tokens,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            finished_requests: Some(BTreeSet::from([request_id.to_string()])),
+            ..Default::default()
+        })
+    };
+    let meta = test_meta();
+    let user = "Hello world";
+    for route in [
+        "chat",
+        "chat stream",
+        "completions",
+        "messages",
+        "responses",
+        "generate",
+    ] {
+        for reported in [None, Some(5)] {
+            let stream = route == "chat stream";
+            let mut request = match route {
+                "chat" | "chat stream" => {
+                    let mut body = serde_json::json!({
+                        "model": MODEL,
+                        "messages": [{"role": "user", "content": user}],
+                        "max_tokens": 2,
+                        "stream": stream,
+                    });
+                    if stream {
+                        body["stream_options"] = serde_json::json!({"include_usage": true});
+                    }
+                    let body: ChatCompletionRequest =
+                        serde_json::from_value(body).expect("a chat request");
+                    router.route_chat(None, &meta, body, MODEL)
+                }
+                "completions" => {
+                    let body: CompletionRequest = serde_json::from_value(serde_json::json!({
+                        "model": MODEL,
+                        "prompt": user,
+                        "max_tokens": 2,
+                    }))
+                    .expect("a completion request");
+                    router.route_completion(None, &meta, body, MODEL)
+                }
+                "messages" => {
+                    let body: CreateMessageRequest = serde_json::from_value(serde_json::json!({
+                        "model": MODEL,
+                        "max_tokens": 2,
+                        "messages": [{"role": "user", "content": user}],
+                    }))
+                    .expect("a messages request");
+                    router.route_messages(None, &meta, body, MODEL)
+                }
+                "responses" => {
+                    let body: ResponsesRequest = serde_json::from_value(serde_json::json!({
+                        "model": MODEL,
+                        "input": user,
+                        "store": false,
+                        "max_output_tokens": 2,
+                    }))
+                    .expect("a responses request");
+                    router.route_responses(None, &meta, body, MODEL)
+                }
+                "generate" => {
+                    let body: GenerateRequest = serde_json::from_value(serde_json::json!({
+                        "model": MODEL,
+                        "text": user,
+                        "sampling_params": {"max_new_tokens": 2},
+                    }))
+                    .expect("a generate request");
+                    router.route_generate(None, &meta, body, MODEL)
+                }
+                other => panic!("no such route: {other}"),
+            };
+            // A streamed answer's response goes out once the request is at
+            // the engine, before the engine answers; a plain one only after.
+            let (inbound, early) = if stream {
+                let response = (&mut request).await;
+                (input.recv().await, Some(response))
+            } else {
+                let inbound = tokio::select! {
+                    inbound = input.recv() => inbound,
+                    response = &mut request => {
+                        let status = response.status();
+                        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                            .await
+                            .expect("response body");
+                        panic!(
+                            "{route}: answered before the engine saw it: {status} {}",
+                            String::from_utf8_lossy(&body)
+                        );
+                    }
+                };
+                (inbound, None)
+            };
+            let sent = match inbound.expect("the engine's next inbound") {
+                EngineInbound::Add(sent) => sent,
+                other => panic!("{route}: expected an add-request, got {other:?}"),
+            };
+            let sent_ids = sent.prompt_token_ids.as_ref().map_or(0, Vec::len);
+            assert!(sent_ids > 0, "{route}: the gateway sends the prompt's ids");
+            let expected = reported.map_or(sent_ids as u64, u64::from);
+            output
+                .send_outputs(&answer(&sent.request_id, reported))
+                .await
+                .expect("the answer is sent");
+            let response = match early {
+                Some(response) => response,
+                None => (&mut request).await,
+            };
+            assert_eq!(response.status(), http::StatusCode::OK, "{route}");
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("response body");
+            let text = String::from_utf8_lossy(&body);
+            let usage: serde_json::Value = if stream {
+                // The usage rides the last data chunk before `[DONE]`.
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                    .rfind(|chunk| !chunk["usage"].is_null())
+                    .unwrap_or_else(|| panic!("{route}: no usage chunk in {text}"))
+            } else {
+                serde_json::from_str(&text)
+                    .unwrap_or_else(|error| panic!("{route}: {error} in {text}"))
+            };
+            let prompt_tokens = [
+                "/usage/prompt_tokens",
+                "/usage/input_tokens",
+                "/meta_info/prompt_tokens",
+                "/0/meta_info/prompt_tokens",
+            ]
+            .iter()
+            .find_map(|pointer| usage.pointer(pointer))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("{route}: no prompt count in {usage}"));
+            assert_eq!(
+                prompt_tokens, expected,
+                "{route}, prefill stats {reported:?}: the usage's prompt count is the gateway's \
+                 {sent_ids} ids unless the engine reports its own"
+            );
+        }
+    }
+}

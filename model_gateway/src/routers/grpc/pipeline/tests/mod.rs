@@ -2477,6 +2477,35 @@ async fn wait_for_load_released(worker: &Arc<dyn Worker>, deadline: Instant) {
     }
 }
 
+/// Wait until the record under `id` reads "completed" (the background
+/// generation ran on after its client left), within ten seconds; then prove
+/// `scheduler` aborted nothing and `worker`'s load is back at 0.
+async fn background_generation_completes_unaborted(
+    ctx: &ResponsesContext,
+    id: &str,
+    scheduler: &GatedScheduler,
+    worker: &Arc<dyn Worker>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stored_status(ctx, id).await != "completed" {
+        assert!(
+            Instant::now() < deadline,
+            "the background response did not complete after its client left: {}",
+            stored_status(ctx, id).await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        scheduler
+            .aborted_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty(),
+        "a background generation is not aborted when its client leaves"
+    );
+    wait_for_load_released(worker, deadline).await;
+}
+
 /// Responses API over the gRPC regular path: the client leaves a
 /// foreground stream while the engine's generation wedged after its
 /// first token (read by the chat layer, whose body the Responses relay
@@ -2572,24 +2601,7 @@ async fn a_client_that_leaves_a_background_responses_stream_leaves_its_generatio
     drop(response);
     generation_end.store(true, Ordering::SeqCst);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while stored_status(&ctx, id).await != "completed" {
-        assert!(
-            Instant::now() < deadline,
-            "the background response did not complete after its client left: {}",
-            stored_status(&ctx, id).await
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        scheduler
-            .aborted_request_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty(),
-        "a background generation is not aborted when its client leaves"
-    );
-    wait_for_load_released(&worker, deadline).await;
+    background_generation_completes_unaborted(&ctx, id, &scheduler, &worker).await;
 }
 
 /// The id a streamed Responses body announces in its first frame
@@ -2852,24 +2864,7 @@ async fn a_client_that_leaves_a_background_harmony_responses_stream_leaves_its_g
 
     drop(response);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while stored_status(&ctx, id).await != "completed" {
-        assert!(
-            Instant::now() < deadline,
-            "the background response did not complete after its client left: {}",
-            stored_status(&ctx, id).await
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        scheduler
-            .aborted_request_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty(),
-        "a background generation is not aborted when its client leaves"
-    );
-    wait_for_load_released(&worker, deadline).await;
+    background_generation_completes_unaborted(&ctx, id, &scheduler, &worker).await;
 }
 
 /// gRPC PD path: the prefill side answers on its own and reports when its
@@ -3930,5 +3925,90 @@ async fn assert_aborted_and_released(scheduler: &GatedScheduler, worker: &Arc<dy
             "the worker's load never returned to zero"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Media the request got wrong as it sent it is refused under the media
+/// stage's own `invalid_multimodal_request`, a 400 with the connector's
+/// words, and nothing reaches the worker: a data URL that is not base64, one
+/// with no comma, one in the non-base64 form, a payload that is not an
+/// image, a URL that does not parse, a host the policy refuses, and a
+/// `max_long_side_pixel` out of range. Before, every one of these was a
+/// `media_fetch_failed` with nothing fetched.
+#[tokio::test]
+async fn deepseek_v41_media_refused_as_sent_answers_the_media_stages_code() {
+    let Some(dir) = deepseek_v41_model_dir().await else {
+        skip_no_tokenizer();
+        return;
+    };
+    let corn = format!("data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG));
+    let cases = [
+        (
+            "not base64",
+            serde_json::json!({"url": "data:image/png;base64,!!!"}),
+            "base64 decode error",
+        ),
+        (
+            "no comma",
+            serde_json::json!({"url": "data:image/png;base64"}),
+            "missing comma in data url",
+        ),
+        (
+            "not the base64 form",
+            serde_json::json!({"url": "data:image/svg+xml,<svg/>"}),
+            "only base64 encoded data URLs are supported",
+        ),
+        (
+            "not an image",
+            serde_json::json!({"url": "data:application/pdf;base64,JVBERi0xLjQK"}),
+            "image decode error",
+        ),
+        (
+            "not a URL",
+            serde_json::json!({"url": "not a url"}),
+            "invalid media URL",
+        ),
+        (
+            "a loopback host",
+            serde_json::json!({"url": "http://127.0.0.1:9/x.png"}),
+            "loopback",
+        ),
+        (
+            "a cap out of range",
+            serde_json::json!({"url": corn, "max_long_side_pixel": 0}),
+            "max_long_side_pixel",
+        ),
+    ];
+    for (name, image_url, words) in cases {
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": image_url}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            }),
+            true,
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON envelope");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(
+            body["error"]["code"], "invalid_multimodal_request",
+            "{name}: {body}"
+        );
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "{name}: {body}"
+        );
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(words), "{name}: {body}");
+        assert!(ids.is_empty(), "{name}: nothing reaches the worker");
     }
 }

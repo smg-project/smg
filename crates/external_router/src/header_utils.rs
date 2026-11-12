@@ -64,6 +64,33 @@ pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_routing_key_hint_named(headers, &HEADER_ROUTING_KEY)
 }
 
+/// Whether the request's `anthropic-beta` header names the beta `name` in
+/// its dated form, `name-YYYY-MM-DD`: the header may repeat, and each value
+/// may list several betas, comma separated. A longer beta name that begins
+/// with `name` is another beta, not this one.
+pub fn anthropic_beta_named(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|beta| beta.trim().strip_prefix(name).is_some_and(is_dated_suffix))
+}
+
+/// `-YYYY-MM-DD`, the date a public beta's name ends with: the shape alone,
+/// not the calendar.
+fn is_dated_suffix(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    bytes.len() == 11
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 0 || i == 5 || i == 8 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+}
+
 /// Declared size of the incoming raw body; pre-sizes reserialization buffers.
 pub fn content_length(headers: Option<&HeaderMap>) -> Option<usize> {
     headers?
@@ -419,6 +446,57 @@ mod tests {
     use rustls::crypto::ring;
 
     use super::*;
+
+    /// The beta is found in a repeated header and in a comma-separated list,
+    /// by its undated name; another beta or no header is not it.
+    #[test]
+    fn anthropic_beta_named_reads_repeated_and_listed_values() {
+        let mut headers = HeaderMap::new();
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        assert!(anthropic_beta_named(&headers, "interleaved-thinking"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static(
+                "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12",
+            ),
+        );
+        assert!(anthropic_beta_named(&headers, "message-threads"));
+        assert!(anthropic_beta_named(
+            &headers,
+            "fine-grained-tool-streaming"
+        ));
+        assert!(!anthropic_beta_named(&headers, "threads"));
+    }
+
+    /// The dated form alone is the beta: a longer beta name sharing the
+    /// prefix, the undated name, a malformed date and a date of the right
+    /// shape but the wrong length are not it.
+    #[test]
+    fn anthropic_beta_named_requires_the_dated_suffix() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("token-counting-2024-11-01, token-efficient-tools-2025-02-19"),
+        );
+        assert!(anthropic_beta_named(&headers, "token-counting"));
+        assert!(anthropic_beta_named(&headers, "token-efficient-tools"));
+        assert!(!anthropic_beta_named(&headers, "token"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("message-threads, message-threads-2026-8-12"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("message-threads-2026-08-1, message-threads-2026-08-123"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+    }
 
     #[test]
     fn preserve_response_headers_drops_smg_owned_error_code() {

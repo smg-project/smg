@@ -237,10 +237,15 @@ fn a_single_whole_wire_item_moves_its_own_bytes_into_the_payload() {
     match (&a.storage, &b.storage) {
         (TokenSpeedTensorStorage::Inline(x), TokenSpeedTensorStorage::Inline(y)) => {
             assert_eq!(
-                x, &wire_bytes,
+                x.as_slice(),
+                wire_bytes.as_slice(),
                 "the view-written item carries the wire's bytes"
             );
-            assert_eq!(y, &wire_bytes, "the moved item carries the wire's bytes");
+            assert_eq!(
+                y.as_slice(),
+                wire_bytes.as_slice(),
+                "the moved item carries the wire's bytes"
+            );
         }
         other => panic!("inline payloads expected, got {other:?}"),
     }
@@ -416,6 +421,62 @@ fn a_patched_item_may_span_a_wider_structural_range() {
     );
     let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
     assert_eq!(assembled.items[0].mm_placeholders, vec![(11, 2)]);
+}
+
+/// One image in a layout with structural tokens around its feature runs:
+/// four crops of 81 image tokens between their start and end tokens, a
+/// newline after the first row, then the view's 169 between its own. The
+/// runs are the reservation (493 of the 504 positions); `features` is the
+/// count the item claims for them.
+fn one_image_in_a_structural_layout(features: usize) -> PrecomputedMultimodalIntermediate {
+    let mut offset = 10;
+    let mut patches = Vec::new();
+    for crop in 0..4 {
+        patches.push(PlaceholderRange {
+            offset: offset + 1,
+            length: 81,
+        });
+        offset += 83 + usize::from(crop == 1);
+    }
+    patches.push(PlaceholderRange {
+        offset: offset + 1,
+        length: 169,
+    });
+    let mut intermediate = one_image_intermediate(504, patches);
+    intermediate.preprocessed.feature_token_counts = vec![features];
+    intermediate
+}
+
+/// The structural tokens of a layout are prompt text, not reserved
+/// positions: an item fits when its feature count is the runs' length, and a
+/// count that took the structural tokens for features never fits.
+#[test]
+fn a_layouts_structural_tokens_are_not_reserved_positions() {
+    let fits = one_image_in_a_structural_layout(493);
+    assert!(validate_precomputed_batch(&fits).is_ok());
+    // The wire that picks the feature positions out of the structural range
+    // is sent the whole range; the wires that take the runs as they are get
+    // exactly as many positions as the item has features.
+    assert_eq!(
+        placeholders_for_bindings(&fits.bindings, false).unwrap(),
+        vec![(10, 504)]
+    );
+    let runs = placeholders_for_bindings(&fits.bindings, true).unwrap();
+    assert_eq!(runs.len(), 5);
+    assert_eq!(
+        runs.iter()
+            .map(|&(_, length)| length as usize)
+            .sum::<usize>(),
+        493
+    );
+
+    let error = validate_precomputed_batch(&one_image_in_a_structural_layout(504))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("reserves 493 prompt positions for 504 encoder features"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1385,4 +1446,56 @@ fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
     let floats = assemble_vllm(intermediate([(32, 32), (48, 32)]), &normalizes_on_host)
         .expect("a worker that normalizes on host takes the floats");
     assert_eq!(floats.pixel_values_dtype, "bfloat16");
+}
+
+/// Selected SGLang workers receive their declared precision in every batch;
+/// unknown or absent labels retain float32 and integer metadata stays intact.
+#[test]
+fn sglang_assembly_honors_worker_dtype_for_all_batches() {
+    use crate::worker::BasicWorkerBuilder;
+
+    for (label, expected, width) in [
+        (None, "float32", 4),
+        (Some("bfloat16"), "bfloat16", 2),
+        (Some("float16"), "float16", 2),
+        (Some("float32"), "float32", 4),
+        (Some("uint8"), "float32", 4),
+        (Some("float64"), "float32", 4),
+        (Some(""), "float32", 4),
+    ] {
+        let mut builder =
+            BasicWorkerBuilder::new("http://sglang").runtime_type(RuntimeType::Sglang);
+        if let Some(dtype) = label {
+            builder = builder.label("multimodal_encoder_dtype", dtype);
+        }
+        let workers = WorkerSelection::Single {
+            worker: Arc::new(builder.build()),
+        };
+        let expected_image =
+            assemble_sglang_with_dtype(single_image_intermediate(), expected).unwrap();
+        let expected_video =
+            assemble_sglang_with_dtype(one_video_intermediate(2, 2), expected).unwrap();
+        let intermediate = MultimodalIntermediate::try_new(vec![
+            single_image_intermediate(),
+            one_video_intermediate(2, 2),
+        ])
+        .unwrap();
+        let MultimodalData::Sglang(data) =
+            assemble_sglang_data(intermediate, Some(&workers)).unwrap()
+        else {
+            panic!("SGLang data expected");
+        };
+        let (first, extra) = data.into_protos();
+        assert_eq!(extra.len(), 1);
+        for (batch, (reference, elements, grid)) in std::iter::once(first).chain(extra).zip([
+            (expected_image, 8, "patches_per_image"),
+            (expected_video, 4, "patches_per_video"),
+        ]) {
+            let pixels = batch.pixel_values.unwrap();
+            assert_eq!(pixels.dtype, expected);
+            assert_eq!(pixels.data.len(), elements * width);
+            assert_eq!(pixels.data.as_ref(), reference.pixel_values.as_slice());
+            assert_eq!(batch.model_specific_tensors[grid].dtype, "uint32");
+        }
+    }
 }

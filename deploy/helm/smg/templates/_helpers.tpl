@@ -141,8 +141,9 @@ the ConfigMap's key under /etc/smg/discovery, where the router pod mounts it.
 Admission config validation -- the values the gateway would refuse at
 start-up or ignore with a warning: the tenant rate limit enabled without its
 YAML (the gateway requires --tenant-rate-limit-config with the flag), and a
-scheduler ConfigMap without the scheduler enabled (--priority-scheduler-config
-is ignored without --priority-scheduler-enabled). Renders nothing.
+rate-limit or scheduler ConfigMap without its feature enabled (the gateway
+ignores --tenant-rate-limit-config and --priority-scheduler-config without
+their enabled flags). Renders nothing.
 */}}
 {{- define "smg.validateAdmission" -}}
 {{- if and .Values.router.tenantRateLimit.enabled (not .Values.router.tenantRateLimit.configMap.name) -}}
@@ -150,6 +151,9 @@ is ignored without --priority-scheduler-enabled). Renders nothing.
 {{- end -}}
 {{- if and .Values.router.priorityScheduler.configMap.name (not .Values.router.priorityScheduler.enabled) -}}
 {{- fail "router.priorityScheduler.configMap.name without router.priorityScheduler.enabled: the gateway ignores --priority-scheduler-config without --priority-scheduler-enabled" -}}
+{{- end -}}
+{{- if and .Values.router.tenantRateLimit.configMap.name (not .Values.router.tenantRateLimit.enabled) -}}
+{{- fail "router.tenantRateLimit.configMap.name without router.tenantRateLimit.enabled: the gateway ignores --tenant-rate-limit-config without --tenant-rate-limit-enabled" -}}
 {{- end -}}
 {{- end -}}
 
@@ -237,7 +241,26 @@ Called from the router Deployment template.
 - "0.0.0.0"
 - "--port"
 - {{ .Values.router.port | quote }}
+{{- /* The admin listener's values the gateway would refuse at start are
+     refused here: a host without the port, and a port another rendered
+     listener holds (the data and metrics ports; the mesh port when the
+     mesh is on). */}}
+{{- if and .Values.router.adminHost (not .Values.router.adminPort) -}}
+{{- fail "router.adminHost without router.adminPort: the gateway refuses --admin-host without --admin-port" -}}
+{{- end -}}
 {{- if .Values.router.adminPort }}
+{{- $admin := int .Values.router.adminPort -}}
+{{- $taken := "" -}}
+{{- if eq $admin (int .Values.router.port) -}}
+{{- $taken = "router.port" -}}
+{{- else if eq $admin (int .Values.router.metrics.port) -}}
+{{- $taken = "router.metrics.port" -}}
+{{- else if and .Values.router.mesh.enabled (eq $admin (int .Values.router.mesh.port)) -}}
+{{- $taken = "router.mesh.port" -}}
+{{- end -}}
+{{- if $taken -}}
+{{- fail (printf "router.adminPort %d equals %s: the gateway refuses two listeners on one port" $admin $taken) -}}
+{{- end }}
 - "--admin-port"
 - {{ .Values.router.adminPort | quote }}
 {{- with .Values.router.adminHost }}

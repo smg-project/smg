@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/lightseek/smg/go-grpc-sdk/internal/ffi"
+	"github.com/smg-project/smg/bindings/golang/internal/ffi"
 )
 
 // MultiClient is a client that distributes requests across multiple gRPC workers

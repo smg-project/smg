@@ -4,27 +4,22 @@
 //! on this wire, so string stops ride the request and the scheduler matches
 //! them itself; the servicer has no stop matcher of its own.
 
-use std::{
-    collections::BTreeMap,
-    ops::ControlFlow,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Instant,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use engine_zmq_adapter::{to_sglang_response, SglangGenerateStream};
-use futures::{Stream, StreamExt};
-use smg_grpc_client::{sglang_proto as sg, vllm_proto as vllm};
+use futures::StreamExt;
+use smg_grpc_client::{
+    media_identity::{self as media, sglang as contract},
+    sglang_proto as sg, vllm_proto as vllm,
+};
 use tonic::Status;
 
 use super::{hidden_states_cap, HiddenStatesCap, SglangModelInfo, State};
 use crate::{
+    choice::{Plain, Shape},
     load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe, Submission},
-    metrics::{complete_finish_reason, ChoiceMetrics},
-    requests::HeldTerminal,
     servicer::RequestOrigin,
-    stream::{poll_engine_item, Choice, Choices, RequestStream},
+    stream::{Choices, RequestStream},
     BoxStream,
 };
 
@@ -91,25 +86,24 @@ pub(super) async fn generate(
                 state.mm_hasher.as_ref(),
                 req.mm_inputs.as_mut(),
             ) {
-                if smg_grpc_client::sglang_media_identity::reusable_request(&original) {
+                if contract::reusable_request(&original) {
                     tokio::select! {
                         biased;
                         _ = &mut cancel => return Err(Status::cancelled("media identity request aborted")),
                         result = hasher.precompute_proto(mm, &req.request_id) => result?,
                     };
+                    let batch: &sg::MultimodalInputs = mm;
                     identity = sg::MediaIdentity {
-                        version: smg_grpc_client::sglang_media_identity::VERSION,
+                        version: contract::VERSION,
                         processor_key: key.to_string(),
-                        request_digest: smg_grpc_client::sglang_media_identity::request_digest(
-                            &original,
-                        ),
+                        request_digest: contract::request_digest(&original),
                         input_ids: req
                             .tokenized
                             .as_ref()
                             .map_or_else(Vec::new, |t| t.input_ids.clone()),
-                        mm_inputs: Some(smg_grpc_client::sglang_media_identity::pixel_less(mm)),
+                        mm_inputs: media::identity(batch),
                     };
-                    if smg_grpc_client::sglang_media_identity::validate(&identity, &original, key) {
+                    if contract::validate(&identity, &original, key) {
                         state.shared.metrics.media_identity("prepared");
                     } else {
                         identity = sg::MediaIdentity::default();
@@ -131,7 +125,7 @@ pub(super) async fn generate(
         .sampling_params
         .as_ref()
         .map_or((None, 1), |params| (params.max_new_tokens, params.n));
-    // A language-side worker hands a request's image references to the
+    // A language-side worker hands a request's media references to the
     // encoders before the submit (the dispatcher the lifecycle owner
     // supplied); every other worker refuses such a request there.
     let subs = client
@@ -190,14 +184,15 @@ pub(super) async fn generate(
             }
             RequestOrigin::HealthProbe => ChoiceLoad::uncounted(),
         };
-        choices.push(ChoiceStream {
-            request_id: Arc::clone(&request_id),
-            state: Arc::clone(state),
-            inner: Some(sub),
+        choices.push(Plain::new(
+            Arc::clone(state),
+            Arc::clone(&request_id),
+            sub,
             streaming,
-            metrics: metrics.choice(),
+            metrics.choice(),
             load,
-        });
+            SglangShape,
+        ));
     }
     let stream = RequestStream::new(choices, cancel, registration, metrics).holding(loads);
     Ok(Box::pin(
@@ -223,147 +218,26 @@ fn refuse_hidden_states_above_cap(model: &SglangModelInfo) -> Result<(), Status>
     }
 }
 
-/// One choice of a generate request: the ZMQ-mapped stream under the
-/// request's id.
-struct ChoiceStream {
-    /// The request's id, stamped on every response (the choices of an
-    /// `n > 1` fan-out ride under the parent's id, told apart by `index`).
-    request_id: Arc<str>,
-    /// `None` once this choice ended (terminal response yielded or error).
-    /// Dropping it before the engine's own terminal output aborts the
-    /// engine-side request.
-    inner: Option<SglangGenerateStream>,
-    /// Whether the client asked for incremental chunks. A non-streaming
-    /// request receives only the terminal `Complete`.
-    streaming: bool,
-    /// This choice's observation of the request's metrics.
-    metrics: ChoiceMetrics,
-    /// The servicer state, for the load tracker.
-    state: Arc<State>,
-    /// This choice's share of the load tracker's bookkeeping.
-    load: ChoiceLoad,
-}
+/// What this wire makes of a choice's items: the SGLang-proto response under
+/// the request's id, with the choice's reasoning-token count and selected
+/// scores read off the open engine stream, which the vLLM intermediate
+/// cannot carry.
+struct SglangShape;
 
-impl ChoiceStream {
-    /// The SGLang-proto response, including the choice's reasoning-token
-    /// count and selected scores, which the vLLM intermediate cannot carry.
-    fn convert(&self, response: vllm::GenerateResponse) -> sg::GenerateResponse {
-        match self.inner.as_ref() {
-            Some(inner) => inner.to_sglang_response(&self.request_id, response),
-            None => to_sglang_response(&self.request_id, response, 0),
-        }
-    }
-}
-
-impl Choice for ChoiceStream {
-    /// End this choice on an abort: the engine's parked `Complete` or a
-    /// synthesized `abort` one; `None` once it has already ended. Dropping the
-    /// engine stream aborts the engine side.
-    fn abort(&mut self) -> Option<sg::GenerateResponse> {
-        let complete = self.inner.as_mut()?.complete_aborted();
-        if let Some(reason) = complete_finish_reason(&complete) {
-            self.metrics.ended(reason);
-        }
-        let response = self.convert(complete);
-        self.inner = None;
-        Some(response)
-    }
-}
-
-impl HeldTerminal for ChoiceStream {
+impl Shape for SglangShape {
+    type Engine = SglangGenerateStream;
+    type State = State;
     type Response = sg::GenerateResponse;
 
-    /// The terminal this choice already holds, when the engine finished it on
-    /// the tick before the poll that would have yielded it (the parked
-    /// `Complete`). `None` for a choice still open, which is left as it is.
-    fn finished(&mut self) -> Option<sg::GenerateResponse> {
-        let inner = self.inner.as_mut()?;
-        if !inner.has_parked_complete() {
-            return None;
-        }
-        // `complete_aborted` yields the parked `Complete` when there is one.
-        let complete = inner.complete_aborted();
-        if let Some(reason) = complete_finish_reason(&complete) {
-            self.metrics.ended(reason);
-        }
-        let response = self.convert(complete);
-        self.inner = None;
-        Some(response)
-    }
-
-    /// Whether this choice is still open: neither ended nor holding its
-    /// terminal.
-    fn is_open(&self) -> bool {
-        self.inner.is_some()
-    }
-}
-
-type ChoiceItem = Result<sg::GenerateResponse, Status>;
-
-impl Stream for ChoiceStream {
-    type Item = ChoiceItem;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            let item = match poll_engine_item(&mut this.inner, &mut this.metrics, cx) {
-                ControlFlow::Continue(item) => item,
-                ControlFlow::Break(poll) => return poll,
-            };
-            let is_chunk = match item.response.as_ref() {
-                Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                    let tokens = u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX);
-                    // The metrics' clock read serves the load tracker too.
-                    let at = this
-                        .metrics
-                        .chunk(tokens, chunk.prompt_tokens, chunk.cached_tokens)
-                        .unwrap_or_else(Instant::now);
-                    let loads = &this.state.shared.loads;
-                    this.load.count_prompt(
-                        loads,
-                        &this.request_id,
-                        chunk.prompt_tokens,
-                        chunk.cached_tokens,
-                        at,
-                    );
-                    this.load.generated(loads, tokens, at);
-                    true
-                }
-                Some(vllm::generate_response::Response::Complete(complete)) => {
-                    this.load.count_prompt(
-                        &this.state.shared.loads,
-                        &this.request_id,
-                        complete.prompt_tokens,
-                        complete.cached_tokens,
-                        Instant::now(),
-                    );
-                    this.metrics.complete(
-                        &complete.finish_reason,
-                        complete.prompt_tokens,
-                        complete.cached_tokens,
-                    );
-                    false
-                }
-                _ => false,
-            };
-            if is_chunk && !this.streaming {
-                continue;
-            }
-            // The engine's own terminal `Complete` passes through as-is; the
-            // engine stream ends after it, and the choice is no longer open
-            // once the `Complete` is out (a shutdown landing before the next
-            // poll must not cut it; the engine stream has already seen the
-            // finish, so dropping it sends no abort). `convert` reads the
-            // engine stream, so it goes first.
-            let ended = matches!(
-                item.response,
-                Some(vllm::generate_response::Response::Complete(_))
-            );
-            let response = this.convert(item);
-            if ended {
-                this.inner = None;
-            }
-            return Poll::Ready(Some(Ok(response)));
+    fn convert(
+        &self,
+        request_id: &str,
+        engine: Option<&SglangGenerateStream>,
+        response: vllm::GenerateResponse,
+    ) -> sg::GenerateResponse {
+        match engine {
+            Some(inner) => inner.to_sglang_response(request_id, response),
+            None => to_sglang_response(request_id, response, 0),
         }
     }
 }

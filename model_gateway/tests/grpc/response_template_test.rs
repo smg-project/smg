@@ -34,7 +34,7 @@ use smg::{
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tower::ServiceExt;
-use tracing_subscriber::{layer::SubscriberExt, Layer};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 use super::{events, read, tokens};
 use crate::{common, scripted_tokenizer, scripted_worker};
@@ -592,6 +592,13 @@ fn json_lines(capture: &Capture) -> Vec<Value> {
 /// none on it.
 #[tokio::test]
 async fn a_streamed_outputs_reading_is_on_the_streams_end_line() {
+    // The process's default subscriber, so tracing reads a callsite's interest from a
+    // subscriber on every thread. It reads the interest once, at the callsite's first
+    // hit, and with this test's capture the one live dispatcher it asks the hitting
+    // thread's subscriber: a line another test's thread reached first was cached as
+    // never interesting, and the capture missed it for good (the access log's head
+    // line in a whole-binary run, while its start and end lines stayed).
+    let _ = tracing_subscriber::registry().try_init();
     for (output, outcome) in [(OUTPUT, None), (UNDECLARED_CALL, Some("unknown_tool"))] {
         let gateway = serve(Setup {
             output,
@@ -1321,4 +1328,110 @@ async fn the_selected_workers_policy_decides_and_what_no_grammar_holds_is_refuse
         }
     }
     assert!(wrong.is_empty(), "not refused as expected: {wrong:#?}");
+}
+
+/// A `structural_tag` response format is a grammar of the request's own: the table shapes nothing
+/// over it (no answer's tag, no `auto` tag over the tools under `always`, no whole turn from the
+/// first token), and the engine receives the client's object as its structural tag, key for key.
+#[tokio::test]
+async fn a_structural_tag_response_format_is_the_engines_constraint_as_sent() {
+    let tag = json!({
+        "type": "structural_tag",
+        "structures": [{
+            "begin": "<w>",
+            "schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "end": "</w>"
+        }],
+        "triggers": ["<w>"]
+    });
+    let sent_tag = |gateway: &Gateway| -> Value {
+        let (kind, text) = gateway.last_constraint().expect("the request's own tag");
+        assert_eq!(kind, "structural_tag");
+        serde_json::from_str(&text).expect("the tag as JSON")
+    };
+    // The registry table, requested and always: without and with tools.
+    for policy in [None, Some(ConstrainedDecoding::Always)] {
+        let gateway = serve(Setup {
+            constrained_decoding: policy,
+            ..Setup::default()
+        })
+        .await;
+        for extra in [
+            json!({"response_format": tag}),
+            json!({"tools": tools(), "response_format": tag}),
+        ] {
+            chat(&gateway, extra.clone()).await;
+            assert_eq!(sent_tag(&gateway), tag, "{policy:?} {extra}");
+        }
+    }
+    // A table whose calls spell a whole turn, on a worker that takes it from the first token.
+    let gateway = serve(Setup {
+        template: Some(turn_template()),
+        chat_template: false,
+        prompt_tail: "<|head|>assistant",
+        output: "<|via|>notes<|body|>plan<|stop|><|head|>assistant<|via|>reply<|body|>Hello<|eos|>",
+        eos: "<|eos|>",
+        constrained_decoding: Some(ConstrainedDecoding::Always),
+        labels: vec![("constrained_decoding_start", "first_token")],
+        ..Setup::default()
+    })
+    .await;
+    chat(&gateway, json!({"tools": tools(), "response_format": tag})).await;
+    assert_eq!(sent_tag(&gateway), tag);
+}
+
+/// A `structural_tag` response format beside a forced call under the legacy parsers (no table sets
+/// the format aside), on an engine whose builder lets the body's format outrank the forced call's
+/// grammar (TokenSpeed's, as TensorRT-LLM's and SGLang's; vLLM's lets the call win): every worker
+/// receives the client's tag, on the first attempt and on the retries alike, never the grammar the
+/// builder dropped. Each worker refuses its first `Generate`, so the request crosses to the other
+/// worker and back: three attempts.
+#[tokio::test]
+async fn a_retry_keeps_the_clients_structural_tag_over_the_forced_calls() {
+    let tag = json!({
+        "type": "structural_tag",
+        "structures": [{"begin": "<w>", "schema": {"type": "object"}, "end": "</w>"}],
+        "triggers": ["<w>"]
+    });
+    let gateway = serve_engines(
+        Setup {
+            template: None,
+            chat_template: false,
+            parser: ParserChoice::Legacy,
+            reasoning_parser: None,
+            tool_parser: Some("kimik2"),
+            round_robin: true,
+            ..Setup::default()
+        },
+        vec![
+            Engine {
+                labels: vec![],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+            Engine {
+                labels: vec![],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+        ],
+    )
+    .await;
+    chat(
+        &gateway,
+        json!({"tools": tools(), "tool_choice": "required", "response_format": tag}),
+    )
+    .await;
+    let received: Vec<Value> = gateway
+        .requests
+        .iter()
+        .flat_map(|log| {
+            let log = log.lock().expect("the worker's log");
+            log.iter().map(constraint_of).collect::<Vec<_>>()
+        })
+        .map(|constraint| {
+            let (kind, text) = constraint.expect("a constraint");
+            assert_eq!(kind, "structural_tag");
+            serde_json::from_str(&text).expect("the tag as JSON")
+        })
+        .collect();
+    assert_eq!(received, vec![tag.clone(), tag.clone(), tag]);
 }

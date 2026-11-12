@@ -360,10 +360,9 @@ struct EvictionEntry {
 
 impl Eq for EvictionEntry {}
 
-#[expect(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for EvictionEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.timestamp.cmp(&other.timestamp))
+        Some(self.cmp(other))
     }
 }
 
@@ -412,29 +411,58 @@ fn shared_prefix_len(a: &str, b: &str) -> (usize, usize) {
 }
 
 /// The bytes `a` and `b` share from the start. The span of the shorter run is
-/// compared as one slice first: on the tree's walks the input usually runs
-/// through a node's whole text, so one compare settles it. On a difference,
-/// the first unequal word of eight bytes names the byte by the lowest set bit
-/// of its xor (the lowest-addressed byte, read little-endian), and the bytes
-/// under one word at the end go one at a time: the count the byte-wise scan
-/// gave, for every pair.
+/// compared as one slice: on the tree's walks the input usually runs through
+/// a node's whole text, so one compare settles it, and only a difference goes
+/// on to `first_differing_byte`. The count is the one the byte-wise scan gave,
+/// for every pair.
 #[inline]
 fn common_byte_prefix(a: &[u8], b: &[u8]) -> usize {
-    const WORD: usize = 8;
     let len = a.len().min(b.len());
     let (a, b) = (&a[..len], &b[..len]);
     if a == b {
-        return len;
+        len
+    } else {
+        first_differing_byte(a, b)
     }
+}
+
+/// The index of the first differing byte of two runs of one length that are
+/// known to differ: the equal 32-byte chunks in front of it are skipped whole
+/// (32 bytes is the widest constant compare the compiler expands in line on
+/// the baseline target; a 64-byte chunk became a library call per chunk,
+/// measured), then the first unequal word of eight bytes names the byte by
+/// the lowest set bit of its xor (the lowest-addressed byte, read
+/// little-endian), and the bytes under one word at the end go one at a time.
+/// Out of line and cold: the walks' usual outcome, per node compared, never
+/// reaches it, and their hot paths stay as small as before (smaller: the word
+/// loop and the tail were inlined into every walk). Per operation, a prompt
+/// that departs from every cached text reaches it once, at the node it
+/// departs from: `#[cold]` keeps the locate step out of the walks' code, it
+/// does not say the step is rare per request.
+#[cold]
+#[inline(never)]
+fn first_differing_byte(a: &[u8], b: &[u8]) -> usize {
+    const CHUNK: usize = 32;
+    const WORD: usize = 8;
+    let (a_chunks, _) = a.as_chunks::<CHUNK>();
+    let (b_chunks, _) = b.as_chunks::<CHUNK>();
+    let start = a_chunks
+        .iter()
+        .zip(b_chunks)
+        .take_while(|(x, y)| x == y)
+        .count()
+        * CHUNK;
+    let (a, b) = (&a[start..], &b[start..]);
     let (a_words, a_tail) = a.as_chunks::<WORD>();
     let (b_words, b_tail) = b.as_chunks::<WORD>();
     for (i, (x, y)) in a_words.iter().zip(b_words).enumerate() {
         let differing = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
         if differing != 0 {
-            return i * WORD + differing.trailing_zeros() as usize / 8;
+            return start + i * WORD + differing.trailing_zeros() as usize / 8;
         }
     }
-    a_words.len() * WORD
+    start
+        + a_words.len() * WORD
         + a_tail
             .iter()
             .zip(b_tail)
@@ -686,7 +714,7 @@ impl Tree {
             Done,
             Continue {
                 next_prev: NodeRef,
-                advance_chars: usize,
+                advance_bytes: usize,
             },
         }
 
@@ -728,7 +756,8 @@ impl Tree {
                     let matched_node_text_str = matched_node_text.as_str();
 
                     // Use slice-based comparison - no allocation
-                    let shared_count = shared_prefix_count(remaining, matched_node_text_str);
+                    let (shared_count, shared_bytes) =
+                        shared_prefix_len(remaining, matched_node_text_str);
 
                     if shared_count < matched_node_text_count {
                         // Split the matched node
@@ -787,7 +816,7 @@ impl Tree {
 
                         InsertStep::Continue {
                             next_prev: new_node,
-                            advance_chars: shared_count,
+                            advance_bytes: shared_bytes,
                         }
                     } else {
                         // Full match - move to next node (intermediate - no timestamp update)
@@ -802,7 +831,7 @@ impl Tree {
 
                         InsertStep::Continue {
                             next_prev: matched_node,
-                            advance_chars: shared_count,
+                            advance_bytes: shared_bytes,
                         }
                     }
                 }
@@ -813,10 +842,10 @@ impl Tree {
                 InsertStep::Done => return, // New leaf created with timestamp, we're done
                 InsertStep::Continue {
                     next_prev,
-                    advance_chars,
+                    advance_bytes,
                 } => {
                     prev = next_prev;
-                    remaining = advance_by_chars(remaining, advance_chars);
+                    remaining = &remaining[advance_bytes..];
                 }
             }
         }
@@ -858,14 +887,15 @@ impl Tree {
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
+                let (shared_count, shared_bytes) =
+                    shared_prefix_len(remaining, matched_text_guard.as_str());
                 drop(matched_text_guard);
 
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
                     matched_chars += shared_count;
                     consumed_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
+                    remaining = &remaining[shared_bytes..];
                     prev = matched_node;
                 } else {
                     // Partial match - still use this node for tenant selection
@@ -1277,13 +1307,14 @@ impl Tree {
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
+                let (shared_count, shared_bytes) =
+                    shared_prefix_len(remaining, matched_text_guard.as_str());
                 drop(matched_text_guard);
 
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
                     matched_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
+                    remaining = &remaining[shared_bytes..];
                     prev = matched_node;
                 } else {
                     // Partial match - still use this node for timestamp update

@@ -9,11 +9,12 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, strict_schema_missing_additional_properties, validate_json_schema_shape,
-        validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function,
-        FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
-        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
-        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
+        default_true, json_type_name, strict_schema_missing_additional_properties,
+        validate_json_schema_shape, validate_stop, ChatLogProbs, ContextManagementEntry,
+        ConversationRef, Detail, Function, FunctionChoice, GenerationRequest, PromptCacheRetention,
+        PromptTokenUsageInfo, ResponsePrompt, StreamOptions, StringOrArray,
+        ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage,
+        UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -3072,6 +3073,9 @@ impl ResponseUsage {
             prompt_tokens_details: Some(PromptTokenUsageInfo {
                 cached_tokens: self.input_tokens_details.cached_tokens,
                 audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
             }),
         }
     }
@@ -4034,18 +4038,6 @@ fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// The JSON type name used in validation messages.
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
-}
-
 /// Normalize a SimpleInputMessage to a proper Message item
 ///
 /// This helper converts SimpleInputMessage (which can have flexible content)
@@ -4197,14 +4189,22 @@ fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
     }
 }
 
+/// A fresh id: `prefix`, an underscore and 50 lowercase hex digits (25 random
+/// bytes), written into one string sized for the whole id.
 pub fn generate_id(prefix: &str) -> String {
     use rand::Rng;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut rng = rand::rng();
-    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
     let mut bytes = [0u8; 25];
     rng.fill_bytes(&mut bytes);
-    let hex_string: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{prefix}_{hex_string}")
+    let mut id = String::with_capacity(prefix.len() + 1 + 2 * bytes.len());
+    id.push_str(prefix);
+    id.push('_');
+    for byte in bytes {
+        id.push(char::from(HEX[usize::from(byte >> 4)]));
+        id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    id
 }
 
 /// The Response object of `POST /v1/responses`.

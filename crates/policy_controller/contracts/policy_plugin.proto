@@ -1,0 +1,694 @@
+// smg.policy.v1: the policy controller's plugin contract and the view, decision
+// and lifecycle vocabulary it shares with policy_controller.proto. Every
+// message's in-process form is the engine crate's own type (view.rs,
+// decision.rs, lease.rs), field for field in the same order; a wire message
+// is the record without its host-only fields, which the comments name;
+// tests/contracts.rs holds the two together.
+//
+// Versioning: design appendix A (additive within v1, negotiated per stream,
+// the controller speaks N and N-1). A `oneof` case a reader does not know
+// decodes as unset: a Decision with no outcome is a deadline miss, a
+// PluginDecision answering none of its asked stages a decline. On the decide,
+// session, plugin and lifecycle wires no absolute instant crosses: budgets,
+// ages and vetoes are durations relative to the frame's receipt.
+// Widths: a `uint32` marked `u8` or `u16` holds a value of that width in the
+// record, and a reader refuses a larger one. A worker id is the 64-bit hash
+// of (registration key, incarnation), never a URL.
+
+syntax = "proto3";
+package smg.policy.v1;
+
+// --- Enumerations: zero means unspecified, so an absent field reads as such -
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_SINGLE = 1;
+  ROLE_PREFILL = 2;
+  ROLE_DECODE = 3;
+  ROLE_ENCODE = 4;
+}
+
+enum Phase {
+  PHASE_UNSPECIFIED = 0;
+  PHASE_SINGLE = 1;
+  PHASE_PREFILL = 2;
+  PHASE_DECODE = 3;
+  PHASE_ENCODE = 4;
+}
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_SINGLE = 1;
+  SIDE_PREFILL = 2;
+  SIDE_DECODE = 3;
+  SIDE_ENCODE = 4;
+}
+
+enum HashKind {
+  HASH_KIND_UNSPECIFIED = 0;
+  // Token blocks of the model's block size of record.
+  HASH_KIND_TOKEN = 1;
+  // Fixed character windows over the text, for a host without a tokenizer.
+  HASH_KIND_TEXT = 2;
+}
+
+enum SignalSource {
+  SIGNAL_SOURCE_UNSPECIFIED = 0;
+  SIGNAL_SOURCE_NONE = 1;
+  SIGNAL_SOURCE_EVENTS = 2;
+  SIGNAL_SOURCE_SCRAPE = 3;
+  SIGNAL_SOURCE_RELAY = 4;
+  // The poll a servicer falls back to when its stream stops.
+  SIGNAL_SOURCE_POLL = 5;
+}
+
+enum OverloadRegime {
+  OVERLOAD_REGIME_UNSPECIFIED = 0;
+  OVERLOAD_REGIME_NONE = 1;
+  OVERLOAD_REGIME_PARTIAL = 2;
+  OVERLOAD_REGIME_SATURATED = 3;
+}
+
+// Bits of `Candidate.health`: a bitmask, one byte per candidate on the wire.
+enum HealthFlag {
+  HEALTH_FLAG_UNSPECIFIED = 0;
+  HEALTH_FLAG_HEALTHY = 1;
+  HEALTH_FLAG_BREAKER_OPEN = 2;
+  HEALTH_FLAG_STALLED = 4;
+  HEALTH_FLAG_DRAINING = 8;
+  HEALTH_FLAG_OVERLOADED = 16;
+}
+
+// Bits of `Candidate.wire_modes` and `Constraints.wire_modes`.
+enum WireMode {
+  WIRE_MODE_UNSPECIFIED = 0;
+  WIRE_MODE_HTTP = 1;
+  WIRE_MODE_GRPC = 2;
+  WIRE_MODE_ZMQ = 4;
+}
+
+enum ShedReason {
+  SHED_REASON_UNSPECIFIED = 0;
+  SHED_REASON_SATURATED = 1;        // 503 worker_overload_protection_shed, Retry-After
+  SHED_REASON_FLOW_LIMIT = 2;       // 429, Retry-After: 2
+  SHED_REASON_NO_ENDPOINTS = 3;     // 503 no_available_workers, unless wait_allowed
+  SHED_REASON_POLICY_DECLINED = 4;  // 503 policy_declined, the stage in the trace
+  SHED_REASON_DEADLINE = 5;         // 503, the scheduler's queue timeout
+}
+
+enum LeaseKind {
+  LEASE_KIND_UNSPECIFIED = 0;
+  // Soft load accounting: released by Completed, Released, the dispatch TTL,
+  // or a load report sampled after the dispatch.
+  LEASE_KIND_CREDIT = 1;
+  // A prefill slot or a decode room: released only by Completed of its side,
+  // Released, or the stream rule.
+  LEASE_KIND_RESERVATION = 2;
+}
+
+// Who minted a lease (a fallback dispatch carries a gateway-minted one). The
+// id spaces are disjoint: a LOCAL id has bit 63 set and is unique for the
+// gateway's lifetime; a controller-minted id has it clear and is its minting
+// term in bits 32 to 62 over a per-term counter in the low 32. Bounds: terms
+// stay below 2^31, the counter starts at 1, and a leader whose counter would
+// pass 2^32 - 1 bumps its term before it mints again, so an id is never 0 and
+// never repeats across terms.
+enum LeaseOrigin {
+  LEASE_ORIGIN_UNSPECIFIED = 0;
+  LEASE_ORIGIN_CONTROLLER = 1;
+  LEASE_ORIGIN_LOCAL = 2;
+}
+
+// Which index scored the prefix affinity.
+enum AffinitySource {
+  AFFINITY_SOURCE_UNSPECIFIED = 0;
+  AFFINITY_SOURCE_NONE = 1;
+  AFFINITY_SOURCE_INDEX = 2;
+  AFFINITY_SOURCE_PREDICTOR = 3;
+  AFFINITY_SOURCE_MERGED = 4;
+}
+
+// Stages a plugin implements or is asked for, as bits.
+enum Stage {
+  STAGE_UNSPECIFIED = 0;
+  STAGE_FILTER = 1;
+  STAGE_SCORE = 2;
+  STAGE_PICK = 4;
+}
+
+// --- The view: RequestFacts, Candidate, LoadRow, Constraints, PoolFacts -----
+
+// A tenant or a session key: the gateway fills `plain`, a plugin receives
+// `hash` unless its exposure says `plain`, nothing under `none`. The hash is
+// 64-bit FNV-1a over the key's bytes (offset basis 0xcbf29ce484222325, prime
+// 0x100000001b3, a zero result mapped to 1), the lease and pin keys' form.
+message Identity {
+  oneof form {
+    fixed64 hash = 1;
+    string plain = 2;
+  }
+}
+
+// The engine load record's routing core, rounded to narrow fields by the
+// host; permille fields are the record's ratios times 1000.
+message LoadRow {
+  uint32 running = 1;
+  uint32 queued = 2;
+  // Token-work of the queue; 0 when the engine reports a depth alone.
+  uint32 waiting_uncached_tokens = 3;
+  uint32 kv_usage_permille = 4;  // u16
+  // The share of the KV cache the running requests hold.
+  uint32 active_kv_permille = 5;  // u16
+  uint32 live_rate = 6;  // tokens per second; 0 when unknown
+  uint32 resident_tokens = 7;
+  // Age of the sample at the decision; the instant itself is host-only.
+  uint32 report_age_ms = 8;
+  SignalSource source = 9;
+  uint32 max_running = 10;  // the admission window; 0 when unknown
+}
+
+// Media on the request; the counts are u16.
+message MediaCounts {
+  uint32 images = 1;
+  uint32 audio = 2;
+  uint32 video = 3;
+  uint32 bytes = 4;
+}
+
+// An allow-listed header: `name` is a zero-based position into the spec's
+// `view.headers` list (u8; at most 256 names; 0 is the first declared name,
+// unlike the one-based `zone`, `engine_kind` and `connector`).
+message Header {
+  uint32 name = 1;
+  string value = 2;
+}
+
+// One candidate row: a worker, or one DP rank of one. Positions are the
+// row's index in the list the decision was given; stage results and targets
+// name positions, leases and events name ids. Host-only: the row's position
+// in the host's slice and the sample instant of `load`.
+message Candidate {
+  fixed64 id = 1;
+  Role role = 2;
+  uint32 dp_rank = 3;  // u16
+  uint32 dp_size = 4;  // u16
+  uint32 health = 5;  // HealthFlag bits
+  uint32 wire_modes = 6;  // WireMode bits the worker serves
+  // One-based position into the spec's `view.engines` list; 0 unspecified.
+  uint32 engine_kind = 7;  // u16
+  // One-based position into `view.connectors`; 0 when none.
+  uint32 connector = 8;  // u16
+  // Requests the deciding host holds on the worker (the controller: leases).
+  uint32 in_flight = 9;
+  // Absent when the host has no report for the worker.
+  LoadRow load = 10;
+  // Prefix blocks of the request this worker holds, by the event index.
+  uint32 overlap_blocks = 11;
+  // The same by the sent-prefix predictor.
+  uint32 predicted_blocks = 12;
+  // The request's session key is pinned to this worker.
+  bool session_hit = 13;
+  uint32 session_in_flight = 14;  // u16; of the request's key
+  // A decode may pair with a prefill of the same class; 0 outside any pairing.
+  uint32 pair_class = 15;
+  // Host-supplied admission bit: the prefill capacity window has a slot.
+  bool has_capacity = 16;
+  // Host-supplied admission bit: the decode's running window has a room
+  // nobody waiting at its gate is in line for.
+  bool has_room = 17;
+  uint32 admitted_age_ms = 18;  // since admission to the pool
+  // Blocks the index learned about the worker since admission.
+  uint32 indexed_growth = 19;
+  // One-based position into `view.zones`; 0 when unzoned.
+  uint32 zone = 20;  // u16
+  // Bits over the spec's declared label list (at most 64; validation refuses
+  // a longer list).
+  fixed64 labels = 21;
+  // Encode-side compatibility for an encode-prefill-decode dispatch.
+  bool ec_compatible = 22;
+  bool vision = 23;  // takes images
+  // Reachable from one gateway only (a host-local wire).
+  bool host_local = 24;
+  uint32 active_sessions = 25;  // u16; keys with a request in flight
+  // The worker's stable identity for placement: the low 32 bits of its
+  // registration key's fingerprint, equal across one worker's handles and
+  // across gateway replicas (where `id` is per handle); 0 when none.
+  uint32 key = 26;  // u32
+}
+
+// One request as a decision sees it; the tenant and the session key travel
+// plain to the controller and projected to a plugin. Host-only: the clock.
+message RequestFacts {
+  // The resolved model id, after aliasing.
+  string model = 1;
+  // The cache namespace folded into the block-hash seed.
+  fixed64 namespace_seed = 2;
+  Identity tenant = 3;
+  // A signed band (system 200, interactive 100, default 0, bulk -100); 0
+  // without a scheduler; negative is sheddable.
+  sint32 priority = 4;
+  bool streaming = 5;
+  uint32 max_output_tokens = 6;
+  uint32 prompt_tokens = 7;  // the host's count or estimate
+  // Prefix block hashes, capped by `view.max_block_hashes`.
+  repeated fixed64 block_hashes = 8 [packed = true];
+  HashKind hash_kind = 9;
+  // The routing key as the host derives it.
+  Identity session_key = 10;
+  Phase phase = 11;
+  uint32 attempt = 12;  // u8; 0 for the first attempt
+  repeated fixed64 tried = 13 [packed = true];
+  // Time left for the decision, relative to the frame's receipt.
+  uint32 budget_micros = 14;
+  repeated Header headers = 15;  // allow-listed only
+  MediaCounts media = 16;
+  // The per-decision seed; the only randomness a stage or plugin gets.
+  fixed64 seed = 17;
+  // Wire-only, foreign hosts only (a front with text and no tokenizer): the
+  // controller hashes it into `block_hashes` before any stage sees the view;
+  // bounded by `view.max_prompt_text_bytes`, refused over it.
+  bytes prompt_text = 18;
+}
+
+// What only the deciding gateway knows now. Its standing vetoes are not here:
+// the controller applies them to that gateway's candidate rows before any stage
+// runs (there alone the vetoed worker reads breaker-open for a breaker veto,
+// stalled for a liveness veto).
+message Constraints {
+  // Ids this gateway just failed to connect to.
+  repeated fixed64 excluded = 1 [packed = true];
+  uint32 wire_modes = 2;  // WireMode bits the gateway speaks
+  // The overload veto does not apply to this decision.
+  bool overload_lifted = 3;
+  // At most this many candidates; absent for no hint, a present 0 a decision
+  // over no candidates.
+  optional uint32 subset_hint = 4;
+}
+
+message PoolFacts {
+  // Before any narrowing.
+  uint32 pool_size = 1;
+  uint64 membership_epoch = 2;
+  uint64 ring_epoch = 3;  // 0 without a ring
+  OverloadRegime regime = 4;
+  // The spec generation the decision runs under.
+  uint64 generation = 5;
+  // By zone position; empty for an unzoned fleet.
+  repeated ZoneCapacity zones = 6;
+}
+
+message ZoneCapacity {
+  // One-based as `Candidate.zone`; never 0.
+  uint32 zone = 1;  // u16
+  uint32 healthy = 2;
+  uint32 total = 3;
+}
+
+// --- The decision and the lease ---------------------------------------------
+
+// For a pair, `id` is the prefill and `pair` the decode; once Dispatched
+// { side: prefill } was sent an alternate may only change the decode. The
+// record's position is host-local.
+message Target {
+  fixed64 id = 1;
+  uint32 dp_rank = 2;  // u16
+  Pair pair = 3;
+}
+
+// The decode side of a pair; the rendezvous is the host's at dispatch.
+message Pair {
+  fixed64 decode_id = 1;
+  uint32 decode_dp_rank = 2;  // u16
+}
+
+message Pick {
+  // At most 4 (the record's MAX_TARGETS), best first.
+  repeated Target targets = 1;
+}
+
+message Shed {
+  ShedReason reason = 1;
+  // The filter, the picker or the pair plan's pre-pass that left nothing.
+  string emptied_by = 2;
+  uint32 retry_after_secs = 3;  // u16
+  // The binding's scale-from-zero budget lets the host hold the request.
+  bool wait_allowed = 4;
+}
+
+// Specified in v1; no built-in issues one before the admission step, and a
+// host that meets one refuses the request.
+message Queue {
+  fixed64 ticket = 1;
+  // Within the request's admission budget.
+  uint32 max_wait_micros = 2;
+}
+
+// One issued decision, or one side of a pair decision (two leases, distinct
+// lifetimes): the record's first seven fields in order, then three controller
+// facts; the record's issue instant and session verdict are host-only.
+message Lease {
+  // Bit 63 set on a gateway-minted (LOCAL) id, clear on a controller-minted
+  // one (LeaseOrigin, whose bounds keep it unique and never 0). On the plugin
+  // wire a re-minted fallback lease carries the controller's id with origin
+  // LOCAL.
+  fixed64 id = 1;
+  LeaseKind kind = 2;
+  // Single outside a pair.
+  Side side = 3;
+  // Which target of the pick this lease books.
+  uint32 target_index = 4;  // u8
+  uint64 generation = 5;
+  // Fingerprint of the session key, for the sticky cap; 0 when none.
+  fixed64 session_key = 6;
+  // Token-work booked on the target.
+  uint32 tokens = 7;
+  // The leader's term that minted the lease.
+  uint64 term = 8;
+  // Bounds decision to Dispatched; then Completed or the stream rule ends it.
+  uint32 dispatch_ttl_ms = 9;
+  LeaseOrigin origin = 10;
+}
+
+// Serves the routing trace header and Explain; positions into the generation's
+// spec. The record carries the first five fields (its `top` at most three
+// entries, each only `worker_id` and `score`); the observability contract
+// fills the rest, unset until then.
+message Trace {
+  // Zero-based position in the spec's profile names in ascending UTF-8 order.
+  uint32 profile = 1;  // u16
+  // Candidates left after the filters.
+  uint32 survivors = 2;
+  // Best first; at most 3 (the record's TRACE_TOP).
+  repeated Scored top = 3;
+  fixed64 seed = 4;
+  uint64 generation = 5;
+  // One-based position into the schema's `PlanName` order (`single`,
+  // `pd-pair`, `epd`), counted as `Candidate.engine_kind`, `connector` and
+  // `zone` are; 0 means not filled (the observability contract fills it),
+  // never the first plan.
+  uint32 plan = 6;
+  repeated FilterDrop drops = 7;
+  // One-based position into spec.rs's `PICKERS` (`best` first,
+  // `best-with-temperature` ninth, which the schema lists apart from the
+  // bare names); 0 means not filled, never the first picker.
+  uint32 picker = 8;
+  // The shadow profile's pick when one ran, 0 when none.
+  fixed64 shadow_pick = 9;
+  // The gateway's fallback profile decided.
+  bool fallback = 10;
+  AffinitySource affinity_source = 11;
+}
+
+message FilterDrop {
+  // Position in the profile's filter list.
+  uint32 stage = 1;
+  uint32 dropped = 2;
+}
+
+message Scored {
+  fixed64 worker_id = 1;
+  float score = 2;
+  // Per scorer, in the profile's scorer order.
+  repeated float contributions = 3 [packed = true];
+  // The rank the row scores: a rank is a candidate.
+  uint32 dp_rank = 4;
+}
+
+// The controller will not reach this decide in budget: the gateway decides
+// locally at once. Never a decision: no lease, no trace; never seen in the
+// embedded mode.
+message Busy {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_QUEUE_DEPTH = 1;
+    REASON_NO_CREDIT = 2;
+    REASON_BUDGET_GONE_ON_ARRIVAL = 3;
+    REASON_NOT_LEADER = 4;
+  }
+  Reason reason = 1;
+  uint32 retry_after_micros = 2;
+}
+
+// The leases it books, one outcome, the trace. The record is the outcome
+// enum with the trace inside each variant and no leases (the host mints the
+// lease at commit); the wire hoists the trace and carries the leases.
+message Decision {
+  repeated Lease leases = 1;
+  oneof outcome {
+    Pick pick = 2;
+    Shed shed = 3;
+    Queue queue = 4;
+  }
+  Trace trace = 5;
+}
+
+// --- The lifecycle, for Observe and the decision log ------------------------
+
+message Issued {
+  Decision decision = 1;
+  fixed64 decision_id = 2;
+}
+
+message Dispatched {
+  fixed64 lease_id = 1;
+  uint32 target_index = 2;  // u8
+  Side side = 3;
+  // Decision to dispatch on the host's clock; a load credit dates from here.
+  uint32 since_decision_micros = 4;
+}
+
+// The lease, then the record's `Outcome` in its order.
+message Completed {
+  fixed64 lease_id = 1;
+  Side side = 2;
+  fixed64 served = 3;
+  // The HTTP status or the gRPC code the request ended with.
+  uint32 status = 4;  // u16
+  // The transport outcome the health precedence reads.
+  enum Class {
+    CLASS_UNSPECIFIED = 0;
+    CLASS_OK = 1;
+    CLASS_CLIENT_ERROR = 2;
+    CLASS_SERVER_ERROR = 3;
+    CLASS_CONNECT_FAILED = 4;
+    CLASS_TIMEOUT = 5;
+    CLASS_CANCELLED = 6;
+  }
+  Class class = 5;
+  uint32 ttft_micros = 6;
+  uint32 tokens_in = 7;
+  uint32 tokens_out = 8;
+  uint32 duration_micros = 9;
+}
+
+message Released {
+  oneof what {
+    fixed64 lease_id = 1;
+    fixed64 ticket = 2;
+  }
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // The host gave up before dispatch.
+    REASON_ABANDONED = 1;
+    // A late decision arrived after a fallback dispatch.
+    REASON_LATE_DECISION = 2;
+    // The client went away.
+    REASON_CLIENT_GONE = 3;
+    // The commit refused every target (a removed worker, a lost room).
+    REASON_COMMIT_FAILED = 4;
+  }
+  Reason reason = 3;
+  // Unspecified releases every side; a pair's leases share an id, so name it.
+  Side side = 4;
+}
+
+message MembershipChange {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_ADDED = 1;
+    KIND_REMOVED = 2;
+    // The same registration key with a new incarnation.
+    KIND_REPLACED = 3;
+    KIND_RELABELLED = 4;
+    // The worker's data-parallel width changed.
+    KIND_RESIZED = 5;
+    // After a resync, `ids` lists every worker of every pool, never one pool.
+    KIND_SNAPSHOT = 6;
+  }
+  Kind kind = 1;
+  fixed64 worker_id = 2;
+  // The retiring id of a replacement.
+  fixed64 old_worker_id = 3;
+  repeated fixed64 ids = 4 [packed = true];
+}
+
+message Signal {
+  fixed64 worker_id = 1;
+  uint32 dp_rank = 2;  // u16
+  oneof kind {
+    LoadRow load = 3;
+    // HealthFlag bits after the transition.
+    uint32 health = 4;
+    // The worker's standing veto aggregated over every gateway: it stands
+    // while any gateway holds one, the micros are the longest remaining, 0
+    // only when none remains; the veto's end instant is host-only. The
+    // deciding gateway's own veto is applied before any stage runs: in that
+    // gateway's candidate rows alone the worker reads breaker-open (a breaker
+    // veto) or stalled (a liveness veto), so a plugin never needs this signal
+    // to honour it.
+    uint32 gateway_veto_micros = 5;
+  }
+}
+
+// One stream per plugin, every gateway's leases on it. A lease id here is
+// the controller's (bit 63 clear): a gateway-minted fallback id is re-minted
+// when the controller first learns the lease, its origin kept LOCAL.
+message LifecycleEvent {
+  // Monotonic per Observe stream.
+  uint64 seq = 1;
+  oneof event {
+    Issued issued = 2;
+    Dispatched dispatched = 3;
+    Completed completed = 4;
+    Released released = 5;
+    MembershipChange membership = 6;
+    Signal signal = 7;
+  }
+}
+
+// --- The user plugin over gRPC: one call per decision, pipelined per shard --
+
+// Transport: a Unix socket with a peer-credential check, or TCP under mTLS
+// with a server-name pin; both streams authenticate once at open; the
+// controller is the client.
+//
+// The first frame on a Decide stream.
+message PluginHello {
+  uint32 protocol_min = 1;
+  uint32 protocol_max = 2;
+  // `plugins[].name`.
+  string plugin = 3;
+  // `plugins[].config`, opaque to the controller.
+  bytes config = 4;
+  Exposure exposure = 5;
+  // Counter names the spec declared for this plugin, in id order.
+  repeated string counters = 6;
+  // Stage bits the controller will ask for.
+  uint32 stages = 7;
+  // Decisions the controller keeps in flight on this stream at most.
+  uint32 max_in_flight = 8;
+  uint64 generation = 9;
+}
+
+// What the plugin sees of identities and headers.
+message Exposure {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    MODE_NONE = 1;
+    MODE_HASH = 2;
+    MODE_PLAIN = 3;
+  }
+  Mode tenant = 1;
+  Mode session_key = 2;
+  // Positions into `view.headers` the plugin receives, numbered as Header.name.
+  repeated uint32 headers = 3 [packed = true];
+}
+
+message PluginHelloAck {
+  uint32 protocol = 1;
+  bool ok = 2;
+  // Why `init` failed; fails the apply.
+  string error = 3;
+  // Stage bits the plugin implements.
+  uint32 stages = 4;
+}
+
+// `scores_in` carries the native scorers' combined scores when the plugin is
+// asked for the pick alone; a row the filters dropped scores below zero. The
+// candidate list is bounded by `plugins[].max_candidates`.
+message PluginDecide {
+  fixed64 decision_id = 1;
+  RequestFacts request = 2;
+  repeated Candidate candidates = 3;
+  PoolFacts pool = 4;
+  uint32 stages = 5;
+  repeated float scores_in = 6 [packed = true];
+  uint32 budget_micros = 7;
+}
+
+message Decline {
+  uint32 stage = 1;
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_NOT_APPLICABLE = 1;
+    REASON_BUDGET = 2;
+    REASON_INTERNAL = 3;
+  }
+  Reason reason = 2;
+  string detail = 3;
+}
+
+// Validity rules (design appendix B): surviving positions unique and in
+// range, `scores` finite and one per candidate (the host clamps them to
+// [0, 1]), `pick` within the surviving set; a violation is a trap (fallback,
+// the breaker counts it), a `decline` the stage's fallback alone. Each asked
+// stage answers with its own field: `survivors` present and empty sheds,
+// never a fallback; `pick` unset after a PICK ask declines; a stage asked
+// for and left unanswered is declined.
+message PluginDecision {
+  fixed64 decision_id = 1;
+  Survivors survivors = 2;
+  repeated float scores = 3 [packed = true];
+  optional uint32 pick = 4;
+  Decline decline = 5;
+  // Counter increments by declared id, applied by the controller.
+  repeated CounterDelta counters = 6;
+}
+
+message CounterDelta {
+  uint32 id = 1;
+  uint64 by = 2;
+}
+
+// The surviving positions, any order; present when asked, empty when none.
+message Survivors {
+  repeated uint32 positions = 1 [packed = true];
+}
+
+message PluginRequest {
+  oneof request {
+    PluginHello hello = 1;
+    PluginDecide decide = 2;
+  }
+}
+
+// The hello first, as on Decide (a plugin that refuses its version ends the
+// stream with FAILED_PRECONDITION), then the events; one Ack at the end.
+message ObserveRequest {
+  oneof request {
+    PluginHello hello = 1;
+    LifecycleEvent event = 2;
+  }
+}
+
+message PluginResponse {
+  oneof response {
+    PluginHelloAck hello = 1;
+    PluginDecision decision = 2;
+  }
+}
+
+// What a client-streaming RPC answers at its end, and what StepDown answers.
+message Ack {
+  uint64 frames = 1;
+  uint64 accepted = 2;
+  string error = 3;
+}
+
+service PolicyPlugin {
+  // One bidirectional stream per controller shard, pipelined, ordered per
+  // decision id: view and stage set in; mask, scores and pick out.
+  rpc Decide(stream PluginRequest) returns (stream PluginResponse);
+  // A client stream answered once: the lifecycle of the ids the plugin saw.
+  rpc Observe(stream ObserveRequest) returns (Ack);
+}

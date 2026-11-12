@@ -53,6 +53,18 @@ pub(crate) fn request_body_too_large_response() -> Response {
     )
 }
 
+/// The refusal of a body whose client made no progress for the stall
+/// timeout, under [`REQUEST_BODY_STALLED`]: one code and one message for
+/// every framing (the buffered read here, the streamed read in the HTTP
+/// router).
+pub(crate) fn request_body_stalled_response(timeout_secs: u64) -> Response {
+    create_error(
+        StatusCode::REQUEST_TIMEOUT,
+        REQUEST_BODY_STALLED,
+        format!("No request body bytes arrived from the client for {timeout_secs} seconds"),
+    )
+}
+
 const READING: u8 = 0;
 const STALLED: u8 = 1;
 const TIMED_OUT: u8 = 2;
@@ -103,11 +115,7 @@ fn settled(timeouts: RequestBodyTimeouts, outcome: &AtomicU8, response: Response
                 timeout_secs,
                 "Request body stalled waiting on the client; ending the request"
             );
-            create_error(
-                StatusCode::REQUEST_TIMEOUT,
-                REQUEST_BODY_STALLED,
-                format!("No request body bytes arrived from the client for {timeout_secs} seconds"),
-            )
+            request_body_stalled_response(timeout_secs)
         }
         TIMED_OUT => {
             let timeout_secs = timeouts.total.as_secs();
@@ -230,9 +238,23 @@ struct TimedBody {
     stall: Option<Duration>,
     /// Armed on the first pending poll of a wait, cleared on progress.
     stall_timer: Option<Pin<Box<Sleep>>>,
-    deadline: Pin<Box<Sleep>>,
+    /// When the request timeout ends, read once at the wrap; the timer that
+    /// waits for it is built on the first poll that has to wait, as the stall
+    /// timer is: a body that arrives whole never waits, and a timer boxed at
+    /// the wrap was one allocation per request for nothing.
+    deadline_at: tokio::time::Instant,
+    deadline: Option<Pin<Box<Sleep>>>,
     outcome: Arc<AtomicU8>,
     ended: bool,
+}
+
+/// `now + total`, saturated to a far future when the sum does not fit an
+/// instant: a `request_timeout_secs` too large to hold (the "no timeout"
+/// idiom) is a deadline that never comes, as `tokio::time::sleep` treats it.
+fn deadline_from_now(total: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(total)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
 }
 
 impl TimedBody {
@@ -241,7 +263,8 @@ impl TimedBody {
             inner,
             stall: timeouts.stall,
             stall_timer: None,
-            deadline: Box::pin(tokio::time::sleep(timeouts.total)),
+            deadline_at: deadline_from_now(timeouts.total),
+            deadline: None,
             outcome,
             ended: false,
         }
@@ -282,7 +305,11 @@ impl http_body::Body for TimedBody {
                 return Poll::Ready(frame);
             }
         }
-        if this.deadline.as_mut().poll(cx).is_ready() {
+        let deadline_at = this.deadline_at;
+        let deadline = this
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline_at)));
+        if deadline.as_mut().poll(cx).is_ready() {
             return this.end(
                 TIMED_OUT,
                 "request body still incomplete at the request timeout",
@@ -427,6 +454,44 @@ mod tests {
             waited >= Duration::from_secs(20) && waited < Duration::from_secs(22),
             "ended after {waited:?}, expected the whole 20 s request timeout from this layer"
         );
+    }
+
+    /// The request timeout counts from the wrap, where this layer is
+    /// reached, not from the first read of the body: a handler that reads
+    /// late is cut at the timeout the wrap started.
+    #[tokio::test(start_paused = true)]
+    async fn the_request_timeout_counts_from_the_wrap_not_from_the_first_read() {
+        let wrapped_at = Instant::now();
+        let (request, outcome) = timed(
+            echo_request(trickle(usize::MAX, Duration::from_secs(1))),
+            timeouts(0, 5),
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let read = to_bytes(request.into_body(), usize::MAX).await;
+        assert!(read.is_err(), "the body ends with the timeout's error");
+        assert_eq!(outcome.load(Ordering::Acquire), TIMED_OUT);
+        let waited = wrapped_at.elapsed();
+        assert!(
+            waited >= Duration::from_secs(5) && waited < Duration::from_secs(6),
+            "cut {waited:?} after the wrap: the 5 s timeout counted from the wrap, not from the first read at 3 s"
+        );
+    }
+
+    /// A `request_timeout_secs` no instant can hold (the "no timeout" idiom;
+    /// validation rejects only zero) is a deadline that never comes, as the
+    /// replaced `sleep` saturated to, not an overflow at the wrap.
+    #[tokio::test(start_paused = true)]
+    async fn a_total_no_instant_can_hold_is_a_deadline_that_never_comes() {
+        let (request, outcome) = timed(
+            echo_request(trickle(3, Duration::from_secs(86_400 * 365))),
+            timeouts(0, u64::MAX),
+        );
+        let read = to_bytes(request.into_body(), usize::MAX).await;
+        assert_eq!(
+            read.expect("three frames a year apart arrive whole"),
+            Bytes::from_static(b"xxx")
+        );
+        assert_ne!(outcome.load(Ordering::Acquire), TIMED_OUT);
     }
 
     /// Progress inside the stall window resets the watchdog: a slow but

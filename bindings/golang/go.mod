@@ -1,4 +1,4 @@
-module github.com/lightseek/smg/go-grpc-sdk
+module github.com/smg-project/smg/bindings/golang
 
 go 1.24.0
 

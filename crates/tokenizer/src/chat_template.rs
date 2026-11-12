@@ -21,7 +21,7 @@ use chrono::{
 use minijinja::{
     machinery::{
         ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
-        parse, WhitespaceConfig,
+        parse, tokenize, Token, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
     value::{DynObject, Enumerator, Kwargs, Object, ObjectRepr, ValueKind},
@@ -105,7 +105,9 @@ pub enum ThinkingToggle {
 }
 
 /// Detect whether the chat template supports a thinking/reasoning toggle
-/// and what its default value is.
+/// and what its default value is. A `thinking` variable counts where the
+/// template's code reads it (`mentions_thinking_variable`), not where its
+/// prose prints the word.
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
     if template.contains("think_begin_token")
         && template.contains("no_think")
@@ -171,8 +173,13 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 /// thinking ...`, `thinking is ...`, `thinking == ...`, `set thinking ...`).
 /// The word must stand alone: `clear_thinking is defined` (GLM-5.3) or
 /// `thinking_mode`/`thinking_budget` name other variables, and a template
-/// that only reads those has no thinking switch.
+/// that only reads those has no thinking switch. Only the template's code
+/// is read (`jinja_code`): the MiniMax M3.1 template prints the prose
+/// "When thinking is enabled" from a string literal and branches on no
+/// variable, so it has no switch either.
 fn mentions_thinking_variable(template: &str) -> bool {
+    let code = jinja_code(template);
+    let template = code.as_str();
     template.match_indices("thinking").any(|(start, matched)| {
         let before = &template[..start];
         let after = &template[start + matched.len()..];
@@ -187,6 +194,35 @@ fn mentions_thinking_variable(template: &str) -> bool {
             || after.starts_with(" ==")
             || ((before.ends_with("if ") || before.ends_with("set ")) && after.starts_with(' '))
     })
+}
+
+/// The template's code with everything else blanked to spaces: the text the
+/// template prints (the data outside the blocks and inside a `{% raw %}`
+/// block) and the string literals; the comments never reach the lexer's
+/// tokens. Built from minijinja's own tokenizer, so a block ends where the
+/// lexer ends it (a nested dict literal's `}}` does not close a `{{ }}`
+/// block). A word of the result is a variable, a keyword or an operator the
+/// template evaluates; the words a template prints are not in it. A template
+/// the lexer refuses is read whole, as the detector read every template
+/// before this view.
+fn jinja_code(template: &str) -> String {
+    let mut code = vec![b' '; template.len()];
+    for item in tokenize(template, false, SyntaxConfig, WhitespaceConfig::default()) {
+        match item {
+            Ok((Token::TemplateData(_) | Token::Str(_) | Token::String(_), _)) => {}
+            Ok((_, span)) => {
+                let (start, end) = (span.start_offset as usize, span.end_offset as usize);
+                if let (Some(from), Some(to)) = (
+                    template.as_bytes().get(start..end),
+                    code.get_mut(start..end),
+                ) {
+                    to.copy_from_slice(from);
+                }
+            }
+            Err(_) => return template.to_string(),
+        }
+    }
+    String::from_utf8(code).unwrap_or_else(|_| template.to_string())
 }
 
 /// Detect the content format expected by a Jinja2 chat template
@@ -1138,7 +1174,7 @@ const TOJSON_BUFFER_BYTES: usize = 1024;
 /// JSON separator pair passed through HuggingFace's `tojson` filter. The
 /// defaults are the static bytes; only a `separators` argument owns its own.
 #[derive(Debug, Clone)]
-struct JsonSeparators {
+pub(crate) struct JsonSeparators {
     item: Cow<'static, [u8]>,
     key: Cow<'static, [u8]>,
 }
@@ -1147,7 +1183,7 @@ impl JsonSeparators {
     /// Python's defaults: `(', ', ': ')` for compact output and `(',', ': ')`
     /// when an indent was given (`pretty`), whatever the indent is: an empty
     /// one still puts every item on its own line.
-    fn python_default(pretty: bool) -> Self {
+    pub(crate) fn python_default(pretty: bool) -> Self {
         let item: &'static [u8] = if pretty { b"," } else { b", " };
         Self {
             item: Cow::Borrowed(item),
@@ -1178,6 +1214,29 @@ impl<'a> PythonJsonFormatter<'a> {
             indent,
             separators,
             ensure_ascii,
+        }
+    }
+
+    /// One more array item or object key: with an indent, a line break after
+    /// the item separator (none before the first item) and the indentation;
+    /// without one, the item separator before every item but the first.
+    /// Python's `json.dumps` begins the two the same way.
+    fn begin_item<W>(&self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if let Some(indent) = self.indent {
+            if first {
+                writer.write_all(b"\n")?;
+            } else {
+                writer.write_all(&self.separators.item)?;
+                writer.write_all(b"\n")?;
+            }
+            write_indent(writer, self.current_indent, indent)
+        } else if first {
+            Ok(())
+        } else {
+            writer.write_all(&self.separators.item)
         }
     }
 }
@@ -1266,19 +1325,7 @@ impl Formatter for PythonJsonFormatter<'_> {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent {
-            if first {
-                writer.write_all(b"\n")?;
-            } else {
-                writer.write_all(&self.separators.item)?;
-                writer.write_all(b"\n")?;
-            }
-            write_indent(writer, self.current_indent, indent)
-        } else if first {
-            Ok(())
-        } else {
-            writer.write_all(&self.separators.item)
-        }
+        self.begin_item(writer, first)
     }
 
     fn end_array_value<W>(&mut self, _writer: &mut W) -> io::Result<()>
@@ -1318,19 +1365,7 @@ impl Formatter for PythonJsonFormatter<'_> {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent {
-            if first {
-                writer.write_all(b"\n")?;
-            } else {
-                writer.write_all(&self.separators.item)?;
-                writer.write_all(b"\n")?;
-            }
-            write_indent(writer, self.current_indent, indent)
-        } else if first {
-            Ok(())
-        } else {
-            writer.write_all(&self.separators.item)
-        }
+        self.begin_item(writer, first)
     }
 
     fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
@@ -1423,7 +1458,10 @@ fn parse_separators(
     })
 }
 
-fn serialize_with_python_json<T: Serialize>(
+/// Python's `json.dumps` of `value` through the formatter the `tojson` filter
+/// and the prompt encoders share: `indent`, `separators` and `ensure_ascii` as
+/// the filter reads them.
+pub(crate) fn serialize_with_python_json<T: Serialize>(
     value: &T,
     indent: Option<&[u8]>,
     separators: JsonSeparators,
@@ -1446,12 +1484,6 @@ fn serialize_with_python_json<T: Serialize>(
             format!("Invalid UTF-8 in JSON output: {e}"),
         )
     })
-}
-
-/// Compact JSON spelling shared by the Jinja filter and native renderers.
-pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
-    serialize_with_python_json(value, None, JsonSeparators::python_default(false), false)
-        .map_err(Into::into)
 }
 
 /// Whether a filter call passed no keyword argument at all. `Kwargs::args`
@@ -2514,9 +2546,14 @@ fn render_messages<'a>(
         .map_err(|e| anyhow!("Failed to get template: {e}"))?;
 
     // transformers adds `strftime_now` to the template environment; here it is
-    // a callable of the render context, bound to the render's instant.
-    let now = params.now.unwrap_or_else(render_instant);
-    let strftime_now = Value::from_function(move |format: String| strftime(&now, &format));
+    // a callable of the render context, bound to the render's instant. The
+    // instant is read when the template first writes it: a template that never
+    // calls `strftime_now` costs its render no wall-clock read, and one that
+    // calls it twice writes one instant.
+    let instant = params.now.map_or_else(OnceLock::new, OnceLock::from);
+    let strftime_now = Value::from_function(move |format: String| {
+        strftime(instant.get_or_init(render_instant), &format)
+    });
 
     // Convert messages to minijinja::Value (messages already processed by router)
     let minijinja_messages: Vec<Value> = messages.map(Value::from_serialize).collect();

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,7 +10,10 @@ use smg::{config::RouterConfig, routers::RouterFactory};
 use tower::ServiceExt;
 
 use crate::common::{
-    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    mock_worker::{
+        set_request_recorder, HealthStatus, MockWorker, MockWorkerConfig, RequestRecorder,
+        WorkerType,
+    },
     AppTestContext,
 };
 
@@ -294,6 +299,86 @@ mod generation_tests {
         ctx.shutdown().await;
     }
 
+    /// The route reads its body through the gateway's validated extractor, as
+    /// the chat route does: a negative temperature, a `top_p` above one, an
+    /// `n` of zero, an empty `input_ids` and a negative token id in it are
+    /// refused in the error envelope with the chat route's codes before a
+    /// worker sees them, and a body within the rules is served.
+    #[tokio::test]
+    async fn generate_refuses_the_sampling_values_the_chat_route_refuses() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18109,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let post = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (body, code, param) in [
+            (
+                json!({"text": "hi", "sampling_params": {"temperature": -1, "max_new_tokens": 4}}),
+                "decimal_below_min_value",
+                "sampling_params.temperature",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"top_p": 2, "max_new_tokens": 4}}),
+                "decimal_above_max_value",
+                "sampling_params.top_p",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"n": 0, "max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "sampling_params.n",
+            ),
+            (
+                json!({"input_ids": [], "sampling_params": {"max_new_tokens": 4}}),
+                "empty_array",
+                "input_ids",
+            ),
+            (
+                json!({"input_ids": [1, -2, 3], "sampling_params": {"max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "input_ids",
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(body.clone())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                envelope["error"]["type"], "invalid_request_error",
+                "{envelope}"
+            );
+            assert_eq!(envelope["error"]["code"], code, "{envelope}");
+            assert_eq!(envelope["error"]["param"], param, "{envelope}");
+        }
+
+        let served = json!({
+            "text": "hi",
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+        });
+        let resp = app.oneshot(post(served)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a body within the rules is served"
+        );
+
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_v1_chat_completions_streaming_preserves_worker_json_error_content_type() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -329,6 +414,54 @@ mod generation_tests {
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body_json["error"]["type"], "internal_error");
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/completions` serves a `max_tokens` of zero: it is the
+    /// prompt-scoring request (`echo` with `logprobs`, nothing generated),
+    /// so the gateway forwards the zero to the worker as written, where the
+    /// chat route refuses its own `max_tokens: 0`.
+    #[tokio::test]
+    async fn test_v1_completions_max_tokens_zero_reaches_the_worker_as_written() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18114, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18114,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "prompt": "hello",
+            "max_tokens": 0,
+            "echo": true,
+            "logprobs": 1
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "max_tokens 0 is a request, not a refused value"
+        );
+        let forwarded = recorder.only_body();
+        assert_eq!(
+            forwarded["max_tokens"], 0,
+            "the zero reaches the worker as written: {forwarded}"
+        );
+        assert_eq!(forwarded["echo"], true, "echo rides with it: {forwarded}");
 
         ctx.shutdown().await;
     }
@@ -1179,7 +1312,7 @@ mod responses_endpoint_tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         assert_eq!(
             err_body["error"]["code"].as_str(),
@@ -2082,6 +2215,62 @@ mod rerank_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/rerank` routes by the body's `model`, as `/v1/embeddings` does:
+    /// the worker receives it, and `top_n` holds on the answer.
+    #[tokio::test]
+    async fn test_v1_rerank_carries_the_model_and_top_n() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18113, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18113,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial"
+            ],
+            "top_n": 1
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["model"], "mock-model");
+        assert_eq!(
+            body_json["results"].as_array().unwrap().len(),
+            1,
+            "top_n holds on the answer"
+        );
+        assert_eq!(
+            recorder.only_body()["model"],
+            "mock-model",
+            "the worker receives the body's model"
+        );
 
         ctx.shutdown().await;
     }

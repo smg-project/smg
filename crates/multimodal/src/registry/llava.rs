@@ -4,7 +4,10 @@ use serde_json::Value;
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        layouts::batched_with_image_sizes, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{
         LlavaNextProcessor, LlavaProcessor, PixtralProcessor, PreProcessorConfig,
@@ -215,10 +218,7 @@ impl ModelProcessorSpec for LlavaSpec {
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // pixel_values is [num_images, C, H, W]; the Pixtral tower's
         // image_sizes is [num_images, 2] (a CLIP tower emits none).
-        HashMap::from([
-            ("pixel_values".to_string(), FieldLayout::Batched),
-            ("image_sizes".to_string(), FieldLayout::Batched),
-        ])
+        batched_with_image_sizes()
     }
 }
 
@@ -295,10 +295,7 @@ impl ModelProcessorSpec for LlavaNextSpec {
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // encoder_input is [num_images, max_patches, C, H, W] (5D, batched).
         // image_sizes is [num_images, 2] (batched), matching the reference processor's kwargs.
-        HashMap::from([
-            ("pixel_values".to_string(), FieldLayout::Batched),
-            ("image_sizes".to_string(), FieldLayout::Batched),
-        ])
+        batched_with_image_sizes()
     }
 }
 

@@ -15,7 +15,9 @@ use axum::{
 use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, ThinkingKeyName,
+    },
     traits::{Encoding, PromptEncoding, Tokenizer},
     StopRules, StopSequenceConfig, StopSequenceDecoder,
 };
@@ -698,14 +700,31 @@ pub(crate) fn insert_tool_choice_kwarg(
 /// owns interpretation (level→value mapping, `tool_choice`/`response_format`
 /// rendering, defaulting, and validation); an explicit `chat_template_kwargs`
 /// entry wins, except for `reasoning_effort`: the request-level effort
-/// (`thinking.effort`, else the top-level field) is written over an entry,
-/// as the engine's own server renders it.
-fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+/// (`thinking.effort`, else the top-level field) owns the key, as the
+/// engine's own server renders it, written over an entry as the request's
+/// provider profile hands it to the template
+/// (`ProviderProfile::template_reasoning_effort`, given the thinking
+/// preference the prompt renders with: the template's own `thinking_mode`
+/// switch among the kwargs where the template reads that key, `thinking_key`
+/// being the tokenizer's detected thinking key as the backed plan gates its
+/// mode kwargs, else the typed toggle or the profile's reading of the effort),
+/// and the entry removed when the profile hands the template none.
+fn build_chat_template_kwargs(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    thinking_key: Option<ThinkingKeyName>,
+) -> HashMap<String, Value> {
     let request_kwargs = request
         .chat_template_kwargs
         .as_ref()
         .map_or(0, HashMap::len);
-    let reasoning_effort = request.effective_reasoning_effort();
+    let explicit = matches!(thinking_key, Some(ThinkingKeyName::ThinkingMode))
+        .then(|| provider.thinking_from_template_kwargs(request.chat_template_kwargs.as_ref()))
+        .flatten();
+    let reasoning_effort = provider.template_reasoning_effort(
+        request.effective_reasoning_effort(),
+        explicit.or_else(|| request.template_thinking_for(provider)),
+    );
     // A plain request (no tool choice, no response format, no kwargs, no
     // effort) renders with no kwargs at all: its map stays unallocated.
     let mut combined = if request.tool_choice.is_some()
@@ -728,11 +747,18 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     if let Some(template_kwargs) = &request.chat_template_kwargs {
         combined.extend(template_kwargs.clone());
     }
-    if let Some(reasoning_effort) = reasoning_effort {
-        combined.insert(
-            REASONING_EFFORT_KEY.to_string(),
-            Value::String(reasoning_effort.to_string()),
-        );
+    if request.effective_reasoning_effort().is_some() {
+        match reasoning_effort {
+            Some(reasoning_effort) => {
+                combined.insert(
+                    REASONING_EFFORT_KEY.to_string(),
+                    Value::String(reasoning_effort.to_string()),
+                );
+            }
+            None => {
+                combined.remove(REASONING_EFFORT_KEY);
+            }
+        }
     }
     combined
 }
@@ -815,6 +841,17 @@ fn process_content_format_with_order(
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
 
             if let Some(obj) = message_json.as_object_mut() {
+                // The engines' chat utils build an assistant turn for the
+                // template from its content, tool calls, reasoning and name. A
+                // replayed refusal, audio reference or deprecated function call
+                // is kept for an upstream and left out here, so the prompt is
+                // the one the engine itself renders.
+                if obj.get("role").and_then(Value::as_str) == Some("assistant") {
+                    for key in ["refusal", "audio", "function_call"] {
+                        obj.remove(key);
+                    }
+                }
+
                 // skip_serializing_none omits content when None (a tool-call-only
                 // assistant turn, the OpenAI shape), and a function result with
                 // `content: null` keeps its null on the wire. The engine's chat
@@ -1132,7 +1169,8 @@ pub(crate) fn process_chat_messages_with_placeholders(
         // tool set and shared by every request that carries the same tools.
         let prepared_tools = request.tools.as_deref().map(prepare_tools).transpose()?;
 
-        let combined_template_kwargs = build_chat_template_kwargs(request);
+        let combined_template_kwargs =
+            build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name());
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
             None

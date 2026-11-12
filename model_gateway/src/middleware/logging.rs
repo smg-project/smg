@@ -15,14 +15,13 @@
 use std::{
     borrow::Cow,
     fmt::Write as _,
-    future::Future,
     net::SocketAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -33,7 +32,6 @@ use axum::{
     response::Response,
 };
 use opentelemetry::trace::TraceContextExt;
-use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 use tower_http::{
     classify::ServerErrorsFailureClass,
@@ -46,6 +44,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{
     auth::fingerprint_of,
+    duty::{Duty, DutyFuture},
     edge_body::BodyDuties,
     metrics::{matched_path_label, BodyProgress, CLIENT_CLOSED_REQUEST_STATUS},
     request_id::RequestId,
@@ -592,35 +591,28 @@ where
             let _enter = span.enter();
             self.inner.call(request)
         };
-        RequestTraceFuture {
-            inner: inner.instrument(span.clone()),
-            duty: Some(RecordDuty {
+        DutyFuture::new(
+            inner.instrument(span.clone()),
+            RecordDuty {
                 span,
                 start,
                 fields,
                 request_bytes,
                 close_log,
-            }),
-        }
+            },
+        )
     }
 }
 
-pin_project! {
-    /// The request-span layer's future: the route's future under the span,
-    /// then the response line of the access log and the span's hand-over to
-    /// the edge's body wrapper. `duty` is the record's state until the route
-    /// answers, taken at the answer.
-    pub struct RequestTraceFuture<F> {
-        #[pin]
-        inner: Instrumented<F>,
-        duty: Option<RecordDuty>,
-    }
-}
+/// The request-span layer's future: the route's future under the request's
+/// span, with the span's record as its duty.
+pub type RequestTraceFuture<F> = DutyFuture<Instrumented<F>, RecordDuty>;
 
 /// What the request-span layer holds for a request between its first line
-/// and the route's answer. Dropped with the future before the answer, its
-/// close log writes the client-closed line.
-struct RecordDuty {
+/// and the route's answer: the response line of the access log and the
+/// span's hand-over to the edge's body wrapper. Dropped with the future
+/// before the answer, its close log writes the client-closed line.
+pub struct RecordDuty {
     span: Span,
     start: Instant,
     fields: AccessLogFields,
@@ -628,25 +620,7 @@ struct RecordDuty {
     close_log: ClientCloseLog,
 }
 
-impl<F, E> Future for RequestTraceFuture<F>
-where
-    F: Future<Output = Result<Response, E>>,
-{
-    type Output = Result<Response, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let answer = ready!(this.inner.poll(cx));
-        Poll::Ready(match this.duty.take() {
-            Some(duty) => duty.answered(answer),
-            // A poll after the answer breaks the caller's contract; the
-            // route's word to it passes through.
-            None => answer,
-        })
-    }
-}
-
-impl RecordDuty {
+impl Duty for RecordDuty {
     /// The route answered: the response line is written and the span handed
     /// to the edge's body wrapper; an error of the inner service ends the
     /// record without a line of its own.
@@ -1120,6 +1094,20 @@ mod client_closed_tests {
             .expect("request")
     }
 
+    /// The response `build`'s router streams at `uri`, its first chunk `first`
+    /// already sent; the sender keeps the stream open until the test drops it.
+    async fn streamed(
+        build: fn(Body) -> Router,
+        uri: &str,
+        first: &'static [u8],
+    ) -> (Response, mpsc::Sender<Result<Bytes, Infallible>>) {
+        let (tx, rx) = mpsc::channel(4);
+        let body = Body::from_stream(ReceiverStream::new(rx));
+        let response = build(body).oneshot(request(uri)).await.expect("response");
+        tx.send(Ok(Bytes::from_static(first))).await.expect("send");
+        (response, tx)
+    }
+
     /// `/stream` hands out `body` once; `/slow` never answers.
     fn app(body: Body) -> Router {
         let slot = Arc::new(Mutex::new(Some(body)));
@@ -1178,14 +1166,7 @@ mod client_closed_tests {
         // left.
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/relay"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(relay_app, "/relay", b"data: x\n\n").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert_eq!(frame.data_ref().map(Bytes::len), Some(9));
@@ -1203,14 +1184,7 @@ mod client_closed_tests {
         // the body short of its declared bytes.
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/relay"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data:")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(relay_app, "/relay", b"data:").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert_eq!(frame.data_ref().map(Bytes::len), Some(5));
@@ -1248,14 +1222,7 @@ mod client_closed_tests {
     async fn a_stream_the_client_dropped_logs_one_info_line_after_the_access_log() {
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/stream"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(app, "/stream", b"data: x\n\n").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert!(frame.is_data());
@@ -1277,14 +1244,7 @@ mod client_closed_tests {
     async fn a_stream_that_ends_logs_no_client_close() {
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/stream"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(app, "/stream", b"data: x\n\n").await;
         drop(tx);
         let _ = response.into_body().collect().await.expect("body");
         assert_eq!(
@@ -1327,8 +1287,8 @@ mod field_tests {
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         middleware::{
-            auth_middleware, route_request_meta_middleware, sse_keepalive_middleware, AuthConfig,
-            HttpMetricsLayer, SseKeepAlive, TenantResolutionState,
+            auth_middleware, route_request_meta_middleware, AuthConfig, HttpMetricsLayer,
+            SseKeepAlive, TenantResolutionState,
         },
         observability::{
             inflight_tracker::InFlightRequestTracker,
@@ -1464,10 +1424,7 @@ mod field_tests {
                     }
                 }),
             )
-            .route_layer(from_fn_with_state(
-                SseKeepAlive::every_secs(15),
-                sse_keepalive_middleware,
-            ))
+            .route_layer(SseKeepAlive::every_secs(15).layer())
             .route_layer(from_fn_with_state(tenants, route_request_meta_middleware))
             .route_layer(from_fn_with_state(auth, auth_middleware))
             .layer(create_logging_layer(fields))

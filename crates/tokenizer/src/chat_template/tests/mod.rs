@@ -936,6 +936,22 @@ fn strftime_now_writes_the_render_instant() {
     assert!(error.contains("strftime_now"), "{error}");
 }
 
+/// A render that names no instant reads the clock when the template first
+/// writes it, once: every `strftime_now` of the render writes the same
+/// instant, down to the nanosecond.
+#[test]
+fn strftime_now_reads_one_instant_per_render() {
+    let template = "{{ strftime_now('%s.%f') }}|{{ strftime_now('%s.%f') }}";
+    let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+    let messages: [serde_json::Value; 0] = [];
+    let rendered = processor
+        .apply_chat_template(&messages, ChatTemplateParams::default())
+        .unwrap();
+    let (first, second) = rendered.split_once('|').unwrap();
+    assert_eq!(first, second, "{rendered}");
+    assert!(first.contains('.'), "{rendered}");
+}
+
 /// Jinja2's `dict()` is Python's: it builds a map from nothing, from a
 /// mapping or from an iterable of key/value pairs, keyword arguments are
 /// written over the result, and a repeated key keeps its first position
@@ -1464,6 +1480,68 @@ fn clear_thinking_is_not_a_thinking_switch() {
             "{template}"
         );
     }
+}
+
+/// The word `thinking` in what a template prints is not a switch: the
+/// MiniMax M3.1 template's system prose ("When thinking is enabled, wrap your
+/// reasoning in ...") stands in a string literal, and the template branches
+/// on no thinking variable, where the M3 template branched on
+/// `thinking_mode`. A comment or the raw text outside the blocks is not a
+/// switch either; the same words as code are.
+#[test]
+fn thinking_in_prose_or_a_comment_is_not_a_thinking_switch() {
+    let m31_shape = "{{- 'You have a thinking capability that allows you to reason step by step \
+                     before responding. When thinking is enabled, wrap your reasoning in ' ~ \
+                     think_begin_token ~ ' and ' ~ think_end_token }}\
+                     {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                     {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    for template in [
+        m31_shape,
+        "{{ \"When thinking is enabled, think.\" }}{% for m in messages %}{{ m.content }}{% endfor %}",
+        "{% set note = 'if thinking == true' %}{{ note }}",
+        "{# if thinking is defined #}{{ messages | length }}",
+        "When thinking is enabled, think.{% for m in messages %}{{ m.content }}{% endfor %}",
+        // A raw block prints its text as it is, switch-looking words included.
+        "{% raw %}{% if thinking %}on{% endif %}{% endraw %}{{ messages | length }}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::None, None),
+            "{template}"
+        );
+    }
+    let state = ChatTemplateState::new(Some(m31_shape.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+    assert_eq!(state.thinking_key_name(), None);
+    assert!(!state.prefill_opens_think_block());
+
+    // The same words as code are the switch, after a literal and after a
+    // literal with an escaped quote in it.
+    for template in [
+        "{% if thinking is defined and thinking %}<think>{% endif %}",
+        "{{ 'When thinking is enabled' }}{% if thinking %}<think>{% endif %}",
+        "{{ 'it\\'s thinking' }}{% if thinking == true %}<think>{% endif %}",
+        "{{ \"a 'quoted' word\" }}{% set thinking = thinking %}",
+        // A nested dict literal's `}}` does not end the block before the switch.
+        "{{ {'a': {'b': '<think>'}}['a']['b'] if thinking else '' }}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
+            "{template}"
+        );
+    }
+    // The M3 shape keeps its tri-state switch.
+    assert_eq!(
+        detect_thinking_toggle(
+            "{{- 'When thinking is enabled, wrap your reasoning.' }}\
+             {%- if thinking_mode is defined and thinking_mode == \"enabled\" -%}<think>{%- endif -%}"
+        ),
+        (
+            ThinkingToggle::DefaultOff,
+            Some(ThinkingKeyName::ThinkingMode)
+        )
+    );
 }
 
 #[test]

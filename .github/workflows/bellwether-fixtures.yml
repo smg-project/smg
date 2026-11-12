@@ -39,6 +39,11 @@ on:
       - .github/workflows/bellwether-fixtures.yml
       - .github/actions/setup-rust/**
       - scripts/ci_install_rust.sh
+      - scripts/ci_apt_mirror.sh
+      - scripts/ci_apt_update.sh
+      - scripts/ci_retry.sh
+      - scripts/ci_install_build_deps.sh
+      - scripts/ci_install_protoc.sh
   pull_request:
     branches: [ main, release/** ]
     types: [opened, synchronize, reopened]
@@ -56,6 +61,11 @@ on:
       - .github/workflows/bellwether-fixtures.yml
       - .github/actions/setup-rust/**
       - scripts/ci_install_rust.sh
+      - scripts/ci_apt_mirror.sh
+      - scripts/ci_apt_update.sh
+      - scripts/ci_retry.sh
+      - scripts/ci_install_build_deps.sh
+      - scripts/ci_install_protoc.sh
   workflow_dispatch:
 
 permissions:

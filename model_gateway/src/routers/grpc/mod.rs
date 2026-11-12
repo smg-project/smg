@@ -29,6 +29,7 @@ pub mod utils; // Used by routers/http and bindings/golang
 /// drives, compiled for the crate's test targets only.
 #[cfg(any(test, feature = "test-util"))]
 pub use regular::streaming::bench::{EngineScript, StreamBench};
+pub(crate) mod wire;
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 
 // Re-export for convenience

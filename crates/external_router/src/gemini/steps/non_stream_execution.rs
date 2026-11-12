@@ -3,10 +3,7 @@
 //! Transition: NonStreamRequest → ProcessResponse (no tool calls)
 //!                               | NonStreamRequest (MCP tool loop — Phase 2)
 
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
 use crate::{
@@ -97,8 +94,6 @@ pub(crate) async fn non_stream_request_execution(
     worker.record_outcome(status.as_u16());
 
     if !status.is_success() {
-        let status = StatusCode::from_u16(response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
         let body = response.text().await.unwrap_or_else(|e| {
             tracing::warn!("Failed to read upstream error body: {e}");

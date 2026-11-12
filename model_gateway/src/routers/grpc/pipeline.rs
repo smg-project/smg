@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
@@ -84,6 +84,7 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
+            json_response,
             placement::{self, Candidates, WireConstraint},
             retry::{is_retryable_response, BackoffCalculator},
         },
@@ -334,8 +335,7 @@ impl RequestPipeline {
             deps.prefill_admission.clone(),
         )
         .with_queue_timeout(deps.queue_timeout);
-        let plan_kind = mode.plan_kind();
-        let inject_pd_metadata = mode.inject_pd_metadata();
+        let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
         let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
@@ -363,8 +363,7 @@ impl RequestPipeline {
                     worker_selection,
                     encode,
                     request_building: Box::new(ChatGenerateRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(ChatGenerateResponseProcessingStage::new(
                         processor,
@@ -381,10 +380,7 @@ impl RequestPipeline {
                     rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(MessageRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(MessageRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(MessageResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -399,10 +395,7 @@ impl RequestPipeline {
                     rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(CompletionRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(CompletionRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(CompletionResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -420,8 +413,7 @@ impl RequestPipeline {
                     worker_selection,
                     encode: None,
                     request_building: Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(
                         harmony::stages::HarmonyResponseProcessingStage::new(),
@@ -548,12 +540,7 @@ impl RequestPipeline {
         )?;
         step!(
             "OutputBudget",
-            enforce_output_budget(
-                &ctx.input.request_type,
-                workers,
-                &ctx.input.model_id,
-                ctx.state.provider,
-            )
+            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
         )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
@@ -609,6 +596,10 @@ impl RequestPipeline {
             );
             let retained = plan.as_mut().ok_or_else(consumed)?;
             helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
+            // The new workers' window, for the stop reason of a `length` finish.
+            if let Some(ResponseSpec::Messages(messages)) = spec.as_mut() {
+                messages.context_window = selection_context_length(workers, &dctx.model_id);
+            }
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }
@@ -1160,7 +1151,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_chat",
@@ -1221,7 +1212,7 @@ impl RequestPipeline {
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     let body = generate_response_body(single_prompt, n, response);
-                    Self::routed_response(&dctx, axum::Json(body).into_response())
+                    Self::routed_response(&dctx, json_response(&body))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -1265,7 +1256,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_completion",
@@ -1312,7 +1303,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_messages",
@@ -1359,7 +1350,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_decisions",
@@ -1403,7 +1394,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_embeddings",
@@ -1504,7 +1495,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_classify",
@@ -1637,7 +1628,7 @@ impl RequestPipeline {
                         rate_limit_cell
                             .settle(Self::recorded_settlement(&dctx.response))
                             .await;
-                        Ok(iteration_result)
+                        Ok(*iteration_result)
                     }
                     None => {
                         error!(

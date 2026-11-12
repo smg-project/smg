@@ -492,7 +492,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                         for mm_hash in batch.mm_hashes
                     )
                 # P may send KV remotely, but it still needs every incoming EC
-                # handle. Only a leg without EC parameters may rely on KV alone.
+                # handle. Only a request without EC parameters may rely on KV alone.
                 if (
                     missing_pixels
                     and (ec_transfer_params is not None or kv_transfer_params is None)
@@ -508,7 +508,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                     raise ValueError(
                         "multimodal payload carries grid tensors but no pixel_values and "
-                        f"{reason}; a pixel-less leg requires a handoff"
+                        f"{reason}; a pixel-less request requires a handoff"
                     )
                 # Preprocessed multimodal from Rust router.
                 # Token IDs already have expanded placeholders; tensors are
@@ -556,6 +556,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     "ec_transfer_params": ec_transfer_params,
                 }
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
+            # The parser must start in the same thinking mode as the rendered prompt.
+            generate_kwargs = {}
+            if hasattr(request, "chat_template_kwargs_json") and request.HasField(
+                "chat_template_kwargs_json"
+            ):
+                template_kwargs = json.loads(request.chat_template_kwargs_json)
+                if not isinstance(template_kwargs, dict):
+                    raise ValueError("chat_template_kwargs_json must contain a JSON object")
+                generate_kwargs["reasoning_parser_kwargs"] = {
+                    "chat_template_kwargs": template_kwargs
+                }
 
             # Extract logprobs configuration
             num_logprobs = sampling_params.logprobs
@@ -605,6 +616,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=pinned_rank,
+                **generate_kwargs,
             ):
                 # ECCPU may evict an encoding before completion and return
                 # metadata without a fetch address. P has no pixels to

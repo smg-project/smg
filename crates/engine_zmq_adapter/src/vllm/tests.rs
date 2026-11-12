@@ -61,6 +61,14 @@ async fn generate_e2e_translates_and_streams_vllm_proto() {
             other => panic!("expected Add, got {other:?}"),
         };
         assert_eq!(request.request_id, "r1");
+        assert_eq!(
+            request
+                .reasoning_parser_kwargs
+                .as_ref()
+                .unwrap()
+                .chat_template_kwargs["thinking_mode"],
+            "enabled"
+        );
         assert_eq!(request.prompt_token_ids, Some(vec![1, 2, 3]));
         assert_eq!(request.sampling_params.as_ref().unwrap().max_tokens, 2);
         output
@@ -93,6 +101,7 @@ async fn generate_e2e_translates_and_streams_vllm_proto() {
             logprobs: Some(1),
             ..Default::default()
         }),
+        chat_template_kwargs_json: Some(r#"{"thinking_mode":"enabled"}"#.into()),
         stream: true,
         ..Default::default()
     };
@@ -1563,5 +1572,112 @@ async fn prefill_samples_require_timing_and_skip_preemption_and_errors() {
             })
             .unwrap();
         assert_eq!(stream.take_prefill_sample(), None);
+    }
+}
+
+/// Parser kwargs survive translation without changing the grammar-start override.
+#[test]
+fn thinking_mode_reaches_engine_reasoning_parser_with_a_constraint() {
+    for mode in [None, Some("enabled"), Some("disabled"), Some("adaptive")] {
+        for first_token in [false, true] {
+            let mut req = tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+                grammar_from_first_token: first_token,
+                ..Default::default()
+            });
+            req.chat_template_kwargs_json =
+                mode.map(|mode| serde_json::json!({"thinking_mode": mode}).to_string());
+            let translated =
+                translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+                    .unwrap();
+            assert_eq!(translated.reasoning_ended, first_token.then_some(true));
+            assert_eq!(
+                translated
+                    .reasoning_parser_kwargs
+                    .map(|kwargs| kwargs.chat_template_kwargs),
+                mode.map(|mode| HashMap::from([(
+                    "thinking_mode".to_string(),
+                    serde_json::json!(mode)
+                )]))
+            );
+        }
+    }
+}
+
+/// Refuse malformed or non-object parser kwargs before submitting engine work.
+#[test]
+fn malformed_reasoning_template_kwargs_are_rejected() {
+    for json in ["{", "[]", "null", "true"] {
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        req.chat_template_kwargs_json = Some(json.to_string());
+        let error = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .unwrap_err();
+        assert!(
+            error.starts_with("invalid chat_template_kwargs_json:"),
+            "{error}"
+        );
+    }
+}
+
+/// The prompt count the usage reports is the request's own until the engine's
+/// prefill stats report one: an engine whose first output carries none bills
+/// the prompt the gateway sent, not zero; one that reports a count has the
+/// last word, on the chunk and on the terminal `Complete` alike.
+#[tokio::test]
+async fn usage_prompt_count_is_the_requests_until_the_engine_reports_one() {
+    use engine_zmq_client::protocol::vllm::stats::PrefillStats;
+    fn prompt_tokens_of(response: &vllm::GenerateResponse) -> u32 {
+        match &response.response {
+            Some(vllm::generate_response::Response::Chunk(chunk)) => chunk.prompt_tokens,
+            Some(vllm::generate_response::Response::Complete(complete)) => complete.prompt_tokens,
+            None => panic!("expected a chunk or a complete, got an empty response"),
+        }
+    }
+    let (client, _engine, _dir) = connected_pair(RuntimeType::Vllm).await;
+    for (index, reported, expected) in [(0, None, 3), (1, Some(7), 7)] {
+        let request = vllm::GenerateRequest {
+            request_id: format!("usage-{index}"),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    ..Default::default()
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(2),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let mut streams = client.generate_vllm_streams(request).await.unwrap();
+        let stream = &mut streams[0];
+        let chunk = stream
+            .map_output(EngineCoreOutput {
+                new_token_ids: vec![10],
+                prefill_stats: reported.map(|num_prompt_tokens| PrefillStats {
+                    num_prompt_tokens,
+                    num_computed_tokens: num_prompt_tokens,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            prompt_tokens_of(&chunk),
+            expected,
+            "the first chunk with prefill stats {reported:?}"
+        );
+        let complete = stream
+            .map_output(EngineCoreOutput {
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            prompt_tokens_of(&complete),
+            expected,
+            "the complete with prefill stats {reported:?}"
+        );
     }
 }

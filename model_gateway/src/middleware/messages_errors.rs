@@ -1,14 +1,18 @@
 //! The Messages API's error envelope.
 //!
 //! Every error answered on `/v1/messages` and `/v1/messages/count_tokens`
-//! leaves as `{"type":"error","error":{"type","message"},"request_id"}`,
-//! the shape the Anthropic SDKs decode, whatever produced it inside: the
+//! leaves as `{"type":"error","error":{"type","message"},"request_id"}`
+//! (with `error.details` when the error carries a code, as a message
+//! thread's refusals do), the shape the Anthropic SDKs decode, whatever
+//! produced it inside: the
 //! gateway's OpenAI-shaped envelope, a plain-text refusal, an empty body. The
 //! status is kept and `error.type` follows from it.
 
 use std::{
     convert::Infallible,
-    task::{Context, Poll},
+    future::Future,
+    pin::Pin,
+    task::{ready, Context, Poll},
 };
 
 use axum::{
@@ -22,6 +26,7 @@ use axum::{
 };
 use futures_util::future::{BoxFuture, Either};
 use openai_protocol::messages::{ErrorEnvelope, ErrorResponse};
+use pin_project_lite::pin_project;
 use serde_json::Value;
 use tower::{Layer, Service};
 
@@ -95,11 +100,10 @@ pub struct MessagesErrorEnvelope<S> {
 impl<S> Service<Request> for MessagesErrorEnvelope<S>
 where
     S: Service<Request, Response = Response, Error = Infallible>,
-    S::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
-    type Future = Either<S::Future, BoxFuture<'static, Result<Response, Infallible>>>;
+    type Future = Either<S::Future, EnvelopeFuture<S::Future>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -110,14 +114,47 @@ where
             return Either::Left(self.inner.call(request));
         }
         let request_id = request_id_of(&request);
-        let response = self.inner.call(request);
-        Either::Right(Box::pin(async move {
-            let Ok(response) = response.await;
-            if !(response.status().is_client_error() || response.status().is_server_error()) {
-                return Ok(response);
-            }
-            Ok(into_messages_envelope(response, request_id).await)
-        }))
+        Either::Right(EnvelopeFuture {
+            inner: self.inner.call(request),
+            request_id: Some(request_id),
+            envelope: None,
+        })
+    }
+}
+
+pin_project! {
+    /// A Messages route's response, its error answers rewritten into the
+    /// API's envelope: the inner future runs in place, and only an error
+    /// answer boxes the rewrite (an `async` block boxed for every Messages
+    /// request was one allocation per request for the rare case).
+    pub struct EnvelopeFuture<F> {
+        #[pin]
+        inner: F,
+        request_id: Option<String>,
+        envelope: Option<BoxFuture<'static, Response>>,
+    }
+}
+
+impl<F> Future for EnvelopeFuture<F>
+where
+    F: Future<Output = Result<Response, Infallible>>,
+{
+    type Output = Result<Response, Infallible>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if let Some(envelope) = this.envelope.as_mut() {
+            return envelope.as_mut().poll(cx).map(Ok);
+        }
+        let Ok(response) = ready!(this.inner.poll(cx));
+        if !(response.status().is_client_error() || response.status().is_server_error()) {
+            return Poll::Ready(Ok(response));
+        }
+        let request_id = this.request_id.take().unwrap_or_default();
+        let envelope = this
+            .envelope
+            .insert(Box::pin(into_messages_envelope(response, request_id)));
+        envelope.as_mut().poll(cx).map(Ok)
     }
 }
 
@@ -143,15 +180,15 @@ pub async fn into_messages_envelope(response: Response, request_id: String) -> R
     let error = match serde_json::from_slice::<Value>(&bytes) {
         Ok(json) => match messages_error_of(&json) {
             Some(error) => error,
-            None => ErrorResponse {
-                error_type: messages_error_type(status).to_string(),
-                message: message_of(&json).unwrap_or_else(|| reason(status)),
-            },
+            None => ErrorResponse::new(
+                messages_error_type(status),
+                message_of(&json).unwrap_or_else(|| reason(status)),
+            ),
         },
-        Err(_) => ErrorResponse {
-            error_type: messages_error_type(status).to_string(),
-            message: text_of(&bytes).unwrap_or_else(|| reason(status)),
-        },
+        Err(_) => ErrorResponse::new(
+            messages_error_type(status),
+            text_of(&bytes).unwrap_or_else(|| reason(status)),
+        ),
     };
     let envelope = ErrorEnvelope::new(error, request_id);
     let json = serde_json::to_vec(&envelope).unwrap_or_default();
@@ -168,7 +205,8 @@ pub async fn into_messages_envelope(response: Response, request_id: String) -> R
     Response::from_parts(parts, Body::from(json))
 }
 
-/// The `error` of a body that already is a Messages envelope.
+/// The `error` of a body that already is a Messages envelope, with the
+/// `details` it carries (the error code a thread refusal names).
 fn messages_error_of(json: &Value) -> Option<ErrorResponse> {
     if json.get("type").and_then(Value::as_str) != Some("error") {
         return None;
@@ -177,6 +215,9 @@ fn messages_error_of(json: &Value) -> Option<ErrorResponse> {
     Some(ErrorResponse {
         error_type: error.get("type")?.as_str()?.to_string(),
         message: error.get("message")?.as_str()?.to_string(),
+        details: error
+            .get("details")
+            .and_then(|details| serde_json::from_value(details.clone()).ok()),
     })
 }
 

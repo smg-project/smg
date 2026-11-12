@@ -101,8 +101,8 @@ use openai_protocol::{
 
 use super::*;
 use crate::worker::{
-    circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker,
-    WorkerError, WorkerRegistry, WorkerType,
+    circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
+    ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry, WorkerType,
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -126,6 +126,24 @@ fn test_config() -> WorkerManagerConfig {
         default_check_interval_secs: 5,
         remove_unhealthy: UnhealthyRemovalScope::Disabled,
     }
+}
+
+/// `test_config()` removing the unhealthy workers of `scope`.
+fn config_removing(scope: UnhealthyRemovalScope) -> WorkerManagerConfig {
+    WorkerManagerConfig {
+        remove_unhealthy: scope,
+        ..test_config()
+    }
+}
+
+/// A registry holding one worker whose probes have failed, and that worker's
+/// id: what a bootstrap reconcile finds after a restart.
+fn registry_with_a_failed_worker() -> (Arc<WorkerRegistry>, WorkerId) {
+    let registry = Arc::new(WorkerRegistry::new());
+    let failed_worker = make_worker("http://failed:1", 2, 3);
+    failed_worker.set_status(WorkerStatus::Failed);
+    let failed_id = registry.register(failed_worker).unwrap();
+    (registry, failed_id)
 }
 
 /// The completion of a passing probe of `worker`, launched while the worker
@@ -219,7 +237,7 @@ fn discovered_worker_with(url: &str, health: HealthCheckConfig) -> Arc<dyn Worke
 }
 
 #[test]
-fn labels_follow_the_engine_for_local_non_zmq_workers_only() {
+fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
     let registry = Arc::new(WorkerRegistry::new());
     let local = discovered_worker("http://local:1");
     let local_id = registry.register(local.clone()).unwrap();
@@ -248,13 +266,15 @@ fn labels_follow_the_engine_for_local_non_zmq_workers_only() {
         &external
     ));
 
+    // A ZMQ engine reports its geometry at the handshake: the worker's own
+    // link holds it, and the refresh step reads the link.
     let zmq: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("ipc:///tmp/engine.sock")
             .connection_mode(ConnectionMode::Zmq)
             .build(),
     );
     let zmq_id = registry.register(zmq.clone()).unwrap();
-    assert!(!labels_follow_the_engine(&registry, &zmq_id, &zmq));
+    assert!(labels_follow_the_engine(&registry, &zmq_id, &zmq));
 
     registry.on_remote_worker_state(&smg_mesh::WorkerState {
         worker_id: "peer-w1".to_string(),
@@ -591,10 +611,7 @@ fn make_dp_worker(base: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
 /// static worker under the discovery default all come to `false`.
 #[test]
 fn the_probe_slot_follows_the_status_and_the_health_settings() {
-    let config = WorkerManagerConfig {
-        default_check_interval_secs: 5,
-        remove_unhealthy: UnhealthyRemovalScope::AllLocal,
-    };
+    let config = config_removing(UnhealthyRemovalScope::AllLocal);
     let probe = |secs| ProbeSlot::Probe(Duration::from_secs(secs));
     // (status, checks disabled, own interval, removable, slot)
     let cases = [
@@ -639,10 +656,7 @@ async fn a_failed_mesh_import_under_removal_keeps_its_probe_slot() {
     let worker_id = registry.get_id_by_url("http://remote:1").unwrap();
     let worker = registry.get(&worker_id).unwrap();
     worker.set_status(WorkerStatus::Failed);
-    let config = WorkerManagerConfig {
-        default_check_interval_secs: 5,
-        remove_unhealthy: UnhealthyRemovalScope::AllLocal,
-    };
+    let config = config_removing(UnhealthyRemovalScope::AllLocal);
 
     let mut next_check = HashMap::new();
     reconcile_from_registry(&registry, &mut next_check, &config);
@@ -1135,6 +1149,58 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
     );
 }
 
+/// A handshake can complete while the worker's registration job is still
+/// running its last steps (the worker is in the registry from the register
+/// step on). The refresh that signal asks for is kept behind that job and
+/// run when it ends, never dropped: on the ZMQ wire it is what gives the
+/// worker its window, and a worker that stays in service has no next
+/// transition to retry on. The registration's status stays its own.
+#[tokio::test]
+async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
+    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    let app_context = create_test_app_context();
+    let registry = Arc::clone(&app_context.worker_registry);
+    let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+
+    let worker = discovered_worker_with(
+        "http://local:12",
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..HealthCheckConfig::default()
+        },
+    );
+    worker.set_status(WorkerStatus::NotReady);
+    let revision = worker.revision();
+    registry.register(worker.clone()).unwrap();
+    job_queue.hold_url_for_tests("http://local:12", "AddWorker");
+
+    apply_connect_signal_and_refresh(
+        &registry,
+        WorkerConnected {
+            url: "http://local:12".to_string(),
+            revision,
+        },
+        &mut HashMap::new(),
+        &test_config(),
+        Some(&job_queue),
+    )
+    .await;
+
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+    assert!(
+        job_queue.kept_for("http://local:12"),
+        "the refresh is kept behind the registration job"
+    );
+    assert_eq!(
+        job_queue
+            .get_status("http://local:12")
+            .expect("the registration's status")
+            .job_type,
+        "AddWorker",
+        "the registration keeps its own status"
+    );
+}
+
 #[test]
 fn apply_connect_signal_ignores_stale_revision() {
     let registry = Arc::new(WorkerRegistry::new());
@@ -1464,13 +1530,9 @@ async fn engine_metrics_tries_the_next_registration_when_stale_credentials_get_a
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn engine_metrics_logs_a_failed_scrape_without_its_credentials() {
-    // A port nothing listens on: bound to learn its number, then released.
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port to release");
-        listener.local_addr().expect("the port").port()
-    };
+    // The down engine's port: held and refused for the whole case.
+    let down = RefusedAddress::reserve();
+    let closed = down.port();
     let registry = WorkerRegistry::new();
     registry
         .register(make_worker(
@@ -1507,13 +1569,10 @@ async fn engine_metrics_logs_a_failed_scrape_without_its_credentials() {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn engine_metrics_closes_an_address_on_a_transport_error() {
-    // A port nothing listens on: bound to learn its number, then released.
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port to release");
-        listener.local_addr().expect("the port").port()
-    };
+    // The down engine's port: held and refused for the whole case, so no
+    // later bind, the healthy stub's included, can draw it.
+    let down = RefusedAddress::reserve();
+    let closed = down.port();
     let healthy_hits = Arc::new(AtomicUsize::new(0));
     let healthy = start_metrics_stub(healthy_hits.clone()).await;
 
@@ -1876,10 +1935,7 @@ async fn test_removal_candidate_strips_dp_rank_suffix() {
 
     let removals = queue_due_probes(
         &registry,
-        &WorkerManagerConfig {
-            default_check_interval_secs: 5,
-            remove_unhealthy: UnhealthyRemovalScope::AllLocal,
-        },
+        &config_removing(UnhealthyRemovalScope::AllLocal),
         &mut next_check,
         &mut in_flight,
         &mut probes,
@@ -1916,10 +1972,7 @@ async fn the_discovery_default_removes_only_the_discovered_failed_worker() {
     let mut probes: ProbeFutures = FuturesUnordered::new();
     let removals = queue_due_probes(
         &registry,
-        &WorkerManagerConfig {
-            default_check_interval_secs: 5,
-            remove_unhealthy: UnhealthyRemovalScope::DiscoveryOwned,
-        },
+        &config_removing(UnhealthyRemovalScope::DiscoveryOwned),
         &mut next_check,
         &mut in_flight,
         &mut probes,
@@ -1939,19 +1992,13 @@ async fn the_discovery_default_removes_only_the_discovered_failed_worker() {
 
 #[test]
 fn test_reconcile_from_registry_skips_failed_workers_on_bootstrap() {
-    let registry = Arc::new(WorkerRegistry::new());
-    let failed_worker = make_worker("http://failed:1", 2, 3);
-    failed_worker.set_status(WorkerStatus::Failed);
-    let failed_id = registry.register(failed_worker).unwrap();
+    let (registry, failed_id) = registry_with_a_failed_worker();
 
     let mut next_check = HashMap::new();
     reconcile_from_registry(
         &registry,
         &mut next_check,
-        &WorkerManagerConfig {
-            default_check_interval_secs: 5,
-            remove_unhealthy: UnhealthyRemovalScope::AllLocal,
-        },
+        &config_removing(UnhealthyRemovalScope::AllLocal),
     );
 
     assert!(
@@ -1964,19 +2011,9 @@ fn test_reconcile_from_registry_skips_failed_workers_on_bootstrap() {
 fn test_reconcile_from_registry_keeps_failed_workers_probed_without_removal() {
     // Without --remove-unhealthy-workers a Failed worker is kept on the
     // schedule: the probe is how a restart on the same address rejoins.
-    let registry = Arc::new(WorkerRegistry::new());
-    let failed_worker = make_worker("http://failed:1", 2, 3);
-    failed_worker.set_status(WorkerStatus::Failed);
-    let failed_id = registry.register(failed_worker).unwrap();
+    let (registry, failed_id) = registry_with_a_failed_worker();
     let mut next_check = HashMap::new();
-    reconcile_from_registry(
-        &registry,
-        &mut next_check,
-        &WorkerManagerConfig {
-            default_check_interval_secs: 5,
-            remove_unhealthy: UnhealthyRemovalScope::Disabled,
-        },
-    );
+    reconcile_from_registry(&registry, &mut next_check, &test_config());
     assert!(
         next_check.contains_key(&failed_id),
         "a failed worker that is not being removed must keep being probed"
@@ -2005,10 +2042,7 @@ fn test_reconcile_from_registry_captures_pending_and_ready_workers() {
     reconcile_from_registry(
         &registry,
         &mut next_check,
-        &WorkerManagerConfig {
-            default_check_interval_secs: 5,
-            remove_unhealthy: UnhealthyRemovalScope::AllLocal,
-        },
+        &config_removing(UnhealthyRemovalScope::AllLocal),
     );
 
     assert!(

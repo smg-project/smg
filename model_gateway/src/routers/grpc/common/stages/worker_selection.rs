@@ -10,7 +10,7 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
-use openai_protocol::profile::ProviderProfile;
+use smg_policy_controller::{fingerprint, Side, Target};
 use tracing::{debug, error, warn};
 
 use super::{
@@ -24,12 +24,15 @@ use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
-    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole},
+    policies::{
+        engine_host::EncodeRequest, CacheNamespace, Decider, LoadBalancingPolicy, PolicyRegistry,
+        SelectWorkerInfo, WorkerRole,
+    },
     routers::{
         common::{
             placement::{
-                self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
-                RefusalSite,
+                self, target_ids, CandidateFilter, PairFailure, PipelinePin, PlacementFailure,
+                PlacementInputs, RefusalSite,
             },
             retry::mark_non_retryable,
         },
@@ -355,14 +358,13 @@ impl<'a> SelectionInputs<'a> {
         intermediate: Option<&'a multimodal::MultimodalIntermediate>,
         refs: Option<&'a multimodal::MediaPlan>,
         media_refs_pipeline: PipelinePin,
-        provider: Option<ProviderProfile>,
     ) -> Self {
         let media_refs = refs.is_some();
         let needs_vision = multimodal::request_needs_vision(intermediate, refs);
         let context_requirements = if stage.mode == WorkerSelectionMode::EncodePrefillDecode {
             ContextRequirements::default()
         } else {
-            ContextRequirements::new_for(prep, &input.request_type, provider)
+            ContextRequirements::new(prep, &input.request_type)
         };
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
@@ -473,6 +475,7 @@ impl<'a> SelectionInputs<'a> {
             cache_namespace: self.cache_namespace,
             candidate_filter,
             tried: &[],
+            sequence: None,
         }
     }
 }
@@ -500,7 +503,6 @@ impl WorkerSelectionStage {
             ctx.state.multimodal_intermediate.as_ref(),
             ctx.state.multimodal_refs.as_ref(),
             ctx.state.media_refs_pipeline,
-            ctx.state.provider,
         );
         ctx.state.sticky_key = self
             .policy_registry
@@ -793,6 +795,7 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     candidate_filter: Some(&pinned),
                     tried: &[],
+                    sequence: None,
                 };
                 let (pair, guard) = self
                     .admit_pd_pair(
@@ -826,7 +829,7 @@ impl WorkerSelectionStage {
 
     /// Keep known grid-bearing decode identities on vision-capable workers.
     /// EPD references are unresolved: prefer vision when available, but let
-    /// dispatch validate the resulting identity before using a stripped leg.
+    /// dispatch validate the resulting identity before using a stripped decode request.
     fn decode_side_needs_vision(
         &self,
         request: &RequestType,
@@ -1328,7 +1331,7 @@ impl WorkerSelectionStage {
     /// 404 of a model nobody serves.
     fn role_missing(model_id: &str, missing: &[&'static str]) -> Response {
         placement::no_available_workers(format!(
-            "No {} worker is registered for model '{model_id}' at the moment (its other leg \
+            "No {} worker is registered for model '{model_id}' at the moment (its other side \
              is): the pair is incomplete",
             missing.join(" or ")
         ))
@@ -1438,10 +1441,10 @@ impl WorkerSelectionStage {
         response
     }
 
-    /// Workers serve the model but none of the leg's workers processes media
+    /// Workers serve the model but none of the pool's workers processes media
     /// references. Preparation answers this verdict for the pool as
     /// registered (`multimodal::resolve_mm_processing`); here it is the
-    /// backstop for a pool that changed in between, or a disaggregated leg
+    /// backstop for a pool that changed in between, or a disaggregated side
     /// none of whose workers does. Terminal: capability cannot change within
     /// a retry window. Its one rate-limited line is written by
     /// [`Self::report_refusal`] at the stage's entry points, like the pool's
@@ -1746,6 +1749,12 @@ impl WorkerSelectionStage {
             } else {
                 candidate_filter
             };
+        // The request's sequence before the pool read: see
+        // `PlacementInputs::sequence`.
+        let sequence = self
+            .policy_registry
+            .decider()
+            .map(|decider| decider.begin());
         // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
         // accepts either transport (not HTTP). A retry pins the retained wire.
         let candidates = placement::candidates(
@@ -1773,6 +1782,7 @@ impl WorkerSelectionStage {
                 cache_namespace,
                 candidate_filter,
                 tried,
+                sequence,
             },
         )
     }
@@ -1916,6 +1926,7 @@ impl WorkerSelectionStage {
             takes_media(worker) && demand.context.admits(worker, model_id)
         }) {
             let mut largest = None;
+            let mut widest_decode = None;
             for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
                 if !WireConstraint::admits(wire, prefill.as_ref()) || !takes_media(prefill.as_ref())
                 {
@@ -1929,14 +1940,24 @@ impl WorkerSelectionStage {
                 }) {
                     let limit = pair_context_length(prefill.as_ref(), decode.as_ref(), model_id);
                     largest = largest.max(limit);
+                    // The budget is judged among the pairs that hold the
+                    // input: two maxima from different pairs would pass a
+                    // request no single pair holds, and placement would
+                    // answer a retryable 503 for it.
+                    if limit.is_none_or(|limit| demand.context.input_fits(limit)) {
+                        widest_decode = widest_decode.max(decode.context_length(model_id));
+                    }
                 }
             }
-            if let Some(limit) = largest {
-                demand
-                    .context
-                    .enforce(limit, model_id)
-                    .map_err(|response| PdSelectionFailure::Context(Box::new(response)))?;
-            }
+            // The input against the widest window a pair offers it, the
+            // budget against the widest decode window among the pairs that
+            // hold the input: the refusal names the window that bound the
+            // request, and a request no pair holds is a 400 here, never a
+            // 503 from placement.
+            demand
+                .context
+                .enforce_for_pair(largest, widest_decode, model_id)
+                .map_err(|response| PdSelectionFailure::Context(Box::new(response)))?;
         }
         let inputs = PlacementInputs {
             candidate_filter: Some(&fits),
@@ -2073,11 +2094,15 @@ impl WorkerSelectionStage {
         )
         .map_err(EpdSelectionFailure::Placement)?;
         let handoff = PdProtocol::encode_handoff(pair.runtime);
-        available_encode.retain(|worker| {
+        // The encoders that pair with the chosen prefill side: its runtime
+        // and, under a push handoff, its EC roles and connector. The legacy
+        // path narrows the pool by it; the engine reads it as each row's
+        // compatibility bit, which its `epd` plan filters on.
+        let pairs_with_prefill = |worker: &Arc<dyn Worker>| {
             worker.metadata().spec.runtime_type == pair.runtime
                 && (handoff != Some(EncodeHandoff::Push)
                     || ec_pair(worker.as_ref(), pair.prefill.as_ref()))
-        });
+        };
         // Only image-only reference requests can merge a push encoder's prompt updates.
         let prompt_hash;
         let hashes = if handoff == Some(EncodeHandoff::Push) && needs_encode && !demand.image_fanout
@@ -2092,13 +2117,33 @@ impl WorkerSelectionStage {
         } else {
             encode_item_hashes
         };
-        let assignments = assign_encode_workers(
-            &available_encode,
-            hashes,
-            model_id,
-            self.policy_registry.get_encode_policy().as_ref(),
-            self.worker_registry.get_hash_ring(model_id),
-        )
+        // The seam: under `--policy-engine engine` the items are the engine's
+        // decisions over the capable encoders; the legacy policy decides
+        // them per item over the encoders that pair with the prefill.
+        let assignments = match self.policy_registry.encode_engine_for() {
+            Some(decider) => assign_encode_workers_decided(
+                decider,
+                EncodeItems {
+                    encoders: &available_encode,
+                    pairs_with_prefill: &pairs_with_prefill,
+                    eligible: &|worker: &Arc<dyn Worker>| worker.is_healthy_and_eligible(),
+                    item_hashes: hashes,
+                    model_id,
+                    images: demand.encode.vision,
+                    policy: self.policy_registry.get_encode_policy().name(),
+                },
+            ),
+            None => {
+                available_encode.retain(pairs_with_prefill);
+                assign_encode_workers(
+                    &available_encode,
+                    hashes,
+                    model_id,
+                    self.policy_registry.get_encode_policy().as_ref(),
+                    self.worker_registry.get_hash_ring(model_id),
+                )
+            }
+        }
         .ok_or(EpdSelectionFailure::Unavailable)?;
         Ok((assignments, pair.prefill, pair.decode, pair.runtime))
     }
@@ -2183,6 +2228,94 @@ fn assign_encode_workers(
         .collect()
 }
 
+/// What the engine decides the encode items of one request over.
+struct EncodeItems<'a> {
+    /// The capable encoders of the pool, before the pair's compatibility.
+    encoders: &'a [Arc<dyn Worker>],
+    pairs_with_prefill: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    /// The eligibility the commit re-validates each target under.
+    eligible: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    item_hashes: &'a [Vec<u8>],
+    model_id: &'a str,
+    /// The items carry pixel media: the plan's vision rule applies.
+    images: bool,
+    /// The encode policy's name: the selection metric's label, as under the
+    /// legacy path, until the observability step relabels it.
+    policy: &'static str,
+}
+
+/// [`assign_encode_workers`] through the policy engine: one view of the
+/// encoders with each row's compatibility and vision bits, one decision per
+/// item keyed by the item's content hash, the commit under the caller's
+/// eligibility walking the decision's targets (the ring's next members) and,
+/// when every target missed, one re-decision of that item with the misses
+/// excluded. `None` when an item finds no encoder, as the legacy loop
+/// answers.
+fn assign_encode_workers_decided(
+    decider: &Decider,
+    items: EncodeItems<'_>,
+) -> Option<Vec<EncodeWorkerAssignment>> {
+    let EncodeItems {
+        encoders,
+        pairs_with_prefill,
+        eligible,
+        item_hashes,
+        model_id,
+        images,
+        policy,
+    } = items;
+    if item_hashes.is_empty() {
+        return Some(Vec::new());
+    }
+    let sees = |worker: &Arc<dyn Worker>| vision_capable(worker.as_ref());
+    let request = EncodeRequest {
+        model: model_id,
+        pairs_with_prefill,
+        vision_capable: &sees,
+        images: if images {
+            u16::try_from(item_hashes.len()).unwrap_or(u16::MAX)
+        } else {
+            0
+        },
+    };
+    let keys: Vec<u64> = item_hashes.iter().map(|hash| fingerprint(hash)).collect();
+    let decided = decider.decide_encode_items(&request, encoders, &keys, &[]);
+    let accept = |target: &Target| eligible(&encoders[target.position as usize]);
+    keys.iter()
+        .zip(decided)
+        .enumerate()
+        .map(|(item_index, (key, (decision, lease)))| {
+            let target = decider
+                .commit(&lease, &decision, Side::Encode, accept)
+                .or_else(|| {
+                    let (missed, count) = target_ids(&decision);
+                    if count == 0 {
+                        return None;
+                    }
+                    let (again, lease) = decider
+                        .decide_encode_items(
+                            &request,
+                            encoders,
+                            std::slice::from_ref(key),
+                            &missed[..count],
+                        )
+                        .pop()?;
+                    decider.commit(&lease, &again, Side::Encode, accept)
+                })?;
+            Metrics::record_worker_selection(
+                metrics_labels::WORKER_ENCODE,
+                metrics_labels::CONNECTION_GRPC,
+                model_id,
+                policy,
+            );
+            Some(EncodeWorkerAssignment {
+                item_index,
+                worker: Arc::clone(&encoders[target.position as usize]),
+            })
+        })
+        .collect()
+}
+
 fn encode_routing_headers(content_hash: &[u8]) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let key = hex_encode(content_hash);
@@ -2217,7 +2350,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::PolicyConfig,
+        config::types::{PolicyConfig, PolicyEngineMode, RoutingMode},
         mesh::adapters::tree_sync::RepairEntry,
         middleware::{ReportedRefusal, TenantRequestMeta},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
@@ -2835,6 +2968,107 @@ mod tests {
         assert!(decode_urls.contains(&decode.url().to_string()));
     }
 
+    /// Two pairing islands whose windows cross (island A: a wide prefill
+    /// window with a narrow decode one; island B: the reverse) and a request
+    /// that no single pair holds (its input fits A's pair window but its
+    /// budget only B's decode window): the capacity refusal judges the
+    /// budget among the pairs that hold the input, so the answer is the
+    /// 400 naming A's decode window, not a retryable 503 from placement. A
+    /// request B holds on its own (a small input, the same budget) pairs.
+    #[test]
+    fn select_pd_pair_refuses_a_request_no_island_holds_with_a_400() {
+        use crate::routers::grpc::context::{PreparationOutput, RequestType};
+
+        let model_id = "test-model-islands";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let register = |url: &str, worker_type: WorkerType, runtime: RuntimeType, window: u32| {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id).with_context_length(window))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(runtime)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        };
+        register(
+            "grpc://127.0.0.1:8300",
+            WorkerType::Prefill,
+            RuntimeType::Sglang,
+            32768,
+        );
+        register(
+            "grpc://127.0.0.1:8301",
+            WorkerType::Decode,
+            RuntimeType::Sglang,
+            4096,
+        );
+        register(
+            "grpc://127.0.0.1:8302",
+            WorkerType::Prefill,
+            RuntimeType::Vllm,
+            2048,
+        );
+        register(
+            "grpc://127.0.0.1:8303",
+            WorkerType::Decode,
+            RuntimeType::Vllm,
+            32768,
+        );
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+        let demands = |input_tokens: usize, budget: u32| PairDemands {
+            context: ContextRequirements::new(
+                &PreparationOutput::Generate {
+                    original_text: None,
+                    token_ids: vec![7; input_tokens],
+                },
+                &RequestType::Completion(Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "model": model_id,
+                        "prompt": "hi",
+                        "max_tokens": budget,
+                    }))
+                    .expect("a completion request"),
+                )),
+            ),
+            ..PairDemands::default()
+        };
+
+        match stage.select_pd_pair(
+            model_id,
+            PlacementInputs::default(),
+            None,
+            None,
+            demands(3072, 8192),
+        ) {
+            Err(PdSelectionFailure::Context(response)) => {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            Ok(_) => panic!("a request no island holds must not pair"),
+            Err(PdSelectionFailure::Placement(_)) => {
+                panic!("a request no island holds is a 400 at selection, not a placement failure")
+            }
+            Err(PdSelectionFailure::NoVisionCapablePrefill) => {
+                panic!("a request no island holds is a 400 at selection, not a vision refusal")
+            }
+        }
+
+        let (prefill, decode, _) = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs::default(),
+                None,
+                None,
+                demands(1024, 8192),
+            )
+            .expect("island B holds the small input and the budget");
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:8302");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8303");
+    }
+
     /// TokenSpeed's direct-ZMQ engines carry the rendezvous on their generate
     /// request, so a ZMQ prefill and a ZMQ decode engine of TokenSpeed pair.
     #[test]
@@ -3130,6 +3364,16 @@ mod tests {
         )))
     }
 
+    /// The gRPC wire constraint of a `runtime` worker: no media refs, any pipeline.
+    fn grpc_wire(runtime: RuntimeType) -> WireConstraint {
+        WireConstraint {
+            runtime,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+            pipeline: PipelinePin::Any,
+        }
+    }
+
     /// A retry context with a retained wire and no extra request constraints.
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
@@ -3212,15 +3456,7 @@ mod tests {
             None,
         );
 
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
         for _ in 0..8 {
             stage
                 .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
@@ -3277,15 +3513,7 @@ mod tests {
             WorkerSelectionMode::Regular,
             None,
         );
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::TokenSpeed,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
         let decided_on = |worker: &Arc<dyn Worker>| {
             utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
                 worker: Arc::clone(worker),
@@ -3384,15 +3612,7 @@ mod tests {
                 mode,
                 None,
             );
-            let mut ctx = dispatch_ctx(
-                model_id,
-                WireConstraint {
-                    runtime: RuntimeType::TokenSpeed,
-                    connection: ConnectionMode::Grpc,
-                    requires_media_refs: false,
-                    pipeline: PipelinePin::Any,
-                },
-            );
+            let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
             ctx.constraint_decided_on =
                 Some(utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
                     worker: Arc::clone(&workers[2]),
@@ -3469,15 +3689,7 @@ mod tests {
                 mode,
                 None,
             );
-            let mut ctx = dispatch_ctx(
-                model_id,
-                WireConstraint {
-                    runtime: RuntimeType::TokenSpeed,
-                    connection: ConnectionMode::Grpc,
-                    requires_media_refs: false,
-                    pipeline: PipelinePin::Any,
-                },
-            );
+            let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::TokenSpeed));
             let prep = PreparationOutput::Generate {
                 original_text: None,
                 token_ids: vec![7; 24],
@@ -3554,15 +3766,7 @@ mod tests {
             WorkerSelectionMode::Regular,
             None,
         );
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
         let mut headers = HeaderMap::new();
         headers.insert("x-smg-routing-key", "session-42".parse().unwrap());
         ctx.headers = Some(headers);
@@ -3666,15 +3870,7 @@ mod tests {
             None,
         );
 
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
         for _ in 0..8 {
             stage
                 .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
@@ -3733,15 +3929,7 @@ mod tests {
             WorkerSelectionMode::Regular,
             None,
         );
-        let mut ctx = dispatch_ctx(
-            model_id,
-            WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
 
         let response = stage
             .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
@@ -3788,12 +3976,7 @@ mod tests {
             WorkerSelectionMode::Regular,
             None,
         );
-        let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
-            requires_media_refs: false,
-            pipeline: PipelinePin::Any,
-        };
+        let wire = grpc_wire(RuntimeType::Vllm);
         let namespace = |salt: &str| {
             CacheNamespace::derive(&CachePartition {
                 cache_salt: Some(salt),
@@ -3847,10 +4030,8 @@ mod tests {
                 let mut ctx = dispatch_ctx(
                     "epd-retry",
                     WireConstraint {
-                        runtime: RuntimeType::Vllm,
-                        connection: ConnectionMode::Grpc,
                         requires_media_refs: refs,
-                        pipeline: PipelinePin::Any,
+                        ..grpc_wire(RuntimeType::Vllm)
                     },
                 );
                 let request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
@@ -3880,9 +4061,159 @@ mod tests {
         }
     }
 
-    /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.
+    /// The policy registry of an EPD stage with the encode policy unset
+    /// (consistent hashing, the default), under the legacy path or the
+    /// engine.
+    fn epd_policies(engine: bool) -> Arc<PolicyRegistry> {
+        let mode = if engine {
+            PolicyEngineMode::Engine
+        } else {
+            PolicyEngineMode::Legacy
+        };
+        let routing = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_policy_engine_for(
+            mode,
+            &routing,
+            &PolicyConfig::RoundRobin,
+        );
+        assert_eq!(policies.encode_engine_for().is_some(), engine);
+        Arc::new(policies)
+    }
+
+    /// [`epd_policies`] with the encode side on `encode` (the legacy encode
+    /// policy set, the engine's encode profile bound to it).
+    fn epd_policies_with(engine: bool, encode: PolicyConfig) -> Arc<PolicyRegistry> {
+        let mode = if engine {
+            PolicyEngineMode::Engine
+        } else {
+            PolicyEngineMode::Legacy
+        };
+        let routing = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: Some(encode.clone()),
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_policy_engine_for(
+            mode,
+            &routing,
+            &PolicyConfig::RoundRobin,
+        );
+        policies.set_encode_policy(PolicyFactory::create_from_config(&encode));
+        assert_eq!(policies.encode_engine_for().is_some(), engine);
+        Arc::new(policies)
+    }
+
+    #[test]
+    fn the_encode_assignment_is_narrowed_to_encoders_that_pair_with_the_prefill() {
+        encode_assignment_narrowed_to_pairing_encoders(false);
+    }
+
+    #[test]
+    fn the_encode_assignment_is_narrowed_to_encoders_that_pair_with_the_prefill_through_the_engine()
+    {
+        encode_assignment_narrowed_to_pairing_encoders(true);
+    }
+
+    /// Two capable encoders of the pair's runtime, one on the prefill's EC
+    /// connector and one on another: under a rotating encode policy both
+    /// items of a request land on the pairing encoder, under the legacy path
+    /// (the pool narrowed before the policy) and under the engine (the row's
+    /// compatibility bit); without the narrowing the rotation would hand the
+    /// second item to the other encoder.
+    fn encode_assignment_narrowed_to_pairing_encoders(engine: bool) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let model = "epd-pairing";
+        for (port, role, connector) in [
+            (8910, WorkerType::Encode, "ECCPUConnector"),
+            (8911, WorkerType::Encode, "ECOtherConnector"),
+            (8912, WorkerType::Prefill, "ECCPUConnector"),
+            (8913, WorkerType::Decode, "ECCPUConnector"),
+        ] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(ModelCard::new(model))
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Vllm)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .label("supports_ec_transfer", "true")
+                        .label("ec_connector", connector)
+                        .label(
+                            "ec_role",
+                            if role == WorkerType::Encode {
+                                "ec_producer"
+                            } else {
+                                "ec_consumer"
+                            },
+                        )
+                        .label("kv_connector", "NixlConnector")
+                        .label("mm_processor", "inprocess")
+                        .label("mm_media_ref_schemes", "http,https,data")
+                        .label("supports_vision", "true")
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            registry,
+            epd_policies_with(engine, PolicyConfig::RoundRobin),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        for _ in 0..3 {
+            let (encoders, prefill, _decode, _runtime) = stage
+                .select_encode_prefill_decode_workers(
+                    model,
+                    PlacementInputs::default(),
+                    &[vec![1], vec![2]],
+                    EpdDemands {
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: false,
+                        image_fanout: true,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("the EPD set is selected"));
+            assert_eq!(prefill.url(), "grpc://127.0.0.1:8912");
+            assert_eq!(encoders.len(), 2);
+            for assignment in &encoders {
+                assert_eq!(
+                    assignment.worker.url(),
+                    "grpc://127.0.0.1:8910",
+                    "only the encoder on the prefill's connector takes an item"
+                );
+            }
+        }
+    }
+
     #[test]
     fn epd_filters_capabilities_and_pairs_before_encoding() {
+        epd_filters_capabilities_and_pairs(false);
+    }
+
+    #[test]
+    fn epd_filters_capabilities_and_pairs_before_encoding_through_the_engine() {
+        epd_filters_capabilities_and_pairs(true);
+    }
+
+    /// EPD selects a compatible EC consumer even with mixed runtimes and
+    /// connectors, under the legacy encode policy and under the engine.
+    fn epd_filters_capabilities_and_pairs(engine: bool) {
         for media_refs in [true, false] {
             let registry = Arc::new(WorkerRegistry::new());
             let model = "epd-model";
@@ -3960,7 +4291,7 @@ mod tests {
             }
             let stage = WorkerSelectionStage::new(
                 registry,
-                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                epd_policies(engine),
                 WorkerSelectionMode::EncodePrefillDecode,
                 None,
             );
@@ -3989,6 +4320,24 @@ mod tests {
                 assert_eq!(encoders.len(), if image_fanout { 2 } else { 1 });
                 assert_eq!(prefill.url(), "grpc://127.0.0.1:8805");
                 assert_eq!(decode.url(), "grpc://127.0.0.1:8807");
+                // The assignment is narrowed to the encoders that pair with
+                // the chosen prefill side, under either switch value.
+                for assignment in &encoders {
+                    let encoder = assignment.worker.as_ref();
+                    assert_eq!(
+                        encoder.metadata().spec.runtime_type,
+                        runtime,
+                        "an assigned encoder shares the pair's runtime: {}",
+                        encoder.url()
+                    );
+                    if PdProtocol::encode_handoff(runtime) == Some(EncodeHandoff::Push) {
+                        assert!(
+                            ec_pair(encoder, prefill.as_ref()),
+                            "an assigned encoder pairs with the prefill: {}",
+                            encoder.url()
+                        );
+                    }
+                }
             }
             let encoder = stage
                 .worker_registry
@@ -4036,9 +4385,19 @@ mod tests {
         }
     }
 
-    /// EC roles/connectors and E/D vision demands are independent constraints.
     #[test]
     fn epd_enforces_ec_roles_connectors_and_media_demands() {
+        epd_enforces_ec_roles_connectors_and_demands(false);
+    }
+
+    #[test]
+    fn epd_enforces_ec_roles_connectors_and_media_demands_through_the_engine() {
+        epd_enforces_ec_roles_connectors_and_demands(true);
+    }
+
+    /// EC roles/connectors and E/D vision demands are independent
+    /// constraints, under the legacy encode policy and under the engine.
+    fn epd_enforces_ec_roles_connectors_and_demands(engine: bool) {
         for runtime in [RuntimeType::Vllm, RuntimeType::TokenSpeed] {
             for (
                 e_connector,
@@ -4190,7 +4549,7 @@ mod tests {
                 }
                 let stage = WorkerSelectionStage::new(
                     registry,
-                    Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                    epd_policies(engine),
                     WorkerSelectionMode::EncodePrefillDecode,
                     None,
                 );
@@ -4271,11 +4630,219 @@ mod tests {
                                 None
                             )
                             .is_ok(),
-                        "unresolved refs may use a stripped decode leg when no vision D exists"
+                        "unresolved refs may use a stripped decode request when no vision D exists"
                     );
                 }
             }
         }
+    }
+
+    /// An EPD fleet of one runtime: three push encoders on the prefill's
+    /// connector, one prefill, one decode.
+    fn epd_fleet(model: &str) -> Arc<WorkerRegistry> {
+        let registry = Arc::new(WorkerRegistry::new());
+        for (port, role) in [
+            (8820, WorkerType::Encode),
+            (8821, WorkerType::Encode),
+            (8822, WorkerType::Encode),
+            (8823, WorkerType::Prefill),
+            (8824, WorkerType::Decode),
+        ] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(ModelCard::new(model))
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Vllm)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .label("supports_ec_transfer", "true")
+                        .label("mm_processor", "inprocess")
+                        .label("mm_media_ref_schemes", "http,https,data")
+                        .label("ec_connector", "ECCPUConnector")
+                        .label(
+                            "ec_role",
+                            if role == WorkerType::Encode {
+                                "ec_producer"
+                            } else {
+                                "ec_consumer"
+                            },
+                        )
+                        .label("supports_vision", "true")
+                        .label("kv_connector", "NixlConnector")
+                        .build(),
+                ))
+                .unwrap();
+        }
+        registry
+    }
+
+    /// Under `--policy-engine engine` the encode items are the engine's
+    /// decisions: an item's content hash keys its encoder, so equal hashes
+    /// share one and the same hashes land the same way across requests; an
+    /// encoder that is not ready is passed over for the ring's next member
+    /// while an item whose encoder stayed keeps it, and the items return
+    /// when it is ready again.
+    #[test]
+    fn encode_items_through_the_engine_keep_their_owner_and_pass_over_an_unready_encoder() {
+        let model = "epd-engine";
+        let stage = WorkerSelectionStage::new(
+            epd_fleet(model),
+            epd_policies(true),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        let decider = Arc::clone(
+            stage
+                .policy_registry
+                .encode_engine_for()
+                .expect("the engine serves the encode items"),
+        );
+        let select = |hashes: &[Vec<u8>]| {
+            let (encoders, prefill, decode, _) = stage
+                .select_encode_prefill_decode_workers(
+                    model,
+                    PlacementInputs::default(),
+                    hashes,
+                    EpdDemands {
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: false,
+                        image_fanout: true,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("the EPD set is selected"));
+            assert_eq!(prefill.url(), "grpc://127.0.0.1:8823");
+            assert_eq!(decode.url(), "grpc://127.0.0.1:8824");
+            let mut by_item: Vec<(usize, String)> = encoders
+                .iter()
+                .map(|a| (a.item_index, a.worker.url().to_string()))
+                .collect();
+            by_item.sort();
+            by_item.into_iter().map(|(_, url)| url).collect::<Vec<_>>()
+        };
+        let hashes = [vec![1u8, 2], vec![3u8, 4], vec![1u8, 2]];
+        let first = select(&hashes);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0], first[2], "equal hashes share an encoder");
+        assert_eq!(decider.decisions(), 3, "one decision per item");
+        assert_eq!(select(&hashes), first, "the same hashes land the same way");
+        let owner = stage
+            .worker_registry
+            .get_by_url(&first[0])
+            .expect("registered");
+        owner.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        let moved = select(&hashes);
+        assert_ne!(moved[0], first[0], "the unready owner is passed over");
+        assert_eq!(moved[0], moved[2]);
+        if first[1] != first[0] {
+            assert_eq!(moved[1], first[1], "an item whose encoder stayed keeps it");
+        }
+        owner.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        assert_eq!(
+            select(&hashes),
+            first,
+            "the owner is back: its items return"
+        );
+    }
+
+    /// Eight ready encoders of one runtime, for the seam alone (no registry).
+    fn eight_encoders() -> Vec<Arc<dyn Worker>> {
+        (0..8)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8900 + i))
+                        .worker_type(WorkerType::Encode)
+                        .runtime_type(RuntimeType::Vllm)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// The commit re-validates each target of an item under the caller's
+    /// eligibility: when every target of the decision is refused, the item
+    /// is decided once more with those targets excluded and lands on another
+    /// encoder; when nothing is eligible, the item has no encoder.
+    #[test]
+    fn encode_items_re_decide_once_when_every_target_of_an_item_is_refused() {
+        let encoders = eight_encoders();
+        let decider = Arc::clone(
+            epd_policies(true)
+                .encode_engine_for()
+                .expect("the engine serves the encode items"),
+        );
+        let hash = vec![7u8, 7, 7];
+        let pairs = |_: &Arc<dyn Worker>| true;
+        let sees = |_: &Arc<dyn Worker>| true;
+        let request = EncodeRequest {
+            model: "m",
+            pairs_with_prefill: &pairs,
+            vision_capable: &sees,
+            images: 0,
+        };
+        let probe = decider.decide_encode_items(&request, &encoders, &[fingerprint(&hash)], &[]);
+        let refused: Vec<String> = probe[0]
+            .0
+            .pick()
+            .expect("a pick")
+            .targets
+            .iter()
+            .map(|t| encoders[t.position as usize].url().to_string())
+            .collect();
+        assert!(
+            !refused.is_empty() && refused.len() < encoders.len(),
+            "the decision names some of the encoders: {refused:?}"
+        );
+        let before = decider.decisions();
+        let eligible = |worker: &Arc<dyn Worker>| !refused.contains(&worker.url().to_string());
+        let assigned = assign_encode_workers_decided(
+            &decider,
+            EncodeItems {
+                encoders: &encoders,
+                pairs_with_prefill: &pairs,
+                eligible: &eligible,
+                item_hashes: std::slice::from_ref(&hash),
+                model_id: "m",
+                images: false,
+                policy: "consistent_hashing",
+            },
+        )
+        .expect("another encoder takes the item");
+        assert_eq!(assigned.len(), 1);
+        assert!(
+            !refused.contains(&assigned[0].worker.url().to_string()),
+            "the re-decision lands outside the refused targets: {}",
+            assigned[0].worker.url()
+        );
+        assert_eq!(
+            decider.decisions() - before,
+            2,
+            "one decision and one re-decision for the item"
+        );
+        let nobody = |_: &Arc<dyn Worker>| false;
+        assert!(
+            assign_encode_workers_decided(
+                &decider,
+                EncodeItems {
+                    encoders: &encoders,
+                    pairs_with_prefill: &pairs,
+                    eligible: &nobody,
+                    item_hashes: std::slice::from_ref(&hash),
+                    model_id: "m",
+                    images: false,
+                    policy: "consistent_hashing",
+                },
+            )
+            .is_none(),
+            "nothing eligible: the item has no encoder"
+        );
     }
 
     fn vllm_grpc_worker(
@@ -4341,10 +4908,8 @@ mod tests {
         }
 
         let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
             requires_media_refs: true,
-            pipeline: PipelinePin::Any,
+            ..grpc_wire(RuntimeType::Vllm)
         };
         let worker = stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -4405,10 +4970,8 @@ mod tests {
         );
         // The wire pin alone carries the media-refs fact on retries.
         let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
             requires_media_refs: true,
-            pipeline: PipelinePin::Any,
+            ..grpc_wire(RuntimeType::Vllm)
         };
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -4577,10 +5140,9 @@ mod tests {
             let mut ctx = dispatch_ctx(
                 model_id,
                 WireConstraint {
-                    runtime: RuntimeType::Vllm,
-                    connection: ConnectionMode::Grpc,
                     requires_media_refs: true,
                     pipeline: pin,
+                    ..grpc_wire(RuntimeType::Vllm)
                 },
             );
             for _ in 0..6 {
@@ -4814,12 +5376,7 @@ mod tests {
             ))
             .unwrap();
         let stage = regular_stage(Arc::clone(&worker_registry));
-        let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
-            requires_media_refs: false,
-            pipeline: PipelinePin::Any,
-        };
+        let wire = grpc_wire(RuntimeType::Vllm);
 
         let stage = &stage;
         let reselected = |needs_vision: bool| async move {
@@ -5687,12 +6244,7 @@ mod tests {
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
-        let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
-            requires_media_refs: false,
-            pipeline: PipelinePin::Any,
-        };
+        let wire = grpc_wire(RuntimeType::Vllm);
 
         let stage = &stage;
         let prefill_workers = |needs_vision: bool| async move {
@@ -6339,12 +6891,7 @@ mod tests {
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
-        let wire = WireConstraint {
-            runtime: RuntimeType::Vllm,
-            connection: ConnectionMode::Grpc,
-            requires_media_refs: false,
-            pipeline: PipelinePin::Any,
-        };
+        let wire = grpc_wire(RuntimeType::Vllm);
 
         let stage = &stage;
         let decode_workers = |decode_needs_vision: bool| async move {

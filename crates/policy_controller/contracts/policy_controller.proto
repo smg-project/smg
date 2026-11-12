@@ -1,0 +1,961 @@
+// smg.policy.v1: the policy controller's gateway, ingestion, control and
+// replication protocol (design 5.2 and appendix A). The view and decision
+// vocabulary is in policy_plugin.proto; the relay frames carry the engine
+// wire's own messages (smg.grpc.common) unchanged.
+//
+// Versioning: design appendix A (additive within v1). The package is
+// pre-release until the first shipped release that carries it; the rule
+// binds from then on.
+//
+// Scopes and principals: design 5.2. Four credentialed scopes, each
+// mountable on its own listener; the verified principal is transport
+// metadata, never a field a peer fills in. Gateway: Session, Decide,
+// WatchWorkers and Leader; a Hello whose gateway_id is not the verified
+// subject is refused with UNAUTHENTICATED and the stream closes. Ingestion:
+// PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
+// Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
+// WatchRegime), `admin` writes the rest; every call writes an audit event.
+// Replication: Replicate, and GetSnapshot as the re-sync base;
+// ReplicaHello.replica_id must equal the subject. Leader is served to every
+// scope; a standby serves Leader, WatchWorkers, GetSnapshot and GetPolicySpec
+// and answers Session and Decide with NotLeader / Busy { NOT_LEADER }.
+// Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
+// leader's term, every GatewayFrame the gateway's term floor. A gateway
+// raises its floor from Leader and rejects frames below it; the controller
+// refuses a floor above its own term with FAILED_PRECONDITION; a leader past
+// its renew deadline sends NotLeader with an empty address and releases
+// nothing.
+// Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
+// ride the Decide stream as deltas (Credit) and are never taken back; with
+// no credit the gateway decides locally; a Decide whose budget is gone on
+// arrival is answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease; a
+// Decision that arrives after a fallback is answered with Released.
+// Errors (gRPC status): UNAUTHENTICATED no verified principal, or Hello's
+// id is not the subject (the stream closes); PERMISSION_DENIED the scope or
+// role does not cover the RPC; FAILED_PRECONDITION not the leader (a
+// NotLeader in the status details), a floor above the term, a revision or
+// digest guard; INVALID_ARGUMENT a spec or registration rejected (the field
+// path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
+// relay over its per-subscriber budget or a standby over its backlog (a
+// resync_required batch precedes it); UNAVAILABLE a standby not yet synced;
+// ABORTED fenced mid-stream, reconnect through Leader; OUT_OF_RANGE and
+// DATA_LOSS never raised, forwarded as RelayResync. In-band within a stream:
+// Busy, NotLeader, SpecAck { accepted: false }, Decline.
+
+syntax = "proto3";
+package smg.policy.v1;
+
+import "policy_plugin.proto";
+import "common.proto";
+
+service PolicyController {
+  // Gateway scope, one bidirectional stream per gateway: identity, leases,
+  // pins, vetoes and acks in; welcome, terms, spec pushes, pre-emptions out.
+  rpc Session(stream GatewayFrame) returns (stream ControllerFrame);
+  // Gateway scope, one bidirectional stream per gateway runtime thread.
+  rpc Decide(stream DecideRequest) returns (stream DecideAnswer);
+  // Gateway scope, server stream: a snapshot then the tail, resumable by seq.
+  rpc WatchWorkers(WatchWorkersRequest) returns (stream WorkerEvent);
+  // Ingestion scope (relays only), client streams answered once at the end.
+  rpc PushLoad(stream LoadReport) returns (Ack);
+  rpc PushKvEvents(stream RelayKvFrame) returns (Ack);
+  // Control scope, unary.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerEvent);
+  rpc PatchWorker(PatchWorkerRequest) returns (WorkerEvent);
+  rpc DeregisterWorker(DeregisterWorkerRequest) returns (WorkerEvent);
+  rpc GetSnapshot(SnapshotRequest) returns (Snapshot);
+  rpc Explain(ExplainRequest) returns (DecisionRecord);
+  rpc ApplyPolicySpec(ApplyRequest) returns (ApplyResult);
+  rpc GetPolicySpec(GetPolicySpecRequest) returns (PolicySpecDocument);
+  rpc RollbackPolicySpec(RollbackRequest) returns (ApplyResult);
+  // Every scope, unary, served by every replica: a gateway polls it for its
+  // term floor.
+  rpc Leader(LeaderRequest) returns (LeaderInfo);
+  // Control scope, unary.
+  rpc StepDown(StepDownRequest) returns (Ack);
+  // Control scope, server stream.
+  rpc WatchRegime(RegimeRequest) returns (stream Regime);
+  // Replication scope, one bidirectional stream per standby: the leader's
+  // ordered log, acknowledged per batch, cut past a bounded backlog.
+  rpc Replicate(stream ReplicaFrame) returns (stream ReplicationBatch);
+  // Liveness and readiness are grpc.health.v1, not here.
+}
+
+// --- Session: gateway to controller -----------------------------------------
+
+message GatewayFrame {
+  uint64 seq = 1;
+  uint64 term_floor = 2;
+  oneof frame {
+    Hello hello = 3;
+    HelloPage hello_page = 4;
+    Dispatched dispatched = 5;
+    Completed completed = 6;
+    Released released = 7;
+    GatewayVeto veto = 8;
+    SpecAck spec_ack = 9;
+  }
+}
+
+// What the gateway holds; the leases, pins and vetoes follow in HelloPage
+// frames, the counts here size the restore.
+message Hello {
+  // Must equal the verified subject.
+  string gateway_id = 1;
+  uint32 protocol_min = 2;
+  uint32 protocol_max = 3;
+  uint64 term_seen = 4;
+  Locality locality = 5;
+  uint32 decide_streams = 6;
+  // The spec generation its fallback engine runs.
+  uint64 generation = 7;
+  uint32 lease_count = 8;
+  uint32 pin_count = 9;
+  uint32 veto_count = 10;
+  // A reconnect inside the grace period: restore exactly what the pages list
+  // and release at once what they omit (the inverse rule, design 4.3).
+  bool resume = 11;
+  // The gateway's release string, for the audit log.
+  string version = 16;
+  // Never assigned; kept out of use so a later field takes a fresh number.
+  reserved 12 to 15;
+}
+
+message Locality {
+  string zone = 1;
+  // Topology keys as `key=value`, for the placement stages.
+  repeated string topology = 2;
+}
+
+// At most 64 KB a page (about 900 leases); the counts in Hello size the whole.
+message HelloPage {
+  repeated LeaseAssertion leases = 1;
+  repeated Pin pins = 2;
+  repeated VetoAssertion vetoes = 3;
+  bool last = 4;
+}
+
+// A lease the gateway still holds, controller-minted or local (LeaseOrigin).
+message LeaseAssertion {
+  Lease lease = 1;
+  bytes request_id = 2;
+  fixed64 worker_id = 3;
+  uint32 dp_rank = 4;
+  bool dispatched = 5;
+  uint32 age_ms = 6;
+}
+
+// A session pin the gateway holds.
+message Pin {
+  fixed64 key = 1;
+  fixed64 worker_id = 2;
+  uint32 dp_rank = 3;
+  uint32 idle_ms = 4;
+  string model = 5;
+}
+
+// A standing veto re-asserted at reconnect, so the new leader learns it
+// before its next transition.
+message VetoAssertion {
+  fixed64 worker_id = 1;
+  GatewayVeto.Kind kind = 2;
+  uint32 remaining_micros = 3;
+}
+
+message GatewayVeto {
+  fixed64 worker_id = 1;
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_BREAKER = 1;
+    KIND_LIVENESS = 2;
+  }
+  Kind kind = 2;
+  // How long the veto stands; 0 with `clear` lifts it.
+  uint32 for_micros = 3;
+  bool clear = 4;
+}
+
+// The gateway's answer to a SpecPush.
+message SpecAck {
+  uint64 generation = 1;
+  bool accepted = 2;
+  string error = 3;
+}
+
+// --- Session: controller to gateway -----------------------------------------
+
+message ControllerFrame {
+  uint64 seq = 1;
+  uint64 term = 2;
+  oneof frame {
+    Welcome welcome = 3;
+    NotLeader not_leader = 4;
+    Preempt preempt = 5;
+    SpecPush spec = 6;
+  }
+}
+
+// The answer to Hello; `principal` echoes what the transport verified.
+message Welcome {
+  uint32 protocol = 1;
+  uint64 generation = 2;
+  string controller_id = 3;
+  Principal principal = 4;
+  NeedsSummary needs = 5;
+  // Block size and seed rule per model, for the host's hashing step.
+  repeated ModelHashing hashing = 6;
+  // Initial credit per Decide stream; a new Decide stream starts here again.
+  uint32 decide_window = 7;
+  uint32 max_decide_streams = 8;
+  // The stream rule's grace period and the default dispatch TTL.
+  uint32 grace_period_ms = 9;
+  uint32 dispatch_ttl_ms = 10;
+  // How often the gateway polls Leader for its term floor.
+  uint32 leader_poll_ms = 11;
+  uint32 leases_restored = 12;
+  uint32 pins_restored = 13;
+}
+
+// What the transport verified.
+message Principal {
+  string subject = 1;
+  enum Scope {
+    SCOPE_UNSPECIFIED = 0;
+    SCOPE_GATEWAY = 1;
+    SCOPE_INGESTION = 2;
+    SCOPE_CONTROL = 3;
+    SCOPE_REPLICATION = 4;
+  }
+  Scope scope = 2;
+  enum Method {
+    METHOD_UNSPECIFIED = 0;
+    METHOD_MTLS = 1;
+    METHOD_BEARER = 2;
+    METHOD_PEER_CREDENTIAL = 3;
+  }
+  Method method = 3;
+  // Control scope only: `user` or `admin`.
+  string role = 4;
+}
+
+// What the host must feed per model and role, from the spec's validation.
+message NeedsSummary {
+  repeated ModelNeeds models = 1;
+}
+
+message ModelNeeds {
+  string model = 1;
+  Role role = 2;
+  bool text = 3;
+  bool token_hashes = 4;
+  bool text_hashes = 5;
+  bool loads = 6;
+  bool events = 7;
+  bool ring = 8;
+  bool headers = 9;
+  bool media = 10;
+}
+
+message ModelHashing {
+  string model = 1;
+  uint32 block_size = 2;
+  HashKind kind = 3;
+  // How the namespace seed is derived (salt, adapter, extra key order).
+  string seed_rule = 4;
+}
+
+// An empty address means fenced, no leader known: re-resolve through Leader.
+message NotLeader {
+  string leader_address = 1;
+  string successor_id = 2;
+}
+
+// Reserved: abort the named lease (off unless admission.eviction).
+message Preempt {
+  fixed64 lease_id = 1;
+  string reason = 2;
+}
+
+// The generation's document for every fallback engine; answered by SpecAck.
+message SpecPush {
+  uint64 generation = 1;
+  string digest = 2;
+  bytes document = 3;
+  // `yaml` or `json`.
+  string format = 4;
+  NeedsSummary needs = 5;
+}
+
+// --- Decide: one stream per gateway runtime thread --------------------------
+
+// Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
+// repeated Decide after a stream reset returns the standing decision.
+message DecideRequest {
+  bytes request_id = 1;
+  RequestFacts facts = 2;
+  Constraints constraints = 3;
+}
+
+message DecideAnswer {
+  // Empty on a Credit frame.
+  bytes request_id = 1;
+  uint64 term = 2;
+  oneof answer {
+    Decision decision = 3;
+    Busy busy = 4;
+    Credit credit = 5;
+  }
+}
+
+// Credit added to this Decide stream, a delta as HTTP/2's WINDOW_UPDATE:
+// each DecideRequest spends one, no answer returns one, the controller never
+// takes credit back; a new stream starts again at Welcome.decide_window.
+message Credit {
+  uint32 window = 1;
+}
+
+// --- WatchWorkers: membership, health, the id-to-URL map, the needs ---------
+
+message WatchWorkersRequest {
+  // Empty for every model.
+  repeated string models = 1;
+  // 0: a snapshot first, then the tail; otherwise the tail after this seq,
+  // exclusive; when the buffer no longer holds seq + 1 the server answers one
+  // SnapshotRequired and ends the stream. membership_epoch moves only on a
+  // membership change and is no resume point.
+  uint64 resume_seq = 2;
+  bool with_needs = 3;
+}
+
+message WorkerEvent {
+  uint64 seq = 1;
+  uint64 membership_epoch = 2;
+  oneof event {
+    WorkerSnapshot snapshot = 3;
+    WorkerRow registered = 4;
+    Replaced replaced = 5;
+    Removed removed = 6;
+    StatusChanged status = 7;
+    WorkerRow relabelled = 8;
+    NeedsSummary needs = 9;
+    // The tail cannot resume after the requested seq: the stream ends and the
+    // watcher reconnects with resume_seq 0.
+    SnapshotRequired snapshot_required = 10;
+  }
+}
+
+// Paged at 128 rows under one epoch; a watcher switches at `last`.
+message WorkerSnapshot {
+  repeated WorkerRow workers = 1;
+  bool last = 2;
+}
+
+message SnapshotRequired {
+  uint64 oldest_seq = 1;
+}
+
+// Same registration key, new incarnation.
+message Replaced {
+  WorkerRow old = 1;
+  WorkerRow new = 2;
+  // Runtime and breaker state carried over.
+  bool state_carried = 3;
+}
+
+message Removed {
+  fixed64 worker_id = 1;
+  string registration_key = 2;
+  uint64 revision = 3;
+  bool draining = 4;
+}
+
+enum WorkerStatus {
+  WORKER_STATUS_UNSPECIFIED = 0;
+  WORKER_STATUS_PENDING = 1;
+  WORKER_STATUS_READY = 2;
+  WORKER_STATUS_NOT_READY = 3;
+  WORKER_STATUS_DRAINING = 4;
+}
+
+message StatusChanged {
+  fixed64 worker_id = 1;
+  WorkerStatus old = 2;
+  WorkerStatus new = 3;
+  // HealthFlag bits after the transition.
+  uint32 health = 4;
+}
+
+message WorkerRow {
+  fixed64 id = 1;
+  string registration_key = 2;
+  uint64 incarnation = 3;
+  string url = 4;
+  // The one wire this registration serves (one URL on one wire).
+  WireMode wire = 5;
+  Role role = 6;
+  string runtime = 7;
+  repeated string models = 8;
+  uint32 dp_size = 9;
+  map<string, string> labels = 10;
+  string zone = 11;
+  WorkerStatus status = 12;
+  uint64 revision = 13;
+  // HealthFlag bits.
+  uint32 health = 14;
+  Reachability reachable = 15;
+  PairingDescriptor pairing = 16;
+  OverloadThresholds overload = 17;
+  Signals signals = 18;
+  uint32 kv_block_size = 19;
+  // The registration label `policy`: a lowest-precedence binding of the model.
+  string policy = 20;
+  repeated string topology = 21;
+  uint32 max_running = 22;
+}
+
+// A host-local wire is reachable from one gateway only.
+message Reachability {
+  oneof scope {
+    bool any = 1;
+    string gateway_id = 2;
+  }
+}
+
+// What one PD worker offers a rendezvous partner, and the store's class.
+message PairingDescriptor {
+  string protocol = 1;
+  string connector = 2;
+  string transport = 3;
+  string version = 4;
+  uint32 bootstrap_port = 5;
+  string bootstrap_host = 6;
+  map<string, string> kv_layout = 7;
+  uint32 pair_class = 8;
+  bool ec_producer = 9;
+  bool ec_consumer = 10;
+  bool vision = 11;
+}
+
+// Per-worker overrides over the spec's defaults; unset means the spec's value.
+message OverloadThresholds {
+  optional uint32 queue_limit = 1;
+  optional uint32 kv_usage_permille = 2;
+  optional uint32 in_flight_limit = 3;
+  optional uint32 waiting_tokens_limit = 4;
+}
+
+// How the controller learns the worker's loads and events.
+message Signals {
+  bool events = 1;
+  bool loads = 2;
+  bool scrape = 3;
+  uint32 scrape_interval_ms = 4;
+  // The scrape source's engine-family name.
+  string scrape_family = 5;
+}
+
+// --- Ingestion scope: relays only -------------------------------------------
+
+// One load record of one rank: the engine wire's EngineLoad unchanged, with
+// the worker, the rank and the relay's receipt; a gateway in front of a
+// host-local wire forwards what it received, its verified subject the origin.
+message LoadReport {
+  fixed64 worker_id = 1;
+  // When the relay has no id yet (a worker it registered itself).
+  string registration_key = 2;
+  uint32 dp_rank = 3;
+  smg.grpc.common.EngineLoad record = 4;
+  // EVENTS, POLL or SCRAPE at the relay; the controller records the RELAY hop.
+  SignalSource source = 5;
+  // The relay's receipt, microseconds since its stream opened.
+  uint64 received_offset_micros = 6;
+  uint64 relay_seq = 7;
+}
+
+// The engine wire's event batch unchanged, or the stream status the relay saw.
+message RelayKvFrame {
+  fixed64 worker_id = 1;
+  string registration_key = 2;
+  oneof frame {
+    smg.grpc.common.KvEventBatch batch = 3;
+    RelaySubscribed subscribed = 4;
+    RelayResync resync = 5;
+    RelayEnded ended = 6;
+  }
+  uint64 received_offset_micros = 7;
+}
+
+message RelaySubscribed {
+  uint64 start_sequence_number = 1;
+  bool loads_only = 2;
+  uint32 dp_size = 3;
+}
+
+// The engine wire's status codes and stream ends as frames.
+message RelayResync {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_OUT_OF_RANGE = 1;
+    REASON_DATA_LOSS = 2;
+    REASON_STREAM_ENDED = 3;
+    REASON_SNAPSHOT_ABANDONED = 4;
+    REASON_RELAY_RESTART = 5;
+    REASON_ENGINE_REPLACED = 6;
+  }
+  Reason reason = 1;
+  uint32 dp_rank = 2;
+  uint64 resume_from = 3;
+}
+
+message RelayEnded {
+  string reason = 1;
+}
+
+// --- Control scope: membership ----------------------------------------------
+
+message RegisterWorkerRequest {
+  WorkerSpec spec = 1;
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    MODE_ADD = 1;
+    MODE_REPLACE = 2;
+    MODE_UPSERT = 3;
+  }
+  Mode mode = 2;
+  // Wait for the handshake; otherwise the row is answered PENDING and the
+  // handshake's result is a StatusChanged on WatchWorkers.
+  bool wait_ready = 3;
+}
+
+// A registration before the handshake fills the row.
+message WorkerSpec {
+  string url = 1;
+  WireMode wire = 2;
+  Role role = 3;
+  string runtime = 4;
+  repeated string models = 5;
+  map<string, string> labels = 6;
+  string zone = 7;
+  OverloadThresholds overload = 8;
+  uint32 kv_block_size = 9;
+  PairingDescriptor pairing = 10;
+  // 0: discover the data-parallel width (always on).
+  uint32 dp_size = 11;
+  Signals signals = 12;
+  repeated string topology = 13;
+}
+
+message PatchWorkerRequest {
+  fixed64 worker_id = 1;
+  map<string, string> labels = 2;
+  repeated string remove_labels = 3;
+  OverloadThresholds overload = 4;
+  // The row's revision the caller read; FAILED_PRECONDITION when it moved.
+  uint64 revision = 5;
+}
+
+message DeregisterWorkerRequest {
+  fixed64 worker_id = 1;
+  uint64 revision = 2;
+  // Drain (no new leases, Removed after the last Completed) instead of an
+  // immediate removal that releases its leases.
+  bool drain = 3;
+}
+
+// --- Control scope: the store -----------------------------------------------
+
+// Redacted by default: URLs lose credentials, session keys and header values
+// are fingerprinted, plugin state dumps hash identifiers. The replication
+// scope's call is served complete and unredacted: a standby's re-sync base.
+message SnapshotRequest {
+  enum Slice {
+    SLICE_UNSPECIFIED = 0;
+    SLICE_WORKERS = 1;
+    SLICE_HEALTH = 2;
+    SLICE_LOADS = 3;
+    SLICE_SESSIONS = 4;
+    SLICE_LEASES = 5;
+    SLICE_PAIRS = 6;
+    SLICE_SPEC = 7;
+    SLICE_PLUGINS = 8;
+    SLICE_KV_INDEX = 9;
+    SLICE_GATEWAYS = 10;
+  }
+  // Empty for every slice.
+  repeated Slice slices = 1;
+  repeated string models = 2;
+  // Admin only in the control scope: identifiers in clear.
+  bool plain_identifiers = 3;
+  // Rows per slice at most; `truncated` says when it bit.
+  uint32 limit = 4;
+}
+
+message Snapshot {
+  uint64 term = 1;
+  uint64 generation = 2;
+  string controller_id = 3;
+  repeated WorkerRow workers = 4;
+  repeated HealthRow health = 5;
+  repeated LoadSample loads = 6;
+  repeated SessionRow sessions = 7;
+  repeated LeaseRow leases = 8;
+  repeated PairRow pairs = 9;
+  SpecStatus spec = 10;
+  repeated PluginState plugins = 11;
+  KvIndexSummary kv_index = 12;
+  repeated GatewayRow gateways = 13;
+  bool truncated = 14;
+  // The log position the snapshot is consistent with (a standby rejoins with
+  // `last_applied_seq` here); non-zero only on a complete, unredacted snapshot
+  // of the replication scope, zero on a partial or redacted one.
+  uint64 replication_seq = 15;
+  // The interned-id table at that position.
+  IdAssignment ids = 16;
+  // The current generation first, then every retained one in `spec.retained`'s
+  // order, each as the log replicates it (status and document), so a standby
+  // answers GetPolicySpec alike from either path; present with
+  // `replication_seq`.
+  repeated GenerationEvent documents = 17;
+}
+
+// The health precedence's inputs.
+message HealthRow {
+  fixed64 worker_id = 1;
+  uint32 health = 2;
+  uint32 probe_failures = 3;
+  // Gateways with a standing veto on the worker.
+  uint32 vetoing_gateways = 4;
+  // Gateways whose Completed reports succeeded within the last probe interval.
+  uint32 reporting_ok = 5;
+  uint32 since_ms = 6;
+}
+
+message LoadSample {
+  fixed64 worker_id = 1;
+  uint32 dp_rank = 2;
+  LoadRow load = 3;
+}
+
+message SessionRow {
+  fixed64 key = 1;
+  fixed64 worker_id = 2;
+  uint32 dp_rank = 3;
+  uint32 idle_ms = 4;
+  string model = 5;
+}
+
+message LeaseRow {
+  Lease lease = 1;
+  string gateway_id = 2;
+  bytes request_id = 3;
+  fixed64 worker_id = 4;
+  uint32 dp_rank = 5;
+  uint32 age_ms = 6;
+  bool dispatched = 7;
+}
+
+message PairRow {
+  fixed64 prefill_id = 1;
+  repeated fixed64 decodes = 2 [packed = true];
+  uint32 pair_class = 3;
+  uint32 slots_free = 4;
+}
+
+enum ApplyMode {
+  APPLY_MODE_UNSPECIFIED = 0;
+  APPLY_MODE_ENFORCE = 1;
+  // A new generation runs as the shadow of the current one.
+  APPLY_MODE_AUDIT = 2;
+  // Validate and report the needs diff; nothing persisted.
+  APPLY_MODE_DRY_RUN = 3;
+}
+
+message SpecStatus {
+  uint64 generation = 1;
+  string digest = 2;
+  int64 applied_unix_micros = 3;
+  ApplyMode mode = 4;
+  // Generations retained for RollbackPolicySpec.
+  repeated uint64 retained = 5 [packed = true];
+  // `file` or `api`.
+  string source = 6;
+}
+
+// A bounded, redacted dump per plugin instance.
+message PluginState {
+  string plugin = 1;
+  string digest = 2;
+  uint32 instances = 3;
+  uint64 traps = 4;
+  uint64 budget_hits = 5;
+  uint64 declines = 6;
+  bool breaker_open = 7;
+  bytes state = 8;
+  bool state_truncated = 9;
+}
+
+message KvIndexSummary {
+  uint64 blocks = 1;
+  uint32 workers = 2;
+  uint32 ranks_live = 3;
+  uint32 ranks_resyncing = 4;
+  uint32 models = 5;
+}
+
+message GatewayRow {
+  string gateway_id = 1;
+  uint64 acknowledged_generation = 2;
+  uint32 decide_streams = 3;
+  uint32 leases = 4;
+  string zone = 5;
+  uint32 idle_ms = 6;
+  uint32 protocol = 7;
+}
+
+// --- Control scope: Explain and the spec ------------------------------------
+
+message ExplainRequest {
+  oneof key {
+    fixed64 decision_id = 1;
+    bytes request_id = 2;
+  }
+  // With a request id: which gateway's.
+  string gateway_id = 3;
+}
+
+// The durable record of one decision: names resolved from the generation's
+// spec, identities redacted unless the principal is admin and asked.
+message DecisionRecord {
+  fixed64 decision_id = 1;
+  bytes request_id = 2;
+  string gateway_id = 3;
+  uint64 generation = 4;
+  uint32 binding = 5;
+  // A digest of the view as decided, for replay checks.
+  fixed64 view_digest = 6;
+  RequestFacts request = 7;
+  repeated Scored candidates = 8;
+  Decision decision = 9;
+  // Which exposure each plugin saw.
+  repeated PluginProjection projections = 10;
+  // Joined later from the lifecycle; unset until then.
+  Completed outcome = 11;
+  int64 at_unix_micros = 12;
+  string profile_name = 13;
+  string plan_name = 14;
+  string picker_name = 15;
+  repeated string filter_names = 16;
+  repeated string scorer_names = 17;
+}
+
+message PluginProjection {
+  string plugin = 1;
+  Exposure exposure = 2;
+}
+
+message ApplyRequest {
+  bytes document = 1;
+  // `yaml` or `json`.
+  string format = 2;
+  ApplyMode mode = 3;
+  // The digest of the generation the caller edited; FAILED_PRECONDITION when
+  // another apply landed first.
+  string expected_digest = 4;
+}
+
+// Persisted first, then applied; under `source: file` the answer is read_only.
+message ApplyResult {
+  bool accepted = 1;
+  uint64 generation = 2;
+  string digest = 3;
+  repeated SpecIssue issues = 4;
+  NeedsDiff needs = 5;
+  bool read_only = 6;
+  string audit_id = 7;
+}
+
+message SpecIssue {
+  string field_path = 1;
+  string message = 2;
+  // The plugin the issue is about, when one.
+  string plugin = 3;
+}
+
+message NeedsDiff {
+  NeedsSummary before = 1;
+  NeedsSummary after = 2;
+}
+
+message GetPolicySpecRequest {
+  // 0 for the current generation.
+  uint64 generation = 1;
+}
+
+message PolicySpecDocument {
+  uint64 generation = 1;
+  string digest = 2;
+  bytes document = 3;
+  string format = 4;
+  int64 applied_unix_micros = 5;
+  ApplyMode mode = 6;
+  repeated GatewayAckRow acks = 7;
+}
+
+message GatewayAckRow {
+  string gateway_id = 1;
+  uint64 generation = 2;
+  bool accepted = 3;
+  string error = 4;
+}
+
+message RollbackRequest {
+  uint64 generation = 1;
+}
+
+// --- Leadership and the regime ----------------------------------------------
+
+message LeaderRequest {
+  // Empty for the controller's own lease; a model for its group's lease.
+  string model = 1;
+}
+
+message LeaderInfo {
+  string controller_id = 1;
+  // `host:port`, dialable without a Service.
+  string address = 2;
+  uint64 term = 3;
+  bool is_leader = 4;
+  // Synced on replication lag, live ranks and generation (design 5.4).
+  bool synced = 5;
+  SyncState sync = 6;
+  repeated GroupLeader groups = 7;
+  uint32 protocol_min = 8;
+  uint32 protocol_max = 9;
+}
+
+message SyncState {
+  uint32 replication_lag_ms = 1;
+  uint32 ranks_live = 2;
+  uint32 ranks_total = 3;
+  uint32 ranks_resyncing = 4;
+  uint64 generation = 5;
+}
+
+message GroupLeader {
+  string model_group = 1;
+  string controller_id = 2;
+  string address = 3;
+  uint64 term = 4;
+}
+
+message StepDownRequest {
+  string successor = 1;
+  // Bounded wait for a synced successor; then the lease is released anyway.
+  uint32 wait_ms = 2;
+}
+
+message RegimeRequest {
+  repeated string models = 1;
+  uint32 interval_ms = 2;
+}
+
+// For autoscalers: per model group and zone.
+message Regime {
+  string model_group = 1;
+  string zone = 2;
+  OverloadRegime regime = 3;
+  uint32 queued = 4;
+  uint32 in_flight = 5;
+  uint32 median_report_age_ms = 6;
+  // Free capacity as a fraction of the healthy capacity, 0 to 1.
+  float headroom = 7;
+  uint32 healthy_workers = 8;
+  uint64 generation = 9;
+}
+
+// --- Replication: the typed log a standby applies ---------------------------
+
+// Reservations and their ends, pins, membership, health, loads and
+// generations with their documents; never credits (rebuilt from Hello).
+// IdAssignment interns worker ids in the same order on every replica.
+message ReplicaFrame {
+  oneof frame {
+    ReplicaHello hello = 1;
+    ReplicationAck ack = 2;
+  }
+}
+
+message ReplicaHello {
+  string replica_id = 1;
+  uint64 last_applied_seq = 2;
+  uint64 term_seen = 3;
+  // Events the standby can hold unacknowledged; the leader cuts a slower one.
+  uint32 max_backlog = 4;
+}
+
+message ReplicationAck {
+  uint64 seq = 1;
+}
+
+message ReplicationBatch {
+  uint64 first_seq = 1;
+  uint64 term = 2;
+  repeated ReplicationEvent events = 3;
+  // The standby's backlog was cut: re-sync from GetSnapshot, then rejoin.
+  bool resync_required = 4;
+}
+
+message ReplicationEvent {
+  oneof event {
+    WorkerEvent membership = 1;
+    HealthRow health = 2;
+    LoadSample load = 3;
+    SessionRow pin = 4;
+    LeaseRow reservation = 5;
+    GenerationEvent generation = 6;
+    IdAssignment ids = 7;
+    LeaseEnd lease_end = 8;
+  }
+}
+
+// A generation as the leader applied it (the status, the document the
+// gateways receive), so a standby serves GetPolicySpec and RollbackPolicySpec
+// and runs it after promotion; a rollback replicates the restored one alike.
+message GenerationEvent {
+  SpecStatus status = 1;
+  SpecPush document = 2;
+}
+
+// A reservation's end, keyed as its row is: the gateway, the lease id
+// (LeaseOrigin, with its bounds) and the side (a pair's two sides share an
+// id); the standby drops the row at once, never at the lease's term.
+message LeaseEnd {
+  string gateway_id = 1;
+  fixed64 lease_id = 2;
+  Side side = 3;
+  enum Cause {
+    CAUSE_UNSPECIFIED = 0;
+    // Completed of its side.
+    CAUSE_COMPLETED = 1;
+    // Released by the gateway; `reason` says why.
+    CAUSE_RELEASED = 2;
+    // The stream rule's grace passed without a Completed.
+    CAUSE_EXPIRED = 3;
+    // An immediate deregistration released the worker's leases.
+    CAUSE_WORKER_REMOVED = 4;
+  }
+  Cause cause = 4;
+  Released.Reason reason = 5;
+}
+
+message IdAssignment {
+  repeated IdEntry entries = 1;
+}
+
+message IdEntry {
+  fixed64 worker_id = 1;
+  string registration_key = 2;
+  uint64 incarnation = 3;
+  // The position the index interns the worker at.
+  uint32 interned = 4;
+}

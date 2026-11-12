@@ -17,6 +17,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use axum::{
@@ -31,7 +32,7 @@ use axum::{
     serve::ListenerExt,
     Json, Router,
 };
-use futures::{stream, Stream};
+use futures::{stream, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::{
     net::TcpListener,
@@ -43,7 +44,7 @@ use crate::{
     config::{Config, Role},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, NewRequest},
-    script::{self, Answer},
+    script::{self, Answer, MatchedStop},
 };
 
 /// The bootstrap port a scheduler takes without being told one, and the
@@ -77,6 +78,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/generate", post(generate))
+        .route("/v1/messages", post(messages))
         .route("/v1/loads", get(loads))
         .route("/server_info", get(server_info))
         .route("/get_server_info", get(server_info))
@@ -298,6 +300,12 @@ async fn generate(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     handle(Route::Generate, state, body).await
 }
 
+/// `POST /v1/messages`, the Messages API: the same answers as chat, in the
+/// Messages shape ([`handle_messages`]).
+async fn messages(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    handle_messages(state, body).await
+}
+
 /// `POST /flush_cache`: the engine's cache cleared at once (a canned worker
 /// has none), answered 200 as the engines' servers answer it.
 async fn flush_cache(State(state): State<Arc<AppState>>) -> Response {
@@ -473,20 +481,25 @@ fn prompt_side_response(
     Json(body).into_response()
 }
 
-async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
-    let endpoint = route.endpoint();
-    // In flight from here until the response is complete or its stream is
-    // done, so a shutdown knows what it waits for and this worker's load
-    // report counts it.
-    let in_flight = InFlight::enter_on(&state.in_flight);
-    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+/// A request as every completion route and the Messages route read it: the
+/// body, whether it asked for a stream, and the prompt's text and synthetic
+/// ids.
+struct Incoming {
+    parsed: Value,
+    stream_requested: bool,
+    prompt_text: String,
+    prompt_ids: Vec<u32>,
+}
+
+fn incoming(state: &AppState, body: &[u8]) -> Result<Incoming, Response> {
+    let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     // A disaggregated worker reads the rendezvous the gateway injected before
     // anything is spent on the request: a request without it went to the
     // wrong pool, or came from a gateway that is not pairing. The check is
     // pure, so an armed fault waits for a request this side serves.
     if state.cfg.role.is_some() {
         if let Err(why) = bootstrap_of(&parsed, state.bootstrap_port) {
-            return bad_request(why);
+            return Err(bad_request(why));
         }
     }
     let stream_requested = parsed
@@ -504,6 +517,88 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
             String::new()
         };
     let prompt_ids = synth_token_ids(&prompt_text);
+    Ok(Incoming {
+        parsed,
+        stream_requested,
+        prompt_text,
+        prompt_ids,
+    })
+}
+
+/// The engine simulator's side of a request: the answer channel, the cut an
+/// armed fault takes after some output, and the prompt's token count.
+struct Submitted {
+    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
+    prompt_tokens: u32,
+}
+
+/// Submit a request to the engine simulator: the fault hook's stall served
+/// first, its status before admission answered instead (`Err`), its cut
+/// after some output carried along for the answer to apply.
+async fn submit_realistic(
+    engine: &Engine,
+    cfg: &Config,
+    parsed: &Value,
+    prompt_ids: Vec<u32>,
+) -> Result<Submitted, Response> {
+    // The fault hook's answer for this request, when one is armed: a
+    // stall, a status before admission, or a cut after some output.
+    let injected = engine.inject();
+    if let Some(fault) = injected {
+        if !fault.stall.is_zero() {
+            tokio::time::sleep(fault.stall).await;
+        }
+        if fault.status != 0 && fault.after_tokens.is_none() {
+            engine.record_failure();
+            return Err(injected_error(fault.status));
+        }
+    }
+    // An HTTP worker has no engine-failure frame on its wire: an armed
+    // `finish=error` cuts with a 500 here.
+    let cut = injected.and_then(|fault| {
+        let status = if fault.finish_error {
+            500
+        } else {
+            fault.status
+        };
+        fault
+            .after_tokens
+            .map(|after| (after, status, engine.cut_counter()))
+    });
+    let prompt_tokens = u32::try_from(prompt_ids.len()).unwrap_or(u32::MAX);
+    let max_new = extract_max_tokens(parsed).unwrap_or(cfg.output_tokens);
+    let request_id = next_request_id();
+    let (tx, rx) = mpsc::unbounded_channel();
+    engine.submit(NewRequest {
+        request_id,
+        prompt_token_ids: prompt_ids,
+        max_new,
+        choice: 0,
+        events: tx,
+    });
+    Ok(Submitted {
+        rx,
+        cut,
+        prompt_tokens,
+    })
+}
+
+async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
+    let endpoint = route.endpoint();
+    // In flight from here until the response is complete or its stream is
+    // done, so a shutdown knows what it waits for and this worker's load
+    // report counts it.
+    let in_flight = InFlight::enter_on(&state.in_flight);
+    let Incoming {
+        parsed,
+        stream_requested,
+        prompt_text,
+        prompt_ids,
+    } = match incoming(&state, &body) {
+        Ok(incoming) => incoming,
+        Err(refused) => return refused,
+    };
 
     // A prefill worker's answer: the prompt side's completion alone, ahead
     // of the script and of either engine mode. The decode side of the pair
@@ -562,40 +657,14 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
 
     // Realistic mode: drive the engine simulator.
     if let Some(engine) = &state.engine {
-        // The fault hook's answer for this request, when one is armed: a
-        // stall, a status before admission, or a cut after some output.
-        let injected = engine.inject();
-        if let Some(fault) = injected {
-            if !fault.stall.is_zero() {
-                tokio::time::sleep(fault.stall).await;
-            }
-            if fault.status != 0 && fault.after_tokens.is_none() {
-                engine.record_failure();
-                return injected_error(fault.status);
-            }
-        }
-        // An HTTP worker has no engine-failure frame on its wire: an armed
-        // `finish=error` cuts with a 500 here.
-        let cut = injected.and_then(|fault| {
-            let status = if fault.finish_error {
-                500
-            } else {
-                fault.status
-            };
-            fault
-                .after_tokens
-                .map(|after| (after, status, engine.cut_counter()))
-        });
-        let prompt_tokens = prompt_ids.len() as u32;
-        let max_new = extract_max_tokens(&parsed).unwrap_or(state.cfg.output_tokens);
-        let request_id = next_request_id();
-        let (tx, rx) = mpsc::unbounded_channel();
-        engine.submit(NewRequest {
-            request_id,
-            prompt_token_ids: prompt_ids,
-            max_new,
-            events: tx,
-        });
+        let Submitted {
+            rx,
+            cut,
+            prompt_tokens,
+        } = match submit_realistic(engine, &state.cfg, &parsed, prompt_ids).await {
+            Ok(submitted) => submitted,
+            Err(refused) => return refused,
+        };
         let model = state.cfg.model_id.clone();
         return if stream_requested {
             realistic_sse(rx, model, endpoint, cut, in_flight).into_response()
@@ -614,6 +683,413 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
     } else {
         Json(canned_answer(route, &state.cfg)).into_response()
     }
+}
+
+// ── Messages responses ─────────────────────────────────────────────────────
+
+/// The Messages route's answer: the decisions of [`handle`] (the prompt side,
+/// a scripted answer, the engine simulator, the canned answer) in the
+/// Messages shape. One JSON message, or the event stream `message_start`,
+/// `content_block_start`, one `content_block_delta` per text piece,
+/// `content_block_stop`, `message_delta` with the stop reason and the output
+/// tokens, then `message_stop`; no `[DONE]`. The stop reason comes from the
+/// answer's finish reason ([`stop_reason`]); logprobs and `n` have no
+/// Messages form, so one answer is taken and none are read.
+async fn handle_messages(state: Arc<AppState>, body: Bytes) -> Response {
+    let in_flight = InFlight::enter_on(&state.in_flight);
+    let Incoming {
+        parsed,
+        stream_requested,
+        prompt_text,
+        prompt_ids,
+    } = match incoming(&state, &body) {
+        Ok(incoming) => incoming,
+        Err(refused) => return refused,
+    };
+    let model = state.cfg.model_id.clone();
+    let prompt_tokens = u32::try_from(prompt_ids.len()).unwrap_or(u32::MAX);
+
+    if state.cfg.role == Some(Role::Prefill) {
+        let finish_reason = match prompt_side_admission(&state).await {
+            Ok(finish_reason) => finish_reason,
+            Err(refused) => return refused,
+        };
+        let answer = MessageAnswer {
+            text: String::new(),
+            pieces: Vec::new(),
+            finish_reason: finish_reason.to_string(),
+            stop_sequence: None,
+            input_tokens: prompt_tokens,
+            output_tokens: 0,
+            delay: Duration::ZERO,
+        };
+        return answer.response(&model, stream_requested, in_flight).await;
+    }
+
+    match script::take_per_choice(&state.name, &prompt_ids, Some(&prompt_text), 1) {
+        Ok(Some(answers)) => {
+            if let Some(answer) = answers.into_iter().next() {
+                let answer = answer.cut_to(extract_max_tokens(&parsed));
+                let answer = MessageAnswer::scripted(&answer, prompt_ids.len());
+                return answer.response(&model, stream_requested, in_flight).await;
+            }
+        }
+        Ok(None) => {}
+        Err(why) => return (StatusCode::PRECONDITION_FAILED, why).into_response(),
+    }
+
+    // Realistic mode: drive the engine simulator.
+    if let Some(engine) = &state.engine {
+        let Submitted {
+            rx,
+            cut,
+            prompt_tokens,
+        } = match submit_realistic(engine, &state.cfg, &parsed, prompt_ids).await {
+            Ok(submitted) => submitted,
+            Err(refused) => return refused,
+        };
+        return if stream_requested {
+            let frames = messages_realistic_frames(rx, model, prompt_tokens, cut);
+            Sse::new(in_flight.until_done(frames)).into_response()
+        } else {
+            messages_realistic_body(rx, &model, prompt_tokens, cut).await
+        };
+    }
+
+    if !state.cfg.gen_delay.is_zero() {
+        tokio::time::sleep(state.cfg.gen_delay).await;
+    }
+    let answer = MessageAnswer {
+        text: "mock".to_string(),
+        pieces: vec![
+            "x".to_string();
+            usize::try_from(state.cfg.output_tokens).unwrap_or(usize::MAX)
+        ],
+        finish_reason: "stop".to_string(),
+        stop_sequence: None,
+        input_tokens: 1,
+        output_tokens: state.cfg.output_tokens,
+        delay: Duration::ZERO,
+    };
+    answer.response(&model, stream_requested, in_flight).await
+}
+
+/// One Messages answer, however it was decided: the text pieces its stream
+/// carries as one delta each and the text its JSON body carries, the finish
+/// reason and matched stop that become its stop reason, the token counts
+/// its usage reports, and the pause between two deltas.
+struct MessageAnswer {
+    text: String,
+    pieces: Vec<String>,
+    finish_reason: String,
+    stop_sequence: Option<Value>,
+    input_tokens: u32,
+    output_tokens: u32,
+    delay: Duration,
+}
+
+impl MessageAnswer {
+    /// A scripted answer in the Messages shape: its text frames as the deltas.
+    fn scripted(answer: &Answer, prompt_len: usize) -> Self {
+        MessageAnswer {
+            text: answer.text(),
+            pieces: answer
+                .text_frames()
+                .iter()
+                .map(script::Frame::text)
+                .collect(),
+            finish_reason: answer.finish_reason.clone(),
+            // A text stop is the sequence the Messages shape names; a token id
+            // is no sequence, so that answer keeps its finish reason's stop reason.
+            stop_sequence: match answer.matched_stop.as_ref() {
+                Some(MatchedStop::Text(text)) => Some(json!(text)),
+                Some(MatchedStop::Token(_)) | None => None,
+            },
+            input_tokens: answer.prompt_tokens(prompt_len),
+            output_tokens: answer.completion_tokens(),
+            delay: answer.delay,
+        }
+    }
+
+    fn stop_reason(&self) -> &'static str {
+        stop_reason(&self.finish_reason, self.stop_sequence.is_some())
+    }
+
+    /// The answer on the wire: the event stream, or one JSON body after the
+    /// pauses its deltas would have taken.
+    async fn response(self, model: &str, stream: bool, in_flight: InFlight) -> Response {
+        // An HTTP worker has no engine-failure frame on its wire and the Messages
+        // shape has no `error` stop reason: an `error` finish, armed or scripted,
+        // answers a 500 here. The completion routes cut an armed one the same
+        // way and pass a scripted one through as a 200 with its finish reason.
+        if self.finish_reason == "error" {
+            return injected_error(500);
+        }
+        if stream {
+            return Sse::new(in_flight.until_done(self.events(model))).into_response();
+        }
+        let pauses =
+            self.delay * u32::try_from(self.pieces.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        if !pauses.is_zero() {
+            tokio::time::sleep(pauses).await;
+        }
+        Json(self.json(model)).into_response()
+    }
+
+    fn json(&self, model: &str) -> Value {
+        json!({
+            "id": "msg-mock",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": self.text}],
+            "stop_reason": self.stop_reason(),
+            "stop_sequence": self.stop_sequence,
+            "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens},
+        })
+    }
+
+    /// The Messages event stream of the answer, one `content_block_delta`
+    /// per piece with the pause before every piece but the first.
+    fn events(self, model: &str) -> impl Stream<Item = Result<Event, Infallible>> {
+        let prelude = [
+            message_start_event(model, self.input_tokens),
+            content_block_start_event(),
+        ];
+        let tail = [
+            content_block_stop_event(),
+            message_delta_event(self.stop_reason(), &self.stop_sequence, self.output_tokens),
+            message_stop_event(),
+        ];
+        let delay = self.delay;
+        let deltas = stream::iter(self.pieces.into_iter().enumerate()).then(
+            move |(index, piece)| async move {
+                if index > 0 && !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                text_delta_event(&piece)
+            },
+        );
+        stream::iter(prelude)
+            .chain(deltas)
+            .chain(stream::iter(tail))
+            .map(Ok::<Event, Infallible>)
+    }
+}
+
+/// The Messages stop reason of a finish reason: `length` is `max_tokens`, a
+/// tool call is `tool_use`, a matched stop is `stop_sequence`, and the end of
+/// an answer is `end_turn`, whatever else the engine wire called it.
+fn stop_reason(finish_reason: &str, stopped_on_sequence: bool) -> &'static str {
+    if stopped_on_sequence {
+        return "stop_sequence";
+    }
+    match finish_reason {
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+fn message_start_event(model: &str, input_tokens: u32) -> Event {
+    let message = json!({
+        "type": "message_start",
+        "message": {
+            "id": "msg-mock",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": Value::Null,
+            "stop_sequence": Value::Null,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        },
+    });
+    Event::default()
+        .event("message_start")
+        .data(message.to_string())
+}
+
+fn content_block_start_event() -> Event {
+    let start = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    });
+    Event::default()
+        .event("content_block_start")
+        .data(start.to_string())
+}
+
+fn text_delta_event(text: &str) -> Event {
+    let delta = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": text},
+    });
+    Event::default()
+        .event("content_block_delta")
+        .data(delta.to_string())
+}
+
+fn content_block_stop_event() -> Event {
+    let stop = json!({"type": "content_block_stop", "index": 0});
+    Event::default()
+        .event("content_block_stop")
+        .data(stop.to_string())
+}
+
+fn message_delta_event(
+    stop_reason: &str,
+    stop_sequence: &Option<Value>,
+    output_tokens: u32,
+) -> Event {
+    let delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+        "usage": {"output_tokens": output_tokens},
+    });
+    Event::default()
+        .event("message_delta")
+        .data(delta.to_string())
+}
+
+fn message_stop_event() -> Event {
+    Event::default()
+        .event("message_stop")
+        .data(json!({"type": "message_stop"}).to_string())
+}
+
+/// The engine simulator's answer as one Messages body: the output counted
+/// as it arrives (a cut armed after some output answers its status instead).
+async fn messages_realistic_body(
+    mut rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    model: &str,
+    prompt_tokens: u32,
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
+) -> Response {
+    let mut completion_tokens = 0u32;
+    let mut finish_reason = "stop";
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            engine::GenEvent::Token { .. } => {
+                completion_tokens += 1;
+                if let Some((after, status, cut_total)) = &cut {
+                    if completion_tokens > *after {
+                        cut_total.fetch_add(1, Ordering::Relaxed);
+                        return injected_error(*status);
+                    }
+                }
+            }
+            engine::GenEvent::Done {
+                completion_tokens: c,
+                finish_reason: reason,
+                ..
+            } => {
+                completion_tokens = c;
+                finish_reason = reason;
+            }
+        }
+    }
+    let answer = MessageAnswer {
+        text: "mock".to_string(),
+        pieces: Vec::new(),
+        finish_reason: finish_reason.to_string(),
+        stop_sequence: None,
+        input_tokens: prompt_tokens,
+        output_tokens: completion_tokens,
+        delay: Duration::ZERO,
+    };
+    Json(answer.json(model)).into_response()
+}
+
+/// The engine simulator's answer as the Messages event stream: one delta per
+/// generated token, the stop events after the engine's `Done`, and a cut
+/// armed after some output ending the stream with an error, as the chat
+/// stream does.
+fn messages_realistic_frames(
+    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    model: String,
+    prompt_tokens: u32,
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
+) -> impl Stream<Item = Result<Event, io::Error>> {
+    enum St {
+        Start {
+            rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+            cut: Option<(u32, u16, Arc<AtomicU64>)>,
+        },
+        BlockStart {
+            rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+            cut: Option<(u32, u16, Arc<AtomicU64>)>,
+        },
+        Active {
+            rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+            cut: Option<(u32, u16, Arc<AtomicU64>)>,
+            served: u32,
+        },
+        MessageDelta {
+            served: u32,
+            finish_reason: &'static str,
+        },
+        MessageStop,
+        Ended,
+    }
+    stream::unfold(
+        (St::Start { rx, cut }, model),
+        move |(st, model)| async move {
+            let (event, next) = match st {
+                St::Start { rx, cut } => (
+                    message_start_event(&model, prompt_tokens),
+                    St::BlockStart { rx, cut },
+                ),
+                St::BlockStart { rx, cut } => (
+                    content_block_start_event(),
+                    St::Active { rx, cut, served: 0 },
+                ),
+                St::Active {
+                    mut rx,
+                    cut,
+                    served,
+                } => match rx.recv().await {
+                    Some(engine::GenEvent::Token { .. }) => {
+                        if let Some((after, status, cut_total)) = &cut {
+                            if served >= *after {
+                                cut_total.fetch_add(1, Ordering::Relaxed);
+                                let cut = io::Error::other(format!("injected {status}"));
+                                return Some((Err(cut), (St::Ended, model)));
+                            }
+                        }
+                        (
+                            text_delta_event("x"),
+                            St::Active {
+                                rx,
+                                cut,
+                                served: served + 1,
+                            },
+                        )
+                    }
+                    Some(engine::GenEvent::Done { finish_reason, .. }) => (
+                        content_block_stop_event(),
+                        St::MessageDelta {
+                            served,
+                            finish_reason,
+                        },
+                    ),
+                    None => return None,
+                },
+                St::MessageDelta {
+                    served,
+                    finish_reason,
+                } => (
+                    message_delta_event(stop_reason(finish_reason, false), &None, served),
+                    St::MessageStop,
+                ),
+                St::MessageStop => (message_stop_event(), St::Ended),
+                St::Ended => return None,
+            };
+            Some((Ok(event), (next, model)))
+        },
+    )
 }
 
 // ── Canned responses ───────────────────────────────────────────────────────
@@ -1231,15 +1707,21 @@ fn final_chunk(endpoint: Endpoint, model: &str) -> Value {
 
 // ── HTTP prompt helpers ──────────────────────────────────────────────────────
 
-/// Extract prompt text from a chat/completions/generate body: the messages'
-/// content (a string, or the `text` of its parts), else the prompt (a
-/// string, or an array of them), joined by spaces.
+/// Extract prompt text from a chat/completions/generate/messages body: the
+/// top-level `system` of a Messages request (a string, or text blocks) and
+/// the messages' content (a string, or the `text` of its parts), else the
+/// prompt (a string, or an array of them), joined by spaces.
 fn extract_prompt_text(v: &Value) -> String {
     if let Some(messages) = v.get("messages").and_then(Value::as_array) {
-        return messages
-            .iter()
-            .filter_map(|m| m.get("content"))
-            .flat_map(texts_of)
+        let system = v.get("system").map(texts_of).unwrap_or_default();
+        return system
+            .into_iter()
+            .chain(
+                messages
+                    .iter()
+                    .filter_map(|m| m.get("content"))
+                    .flat_map(texts_of),
+            )
             .collect::<Vec<_>>()
             .join(" ");
     }
@@ -1334,6 +1816,20 @@ mod tests {
                     {"type": "text", "text": "apricot"},
                 ]},
             ]})),
+            "be brief say apricot"
+        );
+        // A Messages request carries its system prompt as a top-level field.
+        assert_eq!(
+            extract_prompt_text(
+                &json!({"system": "be brief", "messages": [{"role": "user", "content": "say apricot"}]})
+            ),
+            "be brief say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({
+                "system": [{"type": "text", "text": "be"}, {"type": "text", "text": "brief"}],
+                "messages": [{"role": "user", "content": "say apricot"}],
+            })),
             "be brief say apricot"
         );
         assert_eq!(
@@ -1565,6 +2061,83 @@ mod tests {
         serde_json::from_str(&text_of(response).await).expect("json")
     }
 
+    /// The Messages stop reason follows the finish reason: a realistic answer
+    /// that hit its token limit says `max_tokens` in the body and in the
+    /// `message_delta`, a scripted text stop is the `stop_sequence`, and a
+    /// scripted token-id stop is no sequence at all.
+    #[tokio::test]
+    async fn the_messages_stop_reason_follows_the_finish_reason() {
+        let limit = || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(token()).unwrap();
+            tx.send(engine::GenEvent::Done {
+                finish_reason: "length",
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+            .unwrap();
+            rx
+        };
+        let body = json_of(messages_realistic_body(limit(), "m", 3, None).await).await;
+        assert_eq!(body["stop_reason"], "max_tokens", "{body}");
+        let frames = text_of(
+            Sse::new(messages_realistic_frames(limit(), "m".to_string(), 3, None)).into_response(),
+        )
+        .await;
+        let delta: Value = frames
+            .split("event: message_delta\n")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .and_then(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).expect("delta json"))
+            .expect("a message_delta frame");
+        assert_eq!(delta["delta"]["stop_reason"], "max_tokens", "{frames}");
+        // Scripted: a text stop is the stop sequence, a token id is none.
+        let state = state_of(None, None, "http:messages-stops");
+        let request = || {
+            Bytes::from(
+                json!({
+                    "model": "m",
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "say apricot"}],
+                })
+                .to_string(),
+            )
+        };
+        let answer = |stop: Value| {
+            script::Answer::parse(&json!({
+                "output_text": "apricot",
+                "finish_reason": "stop",
+                "matched_stop": stop,
+            }))
+            .expect("an answer")
+        };
+        script::enqueue(
+            "http:messages-stops",
+            vec![answer(json!("</s>")), answer(json!(2))],
+        )
+        .expect("a known worker");
+        let text_stop = json_of(handle_messages(Arc::clone(&state), request()).await).await;
+        assert_eq!(text_stop["stop_reason"], "stop_sequence", "{text_stop}");
+        assert_eq!(text_stop["stop_sequence"], "</s>");
+        let token_stop = json_of(handle_messages(Arc::clone(&state), request()).await).await;
+        assert_eq!(token_stop["stop_reason"], "end_turn", "{token_stop}");
+        assert!(token_stop["stop_sequence"].is_null(), "{token_stop}");
+        // An error finish, armed or scripted, answers a 500: the shape has no
+        // error stop reason and the wire has no failure frame.
+        script::enqueue(
+            "http:messages-stops",
+            vec![
+                script::Answer::parse(&json!({"output_text": "x", "finish_reason": "error"}))
+                    .expect("an answer"),
+            ],
+        )
+        .expect("a known worker");
+        let failed = handle_messages(Arc::clone(&state), request()).await;
+        assert_eq!(failed.status(), 500);
+    }
+
     /// The prompt side's completion in both shapes and as a stream, with
     /// the scripted answer left where the decode side takes it.
     #[tokio::test]
@@ -1629,6 +2202,128 @@ mod tests {
             ),
             (Some(1), Some(0), Some(0)),
             "the scripted answer waits for the decode side, and no miss is counted: {status}"
+        );
+    }
+
+    /// The Messages route's answers in the Messages shape: one message, or the
+    /// event stream between `message_start` and `message_stop` with no `[DONE]`,
+    /// for the canned, scripted and prompt-side answers.
+    #[tokio::test]
+    async fn the_messages_route_answers_in_the_messages_shape() {
+        let state = state_of(None, None, "http:messages-test");
+        let request = |stream: bool| {
+            Bytes::from(
+                json!({
+                    "model": "m",
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "say apricot"}],
+                    "stream": stream,
+                })
+                .to_string(),
+            )
+        };
+        let events_of = |frames: &str| -> Vec<String> {
+            frames
+                .lines()
+                .filter_map(|line| line.strip_prefix("event: "))
+                .map(str::to_string)
+                .collect()
+        };
+        // Canned: one message with the mock text, one delta per output token.
+        let canned = json_of(handle_messages(Arc::clone(&state), request(false)).await).await;
+        assert_eq!(canned["type"], "message", "{canned}");
+        assert_eq!(canned["content"][0]["text"], "mock");
+        assert_eq!(canned["stop_reason"], "end_turn");
+        assert_eq!(canned["usage"]["output_tokens"], 2);
+        assert!(canned.get("choices").is_none(), "{canned}");
+        let frames = text_of(handle_messages(Arc::clone(&state), request(true)).await).await;
+        assert_eq!(
+            events_of(&frames),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+            "{frames}"
+        );
+        assert!(!frames.contains("[DONE]"), "{frames}");
+        // Scripted: the answer's text in the body and as the deltas, its finish
+        // reason as the stop reason, its usage.
+        let parse = || {
+            script::Answer::parse(&json!({"output_text": "apricot", "finish_reason": "length"}))
+                .expect("an answer")
+        };
+        let deltas = parse().answer.text_frames().len();
+        script::enqueue("http:messages-test", vec![parse(), parse()]).expect("a known worker");
+        let body = json_of(handle_messages(Arc::clone(&state), request(false)).await).await;
+        assert_eq!(body["content"][0]["text"], "apricot", "{body}");
+        assert_eq!(body["stop_reason"], "max_tokens");
+        assert_eq!(
+            body["usage"]["input_tokens"], 2,
+            "the prompt's two words: {body}"
+        );
+        assert!(
+            body["usage"]["output_tokens"]
+                .as_u64()
+                .is_some_and(|n| n >= 1),
+            "{body}"
+        );
+        let frames = text_of(handle_messages(Arc::clone(&state), request(true)).await).await;
+        let events = events_of(&frames);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| *e == "content_block_delta")
+                .count(),
+            deltas,
+            "{frames}"
+        );
+        assert!(
+            events.first().is_some_and(|e| e == "message_start")
+                && events.last().is_some_and(|e| e == "message_stop")
+                && frames.contains(r#""stop_reason":"max_tokens""#)
+                && frames.contains("apricot"),
+            "{frames}"
+        );
+        // The prompt side answers the message with no content and no delta.
+        let prefill = state_of(
+            Some(Role::Prefill),
+            Some(8998),
+            "http:messages-prefill-test",
+        );
+        let on_the_prompt_side = |stream: bool| {
+            Bytes::from(
+                json!({
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "say apricot"}],
+                    "stream": stream,
+                    "bootstrap_room": 7,
+                    "bootstrap_port": 8998,
+                })
+                .to_string(),
+            )
+        };
+        let body =
+            json_of(handle_messages(Arc::clone(&prefill), on_the_prompt_side(false)).await).await;
+        assert_eq!(body["content"][0]["text"], "", "{body}");
+        assert_eq!(
+            (
+                body["usage"]["input_tokens"].as_u64(),
+                body["usage"]["output_tokens"].as_u64()
+            ),
+            (Some(2), Some(0))
+        );
+        let frames = text_of(handle_messages(prefill, on_the_prompt_side(true)).await).await;
+        assert!(
+            !events_of(&frames)
+                .iter()
+                .any(|e| e == "content_block_delta")
+                && frames.contains("message_stop"),
+            "{frames}"
         );
     }
 

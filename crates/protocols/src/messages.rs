@@ -88,6 +88,13 @@ pub struct CreateMessageRequest {
     /// MCP servers to be utilized in this request (beta).
     pub mcp_servers: Option<Vec<McpServerConfig>>,
 
+    /// The message thread this request opens or continues (beta): a
+    /// `create` request is a whole conversation whose answer the gateway
+    /// keeps under the answer's `id`; a `continue` request names that id as
+    /// `previous_message_id` and carries the messages since the answer,
+    /// without `system` or `tools` (the thread keeps the create request's).
+    pub thread: Option<MessageThread>,
+
     /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
@@ -111,6 +118,15 @@ pub struct CreateMessageRequest {
 
 impl Normalizable for CreateMessageRequest {
     // Use default no-op implementation
+}
+
+/// The `thread` of a Messages request: the first turn of a thread, or the
+/// next turn of the one whose last answer is `previous_message_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageThread {
+    Create,
+    Continue { previous_message_id: String },
 }
 
 /// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
@@ -167,6 +183,16 @@ impl CreateMessageRequest {
         self.stream.unwrap_or(false)
     }
 
+    /// The public API's request rules this request breaks, as the extractor
+    /// states them, or `None`: the field rules and the crate's own
+    /// (`messages_validation`), applied again to a conversation the gateway
+    /// rebuilt from a message thread's stored turns.
+    pub fn contract_violation(&self) -> Option<String> {
+        Validate::validate(self)
+            .err()
+            .map(|errors| errors.to_string())
+    }
+
     /// Get the model name
     pub fn get_model(&self) -> &str {
         &self.model
@@ -192,9 +218,21 @@ impl CreateMessageRequest {
         continues_final_assistant(&self.messages)
     }
 
-    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    /// `output_config.effort`, the request's `reasoning_effort`
+    /// ([`Self::template_reasoning_effort_for`] is the one the template renders).
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effort as the
+    /// model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
     }
 
     /// The thinking preference the `thinking` block states, none without one.
@@ -369,6 +407,13 @@ fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator:
     let Some(tool_choice) = &req.tool_choice else {
         return Ok(());
     };
+
+    // A continue request of a message thread sends no tools: the thread
+    // keeps the create request's, and the choice is judged against them on
+    // the conversation the gateway rebuilds.
+    if matches!(req.thread, Some(MessageThread::Continue { .. })) {
+        return Ok(());
+    }
 
     let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
     let requires_tools = !matches!(tool_choice, ToolChoice::None);
@@ -573,6 +618,11 @@ pub enum InputContentBlock {
     ToolSearchToolResult(ToolSearchToolResultBlock),
     /// Tool reference block
     ToolReference(ToolReferenceBlock),
+    /// MCP tool use block (an assistant message of the MCP beta, replayed
+    /// or read back from a stored turn)
+    McpToolUse(McpToolUseBlock),
+    /// MCP tool result block (the same message, beside its use)
+    McpToolResult(McpToolResultBlock),
 }
 
 /// Whether `messages` end with an assistant message that has text and no
@@ -1460,6 +1510,10 @@ pub enum StopReason {
     PauseTurn,
     /// Streaming classifiers intervened
     Refusal,
+    /// The response filled the model's context window before it reached
+    /// `max_tokens`: the client treats it as truncated and does not retry
+    /// with a larger budget
+    ModelContextWindowExceeded,
 }
 
 /// Billing and rate-limit usage.
@@ -1682,6 +1736,34 @@ pub struct ErrorResponse {
     pub error_type: String,
 
     pub message: String,
+
+    /// The code a client switches on before it retries, with what the
+    /// refusal names; the message-thread errors carry one, the others none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<ErrorDetails>,
+}
+
+impl ErrorResponse {
+    /// An error of `error_type` with `message` and no `details`.
+    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            error_type: error_type.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+}
+
+/// The `error.details` of a Messages error: `error_code`, which a client
+/// reads before it retries (a continue refused as `thread_not_found` is
+/// replayed as a new create request, a `thread_fingerprint_mismatch` is
+/// not), and under `unsupported` the request features a refusal names.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MessagesErrorDetails")]
+pub struct ErrorDetails {
+    pub error_code: String,
+    pub unsupported: Option<Vec<String>>,
 }
 
 /// The body of an error on the Messages API:
@@ -1700,6 +1782,7 @@ pub struct ErrorEnvelope {
 }
 
 impl ErrorEnvelope {
+    /// Wraps an error with the id of the request it answers.
     pub fn new(error: ErrorResponse, request_id: impl Into<String>) -> Self {
         Self {
             envelope_type: "error".to_string(),
@@ -1735,6 +1818,7 @@ pub enum ApiError {
 /// Request to count tokens in a message
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, schemars::JsonSchema)]
+#[validate(schema(function = "validate_count_message_tokens_request"))]
 pub struct CountMessageTokensRequest {
     /// The model to use for token counting
     #[validate(length(min = 1, message = "model field is required and cannot be empty"))]
@@ -1760,6 +1844,10 @@ pub struct CountMessageTokensRequest {
     /// (boxed as [`CreateMessageRequest::output_config`] is).
     pub output_config: Option<Box<OutputConfig>>,
 
+    /// The thread of a Messages request, which a count takes none of: the
+    /// count reads the whole conversation, with its `system` and `tools`.
+    pub thread: Option<Value>,
+
     /// Additional backend-specific token counting options.
     #[serde(flatten)]
     pub other: Map<String, Value>,
@@ -1767,6 +1855,20 @@ pub struct CountMessageTokensRequest {
 
 impl Normalizable for CountMessageTokensRequest {
     // Use default no-op implementation
+}
+
+/// A count reads the whole conversation: `thread` is refused, as the public
+/// API refuses it, and the client counts what a create request would send.
+fn validate_count_message_tokens_request(
+    req: &CountMessageTokensRequest,
+) -> Result<(), validator::ValidationError> {
+    if req.thread.is_some() {
+        return Err(invalid(
+            "thread_not_counted",
+            "thread: count_tokens takes no thread; count the whole conversation, with its system and tools",
+        ));
+    }
+    Ok(())
 }
 
 impl CountMessageTokensRequest {
@@ -1781,9 +1883,21 @@ impl CountMessageTokensRequest {
         continues_final_assistant(&self.messages)
     }
 
-    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    /// `output_config.effort`, the request's `reasoning_effort`
+    /// ([`Self::template_reasoning_effort_for`] is the one the template renders).
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effort as the
+    /// model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
     }
 
     /// The thinking preference the prompt is rendered with.
@@ -2853,6 +2967,36 @@ mod tests {
         );
     }
 
+    /// An assistant message carrying an MCP exchange, as the Messages API
+    /// answers one under the MCP beta, is read as input: a stored MCP turn
+    /// continues and a client's replay of it is accepted.
+    #[test]
+    fn an_mcp_exchange_is_read_as_input() {
+        let message: InputMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}]},
+                {"type": "text", "text": "it is 42"}
+            ]
+        }))
+        .expect("an MCP exchange is input");
+        let InputContent::Blocks(blocks) = &message.content else {
+            panic!("blocks");
+        };
+        assert!(matches!(
+            &blocks[..],
+            [
+                InputContentBlock::McpToolUse(mcp_use),
+                InputContentBlock::McpToolResult(result),
+                InputContentBlock::Text(_)
+            ] if mcp_use.server_name == "s" && result.tool_use_id == "mcptoolu_1"
+        ));
+        let written = serde_json::to_value(&message).expect("serializes");
+        assert_eq!(written["content"][0]["type"], "mcp_tool_use");
+        assert_eq!(written["content"][1]["type"], "mcp_tool_result");
+    }
+
     /// A content field that is neither a string nor an array of blocks, or
     /// holds a block that cannot be read, is refused with the block's own
     /// reason: the unknown `type` with the accepted ones, the missing field,
@@ -2865,12 +3009,12 @@ mod tests {
                 .to_string()
         };
         let unknown_block = refusal(json!({
-            "role": "assistant",
-            "content": [{"type": "mcp_tool_use", "id": "m1", "name": "echo", "server_name": "s", "input": {}}]
+            "role": "user",
+            "content": [{"type": "container_upload", "file_id": "file_1"}]
         }));
         assert!(
             unknown_block.starts_with(
-                "unknown variant `mcp_tool_use`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
+                "unknown variant `container_upload`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
             ),
             "{unknown_block}"
         );
@@ -3020,6 +3164,82 @@ mod tests {
         }))
         .expect("a count_tokens request");
         assert!(count.continues_final_assistant());
+    }
+
+    /// The effort the template renders is the profile's reading of
+    /// `output_config.effort`, with the `thinking` block's toggle: as sent
+    /// under the default profile; under MiniMax a level the contract names
+    /// only (`minimal` as `low`), and none while thinking is off. The
+    /// count_tokens request reads the same.
+    #[test]
+    fn template_reasoning_effort_follows_the_profile() {
+        let body = |output_config: Value, thinking: Value| {
+            json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config, "thinking": thinking,
+                "messages": [{"role": "user", "content": "Hello"}]
+            })
+        };
+        for (output_config, thinking, minimax, generic) in [
+            (
+                json!({"effort": "high"}),
+                Value::Null,
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"effort": "max"}),
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                Some("max"),
+                Some("max"),
+            ),
+            (json!({"effort": "none"}), Value::Null, None, Some("none")),
+            (
+                json!({"effort": "minimal"}),
+                Value::Null,
+                Some("low"),
+                Some("minimal"),
+            ),
+            (json!({"effort": "64"}), Value::Null, None, Some("64")),
+            (
+                json!({"effort": "high"}),
+                json!({"type": "disabled"}),
+                None,
+                Some("high"),
+            ),
+            (
+                json!({"effort": "none"}),
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                None,
+                Some("none"),
+            ),
+            (json!({}), Value::Null, None, None),
+        ] {
+            let request: CreateMessageRequest =
+                serde_json::from_value(body(output_config.clone(), thinking.clone()))
+                    .expect("a Messages request");
+            assert_eq!(
+                request.template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax,
+                "MiniMax {output_config} {thinking}"
+            );
+            assert_eq!(
+                request.template_reasoning_effort_for(ProviderProfile::Generic),
+                generic,
+                "generic {output_config} {thinking}"
+            );
+            let count: CountMessageTokensRequest = serde_json::from_value(json!({
+                "model": "m", "messages": [], "output_config": output_config, "thinking": thinking
+            }))
+            .expect("a count_tokens request");
+            assert_eq!(
+                count.template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax
+            );
+            assert_eq!(
+                count.template_reasoning_effort_for(ProviderProfile::Generic),
+                generic
+            );
+        }
     }
 
     /// `output_config.effort` reads as a Chat `reasoning_effort`: a string
@@ -3309,6 +3529,7 @@ mod tests {
             top_p: None,
             container: None,
             mcp_servers: None,
+            thread: None,
             rid: None,
             other: Map::new(),
         }

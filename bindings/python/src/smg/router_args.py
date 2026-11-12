@@ -248,19 +248,6 @@ def _entries_from_environment(sources: _SecretSources) -> list[str]:
     return entries
 
 
-def _read_entries_file(path: str, sources: _SecretSources) -> list[str]:
-    """The entries of a list-valued secret's file, one per line; blank lines
-    and lines starting with '#' are skipped. A file without an entry is
-    refused."""
-    entries = _entries_of(_read_text(path, sources.file_flag), r"\n")
-    if not entries:
-        raise ValueError(
-            f"{sources.file_flag} {path!r}: the file holds no entry; one {sources.entry} per line,"
-            " blank and # lines skipped"
-        )
-    return entries
-
-
 _ACCESS_LOG_FIELD_NAMES = (
     "client_addr",
     "forwarded_for",
@@ -315,12 +302,13 @@ class RouterArgs:
     # The admin listener (bind host and port) for the control-plane routes; None = the
     # control plane stays on the data listener
     admin_host: str | None = None
-    # Most client connections the admin listener holds open at once (0 = no bound)
+    # Most client connections the admin listener holds open at once (0 = no bound; needs
+    # admin_port; a probe on the admin port falls under it like any connection)
     admin_max_connections: int = 0
     admin_port: int | None = None
     api_key: str | None = None
-    # The file the shared API key was read from, when a file was its source:
-    # a target of the key reload, beside the key (a path alone is refused)
+    # The file the shared API key comes from, when a file is its source: the
+    # binding reads it and the key reload watches it (a key beside it is refused)
     api_key_file: str | None = None
     # Routing-key assignment; defaults: random (manual policy), delegate (override)
     assignment_mode: str | None = None
@@ -364,8 +352,8 @@ class RouterArgs:
     consul_service: str | None = None
     # API keys for control plane auth (list of tuples: id, name, key, role)
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
-    # The file the control-plane keys were read from, when a file was their source,
-    # beside the keys (a path alone is refused)
+    # The file the control-plane keys come from, when a file is their source: the
+    # binding reads it (keys beside it are refused)
     control_plane_api_keys_file: str | None = None
     control_plane_audit_enabled: bool = False
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -549,6 +537,9 @@ class RouterArgs:
     # protocol: off, lenient or strict
     pd_pairing_mode: str = "lenient"
     policy: str = "cache_aware"
+    # Which implementation decides worker selection: legacy (the policies over
+    # worker handles) or engine (the policy engine over its bounded view)
+    policy_engine: str = "legacy"
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
     # operation included)
@@ -666,8 +657,8 @@ class RouterArgs:
     stream_body_stall_timeout_secs: int = 300
     # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
     tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
-    # The file the tenant keys were read from, when a file was their source,
-    # beside the keys (a path alone is refused)
+    # The file the tenant keys come from, when a file is their source: the
+    # binding reads it (keys beside it are refused)
     tenant_api_keys_file: str | None = None
     # The tenant header trust_tenant_header reads
     tenant_header_name: str = "x-smg-tenant-id"
@@ -957,6 +948,19 @@ class RouterArgs:
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-engine",
+            type=str,
+            choices=["legacy", "engine"],
+            default=RouterArgs.policy_engine,
+            help=(
+                "Which implementation decides worker selection: legacy, the policies over"
+                " worker handles, or engine, the policy engine over its bounded view. Under"
+                " engine the policy must be one the engine carries: random, round_robin,"
+                " passthrough, power_of_two (expected_wait, requests, least_requests),"
+                " least_load or manual"
             ),
         )
         routing_group.add_argument(
@@ -2223,8 +2227,9 @@ class RouterArgs:
                 " a response: the client sees its connection end and should retry with"
                 " backoff; each is counted in smg_http_connections_rejected_total."
                 " Readiness is unaffected. Probes on the data port are subject to the"
-                " bound like any connection: point them at --health-check-port or"
-                " --admin-port, which it does not cover. 0 = no bound"
+                " bound like any connection: point them at --health-check-port, which no"
+                " bound covers. --admin-port is outside this bound and inside its own,"
+                " --admin-max-connections. 0 = no bound"
             ),
         )
         request_group.add_argument(
@@ -2238,7 +2243,9 @@ class RouterArgs:
                 " smg_http_connections_rejected_total. 0 = no bound. The bound is the admin"
                 " listener's own, so the control plane stays reachable while the data plane"
                 " is saturated, and a client that reaches the admin listener cannot hold it"
-                " open without limit"
+                " open without limit. Needs --admin-port. Probes on the admin port fall under"
+                " the bound like any connection: point them at --health-check-port, which no"
+                " bound covers"
             ),
         )
         request_group.add_argument(
@@ -2749,8 +2756,9 @@ class RouterArgs:
             default=RouterArgs.history_memory_max_responses,
             help=(
                 "Most stored responses the memory history backend keeps; the oldest go"
-                " first, on every write (memory backend only; a stored response takes"
-                " about 12 KB)."
+                " first, on every write (a stored response takes about 12 KB). The"
+                " Messages thread store keeps that many turns under every history"
+                " backend, the oldest evicted first."
             ),
         )
         backend_group.add_argument(
@@ -2772,7 +2780,8 @@ class RouterArgs:
                 " on every write; 0 keeps a record until a count bound drops it. A"
                 " conversation is kept that long after its last use (created, read or"
                 " updated); a background response still running is not dropped by a"
-                " count bound."
+                " count bound. The Messages thread store keeps a turn that long after it"
+                " was written, under every history backend."
             ),
         )
 
@@ -3326,11 +3335,12 @@ class RouterArgs:
 
         if args_dict.get("api_key") is None:
             _value_from_environment(args_dict, "api_key", _API_KEY_SOURCES.env, strip=True)
+        # A key file is the binding's to read: its path goes alone, and a key
+        # given beside it is refused here, by the flags' names.
         api_key_file = file_option(_API_KEY_SOURCES)
         if api_key_file is not None:
             if args_dict.get("api_key") is not None:
                 raise _given_twice(_API_KEY_SOURCES)
-            args_dict["api_key"] = _read_secret_file(api_key_file, _API_KEY_SOURCES.file_flag)
             args_dict["api_key_file"] = api_key_file
 
         backend = args_dict.get("history_backend", cls.history_backend)
@@ -3348,7 +3358,8 @@ class RouterArgs:
             args_dict[name] = _read_secret_file(url_file, sources.file_flag)
 
         # Parse per-tenant data-plane API keys: the flag's entries, else the
-        # environment's (split at ',' and at line ends), else the file's.
+        # environment's (split at ',' and at line ends); a file's path goes
+        # alone, for the binding to read.
         tenant_entries = list(cli_args_dict.get(f"{prefix}tenant_api_key") or [])
         if not tenant_entries:
             tenant_entries = _entries_from_environment(_TENANT_API_KEYS_SOURCES)
@@ -3356,12 +3367,11 @@ class RouterArgs:
         if tenant_file is not None:
             if tenant_entries:
                 raise _given_twice(_TENANT_API_KEYS_SOURCES)
-            tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES)
             args_dict["tenant_api_keys_file"] = tenant_file
         args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(tenant_entries)
 
         # The control-plane keys under the same rule: the flag's entries, else
-        # the environment's, else the file's.
+        # the environment's; a file's path goes alone.
         control_plane_entries = list(cli_args_dict.get(f"{prefix}control_plane_api_keys") or [])
         if not control_plane_entries:
             control_plane_entries = _entries_from_environment(_CONTROL_PLANE_API_KEYS_SOURCES)
@@ -3369,9 +3379,6 @@ class RouterArgs:
         if control_plane_file is not None:
             if control_plane_entries:
                 raise _given_twice(_CONTROL_PLANE_API_KEYS_SOURCES)
-            control_plane_entries = _read_entries_file(
-                control_plane_file, _CONTROL_PLANE_API_KEYS_SOURCES
-            )
             args_dict["control_plane_api_keys_file"] = control_plane_file
         args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
             control_plane_entries

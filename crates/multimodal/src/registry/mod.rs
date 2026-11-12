@@ -4,6 +4,7 @@ mod glm53_flash;
 mod inkling;
 mod kimi_k25;
 mod kimi_k3;
+mod layouts;
 mod llama4;
 mod llava;
 mod minimax_m3;
@@ -258,6 +259,22 @@ mod tests {
             .lookup(&metadata)
             .expect("the gemma4 family has a spec");
         assert_eq!(spec.name(), "gemma4");
+    }
+
+    /// One family sizes its source images itself. The gateway sites that
+    /// plan that geometry read the spec's answer, never the family's name,
+    /// so a rename of the entry keeps the rule where it is.
+    #[test]
+    fn one_family_resizes_its_source_images() {
+        let registry = ModelRegistry::new();
+        let resizing: Vec<&str> = registry
+            .specs
+            .iter()
+            .map(|spec| spec.get())
+            .filter(|spec| spec.resizes_source_images())
+            .map(|spec| spec.name())
+            .collect();
+        assert_eq!(resizing, ["minimax_m3"]);
     }
 
     /// The vision processors come from the spec a model resolves to, so they

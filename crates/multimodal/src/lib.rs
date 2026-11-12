@@ -21,6 +21,7 @@ pub mod types;
 mod video_seek;
 pub mod vision;
 pub mod webp_native;
+mod wire_bytes;
 
 pub use audio::AudioPreProcessor;
 pub use encoder_inputs::{
@@ -32,8 +33,8 @@ pub use error::{
     TransformError,
 };
 pub use media::{
-    init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
-    MediaConnectorConfig, MediaSource, VideoFetchConfig,
+    init_log_video_decode_timing, missing_video_decoder, FrameSampling, ImageFetchConfig,
+    MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
 pub use registry::{
     EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
@@ -55,6 +56,7 @@ pub use vision::{
     DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig, VideoClipOptions,
     VisionPreProcessor, VisionPreprocessingContext,
 };
+pub use wire_bytes::WireBytes;
 
 /// Support for this crate's unit tests.
 #[cfg(test)]
@@ -64,13 +66,67 @@ pub(crate) mod test_support {
     use image::{DynamicImage, Rgb, RgbImage};
     use rustls::crypto::ring;
 
-    use crate::vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs};
+    use crate::{
+        audio::DecodedAudio,
+        vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs},
+    };
 
     /// Set to a non-empty value where the video tools must be installed (CI
     /// sets it on the shards that install ffmpeg): the tests that decode or
     /// write a clip then fail, instead of skipping, when ffmpeg, ffprobe or
     /// an encoder they use is missing.
     pub(crate) const REQUIRE_VIDEO_TOOLS: &str = "SMG_REQUIRE_VIDEO_TOOLS";
+
+    /// Set to a non-empty value where libjpeg-turbo must be installed (CI
+    /// sets it on the jobs that install the library): the TurboJPEG decode
+    /// tests then fail, instead of skipping, when the library does not load.
+    pub(crate) const REQUIRE_TURBOJPEG: &str = "SMG_REQUIRE_TURBOJPEG";
+
+    /// Whether the TurboJPEG library loads, for a test that needs it: where
+    /// it does not, a failure where [`REQUIRE_TURBOJPEG`] is set, else a
+    /// skip said on stderr, so a run that requires the library cannot pass
+    /// `test` without running it.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skip says so; the harness shows it under --nocapture"
+    )]
+    pub(crate) fn turbojpeg_or_skip(test: &str) -> bool {
+        if crate::jpeg_turbo::turbojpeg_available() {
+            return true;
+        }
+        let required = std::env::var_os(REQUIRE_TURBOJPEG).is_some_and(|value| !value.is_empty());
+        assert!(
+            !required,
+            "libturbojpeg not found, and {REQUIRE_TURBOJPEG} is set: {test}"
+        );
+        eprintln!("libturbojpeg not found: skipping {test}");
+        false
+    }
+
+    /// Whether the TurboJPEG library loads and reads a call's warning
+    /// (`tjGetErrorCode`, TurboJPEG 2.0 and later), for a test of a frame
+    /// kept after a warning: a 1.x library decodes the same files and keeps
+    /// none, so where the reading is missing, a failure where
+    /// [`REQUIRE_TURBOJPEG`] is set, else a skip said on stderr.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skip says so; the harness shows it under --nocapture"
+    )]
+    pub(crate) fn warned_decode_or_skip(test: &str) -> bool {
+        if !turbojpeg_or_skip(test) {
+            return false;
+        }
+        if crate::jpeg_turbo::turbojpeg_reads_warnings() {
+            return true;
+        }
+        let required = std::env::var_os(REQUIRE_TURBOJPEG).is_some_and(|value| !value.is_empty());
+        assert!(
+            !required,
+            "libturbojpeg reads no warning (TurboJPEG 1.x), and {REQUIRE_TURBOJPEG} is set: {test}"
+        );
+        eprintln!("libturbojpeg reads no warning: skipping {test}");
+        false
+    }
 
     /// Reports that `missing` keeps a test or a case from running: a failure
     /// where [`REQUIRE_VIDEO_TOOLS`] is set, a skip said on stderr elsewhere.
@@ -138,6 +194,12 @@ pub(crate) mod test_support {
         DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, bytes).expect("image size"))
     }
 
+    /// `bytes` as lowercase hex, two digits a byte: the form the kernel tests
+    /// pin their reference digests in.
+    pub(crate) fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     /// `w` by `h` RGB bytes that vary with the position and `seed`: the
     /// resamplers' parity inputs.
     pub(crate) fn gradient_rgb(w: usize, h: usize, seed: usize) -> Vec<u8> {
@@ -151,6 +213,42 @@ pub(crate) mod test_support {
             }
         }
         data
+    }
+
+    /// The audio processors' frame-geometry corpus: three clips per count in
+    /// `sample_counts` at 16 kHz (a sine with LCG noise, quiet at 0.001, mid at
+    /// 0.5, loud at 1.0; named `<samples> samples <label>`), then one 8 kHz clip
+    /// of 8,000 samples through the resampler.
+    pub(crate) fn waveform_corpus(sample_counts: &[usize]) -> Vec<(String, DecodedAudio)> {
+        let mut corpus = Vec::new();
+        for &samples in sample_counts {
+            for (scale, label) in [(0.001_f32, "quiet"), (0.5, "mid"), (1.0, "loud")] {
+                let mut state: u32 = 0x9E37_79B9 ^ samples as u32;
+                let wave: Vec<f32> = (0..samples)
+                    .map(|i| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let noise = (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0;
+                        ((i as f32 * 0.03).sin() * 0.7 + noise * 0.3) * scale
+                    })
+                    .collect();
+                corpus.push((
+                    format!("{samples} samples {label}"),
+                    DecodedAudio {
+                        samples: wave,
+                        sample_rate: 16_000,
+                    },
+                ));
+            }
+        }
+        let wave: Vec<f32> = (0..8_000).map(|i| (i as f32 * 0.05).sin() * 0.4).collect();
+        corpus.push((
+            "8000 samples at 8 kHz".to_string(),
+            DecodedAudio {
+                samples: wave,
+                sample_rate: 8_000,
+            },
+        ));
+        corpus
     }
 
     /// `actual` is `expected` byte for byte; otherwise the test fails naming

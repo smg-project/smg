@@ -526,11 +526,24 @@ impl KvEventMonitor {
                 // stop retrying — this RPC will never succeed.
                 if e.code() == tonic::Code::Unimplemented {
                     match sub.role {
+                        // The one line an operator gets for a worker whose
+                        // cache the cache-aware policy cannot see: it names
+                        // the model and carries the servicer's own reason
+                        // (the publisher is off, or the engine cannot serve
+                        // this model's cache groups). The model itself stays
+                        // on its event index while any other worker of it
+                        // publishes; only when none does is it routed on the
+                        // approximate prefix tree.
                         Role::Index { .. } => warn!(
                             worker_url = %Endpoint::redacted_str(worker_url),
+                            model_id = sub.model_id,
+                            reason = e.message(),
                             "Backend does not implement SubscribeKvEvents, \
                              disabling KV event subscription for this worker; \
-                             cache-aware routing sees nothing of its cache"
+                             cache-aware routing sees nothing of this worker's \
+                             cache, and the model falls back to the approximate \
+                             prefix tree only when no worker of it publishes \
+                             events"
                         ),
                         Role::Loads => info!(
                             worker_url = %Endpoint::redacted_str(worker_url),
@@ -793,7 +806,10 @@ mod tests {
 
     use futures::Stream;
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
-    use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
+    };
     use smg_grpc_client::{
         common_proto as common,
         tokenspeed_scheduler::tokenspeed_proto::{
@@ -802,6 +818,7 @@ mod tests {
         },
     };
     use tonic::{transport::Server, Request, Response, Status};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
@@ -874,6 +891,35 @@ mod tests {
         KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(2, 0)]));
         KvEventMonitor::learn_block_size(&sizes, "m", &KvEventBatch::default());
         assert_eq!(learned(&sizes), Some(128));
+    }
+
+    /// The reconnect delay a failing stream waits doubles from the initial
+    /// delay to the cap, stays at the cap once there, and a reset returns
+    /// it to the initial delay.
+    #[test]
+    fn the_reconnect_backoff_doubles_to_its_cap_and_a_reset_starts_over() {
+        let mut backoff = Backoff::new();
+        assert_eq!(backoff.delay_ms(), INITIAL_RECONNECT_DELAY_MS);
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            backoff.grow();
+            delays.push(backoff.delay_ms());
+        }
+        assert_eq!(
+            delays,
+            [200, 400, 800, 1_600, 3_200, 5_000, 5_000, 5_000],
+            "doubled from 100 ms up to the 5 s cap, then held there"
+        );
+        assert_eq!(
+            backoff.delay(),
+            Duration::from_millis(MAX_RECONNECT_DELAY_MS)
+        );
+        backoff.reset();
+        assert_eq!(
+            backoff.delay_ms(),
+            INITIAL_RECONNECT_DELAY_MS,
+            "a reset returns the initial delay"
+        );
     }
 
     /// What the test scheduler's `SubscribeKvEvents` does.
@@ -1651,7 +1697,11 @@ mod tests {
     /// not a working one: the delay before the next attempt doubles from
     /// attempt to attempt instead of restarting at the initial delay on
     /// every connect, the worker's own answer to the subscribe call does
-    /// not end the wait early, and the failure is counted by its code.
+    /// not end the wait early, and the failure is counted by its code. The
+    /// doubling is read from the delays the subscription schedules (its
+    /// retry lines), not from the wall-clock gaps between the connects,
+    /// which a loaded host stretches unevenly.
+    #[traced_test]
     #[test]
     fn a_stream_that_fails_on_its_first_message_backs_off_and_is_counted() {
         use metrics_exporter_prometheus::PrometheusBuilder;
@@ -1688,11 +1738,36 @@ mod tests {
             "{} subscribe calls in 1.9 s",
             calls.len()
         );
+        // The delay scheduled after each failed stream doubles up to the cap.
+        logs_assert(|lines: &[&str]| {
+            let delays = lines
+                .iter()
+                .filter(|line| line.contains("KV event stream error, reconnecting"))
+                .map(|line| {
+                    line.split("delay_ms=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                        .ok_or_else(|| format!("no delay_ms on the retry line: {line}"))
+                })
+                .collect::<Result<Vec<u64>, String>>()?;
+            if delays.len() < 3 {
+                return Err(format!(
+                    "{} retry lines, three or more expected",
+                    delays.len()
+                ));
+            }
+            if delays[0] != INITIAL_RECONNECT_DELAY_MS
+                || !delays
+                    .windows(2)
+                    .all(|pair| pair[1] == (pair[0] * 2).min(MAX_RECONNECT_DELAY_MS))
+            {
+                return Err(format!("the scheduled delays do not double: {delays:?}"));
+            }
+            Ok(())
+        });
+        // The last wait was slept: a loaded host only stretches it.
         let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
-        assert!(
-            gaps.windows(2).all(|pair| pair[1] > pair[0]),
-            "the gaps do not grow: {gaps:?}"
-        );
         assert!(
             gaps.last().unwrap() >= &Duration::from_millis(600),
             "{gaps:?}"
@@ -1717,8 +1792,11 @@ mod tests {
     }
 
     /// A backend that serves no KV events (an engine whose publisher is off)
-    /// left one WARN line as the only trace of a cache-aware router routing
-    /// blind: the worker carries a gauge from the answer until it leaves.
+    /// leaves one WARN line, which names the model, carries the servicer's
+    /// own reason and says that the model reaches the approximate tree only
+    /// when no worker of it publishes; the worker carries a gauge from the
+    /// answer until it leaves.
+    #[traced_test]
     #[test]
     fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
         use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -1745,7 +1823,18 @@ mod tests {
             rt.block_on(async {
                 let (addr, server) = serve(Subscribe::Unimplemented).await;
 
-                let worker = grpc_worker(addr);
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://{addr}"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .model(ModelCard::new("hybrid-m"))
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                );
                 let monitor = KvEventMonitor::new();
                 monitor
                     .on_worker_added(&worker, SubscriptionKind::Events)
@@ -1761,6 +1850,27 @@ mod tests {
                     Some(1.0),
                     "the answer raises the gauge"
                 );
+                // The WARN line itself names the model, carries the servicer's
+                // reason and says when the model reaches the tree; the
+                // subscription's start line names the model too, so the
+                // checks are scoped to the refusal's line.
+                logs_assert(|lines: &[&str]| {
+                    let line = lines
+                        .iter()
+                        .find(|line| line.contains("does not implement SubscribeKvEvents"))
+                        .ok_or_else(|| "no refusal line was logged".to_string())?;
+                    for wanted in [
+                        "WARN",
+                        "hybrid-m",
+                        "KV cache events not enabled",
+                        "approximate prefix tree only when no worker of it publishes events",
+                    ] {
+                        if !line.contains(wanted) {
+                            return Err(format!("the refusal line lacks {wanted:?}: {line}"));
+                        }
+                    }
+                    Ok(())
+                });
 
                 monitor.on_worker_removed(worker.url()).await;
                 assert_eq!(

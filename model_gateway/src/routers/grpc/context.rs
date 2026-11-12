@@ -255,7 +255,7 @@ pub(crate) struct ProcessingState {
 
     /// The provider profile of the request's model (`ProviderProfile::for_model`), derived once
     /// by the chat and Messages preparations and read by the later stages in place of a
-    /// derivation of their own (the output budget, the constraint's tool-call reading, the
+    /// derivation of their own (the constraint's tool-call reading, request building, the
     /// response spec). `None` on the other endpoints; a read then derives it itself.
     pub provider: Option<ProviderProfile>,
     /// The table's replay of the rendered prompt, as preparation read it for the forced call's
@@ -585,6 +585,28 @@ pub(crate) enum ExecutionPlanKind {
     Single,
     PrefillDecode,
     EncodePrefillDecode,
+}
+
+/// The mode's settings for the request a stage builds: which execution plan
+/// it becomes, and whether the prefill-decode metadata is injected into it.
+/// Read once off the mode by the pipeline and held by every request-building
+/// stage as one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanSettings {
+    pub inject_pd_metadata: bool,
+    pub plan_kind: ExecutionPlanKind,
+}
+
+impl PlanSettings {
+    /// The mode-bearing part of a stage's descriptor in the pipeline parity
+    /// test: one form for every stage that holds the settings.
+    #[cfg(test)]
+    pub(crate) fn signature(self) -> String {
+        format!(
+            "inject_pd_metadata={}, {:?}",
+            self.inject_pd_metadata, self.plan_kind
+        )
+    }
 }
 
 impl ExecutionPlan {
@@ -1045,8 +1067,13 @@ pub(crate) struct ResponseState {
     /// unchanged (completion, generate, decisions, embeddings, classify).
     pub engine_counts: Option<TokenCounts>,
 
-    /// Responses API iteration result (Harmony only, for tool loop orchestration)
-    pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
+    /// Responses API iteration result (Harmony only, for tool loop
+    /// orchestration). Behind a pointer: the field is empty on every other
+    /// path, and the dispatch context is boxed once per request; inline, its
+    /// 208 bytes (a usage object among them) had pushed that box over the
+    /// allocator's 2,560-byte class edge on every chat, completion and
+    /// Messages request.
+    pub responses_iteration_result: Option<Box<super::harmony::ResponsesIterationResult>>,
 }
 
 impl RequestContext {
@@ -2385,5 +2412,25 @@ mod tests {
             )
         );
         server.abort();
+    }
+
+    /// The Harmony iteration result rides behind a pointer, and the dispatch
+    /// context, boxed once per request, fits the allocator's 2,560-byte class
+    /// on 64-bit targets: inline, the result's 208 bytes had taken the box
+    /// from 2,520 to 2,584 bytes, one class up, when the usage object it and
+    /// the final response carry grew by 32 bytes each. A field that grows
+    /// the context past the class needs its own read.
+    #[test]
+    fn the_iteration_result_rides_behind_a_pointer_and_the_dispatch_context_fits_its_class() {
+        let state = ResponseState::default();
+        assert_eq!(
+            size_of_val(&state.responses_iteration_result),
+            size_of::<usize>()
+        );
+        assert!(
+            size_of::<DispatchContext>() <= 2560,
+            "the dispatch context is {} bytes",
+            size_of::<DispatchContext>()
+        );
     }
 }

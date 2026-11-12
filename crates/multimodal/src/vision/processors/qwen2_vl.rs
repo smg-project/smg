@@ -279,6 +279,16 @@ impl VisionPreProcessor for Qwen2VLProcessor {
         true
     }
 
+    /// Each image contributes independent BF16 patch rows and grid metadata.
+    fn supports_bf16_batch_cache(&self) -> bool {
+        true
+    }
+
+    /// Use the same geometry as the shared Qwen image encoder for admission.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
+    }
+
     fn emits_pixel_bytes(&self) -> bool {
         true
     }
