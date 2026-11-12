@@ -573,6 +573,12 @@ mod tests {
             ("microsoft/AesCode-32B", Table::Qwen3),
             ("internlm/Visual-ERM", Table::Qwen3),
             ("tencent/WeVisOne-VL-2B", Table::Qwen3),
+            ("LiquidAI/LFM2.5-24B-A2B-FP8", Table::Lfm2_5),
+            ("tencent/Hy-Memory-30B-A3B-FP8", Table::HyV3),
+            ("mistralai/Mistral-Large-4-1T-A52B-NVFP4", Table::MistralV13),
+            ("nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4", Table::Qwen3Tagged),
+            ("nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8", Table::Qwen3Tagged),
+            ("nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4", Table::Qwen3Tagged),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");

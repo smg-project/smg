@@ -1213,7 +1213,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "hy-memory-30b-a3b",
         model: "tencent/Hy-Memory-30B-A3B",
-        also: &[],
+        also: &["Hy-Memory-30B-A3B-FP8"],
         released: "2026-10-15",
         smg: (None, None),
         table: Some(Table::HyV3),
@@ -1363,7 +1363,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "lfm2.5-24b-a2b",
         model: "LiquidAI/LFM2.5-24B-A2B",
-        also: &[],
+        also: &["LFM2.5-24B-A2B-FP8"],
         released: "2026-10-12",
         smg: (None, None),
         table: Some(Table::Lfm2_5),
@@ -1795,7 +1795,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "mistral-large-4-1t-a52b",
         model: "mistralai/Mistral-Large-4-1T-A52B",
-        also: &[],
+        also: &["Mistral-Large-4-1T-A52B-NVFP4"],
         released: "2026-09-30",
         smg: (Some("mistral"), None),
         table: Some(Table::MistralV13),
@@ -1998,7 +1998,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-3.5-super-vl-120b-a12b-bf16",
         model: "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16",
-        also: &[],
+        also: &["NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"],
         released: "2026-10-12",
         smg: (Some("qwen_xml"), Some("nano_v3")),
         table: Some(Table::Qwen3Tagged),
@@ -2028,7 +2028,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-labs-dory1.0-4b-bf16",
         model: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
-        also: &[],
+        also: &["NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8", "NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4"],
         released: "2026-10-16",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
