@@ -472,14 +472,14 @@ pub(crate) async fn previous_response_chain(
         {
             let responses = visible_chain(chain.responses, tenant);
             if responses.is_empty() {
-                return Err(error::bad_request(
+                return Err(error::not_found(
                     "previous_response_not_found",
                     format!("Previous response with id '{prev_id_str}' not found."),
                 ));
             }
             Ok(responses)
         }
-        Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::bad_request(
+        Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::not_found(
             "previous_response_not_found",
             format!("Previous response with id '{prev_id_str}' not found."),
         )),
@@ -686,7 +686,8 @@ mod tests {
     /// A chain ending in a record its client asked not to store is no
     /// previous response (the loaders of both model families call this; the
     /// item-reference resolver shares its predicate); a stored chain is
-    /// returned, an unknown id refused the same way.
+    /// returned, an unknown id refused the same way: 404, the resource the
+    /// request names is absent.
     #[tokio::test]
     async fn an_unstored_record_is_no_previous_response() {
         let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
@@ -701,7 +702,7 @@ mod tests {
         let refused = previous_response_chain(&storage, "resp_unstored", None)
             .await
             .expect_err("an unstored record is no previous response");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
         let chain = previous_response_chain(&storage, "resp_stored", None)
             .await
             .expect("a stored record is a previous response");
@@ -709,7 +710,7 @@ mod tests {
         let unknown = previous_response_chain(&storage, "resp_unknown", None)
             .await
             .expect_err("an unknown id is refused");
-        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     /// `background: true` with `store: false`, the public API's probe: the
