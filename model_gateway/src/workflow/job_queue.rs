@@ -1555,6 +1555,67 @@ mod tests {
         assert!(queue.outcomes.is_empty());
     }
 
+    /// A caller leaving while its submit is parked on a slot (the queue full)
+    /// takes its waiter with it: the waiter is under the key while the submit
+    /// waits, gone when the caller is, and a later caller takes the key.
+    #[tokio::test]
+    async fn a_wait_cancelled_under_a_full_queue_leaves_no_waiter() {
+        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+
+        let context = app_context_for_tests(
+            RouterConfig::builder().build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
+        );
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 1,
+                max_concurrent_jobs: 1,
+            },
+            Arc::downgrade(&context),
+        );
+        // The queue's one slot, held for the whole test: every submit parks.
+        let slot = queue.tx.reserve().await.expect("the queue is open");
+        let key = "http://127.0.0.1:8000".to_string();
+
+        let mut wait = Box::pin(queue.submit_and_wait(
+            Job::RefreshWorkerLabels { url: key.clone() },
+            Duration::from_secs(5),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut wait)
+                .await
+                .is_err(),
+            "the submit parks on the held slot"
+        );
+        assert!(
+            queue.outcomes.contains_key(&key),
+            "the waiter is under the key while the submit waits"
+        );
+        drop(wait);
+        assert!(
+            queue.outcomes.is_empty(),
+            "the caller leaving took its waiter"
+        );
+
+        let mut later = Box::pin(queue.submit_and_wait(
+            Job::RefreshWorkerLabels { url: key.clone() },
+            Duration::from_secs(5),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut later)
+                .await
+                .is_err(),
+            "the later submit parks too"
+        );
+        assert!(
+            queue.outcomes.contains_key(&key),
+            "a later caller takes the key"
+        );
+        drop(later);
+        drop(slot);
+    }
+
     fn spec_for(url: &str, router_config: &RouterConfig) -> WorkerSpec {
         let mut spec = WorkerSpec::new(url);
         apply_startup_worker_config(&mut spec, router_config);
