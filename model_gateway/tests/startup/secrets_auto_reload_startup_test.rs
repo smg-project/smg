@@ -185,11 +185,11 @@ fn a_rotated_shared_key_leaves_the_admin_routes_too() {
     within_ten_seconds("the serving key's reload", || {
         serving_accepts(addr, Some(ROTATED_SERVING_KEY))
     });
-    assert_eq!(
-        workers(ROTATED_SERVING_KEY),
-        Some(200),
-        "the admin routes take the rotated key"
-    );
+    // The admin fallback swaps after the serving set on the reload's thread,
+    // so the admin route is polled as the serving route was.
+    within_ten_seconds("the admin fallback's reload", || {
+        workers(ROTATED_SERVING_KEY) == Some(200)
+    });
     assert_eq!(
         workers(SERVING_KEY),
         Some(401),
