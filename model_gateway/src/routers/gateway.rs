@@ -2377,22 +2377,34 @@ mod tests {
                 .clone()
         }
 
-        /// The routing key of the last request this router was handed.
-        fn last_routing_key(&self) -> Option<String> {
+        /// The value under `name` on the last request this router was handed.
+        fn last_header(&self, name: &str) -> Option<String> {
             let seen = self.seen.lock().unwrap();
             let headers = seen.last().expect("a request was routed").as_ref()?;
-            let key = headers.get("x-smg-routing-key")?;
-            Some(key.to_str().expect("a text key").to_string())
+            let value = headers.get(name)?;
+            Some(value.to_str().expect("a text key").to_string())
+        }
+
+        /// The routing key of the last request this router was handed.
+        fn last_routing_key(&self) -> Option<String> {
+            self.last_header("x-smg-routing-key")
         }
     }
 
     /// A gateway over one recording router, its policies built with the
     /// routing-key override on or off.
     fn recording_gateway(override_on: bool) -> (Gateway, Arc<HeaderRecordingRouter>) {
-        let config = RoutingKeyOverrideConfig {
+        recording_gateway_with(RoutingKeyOverrideConfig {
             enabled: override_on,
             ..Default::default()
-        };
+        })
+    }
+
+    /// A gateway over one recording router, its policies built with the
+    /// given routing-key override.
+    fn recording_gateway_with(
+        config: RoutingKeyOverrideConfig,
+    ) -> (Gateway, Arc<HeaderRecordingRouter>) {
         let policies = PolicyRegistry::with_override(PolicyConfig::RoundRobin, config);
         let gateway =
             Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
@@ -2478,5 +2490,64 @@ mod tests {
             .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
             .await;
         assert_eq!(seen.last_routing_key(), None, "the override off");
+    }
+
+    /// With several routing-key names configured, the thread layer sends the
+    /// lineage key under the first, the one placement reads first; a client
+    /// header under a later name still wins, since the request then carries a
+    /// routing key already.
+    #[tokio::test]
+    async fn a_thread_turn_sends_its_lineage_key_under_the_first_configured_name() {
+        use serde_json::json;
+
+        let (gateway, seen) = recording_gateway_with(RoutingKeyOverrideConfig {
+            enabled: true,
+            headers: vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()],
+            ..Default::default()
+        });
+        let policies = gateway.policies.clone().expect("policies");
+        let meta = test_tenant_meta();
+        let turn = || -> CreateMessageRequest {
+            body(json!({
+                "model": "m", "max_tokens": 8, "rid": "conv_t2",
+                "thread": {"type": "create"},
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+        };
+        let placed = |seen: &HeaderRecordingRouter| -> Option<String> {
+            let headers = seen.last_headers()?;
+            policies
+                .sticky_header_key(Some(&headers))
+                .map(str::to_string)
+        };
+
+        gateway.route_messages(None, &meta, turn(), "m").await;
+        assert_eq!(
+            seen.last_header("x-routing-key").as_deref(),
+            Some("conv_t2"),
+            "the key goes out under the first configured name"
+        );
+        assert_eq!(
+            seen.last_header("x-smg-routing-key"),
+            None,
+            "nothing under the second"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some("conv"),
+            "placed once stripped"
+        );
+
+        let mut mine = HeaderMap::new();
+        mine.insert("x-smg-routing-key", "mine".parse().unwrap());
+        gateway
+            .route_messages(Some(&mine), &meta, turn(), "m")
+            .await;
+        assert_eq!(
+            seen.last_header("x-routing-key"),
+            None,
+            "a client header under the second name wins: nothing is added under the first"
+        );
+        assert_eq!(placed(&seen).as_deref(), Some("mine"));
     }
 }
