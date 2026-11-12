@@ -406,7 +406,9 @@ pub(super) enum Node {
     /// character of the class, then that same character while it repeats,
     /// `at_least` characters in all. Taken only as the last atom of a
     /// top-level alternative, where the engine's greedy backreference has
-    /// nothing after it to give characters back to.
+    /// nothing after it to give characters back to, and once per pattern:
+    /// `\1` names the pattern's first group wherever it stands, so a second
+    /// group declines.
     RunOfOne {
         class: usize,
         at_least: u32,
@@ -591,6 +593,10 @@ struct Parser<'a> {
     /// classes under the same indices and share the match loop's one run
     /// memo ([`RunMemo`] is keyed by the index).
     groups_ahead: Option<(usize, usize)>,
+    /// Whether the pattern's capturing group has been read: `\1` names the
+    /// first group wherever it stands, so a second group declines
+    /// ([`Parser::parse_repeated_character`]).
+    captured: bool,
 }
 
 impl Pattern {
@@ -601,6 +607,7 @@ impl Pattern {
             classes: Vec::new(),
             case_insensitive: false,
             groups_ahead: None,
+            captured: false,
         };
         let mut root = parser.parse_alternation()?;
         if parser.chars.next().is_some() {
@@ -2009,9 +2016,17 @@ impl Parser<'_> {
     /// stage writes it): the group holds one class, the backreference follows
     /// it with its quantifier, and nothing else may follow in the alternative
     /// (`Pattern::parse` checks the placement). Every other capture or
-    /// backreference, and the shape under `(?i:)`, declines.
+    /// backreference, a second capturing group (`\1` names the pattern's
+    /// first group wherever it stands) and the shape under `(?i:)` decline.
     fn parse_repeated_character(&mut self, first: char) -> Option<Node> {
         if self.case_insensitive {
+            return None;
+        }
+        // A second group's `\1` reads the first one, unset in another
+        // alternative, where the engine's `\1*` then matches nothing while a
+        // run of the second group would take characters: one group per
+        // pattern.
+        if std::mem::replace(&mut self.captured, true) {
             return None;
         }
         let class = match first {
@@ -2632,6 +2647,13 @@ mod tests {
             // the run with something after it in its alternative
             r"([ab])\1*c",
             r"([ab])\1*|c([ab])\1*d",
+            // a second capturing group: its `\1` names the first group, unset
+            // in another alternative, where the engine's `\1*` matches nothing
+            r"([a])\1*|([b])\1*",
+            r"([ab])\1*|([cd])\1*",
+            r"(?:x|([ab])\1*)|([cd])\1*",
+            r"([ab])\1*([cd])\1*",
+            r"([ab])\1*|([cd])\2*",
             r"(?:([ab])\1*)?",
             r"(?:x([ab])\1*)y",
         ] {
@@ -3348,6 +3370,7 @@ mod tests {
             classes: Vec::new(),
             case_insensitive: false,
             groups_ahead: None,
+            captured: false,
         };
         let root = parser.parse_alternation().expect("parses");
         assert_eq!(choices(&root), 1);
