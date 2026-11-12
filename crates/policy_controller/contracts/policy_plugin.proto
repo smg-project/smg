@@ -497,6 +497,10 @@ message Released {
     REASON_CLIENT_GONE = 3;
     // The commit refused every target (a removed worker, a lost room).
     REASON_COMMIT_FAILED = 4;
+    // The stream rule's grace passed without a Completed.
+    REASON_EXPIRED = 5;
+    // An immediate deregistration released the worker's leases.
+    REASON_WORKER_REMOVED = 6;
   }
   Reason reason = 3;
   // Unspecified releases every side; a pair's leases share an id, so name it.

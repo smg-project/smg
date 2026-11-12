@@ -426,6 +426,8 @@ fn enum_mirrors() -> Vec<(
                     LateDecision,
                     ClientGone,
                     CommitFailed,
+                    Expired,
+                    WorkerRemoved,
                 }
             ),
         ),
@@ -1703,5 +1705,51 @@ fn the_decline_fields_are_pinned() {
             .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
             .collect();
         assert_eq!(found, expected, "{message_name}: a decline field moved");
+    }
+}
+
+/// Every lease end names exactly one lifecycle event: a completion, or a
+/// release with its reason. An end with no event is the leak a stateful plugin
+/// cannot see, so a `LeaseEnd` cause without a row here fails the test.
+const LEASE_END_EVENTS: &[(&str, &str)] = &[
+    ("CAUSE_COMPLETED", "completed"),
+    ("CAUSE_RELEASED", "released(reason)"),
+    ("CAUSE_EXPIRED", "released(REASON_EXPIRED)"),
+    ("CAUSE_WORKER_REMOVED", "released(REASON_WORKER_REMOVED)"),
+];
+
+#[test]
+fn every_lease_end_cause_names_one_lifecycle_event() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let causes: Vec<String> = enum_values(controller, "LeaseEnd.Cause")
+        .expect("LeaseEnd.Cause is an enum")
+        .into_iter()
+        .filter(|(_, number)| *number != 0)
+        .map(|(name, _)| name)
+        .collect();
+    let mapped: Vec<String> = LEASE_END_EVENTS
+        .iter()
+        .map(|(cause, _)| (*cause).to_owned())
+        .collect();
+    assert_eq!(causes, mapped, "a LeaseEnd cause has no lifecycle event");
+    let reasons: Vec<String> = enum_values(plugin, "Released.Reason")
+        .expect("Released.Reason is an enum")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for (cause, event) in LEASE_END_EVENTS {
+        if let Some(reason) = event
+            .strip_prefix("released(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .filter(|reason| reason.starts_with("REASON_"))
+        {
+            assert!(
+                reasons.iter().any(|r| r == reason),
+                "{cause}: {reason} is not a Released.Reason"
+            );
+        }
     }
 }
