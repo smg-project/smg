@@ -210,6 +210,8 @@ class ShardTableTests(unittest.TestCase):
         for name in sorted({row["filter"] for row in shard_table()} | {"rust-ci"}):
             for path in INFRA_FILES:
                 self.assertTrue(filter_matches(filters[name], path), f"{name} misses {path}")
+        missing = sorted(set(filters["rust-infra"]) - set(filters["rust-ci"]))
+        self.assertEqual(missing, [], f"rust-ci misses rust-infra patterns: {missing}")
 
     def test_shard_filters_exclude_unrelated_crates(self):
         filters = path_filters()
