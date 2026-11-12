@@ -510,9 +510,10 @@ struct FrameHeader {
 /// marker, its payload and the offset of what follows the segment. Fill bytes,
 /// stray bytes before a marker and a stuffed zero (`FF 00`; defects both
 /// decoders warn of and read past, one byte at a time) and the standalone
-/// markers (the restart markers, SOI and TEM) are stepped over. The walk ends at the end of the image, at a segment cut short, and
-/// at the scan header unless that is the segment wanted, since no marker walk
-/// crosses the entropy-coded data behind it.
+/// markers (the restart markers, SOI and TEM) are stepped over. The walk ends
+/// at the end of the image, at a segment cut short, and at the scan header
+/// unless that is the segment wanted, since no marker walk crosses the
+/// entropy-coded data behind it.
 fn segment(bytes: &[u8], wanted: impl Fn(u8) -> bool) -> Option<(u8, &[u8], usize)> {
     if !is_jpeg(bytes) {
         return None;
@@ -565,8 +566,10 @@ fn is_frame_header(marker: u8) -> bool {
 /// libjpeg-turbo 2.x refuses a frame whose components are sampled unlike each
 /// other (a CMYK file with subsampled inks and a full-resolution black) with
 /// "Could not determine subsampling type", though its decoder takes such a
-/// frame, so this reader stands in for the call. `None` when the scan or the
-/// end of the image comes before a frame header, or a segment is cut short.
+/// frame, so this reader supplies the component count the call did not, for
+/// a frame whose dimensions agree with the call's (`fallback_frame`). `None`
+/// when the scan or the end of the image comes before a frame header, or a
+/// segment is cut short.
 fn frame_header(bytes: &[u8]) -> Option<FrameHeader> {
     let (_, payload, _) = segment(bytes, is_frame_header)?;
     let (&[_precision, h0, h1, w0, w1, components], _) = payload.split_first_chunk::<6>()?;
@@ -806,8 +809,9 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
     // - `bytes` is a live `&[u8]`; its ptr/len describe a valid immutable region
     //   for the duration of the calls (libjpeg-turbo only reads it).
     // - `buf` is an owned `Vec<u8>` whose length is exactly `w*h*channels`
-    //   (overflow-checked) from the frame's dimensions (the header call's, or
-    //   the frame header's when that call refuses the sampling; the decoder
+    //   (overflow-checked) from the dimensions the header call read (when it
+    //   refuses only the sampling, the frame header adds the component count
+    //   and must name the same dimensions, `fallback_frame`; the decoder
     //   never writes past the size it is given), with `channels` the
     //   pixel size of the format requested (3 for `TJPF_RGB`, 4 for
     //   `TJPF_CMYK`); a pooled buffer has a larger capacity, the length is
