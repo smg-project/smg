@@ -108,16 +108,24 @@ pub struct VllmGenerateStream {
 
 impl VllmGenerateStream {
     /// Start one choice with no observed timing or capacity sample.
+    /// `prompt_tokens` is the number of prompt ids the request carries: the
+    /// usage's prompt count until the engine's prefill stats report their own
+    /// (an engine whose first output carries none would otherwise bill zero
+    /// input).
     pub(crate) fn new(
         inner: EngineCoreStream,
         index: u32,
         top_logprobs: usize,
         prompt_top_logprobs: usize,
         first_prompt_token: Option<u32>,
+        prompt_tokens: u32,
     ) -> Self {
         Self {
             inner,
-            state: StreamState::default(),
+            state: StreamState {
+                prompt_tokens,
+                ..StreamState::default()
+            },
             index,
             top_logprobs,
             prompt_top_logprobs,
@@ -214,6 +222,8 @@ impl MappedGenerateStream for VllmGenerateStream {
         }
         let top_k = self.top_logprobs;
         let state = &mut self.state;
+        // The engine's own prompt count replaces the request's; an output
+        // without the stats leaves it.
         if let Some(stats) = &output.prefill_stats {
             state.prompt_tokens = stats.num_prompt_tokens;
             state.cached_tokens = stats.num_cached_tokens;

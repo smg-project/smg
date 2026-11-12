@@ -1618,3 +1618,66 @@ fn malformed_reasoning_template_kwargs_are_rejected() {
         );
     }
 }
+
+/// The prompt count the usage reports is the request's own until the engine's
+/// prefill stats report one: an engine whose first output carries none bills
+/// the prompt the gateway sent, not zero; one that reports a count has the
+/// last word, on the chunk and on the terminal `Complete` alike.
+#[tokio::test]
+async fn usage_prompt_count_is_the_requests_until_the_engine_reports_one() {
+    use engine_zmq_client::protocol::vllm::stats::PrefillStats;
+    fn prompt_tokens_of(response: &vllm::GenerateResponse) -> u32 {
+        match &response.response {
+            Some(vllm::generate_response::Response::Chunk(chunk)) => chunk.prompt_tokens,
+            Some(vllm::generate_response::Response::Complete(complete)) => complete.prompt_tokens,
+            None => panic!("expected a chunk or a complete, got an empty response"),
+        }
+    }
+    let (client, _engine, _dir) = connected_pair(RuntimeType::Vllm).await;
+    for (index, reported, expected) in [(0, None, 3), (1, Some(7), 7)] {
+        let request = vllm::GenerateRequest {
+            request_id: format!("usage-{index}"),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    ..Default::default()
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(2),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let mut streams = client.generate_vllm_streams(request).await.unwrap();
+        let stream = &mut streams[0];
+        let chunk = stream
+            .map_output(EngineCoreOutput {
+                new_token_ids: vec![10],
+                prefill_stats: reported.map(|num_prompt_tokens| PrefillStats {
+                    num_prompt_tokens,
+                    num_computed_tokens: num_prompt_tokens,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            prompt_tokens_of(&chunk),
+            expected,
+            "the first chunk with prefill stats {reported:?}"
+        );
+        let complete = stream
+            .map_output(EngineCoreOutput {
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            prompt_tokens_of(&complete),
+            expected,
+            "the complete with prefill stats {reported:?}"
+        );
+    }
+}
