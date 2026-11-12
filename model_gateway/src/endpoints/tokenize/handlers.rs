@@ -235,9 +235,10 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         );
     }
 
-    // An empty or whitespace source is refused up front too: nothing loads
-    // from it, and the job the gateway would otherwise queue would fail its
-    // local load and fall back to a worker fetch under the request's name.
+    // An empty or whitespace source is refused up front too: the registry's
+    // load refuses an empty one only once the job runs, after a 202, and a
+    // whitespace one fails its local load and falls back to a worker fetch
+    // under the request's name.
     if request.source.trim().is_empty() {
         return refusal(
             StatusCode::BAD_REQUEST,
