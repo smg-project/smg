@@ -752,9 +752,10 @@ mod tests {
         assert_eq!(completions.load(Ordering::SeqCst), 0);
     }
 
-    /// A prefill answer's prompt logprobs, scored once for the whole
-    /// request, land on every collected decode answer; a prefill that
-    /// scored nothing leaves the decode answers as the engine sent them.
+    /// The first prefill answer's prompt logprobs, scored once for the whole
+    /// request, land on every collected decode answer, and a later prefill
+    /// answer's list reaches none of them; a prefill that scored nothing
+    /// leaves the decode answers as the engine sent them.
     #[test]
     fn prefill_prompt_logprobs_land_on_every_decode_answer() {
         let prompt_logprobs = sglang::InputLogProbs {
@@ -766,10 +767,24 @@ mod tests {
             ],
             ..Default::default()
         };
-        let prefill = [ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
-            input_logprobs: Some(prompt_logprobs.clone()),
+        let later_answer = sglang::InputLogProbs {
+            token_ids: vec![21, 22],
+            token_logprobs: vec![
+                sglang::InputTokenLogProb { value: Some(-2.0) },
+                sglang::InputTokenLogProb { value: Some(-3.0) },
+            ],
             ..Default::default()
-        })];
+        };
+        let prefill = [
+            ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                input_logprobs: Some(prompt_logprobs.clone()),
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                input_logprobs: Some(later_answer),
+                ..Default::default()
+            }),
+        ];
         let mut decodes: Vec<ProtoGenerateComplete> = (0..3)
             .map(|_| ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default()))
             .collect();
@@ -780,7 +795,7 @@ mod tests {
             assert_eq!(
                 decode.as_sglang().input_logprobs.as_ref(),
                 Some(&prompt_logprobs),
-                "decode answer {position}"
+                "decode answer {position} carries the first prefill answer's list"
             );
         }
 
