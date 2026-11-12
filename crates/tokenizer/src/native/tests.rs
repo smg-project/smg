@@ -927,6 +927,21 @@ fn shapes_outside_the_path_are_declined() {
     );
 }
 
+/// `NativeEncoder::check_anchors` accepts an anchored digit stage after a
+/// `Digits` split because every decimal digit of the engine (`\p{Nd}`,
+/// `unicode::DIGIT`, the engine's tables) is numeric to the split
+/// (`unicode::STD_NUMERIC`, the toolchain's); the two tables regenerate on
+/// different triggers, so the inclusion is pinned here.
+#[test]
+fn every_engine_decimal_digit_is_numeric() {
+    for &(lo, hi) in unicode::DIGIT {
+        for code in lo..=hi {
+            let c = char::from_u32(code).expect("a scalar value");
+            assert!(c.is_numeric(), "U+{code:04X}");
+        }
+    }
+}
+
 /// The `Digits` stage holds exactly what `char::is_numeric` accepts, the
 /// reference's test, over every scalar value: the toolchain's numeric set,
 /// not the engine's `\p{N}` (another Unicode version); a toolchain bump that
