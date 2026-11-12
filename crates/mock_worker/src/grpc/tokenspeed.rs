@@ -5,8 +5,8 @@
 //! `--capture` records this wire's requests (the capture file's keys are its
 //! field names).
 //! An encode worker also serves the engine's encoder service beside it
-//! ([`TokenSpeedEncoder`]): its `Encode` takes a request's media with one
-//! rendezvous room per item, and its `Generate` is refused as the wrong pool.
+//! ([`TokenSpeedEncoder`]): its `Encode` takes a request's one media item
+//! with its rendezvous room, and its `Generate` is refused as the wrong pool.
 //! A prefill worker checks the rooms a request's `encode_bootstrap_info`
 //! hands it against the request's media items.
 //! The admin fan-out's flush and profile RPCs are answered by the core, the
@@ -406,11 +406,20 @@ impl TokenSpeedEncoder for MockScheduler {
         let req = request.into_inner();
         // The request's own checks come first, as the prefill role checks its
         // input before the hooks: a malformed request spends no armed fault.
+        // The engine's encoder takes exactly one media item under one room per
+        // request, named by a request id (its adapter refuses the rest), so a
+        // gateway that batched two items into one `Encode` or dropped the id
+        // would pass a looser mock and fail the worker.
+        if req.request_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "mock-worker: an encode request names its request id, got an empty one",
+            ));
+        }
         let items = req.mm_inputs.as_ref().map_or(0, |mm| mm.items.len());
-        if items == 0 || req.items.len() != items {
+        if items != 1 || req.items.len() != 1 {
             return Err(Status::invalid_argument(format!(
-                "mock-worker: an encode request carries one room per media item, got {} \
-                 room(s) for {items} item(s)",
+                "mock-worker: an encode request carries exactly one media item in one room, \
+                 got {items} item(s) in {} room(s)",
                 req.items.len()
             )));
         }
