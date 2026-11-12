@@ -5,7 +5,7 @@
 //! later, and nothing was sent in between. An idle-timeout proxy in front of
 //! the gateway cuts a connection that carries no byte for its idle window
 //! (sixty seconds is a common setting), and the client sees a stream that
-//! ends before it began. [`sse_keepalive_middleware`] gives every SSE
+//! ends before it began. [`SseKeepAlive::layer`] gives every SSE
 //! response a `KeepAlive`, carried by the edge's one body wrapper (the
 //! metrics layer's `EdgeBody`), so an interval
 //! of silence is broken by a frame the client ignores: an SSE comment on the
@@ -23,9 +23,8 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::Request,
     http::header::{CONTENT_LENGTH, CONTENT_TYPE},
-    middleware::Next,
     response::Response,
 };
 use bytes::Bytes;
@@ -103,8 +102,7 @@ fn is_event_stream(response: &Response) -> bool {
 
 impl SseKeepAlive {
     /// This keep-alive as a route layer: the service's own future maps the
-    /// response, nothing is cloned or boxed per request (the `from_fn` form
-    /// did both, on every request of the routes, streamed or not).
+    /// response, nothing is cloned or boxed per request.
     pub fn layer(self) -> SseKeepAliveLayer {
         SseKeepAliveLayer { keep_alive: self }
     }
@@ -177,18 +175,6 @@ where
         let response = std::task::ready!(this.inner.poll(cx))?;
         Poll::Ready(Ok(this.keep_alive.apply(response, *this.messages)))
     }
-}
-
-/// Route-layer middleware: the keep-alive on every SSE response of the
-/// routes it wraps ([`SseKeepAlive::layer`] is the same without the per-request
-/// clone and boxes of `from_fn`).
-pub async fn sse_keepalive_middleware(
-    State(keep_alive): State<SseKeepAlive>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    let messages = request.uri().path() == MESSAGES_ROUTE;
-    keep_alive.apply(next.run(request).await, messages)
 }
 
 /// The keep-alive of one SSE body: `frame` after `interval` of silence, on a
