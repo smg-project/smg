@@ -395,13 +395,21 @@ What this table says beyond the DeepSeek one:
   function's name; the call's closing tag leaves it, and the call's end carries its bytes. A
   second call before the first closed ends the first (`call + call_open = call`), and the
   block's close ends a call still open (`call + tools_close = message`).
-- **The end-of-turn tag ends whatever is open.** `<|close|>message<|sep|>` is a token the model
-  cannot write by accident, so from any state it ends the region and returns to `message`: a
+- **The end-of-turn tag ends whatever is open.** When its opening atom is an actual structural
+  token, `<|close|>message<|sep|>` ends the region from any state and returns to `message`: a
   thought or an answer cut by it is closed, a call is closed into its object, and the tag
   itself is dropped as wrapping. The same holds for a region's opening inside the thought
   (`reasoning + response_open = content`, `reasoning + tools_open = tools`) and for a tools
   block opened inside the answer (`content + tools_open = tools`): the region ended, however
-  the model left it, since the tags are tokens the model cannot write as text.
+  the model left it. These recovery rows remain valid for real structural tokens.
+- **Spelling is not token identity.** Ordinary token pieces can spell the same bytes inside
+  reasoning examples or JSON strings. A tokenized caller can bind the declared
+  `<|open|>` and `<|close|>` atoms to its vocabulary and supply their byte origins before
+  feeding the text. Only those origins authorize these framing transitions; an ordinary-token
+  lookalike stays in its current channel. No quote-state heuristic is used: a genuine
+  structural token still frames a transition after unmatched quotes or prose. Text-only
+  callers, and a caller without a complete vocabulary binding before output, retain the
+  existing string-marker behavior. Once bound, missing counting spans cannot change modes.
 - **The answer's closer ends a thought too.** On about 1 % of very long turns the model writes
   its reply straight into the prefilled thought and closes it with `<|close|>response<|sep|>`,
   never with the thought's closer or the answer's opener (`reasoning + response_close =
@@ -416,10 +424,10 @@ What this table says beyond the DeepSeek one:
   `<|close|>think<|sep|>` at once, and the engine's prompt replay puts the output inside the
   thought first. The turn opener is the message tag with the assistant's role, so an earlier
   turn's regions move nothing.
-- **`<|open|>` and `<|close|>` are structural tokens.** Each is one token of the vocabulary,
-  so an output cut by `max_tokens` inside a tag (`<|close|>message` with no `<|sep|>` after
-  it) ends in a tail the model cannot have written as text: the engine drops it at the end of
-  the output, as the engine's own streaming parser does, instead of releasing it as content.
+- **`<|open|>` and `<|close|>` are structural tokens.** A genuine atomic prefix cut by
+  `max_tokens` inside a tag (`<|close|>message` with no `<|sep|>` after it) remains framing and
+  is dropped at the end. Under bound provenance, the same incomplete spelling made from
+  ordinary tokens remains text. Text-only compatibility retains the earlier cut-tag rule.
 
 ## Inkling (`inkling`)
 

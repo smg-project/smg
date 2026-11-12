@@ -1338,6 +1338,13 @@ impl Format {
         self.terminals.iter().map(|terminal| &*terminal.text)
     }
 
+    /// Vocabulary atoms that make the table's framing structural. A tokenized
+    /// reader can bind their actual IDs; text-only readers retain the table's
+    /// existing string-marker behavior.
+    pub fn structural_token_texts(&self) -> &[String] {
+        &self.structural_tokens
+    }
+
     /// Whether `tail`, at the end of the output in `state`, is a tag the end cut short: it begins
     /// with a whole structural token and is the beginning of a terminal that, whole, would move
     /// the engine out of `state` or be dropped where it stands. The beginning of a terminal the
