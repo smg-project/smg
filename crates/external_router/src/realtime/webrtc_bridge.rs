@@ -619,7 +619,7 @@ impl WebRtcBridge {
                     "Client data channel opened"
                 );
                 self.client_channel = Some(id);
-                self.flush_pending_to_client();
+                self.flush_pending(Side::Client);
             }
             Event::ChannelData(data) => {
                 log_data_channel(&self.call_id, &data, "Client→Upstream");
@@ -688,7 +688,7 @@ impl WebRtcBridge {
                 );
                 self.upstream_channel = Some(id);
                 self.upstream_channel_ready = true;
-                self.flush_pending_to_upstream();
+                self.flush_pending(Side::Upstream);
             }
             Event::ChannelData(data) => {
                 log_data_channel(&self.call_id, &data, "Upstream→Client");
@@ -737,41 +737,38 @@ impl WebRtcBridge {
         }
     }
 
-    /// Send all buffered upstream events to the now-open client data channel.
-    fn flush_pending_to_client(&mut self) {
-        let Some(ch_id) = self.client_channel else {
+    /// Send the messages buffered for `target` to its now-open data channel.
+    fn flush_pending(&mut self, target: Side) {
+        let (channel, pending, rtc) = match target {
+            Side::Client => (
+                self.client_channel,
+                &mut self.pending_to_client,
+                &mut self.client_rtc,
+            ),
+            Side::Upstream => (
+                self.upstream_channel,
+                &mut self.pending_to_upstream,
+                &mut self.upstream_rtc,
+            ),
+        };
+        let Some(ch_id) = channel else {
             return;
         };
-        let pending = std::mem::take(&mut self.pending_to_client);
+        let pending = std::mem::take(pending);
         if pending.is_empty() {
             return;
         }
+        let from = Self::side_label(match target {
+            Side::Client => Side::Upstream,
+            Side::Upstream => Side::Client,
+        });
+        let to = Self::side_label(target);
         info!(
             call_id = self.call_id,
             count = pending.len(),
-            "Flushing buffered upstream events to client"
+            "Flushing buffered {from} events to {to}"
         );
-        if let Some(mut ch) = self.client_rtc.channel(ch_id) {
-            for (binary, data) in pending {
-                let _ = ch.write(binary, &data);
-            }
-        }
-    }
-
-    fn flush_pending_to_upstream(&mut self) {
-        let Some(ch_id) = self.upstream_channel else {
-            return;
-        };
-        let pending = std::mem::take(&mut self.pending_to_upstream);
-        if pending.is_empty() {
-            return;
-        }
-        info!(
-            call_id = self.call_id,
-            count = pending.len(),
-            "Flushing buffered client events to upstream"
-        );
-        if let Some(mut ch) = self.upstream_rtc.channel(ch_id) {
+        if let Some(mut ch) = rtc.channel(ch_id) {
             for (binary, data) in pending {
                 let _ = ch.write(binary, &data);
             }
