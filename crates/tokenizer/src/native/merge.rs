@@ -92,9 +92,12 @@ const NO_KEY: u32 = u32::MAX;
 const MAX_RANKS: usize = 1 << (u32::BITS - SHORT_KEY_BITS);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
-/// The id a byte with no token stands under in a table's byte ids: never
-/// merged (a piece that holds the byte is the model's, see
-/// [`MergeTable::lacks_a_token_for`]).
+/// The id of a byte the vocabulary has no token for. On the byte-level path
+/// a piece that holds the byte is the model's (see
+/// [`MergeTable::lacks_a_token_for`]); on the character symbols' table such
+/// a byte is never reached (`CharSymbols::from_model` declines one the
+/// fallback could reach, and `CharSymbols::merge` asserts it in debug
+/// builds).
 const NO_BYTE_TOKEN: u32 = u32::MAX;
 /// Filter bits per merge of the pair table (see `MergeTable::pair_filter`),
 /// at least: two set per pair in one word, so at eight bits per merge about

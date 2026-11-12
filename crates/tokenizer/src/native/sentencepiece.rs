@@ -305,6 +305,13 @@ impl CharSymbols {
             }
             let mut utf8 = [0u8; 4];
             for &byte in c.encode_utf8(&mut utf8).as_bytes() {
+                // The construction declines a missing byte the fallback
+                // could reach (see `from_model`): one spelled here has a
+                // token.
+                debug_assert!(
+                    !self.merges.lacks_a_token_for_byte(byte),
+                    "a byte without a token reached the fallback: {byte:#04x} in {c:?}"
+                );
                 symbols.push(self.merges.byte_id(byte));
             }
         }
