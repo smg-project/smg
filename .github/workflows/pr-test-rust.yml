@@ -2433,6 +2433,8 @@ jobs:
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
       && vars.SMG_RUN_AMD_GO_LEGS == 'true'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))

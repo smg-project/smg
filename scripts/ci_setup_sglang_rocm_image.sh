@@ -2,8 +2,9 @@
 # Set up a job that runs inside SGLang's ROCm image (the AMD benchmark row).
 #
 # The image provides SGLang, ROCm Torch and Mooncake in /opt/venv. Keep that
-# stack, align its native FFI dependencies and install SMG's gRPC packages
-# in the same interpreter. A venv of the job's own would not see
+# stack and install SMG's gRPC packages. Explicitly pinned callers also align
+# and verify the supported native FFI cohort in the same interpreter.
+# A venv of the job's own would not see
 # SGLang: --system-site-packages exposes the base interpreter's packages, not
 # /opt/venv's. pip keeps to the PIP_CONSTRAINT with which the image pins its
 # ROCm torch.
@@ -19,6 +20,8 @@ if [ "$#" -gt 0 ]; then
     fi
     verify_only=1
     [ "$#" -eq 1 ] || verify_output=("$2")
+fi
+if [ "$verify_only" -eq 1 ] || [ -n "${SMG_SGLANG_ROCM_IMAGE:-}" ]; then
     if [ -z "${SMG_SGLANG_ROCM_IMAGE:-}" ]; then
         echo "unsupported E2E SGLang image" >&2
         exit 1
@@ -76,6 +79,17 @@ except PackageNotFoundError:
 ')"
 
 echo "image: $(python3 -V) at $(command -v python3)"
+
+# Existing benchmark callers keep their editable install and HIP import check.
+# Only callers that explicitly supply the verified image pin opt into repair.
+if [ "$verify_only" -eq 0 ] && [ -z "${SMG_SGLANG_ROCM_IMAGE:-}" ]; then
+    $RETRY 3 10 python3 -m pip install -e crates/grpc_client/python/ -e grpc_servicer/
+    python3 -c "import torch, sglang, mooncake, smg_grpc_servicer; assert torch.version.hip; print('sglang', sglang.__version__, 'HIP', torch.version.hip)"
+    if [ -n "${GITHUB_ENV:-}" ]; then
+        echo "SMG_CI_GRPC_COMPANION_VERSION=${SMG_CI_GRPC_COMPANION_VERSION}" >> "$GITHUB_ENV"
+    fi
+    exit 0
+fi
 
 # This repair is scoped to the pinned SGLang 0.5.21 / ROCm 10 image cohort.
 # Build the original extension sdist against this image's Torch builtin API;

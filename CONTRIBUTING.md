@@ -166,7 +166,7 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD weekly and opt-in PR benchmarks (require `SMG_RUN_AMD_LEGS=true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
 | `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
-| `SMG_RUN_AMD_GO_LEGS` | `false` | Opt in to AMD Go SDK e2e; also requires `SMG_RUN_AMD_LEGS=true` and, for PRs, `SMG_RUN_AMD_ON_PRS=true`. Keep off until the SGLang ROCm environment, Go FFI and model, shared-host admission, and execution budget are qualified and approved |
+| `SMG_RUN_AMD_GO_LEGS` | `false` | Opt in to AMD Go SDK e2e; also requires `SMG_RUN_AMD_LEGS=true` and, for same-repository PRs, `SMG_RUN_AMD_ON_PRS=true`. Fork PRs are excluded because the container inherits the runner's HF token. Keep off until the SGLang ROCm environment, Go FFI and model, shared-host admission, and execution budget are qualified and approved |
 | `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep off until the native environment, performance budget and shared-host admission are qualified |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every

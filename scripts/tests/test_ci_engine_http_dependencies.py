@@ -18,6 +18,10 @@ EXTENSION_SOURCE = (
     "torch_c_dlpack_ext-0.1.5.tar.gz#sha256="
     "d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe"
 )
+FIXED_IMAGE = (
+    "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:"
+    "4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+)
 FAKE = r"""
 import importlib.metadata
 import importlib.util
@@ -83,6 +87,9 @@ elif args[0] == "-c":
                 type("PyCapsule", (), {})() if mode == "present" else object()
             )
         sys.modules["torch"] = torch
+        for name in ("sglang", "mooncake", "smg_grpc_servicer"):
+            sys.modules[name] = types.ModuleType(name)
+        sys.modules["sglang"].__version__ = version("sglang")
     exec(args[1])
 elif args[:2] == ["-m", "pip"]:
     known = (
@@ -204,8 +211,11 @@ def test_unreadable_engine_metadata_stops_before_pip(tmp_path):
     assert calls == []
 
 
+@pytest.mark.parametrize("native_repair", [False, True])
 @pytest.mark.parametrize("image_version", ["1.84.0", "1.90.0"])
-def test_sglang_image_companion_survives_separate_actions_steps(tmp_path, image_version):
+def test_sglang_image_companion_survives_separate_actions_steps(
+    tmp_path, image_version, native_repair
+):
     # Metadata/native modules/pip are fixtures here; this proves only shell wiring.
     github_env = tmp_path / "github.env"
     github_env.write_text("EXISTING=value\n")
@@ -213,10 +223,13 @@ def test_sglang_image_companion_survives_separate_actions_steps(tmp_path, image_
         tmp_path,
         {},
         script="ci_setup_sglang_rocm_image.sh",
-        extra_env={"IMAGE_REFLECTION_VERSION": image_version},
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": image_version,
+            **({"SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE} if native_repair else {}),
+        },
     )
     assert result.returncode == 0, result.stderr
-    assert calls == [
+    expected_native = [
         [
             "-m",
             "pip",
@@ -231,11 +244,15 @@ def test_sglang_image_companion_survives_separate_actions_steps(tmp_path, image_
         ["-m", "pip", "install", "-e", "crates/grpc_client/python/", "-e", "grpc_servicer/"],
         ["-m", "pip", "check"],
     ]
+    assert calls == (expected_native if native_repair else [expected_native[1]])
     assert github_env.read_text() == (
         "EXISTING=value\nSMG_CI_GRPC_COMPANION_VERSION=" + image_version + "\n"
     )
-    native = [json.loads(line) for line in (tmp_path / "native.jsonl").read_text().splitlines()]
-    assert native == [[str(ROOT / "scripts/ci_verify_sglang_rocm_cohort.py")]]
+    if native_repair:
+        native = [json.loads(line) for line in (tmp_path / "native.jsonl").read_text().splitlines()]
+        assert native == [[str(ROOT / "scripts/ci_verify_sglang_rocm_cohort.py")]]
+    else:
+        assert not (tmp_path / "native.jsonl").exists()
     name, value = github_env.read_text().splitlines()[-1].split("=", 1)
     (tmp_path / "pip.jsonl").unlink()
     # A new bash process consumes the real producer output, not the setup shell.
@@ -248,6 +265,46 @@ def test_sglang_image_companion_survives_separate_actions_steps(tmp_path, image_
         "grpcio-health-checking==" + image_version,
         "grpcio-reflection==" + image_version,
     ]
+
+
+@pytest.mark.parametrize("hip", ["legacy-HIP", ""])
+def test_unpinned_legacy_setup_does_not_require_native_verifier(tmp_path, hip):
+    # An existing caller with another ROCm cohort need not ship the new verifier.
+    folder = tmp_path / "legacy"
+    folder.mkdir()
+    for name in ("ci_setup_sglang_rocm_image.sh", "ci_retry.sh"):
+        (folder / name).write_bytes((ROOT / "scripts" / name).read_bytes())
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script=str(folder / "ci_setup_sglang_rocm_image.sh"),
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "IMAGE_SGLANG_VERSION": "0.4.9",
+            "IMAGE_TORCH_VERSION": "2.8.0+rocm6.4",
+            "IMAGE_TORCH_C_API": "absent",
+            "IMAGE_TORCH_HIP": hip,
+        },
+    )
+    assert calls == [
+        ["-m", "pip", "install", "-e", "crates/grpc_client/python/", "-e", "grpc_servicer/"]
+    ]
+    assert (result.returncode == 0) == bool(hip), result.stderr
+    assert (tmp_path / "github.env").exists() == bool(hip)
+    assert not (tmp_path / "native.jsonl").exists()
+
+
+def test_explicit_unsupported_repair_image_stops_before_tools(tmp_path):
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        extra_env={"SMG_SGLANG_ROCM_IMAGE": "unsupported", "IMAGE_REFLECTION_VERSION": "1.84.0"},
+    )
+    assert result.returncode == 1
+    assert "unsupported E2E SGLang image" in result.stderr
+    assert calls == [] and not (tmp_path / "github.env").exists()
+    assert not (tmp_path / "native.jsonl").exists()
 
 
 def test_missing_sglang_image_companion_stops_before_install(tmp_path):
@@ -273,7 +330,11 @@ def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image, diagnosti
         tmp_path,
         {},
         script="ci_setup_sglang_rocm_image.sh",
-        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", **bad_image},
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
+            **bad_image,
+        },
     )
     assert result.returncode != 0
     assert "ERROR:" in result.stderr
@@ -289,6 +350,7 @@ def test_rocm_repair_failure_does_not_publish_handoff(tmp_path, stage, exitcode)
         script="ci_setup_sglang_rocm_image.sh",
         extra_env={
             "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
             "FAIL_PIP_STAGE": stage,
             "FAIL_NATIVE_CHECK": "1" if stage == "native" else "",
         },
@@ -324,7 +386,11 @@ def test_rocm_repair_preserves_all_constraint_inputs(tmp_path):
         tmp_path,
         {},
         script="ci_setup_sglang_rocm_image.sh",
-        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", **expected},
+        extra_env={
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
+            **expected,
+        },
     )
     assert result.returncode == 0, result.stderr
     observed = [json.loads(line) for line in (tmp_path / "pip-env.jsonl").read_text().splitlines()]
@@ -343,12 +409,6 @@ def test_generic_cuda_install_does_not_repair_the_rocm_cohort(tmp_path):
         for call in calls
     )
     assert not (tmp_path / "github.env").exists()
-
-
-FIXED_IMAGE = (
-    "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:"
-    "4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
-)
 
 
 def test_verify_only_does_not_install_or_publish_handoff(tmp_path):
@@ -423,6 +483,7 @@ def test_dlpack_own_library_is_rejected_before_check_and_handoff(tmp_path):
         script="ci_setup_sglang_rocm_image.sh",
         extra_env={
             "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
             "IMAGE_DLPACK_LIB": "fixture-dlpack-library",
         },
     )
@@ -499,7 +560,7 @@ def test_ambient_dlpack_fixture_is_sanitized(tmp_path, monkeypatch):
         tmp_path,
         {},
         script="ci_setup_sglang_rocm_image.sh",
-        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0"},
+        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE},
     )
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "github.env").exists()
