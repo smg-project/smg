@@ -6572,6 +6572,17 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// A sized answer of two short deltas and `[DONE]`: the re-slicing
+    /// policy holds deltas this short and merges them, so a rechunker that
+    /// ran on the body shows in the relayed bytes.
+    const SIZED_DELTA_BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: [DONE]\n\n";
+
     /// A streamed SSE relay may change the body's length, by re-slicing it
     /// or by ending a cut stream with its error event, so a sized upstream
     /// answer reaches the client without the upstream's `Content-Length` on
@@ -6580,14 +6591,7 @@ mod tests {
     async fn a_streamed_sse_relay_drops_the_upstreams_content_length() {
         use openai_protocol::validated::Normalizable;
 
-        const BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
-                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\
-                            \"finish_reason\":null}]}\n\n\
-                            data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
-                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
-                            \"finish_reason\":null}]}\n\n\
-                            data: [DONE]\n\n";
-        let url = spawn_sized_worker(BODY, "text/event-stream").await;
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "text/event-stream").await;
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
         let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
         for model in ["MiniMax-M3", "served-plain-relay-model"] {
@@ -6628,14 +6632,14 @@ mod tests {
     /// A streamed answer that is not SSE is relayed byte for byte, on the
     /// re-chunking model and the plain one alike, so a sized upstream answer
     /// keeps the upstream's `Content-Length` and reaches the client whole.
+    /// The body carries deltas the re-slicing policy would hold and merge,
+    /// so a rechunker that ran under the wrong content type shows in the
+    /// bytes.
     #[tokio::test]
     async fn a_streamed_relay_keeps_the_content_length_of_a_sized_non_sse_answer() {
         use openai_protocol::validated::Normalizable;
 
-        const BODY: &str = "{\"id\":\"sized\",\"object\":\"chat.completion\",\"created\":1700000000,\
-                            \"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\
-                            \"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}";
-        let url = spawn_sized_worker(BODY, "application/json").await;
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "application/json").await;
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
         let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
         for model in ["MiniMax-M3", "served-plain-relay-model"] {
@@ -6656,7 +6660,7 @@ mod tests {
                     .headers()
                     .get(CONTENT_LENGTH)
                     .and_then(|length| length.to_str().ok()),
-                Some(BODY.len().to_string().as_str()),
+                Some(SIZED_DELTA_BODY.len().to_string().as_str()),
                 "{model}: the upstream's Content-Length of a sized non-SSE answer"
             );
             let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -6665,7 +6669,7 @@ mod tests {
                 .to_bytes();
             assert_eq!(
                 bytes.as_ref(),
-                BODY.as_bytes(),
+                SIZED_DELTA_BODY.as_bytes(),
                 "{model}: the bytes are whole"
             );
         }
