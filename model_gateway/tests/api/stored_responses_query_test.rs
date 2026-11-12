@@ -64,8 +64,13 @@ async fn store_a_record_without_item_ids(ctx: &AppTestContext) {
     legacy.input = Value::Array(
         (0..25)
             .map(|i| {
-                json!({"type": "message", "role": "user",
-                       "content": [{"type": "input_text", "text": format!("q{i}")}]})
+                let mut item = json!({"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": format!("q{i}")}]});
+                // every fifth item carries the empty id the store reads as missing
+                if i % 5 == 0 {
+                    item["id"] = json!("");
+                }
+                item
             })
             .collect(),
     );

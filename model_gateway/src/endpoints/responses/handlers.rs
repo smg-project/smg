@@ -203,7 +203,7 @@ pub async fn delete_response(
 
 /// `GET /v1/responses/{id}/input_items` for a caller of `tenant`: the page
 /// of the stored input that `query` asks for (see [`InputItemsQuery`]). An
-/// item stored without an id (a record from before ids were minted at store
+/// item stored without an id or with an empty one (a record from before ids were minted at store
 /// time) is listed under the id `listing_id` derives from the response id and
 /// the item's position, the same on every read, so a page's `last_id` is
 /// found by the next request whichever item it names; a cursor the list does
@@ -229,7 +229,11 @@ pub async fn list_response_input_items(
                 .into_iter()
                 .enumerate()
                 .map(|(position, mut item)| {
-                    if item.get("id").and_then(Value::as_str).is_none() {
+                    if item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                    {
                         if let Some(obj) = item.as_object_mut() {
                             obj.insert("id".to_string(), json!(listing_id(&resp_id, position)));
                         }
@@ -632,8 +636,13 @@ mod tests {
         legacy.input = Value::Array(
             (0..25)
                 .map(|i| {
-                    json!({"type": "message", "role": "user",
-                           "content": [{"type": "input_text", "text": format!("q{i}")}]})
+                    let mut item = json!({"type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": format!("q{i}")}]});
+                    // every fifth item carries the empty id the store reads as missing
+                    if i % 5 == 0 {
+                        item["id"] = json!("");
+                    }
+                    item
                 })
                 .collect(),
         );
