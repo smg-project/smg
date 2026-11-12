@@ -1690,14 +1690,16 @@ fn a_joined_letter_run_encodes_as_the_library_does() {
 /// after the space the same way): the check starts its
 /// window at a space after a character that is neither whitespace, nor one
 /// a run reaches the space from, nor one such an alternative reads before a
-/// space, and refuses a candidate without one in reach. The two patterns,
-/// the family's and five with such an alternative, on a text that is one
-/// run, on prose with a comma, on runs after two spaces and after a line
-/// break with a space, on prose joined by a period and two spaces, on lines
-/// indented by four spaces, and on runs after `1 `, after `, `, after a
-/// literal prefix and after an optional one: the pool's units hold the
-/// whole text's pieces, and the
-/// pool's ids are the serial encode's and the library's.
+/// space, and refuses a candidate without one in reach; a pattern without
+/// a joined run whose letter run reads an optional space takes the same
+/// guarded start. The patterns, the family's, five with such an alternative
+/// and the one without a run, on a text that is one run, on prose with a
+/// comma, on runs after two spaces and after a line break with a space, on
+/// prose joined by a period and two spaces, on lines indented by four
+/// spaces, on runs after `1 `, after `, `, after a literal prefix and after
+/// an optional one, and on single-spaced words: the pool's units hold the
+/// whole text's pieces, and the pool's ids are the serial encode's and the
+/// library's.
 #[test]
 fn a_space_joined_run_is_never_cut_by_the_pool() {
     let mut state = 0x4A4F_494E_4544_5203u64;
@@ -1719,6 +1721,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
         "a".repeat(230),
         "a ".repeat(20_000)
     );
+    let letter_space = "abc ".repeat(20_000);
     for (index, pattern) in [
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}",
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\s+",
@@ -1728,6 +1731,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
         r"x (?:ab*(?: ab*)*)+| a[ a]{998}| (?:ab*(?: ab*)*)+",
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\p{N}? |\s+",
         r" [ ac]{999}|x? a+|(?:ab*(?: ab*)*)+",
+        r"\p{L}+ ?| ?\p{L}+|\s+",
     ]
     .into_iter()
     .enumerate()
@@ -1756,6 +1760,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
             comma_space.as_str(),
             prefix_run.as_str(),
             prefix_opt.as_str(),
+            letter_space.as_str(),
         ] {
             let whole: Vec<String> = {
                 let mut out = Vec::new();
@@ -1788,8 +1793,9 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
     }
 }
 
-/// Without a letter run joined by spaces among the stages, the cut check's
-/// window starts at the nearest space back, however far: a text whose spaces
+/// When no stage reads a space after a non-whitespace character inside one
+/// match (the shape's before-space classes are whitespace alone), the cut
+/// check's window starts at the nearest space back, however far: a text whose spaces
 /// stand further apart than the check's reach keeps its pool cuts, and the
 /// pool's ids are the serial encode's and the library's.
 #[test]

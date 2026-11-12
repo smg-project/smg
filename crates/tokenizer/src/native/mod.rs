@@ -275,10 +275,11 @@ const SEED_THREADS: usize = 4;
 /// over to confirm a piece starts there (widened to the spaces around it).
 const CUT_CHECK_WINDOW: usize = 512;
 /// How far before a candidate cut the window's start may be looked for when
-/// a stage holds a letter run joined by spaces, whose joins and the spaces
-/// a whitespace run took are inside pieces; a candidate without a start
-/// within this reach is refused. Without such a stage the nearest space back
-/// is the start, however far.
+/// a stage can read a space after a non-whitespace character inside one
+/// match (a letter run joined by spaces, a class read before a space), so
+/// that spaces lie inside pieces; a candidate without a start within this
+/// reach is refused. Without such a stage the nearest space back is the
+/// start, however far.
 const CUT_CHECK_REACH: usize = 4 * CUT_CHECK_WINDOW;
 /// Candidates one cut search may reject before it gives up: the byte scan for
 /// a candidate is cheap, the window check on each one is not, so a text whose
@@ -1045,10 +1046,11 @@ pub(crate) struct NativeEncoder {
     /// Added tokens matched after normalization (`normalized: true`).
     normalized_added: Option<AddedTokens>,
     stages: Vec<Stage>,
-    /// Whether a stage holds a letter run joined by spaces
-    /// ([`Pattern::joins_with_space`]): the thread pool's cut check then
-    /// chooses its window's start with care ([`Self::window_start`]).
-    space_joined: bool,
+    /// Whether a stage can read a space after a non-whitespace character
+    /// inside one match ([`Pattern::reads_space_inside`]): the thread
+    /// pool's cut check then chooses its window's start with care
+    /// ([`Self::window_start`]).
+    space_inside: bool,
     /// The one-pass matcher of the stages, when they are a chain it covers
     /// (the stages stay for the cut checks and as the matcher of record).
     chain: Option<chain::Scanner>,
@@ -1189,7 +1191,9 @@ impl NativeEncoder {
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
-            space_joined: stages.iter().any(|stage| stage.pattern.joins_with_space()),
+            space_inside: stages
+                .iter()
+                .any(|stage| stage.pattern.reads_space_inside()),
             stages,
             chain,
             frame,
@@ -1269,7 +1273,7 @@ impl NativeEncoder {
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
             stages: Vec::new(),
-            space_joined: false,
+            space_inside: false,
             chain: None,
             frame,
             alphabet: bytes_char(),
@@ -1886,7 +1890,9 @@ impl NativeEncoder {
             nfc_quick: None,
             end_anchored: false,
             mapped_from: None,
-            space_joined: stages.iter().any(|stage| stage.pattern.joins_with_space()),
+            space_inside: stages
+                .iter()
+                .any(|stage| stage.pattern.reads_space_inside()),
             stages,
             chain,
             frame: Frame::default(),
@@ -2532,17 +2538,20 @@ impl NativeEncoder {
     /// lands the text on the letter after it the same way); a space after
     /// any other character begins a piece, since no alternative of the
     /// subset reads a space inside its match but as the join, in a
-    /// whitespace run or after a character of such a class. Without such
-    /// a run among the stages the nearest space back is the start, however
-    /// far (no other piece of the subset holds a space but at its start, and
-    /// a window begun inside a whitespace run rejoins the text's pieces at
-    /// the run's end). With one, `None` when no such space lies within
-    /// [`CUT_CHECK_REACH`] of `p`: a stretch of words joined by single
-    /// spaces is one piece under such a pattern, and no cut is lost there.
+    /// whitespace run or after a character of such a class. When no stage
+    /// reads a space after a non-whitespace character inside one match
+    /// ([`Pattern::reads_space_inside`]: no such run, and the before-space
+    /// classes whitespace alone), a piece holds a space only at its start
+    /// or in a whitespace run, so the nearest space back is the start,
+    /// however far (a window begun inside a whitespace run rejoins the
+    /// text's pieces at the run's end). Otherwise `None` when no such space
+    /// lies within [`CUT_CHECK_REACH`] of `p`: a long text without one
+    /// stays one unit (under a letter run joined by spaces such a stretch
+    /// is one piece, so no cut is lost there).
     fn window_start(&self, text: &str, p: usize) -> Option<usize> {
         let bytes = text.as_bytes();
         let mut start = p.saturating_sub(CUT_CHECK_WINDOW);
-        if !self.space_joined {
+        if !self.space_inside {
             while start > 0 && !(text.is_char_boundary(start) && bytes[start] == b' ') {
                 start -= 1;
             }

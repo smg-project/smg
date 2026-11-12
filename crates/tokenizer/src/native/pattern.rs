@@ -356,6 +356,19 @@ impl Class {
         self.first().non_ascii
     }
 
+    /// Whether every character the class can hold is whitespace: no
+    /// negation or exclusion, no category but `\s`, every range within the
+    /// characters [`char::is_whitespace`] accepts. The classes of a
+    /// whitespace run are that; a class that may hold anything else is not.
+    pub(super) fn whitespace_only(&self) -> bool {
+        !self.negated
+            && self.without == 0
+            && self.categories & !CAT_SPACE == 0
+            && self.ranges.iter().all(|&(start, end)| {
+                (start..=end).all(|code| char::from_u32(code).is_some_and(char::is_whitespace))
+            })
+    }
+
     /// Whether every character the class can hold is printable ASCII
     /// (U+0021..=U+007E): no category, no negation, every range within.
     pub(super) fn within_printable_ascii(&self) -> bool {
@@ -939,6 +952,23 @@ impl Pattern {
         self.before_space
             .iter()
             .any(|&class| self.classes[class].contains(before))
+    }
+
+    /// Whether some alternative of the pattern can read a space right after
+    /// a character outside whitespace inside one match: a letter run joined
+    /// by spaces ([`Self::joins_with_space`]), or an alternative that reads
+    /// a space anywhere but at its first position through a class that
+    /// holds such a character ([`Self::reads_space_after`]; the whitespace
+    /// runs of the common byte-level shape read one after whitespace
+    /// alone). Under such a pattern a piece of the whole text holds a space
+    /// inside it, so the thread pool's cut check chooses its window's start
+    /// with care (`NativeEncoder::window_start`).
+    pub(super) fn reads_space_inside(&self) -> bool {
+        self.joins_with_space()
+            || self
+                .before_space
+                .iter()
+                .any(|&class| !self.classes[class].whitespace_only())
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
@@ -3639,6 +3669,34 @@ mod tests {
                 reads,
                 "{pattern} after {before:?}"
             );
+        }
+    }
+
+    /// Whether a pattern can read a space after a non-whitespace character
+    /// inside one match ([`Pattern::reads_space_inside`]): the family's
+    /// joined run, a digit run before an optional space and a letter run
+    /// before one say so; the common byte-level shape (its spaces at an
+    /// alternative's start or in whitespace runs), whitespace runs before
+    /// line breaks and a pattern whose space starts its alternative do not.
+    #[test]
+    fn a_space_inside_a_match_is_read_at_parse() {
+        const JOINED: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
+        const DIGIT_SPACE: &str = r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}+ ?| ?\p{L}+|\s+";
+        const LETTER_SPACE: &str = r"\p{L}+ ?| ?\p{L}+|\s+";
+        const BYTE_LEVEL: &str =
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+        const BREAKS: &str = r"\s*[\r\n]|\s+(?!\S)|\s+| ?\p{L}+";
+        const LEAD_ONLY: &str = r"[a-z]+| [a-z]+|\s+";
+        for (pattern, reads) in [
+            (JOINED, true),
+            (DIGIT_SPACE, true),
+            (LETTER_SPACE, true),
+            (BYTE_LEVEL, false),
+            (BREAKS, false),
+            (LEAD_ONLY, false),
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert_eq!(parsed.reads_space_inside(), reads, "{pattern}");
         }
     }
 
