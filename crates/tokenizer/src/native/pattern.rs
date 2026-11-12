@@ -2646,16 +2646,18 @@ mod tests {
             r"(?i:([ab])\1*)",
             // the run with something after it in its alternative
             r"([ab])\1*c",
-            r"([ab])\1*|c([ab])\1*d",
+            r"x|([ab])\1*y",
+            r"(?:([ab])\1*)?",
+            r"(?:x([ab])\1*)y",
             // a second capturing group: its `\1` names the first group, unset
             // in another alternative, where the engine's `\1*` matches nothing
+            // (the last row declines for that before the placement check)
             r"([a])\1*|([b])\1*",
             r"([ab])\1*|([cd])\1*",
             r"(?:x|([ab])\1*)|([cd])\1*",
             r"([ab])\1*([cd])\1*",
             r"([ab])\1*|([cd])\2*",
-            r"(?:([ab])\1*)?",
-            r"(?:x([ab])\1*)y",
+            r"([ab])\1*|c([ab])\1*d",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
