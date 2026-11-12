@@ -109,7 +109,7 @@
   {"model": "MiniMaxAI/MiniMax-M2", "also": [], "table": "minimax_m2", "opener": null, "after": null},
   {"model": "MiniMaxAI/MiniMax-M2.5", "also": [], "table": "minimax_m2", "opener": null, "after": null},
   {"model": "MiniMaxAI/MiniMax-M2.7", "also": [], "table": "minimax_m2", "opener": null, "after": null},
-  {"model": "MiniMaxAI/MiniMax-M3", "also": [], "table": "minimax_m3", "opener": null, "after": null},
+  {"model": "MiniMaxAI/MiniMax-M3", "also": ["MiniMax-M3.1-Flash"], "table": "minimax_m3", "opener": null, "after": null},
   {"model": "mistralai/Ministral-3-14B-Instruct-2512-BF16", "also": [], "table": "mistral_v13", "opener": null, "after": null},
   {"model": "mistralai/Ministral-3-14B-Reasoning-2512", "also": ["Ministral-3-3B-Reasoning-2512", "Ministral-3-8B-Reasoning-2512"], "table": "mistral_v13", "opener": null, "after": null},
   {"model": "mistralai/Ministral-3-3B-Instruct-2512", "also": [], "table": "mistral_v13", "opener": null, "after": null},

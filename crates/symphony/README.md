@@ -236,7 +236,7 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-224 groups, 406 checkpoints, newest first.
+224 groups, 407 checkpoints, newest first.
 12 ready, 159 replaying a recorded set, 4 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
@@ -280,7 +280,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-06-13 | [kimi-k3](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k3) | moonshotai/Kimi-K3 | Kimi-K3.1-Pro, nvidia/Kimi-K3.1-Pro-NVFP4 | `kimi_k3` | 54,418 | ready | `kimi_k3`, `kimi_k3` |
 | 2026-06-11 | [kimi-k2.7-code](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2.7-code) | moonshotai/Kimi-K2.7-Code |  | `kimi_k2` | 28 | replaying the set | `kimik2`, `kimi` |
 | 2026-06-03 | [nvidia-nemotron-3-ultra-550b-a55b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3-ultra-550b-a55b-bf16) | nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 | Nemotron-3-Labs-Ultra-Math-RL, NVIDIA-Nemotron-Labs-Teacher-Chat, NVIDIA-Nemotron-Labs-Teacher-Competition-Coding, NVIDIA-Nemotron-Labs-Teacher-General-Reasoning, NVIDIA-Nemotron-Labs-Teacher-Instruction-Following, NVIDIA-Nemotron-Labs-Teacher-STEM | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
-| 2026-06-02 | [minimax-m3](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m3) | MiniMaxAI/MiniMax-M3 |  | `minimax_m3` | 589,302 | replaying the set | `minimax_m3`, `minimax_m3` |
+| 2026-06-02 | [minimax-m3](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m3) | MiniMaxAI/MiniMax-M3 | MiniMax-M3.1-Flash | `minimax_m3` | 589,302 | replaying the set | `minimax_m3`, `minimax_m3` |
 | 2026-05-22 | [caprl-video-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/caprl-video-4b) | internlm/CapRL-Video-4B | inclusionAI/ArmorOCR | `qwen3` | 576,772 | replaying the set | none |
 | 2026-05-18 | [bitcpm-cann-3b-unquantized](https://github.com/smg-project/bellwether/tree/main/fixtures/bitcpm-cann-3b-unquantized) | openbmb/BitCPM-CANN-3B-unquantized | BitCPM-CANN-1B, BitCPM-CANN-1B-unquantized, BitCPM-CANN-3B | — | 328,662 | pending | none |
 | 2026-05-18 | [ernie-image-aes](https://github.com/smg-project/bellwether/tree/main/fixtures/ernie-image-aes) | baidu/ERNIE-Image-Aes |  | `qwen2.5` | 576,772 | replaying the set | none |
