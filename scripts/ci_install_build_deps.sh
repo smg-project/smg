@@ -3,20 +3,23 @@
 #
 # The workspace needs C and C++ compilers and make (the cc crate's builds,
 # the tokenizers crate's C++ sources), pkg-config with the OpenSSL headers
-# (openssl-sys) and protoc (prost-build in the gRPC crates). The hosted runner image carries the first three and not
-# protoc, so a job that installed all four through apt refreshed the archive's
-# indexes for one package every time, and an archive outage (every Ubuntu
-# mirror unresolvable for hours on 2026-11-11) held every check of the day
-# for tools the image already had.
+# (openssl-sys) and protoc (prost-build in the gRPC crates). The GitHub-hosted
+# runner images carry the first three and not protoc, so a job that installed
+# all four through apt refreshed the archive's indexes for one package every
+# time, and an archive outage (every Ubuntu mirror unresolvable for hours on
+# 2026-11-11) held every check of the day for tools the image already had.
+# Other runners (the cluster's CPU runners) carry none of the four; there the
+# archive installs all of them, as before.
 #
 # Usage: ci_install_build_deps.sh
 #
 # What is present is left alone. What is missing comes from the Ubuntu archive
 # through the mirror, index-refresh and retry helpers beside this script. When
 # protoc alone is missing and the archive does not answer, protoc comes from
-# its GitHub release instead (ci_install_protoc.sh, pinned by sha256), and its
-# bin directory is exported on PATH for the caller and appended to GITHUB_PATH
-# for the steps that follow.
+# its GitHub release instead (ci_install_protoc.sh, pinned by sha256), which
+# appends its bin directory to GITHUB_PATH for the steps that follow; the
+# caller puts that directory on its own PATH (ci_install_rust.sh does), as an
+# export here would die with this shell.
 #
 # Environment:
 #   CI_APT_INSTALL_RETRY_DELAY  first delay of the install retry, seconds
@@ -75,7 +78,6 @@ if [ "${installed}" -eq 1 ]; then
 elif [ "${#missing[@]}" -eq 1 ] && [ "${missing[0]}" = "protobuf-compiler" ]; then
     log "the archive did not answer; protoc comes from its release"
     bash "${here}/ci_install_protoc.sh"
-    export PATH="${CI_PROTOC_PREFIX:-${HOME}/.local}/bin:${PATH}"
 else
     log "could not install ${missing[*]} from the archive" >&2
     exit 1

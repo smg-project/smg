@@ -36,6 +36,12 @@ INFRA_FILES = (
     "Cargo.lock",
     ".cargo/config.toml",
     "scripts/ci_rust_tests.sh",
+    "scripts/ci_install_rust.sh",
+    "scripts/ci_apt_mirror.sh",
+    "scripts/ci_apt_update.sh",
+    "scripts/ci_retry.sh",
+    "scripts/ci_install_build_deps.sh",
+    "scripts/ci_install_protoc.sh",
     ".github/workflows/pr-test-rust.yml",
 )
 
