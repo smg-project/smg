@@ -1708,7 +1708,7 @@ impl StepExecutor<TestWorkflowData> for HeldSucceedingStep {
 /// step's end is written before the state is cleaned up.
 #[tokio::test]
 async fn a_cancelled_workflow_s_terminal_state_waits_for_a_step_past_its_cancel_read() {
-    let engine = Arc::new(WorkflowEngine::<TestWorkflowData>::new());
+    let engine = WorkflowEngine::<TestWorkflowData>::new();
     let running = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let workflow = WorkflowDefinition::new("cancel_under_a_step_workflow", "Cancel Under A Step")
@@ -1729,26 +1729,23 @@ async fn a_cancelled_workflow_s_terminal_state_waits_for_a_step_past_its_cancel_
         .await
         .expect("the held step runs");
     engine.cancel_workflow(instance_id).await.unwrap();
-    let waiter = {
-        let engine = Arc::clone(&engine);
-        tokio::spawn(async move {
-            engine
-                .wait_for_terminal_state(
-                    instance_id,
-                    "cancel under a step",
-                    Duration::from_secs(10),
-                )
-                .await
-        })
-    };
-    // The waiter polls the cancelled state while the step is still held.
-    sleep(Duration::from_millis(300)).await;
-    release.notify_one();
-    let state = timeout(Duration::from_secs(5), waiter)
-        .await
-        .expect("the waiter ends once the step has")
-        .expect("the waiter's task")
-        .unwrap();
+    // The waiter polls the cancelled state while the step is still held;
+    // the release comes 300 ms into its wait.
+    let (state, ()) = tokio::join!(
+        timeout(
+            Duration::from_secs(5),
+            engine.wait_for_terminal_state(
+                instance_id,
+                "cancel under a step",
+                Duration::from_secs(10),
+            ),
+        ),
+        async {
+            sleep(Duration::from_millis(300)).await;
+            release.notify_one();
+        }
+    );
+    let state = state.expect("the waiter ends once the step has").unwrap();
     assert_eq!(
         state.step_states[&StepId::new("held_ok_step")].status,
         StepStatus::Succeeded,
