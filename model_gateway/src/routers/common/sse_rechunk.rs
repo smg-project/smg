@@ -329,7 +329,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
     fn consume<'a>(&mut self, input: &'a [u8], searched: usize, out: &mut Vec<u8>) -> &'a [u8] {
         let mut start = 0;
         // A delimiter is up to four bytes long and may straddle the boundary.
-        let mut from = searched.saturating_sub(3);
+        let mut from = searched.saturating_sub(DELIMITER_OVERLAP);
         while let Some((end, delimiter)) = find_frame_end(&input[start..], from) {
             let frame_end = start + end + delimiter;
             self.handle_frame(&input[start..frame_end], out);
@@ -1218,6 +1218,11 @@ fn classify_frame(frame: &[u8]) -> Frame<'_> {
         _ => Frame::Other,
     }
 }
+
+/// Bytes of a frame delimiter that may already sit before the end of a
+/// scanned prefix: the four-byte `\r\n\r\n` less its last byte. A scan that
+/// resumes this far back finds a delimiter the boundary split.
+pub(crate) const DELIMITER_OVERLAP: usize = 3;
 
 /// Position and length of the first frame delimiter at or after `from`:
 /// `\r\n\r\n`, `\n\n` or `\r\r`.
