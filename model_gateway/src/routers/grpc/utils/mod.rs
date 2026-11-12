@@ -39,6 +39,9 @@ pub(crate) use metrics::{
 };
 #[cfg(test)]
 pub(crate) use parsers::messages_reasoning_starts_in_prefill;
+/// The parser-name resolver, public for its allocation pin
+/// (`tests/parser_read_allocation_pins.rs`): a single read's one String.
+pub use parsers::ParserResolver;
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
 // predicates instead of duplicating them: the rendered one where they render,
 // the request-based guess where they do not.
@@ -48,7 +51,7 @@ pub(crate) use parsers::{
     check_tool_parser_availability, create_reasoning_parser, create_tool_parser, get_tool_parser,
     messages_reasoning_starts_in_prefill_for, reasoning_parser_requires_special_tokens,
     rendered_prompt_reasoning_in_prefill, tool_constraints_for_worker, ModelNames, Names,
-    ParserResolver, TagVocabulary, WorkerDecoding,
+    TagVocabulary, WorkerDecoding,
 };
 pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
 pub(crate) use stream_failure::{choice_mut, send_stream_failure, StreamFailure, StreamSource};
