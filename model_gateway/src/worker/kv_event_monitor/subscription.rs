@@ -1668,7 +1668,11 @@ mod tests {
     /// not a working one: the delay before the next attempt doubles from
     /// attempt to attempt instead of restarting at the initial delay on
     /// every connect, the worker's own answer to the subscribe call does
-    /// not end the wait early, and the failure is counted by its code.
+    /// not end the wait early, and the failure is counted by its code. The
+    /// doubling is read from the delays the subscription schedules (its
+    /// retry lines), not from the wall-clock gaps between the connects,
+    /// which a loaded host stretches unevenly.
+    #[traced_test]
     #[test]
     fn a_stream_that_fails_on_its_first_message_backs_off_and_is_counted() {
         use metrics_exporter_prometheus::PrometheusBuilder;
@@ -1705,11 +1709,36 @@ mod tests {
             "{} subscribe calls in 1.9 s",
             calls.len()
         );
+        // The delay scheduled after each failed stream doubles up to the cap.
+        logs_assert(|lines: &[&str]| {
+            let delays = lines
+                .iter()
+                .filter(|line| line.contains("KV event stream error, reconnecting"))
+                .map(|line| {
+                    line.split("delay_ms=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                        .ok_or_else(|| format!("no delay_ms on the retry line: {line}"))
+                })
+                .collect::<Result<Vec<u64>, String>>()?;
+            if delays.len() < 3 {
+                return Err(format!(
+                    "{} retry lines, three or more expected",
+                    delays.len()
+                ));
+            }
+            if delays[0] != INITIAL_RECONNECT_DELAY_MS
+                || !delays
+                    .windows(2)
+                    .all(|pair| pair[1] == (pair[0] * 2).min(MAX_RECONNECT_DELAY_MS))
+            {
+                return Err(format!("the scheduled delays do not double: {delays:?}"));
+            }
+            Ok(())
+        });
+        // The last wait was slept: a loaded host only stretches it.
         let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
-        assert!(
-            gaps.windows(2).all(|pair| pair[1] > pair[0]),
-            "the gaps do not grow: {gaps:?}"
-        );
         assert!(
             gaps.last().unwrap() >= &Duration::from_millis(600),
             "{gaps:?}"
