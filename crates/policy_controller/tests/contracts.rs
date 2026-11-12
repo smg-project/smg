@@ -1672,3 +1672,36 @@ fn the_hello_version_fields_are_pinned() {
         );
     }
 }
+
+/// The decline a plugin answers a stage with: `stage` is Stage bits, `reason`
+/// the enum, `detail` free text; a frame declining a stage and filling that
+/// stage's answer field is invalid.
+type DeclineField = (&'static str, i32, Type);
+
+const DECLINE_FIELDS: &[(&str, &[DeclineField])] = &[(
+    "Decline",
+    &[
+        ("stage", 1, Type::Uint32),
+        ("reason", 2, Type::Enum),
+        ("detail", 3, Type::String),
+    ],
+)];
+
+#[test]
+fn the_decline_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECLINE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a decline field moved");
+    }
+}
