@@ -145,7 +145,7 @@ pub async fn serve_with_listener_until(
     let health = MockHealth {
         overrides: Arc::clone(&overrides),
         stopped: stopped.clone(),
-        wire,
+        service: health_service_name(wire, cfg.role),
     };
     let bootstrap =
         bootstrap.map(|listener| crate::bootstrap::accept_and_close(listener, stopped.clone()));
@@ -582,6 +582,20 @@ pub(crate) fn service_name(wire: SchedulerWire) -> &'static str {
         SchedulerWire::TokenSpeed => <tokenspeed::Server as NamedService>::NAME,
         SchedulerWire::Vllm => <vllm::Server as NamedService>::NAME,
         SchedulerWire::Sglang => <sglang::Server as NamedService>::NAME,
+    }
+}
+
+/// The service name the standard health service knows beside the empty
+/// name: the scheduler's, or the encoder's for an encode worker on the
+/// TokenSpeed wire, where the engine servicer reports health under the
+/// encoder's name (a probe of the scheduler's name reads NOT_FOUND there, as
+/// on the engine).
+pub(crate) fn health_service_name(wire: SchedulerWire, role: Option<Role>) -> &'static str {
+    match (wire, role) {
+        (SchedulerWire::TokenSpeed, Some(Role::Encode)) => {
+            <tokenspeed::EncoderServer as NamedService>::NAME
+        }
+        _ => service_name(wire),
     }
 }
 
@@ -1112,25 +1126,28 @@ const HEALTH_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 type HealthWatchStream = Pin<Box<dyn Stream<Item = Result<HealthCheckResponse, Status>> + Send>>;
 
 /// The standard `grpc.health.v1` service of a gRPC worker: the whole server
-/// (the empty name) and the scheduler service are SERVING exactly when the
-/// scheduler's own `HealthCheck` answers healthy, i.e. unless the admin API
-/// set the worker not serving (`/admin/serving/{port}`); any other name is
-/// unknown. It is the service a harness or a probe asks before it asks the
-/// engine's own protocol, as every engine servicer hosts it.
+/// (the empty name) and the one service it names (the scheduler's, or the
+/// encoder's in the TokenSpeed encode role, as the engine servicer names it)
+/// are SERVING exactly when the scheduler's own `HealthCheck` answers
+/// healthy, i.e. unless the admin API set the worker not serving
+/// (`/admin/serving/{port}`); any other name is unknown. It is the service a
+/// harness or a probe asks before it asks the engine's own protocol, as every
+/// engine servicer hosts it.
 #[derive(Clone)]
 struct MockHealth {
     overrides: Arc<crate::overrides::WorkerOverrides>,
     /// Flips when the worker stops: ends the watch streams, which have no
     /// end of their own, so the server's drain can finish.
     stopped: watch::Receiver<bool>,
-    /// The wire served: the one scheduler service name that is known.
-    wire: SchedulerWire,
+    /// The one service name known beside the empty one
+    /// ([`health_service_name`]).
+    service: &'static str,
 }
 
 impl MockHealth {
     /// The serving status of `service`, read from the override per probe.
     fn status(&self, service: &str) -> ServingStatus {
-        if !service.is_empty() && service != service_name(self.wire) {
+        if !service.is_empty() && service != self.service {
             ServingStatus::ServiceUnknown
         } else if self.overrides.serving() {
             ServingStatus::Serving
@@ -2064,6 +2081,77 @@ mod tests {
             .expect("watch")
             .into_inner();
         assert_eq!(next(&mut unknown).await, ServingStatus::ServiceUnknown);
+    }
+
+    /// An encode worker on the TokenSpeed wire reports health under the
+    /// encoder service's name, as the engine servicer does in that role: the
+    /// scheduler's name is unknown there, and the encoder's name is unknown
+    /// on a worker without the role.
+    #[tokio::test]
+    async fn the_tokenspeed_encode_role_reports_health_under_the_encoder_name() {
+        let check = |addr: std::net::SocketAddr, service: &str| {
+            let request = HealthCheckRequest {
+                service: service.to_string(),
+            };
+            async move {
+                let channel = Channel::from_shared(format!("http://{addr}"))
+                    .expect("endpoint")
+                    .connect()
+                    .await
+                    .expect("connect");
+                HealthClient::new(channel)
+                    .check(request)
+                    .await
+                    .map(|response| response.into_inner().status())
+            }
+        };
+        let encoder_service = <tokenspeed::EncoderServer as NamedService>::NAME;
+        let scheduler_service = service_name(SchedulerWire::TokenSpeed);
+        let serve = |role: Option<Role>| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let cfg = Config {
+                grpc_wire: SchedulerWire::TokenSpeed,
+                role,
+                ..Config::default()
+            };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the server serves until the test process exits"
+            )]
+            let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
+            addr
+        };
+
+        let encode = serve(Some(Role::Encode)).await;
+        assert_eq!(
+            check(encode, "").await.expect("check"),
+            ServingStatus::Serving
+        );
+        assert_eq!(
+            check(encode, encoder_service).await.expect("check"),
+            ServingStatus::Serving
+        );
+        assert_eq!(
+            check(encode, scheduler_service)
+                .await
+                .expect_err("unknown")
+                .code(),
+            Code::NotFound
+        );
+
+        let plain = serve(None).await;
+        assert_eq!(
+            check(plain, scheduler_service).await.expect("check"),
+            ServingStatus::Serving
+        );
+        assert_eq!(
+            check(plain, encoder_service)
+                .await
+                .expect_err("unknown")
+                .code(),
+            Code::NotFound
+        );
     }
 
     /// The sockets the gRPC worker serves carry `TCP_NODELAY`, so a token

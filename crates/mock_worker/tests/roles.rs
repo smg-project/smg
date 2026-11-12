@@ -1314,6 +1314,35 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
     );
 }
 
+/// The engine's encoder takes exactly one media item under one room per
+/// request, named by a request id: the mock refuses the rest as the engine's
+/// adapter does, so a gateway that batched items into one `Encode` or dropped
+/// the id would not pass the mock row.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_takes_one_item_in_one_room_with_a_request_id() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let before = encodes_served(&http, &fault, &name).await;
+    for (id, items, rooms) in [("ts-one-two", 2usize, &[7i64, 8][..]), ("", 1, &[9][..])] {
+        let refused = encoder
+            .encode(tokenspeed_encode_request(id, items, rooms))
+            .await
+            .expect_err("refused as the engine's adapter refuses it");
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "{id:?}, {items} item(s), rooms {rooms:?}: {refused:?}"
+        );
+    }
+    assert_eq!(encodes_served(&http, &fault, &name).await, before);
+    let answer = encoder
+        .encode(tokenspeed_encode_request("ts-one", 1, &[10]))
+        .await
+        .expect("one item in one room with an id")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+}
+
 #[tokio::test]
 async fn a_realistic_tokenspeed_encode_worker_takes_the_fault_hooks() {
     let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(true).await;

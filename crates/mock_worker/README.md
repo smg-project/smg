@@ -54,11 +54,13 @@ mock, so the gateway forwards media references to it), and answers every
 completion, the media identity (the prompt ids as sent, one hash per media
 item) and one pull handle per hash naming its own address. On the TokenSpeed
 wire the worker mounts the engine's encoder service beside the scheduler's:
-its `Encode` takes a request's media with one rendezvous room per item
-(refused without), runs the realistic engine's admission hooks, counts in the
-admin API's `encodes` and answers accepted; its `Generate` is refused as the
-wrong pool, and a prefill worker on that wire refuses a request whose
-`encode_bootstrap_info` does not name a rendezvous for each media item once.
+its `Encode` takes a request's one media item with its rendezvous room and a
+request id (refused without, as the engine's adapter refuses them), runs the
+realistic engine's admission hooks, counts in the admin API's `encodes` and
+answers accepted; it reports health under the encoder service's name, as the
+engine does in that role; its `Generate` is refused as the wrong pool, and a
+prefill worker on that wire refuses a request whose `encode_bootstrap_info`
+does not name a rendezvous for each media item once.
 The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
 request's media items are checked against the shape the engine requires before
 the canned answer: a known modality, the TokenSpeed item's content hash and,
