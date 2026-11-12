@@ -3786,17 +3786,31 @@ const MAX_METADATA_PAIRS: usize = 16;
 const MAX_METADATA_KEY_CHARS: usize = 64;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
 
+/// The request's `metadata` under the public API's bounds (the field's custom
+/// rule; see [`validate_metadata_pairs`]).
 fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), ValidationError> {
-    if metadata.len() > MAX_METADATA_PAIRS {
+    validate_metadata_pairs(metadata.iter())
+}
+
+/// The public API's bounds on a `metadata` object, for any map of its pairs:
+/// at most 16 pairs (`object_above_max_properties`), keys of at most 64
+/// characters and string values of at most 512 (`string_above_max_length`),
+/// and every value a string (`invalid_type`). The Responses request validates
+/// its `metadata` with this rule; a route that reads a metadata object of its
+/// own (the gateway's Conversations routes) validates it the same way.
+pub fn validate_metadata_pairs<'a>(
+    pairs: impl ExactSizeIterator<Item = (&'a String, &'a Value)>,
+) -> Result<(), ValidationError> {
+    if pairs.len() > MAX_METADATA_PAIRS {
         return Err(invalid(
             "object_above_max_properties",
             format!(
                 "Invalid 'metadata': too many properties. The object has {} properties, but the maximum is {MAX_METADATA_PAIRS}.",
-                metadata.len()
+                pairs.len()
             ),
         ));
     }
-    for (key, value) in metadata {
+    for (key, value) in pairs {
         if key.chars().count() > MAX_METADATA_KEY_CHARS {
             return Err(invalid(
                 "string_above_max_length",
@@ -3806,16 +3820,23 @@ fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), Validation
                 ),
             ));
         }
-        if let Some(text) = value.as_str() {
-            if text.chars().count() > MAX_METADATA_VALUE_CHARS {
-                return Err(invalid(
-                    "string_above_max_length",
-                    format!(
-                        "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
-                        text.chars().count()
-                    ),
-                ));
-            }
+        let Value::String(text) = value else {
+            return Err(invalid(
+                "invalid_type",
+                format!(
+                    "Invalid type for 'metadata.{key}': expected a string, but got {} instead.",
+                    json_type_name(value)
+                ),
+            ));
+        };
+        if text.chars().count() > MAX_METADATA_VALUE_CHARS {
+            return Err(invalid(
+                "string_above_max_length",
+                format!(
+                    "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
+                    text.chars().count()
+                ),
+            ));
         }
     }
     Ok(())
@@ -3824,7 +3845,12 @@ fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), Validation
 /// The roles an input message may carry.
 const INPUT_MESSAGE_ROLES: [&str; 4] = ["assistant", "system", "developer", "user"];
 
-fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
+/// An input message's `role` under the public API's set (`assistant`,
+/// `system`, `developer`, `user`; `invalid_value` otherwise). The Responses
+/// request validates its message items with this rule; a route that stores
+/// message items of its own (the gateway's Conversations routes) validates
+/// them the same way.
+pub fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
     if INPUT_MESSAGE_ROLES.contains(&role) {
         return Ok(());
     }
@@ -4864,6 +4890,59 @@ mod tests {
             plain["output_tokens_details"],
             serde_json::json!({"reasoning_tokens": 0})
         );
+    }
+
+    /// `validate_metadata_pairs` holds the public API's bounds for any map of
+    /// pairs: the pair count, the key and value lengths, and strings only,
+    /// each under the public code; a map at the bounds passes.
+    #[test]
+    fn metadata_pairs_are_bounded_as_the_public_api_bounds_them() {
+        let code = |pairs: Vec<(String, Value)>| {
+            let map: serde_json::Map<String, Value> = pairs.into_iter().collect();
+            validate_metadata_pairs(map.iter()).map_err(|error| error.code.to_string())
+        };
+        assert_eq!(
+            code(
+                (0..16)
+                    .map(|i| (format!("{i:0>64}"), serde_json::json!("v".repeat(512))))
+                    .collect()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            code(
+                (0..17)
+                    .map(|i| (format!("k{i}"), serde_json::json!("v")))
+                    .collect()
+            ),
+            Err("object_above_max_properties".to_string())
+        );
+        assert_eq!(
+            code(vec![("k".repeat(65), serde_json::json!("v"))]),
+            Err("string_above_max_length".to_string())
+        );
+        assert_eq!(
+            code(vec![("k".to_string(), serde_json::json!("v".repeat(513)))]),
+            Err("string_above_max_length".to_string())
+        );
+        for (value, named) in [
+            (serde_json::json!({"nested": 1}), "an object"),
+            (serde_json::json!(5), "a number"),
+            (serde_json::json!(true), "a boolean"),
+            (serde_json::json!(null), "null"),
+            (serde_json::json!(["v"]), "an array"),
+        ] {
+            let map: serde_json::Map<String, Value> =
+                [("k".to_string(), value)].into_iter().collect();
+            let error = validate_metadata_pairs(map.iter())
+                .expect_err("a value that is not a string is refused");
+            assert_eq!(error.code, "invalid_type");
+            let message = error.message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains("'metadata.k'") && message.contains(named),
+                "{message}"
+            );
+        }
     }
 
     /// Codex puts `client_metadata` on every request: it must parse, and it

@@ -6,6 +6,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
+  map of its pairs), `responses::validate_input_message_role` (an input message's role in the
+  public set) and `common::json_type_name` are public: a route that reads a metadata object or
+  stores message items of its own (the gateway's Conversations routes) validates them with the
+  rules the Responses request already validates with, in the same words and under the same codes.
 - `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
   a caller that owns a Messages request's tools converts them into chat tools without copying the
   schemas (the properties and the additional fields move in); the by-reference forms stay for a
@@ -47,6 +52,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- A `metadata` value that is not a string is refused as `400 invalid_type`, naming the key and the
+  type sent (`Invalid type for 'metadata.k': expected a string, but got an object instead.`), as
+  the public API refuses one; before, a request's `metadata` passed validation with an object, a
+  number, a boolean or a null value under a key.
 - A rerank worker's answer is read as `RerankWorkerResponse { results, usage, id }`: its `usage`
   (a rerank server's `prompt_tokens` and `total_tokens`, read as the crate's `UsageInfo`, whose
   `completion_tokens` defaults; a usage in another spelling is left out, as before) and its `id`
