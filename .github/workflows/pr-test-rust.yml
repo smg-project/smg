@@ -1832,7 +1832,7 @@ jobs:
           # TokenSpeed prefill/decode over its Mooncake transfer, on the model
           # its disaggregation path is proven on (Qwen3.5-9B, fetched by id).
           # First run (34173426995): sequential PD passed; 32 concurrent
-          # requests deadlocked both legs because the spec's engine window was
+          # requests deadlocked both sides because the spec's engine window was
           # 4 (prefill waits for a decode that is never admitted). The window
           # now covers the suite's bursts; the over-window deadlock itself is
           # pinned by the topology suite. The prebuilt image is extracted, but
@@ -1859,7 +1859,7 @@ jobs:
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
-  # PD legs both advertise worker-side processing; the M-RoPE class takes the
+  # Both PD sides advertise worker-side processing; the M-RoPE class takes the
   # worker path and the Phi-3.5 class must stay on the router path.
   e2e-2gpu-pd-mm-worker:
     needs: [e2e-1gpu-chat-mm-worker, detect-changes]
@@ -1966,7 +1966,7 @@ jobs:
   # PD disaggregation under one 4-GPU topology (2 prefill + 2 decode) plus a
   # fleet assembled at runtime through the worker API, per engine. The full
   # topology sweep (1p1d .. 3p1d) runs in nightly-pd.yml; this lane guards
-  # every PR with the topology that exercises both legs' load balancing.
+  # every PR with the topology that exercises both pools' load balancing.
   e2e-4gpu-pd:
     name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
