@@ -29,7 +29,7 @@
   {"model": "nvidia/Cosmos3-Edge", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "nvidia/Cosmos3-Edge-Policy-DROID", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "thu-coai/Crispers-7B-v1", "also": ["Crispers-14B-v1"], "table": "qwen2.5", "opener": null, "after": null},
-  {"model": "LiquidAI/d1-2B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
+  {"model": "LiquidAI/d1-2B", "also": [], "table": "qwen3_tagged", "opener": null, "after": ""},
   {"model": "LiquidAI/d1-3B", "also": [], "table": "lfm2.5", "opener": null, "after": null},
   {"model": "LiquidAI/d1-Omni-2B", "also": [], "table": "qwen3_tagged", "opener": null, "after": ""},
   {"model": "deepseek-ai/DeepSeek-R1", "also": ["DeepSeek-R1-Zero"], "table": "deepseek_v3", "opener": null, "after": null},

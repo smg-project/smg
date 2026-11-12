@@ -1026,9 +1026,10 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
 /// `render/common.jsonl`, `tools-call-arguments-object`): the NVIDIA Nemotron 3 groups and Step
 /// 3.5 Flash write `</think>\n<tool_call>` where the Qwen 3.5 template behind their table writes
 /// two newlines; the Nemotron 3.5 Super-VL and Bolt-74B, Dory and NLD-Uni templates write the same one
-/// newline, and the LFM3 templates write the call right after the close.
+/// newline, and the LFM3 and d1 templates write the call right after the close.
 /// The registry's groups carry it as the group's `after`; the test after the next reads the
-/// rendered prompts themselves where the tree holds them.
+/// rendered prompts themselves where the tree holds them (the recorded thinking-on call where the
+/// rendered call turn carries no thought, as d1-2B's does not).
 const MEASURED_AFTER: &[(&str, &str)] = &[
     ("cosmos3-edge", "\n"),
     ("cosmos3-edge-policy-droid", "\n"),
@@ -1048,6 +1049,7 @@ const MEASURED_AFTER: &[(&str, &str)] = &[
     ("lfm3-1.7b", ""),
     ("lfm3-vl-2b", ""),
     ("lfm3-omni-2b", ""),
+    ("d1-2b", ""),
 ];
 
 #[test]
@@ -1083,13 +1085,16 @@ fn every_measured_opener_and_text_after_the_close_is_the_registrys() {
 
 /// The text after the thought's close before a call, read from each recorded model's rendered
 /// `tools-call-arguments-object` (`render/common.jsonl`, the reference's `text`: the assistant
-/// turn that made the call),
+/// turn that made the call), or from its recorded `call-single-thinking-on` (`parse/common.jsonl`,
+/// the reference's `text`: the same oracle's rendering of the assistant turn that made the call)
+/// where the rendered call turn carries no thought,
 /// is the registry's for it: the table's layout, or the group's own `after`. Skipped where the
 /// tree is not given; a model the tree has not recorded, a table without a thought layout or a
 /// close, dots3, whose template writes the call's own lead before every block, and a turn whose
 /// template wrote text of the message there, are not read; a tree under which nothing is read
 /// fails, and so does a measured group ([`MEASURED_AFTER`]) the tree records but this test cannot
-/// read.
+/// read. Muse Spark's text after the close is the next message's opener, read as the rest's
+/// prefix; every other table's is the layout whitespace before the call's first tag.
 #[test]
 #[expect(
     clippy::print_stderr,
@@ -1125,30 +1130,72 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         if format.name() == "dots3" {
             continue;
         }
-        let Some(sets) = sets_of(&root, slug, "render").unwrap_or_else(|e| panic!("{e}")) else {
+        let (render, parse) = (
+            sets_of(&root, slug, "render").unwrap_or_else(|e| panic!("{e}")),
+            sets_of(&root, slug, "parse").unwrap_or_else(|e| panic!("{e}")),
+        );
+        if render.is_none() && parse.is_none() {
             continue;
-        };
-        let Ok(text) = fs::read_to_string(sets.dir.join("common.jsonl")) else {
-            continue;
-        };
-        let Some(rendered) = text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find(|case| {
-                case["id"]
-                    .as_str()
-                    .is_some_and(|id| id.ends_with("/render/tools-call-arguments-object"))
+        }
+        // The rendered call turn, else the recorded thinking-on call: a template that writes no
+        // thought into the history's call turn shows its text after the close there alone.
+        let sources = [
+            (
+                "the rendered call turn",
+                render,
+                "/render/tools-call-arguments-object",
+            ),
+            (
+                "the recorded thinking-on call",
+                parse,
+                "/parse/call-single-thinking-on",
+            ),
+        ];
+        let texts: Vec<(&str, String)> = sources
+            .into_iter()
+            .filter_map(|(source, sets, suffix)| Some((source, sets?, suffix)))
+            .filter_map(|(source, sets, suffix)| {
+                let text = fs::read_to_string(sets.dir.join("common.jsonl")).ok()?;
+                text.lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|case| case["id"].as_str().is_some_and(|id| id.ends_with(suffix)))
+                    .and_then(|case| case["reference"]["text"].as_str().map(str::to_string))
+                    .map(|text| (source, text))
             })
-            .and_then(|case| case["reference"]["text"].as_str().map(str::to_string))
-        else {
-            unread("no rendered tools-call-arguments-object with a reference text".to_string());
+            .collect();
+        if texts.is_empty() {
+            unread(
+                "no rendered tools-call-arguments-object nor recorded call-single-thinking-on \
+                 with a reference text"
+                    .to_string(),
+            );
             continue;
-        };
-        let Some(at) = rendered.find(close) else {
-            unread(format!("no {close:?} in the rendered call turn"));
+        }
+        let Some((source, rendered, at)) = texts
+            .iter()
+            .find_map(|(source, text)| text.find(close).map(|at| (*source, text, at)))
+        else {
+            unread(format!(
+                "no {close:?} in the rendered call turn or the recorded thinking-on call"
+            ));
             continue;
         };
         let rest = &rendered[at + close.len()..];
+        let after = &*thought.after;
+        // A table whose text after the close is the next message's opener (Muse Spark's
+        // `<|start|>assistant`) is read as the rest's prefix; every other table's is the layout
+        // whitespace before the call's first tag.
+        if after.starts_with('<') {
+            if !rest.starts_with(after) {
+                wrong.push(format!(
+                    "{slug} ({}): the template writes {:?} after {close:?} before the call in {source}, the registry {after:?}",
+                    format.name(),
+                    rest.get(..after.len()).unwrap_or(rest)
+                ));
+            }
+            read.push(*slug);
+            continue;
+        }
         let between = &rest[..rest.find('<').unwrap_or(rest.len())];
         // A turn whose template wrote text of the message between the close and the call (a
         // `None` for a content the request left out) says nothing about the layout.
@@ -1158,11 +1205,10 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
             ));
             continue;
         }
-        if between != &*thought.after {
+        if between != after {
             wrong.push(format!(
-                "{slug} ({}): the template writes {between:?} after {close:?} before the call, the registry {:?}",
-                format.name(),
-                &*thought.after
+                "{slug} ({}): the template writes {between:?} after {close:?} before the call in {source}, the registry {after:?}",
+                format.name()
             ));
         }
         read.push(*slug);
