@@ -421,7 +421,6 @@ impl KvEventMonitor {
             indexers: Arc::clone(&self.indexers),
         };
         let task_address = address.clone();
-        let task_url = url.clone();
         let slots = Arc::clone(&self.subscriptions);
 
         #[expect(
@@ -451,15 +450,14 @@ impl KvEventMonitor {
                      no longer feeds routing"
                 );
                 // Counted under the engine's workers (the series the
-                // dashboards key on), or under its first worker when none
-                // is left on the task.
+                // dashboards key on), which hold their workers. With none
+                // left on the task the log line above is the record: a
+                // write by name for a worker already gone would recreate
+                // its series.
                 let members = {
                     let subs = slots.lock().await;
                     Self::members_of(&subs, &task_address, id)
                 };
-                if members.is_empty() {
-                    Metrics::record_kv_event_subscription_failure(&task_url, "panic");
-                }
                 for member in &members {
                     Metrics::record_kv_event_subscription_failure(member, "panic");
                 }
@@ -914,11 +912,28 @@ mod tests {
         )
     }
 
+    /// Rank `rank` of a two-rank data-parallel engine at [`REFUSING_URL`].
+    fn refusing_rank_worker(rank: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(REFUSING_URL)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .dp_config(rank, 2)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
     /// A member's cleanup writes for its worker after the worker has left
-    /// the engine's stream (the gauge `complete_member_removal` lowers), and
-    /// it keeps a handle on the worker through that write: the series store
-    /// forgets a removed address once no handle on its workers is left, so a
-    /// late write by name alone would recreate the address's series for good.
+    /// the registry: it keeps a handle on the worker through that write. The
+    /// series store forgets a removed address once no handle on its workers
+    /// is left, so a late write by name alone would recreate the address's
+    /// series for good. The engine keeps a second member, so the leave runs
+    /// the member's own cleanup and not the task's exit path.
     #[test]
     fn a_removals_late_write_recreates_no_series_for_the_address() {
         use metrics_exporter_prometheus::PrometheusBuilder;
@@ -930,31 +945,44 @@ mod tests {
             PrometheusBuilder::new().build_recorder(),
             Arc::clone(series),
         );
-        let listed = || {
-            let mut rendered = String::new();
-            series.render_into(&mut rendered);
-            rendered
-                .lines()
-                .any(|line| line.contains(&format!("worker=\"{REFUSING_URL}\"")))
-        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // The spawned task runs on this thread, under the local recorder.
+        // The spawned tasks run on this thread, under the local recorder.
         metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let monitor = KvEventMonitor::new();
-                let worker = refusing_grpc_worker();
+                // Two ranks of the refusing engine: the first leaves while the
+                // second keeps the engine's task alive.
+                let worker = refusing_rank_worker(0);
+                let other = refusing_rank_worker(1);
                 let url = worker.url().to_string();
+                let listed = || {
+                    let mut rendered = String::new();
+                    series.render_into(&mut rendered);
+                    rendered
+                        .lines()
+                        .any(|line| line.contains(&format!("worker=\"{url}\"")))
+                };
                 let witness = Arc::downgrade(&worker);
                 monitor
                     .on_worker_added(&worker, SubscriptionKind::Events)
                     .await;
-                // The engine's task starts at this thread's first yield. From
-                // then on it holds the worker as its member: two strong counts
-                // with this test's.
-                wait_until("the task holds the worker", || witness.strong_count() >= 2).await;
+                monitor
+                    .on_worker_added(&other, SubscriptionKind::Events)
+                    .await;
+                // The engine's task holds the worker from before its spawn, so
+                // the strong count says nothing about the task having run; the
+                // index does: the task interns each worker once it has taken it
+                // as a member.
+                let index = monitor
+                    .get_indexer(UNKNOWN_MODEL_ID)
+                    .expect("the model's index");
+                wait_until("the task interns both workers", || {
+                    index.worker_id(&url).is_some() && index.worker_id(other.url()).is_some()
+                })
+                .await;
                 assert!(listed(), "the subscription publishes the worker's series");
 
                 // The registry's removal retires the address with the worker's
@@ -986,6 +1014,10 @@ mod tests {
                     .filter(|sub| sub.id == engine)
                     .expect("the engine's subscription");
                 sub.members -= 1;
+                assert!(
+                    sub.members > 0,
+                    "the other rank keeps the engine's task alive"
+                );
                 sub.changes
                     .send(MemberChange::Leave {
                         url: url.clone(),
@@ -993,24 +1025,22 @@ mod tests {
                         done: done_tx,
                     })
                     .expect("the engine's task takes the change");
-                if sub.members == 0 {
-                    if let Some(shutdown_tx) = sub.shutdown_tx.take() {
-                        let _ = shutdown_tx.send(());
-                    }
-                }
-                wait_until("the member's cleanup holds the worker alone", || {
-                    witness.strong_count() <= 1
+                // The cleanup takes the worker's blocks out of the index first,
+                // then waits at the slot lock this test holds, its handle on
+                // the worker still in hand.
+                wait_until("the cleanup took the worker out of the index", || {
+                    index.worker_id(&url).is_none()
                 })
                 .await;
                 assert_eq!(
                     witness.strong_count(),
                     1,
-                    "the task holds the worker through its removal writes"
+                    "the cleanup holds the worker through its removal writes"
                 );
                 series.run_upkeep();
                 assert!(
                     series.is_retired(&url),
-                    "the address stays retired while the task can still write"
+                    "the address stays retired while the cleanup can still write"
                 );
 
                 drop(subs);
@@ -1018,14 +1048,16 @@ mod tests {
                 assert_eq!(
                     witness.strong_count(),
                     0,
-                    "the task is gone with its handle"
+                    "the cleanup is gone with its handle"
                 );
                 series.run_upkeep();
                 assert!(
                     !series.is_retired(&url),
-                    "the address is forgotten once the task is gone"
+                    "the address is forgotten once the cleanup is gone"
                 );
                 assert!(!listed(), "the removal's late write recreated no series");
+                // The engine's task ends with its last member.
+                monitor.on_worker_removed(other.url()).await;
             });
         });
     }
