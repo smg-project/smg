@@ -371,6 +371,16 @@ async fn completion_events(
     frames: Vec<proto::GenerateResponse>,
     request: Value,
 ) -> (String, Vec<Value>) {
+    completion_events_with_prompts(frames, request, Vec::new()).await
+}
+
+/// The same, with the prepared prompts' texts (one per prompt) an `echo`
+/// prepends to its choices.
+async fn completion_events_with_prompts(
+    frames: Vec<proto::GenerateResponse>,
+    request: Value,
+    prompt_texts: Vec<String>,
+) -> (String, Vec<Value>) {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let (stream, server) = scripted_stream(frames, "0").await;
     let request: openai_protocol::completion::CompletionRequest =
@@ -381,7 +391,7 @@ async fn completion_events(
                 stream,
                 dispatch_start: Instant::now(),
             },
-            CompletionResponseSpec::new(&request, Vec::new()),
+            CompletionResponseSpec::new(&request, prompt_texts),
             dispatch(),
             tokenizer,
             None,
@@ -4113,6 +4123,50 @@ async fn completion_logprobs_go_out_with_a_chunk_whose_text_is_held() {
         .filter_map(|event| event["choices"][0]["text"].as_str())
         .collect();
     assert_eq!(text, "abz", "the held character arrives at the end: {wire}");
+}
+
+/// A `logprobs` completion with `echo`: the returned text begins with the
+/// prompt, so the scored positions' offsets start at the prompt's character
+/// count and continue from it.
+#[tokio::test]
+async fn completion_logprobs_offsets_start_after_the_echoed_prompt() {
+    let (wire, events) = completion_events_with_prompts(
+        vec![
+            chunk_with_logprobs(0, "ab"),
+            chunk_with_logprobs(0, "c"),
+            complete(0, "stop"),
+        ],
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+            "max_tokens":4, "logprobs":1, "echo":true}),
+        vec!["test".to_string()],
+    )
+    .await;
+    assert!(
+        !events.iter().any(|event| event.get("error").is_some()),
+        "{wire}"
+    );
+    let offsets: Vec<&Value> = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["logprobs"]["text_offset"].as_array())
+        .flatten()
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![
+            &serde_json::json!(4),
+            &serde_json::json!(5),
+            &serde_json::json!(6)
+        ],
+        "{wire}"
+    );
+    let text: String = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["text"].as_str())
+        .collect();
+    assert_eq!(
+        text, "testabc",
+        "the prompt is echoed ahead of the text: {wire}"
+    );
 }
 
 /// A `logprobs` completion whose second chunk carries a logprobs message of
