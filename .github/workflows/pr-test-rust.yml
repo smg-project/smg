@@ -1867,8 +1867,9 @@ jobs:
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
-  # Both PD sides advertise worker-side processing; the M-RoPE class takes the
-  # worker path and the Phi-3.5 class must stay on the router path.
+  # The prefill and decode workers both advertise worker-side processing; the
+  # M-RoPE class takes the worker path and the Phi-3.5 class must stay on the
+  # router path.
   e2e-2gpu-pd-mm-worker:
     needs: [e2e-1gpu-chat-mm-worker, detect-changes]
     if: >-
