@@ -219,8 +219,9 @@ def build_control_plane_auth_config(
             "control-plane JWT authentication would otherwise be silently disabled"
         )
 
-    # Check if any auth is configured
-    has_api_keys = bool(api_keys)
+    # Check if any auth is configured; a control-plane key file counts, since
+    # the binding reads it into this config's keys.
+    has_api_keys = bool(api_keys) or args_dict.get("control_plane_api_keys_file") is not None
     has_jwt = jwt_issuer is not None and jwt_audience is not None
 
     if not has_api_keys and not has_jwt:
