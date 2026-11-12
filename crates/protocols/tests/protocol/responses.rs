@@ -2268,6 +2268,33 @@ fn computer_call_output_input_item_round_trips_spec_shape() {
     assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
 }
 
+/// A replayed `computer_call_output` may carry `acknowledged_safety_checks:
+/// null`, which the public API's input item allows: it parses as none
+/// acknowledged and is written back without the key, as an item without it
+/// is.
+#[test]
+fn a_computer_call_output_with_null_safety_checks_parses() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "computer-use-preview",
+        "input": [{
+            "type": "computer_call_output",
+            "call_id": "call_1",
+            "output": {"type": "computer_screenshot", "file_id": "file_1"},
+            "acknowledged_safety_checks": null
+        }]
+    }))
+    .expect("a computer_call_output with null safety checks parses");
+    let written = serde_json::to_value(&request).expect("serialize the request");
+    assert_eq!(
+        written["input"][0],
+        json!({
+            "type": "computer_call_output",
+            "call_id": "call_1",
+            "output": {"type": "computer_screenshot", "file_id": "file_1"}
+        })
+    );
+}
+
 #[test]
 fn computer_call_output_item_round_trips_spec_shape() {
     let payload = json!({
