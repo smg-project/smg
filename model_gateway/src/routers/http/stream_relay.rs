@@ -600,9 +600,12 @@ mod tests {
         let [.., error_event, done] = events.as_slice() else {
             panic!("{events:?}");
         };
-        let error: serde_json::Value =
-            serde_json::from_str(error_event.strip_prefix("data: ").unwrap())
-                .expect("the error event is JSON");
+        let error: serde_json::Value = serde_json::from_str(
+            error_event
+                .strip_prefix("data: ")
+                .unwrap_or_else(|| panic!("the error event is a data line: {error_event}")),
+        )
+        .unwrap_or_else(|error| panic!("the error event is JSON ({error}): {error_event}"));
         assert_eq!(error["error"]["type"], "stream_error", "{error_event}");
         assert!(
             error["error"]["message"]
