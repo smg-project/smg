@@ -475,7 +475,9 @@ fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Re
 /// A thread turn names the message-threads beta, as the public API requires
 /// (`anthropic-beta: message-threads-2026-08-12`). That header is what tells
 /// the body layer to parse the request before the route, so a `thread` field
-/// without it is refused here with the public API's own 400.
+/// without it is refused here with the public API's own 400 on the parsed
+/// (buffered) path. A header-less turn on the raw pass-through path never
+/// reaches this handler: it is forwarded unparsed, `thread` and all.
 fn check_thread_beta(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
     if body.thread.is_none() || header_utils::anthropic_beta_named(headers, "message-threads") {
         Ok(())
