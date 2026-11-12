@@ -2525,9 +2525,14 @@ impl NativeEncoder {
     /// text then lands on the character after the run, where a letter run
     /// joined by spaces can begin, which a window begun on the space would
     /// read by another alternative, a step behind the text for the whole
-    /// run) or when it is the join of such a run
-    /// ([`Pattern::spans_space_between`]); a space after a character that is
-    /// neither begins a piece under every pattern of the subset. Without such
+    /// run), when it is the join of such a run
+    /// ([`Pattern::spans_space_between`]), or when some alternative of a
+    /// stage reads a space after a character like the one before it inside
+    /// one match ([`Pattern::reads_space_after`]: `\p{N}+ ?` takes `1 ` and
+    /// lands the text on the letter after it the same way); a space after
+    /// any other character begins a piece, since no alternative of the
+    /// subset reads a space inside its match but as the join, in a
+    /// whitespace run or after a character of such a class. Without such
     /// a run among the stages the nearest space back is the start, however
     /// far (no other piece of the subset holds a space but at its start, and
     /// a window begun inside a whitespace run rejoins the text's pieces at
@@ -2549,10 +2554,10 @@ impl NativeEncoder {
                 let after = text[start + 1..].chars().next();
                 let taken = text[..start].chars().next_back().is_some_and(|before| {
                     before.is_whitespace()
-                        || self
-                            .stages
-                            .iter()
-                            .any(|stage| stage.pattern.spans_space_between(before, after))
+                        || self.stages.iter().any(|stage| {
+                            stage.pattern.spans_space_between(before, after)
+                                || stage.pattern.reads_space_after(before)
+                        })
                 });
                 if !taken {
                     return Some(start);
