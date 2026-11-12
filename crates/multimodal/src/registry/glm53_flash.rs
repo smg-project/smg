@@ -364,7 +364,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::registry::{test_helpers::*, ModelRegistry};
+    use crate::registry::{layouts::grid_patch_fields, test_helpers::*, ModelRegistry};
 
     const IMAGE_ID: u32 = 154854;
     const BEGIN_ID: u32 = 154830;
@@ -654,5 +654,37 @@ mod tests {
         assert!(spec.worker_expandable(Modality::Image));
         assert!(!spec.worker_expandable(Modality::Video));
         assert!(!spec.worker_expandable(Modality::Audio));
+    }
+
+    /// The entry's legacy field map is the grid-patch table: the pixels flat
+    /// over `patches_per_image`, the image and video grids, counts and frame
+    /// spacing one row per item. The engine slices a batch by this map, so an
+    /// emptied map or another tower's table reads here, key for key against
+    /// the shared table and against the rows themselves.
+    #[test]
+    fn the_field_map_is_the_grid_patch_table() {
+        let fields = Glm53FlashSpec.field_layouts();
+        assert_eq!(fields, grid_patch_fields());
+        let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "image_grid_thw",
+                "patches_per_image",
+                "patches_per_video",
+                "pixel_values",
+                "video_grid_thw",
+                "video_second_per_grid"
+            ]
+        );
+        assert_eq!(
+            fields["pixel_values"],
+            FieldLayout::flat("patches_per_image")
+        );
+        assert!(fields
+            .iter()
+            .filter(|(key, _)| *key != "pixel_values")
+            .all(|(_, layout)| *layout == FieldLayout::Batched));
     }
 }
