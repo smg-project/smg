@@ -207,12 +207,7 @@ fn mentions_thinking_variable(template: &str) -> bool {
 /// before this view.
 fn jinja_code(template: &str) -> String {
     let mut code = vec![b' '; template.len()];
-    for item in tokenize(
-        template,
-        false,
-        SyntaxConfig,
-        WhitespaceConfig::default(),
-    ) {
+    for item in tokenize(template, false, SyntaxConfig, WhitespaceConfig::default()) {
         match item {
             Ok((Token::TemplateData(_) | Token::Str(_) | Token::String(_), _)) => {}
             Ok((_, span)) => {
