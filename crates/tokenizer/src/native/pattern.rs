@@ -2649,6 +2649,9 @@ mod tests {
             r"x|([ab])\1*y",
             r"(?:([ab])\1*)?",
             r"(?:x([ab])\1*)y",
+            // a zero-width anchor after it too: the engine backs `\1*` off so
+            // that `$` holds before a `\n` of the run
+            r"([\n])\1*$",
             // a second capturing group: its `\1` names the first group, unset
             // in another alternative, where the engine's `\1*` matches nothing
             // (the last row declines for that before the placement check)
