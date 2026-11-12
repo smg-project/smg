@@ -567,6 +567,11 @@ fn intermediate_of(
     bindings: Vec<Vec<PromptBinding>>,
     spec: &dyn ModelProcessorSpec,
 ) -> Result<MultimodalIntermediate> {
+    let image_prompt_tokens = image_prompt_tokens(
+        prepared_parts
+            .iter()
+            .map(|part| (part.media.modality(), part.prompt_replacements.as_slice())),
+    );
     let batches = prepared_parts
         .into_iter()
         .zip(bindings)
@@ -581,7 +586,26 @@ fn intermediate_of(
         })
         .collect::<Vec<_>>();
     Ok(MultimodalIntermediate::try_new(batches)?
-        .with_encoder_input_format(spec.encoder_input_format()))
+        .with_encoder_input_format(spec.encoder_input_format())
+        .with_image_prompt_tokens(image_prompt_tokens))
+}
+
+/// The tokens the expansion writes into the prompt for the request's images:
+/// the image part's replacements summed, each the whole run that stands in
+/// for one image anchor and that the engine counts as prompt tokens; what the
+/// chat usage reports as `prompt_tokens_details.image_tokens`. `None` when no
+/// part is images: the other modalities' placeholders are not image tokens.
+fn image_prompt_tokens<'a>(
+    parts: impl IntoIterator<Item = (Modality, &'a [PromptReplacement])>,
+) -> Option<u32> {
+    parts
+        .into_iter()
+        .find(|(modality, _)| *modality == Modality::Image)
+        .map(|(_, replacements)| {
+            replacements.iter().fold(0u32, |tokens, replacement| {
+                tokens.saturating_add(u32::try_from(replacement.tokens.len()).unwrap_or(u32::MAX))
+            })
+        })
 }
 
 /// Preprocess one modality's batch, using the pixel cache for eligible images.
@@ -1696,6 +1720,26 @@ mod tests {
         assert_eq!(result.bindings[0][0].structural.length, 2);
         assert_eq!(result.bindings[0][1].structural.offset, 4);
         assert_eq!(result.bindings[0][1].structural.length, 3);
+    }
+
+    #[test]
+    fn image_prompt_tokens_are_the_image_replacements_alone() {
+        let images =
+            PromptReplacement::repeated_per_item(Modality::Image, "<image>", 7, &[324, 576]);
+        let video = PromptReplacement::repeated_per_item(Modality::Video, "<video>", 8, &[48]);
+        assert_eq!(
+            image_prompt_tokens([
+                (Modality::Video, video.as_slice()),
+                (Modality::Image, images.as_slice()),
+            ]),
+            Some(900)
+        );
+        assert_eq!(
+            image_prompt_tokens([(Modality::Video, video.as_slice())]),
+            None,
+            "a video's placeholders are not image tokens"
+        );
+        assert_eq!(image_prompt_tokens(std::iter::empty()), None);
     }
 
     #[test]

@@ -12,6 +12,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   one under another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
   `invalid_json` or `json_parse_error`) as the typed routes do. The gateway's Conversations routes
   read it.
+- `Usage::with_image_tokens`: the prompt's image token count reported as
+  `prompt_tokens_details.image_tokens`, kept within `prompt_tokens`; `None` leaves the details as
+  they are. The gateway's chat route reports the tokens its own multimodal expansion wrote into
+  the prompt for the request's images, on the non-streamed answer and the final usage chunk
+  alike; a request without such an image answers as before.
 - `ValidatedQuery<T>` and `ValidatedPath<T>`, behind the `axum` feature: a route's query string
   and path segments read as the typed routes' body extractor reads a body. A query value the type
   does not take, one that does not parse or a required one that is missing, and a path segment
