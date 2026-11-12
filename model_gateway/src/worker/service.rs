@@ -664,12 +664,20 @@ impl WorkerService {
     ) -> Result<UpdateWorkerResult, WorkerServiceError> {
         let worker_id = Self::parse_worker_id(worker_id_raw)?;
 
-        let existing =
-            self.worker_registry
-                .get(&worker_id)
-                .ok_or_else(|| WorkerServiceError::NotFound {
+        let Some(existing) = self.worker_registry.get(&worker_id) else {
+            // A data-parallel group's own id, the one its Location named and
+            // GET, PATCH and DELETE resolve to its rank rows, has no row of
+            // its own: its PUT is refused as a rank's is below, not told the
+            // group does not exist.
+            return Err(match self.worker_registry.get_url_by_id(&worker_id) {
+                Some(url) if !self.dp_group_for_url(&url).is_empty() => {
+                    Self::refuse_data_parallel_put(&url)
+                }
+                _ => WorkerServiceError::NotFound {
                     worker_id: worker_id_raw.to_string(),
-                })?;
+                },
+            });
+        };
         // Before the body is read: a discovered worker's own spec, sent back,
         // carries the reserved labels, and the useful answer is where to make
         // the change, not which labels to strip.
@@ -686,13 +694,7 @@ impl WorkerService {
         // check and is refused by the register step's batch rule, which takes
         // exactly one worker for one ID.)
         if existing.is_dp_aware() {
-            return Err(WorkerServiceError::BadRequest {
-                message: format!(
-                    "Worker '{url}' belongs to a data-parallel group. \
-                    PUT is not supported for data-parallel workers. \
-                    Use DELETE + POST instead."
-                ),
-            });
+            return Err(Self::refuse_data_parallel_put(&url));
         }
 
         // Validate that the URL in the request body matches the existing worker.
@@ -779,6 +781,20 @@ impl WorkerService {
             prefill_count,
             decode_count,
             regular_count,
+        }
+    }
+
+    /// The refusal of a PUT that names a data-parallel engine, by one rank's
+    /// id (`url` the rank's) or by the group's (`url` the engine's): its
+    /// registration is one worker per rank, which a replacement by one id
+    /// cannot express.
+    fn refuse_data_parallel_put(url: &str) -> WorkerServiceError {
+        WorkerServiceError::BadRequest {
+            message: format!(
+                "Worker '{url}' belongs to a data-parallel group. \
+                PUT is not supported for data-parallel workers. \
+                Use DELETE + POST instead."
+            ),
         }
     }
 
@@ -898,6 +914,7 @@ impl WorkerService {
 
         let job = Job::UpdateWorker {
             url: url.clone(),
+            expected_id: worker_id.as_str().to_string(),
             update: Box::new(update),
         };
 
@@ -1044,6 +1061,46 @@ mod tests {
                 "dp_aware {dp_aware}"
             );
         }
+    }
+
+    /// A PUT that names a data-parallel group by the group's own id, the
+    /// one its Location named and GET, PATCH and DELETE resolve to the rank
+    /// rows, is refused as a PUT of one rank is, not answered 404. An id
+    /// reserved for a plain worker still registering is no group: its PUT
+    /// is answered 404 as before.
+    #[tokio::test]
+    async fn put_of_a_group_by_its_id_is_refused_like_a_ranks() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.14:8000";
+        let group_id = registry.reserve_id_for_url(url);
+        for rank in 0..2 {
+            let row = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(rank, 2)
+                .build();
+            registry.register(Arc::new(row)).unwrap();
+        }
+        let pending_url = "grpc://10.0.0.15:8000";
+        let pending_id = registry.reserve_id_for_url(pending_url);
+        let service = make_service(Arc::clone(&registry));
+
+        let err = service
+            .replace_worker(group_id.as_str(), worker_spec(url))
+            .await
+            .expect_err("a group's PUT");
+        assert!(
+            matches!(&err, WorkerServiceError::BadRequest { message }
+                if message.contains("data-parallel") && message.contains(url)),
+            "{err}"
+        );
+        assert!(matches!(
+            service
+                .replace_worker(pending_id.as_str(), worker_spec(pending_url))
+                .await
+                .expect_err("a pending worker's PUT"),
+            WorkerServiceError::NotFound { .. }
+        ));
     }
 
     #[tokio::test]

@@ -283,6 +283,14 @@ pub struct WorkerUpdateWorkflowData {
     /// Updated worker objects (transient, not serialized)
     #[serde(skip, default)]
     pub updated_workers: Option<Vec<Arc<dyn Worker>>>,
+    /// The id a `PATCH` named, a worker's or a data-parallel group's, as it
+    /// resolved to `worker_url` when the request was accepted: the find step
+    /// applies the update only while the id still resolves to the URL, so a
+    /// registration that replaced the named one at the address meanwhile
+    /// (a DELETE and a POST) does not take it. A label refresh names no id:
+    /// it re-reads whatever engine stands at the address.
+    #[serde(default)]
+    pub expected_id: Option<String>,
     /// Set by a label refresh (the worker's engine came back into service or
     /// finished loading): the labels are re-read from the engine and replace
     /// the discovered set instead of being merged from `config`.

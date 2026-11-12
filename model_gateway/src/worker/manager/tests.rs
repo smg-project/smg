@@ -2508,3 +2508,133 @@ async fn test_profile_all_url_filter_without_match() {
     assert!(result.failed.is_empty());
     assert!(result.message.contains("No worker matching"));
 }
+
+/// Spawn a loopback HTTP server standing for one engine's admin endpoints:
+/// its profiler starts once and refuses a second start while it runs, as an
+/// engine does; the flush and the stop answer 200. The counter is the number
+/// of admin calls the engine received.
+async fn spawn_single_profiler_admin_stub() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = |status: StatusCode| {
+        let calls = Arc::clone(&calls);
+        move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                status
+            }
+        }
+    };
+    let start = {
+        let calls = Arc::clone(&calls);
+        let starts = Arc::new(AtomicUsize::new(0));
+        move || {
+            let calls = Arc::clone(&calls);
+            let starts = Arc::clone(&starts);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/flush_cache", axum::routing::post(counted(StatusCode::OK)))
+        .route("/start_profile", axum::routing::post(start))
+        .route(
+            "/stop_profile",
+            axum::routing::post(counted(StatusCode::OK)),
+        );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), calls)
+}
+
+/// The rank rows of one data-parallel engine at `url`, `ranks` of them.
+fn engine_rows(url: &str, ranks: usize) -> Vec<Arc<dyn Worker>> {
+    (0..ranks)
+        .map(|rank| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .health_config(HealthCheckConfig {
+                        success_threshold: 1,
+                        failure_threshold: 1,
+                        timeout_secs: 1,
+                        check_interval_secs: 1,
+                        disable_health_check: false,
+                        drain_settle_secs: 0,
+                    })
+                    .dp_config(rank, ranks)
+                    .build(),
+            )
+        })
+        .collect()
+}
+
+/// A data-parallel engine registers one row per rank, all at the engine's
+/// address, and runs one profiler: the fleet form of a profiling call and
+/// of a cache flush reach the engine once and count it once, where a call
+/// per rank reached it four times and met the profiler's refusal of every
+/// start after the first.
+#[tokio::test]
+async fn admin_calls_reach_a_data_parallel_engine_once() {
+    let (url, calls) = spawn_single_profiler_admin_stub().await;
+    let registry = WorkerRegistry::new();
+    for row in engine_rows(&url, 4) {
+        registry.register(row).unwrap();
+    }
+
+    let result =
+        WorkerManager::start_profile_all(&registry, &ProfileOptions::default(), None).await;
+    assert_eq!(result.successful, vec![url.clone()], "{}", result.message);
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(result.total_workers, 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one start reached the engine"
+    );
+
+    let result = WorkerManager::flush_cache_all(&registry).await;
+    assert_eq!(result.successful, vec![url.clone()], "{}", result.message);
+    assert_eq!((result.total_workers, result.http_workers), (1, 1));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one flush reached the engine"
+    );
+}
+
+/// The single-engine form names the engine by its address, the URL its
+/// operator registered, or by one of its rank rows; either reaches the
+/// engine once.
+#[tokio::test]
+async fn an_admin_call_filtered_by_an_engines_address_or_a_rank_reaches_it_once() {
+    let (url, calls) = spawn_single_profiler_admin_stub().await;
+    let registry = WorkerRegistry::new();
+    let rows = engine_rows(&url, 4);
+    let rank_url = rows[2].url().to_string();
+    assert_ne!(rank_url, url, "a rank row's URL carries its rank");
+    for row in rows {
+        registry.register(row).unwrap();
+    }
+
+    let result = WorkerManager::stop_profile_all(&registry, Some(url.as_str())).await;
+    assert_eq!(result.successful, vec![url.clone()], "{}", result.message);
+    assert_eq!(result.total_workers, 1);
+    let result = WorkerManager::stop_profile_all(&registry, Some(rank_url.as_str())).await;
+    assert_eq!(result.successful, vec![url.clone()], "{}", result.message);
+    assert_eq!(result.total_workers, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}

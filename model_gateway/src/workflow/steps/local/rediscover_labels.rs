@@ -145,6 +145,7 @@ mod tests {
             app_context: Some(create_test_app_context()),
             workers_to_update: Some(vec![worker]),
             updated_workers: None,
+            expected_id: None,
             refresh_discovered_labels: refresh,
             fresh_engine_labels: None,
             snapshot: None,

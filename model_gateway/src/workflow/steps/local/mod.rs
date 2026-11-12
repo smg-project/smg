@@ -261,6 +261,7 @@ pub fn create_worker_update_workflow_data(
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
+        expected_id: None,
         refresh_discovered_labels: false,
         fresh_engine_labels: None,
         snapshot: None,

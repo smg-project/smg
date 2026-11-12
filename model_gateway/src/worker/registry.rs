@@ -2303,6 +2303,23 @@ impl WorkerRegistry {
             return None;
         }
 
+        // A data-parallel row's group answers to the engine's bare URL under
+        // an id of its own (the one a creation's Location names; GET, PATCH
+        // and DELETE resolve it to the rows). A sibling's removal retires
+        // that id at its group seam when it finds no row, under the URL's
+        // group lock; the row entering re-affirms the id under the same lock
+        // and holds it until it is a row the seam counts, so the rows that
+        // follow a removal mid-registration are a group with an id, a fresh
+        // one when the removal retired the id the creation reserved.
+        let group = worker.is_dp_aware().then(|| {
+            let base = worker.base_url().to_string();
+            #[cfg(test)]
+            self.note_the_group_lock_attempt();
+            let guard = self.group_url_lock(&base).lock();
+            self.reserve_id_for_url(&base);
+            guard
+        });
+
         // Record origin BEFORE the worker becomes visible in `workers`:
         // lock-free readers resolve workers by URL the moment the insert
         // lands, and a visible worker with no origin would be treated as
@@ -2316,6 +2333,8 @@ impl WorkerRegistry {
             self.workers.insert(worker_id.clone(), worker.clone());
             self.bump_global_routing_epoch();
         }
+        // The row is one the group seam counts: the group's id stands.
+        drop(group);
 
         // The worker's series are kept for the time its address is
         // registered (see `observability::worker_metrics`). The builder's
@@ -2837,8 +2856,8 @@ impl WorkerRegistry {
     }
 
     /// Test support: receives one message when the next taker of a group
-    /// lock, a removal's or a creation's, is about to take it, before any
-    /// wait for the lock.
+    /// lock, a removal's, a creation's or a row's registration, is about to
+    /// take it, before any wait for the lock.
     pub(crate) fn watch_the_next_group_lock_attempt(&self) -> test_mpsc::Receiver<()> {
         let (tx, rx) = test_mpsc::channel();
         self.removal_test_hooks.lock().before_group_lock = Some(tx);
