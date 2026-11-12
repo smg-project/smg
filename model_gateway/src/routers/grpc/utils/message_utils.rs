@@ -568,7 +568,11 @@ fn process_message_content_format(
                     )?;
                 }
                 messages::Role::Assistant => {
-                    result.push(convert_assistant_message(&message.content, content_format));
+                    result.push(convert_assistant_message(
+                        index,
+                        &message.content,
+                        content_format,
+                    )?);
                 }
                 // A `system`-role message in `messages[]` (e.g. from Claude Code) is
                 // forwarded in place, preserving its position in the conversation so
@@ -678,6 +682,12 @@ fn convert_user_message(
                         user_parts
                             .extend(tool_result_image_blocks(tr).map(|_| json!({"type": "image"})));
                     }
+                    // An MCP exchange belongs to the MCP loop, which no engine
+                    // route runs: replayed here it is refused by name, as a
+                    // document this gateway cannot render is, never dropped.
+                    InputContentBlock::McpToolUse(_) | InputContentBlock::McpToolResult(_) => {
+                        return Err(mcp_block_refusal(block, index, position));
+                    }
                     _ => {}
                 }
             }
@@ -783,68 +793,84 @@ fn extract_tool_result_text(tool_result: &messages::ToolResultBlock) -> String {
     }
 }
 
+/// The refusal of a replayed MCP block (`mcp_tool_use`, `mcp_tool_result`)
+/// on an engine route, naming the block and its place. The exchange belongs
+/// to the MCP loop, which no engine route runs: the prompt cannot carry it
+/// faithfully, and dropping it in silence would answer without the call.
+fn mcp_block_refusal(block: &InputContentBlock, index: usize, position: usize) -> String {
+    let kind = match block {
+        InputContentBlock::McpToolResult(_) => "mcp_tool_result",
+        _ => "mcp_tool_use",
+    };
+    format!(
+        "messages.{index}.content.{position}: block type '{kind}' is not supported on an engine \
+         route, which runs no MCP loop; send the turn to a provider route or drop the exchange"
+    )
+}
+
 /// Convert an assistant message content to a single JSON value.
 ///
 /// Extracts text content, tool calls, and reasoning/thinking into the
-/// appropriate JSON fields that the chat template expects.
+/// appropriate JSON fields that the chat template expects. A replayed MCP
+/// block is refused by name (`mcp_block_refusal`).
 fn convert_assistant_message(
+    index: usize,
     content: &InputContent,
     content_format: ChatTemplateContentFormat,
-) -> Value {
-    match content {
-        InputContent::String(text) => json!({"role": "assistant", "content": text}),
-        InputContent::Blocks(blocks) => {
-            let (text_parts, tool_calls, thinking_parts) = blocks.iter().fold(
-                (
-                    Vec::<String>::new(),
-                    Vec::<Value>::new(),
-                    Vec::<String>::new(),
-                ),
-                |(mut texts, mut tools, mut thinking), block| {
-                    match block {
-                        InputContentBlock::Text(t) => texts.push(t.text.clone()),
-                        InputContentBlock::ToolUse(tu) => tools.push(json!({
-                            "id": tu.id,
-                            "type": "function",
-                            "function": {
-                                "name": tu.name,
-                                "arguments": serde_json::to_string(&tu.input)
-                                    .unwrap_or_else(|_| "{}".to_string())
-                            }
-                        })),
-                        InputContentBlock::Thinking(t) => thinking.push(t.thinking.clone()),
-                        _ => {}
-                    }
-                    (texts, tools, thinking)
-                },
-            );
-
-            let mut obj = serde_json::Map::new();
-            obj.insert("role".into(), Value::String("assistant".into()));
-
-            // With no text blocks (a tool-use-only turn) the content is the
-            // empty content the engine's chat utils hand a template in its
-            // format (`""` or `[]`), never null, which a template that tests
-            // or concatenates every assistant message's content cannot take.
-            let content = if text_parts.is_empty() {
-                chat_utils::empty_content(content_format)
-            } else {
-                Value::String(text_parts.join(""))
-            };
-            obj.insert("content".into(), content);
-            if !tool_calls.is_empty() {
-                obj.insert("tool_calls".into(), Value::Array(tool_calls));
+) -> Result<Value, String> {
+    let blocks = match content {
+        InputContent::String(text) => return Ok(json!({"role": "assistant", "content": text})),
+        InputContent::Blocks(blocks) => blocks,
+    };
+    let mut text_parts = Vec::<String>::new();
+    let mut tool_calls = Vec::<Value>::new();
+    let mut thinking_parts = Vec::<String>::new();
+    for (position, block) in blocks.iter().enumerate() {
+        match block {
+            InputContentBlock::Text(t) => text_parts.push(t.text.clone()),
+            InputContentBlock::ToolUse(tu) => tool_calls.push(json!({
+                "id": tu.id,
+                "type": "function",
+                "function": {
+                    "name": tu.name,
+                    "arguments": serde_json::to_string(&tu.input)
+                        .unwrap_or_else(|_| "{}".to_string())
+                }
+            })),
+            InputContentBlock::Thinking(t) => thinking_parts.push(t.thinking.clone()),
+            // The exchange the public API puts in the assistant turn:
+            // refused by name, never dropped from the prompt.
+            InputContentBlock::McpToolUse(_) | InputContentBlock::McpToolResult(_) => {
+                return Err(mcp_block_refusal(block, index, position));
             }
-            if !thinking_parts.is_empty() {
-                obj.insert(
-                    "reasoning_content".into(),
-                    Value::String(thinking_parts.join("\n")),
-                );
-            }
-
-            Value::Object(obj)
+            _ => {}
         }
     }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("role".into(), Value::String("assistant".into()));
+
+    // With no text blocks (a tool-use-only turn) the content is the
+    // empty content the engine's chat utils hand a template in its
+    // format (`""` or `[]`), never null, which a template that tests
+    // or concatenates every assistant message's content cannot take.
+    let content = if text_parts.is_empty() {
+        chat_utils::empty_content(content_format)
+    } else {
+        Value::String(text_parts.join(""))
+    };
+    obj.insert("content".into(), content);
+    if !tool_calls.is_empty() {
+        obj.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    if !thinking_parts.is_empty() {
+        obj.insert(
+            "reasoning_content".into(),
+            Value::String(thinking_parts.join("\n")),
+        );
+    }
+
+    Ok(Value::Object(obj))
 }
 
 /// Format content parts based on the template's content format preference.
@@ -2478,5 +2504,53 @@ mod tests {
         };
         assert_eq!(rendered("none"), "user: Hello thinking=False");
         assert_eq!(rendered("high"), "user: Hello thinking=unset");
+    }
+
+    /// A replayed MCP exchange (`mcp_tool_use`, `mcp_tool_result`) is refused
+    /// on the engine routes naming the block and its place, in the assistant
+    /// turn the public API puts it in and in a user turn alike: the engine
+    /// runs no MCP loop, and a silent drop would answer without the call.
+    #[test]
+    fn a_replayed_mcp_exchange_is_refused_naming_the_block() {
+        let convert = |messages: &[InputMessage]| {
+            process_message_content_format(
+                messages,
+                ChatTemplateContentFormat::String,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .unwrap_err()
+        };
+        let assistant: Vec<InputMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Looking."},
+                {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}]},
+                {"type": "text", "text": "it is 42"}
+            ]}
+        ]))
+        .unwrap();
+        let err = convert(&assistant);
+        assert!(
+            err.starts_with(
+                "messages.1.content.1: block type 'mcp_tool_use' is not supported on an engine route"
+            ),
+            "{err}"
+        );
+        let user: Vec<InputMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "the result:"},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}]}
+            ]}
+        ]))
+        .unwrap();
+        let err = convert(&user);
+        assert!(
+            err.starts_with(
+                "messages.0.content.1: block type 'mcp_tool_result' is not supported on an engine route"
+            ),
+            "{err}"
+        );
     }
 }
