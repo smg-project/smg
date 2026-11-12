@@ -41,6 +41,10 @@ name = "decision"
 harness = false
 
 [[bench]]
+name = "epd"
+harness = false
+
+[[bench]]
 name = "contention"
 harness = false
 

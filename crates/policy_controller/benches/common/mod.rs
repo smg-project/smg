@@ -1,7 +1,7 @@
 //! The synthetic fleet the engine's benches decide over: a per-worker state
 //! the way a host reads its routing state, and the view built from it into a
-//! reused buffer. Shared by the single-threaded `decision` bench and the
-//! `contention` bench, so both measure one fleet.
+//! reused buffer. Shared by the single-threaded `decision` and `epd` benches
+//! and the `contention` bench, so all three measure one fleet.
 use smg_policy_controller::{
     Candidate, Engine, Health, LoadRow, PolicySpec, SignalSource, WorkerId,
 };
