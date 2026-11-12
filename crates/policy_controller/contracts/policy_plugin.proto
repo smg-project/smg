@@ -109,7 +109,10 @@ enum LeaseKind {
 // Who minted a lease (a fallback dispatch carries a gateway-minted one). The
 // id spaces are disjoint: a LOCAL id has bit 63 set and is unique for the
 // gateway's lifetime; a controller-minted id has it clear and is its minting
-// term in bits 32 to 62 over a per-term counter in the low 32.
+// term in bits 32 to 62 over a per-term counter in the low 32. Bounds: terms
+// stay below 2^31, the counter starts at 1, and a leader whose counter would
+// pass 2^32 - 1 bumps its term before it mints again, so an id is never 0 and
+// never repeats across terms.
 enum LeaseOrigin {
   LEASE_ORIGIN_UNSPECIFIED = 0;
   LEASE_ORIGIN_CONTROLLER = 1;
@@ -336,7 +339,8 @@ message Queue {
 // facts; the record's issue instant and session verdict are host-only.
 message Lease {
   // Bit 63 set on a gateway-minted (LOCAL) id, clear on a controller-minted
-  // one (LeaseOrigin); never 0. On the plugin wire a re-minted fallback lease
+  // one (LeaseOrigin, whose bounds keep it unique and never 0). On the plugin
+  // wire a re-minted fallback lease
   // carries the controller's id with origin LOCAL.
   fixed64 id = 1;
   LeaseKind kind = 2;

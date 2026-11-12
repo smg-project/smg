@@ -139,7 +139,8 @@ interface types {
   /// The record of one issued decision, or of one side of a pair decision. The
   /// id is the host's and unique within its lifecycle stream: the controller
   /// mints the ids a plugin sees (unique across gateways and terms: the
-  /// minting term in the high bits) and re-mints a gateway-minted fallback id
+  /// minting term in the high bits, under the bounds LeaseOrigin states in the
+  /// proto) and re-mints a gateway-minted fallback id
   /// before it reaches a plugin.
   record lease {
     id: u64,
