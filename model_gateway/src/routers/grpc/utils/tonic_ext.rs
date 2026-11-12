@@ -64,13 +64,17 @@ pub(crate) trait TonicStatusExt {
     /// The worker's report that the request's media failed, when the status
     /// carries one: the `smg-media-fault` trailer, or, from a worker that
     /// predates the trailer, the media connector's own words on
-    /// `UNAVAILABLE`.
+    /// `UNAVAILABLE`; or the gRPC framing's own refusal of a message the
+    /// request's media made longer than its four-byte length prefix carries
+    /// (`RESOURCE_EXHAUSTED` in tonic's words, [`names_the_frame_cap`]): the
+    /// request's own size, whichever side's encoder met it.
     fn media_fault(&self) -> Option<WorkerMediaFault>;
 
     /// The code the public API answers for a failure of the request's media
     /// (see [`TonicStatusExt::media_fault`]): the one the worker names in its
     /// `smg-media-code` trailer (`invalid_multimodal_request` for media refused
-    /// as the request sent it, `media_too_large` for a size refusal), or
+    /// as the request sent it, `media_too_large` for a size refusal),
+    /// `media_too_large` for the framing's refusal of the message's size, or
     /// `media_fetch_failed` from a worker that names none or one this router
     /// does not know.
     fn media_code(&self) -> MediaErrorCode;
@@ -101,6 +105,22 @@ pub(crate) trait TonicStatusExt {
 fn names_a_fetch_failure(message: &str) -> bool {
     message.contains("HTTP error while fetching media")
         || (message.contains("media fetch") && message.contains("timed out after"))
+}
+
+/// Whether a status message is the gRPC framing's refusal of a message
+/// longer than its four-byte length prefix carries: tonic's encoder, on
+/// whichever side encodes the message (this gateway's own client when the
+/// request's pixel tensors ride in the Generate request, a worker's when its
+/// own hop does), answers `RESOURCE_EXHAUSTED` in these words. The size is
+/// the request's own, which no replay changes.
+fn names_the_frame_cap(message: &str) -> bool {
+    message.contains("Cannot return body with more than 4GB")
+}
+
+/// Whether `status` is the framing's refusal of the message's size (see
+/// [`names_the_frame_cap`]).
+fn is_frame_cap_refusal(status: &tonic::Status) -> bool {
+    status.code() == Code::ResourceExhausted && names_the_frame_cap(status.message())
 }
 
 impl TonicStatusExt for tonic::Status {
@@ -194,16 +214,24 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn media_fault(&self) -> Option<WorkerMediaFault> {
-        WorkerMediaFault::from_status(self).or_else(|| {
-            (self.code() == Code::Unavailable && names_a_fetch_failure(self.message()))
-                .then_some(WorkerMediaFault::Transient)
-        })
+        WorkerMediaFault::from_status(self)
+            .or_else(|| {
+                (self.code() == Code::Unavailable && names_a_fetch_failure(self.message()))
+                    .then_some(WorkerMediaFault::Transient)
+            })
+            .or_else(|| is_frame_cap_refusal(self).then_some(WorkerMediaFault::Client))
     }
 
     fn media_code(&self) -> MediaErrorCode {
         smg_grpc_client::media_code(self)
             .and_then(MediaErrorCode::parse)
-            .unwrap_or(MediaErrorCode::FetchFailed)
+            .unwrap_or_else(|| {
+                if is_frame_cap_refusal(self) {
+                    MediaErrorCode::TooLarge
+                } else {
+                    MediaErrorCode::FetchFailed
+                }
+            })
     }
 
     fn breaker_status(&self) -> Option<u16> {
@@ -516,6 +544,24 @@ mod tests {
         assert_eq!(refused.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(refused.media_code(), MediaErrorCode::InvalidRequest);
         assert_eq!(refused.breaker_status(), None);
+
+        // The gRPC framing's refusal of a message longer than its four-byte
+        // length prefix carries (tonic's words; this gateway's own client
+        // when the request's pixel tensors ride in the Generate request): the
+        // request's own size, a 400 under `media_too_large` and no breaker
+        // sample, where a RESOURCE_EXHAUSTED otherwise reads as the worker's
+        // capacity pushback, a 429 the retry layer replays.
+        let framing = tonic::Status::resource_exhausted(
+            "Cannot return body with more than 4GB of data but got 5065026759 bytes",
+        );
+        assert_eq!(framing.media_fault(), Some(WorkerMediaFault::Client));
+        assert_eq!(framing.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(framing.media_code(), MediaErrorCode::TooLarge);
+        assert_eq!(framing.breaker_status(), None);
+        let pushback = tonic::Status::resource_exhausted("the engine is at capacity");
+        assert_eq!(pushback.media_fault(), None);
+        assert_eq!(pushback.http_status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(pushback.breaker_status(), Some(429));
 
         let unknown = smg_grpc_client::stamp_media_code(
             WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument("new words")),

@@ -20,7 +20,9 @@ use tracing::{debug, info, warn};
 
 use super::{
     config::{MultimodalComponents, MultimodalModelConfig, VisionProcessors},
-    encoder_budget::{check_image_size_feature_budget, check_item_feature_budget},
+    encoder_budget::{
+        check_image_size_feature_budget, check_image_wire_cap, check_item_feature_budget,
+    },
     log_mm_timing_enabled,
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
@@ -589,7 +591,9 @@ fn intermediate_of(
 /// never place is refused first, on the size its header gave and the
 /// processor's own size-to-count rule, before any of the batch is decoded
 /// or any tensor built; the counts the preprocessing produces are held to
-/// the same budget in [`prepared_part`].
+/// the same budget in [`prepared_part`]. A batch whose pixel tensors could
+/// not ride in one message to the engine is refused at the same point, on
+/// the same sizes, as the request's own ([`check_image_wire_cap`]).
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
@@ -597,6 +601,8 @@ async fn preprocess_modality(
     if let MediaBatch::Images(images) = media {
         if let Ok(processor) = ctx.vision_processors.image() {
             check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
+            check_image_wire_cap(processor.as_ref(), images, ctx.image_wire_dtype)
+                .map_err(llm_multimodal::MultiModalError::Media)?;
         }
     }
     if let Some(preprocessed) = cached_images(media, ctx).await? {
