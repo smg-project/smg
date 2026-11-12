@@ -1144,11 +1144,11 @@ impl NativeEncoder {
     /// prepend scheme places the marker, or by a `Prepend` of the marker
     /// before the `Replace` (the legacy conversion's shape), which places it
     /// before every text; anything else declines, as does an added token
-    /// matched after the `Replace` with a space or a marker in it (matched
-    /// on the raw text here, its spelling would not be the one `tokenizers`
-    /// matches after the normalizer), and any added token matched after the
-    /// `Prepend` (a text after it gets no marker there; one after a raw
-    /// added token does).
+    /// matched after the `Replace` with a space or a marker in it, or with
+    /// `lstrip` / `rstrip` (matched on the raw text here, its spelling and
+    /// the whitespace it takes would not be the ones `tokenizers` sees after
+    /// the normalizer), and any added token matched after the `Prepend` (a
+    /// text after it gets no marker there; one after a raw added token does).
     fn sentencepiece_from<M: Model + ModelView>(
         tokenizer: &TokenizerOf<M>,
         pre_tokenizer: &Value,

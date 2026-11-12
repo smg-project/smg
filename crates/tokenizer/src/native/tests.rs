@@ -453,6 +453,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[("\u{FB01}le", true), ("<tool_call>", false)],
+            stripped: &[],
         },
         // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
         // split on ASCII digits after the map (the reference cuts the mapped
@@ -471,6 +472,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[],
+            stripped: &[],
         },
         // Five `Split` stages before `Digits` and a `ByteLevel` without its
         // regex, the fourth anchored at the end (`\s+$`, a whitespace run
@@ -572,6 +574,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|begin_of_text|>", "<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         // `Punctuation` one character at a time, then the `ByteLevel` with
         // its own regex.
@@ -587,6 +590,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         // Added tokens with a space inside, matched after normalization
         // (the default of `add_tokens`): a cut at that space would turn
@@ -611,7 +615,7 @@ fn shapes() -> Vec<Shape> {
         // `lstrip` with `rstrip`), as the reference's matcher widens them.
         Shape {
             name: "stripped-sentinels",
-            nfc: false,
+            normalizer: Normalizer::None,
             pre_tokenizers: vec![
                 split(CL100K, SplitDelimiterBehavior::Isolated, false),
                 byte_level(false),
@@ -983,6 +987,9 @@ fn the_punctuation_stage_holds_what_the_reference_cuts_on() {
             .len()
             == 3;
         assert_eq!(native, cuts, "U+{code:04X}");
+    }
+}
+
 /// Added tokens with `lstrip` / `rstrip` take the whitespace beside them, as
 /// the reference's matcher widens them: the whitespace is in no id, the
 /// whitespace between an `rstrip` token and an `lstrip` token goes to the
@@ -3788,6 +3795,12 @@ fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTok
         .add_special_tokens([
             AddedToken::from("<s>", true),
             AddedToken::from("</s>", true),
+            // A sentinel that takes the whitespace on both sides, raw (so
+            // it stays native on every shape): the sweeps match it after a
+            // space and before one, and place the marker after it.
+            AddedToken::from("<|strip|>", true)
+                .lstrip(true)
+                .rstrip(true),
         ])
         .expect("special tokens");
     // Under the `Prepend` an added token matched after normalization is
@@ -3805,7 +3818,7 @@ fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTok
 
 /// The spellings [`random_text`] drops into a text of a sentencepiece shape.
 fn sentencepiece_added() -> Vec<&'static str> {
-    ["<s>", "</s>"]
+    ["<s>", "</s>", "<|strip|>"]
         .into_iter()
         .chain(SENTENCEPIECE_ADDED.iter().map(|(s, _)| *s))
         .collect()
@@ -4427,10 +4440,20 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         "a byte-fallback vocabulary with an added token matched after the Replace normalizer \
          that holds a space or the word marker, or takes the whitespace beside it"
     );
-    // The same token under Metaspace is matched on the same text either way.
+    // The same tokens under Metaspace are matched on the same text either
+    // way, the normalized `<x>` with its strip among them.
     let mut tokenizer = sentencepiece_tokenizer(&shapes[2], &mut state);
     tokenizer
-        .add_tokens([AddedToken::from("end of text", false).normalized(true)])
+        .add_tokens([
+            AddedToken::from("end of text", false).normalized(true),
+            AddedToken::from("<x>", false).normalized(true).rstrip(true),
+        ])
+        .expect("added tokens");
+    assert!(NativeEncoder::from_tokenizer(&tokenizer).is_ok());
+    // A raw token that strips is matched on the raw text on both sides.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[0], &mut state);
+    tokenizer
+        .add_tokens([AddedToken::from("<x>", true).rstrip(true)])
         .expect("added token");
     assert!(NativeEncoder::from_tokenizer(&tokenizer).is_ok());
     // ignore_merges.
