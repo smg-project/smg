@@ -4012,3 +4012,53 @@ async fn deepseek_v41_media_refused_as_sent_answers_the_media_stages_code() {
         assert!(ids.is_empty(), "{name}: nothing reaches the worker");
     }
 }
+
+/// A retry under a disaggregated mode is counted once per side, `prefill`
+/// and `decode` (never `encode`), and under Regular once as `regular`; the
+/// exhausted counter carries the same rows, so a dashboard split by
+/// `worker_type` reads a pair's retry on both of its rows.
+#[test]
+fn retry_counters_carry_one_row_per_side_of_the_mode() {
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    for (mode, sides) in [
+        (Mode::Regular, &["regular"][..]),
+        (Mode::PrefillDecode, &["decode", "prefill"][..]),
+        (Mode::EncodePrefillDecode, &["decode", "prefill"][..]),
+    ] {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            current_thread_runtime().block_on(async {
+                let pipeline = completion_pipeline(&worker_registry, mode);
+                pipeline.record_retry("retry-rows");
+                pipeline.record_retries_exhausted("retry-rows");
+            });
+        });
+        let rendered = handle.render();
+        for counter in [
+            "smg_worker_retries_total",
+            "smg_worker_retries_exhausted_total",
+        ] {
+            let mut rows: Vec<(&str, &str)> = rendered
+                .lines()
+                .filter(|line| {
+                    line.strip_prefix(counter)
+                        .is_some_and(|rest| rest.starts_with('{'))
+                        && line.contains("endpoint=\"retry-rows\"")
+                })
+                .map(|line| (worker_type_of(line), line.rsplit(' ').next().unwrap_or("")))
+                .collect();
+            rows.sort_unstable();
+            let want: Vec<(&str, &str)> = sides.iter().map(|side| (*side, "1")).collect();
+            assert_eq!(rows, want, "{counter} under {mode:?}:\n{rendered}");
+        }
+    }
+}
+
+/// The `worker_type` label's value on one rendered sample line.
+fn worker_type_of(line: &str) -> &str {
+    line.split("worker_type=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or("")
+}
