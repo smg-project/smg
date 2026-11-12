@@ -874,10 +874,17 @@ impl WorkerService {
             url: url.clone(),
             expected_revisions: None,
         };
-        job_queue
-            .submit(job)
-            .await
-            .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+        // One removal per URL at a time: a registration's own end queues one
+        // for the workers it registered and did not finish, and a repeated
+        // DELETE would queue another; the second would find the worker
+        // draining and remove it without the drain wait the first sits out.
+        // The removal in flight owns the URL; this DELETE is answered by it.
+        if job_queue.claim_if_idle(&job) {
+            job_queue
+                .submit_claimed(job)
+                .await
+                .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+        }
 
         Ok(DeleteWorkerResult { worker_id, url })
     }

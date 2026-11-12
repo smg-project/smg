@@ -1674,7 +1674,89 @@ async fn a_cancelled_workflow_s_terminal_state_keeps_its_completed_steps() {
         "the completed step stays readable in the terminal state"
     );
     assert_eq!(
+        state.step_states[&StepId::new("held_step")].status,
+        StepStatus::Cancelled,
+        "the step cancelled in its backoff reads so, not retrying"
+    );
+    assert_eq!(
         wfaas::completion_outcome(&state, "cancel after a step"),
         Err("Workflow cancelled for cancel after a step".to_string())
+    );
+}
+
+/// A step held in its attempt, released after the cancellation, succeeds.
+struct HeldSucceedingStep {
+    running: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for HeldSucceedingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.running.notify_one();
+        self.release.notified().await;
+        Ok(StepResult::Success)
+    }
+}
+
+/// The cancellation is written at once, while a step past its cancel read
+/// is still on its task: the terminal state a waiter reads carries that
+/// step's own end, not the running record the cancellation found, and the
+/// step's end is written before the state is cleaned up.
+#[tokio::test]
+async fn a_cancelled_workflow_s_terminal_state_waits_for_a_step_past_its_cancel_read() {
+    let engine = Arc::new(WorkflowEngine::<TestWorkflowData>::new());
+    let running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let workflow = WorkflowDefinition::new("cancel_under_a_step_workflow", "Cancel Under A Step")
+        .add_step(StepDefinition::new(
+            "held_ok_step",
+            "Step held in its attempt, then succeeding",
+            Arc::new(HeldSucceedingStep {
+                running: Arc::clone(&running),
+                release: Arc::clone(&release),
+            }),
+        ))
+        .add_step(
+            StepDefinition::new("next_step", "Step after it", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["held_ok_step"]),
+        );
+    let instance_id = started(&engine, workflow).await.unwrap();
+    timeout(Duration::from_secs(5), running.notified())
+        .await
+        .expect("the held step runs");
+    engine.cancel_workflow(instance_id).await.unwrap();
+    let waiter = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .wait_for_terminal_state(
+                    instance_id,
+                    "cancel under a step",
+                    Duration::from_secs(10),
+                )
+                .await
+        })
+    };
+    // The waiter polls the cancelled state while the step is still held.
+    sleep(Duration::from_millis(300)).await;
+    release.notify_one();
+    let state = timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the waiter ends once the step has")
+        .expect("the waiter's task")
+        .unwrap();
+    assert_eq!(
+        state.step_states[&StepId::new("held_ok_step")].status,
+        StepStatus::Succeeded,
+        "the state carries the held step's own end, not the running record"
+    );
+    assert_ne!(
+        state.step_states[&StepId::new("next_step")].status,
+        StepStatus::Succeeded,
+        "the step after the cancellation did not run"
     );
 }

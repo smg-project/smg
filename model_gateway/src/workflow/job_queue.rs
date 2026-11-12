@@ -30,8 +30,9 @@ use crate::{
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        registered_in, McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode,
+        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
+        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        WorkerRegistrationMode,
     },
 };
 
@@ -948,19 +949,30 @@ impl JobQueue {
         }
     }
 
-    /// Queues the removal of the worker under `url`: the job a `DELETE` of a
-    /// live worker queues, drain and bookkeeping included.
-    async fn queue_removal(context: &Arc<AppContext>, url: &str) -> Result<(), String> {
+    /// Queues the removal of a registration's workers under `url`, pinned to
+    /// `entries` (their ids and revisions as the registry holds them now, so
+    /// a worker registered or replaced since is left alone): the job a
+    /// `DELETE` of a live worker queues, drain and bookkeeping included.
+    /// `Ok(false)` when a removal for the URL is in flight already (a
+    /// `DELETE`'s): that one owns it, and a second would find the worker
+    /// draining and remove it without the wait the first sits out.
+    async fn queue_removal(
+        context: &Arc<AppContext>,
+        url: &str,
+        entries: HashMap<String, u64>,
+    ) -> Result<bool, String> {
         let queue = context
             .worker_job_queue
             .get()
             .ok_or_else(|| "Worker job queue not initialized".to_string())?;
-        queue
-            .submit(Job::RemoveWorker {
-                url: url.to_string(),
-                expected_revisions: None,
-            })
-            .await
+        let job = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: Some(entries),
+        };
+        if !queue.claim_if_idle(&job) {
+            return Ok(false);
+        }
+        queue.submit_claimed(job).await.map(|()| true)
     }
 
     /// Takes the mark under `own_id`, if there is one: true when a `DELETE`
@@ -1040,16 +1052,37 @@ impl JobQueue {
                 // is its own pass's to reconcile.
                 let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
                 match outcome {
-                    Err(failure) if create_only && registered_in(&state) => {
-                        Err(match Self::queue_removal(context, &config.url).await {
-                            Ok(()) => format!(
-                                "{failure}; its worker was registered and leaves through a \
-                                queued removal"
-                            ),
-                            Err(submit) => format!(
-                                "{failure}; its worker was registered and its removal could \
-                                not be queued: {submit}"
-                            ),
+                    Err(failure) if create_only => {
+                        // The registry says what this registration left in it
+                        // (its workers still the entries under their URLs, by
+                        // id and revision): a worker registered or replaced
+                        // since is not this job's to remove, and the step
+                        // record alone can be read before the step's end.
+                        let entries = registered_entries(&context.worker_registry, &state);
+                        Err(if entries.is_empty() {
+                            if registered_in(&state) {
+                                format!(
+                                    "{failure}; its workers were registered and are no longer \
+                                    the entries under their URLs (removed or replaced since)"
+                                )
+                            } else {
+                                failure
+                            }
+                        } else {
+                            match Self::queue_removal(context, &config.url, entries).await {
+                                Ok(true) => format!(
+                                    "{failure}; its workers were registered and leave through \
+                                    a queued removal"
+                                ),
+                                Ok(false) => format!(
+                                    "{failure}; its workers were registered and a removal of \
+                                    them is in flight"
+                                ),
+                                Err(submit) => format!(
+                                    "{failure}; its workers were registered and their removal \
+                                    could not be queued: {submit}"
+                                ),
+                            }
                         })
                     }
                     outcome => outcome,
@@ -2351,6 +2384,43 @@ mod tests {
         );
         assert!(JobQueue::take_mark(&marks, own.as_ref()));
         assert!(marks.is_empty());
+    }
+
+    /// A registration's cleanup removal is one per URL: a second submission
+    /// (a DELETE's, or a second end) finds the first in flight and queues
+    /// nothing, and the entry under the URL is the removal's own.
+    #[tokio::test]
+    async fn a_registrations_cleanup_removal_is_queued_once_per_url() {
+        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        // A queue that accepts jobs and never runs one: no slot to run one in.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        context.worker_job_queue.set(queue).ok();
+        let url = "http://w:8000";
+        let entries = || HashMap::from([("worker-id".to_string(), 1u64)]);
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, entries()).await,
+            Ok(true)
+        );
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, entries()).await,
+            Ok(false),
+            "a removal in flight owns the URL"
+        );
+        let status = context
+            .worker_job_queue
+            .get()
+            .and_then(|queue| queue.get_status(url))
+            .expect("the removal's entry");
+        assert_eq!(status.job_type, "RemoveWorker");
+        assert_eq!(status.status, "pending");
     }
 
     /// A submission that fails must not leave its claim behind, or the next
