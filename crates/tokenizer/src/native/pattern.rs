@@ -507,8 +507,9 @@ pub(super) enum Node {
     /// space (`joined_run_of`), so a space inside a run is its join, after a
     /// letter or a mark and before a letter: the thread pool's cut check,
     /// which runs the stages from a space before the cut, starts at a space
-    /// that is not that ([`Pattern::spans_space_between`]), where no run is
-    /// in progress.
+    /// that is not that and that no whitespace run took
+    /// ([`Pattern::spans_space_between`], `NativeEncoder::window_start`),
+    /// where the text's own loop begins a piece.
     JoinedRun {
         join: usize,
         letter: usize,

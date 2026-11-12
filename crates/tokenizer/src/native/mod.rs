@@ -2479,7 +2479,7 @@ impl NativeEncoder {
     /// stages see that match from `p` on either way), a gap around `p` hands
     /// the question to the next stage, and a gap at the last stage would be
     /// split, so that is no cut. The window starts where the whole text's
-    /// pieces have a boundary too ([`Self::window_start`]), so that its
+    /// match loop begins a piece too ([`Self::window_start`]), so that its
     /// pieces up to `p` are the text's; a candidate without such a start is
     /// no cut.
     fn piece_starts_at(&self, text: &str, p: usize) -> bool {
@@ -2509,16 +2509,19 @@ impl NativeEncoder {
     }
 
     /// Where the cut check's window for a candidate at `p` starts: the first
-    /// space at or before `p - CUT_CHECK_WINDOW`, or the text's start, that
-    /// no piece of the whole text spans, so that the text's pieces have a
-    /// boundary there as the window's do and the two agree up to `p`. A
-    /// space is inside a piece only as the join of a letter run joined by
-    /// spaces ([`Pattern::spans_space_between`]): such a run cannot start at
-    /// its join, so a window begun at one would read the space by another
-    /// alternative and its pieces would part from the text's. `None` when no
-    /// such space lies within [`CUT_CHECK_REACH`] of `p`: a stretch of words
-    /// joined by single spaces is one piece under such a pattern, and no cut
-    /// is lost there.
+    /// space at or before `p - CUT_CHECK_WINDOW`, or the text's start, where
+    /// the whole text's match loop begins a piece, so that the window's
+    /// pieces up to `p` are the text's. A space begins no piece when a
+    /// whitespace run took it from a whitespace character before it (the
+    /// text then lands on the character after the run, where a letter run
+    /// joined by spaces can begin, which a window begun on the space would
+    /// read by another alternative, a step behind the text for the whole
+    /// run) or when it is the join of such a run
+    /// ([`Pattern::spans_space_between`]); a space after a character that is
+    /// neither begins a piece under every pattern of the subset. `None` when
+    /// no such space lies within [`CUT_CHECK_REACH`] of `p`: a stretch of
+    /// words joined by single spaces is one piece under such a pattern, and
+    /// no cut is lost there.
     fn window_start(&self, text: &str, p: usize) -> Option<usize> {
         let bytes = text.as_bytes();
         let floor = p.saturating_sub(CUT_CHECK_REACH);
@@ -2526,12 +2529,14 @@ impl NativeEncoder {
         while start > 0 {
             if text.is_char_boundary(start) && bytes[start] == b' ' {
                 let after = text[start + 1..].chars().next();
-                let joined = text[..start].chars().next_back().is_some_and(|before| {
-                    self.stages
-                        .iter()
-                        .any(|stage| stage.pattern.spans_space_between(before, after))
+                let taken = text[..start].chars().next_back().is_some_and(|before| {
+                    before.is_whitespace()
+                        || self
+                            .stages
+                            .iter()
+                            .any(|stage| stage.pattern.spans_space_between(before, after))
                 });
-                if !joined {
+                if !taken {
                     return Some(start);
                 }
             }

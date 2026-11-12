@@ -1681,11 +1681,16 @@ fn a_joined_letter_run_encodes_as_the_library_does() {
 /// window started at one of its joins would read the space by another
 /// alternative (` \p{L}` at once; ` ?\p{L}+` after a comma, where the run
 /// does not restart), part from the whole text's pieces and approve a cut
-/// inside the run: the check starts its window at a space no run can span
-/// instead, and refuses a candidate without one in reach. The two patterns
-/// and the family's, on a text that is one run and on prose with a comma:
-/// the pool's units hold the whole text's pieces, and the pool's ids are the
-/// serial encode's and the library's.
+/// inside the run; so would a window begun at a space a whitespace run took
+/// (the text lands on the letter after it, where the run begins, the window
+/// reads ` b` instead): the check starts its window at a space after a
+/// character that is neither whitespace nor one a run reaches the space
+/// from, and refuses a candidate without one in reach. The two patterns and
+/// the family's, on a text that is one run, on prose with a comma, on runs
+/// after two spaces and after a line break with a space, on prose joined by
+/// a period and two spaces and on lines indented by four spaces: the pool's
+/// units hold the whole text's pieces, and the pool's ids are the serial
+/// encode's and the library's.
 #[test]
 fn a_space_joined_run_is_never_cut_by_the_pool() {
     let mut state = 0x4A4F_494E_4544_5203u64;
@@ -1694,6 +1699,10 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
         let words = "lorem ipsum dolor sit amet ".repeat(4_000);
         format!("{words}word, then more {words}end")
     };
+    let double_space = format!("{}  b{}", "c".repeat(31_767), " b".repeat(20_000));
+    let newline_space = format!("{}\n b{}", "c".repeat(32_000), " b".repeat(20_000));
+    let period_prose = "lorem ipsum dolor sit amet consectetur.  ".repeat(3_000);
+    let indented = "    lorem ipsum dolor sit amet\n".repeat(4_000);
     for (index, pattern) in [
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}",
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\s+",
@@ -1715,7 +1724,14 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
         };
         let tokenizer = tokenizer_of(&shape, &mut state);
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
-        for text in [one_run.as_str(), prose.as_str()] {
+        for text in [
+            one_run.as_str(),
+            prose.as_str(),
+            double_space.as_str(),
+            newline_space.as_str(),
+            period_prose.as_str(),
+            indented.as_str(),
+        ] {
             let whole: Vec<String> = {
                 let mut out = Vec::new();
                 native.pieces(0, text, &mut |piece| out.push(piece.to_owned()));
