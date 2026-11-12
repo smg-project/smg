@@ -33,8 +33,8 @@ pub use error::{
     TransformError,
 };
 pub use media::{
-    init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
-    MediaConnectorConfig, MediaSource, VideoFetchConfig,
+    init_log_video_decode_timing, missing_video_decoder, FrameSampling, ImageFetchConfig,
+    MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
 pub use registry::{
     EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec,

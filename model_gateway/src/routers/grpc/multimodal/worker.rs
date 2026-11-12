@@ -1053,7 +1053,7 @@ mod tests {
 
     use llm_tokenizer::MockTokenizer;
 
-    use super::*;
+    use super::{super::process::VideoDecoderUnavailable, *};
 
     /// Set to a non-empty value where the video tools must be installed (CI sets
     /// it on the shards that install ffmpeg): the tests that decode a clip then
@@ -1995,6 +1995,18 @@ mod tests {
         assert!(matches!(classify(decoder), WorkerMediaError::Internal(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
+        // A video part on a worker whose host lacks the video decoder is
+        // refused up front as this host's own fault (INTERNAL on the wire),
+        // which the router replays on another worker, as the decode's
+        // DecoderUnavailable was before the short-circuit.
+        let no_decoder = anyhow::Error::new(VideoDecoderUnavailable {
+            why: "ffmpeg executable not found; install ffmpeg to decode video_url inputs",
+        })
+        .context("Failed to process the plan");
+        assert!(matches!(
+            classify(no_decoder),
+            WorkerMediaError::Internal(message) if message.contains("ffmpeg executable not found")
+        ));
         // An item above the engine's encoder budget is the caller's, with the
         // item's size and the budget in the message, at any depth of the chain.
         let over_budget = anyhow::Error::new(ItemOverEncoderBudget {
