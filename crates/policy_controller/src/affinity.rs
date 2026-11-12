@@ -173,14 +173,20 @@ impl Gates {
         }
     }
 
-    /// The request's size in blocks: its block hashes when the host sent
-    /// them, else its token count over the block size, never under one.
+    /// The request's size in blocks: its token count over the block size
+    /// (the text kind's characters over the character block size, as
+    /// `tokens_of` reads them back), never under one and never under the
+    /// block hashes the host sent. The host caps that list, so a long
+    /// request's hashes alone would understate it and overstate every
+    /// holder's share.
     fn request_blocks(&self, facts: &RequestFacts<'_>) -> u32 {
-        if facts.block_hashes.is_empty() {
-            (facts.prompt_tokens / self.block_size_of(facts)).max(1)
-        } else {
-            u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX)
-        }
+        let units = match facts.hash_kind {
+            HashKind::Token => facts.prompt_tokens,
+            HashKind::Text => facts.prompt_tokens.saturating_mul(CHARS_PER_TOKEN),
+        };
+        let from_tokens = (units / self.block_size_of(facts)).max(1);
+        let from_hashes = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
+        from_tokens.max(from_hashes)
     }
 
     /// `blocks` of the request in tokens, for the held prefix's price: at
@@ -534,20 +540,24 @@ impl WarmupSlice {
                 .map(|c| c.in_flight)
                 .min()
         };
+        // The eligibility read and the window's reservation on one lock
+        // turn: two decisions due together cannot both divert to the same
+        // thin worker inside one window.
         let slot = {
-            let until = self.divert_until.lock();
-            pass.least_loaded(|c| {
+            let mut until = self.divert_until.lock();
+            let slot = pass.least_loaded(|c| {
                 self.is_thin(c.indexed_blocks, level)
                     && !(c.in_flight > 0 && until.get(&c.id).is_some_and(|&t| now < t))
                     && !(holder_load.is_some_and(|h| c.in_flight >= h) && c.overlap_blocks != best)
-            })?
+            })?;
+            until.insert(
+                candidates[kept[slot] as usize].id,
+                now + DIVERT_WINDOW_MICROS,
+            );
+            slot
         };
         self.hits.store(0, Ordering::Relaxed);
         self.shallow_seen.store(false, Ordering::Relaxed);
-        self.divert_until.lock().insert(
-            candidates[kept[slot] as usize].id,
-            now + DIVERT_WINDOW_MICROS,
-        );
         Some(slot)
     }
 }
@@ -908,6 +918,59 @@ mod tests {
         // eight do not: a miss.
         assert_eq!(scores(&slice, &facts(8), &held(4)), vec![1.0, 1.0, 1.0]);
         assert_eq!(scores(&slice, &facts(8), &held(3)), vec![0.0, 0.0, 1.0]);
+    }
+
+    /// The host caps the hash list it sends: a request past the cap keeps
+    /// its token size, so a few-block match on it is not read as half of it.
+    #[test]
+    fn a_request_past_the_hash_cap_keeps_its_token_size() {
+        let params = WarmupSliceParams {
+            share: Some(1.0),
+            divert_every: Some(0),
+            blocks: Some(8),
+            miss_share: Some(0.0),
+            ..WarmupSliceParams::default()
+        };
+        let slice = WarmupSlice::new(&params, Gates::of(None, None, Some(16)));
+        let held = |blocks: u32| {
+            [
+                sized(0, 3, blocks, 64),
+                sized(1, 2, 0, 64),
+                sized(2, 5, 0, 0),
+            ]
+        };
+        // Eight hashes of a sixteen-block request: four blocks are a
+        // quarter of it, a miss; of the hashes alone they would read half.
+        let mut capped = facts(8);
+        capped.prompt_tokens = 16 * 16;
+        assert_eq!(scores(&slice, &capped, &held(4)), vec![0.0, 0.0, 1.0]);
+        assert_eq!(scores(&slice, &capped, &held(8)), vec![1.0, 1.0, 1.0]);
+        // A text-kind request counts characters: 64 tokens are 256
+        // characters, sixteen blocks of sixteen, the same quarter.
+        let mut text = facts(8);
+        text.hash_kind = HashKind::Text;
+        text.prompt_tokens = 64;
+        assert_eq!(scores(&slice, &text, &held(4)), vec![0.0, 0.0, 1.0]);
+    }
+
+    /// A diverting hit reserves its thin worker on the lock turn that found
+    /// it eligible: the window is on the slot before the lock is let go.
+    #[test]
+    fn a_diverting_hit_reserves_its_thin_worker_on_the_same_turn() {
+        let slice = warmup(0.25, 4);
+        let pool = [sized(0, 2, 12, 64), sized(1, 1, 0, 64), sized(2, 0, 0, 0)];
+        let mut now = facts(16);
+        now.now_micros = 1_000;
+        for _ in 0..3 {
+            assert_eq!(scores(&slice, &now, &pool), vec![1.0, 1.0, 1.0]);
+            assert!(slice.divert_until.lock().is_empty());
+        }
+        assert_eq!(scores(&slice, &now, &pool), vec![0.0, 0.0, 1.0]);
+        assert_eq!(
+            slice.divert_until.lock().get(&pool[2].id).copied(),
+            Some(1_000 + DIVERT_WINDOW_MICROS),
+            "the diverted worker holds its window from the turn that picked it"
+        );
     }
 
     #[test]
