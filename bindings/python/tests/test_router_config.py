@@ -272,8 +272,7 @@ class TestRouterConfigValidation:
         pytest.skip("Tokenizer configuration not available in current implementation")
 
     def test_dp_aware_config_validation(self):
-        """Test data parallelism aware configuration validation."""
-        # Valid DP aware config
+        """The deprecated dp_aware argument is still accepted (and ignored)."""
         args = RouterArgs(dp_aware=True, api_key="test-api-key")
         assert args.dp_aware is True
         assert args.api_key == "test-api-key"

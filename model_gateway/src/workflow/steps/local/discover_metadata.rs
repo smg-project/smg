@@ -56,7 +56,7 @@ pub struct ServerInfo {
     pub max_running_requests: Option<usize>,
     /// Whether the engine splits `max_running_requests` across its
     /// attention-DP workers (`attn_dp_size` above carries that width as its
-    /// newer releases resolve it): under `--dp-aware` each rank worker then
+    /// newer releases resolve it): each rank worker then
     /// gets its share of the window (`create_worker::labels_for_rank`), on
     /// this path as on the gRPC one.
     pub enable_dp_attention: Option<bool>,
@@ -121,17 +121,6 @@ impl std::fmt::Display for MetadataError {
 }
 
 /// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
-async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
-    client: &Client,
-    base_url: &str,
-    endpoint: &str,
-    api_key: Option<&str>,
-) -> Result<T, String> {
-    get_json_with_fallback_classified(client, base_url, endpoint, api_key)
-        .await
-        .map_err(|e| e.to_string())
-}
-
 async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
     client: &Client,
     base_url: &str,
@@ -221,14 +210,6 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
-pub async fn get_server_info(
-    client: &Client,
-    url: &str,
-    api_key: Option<&str>,
-) -> Result<ServerInfo, String> {
-    get_json_with_fallback(client, &http_base_url(url), "server_info", api_key).await
-}
-
 /// The labels an engine reports about itself, read the way registration
 /// reads them: an HTTP engine's metadata endpoints (by runtime), or a gRPC
 /// engine's model and server info. Callable again for a worker that is
@@ -283,9 +264,12 @@ async fn fetch_sglang_http_metadata(
 }
 
 /// The SGLang HTTP metadata. Registration tolerates an endpoint that fails
-/// (`strict == false`: the gap is left); a refresh must not mistake a failed
-/// read for an engine that reports less, so with `strict` every endpoint has
-/// to answer or the read is an error.
+/// (`strict == false`: the gap is left; the data-parallel width `server_info`
+/// carries is read again by the step that decides the workers the engine
+/// registers as, see [`read_width_labels`]); an endpoint the engine does not
+/// offer (a 404 on both spellings) is a gap on both forms. A refresh must not
+/// mistake a failed read for an engine that reports less, so with `strict`
+/// every endpoint has to answer or the read is an error.
 async fn fetch_sglang_http_metadata_checked(
     client: &Client,
     url: &str,
@@ -338,6 +322,25 @@ async fn fetch_sglang_http_metadata_checked(
     }
 
     Ok(labels)
+}
+
+/// The endpoint that carries an HTTP engine's data-parallel width, read for
+/// the step that decides the workers the engine registers as: its labels,
+/// `None` for an endpoint the engine does not offer, an error for a read
+/// that failed.
+pub(super) async fn read_width_labels(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<Option<HashMap<String, String>>, String> {
+    let base = http_base_url(url);
+    match get_json_with_fallback_classified::<ServerInfo>(client, &base, "server_info", api_key)
+        .await
+    {
+        Ok(info) => Ok(Some(flat_labels(&info))),
+        Err(MetadataError::NotOffered) => Ok(None),
+        Err(MetadataError::Failed(e)) => Err(format!("server_info: {e}")),
+    }
 }
 
 /// The tolerant read as a plain map, kept for the tests of the registration shape.
@@ -975,6 +978,134 @@ mod tests {
         );
     }
 
+    /// A `/server_info` that fails (the endpoint that carries the data-parallel
+    /// width) is a gap in the registration read like any other endpoint, the
+    /// model info and the models list read in its place (the step that decides
+    /// the workers reads the width again), and fails a strict read by name.
+    #[tokio::test]
+    async fn a_failing_server_info_is_a_gap_for_registration_and_fails_a_strict_read_by_name() {
+        use http::StatusCode;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/server_info",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": "down"}),
+            ),
+            (
+                "/model_info",
+                StatusCode::OK,
+                serde_json::json!({"model_path": "org/model-f"}),
+            ),
+        ])
+        .await;
+        let client = crate::server::http_client();
+
+        let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
+        assert_eq!(label(&tolerant, "model_path"), Some("org/model-f"));
+        assert_eq!(label(&tolerant, "dp_size"), None, "{tolerant:?}");
+
+        let error = fetch_sglang_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect_err("a strict read fails on a failing server_info");
+        assert!(error.starts_with("server_info: status 500"), "{error}");
+    }
+
+    /// Through the step: an HTTP engine keeps the labels its other endpoints
+    /// answer with whatever `/server_info` does (fails, or is absent) and the
+    /// step succeeds: the width that endpoint carries is the DP step's to
+    /// read again, for the runtime that takes rank workers. A `generic`
+    /// worker (a nested gateway, whose old-form endpoint answers 501) keeps
+    /// its models-list name and window.
+    #[tokio::test]
+    async fn the_step_keeps_the_other_labels_whatever_server_info_answers() {
+        use std::sync::Arc;
+
+        use http::StatusCode;
+        use openai_protocol::worker::WorkerSpec;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            config::RouterConfig,
+            worker::WorkerRegistry,
+            workflow::{
+                data::{WorkerKind, WorkerRegistrationMode},
+                steps::{create_worker_workflow_data, local::test_support::serve_json_routes},
+            },
+        };
+
+        let context_for = |base: String, runtime: &str| {
+            let app_context = app_context_for_tests(
+                RouterConfig::default(),
+                Arc::new(WorkerRegistry::new()),
+                None,
+            );
+            let mut data = create_worker_workflow_data(
+                WorkerSpec::new(base),
+                WorkerRegistrationMode::Upsert,
+                app_context,
+            );
+            data.worker_kind = Some(WorkerKind::Local);
+            data.connection_mode = Some(ConnectionMode::Http);
+            data.detected_runtime_type = Some(runtime.to_string());
+            data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+            WorkflowContext::new(WorkflowInstanceId::new(), data)
+        };
+        async fn labels_after_the_step(
+            mut ctx: WorkflowContext<WorkerWorkflowData>,
+        ) -> HashMap<String, String> {
+            assert_eq!(
+                DiscoverMetadataStep.execute(&mut ctx).await.unwrap(),
+                StepResult::Success
+            );
+            ctx.data.discovered_labels
+        }
+        let model_info = || {
+            (
+                "/model_info",
+                StatusCode::OK,
+                serde_json::json!({"model_path": "org/model-g"}),
+            )
+        };
+
+        let failing = serve_json_routes(vec![
+            (
+                "/server_info",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": "down"}),
+            ),
+            model_info(),
+        ])
+        .await;
+        let labels = labels_after_the_step(context_for(failing, "sglang")).await;
+        assert_eq!(label(&labels, "model_path"), Some("org/model-g"));
+        assert_eq!(label(&labels, "dp_size"), None, "{labels:?}");
+
+        let absent = serve_json_routes(vec![model_info()]).await;
+        let labels = labels_after_the_step(context_for(absent, "sglang")).await;
+        assert_eq!(label(&labels, "model_path"), Some("org/model-g"));
+
+        let nested_gateway = serve_json_routes(vec![
+            (
+                "/get_server_info",
+                StatusCode::NOT_IMPLEMENTED,
+                serde_json::json!({"error": "not implemented"}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "served-h", "max_model_len": 4096}]}),
+            ),
+        ])
+        .await;
+        let labels = labels_after_the_step(context_for(nested_gateway, "generic")).await;
+        assert_eq!(label(&labels, "served_model_name"), Some("served-h"));
+        assert_eq!(label(&labels, "max_model_len"), Some("4096"));
+    }
+
     /// The vLLM HTTP read takes the model's identity and window from
     /// `/v1/models` and the build from `/version`; a `/version` the engine
     /// does not offer leaves no label and fails no read.
@@ -1012,11 +1143,12 @@ mod tests {
         assert_eq!(label(&labels, "version"), None, "{labels:?}");
     }
 
-    /// An engine that refuses the connection leaves registration with no
-    /// labels and fails a strict read on the first endpoint, named.
+    /// An engine that refuses the connection: the tolerant reads are empty
+    /// (every endpoint a gap; the width endpoint is the DP step's to read
+    /// again) and a strict read of either fails on its first endpoint,
+    /// named.
     #[tokio::test]
-    async fn an_engine_that_refuses_the_connection_leaves_registration_empty_and_fails_a_strict_read(
-    ) {
+    async fn an_engine_that_refuses_the_connection_reads_empty_and_fails_a_strict_read() {
         use crate::worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
@@ -1252,14 +1384,16 @@ mod tests {
                 labels.get("max_running_requests").map(String::as_str),
                 Some("256")
             );
-            let dp_info = super::super::discover_dp::dp_info_from_labels(&labels).unwrap();
+            let dp_info = super::super::discover_dp::dp_info_from_labels(&labels)
+                .unwrap()
+                .unwrap();
             assert_eq!(dp_info.dp_size, 4);
         }
     }
 
     /// The attention-DP split reaches the labels on this path too, so a
-    /// dp-aware registration over HTTP gives each rank worker its share of
-    /// the window as the gRPC path does.
+    /// data-parallel registration over HTTP gives each rank worker its
+    /// share of the window as the gRPC path does.
     #[test]
     fn test_sglang_server_info_surfaces_the_attention_dp_split() {
         let body = serde_json::json!({
@@ -1349,8 +1483,8 @@ mod tests {
 
     /// A credentialed worker that answers 401 (a wrong password): the error
     /// text names the address masked, never the secret. The status error is
-    /// the likeliest failure of such a worker, and it ends in the DP
-    /// discovery's warning and the step's failure message.
+    /// the likeliest failure of such a worker, and it ends in this step's
+    /// warning at registration and in a strict refresh read's error.
     #[tokio::test]
     async fn a_status_error_names_the_address_masked() {
         use axum::{http::StatusCode, Router};
@@ -1371,13 +1505,15 @@ mod tests {
             .unwrap();
         });
 
-        let err = get_server_info(
+        let err = get_json_with_fallback_classified::<ServerInfo>(
             &crate::server::http_client(),
-            &format!("http://user:secret@127.0.0.1:{port}"),
+            &http_base_url(&format!("http://user:secret@127.0.0.1:{port}")),
+            "server_info",
             None,
         )
         .await
-        .expect_err("401 is a failure");
+        .expect_err("401 is a failure")
+        .to_string();
         server.abort();
 
         assert!(!err.contains("secret"), "{err}");

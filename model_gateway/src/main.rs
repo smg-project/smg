@@ -574,7 +574,9 @@ struct RoutingArgs {
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 
-    /// Enable data parallelism aware scheduling
+    /// Deprecated since 1.16.0, no effect: the gateway always discovers an
+    /// engine's data-parallel ranks at registration and registers one worker
+    /// per rank. Accepted for one release, then removed
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
@@ -631,9 +633,9 @@ struct RoutingArgs {
 
     /// Choose a data-parallel rank per request from the ranks' reported token
     /// loads: the HTTP prefill-decode router, for an engine registered as one
-    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
-    /// pick among them is the rank choice, so this flag chooses nothing there
-    /// (warned at start-up)
+    /// worker. An HTTP engine stays one worker under this scheduler; an engine
+    /// registered per rank (gRPC, or HTTP under a cache-aware policy) takes the
+    /// policy's pick among its rank workers as the rank choice
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 
@@ -3034,6 +3036,23 @@ mod tests {
                 "the refusal names the flag: {err}"
             );
         }
+    }
+
+    /// `--dp-aware` is accepted for one release and changes nothing: the
+    /// configuration it builds is the flagless one with the field set, which
+    /// only the start-up warning reads.
+    #[test]
+    fn dp_aware_is_accepted_and_changes_nothing() {
+        let plain = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        let flagged = cli_args_from(&["--dp-aware"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert!(flagged.dp_aware && !plain.dp_aware);
+        let unflagged = smg::config::RouterConfig {
+            dp_aware: false,
+            ..flagged
+        };
+        assert_eq!(format!("{unflagged:?}"), format!("{plain:?}"));
     }
 
     /// The retry-buffer cap must flow through both conversion paths.

@@ -432,6 +432,11 @@ pub struct RouterConfig {
     /// `SMG_LOG_MM_TIMING`.
     #[serde(default)]
     pub log_mm_timing: bool,
+    /// Deprecated since 1.16.0, no effect: the gateway discovers an engine's
+    /// data-parallel ranks at every registration and registers one worker per
+    /// rank. Read by nothing but the start-up warning; accepted for one
+    /// release, then removed.
+    #[serde(default)]
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,

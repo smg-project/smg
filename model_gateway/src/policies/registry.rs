@@ -873,6 +873,55 @@ impl PolicyRegistry {
         Arc::clone(&self.default_policy)
     }
 
+    /// The name of the policy that will serve `model_id`'s workers of
+    /// `worker_type`, as registration assigns it, with nothing assigned: a
+    /// prefill, decode or encode worker's is its pool's policy (the one
+    /// installed here, else `configured_pool_policy`, the routing mode's
+    /// choice for that pool, which the router installs once it is built,
+    /// possibly after a startup worker registers, else the default); a
+    /// regular worker's is the model's policy where one exists, else the
+    /// worker's `policy` hint (the aliases [`PolicyFactory::create_by_name`]
+    /// takes, a hint naming the configured type included), else the
+    /// configured default. Read before a worker is built, where the
+    /// transport's rank expansion depends on the policy.
+    pub fn policy_name_for(
+        &self,
+        model_id: &str,
+        policy_hint: Option<&str>,
+        worker_type: WorkerType,
+        configured_pool_policy: Option<&PolicyConfig>,
+    ) -> &'static str {
+        // A pool's fallback is the getter's: the default policy for the
+        // prefill and decode pools, the encode pool's own default for it.
+        let pool = |installed: &OnceLock<Arc<dyn LoadBalancingPolicy>>, fallback: &'static str| {
+            installed
+                .get()
+                .map(|policy| policy.name())
+                .or_else(|| configured_pool_policy.map(PolicyConfig::name))
+                .unwrap_or(fallback)
+        };
+        match worker_type {
+            WorkerType::Prefill => pool(&self.prefill_policy, self.default_policy.name()),
+            WorkerType::Decode => pool(&self.decode_policy, self.default_policy.name()),
+            WorkerType::Encode => pool(&self.encode_policy, self.get_encode_policy().name()),
+            WorkerType::Regular => {
+                if let Some(policy) = self.model_policies.get(model_id) {
+                    return policy.name();
+                }
+                match policy_hint {
+                    Some(hint)
+                        if Self::hint_matches_config(hint, self.default_policy_config.name()) =>
+                    {
+                        self.default_policy_config.name()
+                    }
+                    Some(hint) => PolicyFactory::create_by_name(hint)
+                        .map_or_else(|| self.default_policy.name(), |policy| policy.name()),
+                    None => self.default_policy.name(),
+                }
+            }
+        }
+    }
+
     /// Get policy for a model, or default if not found
     pub fn get_policy_or_default(&self, model_id: &str) -> Arc<dyn LoadBalancingPolicy> {
         self.get_policy(model_id)
@@ -1544,6 +1593,58 @@ mod tests {
         assert!(!PolicyRegistry::routing_key_override_applies(
             "consistent_hashing"
         ));
+    }
+
+    /// The policy a worker will be served by is known before the worker
+    /// exists: the model's assigned policy first, else the worker's hint by
+    /// the factory's names (the configured type by its aliases too, an
+    /// unknown name as the default), else the default; a prefill, decode or
+    /// encode worker's is its pool's policy: the installed one, else the one
+    /// the routing mode configures (the router installs it after a startup
+    /// worker may have registered), else the default.
+    #[test]
+    fn policy_name_for_reads_the_assignment_registration_will_make() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let regular = |model: &str, hint: Option<&str>| {
+            reg.policy_name_for(model, hint, WorkerType::Regular, None)
+        };
+        assert_eq!(regular("m", None), "round_robin");
+        assert_eq!(regular("m", Some("cache_aware")), "cache_aware");
+        assert_eq!(regular("m", Some("CacheAware")), "cache_aware");
+        assert_eq!(regular("m", Some("roundrobin")), "round_robin");
+        assert_eq!(regular("m", Some("no_such_policy")), "round_robin");
+
+        reg.on_worker_added("m", Some("least_load"));
+        assert_eq!(regular("m", Some("cache_aware")), "least_load");
+        assert_eq!(regular("other", None), "round_robin");
+
+        // Before the router installs a pool's policy, the configured one
+        // answers, else the default; the installed one wins once it is there.
+        let configured = PolicyConfig::Random;
+        assert_eq!(
+            reg.policy_name_for("m", None, WorkerType::Prefill, Some(&configured)),
+            "random"
+        );
+        assert_eq!(
+            reg.policy_name_for("m", None, WorkerType::Prefill, None),
+            "round_robin"
+        );
+        reg.set_prefill_policy(PolicyFactory::create_by_name("cache_aware").unwrap());
+        assert_eq!(
+            reg.policy_name_for("m", None, WorkerType::Prefill, Some(&configured)),
+            "cache_aware"
+        );
+        assert_eq!(
+            reg.policy_name_for("m", None, WorkerType::Decode, None),
+            "round_robin"
+        );
+        assert_eq!(
+            reg.policy_name_for("m", None, WorkerType::Encode, None),
+            reg.get_encode_policy().name()
+        );
     }
 
     #[test]
