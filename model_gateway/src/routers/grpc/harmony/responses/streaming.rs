@@ -1,6 +1,9 @@
 //! Streaming Harmony Responses API implementation
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::response::Response;
 use openai_protocol::responses::{ResponseUsage, ResponsesRequest};
@@ -11,8 +14,8 @@ use uuid::Uuid;
 
 use super::{
     common::{
-        build_next_request_with_tools, open_mcp_session, strip_image_generation_from_request_tools,
-        McpCallTracking,
+        build_next_request_with_tools, open_mcp_session, owned_request,
+        strip_image_generation_from_request_tools, McpCallTracking,
     },
     execution::execute_mcp_tools,
 };
@@ -139,7 +142,7 @@ pub(crate) async fn serve_harmony_responses_stream(
         } else {
             execute_without_mcp_streaming(
                 ctx,
-                &current_request,
+                current_request,
                 &request,
                 tenant_request_meta,
                 &mut emitter,
@@ -210,6 +213,10 @@ async fn execute_mcp_tool_loop_streaming(
         &session,
         &ctx.mcp_format_registry,
     );
+
+    // Shared with each iteration's pipeline context by reference count; the
+    // loop takes it back (`owned_request`) when it appends the tool outputs.
+    let mut current_request = Arc::new(current_request);
 
     let mut mcp_tracking = McpCallTracking::new();
 
@@ -483,13 +490,13 @@ async fn execute_mcp_tool_loop_streaming(
                 debug!("Only MCP tools - continuing loop with results");
 
                 // Build next request with appended history
-                current_request = build_next_request_with_tools(
-                    current_request,
+                current_request = Arc::new(build_next_request_with_tools(
+                    owned_request(current_request),
                     mcp_tool_calls,
                     mcp_results,
                     analysis,
                     partial_text,
-                );
+                ));
 
                 // Continue loop
             }
@@ -536,7 +543,7 @@ async fn execute_mcp_tool_loop_streaming(
 /// The streaming processor handles all output items (reasoning, message, function tool calls).
 async fn execute_without_mcp_streaming(
     ctx: &ResponsesContext,
-    current_request: &ResponsesRequest,
+    current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     tenant_request_meta: TenantRequestMeta,
     emitter: &mut ResponseStreamEventEmitter,
@@ -547,12 +554,14 @@ async fn execute_without_mcp_streaming(
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
 
     // Execute pipeline and get stream + load guards, under the request's
-    // tenant rate-limit reservation
+    // tenant rate-limit reservation; the one iteration shares the request
+    // with its context instead of copying it.
+    let current_request = Arc::new(current_request);
     let startup_pending = startup.is_some();
     let (execution_result, _load_guards, reservation, router_stops) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(
-            current_request,
+            &current_request,
             ctx,
             Some(tenant_request_meta),
             startup.take(),
