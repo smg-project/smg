@@ -14,7 +14,12 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
-use smg::config::{RouterConfig, RoutingKeyOverrideConfig};
+use smg::{
+    config::{RouterConfig, RoutingKeyOverrideConfig},
+    routers::gateway::Gateway,
+    server::ServerConfig,
+};
+use smg_data_connector::MemoryConfig;
 use tower::ServiceExt;
 
 use super::messages_streaming_test::parse_sse_events;
@@ -23,6 +28,7 @@ use crate::common::{
     mock_worker::{
         set_request_recorder, HealthStatus, MockWorkerConfig, RequestRecorder, WorkerType,
     },
+    test_app::create_test_app_with_context,
     AppTestContext,
 };
 
@@ -474,4 +480,93 @@ fn test_v1_messages_thread_turn_is_buffered_on_the_raw_body_path() {
         None,
         "no turn streamed past the thread layer:\n{rendered}"
     );
+}
+
+/// The operator's `memory` bounds reach the thread store of a gateway built
+/// from its config: under a `max_responses` of one the create turn goes when
+/// the continue's answer is stored, so the next continue is the public 404
+/// and the client replays.
+#[tokio::test]
+async fn test_v1_messages_thread_store_follows_the_operator_memory_bounds() {
+    let mut config = RouterConfig::builder()
+        .regular_mode(vec![])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(3002)
+        .max_payload_size(256 * 1024 * 1024)
+        .request_timeout_secs(600)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .max_concurrent_requests(64)
+        .queue_timeout_secs(60)
+        .memory_config(MemoryConfig {
+            max_responses: 1,
+            ..MemoryConfig::default()
+        })
+        .build_unchecked();
+    config.health_check.disable_health_check = true;
+    let ctx = AppTestContext::new_with_config(
+        config,
+        vec![MockWorkerConfig {
+            port: 18307,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }],
+    )
+    .await;
+    let server_config = ServerConfig {
+        secret_sources: Default::default(),
+        secret_files: Default::default(),
+        secrets_auto_reload: false,
+        router_config: ctx.config.clone(),
+        log_dir: None,
+        log_level: None,
+        log_json: false,
+        service_discovery_config: None,
+        mesh_discovery_config: None,
+        prometheus_config: None,
+        shutdown_grace_period_secs: 1,
+        shutdown_settle_secs: None,
+        control_plane_auth: None,
+        mesh_server_config: None,
+        webrtc_bind_addr: None,
+        webrtc_stun_server: None,
+    };
+    let gateway = Gateway::from_config(&server_config, &ctx.app_context)
+        .await
+        .expect("a gateway from the config");
+    let app = create_test_app_with_context(gateway, Arc::clone(&ctx.app_context));
+
+    let (status, created) = post(
+        &app,
+        "/v1/messages",
+        &json!({
+            "model": "mock-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "first"}],
+            "thread": {"type": "create"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let continued = |previous: &Value| {
+        json!({
+            "model": "mock-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "next"}],
+            "thread": {"type": "continue", "previous_message_id": previous}
+        })
+    };
+    let (status, second) = post(&app, "/v1/messages", &continued(&created["id"])).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let (status, refused) = post(&app, "/v1/messages", &continued(&second["id"])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(
+        refused["error"]["details"]["error_code"],
+        "thread_not_found"
+    );
+
+    ctx.shutdown().await;
 }
