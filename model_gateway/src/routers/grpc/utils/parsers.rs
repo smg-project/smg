@@ -441,7 +441,7 @@ fn native_effort_thinking(effort: &str, tokenizer: &dyn Tokenizer) -> Option<boo
 /// support it, then the typed `thinking.type` toggle, then the provider
 /// profile's reading of `reasoning_effort`
 /// ([`ProviderProfile::thinking_from_reasoning_effort`]: the OpenAI mapping
-/// for every profile but MiniMax, which no effort value switches off).
+/// for every profile but MiniMax, where `none` alone switches off).
 /// The typed rank matches where K3, V3.2 and V4.1 read `params.thinking`;
 /// V4 ranks it above its native effort, so a typed `disabled` plus a native
 /// effort disagrees there.
@@ -1931,18 +1931,24 @@ mod tests {
         );
     }
 
-    /// The MiniMax profile reads `reasoning_effort` by its contract: no value
-    /// switches thinking off, so the parser's arming follows the template's
-    /// default as the render does; the OpenAI reading stays for every other
-    /// profile.
+    /// The MiniMax profile reads `reasoning_effort` by its contract: `none`
+    /// switches thinking off, so the parser is not armed, as the render
+    /// writes the template's off mode; `minimal` is the lowest level and a
+    /// level leaves the template's default. The OpenAI reading stays for
+    /// every other profile.
     #[test]
-    fn minimax_effort_never_switches_the_arming_off() {
+    fn minimax_effort_none_disarms_the_parser_as_everywhere() {
         // A tokenizer like the MiniMax M3 template's: the tri-state key, off by
         // default, and no native `reasoning_effort` words of its own.
         let tok = llm_tokenizer::MockTokenizer::new()
             .with_thinking_toggle(ThinkingToggle::DefaultOff)
             .with_thinking_key_name(ThinkingKeyName::ThinkingMode);
-        for effort in ["none", "minimal", "low", "high"] {
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok, ProviderProfile::Minimax),
+            Some(false),
+            "MiniMax none"
+        );
+        for effort in ["minimal", "low", "high", "max"] {
             assert_eq!(
                 resolve_user_thinking(None, Some(effort), None, &tok, ProviderProfile::Minimax),
                 None,
@@ -2000,8 +2006,7 @@ mod tests {
     /// any level, through the request: the prompt renders thinking off and
     /// the parser is not armed. The effort alone leaves the template's
     /// default; `enabled` arms. (A template with the tri-state toggle, off by
-    /// default, under the one profile whose contract reads no effort value
-    /// as off.)
+    /// default, under the MiniMax profile.)
     #[test]
     fn thinking_disabled_wins_over_reasoning_effort() {
         let tok = llm_tokenizer::MockTokenizer::new()

@@ -184,12 +184,49 @@ impl ProviderProfile {
     /// field) when the request states no `thinking.type`. The OpenAI reading
     /// ([`thinking_from_reasoning_effort`]: `none` and `minimal` switch
     /// thinking off, every other value leaves the template's default) for
-    /// every profile but MiniMax, whose contract keeps thinking on for every
-    /// value: `none` is the model's default depth and `minimal` is `low`.
+    /// every profile but MiniMax, whose contract reads `none` as thinking off
+    /// (the request answers as one with `thinking.type: disabled` does: no
+    /// reasoning, `reasoning_tokens` 0) and `minimal` as its lowest named
+    /// level, `low`, thinking on. Which values reach the template is the
+    /// profile's second reading, [`Self::template_reasoning_effort`].
     pub fn thinking_from_reasoning_effort(self, reasoning_effort: Option<&str>) -> Option<bool> {
         match self {
-            ProviderProfile::Minimax => None,
+            ProviderProfile::Minimax => match reasoning_effort {
+                Some("none") => Some(false),
+                _ => None,
+            },
             _ => thinking_from_reasoning_effort(reasoning_effort),
+        }
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with, from the request's
+    /// effective effort and the thinking preference the prompt renders with
+    /// (the typed toggle, else [`Self::thinking_from_reasoning_effort`]): the
+    /// value as sent under every profile but MiniMax, where the template owns
+    /// the level-to-value mapping, defaulting and validation. The MiniMax
+    /// templates write the value into an effort tag the model reads
+    /// literally, and the contract names the levels: `low`, `medium`, `high`,
+    /// `xhigh` and `max` reach the template, `minimal` reaches it as `low`;
+    /// any other value renders no effort (`none` switches thinking off
+    /// instead, an unknown level is the default depth), and no effort is
+    /// rendered while thinking is off, where the contract ignores it.
+    pub fn template_reasoning_effort(
+        self,
+        reasoning_effort: Option<&str>,
+        thinking: Option<bool>,
+    ) -> Option<&str> {
+        let effort = reasoning_effort?;
+        match self {
+            ProviderProfile::Minimax => {
+                if thinking == Some(false) {
+                    return None;
+                }
+                if effort == minimax::EFFORT_MINIMAL {
+                    return Some(minimax::EFFORT_LOW);
+                }
+                minimax::EFFORT_LEVELS.contains(&effort).then_some(effort)
+            }
+            _ => Some(effort),
         }
     }
 

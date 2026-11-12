@@ -7,6 +7,15 @@ use crate::{
     common::{invalid, ContentPart},
 };
 
+/// The `reasoning_effort` levels the contract names, the values the template
+/// renders into its effort tag
+/// ([`super::ProviderProfile::template_reasoning_effort`]); `minimal` is
+/// rendered as the lowest, `none` switches thinking off instead, any other
+/// value is the default depth.
+pub(super) const EFFORT_LEVELS: [&str; 5] = [EFFORT_LOW, "medium", "high", "xhigh", "max"];
+pub(super) const EFFORT_LOW: &str = "low";
+pub(super) const EFFORT_MINIMAL: &str = "minimal";
+
 /// Tool-protocol strictness for conversation history (MPV tests 16_08, 16_09,
 /// 16_12): tool messages must answer a pending tool_call id, every tool_call
 /// must be answered, ids are unique across the whole conversation, and

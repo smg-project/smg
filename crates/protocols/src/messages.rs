@@ -218,9 +218,21 @@ impl CreateMessageRequest {
         continues_final_assistant(&self.messages)
     }
 
-    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    /// `output_config.effort`, the request's `reasoning_effort`
+    /// ([`Self::template_reasoning_effort_for`] is the one the template renders).
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effort as the
+    /// model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
     }
 
     /// The thinking preference the `thinking` block states, none without one.
@@ -1866,9 +1878,21 @@ impl CountMessageTokensRequest {
         continues_final_assistant(&self.messages)
     }
 
-    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    /// `output_config.effort`, the request's `reasoning_effort`
+    /// ([`Self::template_reasoning_effort_for`] is the one the template renders).
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effort as the
+    /// model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
     }
 
     /// The thinking preference the prompt is rendered with.
@@ -3105,6 +3129,82 @@ mod tests {
         }))
         .expect("a count_tokens request");
         assert!(count.continues_final_assistant());
+    }
+
+    /// The effort the template renders is the profile's reading of
+    /// `output_config.effort`, with the `thinking` block's toggle: as sent
+    /// under the default profile; under MiniMax a level the contract names
+    /// only (`minimal` as `low`), and none while thinking is off. The
+    /// count_tokens request reads the same.
+    #[test]
+    fn template_reasoning_effort_follows_the_profile() {
+        let body = |output_config: Value, thinking: Value| {
+            json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config, "thinking": thinking,
+                "messages": [{"role": "user", "content": "Hello"}]
+            })
+        };
+        for (output_config, thinking, minimax, generic) in [
+            (
+                json!({"effort": "high"}),
+                Value::Null,
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"effort": "max"}),
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                Some("max"),
+                Some("max"),
+            ),
+            (json!({"effort": "none"}), Value::Null, None, Some("none")),
+            (
+                json!({"effort": "minimal"}),
+                Value::Null,
+                Some("low"),
+                Some("minimal"),
+            ),
+            (json!({"effort": "64"}), Value::Null, None, Some("64")),
+            (
+                json!({"effort": "high"}),
+                json!({"type": "disabled"}),
+                None,
+                Some("high"),
+            ),
+            (
+                json!({"effort": "none"}),
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                None,
+                Some("none"),
+            ),
+            (json!({}), Value::Null, None, None),
+        ] {
+            let request: CreateMessageRequest =
+                serde_json::from_value(body(output_config.clone(), thinking.clone()))
+                    .expect("a Messages request");
+            assert_eq!(
+                request.template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax,
+                "MiniMax {output_config} {thinking}"
+            );
+            assert_eq!(
+                request.template_reasoning_effort_for(ProviderProfile::Generic),
+                generic,
+                "generic {output_config} {thinking}"
+            );
+            let count: CountMessageTokensRequest = serde_json::from_value(json!({
+                "model": "m", "messages": [], "output_config": output_config, "thinking": thinking
+            }))
+            .expect("a count_tokens request");
+            assert_eq!(
+                count.template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax
+            );
+            assert_eq!(
+                count.template_reasoning_effort_for(ProviderProfile::Generic),
+                generic
+            );
+        }
     }
 
     /// `output_config.effort` reads as a Chat `reasoning_effort`: a string
