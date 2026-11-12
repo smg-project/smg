@@ -1602,7 +1602,12 @@ mod tests {
             (ALIAS, "zai-org/GLM-5.3-Flash"),
             ("glm-5.3-flash-sampling-checkpoint-alias", CHECKPOINT),
         ]);
-        for model in ["zai-org/GLM-5.3-Flash", "glm53flash-fp8", ALIAS, CHECKPOINT] {
+        for model in [
+            "zai-org/GLM-5.3-Flash",
+            "GLM5.3-FLASH-FP8",
+            ALIAS,
+            CHECKPOINT,
+        ] {
             let mut body = json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -1680,7 +1685,7 @@ mod tests {
         for (model, defaults_to) in [
             ("glm-5.3-flash", Some(65_536)),
             ("zai-org/GLM-5.3-Flash-FP8", Some(65_536)),
-            ("glm53flash", Some(65_536)),
+            ("glm53flash", None),
             (ALIAS, Some(65_536)),
             ("glm-5.3", None),
             ("glm-5.2", None),

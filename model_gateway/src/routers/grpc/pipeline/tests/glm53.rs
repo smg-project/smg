@@ -463,7 +463,7 @@ async fn glm53_flash_tool_reference_reaches_the_prompt() {
     let undeclared = json!({"type": "tool_reference", "name": "undeclared"});
     let missing_name = json!({"type": "tool_reference"});
     let text = json!({"type": "text", "text": "extra"});
-    for (model, role, content, accepted) in [
+    let cases = [
         (MODEL_ID, "tool", json!([reference]), true),
         ("glm-5.3-flash", "tool", json!([reference]), true),
         ("GLM-5.3-Flash-BF16", "tool", json!([reference]), true),
@@ -483,9 +483,25 @@ async fn glm53_flash_tool_reference_reaches_the_prompt() {
         ),
         (MODEL_ID, "tool", json!([reference, text]), false),
         (MODEL_ID, "tool", json!([text, reference]), false),
-    ] {
+    ];
+    let filtered_cases = ["weather", "search"].map(|name| {
+        (
+            MODEL_ID,
+            "tool",
+            json!([reference]),
+            name == "weather",
+            json!({"type": "allowed_tools", "mode": "auto",
+                "tools": [{"type": "function", "name": name}]}),
+        )
+    });
+    for (model, role, content, accepted, tool_choice) in cases
+        .into_iter()
+        .map(|(model, role, content, accepted)| (model, role, content, accepted, json!(null)))
+        .chain(filtered_cases)
+    {
         let mut wire = request.clone();
         wire["model"] = json!(model);
+        wire["tool_choice"] = tool_choice;
         wire["messages"][2]["role"] = json!(role);
         wire["messages"][2]["content"] = content;
         let http_request = Request::builder()

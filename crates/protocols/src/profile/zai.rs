@@ -37,13 +37,12 @@ const DEFAULTS_MARKERS: [&str; 5] = ["glm-5", "glm5", "glm_5", "glm-4.6", "glm-4
 const GLM53_MARKERS: [&str; 5] = ["glm-5.3", "glm5.3", "glm_5.3", "glm-5-3", "glm5-3"];
 
 /// Spellings that select the Flash Chat contract.
-const GLM53_FLASH_MARKERS: [&str; 6] = [
+const GLM53_FLASH_MARKERS: [&str; 5] = [
     "glm-5.3-flash",
     "glm5.3-flash",
     "glm_5.3-flash",
     "glm-5-3-flash",
     "glm5-3-flash",
-    "glm53flash",
 ];
 
 // Hosted API budgets: https://docs.z.ai/guides/overview/concept-param#max-tokens
