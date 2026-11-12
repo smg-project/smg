@@ -1101,7 +1101,9 @@ impl Picker for PowerOfTwoCountFirst {
 #[derive(Debug)]
 pub struct RoundRobin {
     buckets: Box<[Bucket]>,
-    next_start: AtomicU64,
+    /// Claims so far: a claim draws its start from this count and, in a
+    /// full bucket, the word it takes.
+    claims: AtomicU64,
 }
 
 /// One cache line of rotation words: a set lives in whichever word of its
@@ -1152,7 +1154,7 @@ impl RoundRobin {
     pub fn new() -> Self {
         Self {
             buckets: (0..ROTATION_BUCKETS).map(|_| Bucket::default()).collect(),
-            next_start: AtomicU64::new(0),
+            claims: AtomicU64::new(0),
         }
     }
 
@@ -1210,7 +1212,7 @@ impl RoundRobin {
             // whose bucket is full takes the word the counter names, and that
             // word's set draws anew when seen. Another decision may have
             // changed the word meanwhile: the bucket is read again.
-            let claim = self.next_start.fetch_add(1, Ordering::Relaxed);
+            let claim = self.claims.fetch_add(1, Ordering::Relaxed);
             let start = Self::start_of(claim);
             let (way, word) = empty.unwrap_or_else(|| {
                 let way = &ways[(claim as usize) % WAYS];
