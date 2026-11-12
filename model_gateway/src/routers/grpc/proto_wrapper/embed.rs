@@ -93,6 +93,16 @@ pub enum ProtoEmbedComplete {
     Vllm(vllm::EmbedResponse),
 }
 
+/// The two-wire dispatch of the embed wrapper's counters, written once.
+macro_rules! embed_field {
+    ($on:expr, $r:ident => $read:expr) => {
+        match $on {
+            Self::Sglang($r) => $read,
+            Self::Vllm($r) => $read,
+        }
+    };
+}
+
 impl ProtoEmbedComplete {
     pub fn embedding(&self) -> &[f32] {
         match self {
@@ -102,16 +112,32 @@ impl ProtoEmbedComplete {
     }
 
     pub fn prompt_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(r) => r.prompt_tokens,
-            Self::Vllm(r) => r.prompt_tokens,
-        }
+        embed_field!(self, r => r.prompt_tokens)
     }
 
     pub fn embedding_dim(&self) -> u32 {
-        match self {
-            Self::Sglang(r) => r.embedding_dim,
-            Self::Vllm(r) => r.embedding_dim,
-        }
+        embed_field!(self, r => r.embedding_dim)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both counters of the embed pair come from the wire's own fields, on each wire.
+    #[test]
+    fn embed_counters_read_each_wires_own_fields() {
+        let one = ProtoEmbedComplete::Sglang(sglang::EmbedResponse {
+            embedding_dim: 7,
+            prompt_tokens: 3,
+            ..Default::default()
+        });
+        let other = ProtoEmbedComplete::Vllm(vllm::EmbedResponse {
+            embedding_dim: 11,
+            prompt_tokens: 5,
+            ..Default::default()
+        });
+        assert_eq!((one.prompt_tokens(), one.embedding_dim()), (3, 7));
+        assert_eq!((other.prompt_tokens(), other.embedding_dim()), (5, 11));
     }
 }
