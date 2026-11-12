@@ -19,7 +19,10 @@ use openai_protocol::common::Tool;
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
 
-pub use self::output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Turn};
+pub use self::{
+    output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Turn},
+    spelling::{GrammarBackend, Spelling, Unspelled},
+};
 use crate::{
     format::{CallSyntax, Emits, Format, Whitespace},
     shape::{Layout, Message},
@@ -36,6 +39,7 @@ mod output;
 mod pythonic;
 mod schema;
 mod shaped;
+mod spelling;
 mod tagged;
 mod xml;
 mod xtml;

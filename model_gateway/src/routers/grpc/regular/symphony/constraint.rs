@@ -14,7 +14,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use symphony::{
     grammar::{GrammarStart, Options},
-    Format, Grammar, OutputAnswer, OutputChoice, Turn,
+    Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
 };
 use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 
@@ -47,16 +47,45 @@ fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Cow<'_, Val
     }
 }
 
-/// `grammar` as the engine's structural tag, written straight from the tree
-/// ([`Grammar::payload_text`], the bytes of `payload().to_string()` without the JSON tree in
-/// between) in the `vocabulary` the worker's grammar compiler takes: spelled without the newer
-/// nodes first for a worker that advertises the older one ([`Grammar::in_older_vocabulary`]), as
-/// the table built it otherwise ([`TagVocabulary`]).
-fn structural_tag(grammar: Grammar, vocabulary: TagVocabulary) -> ToolConstraint {
-    ToolConstraint::StructuralTag(match vocabulary {
-        TagVocabulary::Current => grammar.payload_text(),
-        TagVocabulary::Older => grammar.in_older_vocabulary().payload_text(),
-    })
+/// `grammar` spelled for the worker's grammar backend ([`Grammar::spelled`]): xgrammar's
+/// structural tag, written straight from the tree, in the `vocabulary` the worker's grammar
+/// compiler takes (spelled without the newer nodes for a worker that advertises the older one,
+/// [`TagVocabulary`]). Every worker spells for xgrammar today. A backend with no spelling of the
+/// grammar is [`Unspelled`], and what that counts as follows what the request asked: a tag the
+/// table does not have where it asked for no constraint ([`auto_tag`], a registry table's
+/// answer through [`unspelled_tag`]), a refusal by the backend's name where it asked for what
+/// the table alone gives (a forced call and the response template's answer through
+/// [`unspelled_tag`], the [`whole_turn`]).
+fn structural_tag(
+    grammar: Grammar,
+    vocabulary: TagVocabulary,
+) -> Result<ToolConstraint, Unspelled> {
+    grammar
+        .spelled(GrammarBackend::Xgrammar, vocabulary)
+        .map(|spelling| match spelling {
+            Spelling::StructuralTag(text) => ToolConstraint::StructuralTag(text),
+        })
+}
+
+/// What a tag the worker's grammar backend has no spelling of counts as, for `model`'s `asked`:
+/// no tag, which a registry table leaves to the older registry as it leaves a tag it does not
+/// have ([`tagged`]), and which the response template's table (`compiled`) refuses by the
+/// backend's name, since its output has no other syntax the older path could constrain.
+fn unspelled_tag(
+    unspelled: Unspelled,
+    compiled: bool,
+    model: &str,
+    asked: &str,
+) -> Result<Option<ToolConstraint>, SymphonyError> {
+    if compiled {
+        Err(SymphonyError::Constraint(format!(
+            "model '{model}' reads its output with its response template, whose structural tag \
+             for {asked} the {} grammar backend has no spelling of",
+            unspelled.backend
+        )))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The constraint `grammar` gives, written straight from the tree as the request carries it, in
@@ -65,7 +94,8 @@ fn structural_tag(grammar: Grammar, vocabulary: TagVocabulary) -> ToolConstraint
 /// table with no tag leaves the older registry to decide, as before; the template's table refuses
 /// instead, since its output has no other syntax the older path could constrain and the table
 /// still read, and so does a prompt that `continues` the assistant's message, since the tag
-/// writes a turn from its start.
+/// writes a turn from its start. A tag the worker's grammar backend has no spelling of counts
+/// as no tag ([`unspelled_tag`]).
 pub(super) fn tagged(
     grammar: Option<Grammar>,
     vocabulary: TagVocabulary,
@@ -79,7 +109,10 @@ pub(super) fn tagged(
             "model '{model}' constrains {asked} from the start of a new assistant message, as its \
              response template writes one, so it cannot continue the assistant's message"
         ))),
-        Some(grammar) => Ok(Some(structural_tag(grammar, vocabulary))),
+        Some(grammar) => match structural_tag(grammar, vocabulary) {
+            Ok(constraint) => Ok(Some(constraint)),
+            Err(unspelled) => unspelled_tag(unspelled, compiled, model, asked),
+        },
         None if compiled => Err(SymphonyError::Constraint(format!(
             "model '{model}' reads its output with its response template, whose table has no \
              structural tag for {asked}"
@@ -600,9 +633,9 @@ pub(crate) fn constraint_for(
 /// callable `tools` with no call required, at most one when parallel calls are off, and
 /// `reasoning_open` when the prompt leaves the model inside its thought. The request asked for
 /// nothing, so nothing is refused: `Ok(None)` when no table reads the response ([`reads`]), the
-/// request takes no tag for its calls ([`Asks::auto_calls`]), or the table has none for them. A
-/// thought and an answer alone are not constrained today. `thought_closed` as for
-/// [`constraint_for`].
+/// request takes no tag for its calls ([`Asks::auto_calls`]), the table has none for them, or
+/// the worker's grammar backend has no spelling of it ([`auto_tag`]). A thought and an answer
+/// alone are not constrained today. `thought_closed` as for [`constraint_for`].
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model"
@@ -636,7 +669,8 @@ pub(crate) fn auto_constraint(
 
 /// The tag of the calls `format` lets a model make under `auto`: no call required, one at most
 /// when `one_call`, in the `vocabulary` the worker's grammar compiler takes; `None` when the
-/// table has no tag for them.
+/// table has no tag for them or the worker's grammar backend has no spelling of it
+/// ([`Unspelled`]): the request asked for no constraint, so none is refused.
 pub(super) fn auto_tag(
     format: &Format,
     tools: &[Tool],
@@ -657,7 +691,7 @@ pub(super) fn auto_tag(
                 start,
             },
         )
-        .map(|grammar| structural_tag(grammar, vocabulary))
+        .and_then(|grammar| structural_tag(grammar, vocabulary).ok())
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known
@@ -925,7 +959,8 @@ impl TagForStart for AutoTag {
             .map_err(String::from)
     }
 
-    /// The `auto` tag stands in for nothing: a worker the table gives none goes unconstrained.
+    /// The `auto` tag stands in for nothing: a worker the table gives none, or whose grammar
+    /// backend spells none, goes unconstrained.
     fn schema(&self) -> Option<&Value> {
         None
     }
@@ -1089,16 +1124,21 @@ fn output_choice(choice: Option<&ToolChoice>) -> OutputChoice {
 }
 
 /// `format`'s grammar for `turn` as the engine's structural tag, in the `vocabulary` the
-/// worker's grammar compiler takes.
+/// worker's grammar compiler takes; refused by the backend's name when that backend has no
+/// spelling of it ([`Unspelled`]): the engine takes the whole turn, so there is no going without.
 pub(super) fn whole_turn(
     format: &Format,
     turn: &Turn<'_>,
     vocabulary: TagVocabulary,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
-    Ok(format
+    format
         .turn_grammar(turn)
         .map_err(SymphonyError::Constraint)?
-        .map(|grammar| structural_tag(grammar, vocabulary)))
+        .map(|grammar| {
+            structural_tag(grammar, vocabulary)
+                .map_err(|unspelled| SymphonyError::Constraint(unspelled.to_string()))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -1107,6 +1147,31 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
+
+    /// A tag the worker's grammar backend has no spelling of counts as a tag the table does not
+    /// have: a registry table's request goes out as before (`auto` and a registry answer ask for
+    /// no constraint), the response template's table refuses by the backend's name, as it refuses
+    /// a tag it lacks. Every worker spells for xgrammar today, so the rule is pinned on the helper
+    /// that takes the spelling's refusal.
+    #[test]
+    fn an_unspelled_tag_counts_as_a_tag_the_table_does_not_have() {
+        for backend in [GrammarBackend::Llguidance, GrammarBackend::Outlines] {
+            let unspelled = Unspelled { backend };
+            assert!(
+                matches!(
+                    unspelled_tag(unspelled, false, "m", "a forced call"),
+                    Ok(None)
+                ),
+                "a registry table leaves the request as it was"
+            );
+            let refused = unspelled_tag(unspelled, true, "m", "a forced call")
+                .expect_err("the response template's table refuses");
+            let words = refused.to_string();
+            assert!(words.contains(backend.name()), "{words}");
+            assert!(words.contains("model 'm'"), "{words}");
+            assert!(words.contains("a forced call"), "{words}");
+        }
+    }
 
     /// A Messages request's untabled schema is its format's, except under a choice that forces a
     /// call to a declared tool: the turn has no text answer to format, whether or not the call has a
