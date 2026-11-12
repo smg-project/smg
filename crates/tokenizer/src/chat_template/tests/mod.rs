@@ -1501,6 +1501,8 @@ fn thinking_in_prose_or_a_comment_is_not_a_thinking_switch() {
         "{% set note = 'if thinking == true' %}{{ note }}",
         "{# if thinking is defined #}{{ messages | length }}",
         "When thinking is enabled, think.{% for m in messages %}{{ m.content }}{% endfor %}",
+        // A raw block prints its text as it is, switch-looking words included.
+        "{% raw %}{% if thinking %}on{% endif %}{% endraw %}{{ messages | length }}",
     ] {
         assert_eq!(
             detect_thinking_toggle(template),
@@ -1520,6 +1522,8 @@ fn thinking_in_prose_or_a_comment_is_not_a_thinking_switch() {
         "{{ 'When thinking is enabled' }}{% if thinking %}<think>{% endif %}",
         "{{ 'it\\'s thinking' }}{% if thinking == true %}<think>{% endif %}",
         "{{ \"a 'quoted' word\" }}{% set thinking = thinking %}",
+        // A nested dict literal's `}}` does not end the block before the switch.
+        "{{ {'a': {'b': '<think>'}}['a']['b'] if thinking else '' }}",
     ] {
         assert_eq!(
             detect_thinking_toggle(template),
