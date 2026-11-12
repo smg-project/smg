@@ -326,19 +326,19 @@ fn check_mm_inputs(req: &ts::GenerateRequest, role: Option<Role>) -> Result<(), 
         &mm.items,
         Some(prompt_ids),
         encoder_input,
-        ServicerReading::SchedulerFeature,
+        TensorRole::SchedulerFeature,
     )
 }
 
 /// Whether an item carries its feature, read as the engine reads a tensor (an
 /// inline payload whose bytes match the dtype and shape, an SHM handle with
 /// the servicer's checks, a remote handle as it came): a malformed one is
-/// refused on every role, as the engine refuses it. `feature` is the reading
-/// the RPC's servicer gives the feature.
+/// refused on every role, as the engine refuses it. `feature` is what the
+/// RPC's servicer makes of the feature.
 fn check_encoder_input(
     item: &ts::MultimodalItem,
     what: &str,
-    feature: ServicerReading,
+    feature: TensorRole,
 ) -> Result<bool, Status> {
     let Some(tensor) = &item.encoder_input else {
         return Ok(false);
@@ -347,36 +347,48 @@ fn check_encoder_input(
     Ok(true)
 }
 
-/// The reading the engine servicer gives a tensor, which decides the checks
-/// on an SHM handle: the scheduler reads a request's feature through
-/// `_feature_from_proto` (tokenspeed/servicer.py, a dtype rule of its own)
-/// and every other tensor through the generic `_tensor_from_proto` (the side
-/// tensors of a request, and every tensor of an `Encode`, which the encoder
-/// servicer reads generically in tokenspeed/encoder_servicer.py).
+/// What a tensor is to the engine servicer, which decides its checks. The
+/// scheduler reads a request's feature through `_feature_from_proto`
+/// (tokenspeed/servicer.py, a dtype rule of its own) and pulls a remote one
+/// through `feature_from_remote`; the encoder servicer reads its feature
+/// through the generic `_tensor_from_proto` (tokenspeed/encoder_servicer.py)
+/// and pulls a remote one the same way; a side tensor goes through the
+/// generic reader on both servicers, whose `tensor_payload_bytes` (mm_shm.py)
+/// refuses a remote payload.
 #[derive(Clone, Copy)]
-enum ServicerReading {
-    /// The scheduler's feature path.
+enum TensorRole {
+    /// The feature of a `Generate` request's item.
     SchedulerFeature,
-    /// The generic tensor path.
-    Generic,
+    /// The feature of an `Encode` request's item.
+    EncoderFeature,
+    /// A side tensor of an item (`model_specific_tensors`), on either RPC.
+    Side,
 }
 
 /// An item's tensor read as the engine reads it: an inline payload through
 /// the wire's own reader, so the mock refuses the tensors the engine's adapter
 /// refuses; an SHM handle with the servicer's checks (the gateway hands the
-/// gRPC wire SHM handles under its shm transport); a remote handle as it
-/// came, since the servicer pulls it over its remote transport
-/// (`feature_from_remote` in tokenspeed/servicer.py), which the mock cannot
-/// reach. `name` is the field in the refusal.
+/// gRPC wire SHM handles under its shm transport); a remote handle on a
+/// feature as it came, since both servicers pull it over their remote
+/// transport (`feature_from_remote` in tokenspeed/servicer.py and in
+/// tokenspeed/encoder_servicer.py), which the mock cannot reach; a remote
+/// handle on a side tensor refused, as the generic reader's
+/// `tensor_payload_bytes` (mm_shm.py) refuses it on both. `name` is the field
+/// in the refusal.
 fn read_tensor(
     tensor: &ts::TensorData,
-    reading: ServicerReading,
+    role: TensorRole,
     what: &str,
     name: &str,
 ) -> Result<(), Status> {
     let read = match &tensor.payload {
-        Some(ts::tensor_data::Payload::Shm(handle)) => read_shm_handle(tensor, reading, handle),
-        Some(ts::tensor_data::Payload::Remote(_)) => Ok(()),
+        Some(ts::tensor_data::Payload::Shm(handle)) => read_shm_handle(tensor, role, handle),
+        Some(ts::tensor_data::Payload::Remote(_)) => match role {
+            TensorRole::SchedulerFeature | TensorRole::EncoderFeature => Ok(()),
+            TensorRole::Side => Err("TensorData.remote payload is not read for a side tensor \
+                                     (the servicer pulls a remote handle for the feature alone)"
+                .to_string()),
+        },
         _ => wire_tensor_tokenspeed(tensor.clone()).map(|_| ()),
     };
     read.map_err(|error| Status::invalid_argument(format!("mock-worker: {what}'s {name}: {error}")))
@@ -388,10 +400,10 @@ fn read_tensor(
 const SHM_FEATURE_DTYPES: [&str; 3] = ["bfloat16", "float16", "float32"];
 
 /// The engine servicer's checks on an SHM handle, the segment itself never
-/// opened. On the scheduler's feature path the dtype is one of
-/// [`SHM_FEATURE_DTYPES`]; on the generic path the tensor keeps its wire
-/// dtype, one the wire does not know passing as the inline reader passes it.
-/// On both the byte length is the dtype's width over the shape
+/// opened. On the scheduler's feature the dtype is one of
+/// [`SHM_FEATURE_DTYPES`]; the encoder's feature and a side tensor keep their
+/// wire dtype, one the wire does not know passing as the inline reader passes
+/// it. On every role the byte length is the dtype's width over the shape
 /// (`_feature_from_proto` and `_tensor_from_proto` in tokenspeed/servicer.py)
 /// and the name is a bare segment name once a leading slash is stripped, no
 /// slash, dot entry or NUL inside (`validated_shm_name` in mm_shm.py). The
@@ -399,10 +411,10 @@ const SHM_FEATURE_DTYPES: [&str; 3] = ["bfloat16", "float16", "float32"];
 /// path.
 fn read_shm_handle(
     tensor: &ts::TensorData,
-    reading: ServicerReading,
+    role: TensorRole,
     handle: &common::ShmHandle,
 ) -> Result<(), String> {
-    if matches!(reading, ServicerReading::SchedulerFeature)
+    if matches!(role, TensorRole::SchedulerFeature)
         && !SHM_FEATURE_DTYPES.contains(&tensor.dtype.as_str())
     {
         return Err(format!(
@@ -449,13 +461,13 @@ enum EncoderInput<'a> {
 /// The item checks shared by `Generate` (with its prompt and the role's
 /// expectation of the encoder input) and `Encode` (no prompt, and the feature
 /// required on every item: the encoder runs the tower on it). `feature` is
-/// the reading the RPC's servicer gives the encoder input: the scheduler's
-/// feature path for `Generate`, the generic path for `Encode`.
+/// what the RPC's servicer makes of the encoder input: the scheduler's
+/// feature for `Generate`, the encoder's for `Encode`.
 fn check_media_items(
     items: &[ts::MultimodalItem],
     prompt_ids: Option<&[u32]>,
     encoder_input: EncoderInput<'_>,
-    feature: ServicerReading,
+    feature: TensorRole,
 ) -> Result<(), Status> {
     let mut covered: BTreeMap<u32, usize> = BTreeMap::new();
     let mut claimed = Vec::new();
@@ -482,7 +494,7 @@ fn check_media_items(
             }
         }
         for (key, tensor) in &item.model_specific_tensors {
-            read_tensor(tensor, ServicerReading::Generic, &what, key)?;
+            read_tensor(tensor, TensorRole::Side, &what, key)?;
         }
         let spans = item
             .placeholders
@@ -548,7 +560,7 @@ impl TokenSpeedEncoder for MockScheduler {
                 &mm.items,
                 None,
                 EncoderInput::Required { roomed: &[] },
-                ServicerReading::Generic,
+                TensorRole::EncoderFeature,
             )?;
         }
         // The realistic engine's fault and admission hooks apply as to the
@@ -1043,6 +1055,32 @@ mod tests {
         assert!(
             status.message().contains("image_grid_thw")
                 && status.message().contains("byte length 8"),
+            "{status:?}"
+        );
+        let mut remote_grid = image_item(1, 2);
+        remote_grid.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            ts::TensorData {
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+                payload: Some(ts::tensor_data::Payload::Remote(
+                    common::RemoteTensorHandle {
+                        transport: "nixl".to_string(),
+                        nbytes: 24,
+                        ..Default::default()
+                    },
+                )),
+            },
+        );
+        let status = refused(
+            &service,
+            with_items(request("ts-mm-remote-grid", &PROMPT), vec![remote_grid]),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("image_grid_thw")
+                && status.message().contains("remote payload"),
             "{status:?}"
         );
     }
