@@ -34,7 +34,9 @@ SPLIT_PACKAGES = {
 INFRA_FILES = (
     "Cargo.toml",
     "Cargo.lock",
+    "rust-toolchain.toml",
     ".cargo/config.toml",
+    ".github/actions/setup-rust/action.yml",
     "scripts/ci_rust_tests.sh",
     "scripts/ci_install_rust.sh",
     "scripts/ci_apt_mirror.sh",
