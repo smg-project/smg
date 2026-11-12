@@ -680,7 +680,7 @@ pub(crate) fn process_content_format(
 }
 
 pub(super) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
-const TOOL_CHOICE_KEY: &str = "tool_choice";
+pub(super) const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
 
 /// The template kwarg both prompt paths tell the tool choice through: the
@@ -708,11 +708,16 @@ pub(crate) fn insert_tool_choice_kwarg(
 /// switch among the kwargs where the template reads that key, `thinking_key`
 /// being the tokenizer's detected thinking key as the backed plan gates its
 /// mode kwargs, else the typed toggle or the profile's reading of the effort),
-/// and the entry removed when the profile hands the template none.
+/// and the entry removed when the profile hands the template none. A control
+/// the renderer never reads (`reads`: the tokenizer's
+/// [`Tokenizer::template_reads`]) is left out: it could not reach the prompt,
+/// and a `response_format` carries a schema the copy into the kwarg walks
+/// node by node.
 fn build_chat_template_kwargs(
     request: &ChatCompletionRequest,
     provider: ProviderProfile,
     thinking_key: Option<ThinkingKeyName>,
+    reads: impl Fn(&str) -> bool,
 ) -> HashMap<String, Value> {
     let request_kwargs = request
         .chat_template_kwargs
@@ -725,10 +730,19 @@ fn build_chat_template_kwargs(
         request.effective_reasoning_effort(),
         explicit.or_else(|| request.template_thinking_for(provider)),
     );
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .filter(|_| reads(TOOL_CHOICE_KEY));
+    let response_format = request
+        .response_format
+        .as_ref()
+        .filter(|_| reads(RESPONSE_FORMAT_KEY));
     // A plain request (no tool choice, no response format, no kwargs, no
-    // effort) renders with no kwargs at all: its map stays unallocated.
-    let mut combined = if request.tool_choice.is_some()
-        || request.response_format.is_some()
+    // effort), or one whose controls the template never reads, renders with
+    // no kwargs at all: its map stays unallocated.
+    let mut combined = if tool_choice.is_some()
+        || response_format.is_some()
         || request_kwargs > 0
         || reasoning_effort.is_some()
     {
@@ -736,10 +750,10 @@ fn build_chat_template_kwargs(
     } else {
         HashMap::new()
     };
-    if let Some(tool_choice) = &request.tool_choice {
+    if let Some(tool_choice) = tool_choice {
         insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
-    if let Some(response_format) = &request.response_format {
+    if let Some(response_format) = response_format {
         if let Ok(value) = serde_json::to_value(response_format) {
             combined.insert(RESPONSE_FORMAT_KEY.to_string(), value);
         }
@@ -1170,7 +1184,9 @@ pub(crate) fn process_chat_messages_with_placeholders(
         let prepared_tools = request.tools.as_deref().map(prepare_tools).transpose()?;
 
         let combined_template_kwargs =
-            build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name());
+            build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name(), |name| {
+                tokenizer.template_reads(name)
+            });
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
             None

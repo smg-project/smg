@@ -5,7 +5,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io, iter,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -254,13 +254,16 @@ struct NotAName;
 
 /// The nodes of a template the engine's rule reads, in document order: each
 /// loop with the macros it sits in (outermost first), the assignments, the
-/// macros and the calls.
+/// macros and the calls; and every name the template reads.
 #[derive(Default)]
 struct Nodes<'a> {
     loops: Vec<(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)>,
     sets: Vec<&'a Set<'a>>,
     macros: Vec<&'a Macro<'a>>,
     calls: Vec<&'a Call<'a>>,
+    /// Every name the template reads: a bare name anywhere in an expression
+    /// (see [`ChatTemplateState::reads`]).
+    names: HashSet<&'a str>,
 }
 
 impl<'a> Nodes<'a> {
@@ -349,9 +352,13 @@ impl<'a> Nodes<'a> {
                 macros.pop();
             }
             // A `{% call %}` block is a call with a body, not a macro of the
-            // template (jinja2 keeps the two apart).
+            // template (jinja2 keeps the two apart); its parameter defaults
+            // are expressions of the template, as a macro's are.
             Stmt::CallBlock(cb) => {
                 self.call(&cb.call);
+                for default in &cb.macro_decl.defaults {
+                    self.expr(default);
+                }
                 self.stmts(&cb.macro_decl.body, macros);
             }
             Stmt::Do(d) => self.call(&d.call),
@@ -379,7 +386,10 @@ impl<'a> Nodes<'a> {
 
     fn expr(&mut self, expr: &'a Expr<'a>) {
         match expr {
-            Expr::Var(_) | Expr::Const(_) => {}
+            Expr::Var(v) => {
+                self.names.insert(v.id);
+            }
+            Expr::Const(_) => {}
             Expr::Slice(s) => {
                 self.expr(&s.expr);
                 for bound in [&s.start, &s.stop, &s.step].into_iter().flatten() {
@@ -534,8 +544,7 @@ fn message_loop_vars<'a>(
 
 /// Whether the template has a loop over a message's content: the engine's
 /// `_iter_nodes_assign_content_item`, which decides its content format.
-fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
-    let nodes = Nodes::of(ast);
+fn iterates_message_content(nodes: &Nodes<'_>) -> Result<bool, NotAName> {
     let messages_names = names_assigned_from(&nodes.sets, "messages")?;
     let message_vars = message_loop_vars(&nodes.loops, &messages_names)?;
     let is_message_content = |expr: &Expr<'_>| {
@@ -545,7 +554,7 @@ fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
     };
 
     // The parameters of each macro that a call fills with a message's content.
-    let fed_params: Vec<(&Macro<'_>, std::collections::HashSet<&str>)> = nodes
+    let fed_params: Vec<(&Macro<'_>, HashSet<&str>)> = nodes
         .macros
         .iter()
         .map(|m| {
@@ -553,7 +562,7 @@ fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
                 Some(Expr::Var(v)) => Some(v.id),
                 _ => None,
             };
-            let mut fed = std::collections::HashSet::new();
+            let mut fed = HashSet::new();
             for call in nodes
                 .calls
                 .iter()
@@ -830,31 +839,47 @@ impl ThinkDetector {
     }
 }
 
-/// Single-pass detection of content format, think-in-prefill, and thinking toggle.
-fn detect_all(
-    template: &str,
-) -> (
-    ChatTemplateContentFormat,
-    bool,
-    ThinkingToggle,
-    Option<ThinkingKeyName>,
-    bool,
-) {
+/// What a template's text says before it is compiled: the answers a
+/// [`ChatTemplateState`] keeps per template.
+#[derive(Default)]
+struct Detected {
+    content_format: ChatTemplateContentFormat,
+    think_in_prefill: bool,
+    thinking_toggle: ThinkingToggle,
+    thinking_key_name: Option<ThinkingKeyName>,
+    prefill_opens_think_block: bool,
+    /// Every name the template reads (see [`ChatTemplateState::reads`]);
+    /// `None` where the template did not parse, the names being unknown.
+    names_read: Option<HashSet<String>>,
+}
+
+/// Single-pass detection of content format, think-in-prefill, thinking toggle
+/// and the names read.
+fn detect_all(template: &str) -> Detected {
     let (thinking_toggle, thinking_key_name) = detect_thinking_toggle(template);
-    let (content_format, think_in_prefill, prefill_opens_think_block) =
+    let (content_format, think_in_prefill, prefill_opens_think_block, names_read) =
         detect_all_with_ast(template);
-    (
+    Detected {
         content_format,
         think_in_prefill,
         thinking_toggle,
         thinking_key_name,
         prefill_opens_think_block,
-    )
+        names_read,
+    }
 }
 
-/// AST detection of content format, think-in-prefill and whether the
-/// generation prompt leaves a think block open.
-fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool, bool) {
+/// AST detection of content format, think-in-prefill, whether the generation
+/// prompt leaves a think block open, and the names the template reads
+/// (`None` where it did not parse).
+fn detect_all_with_ast(
+    template: &str,
+) -> (
+    ChatTemplateContentFormat,
+    bool,
+    bool,
+    Option<HashSet<String>>,
+) {
     let template = plain_generation_blocks(template);
     let ast = match parse(
         &template,
@@ -863,15 +888,22 @@ fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool, bool
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
-        Err(_) => return (ChatTemplateContentFormat::String, false, false),
+        Err(_) => return (ChatTemplateContentFormat::String, false, false, None),
     };
 
-    let content_format = match iterates_message_content(&ast) {
+    let nodes = Nodes::of(&ast);
+    let content_format = match iterates_message_content(&nodes) {
         Ok(true) => ChatTemplateContentFormat::OpenAI,
         Ok(false) | Err(NotAName) => ChatTemplateContentFormat::String,
     };
+    let names_read = Some(nodes.names.iter().map(|name| (*name).to_string()).collect());
     let (think_in_prefill, prefill_opens_think_block) = ThinkDetector::run(&ast);
-    (content_format, think_in_prefill, prefill_opens_think_block)
+    (
+        content_format,
+        think_in_prefill,
+        prefill_opens_think_block,
+        names_read,
+    )
 }
 
 /// Parameters for chat template application
@@ -3006,6 +3038,9 @@ pub struct ChatTemplateState {
     /// The templates are compiled with their control spellings marked (see
     /// [`Self::mark_controls`]).
     marked: bool,
+    /// Every name the default template reads (see [`Self::reads`]); `None`
+    /// where the template did not parse, the names being unknown.
+    names_read: Option<HashSet<String>>,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -3023,13 +3058,14 @@ impl std::fmt::Debug for ChatTemplateState {
 
 impl ChatTemplateState {
     pub fn new(template: Option<String>) -> Result<Self> {
-        let (
+        let Detected {
             content_format,
             think_in_prefill,
             thinking_toggle,
             thinking_key_name,
             prefill_opens_think_block,
-        ) = template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
+            names_read,
+        } = template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
         let developer_role_supported = template
             .as_deref()
             .is_none_or(detect_developer_role_support);
@@ -3049,6 +3085,7 @@ impl ChatTemplateState {
             output_len: RenderedLength::default(),
             processor: None,
             marked: false,
+            names_read,
         };
         state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
         Ok(state)
@@ -3185,6 +3222,7 @@ impl ChatTemplateState {
             output_len: RenderedLength::default(),
             processor: None,
             marked: false,
+            names_read: None,
         }
     }
 
@@ -3395,13 +3433,14 @@ impl ChatTemplateState {
     }
 
     pub fn set(&mut self, template: String) -> Result<()> {
-        let (
+        let Detected {
             content_format,
             think_in_prefill,
             thinking_toggle,
             thinking_key_name,
             prefill_opens_think_block,
-        ) = detect_all(&template);
+            names_read,
+        } = detect_all(&template);
         let developer_role_supported = detect_developer_role_support(&template);
         let root_role_supported = detect_root_role_support(&template);
         let env = build_environment(template)?;
@@ -3412,6 +3451,7 @@ impl ChatTemplateState {
         self.thinking_key_name = thinking_key_name;
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
+        self.names_read = names_read;
         self.env = Some(env);
         // A replacement template stands alone, as a template file does.
         self.tool_use = None;
@@ -3451,6 +3491,30 @@ impl ChatTemplateState {
 
     pub fn think_in_prefill(&self) -> bool {
         self.think_in_prefill
+    }
+
+    /// Whether a render through this state can read the name `name`: the
+    /// default template reads it, or an alternate a request may render through
+    /// does (the `tool_use` one, the processor's). The gateway hands the
+    /// template a request control (`tool_choice`, `response_format`) under its
+    /// name only when the template reads it: one no template reads cannot
+    /// reach the prompt. Without a template every name reads as read, there
+    /// being nothing to leave it out of; so does a template whose names are
+    /// not known (one the detector could not parse).
+    pub fn reads(&self, name: &str) -> bool {
+        self.env.is_none()
+            || self
+                .names_read
+                .as_ref()
+                .is_none_or(|names| names.contains(name))
+            || self
+                .tool_use
+                .as_ref()
+                .is_some_and(|state| state.reads(name))
+            || self
+                .processor
+                .as_ref()
+                .is_some_and(|state| state.reads(name))
     }
 
     /// Whether the generation prompt opens a `<think>` block it does not

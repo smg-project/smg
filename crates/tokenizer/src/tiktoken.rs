@@ -1450,6 +1450,10 @@ impl TokenizerTrait for TiktokenTokenizer {
             .native_thinking_mode(template_kwargs, thinking)
     }
 
+    fn template_reads(&self, name: &str) -> bool {
+        self.template_answers().template_reads(name)
+    }
+
     fn set_chat_template(&mut self, template: String) -> Result<()> {
         // Replaced and marked as one step: a template that fails to mark
         // leaves the previous one in force (see `replace_marked`).
