@@ -228,8 +228,9 @@ message Candidate {
   // Reachable from one gateway only (a host-local wire).
   bool host_local = 24;
   uint32 active_sessions = 25;  // u16; keys with a request in flight
-  // The worker's stable identity for placement: its registration key's
-  // fingerprint, equal across one worker's handles; 0 when the host carries none.
+  // The worker's stable identity for placement: the low 32 bits of its
+  // registration key's fingerprint, equal across one worker's handles and
+  // across gateway replicas (where `id` is per handle); 0 when none.
   uint32 key = 26;  // u32
 }
 

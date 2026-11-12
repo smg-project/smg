@@ -3,18 +3,37 @@
 // vocabulary is in policy_plugin.proto; the relay frames carry the engine
 // wire's own messages (smg.grpc.common) unchanged.
 //
-// Scopes and principals: design 5.2. Four credentialed scopes, each on its
-// own listener; the verified principal is transport metadata, never a field
-// a peer fills in. Leader is served to every scope; a standby serves Leader,
+// Scopes and principals: design 5.2. Four credentialed scopes, each
+// mountable on its own listener; the verified principal is transport
+// metadata, never a field a peer fills in. Gateway: Session, Decide,
+// WatchWorkers and Leader; a Hello whose gateway_id is not the verified
+// subject is refused with UNAUTHENTICATED and the stream closes. Ingestion:
+// PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
+// Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
+// WatchRegime), `admin` writes the rest. Replication: Replicate, and
+// GetSnapshot as the re-sync base; ReplicaHello.replica_id must equal the
+// subject. Leader is served to every scope; a standby serves Leader,
 // WatchWorkers, GetSnapshot and GetPolicySpec and answers Session and Decide
 // with NotLeader / Busy { NOT_LEADER }.
 // Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
-// leader's term, every GatewayFrame the gateway's term floor; a floor above
-// the controller's term is refused with FAILED_PRECONDITION.
+// leader's term, every GatewayFrame the gateway's term floor. A gateway
+// raises its floor from Leader and rejects frames below it; the controller
+// refuses a floor above its own term with FAILED_PRECONDITION; a leader past
+// its renew deadline sends NotLeader with an empty address and releases
+// nothing.
 // Flow: design 5.2. Budgets are relative to receipt; credits ride the Decide
-// stream as deltas (Credit); with no credit the gateway decides locally.
-// Error model: design 5.2's status table; in-band within a stream: Busy,
-// NotLeader, SpecAck { accepted: false }, Decline.
+// stream as deltas (Credit) and are never taken back; with no credit the
+// gateway decides locally; a Decide whose budget is gone on arrival is
+// answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease.
+// Errors (gRPC status): UNAUTHENTICATED no verified principal, or Hello's
+// id is not the subject (the stream closes); PERMISSION_DENIED the scope or
+// role does not cover the RPC; FAILED_PRECONDITION not the leader, a floor
+// above the term, a revision or digest guard; INVALID_ARGUMENT a spec or
+// registration rejected; RESOURCE_EXHAUSTED a relay or standby over budget;
+// UNAVAILABLE a standby not yet synced; ABORTED fenced mid-stream, reconnect
+// through Leader; OUT_OF_RANGE and DATA_LOSS never raised, forwarded as
+// RelayResync. In-band within a stream: Busy, NotLeader, SpecAck
+// { accepted: false }, Decline.
 
 syntax = "proto3";
 package smg.policy.v1;
@@ -45,8 +64,9 @@ service PolicyController {
   // Every scope, unary, served by every replica: a gateway polls it for its
   // term floor.
   rpc Leader(LeaderRequest) returns (LeaderInfo);
-  // Control scope: unary, then a server stream.
+  // Control scope, unary.
   rpc StepDown(StepDownRequest) returns (Ack);
+  // Control scope, server stream.
   rpc WatchRegime(RegimeRequest) returns (stream Regime);
   // Replication scope, one bidirectional stream per standby: the leader's
   // ordered log, acknowledged per batch, cut past a bounded backlog.
