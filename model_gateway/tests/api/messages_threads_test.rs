@@ -390,10 +390,10 @@ async fn test_v1_messages_thread_streamed_create_is_continued() {
 }
 
 /// A thread turn is buffered for the thread layer on the raw body path too:
-/// with router retries off and a body over the buffered size, a request
-/// streams to its worker unread, while a turn under the threads beta is
-/// read here, stored under its id and continued. The body-path counter
-/// names the reason.
+/// with router retries off a request streams to its worker unread at any
+/// size (the body over the buffered size here is the second guard, not the
+/// cause), while a turn under the threads beta is read here, stored under
+/// its id and continued. The body-path counter names the reason.
 #[test]
 fn test_v1_messages_thread_turn_is_buffered_on_the_raw_body_path() {
     let rendered = render_after(|| async {
