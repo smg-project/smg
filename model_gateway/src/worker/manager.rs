@@ -1118,7 +1118,7 @@ async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue
 ///     came back on the same address (a restart), and without
 ///     `--remove-unhealthy-workers` this is the only way it rejoins
 ///   - Failed stays Failed on failure; Draining never transitions here
-fn compute_next_status(
+pub(crate) fn compute_next_status(
     worker: &Arc<dyn Worker>,
     probe_ok: bool,
     health_config: &HealthCheckConfig,

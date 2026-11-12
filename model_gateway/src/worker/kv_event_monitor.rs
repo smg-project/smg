@@ -47,7 +47,6 @@ mod admission;
 mod apply;
 mod subscription;
 
-#[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
 
 /// Interval between publications of each model's index size and, for the chain

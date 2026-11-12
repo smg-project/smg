@@ -21,7 +21,7 @@ use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::PolicyRegistry,
+    policies::{host_stores::HostStores, PolicyRegistry},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -496,6 +496,21 @@ impl AppContextBuilder {
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
+        let policy_registry = self
+            .policy_registry
+            .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
+        // Under `--policy-engine engine` the host's store ingress stands
+        // beside the engine (the registry, the monitors and the admission
+        // counters behind the store traits); nothing reads or writes through
+        // it until the step that moves the ingestion drivers. Under `legacy`
+        // nothing is built.
+        if let Some(decider) = policy_registry.decider() {
+            decider.set_stores(Arc::new(HostStores::new(
+                Arc::clone(&worker_registry),
+                self.worker_monitor.as_ref(),
+                self.kv_event_monitor.as_ref(),
+            )));
+        }
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
@@ -550,9 +565,7 @@ impl AppContextBuilder {
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
             prefill_admission,
-            policy_registry: self
-                .policy_registry
-                .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
+            policy_registry,
             gateway: self.gateway,
             response_storage: self
                 .response_storage
@@ -1287,6 +1300,56 @@ mod tests {
             .await
             .expect("a context under legacy");
         assert!(legacy.policy_registry.decider().is_none());
+    }
+
+    /// Under `engine` the host's store ingress stands beside the decider;
+    /// under `legacy` there is no decider to hand it to.
+    #[tokio::test]
+    async fn a_context_under_the_engine_switch_hands_the_host_stores_to_the_decider() {
+        use smg_policy_controller::store::WorkersStore;
+
+        use crate::config::PolicyEngineMode;
+
+        let mut config = RouterConfig::builder()
+            .round_robin_policy()
+            .policy_engine(PolicyEngineMode::Engine)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("a context under engine");
+        let decider = context.policy_registry.decider().expect("the engine");
+        let stores = decider.stores().expect("the host's stores");
+        assert_eq!(stores.epoch(), 0, "nothing wrote through them");
+    }
+
+    /// The worker monitor holds the policy registry; under `engine` the
+    /// registry's decider holds the host's stores, which must not hold the
+    /// monitor back, or a dropped context leaves its monitor alive.
+    #[tokio::test]
+    async fn a_context_under_the_engine_switch_lets_its_worker_monitor_go_when_dropped() {
+        use crate::config::PolicyEngineMode;
+
+        for (name, mode) in [
+            ("legacy", PolicyEngineMode::Legacy),
+            ("engine", PolicyEngineMode::Engine),
+        ] {
+            let mut config = RouterConfig::builder()
+                .round_robin_policy()
+                .policy_engine(mode)
+                .build_unchecked();
+            config.health_check.disable_health_check = true;
+            let context = AppContext::from_config(config, 30, None, None)
+                .await
+                .expect("a context");
+            let monitor =
+                Arc::downgrade(context.worker_monitor.as_ref().expect("the worker monitor"));
+            drop(context);
+            assert!(
+                monitor.upgrade().is_none(),
+                "the worker monitor outlives its context under {name}"
+            );
+        }
     }
 
     #[test]

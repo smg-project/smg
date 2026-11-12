@@ -29,9 +29,16 @@
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists.
 //!
+//! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
+//!   which the controller's store is fed (membership, health, loads, KV event
+//!   cursors, reservations, sessions, leases), the one-process
+//!   [`store::MemoryStore`] behind them and the contract tests over it. A
+//!   gateway in the embedded mode implements the same traits over its own
+//!   structures; nothing decides through them yet.
+//!
 //! What this step does not hold: the plugin hosts, the operator calls, the
-//! store, ingestion, the gRPC API and the election; they arrive in later steps
-//! and build on these types. The
+//! ingestion drivers, the gRPC API and the election; they arrive in later
+//! steps and build on these types. The
 //! in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 
@@ -40,6 +47,7 @@ pub mod decision;
 pub mod framework;
 pub mod lease;
 pub mod spec;
+pub mod store;
 pub mod view;
 
 pub use decision::{

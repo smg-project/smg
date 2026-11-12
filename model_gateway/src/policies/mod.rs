@@ -20,6 +20,7 @@ pub mod cost;
 mod dp_min_token;
 pub mod engine_host;
 mod factory;
+pub mod host_stores;
 mod least_load;
 mod manual;
 mod passthrough;
