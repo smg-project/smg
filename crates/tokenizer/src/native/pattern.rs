@@ -6,12 +6,14 @@
 //! code points, a group of single-character alternatives (read as the class
 //! of their union), greedy `?` `*` `+` `{m,n}` and the possessive `?+` `*+`
 //! `++` on a class, a case-insensitive group of literal alternatives (or a
-//! class of letters) for the English clitics, the lookahead `(?!\S)` and
-//! the end anchor `$` (the engine's end of line: the end of the text, or
-//! before a newline). This module parses that subset and matches it the
-//! way the engine behind `tokenizers`' `Split` does: leftmost-first
-//! alternation, greedy quantifiers that back off one repetition at a
-//! time. The engine also yields empty matches, and `Split`
+//! class of letters) for the English clitics, the lookahead `(?!\S)`, the
+//! end anchor `$` (the engine's end of line: the end of the text, or
+//! before a newline), the digit class `\d` and the digit-grouping
+//! lookahead `(?=(?:\d{3})*\b)` after a digit, read as the count of the
+//! digit run ahead and the word boundary after it. This module parses that
+//! subset and matches it the way the engine behind `tokenizers`' `Split`
+//! does: leftmost-first alternation, greedy quantifiers that back off one
+//! repetition at a time. The engine also yields empty matches, and `Split`
 //! cuts the text at them; this matcher does not reproduce that, so a pattern
 //! that can match the empty string is declined like everything else outside
 //! the subset, and the caller keeps the `tokenizers` pipeline for it.
@@ -172,6 +174,11 @@ const CAT_SPACE: u16 = 1 << 10;
 /// cuts ideograph runs out before its letter classes and takes them out of
 /// those classes).
 const CAT_HAN: u16 = 1 << 11;
+/// `\d`: the engine's decimal digits.
+const CAT_DIGIT: u16 = 1 << 12;
+/// `\w`: the engine's word characters, the class its word boundary `\b`
+/// reads on either side of a position.
+const CAT_WORD: u16 = 1 << 13;
 
 /// Pairs of ASCII letters that are the full case folding of one character
 /// (ß ẞ: ss; ﬀ: ff; ﬁ: fi; ﬂ: fl; ﬃ ﬄ: ffi, ffl; ﬅ ﬆ: st), which the engine
@@ -215,7 +222,7 @@ fn folded_letters(class: Class) -> Option<Class> {
     Some(folded)
 }
 
-const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
+const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 14] = [
     (CAT_LETTER, unicode::LETTER),
     (CAT_MARK, unicode::MARK),
     (CAT_NUMBER, unicode::NUMBER),
@@ -228,6 +235,8 @@ const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
     (CAT_OTHER_LETTER, unicode::OTHER_LETTER),
     (CAT_SPACE, unicode::SPACE),
     (CAT_HAN, unicode::HAN),
+    (CAT_DIGIT, unicode::DIGIT),
+    (CAT_WORD, unicode::WORD),
 ];
 
 #[inline]
@@ -379,6 +388,16 @@ pub(super) enum Node {
     /// `$`: succeeds at the end of the text and before a newline (the
     /// engine's end of line, in its default syntax).
     End,
+    /// `(?=(?:\d{size})*\b)`: succeeds when the run of the class ahead
+    /// holds a multiple of `size` characters and the word boundary holds
+    /// after it (the text ends there, or the next character is outside
+    /// the `word` class), or when the boundary holds at the position
+    /// itself (see [`Op::GroupsAhead`]).
+    GroupsAhead {
+        class: usize,
+        size: u32,
+        word: usize,
+    },
 }
 
 /// The characters a match of a node can begin with: a table of the ASCII
@@ -478,6 +497,12 @@ enum Op {
     NotAhead(usize),
     /// Succeeds at the end of the text and before a newline (`$`).
     End,
+    /// The digit-grouping lookahead (see [`Node::GroupsAhead`]).
+    GroupsAhead {
+        class: usize,
+        size: u32,
+        word: usize,
+    },
     /// A choice: the ops that follow are tried first; `next` is where to go
     /// when they fail (the following alternative's `Split`, the op after an
     /// optional group, or [`NO_NEXT`] for the last alternative). `first`
@@ -701,6 +726,41 @@ impl Pattern {
                 },
                 Op::End => {
                     if pos == text.len() || text.as_bytes()[pos] == b'\n' {
+                        pc += 1;
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Op::GroupsAhead { class, size, word } => {
+                    // The engine takes the whole run of the class for the
+                    // repeated group and backs off one group at a time. A
+                    // boundary never falls between two characters of the
+                    // class (each is a word character), so it holds either
+                    // after the whole run, when the run holds a multiple of
+                    // `size` characters and ends the text or meets a
+                    // character outside the word class, or at the position
+                    // itself, between the character before it and the one
+                    // at it.
+                    let class = &self.classes[class];
+                    let word = &self.classes[word];
+                    let mut run = 0u32;
+                    let mut end = pos;
+                    while let Some((c, len)) = next_char(text, end) {
+                        if !class.contains(c) {
+                            break;
+                        }
+                        end += len;
+                        run += 1;
+                    }
+                    let word_at =
+                        |p: usize| next_char(text, p).is_some_and(|(c, _)| word.contains(c));
+                    let word_before = text[..pos]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| word.contains(c));
+                    let after_run = run > 0 && run.is_multiple_of(size) && !word_at(end);
+                    if after_run || word_before != word_at(pos) {
                         pc += 1;
                         false
                     } else {
@@ -1253,6 +1313,11 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
         }
         Node::NotAhead(class) => program.push(Op::NotAhead(*class)),
         Node::End => program.push(Op::End),
+        Node::GroupsAhead { class, size, word } => program.push(Op::GroupsAhead {
+            class: *class,
+            size: *size,
+            word: *word,
+        }),
     }
 }
 
@@ -1260,7 +1325,7 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
 /// alternation on a path leaves one until the path is done or backs off.
 fn choices(node: &Node) -> usize {
     match node {
-        Node::Class(_) | Node::NotAhead(_) | Node::End => 0,
+        Node::Class(_) | Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => 0,
         Node::ClassRepeat { possessive, .. } => usize::from(!*possessive),
         Node::Repeat { node, max, .. } => {
             if *max == 0 {
@@ -1329,7 +1394,7 @@ fn can_match_empty(node: &Node) -> bool {
         Node::Repeat { node, min, .. } => *min == 0 || can_match_empty(node),
         Node::Concat(nodes) => nodes.iter().all(can_match_empty),
         Node::Alt { alternatives, .. } => alternatives.iter().any(can_match_empty),
-        Node::NotAhead(_) | Node::End => true,
+        Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => true,
     }
 }
 
@@ -1338,7 +1403,10 @@ fn can_match_empty(node: &Node) -> bool {
 fn holds_end(node: &Node) -> bool {
     match node {
         Node::End => true,
-        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) => false,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::GroupsAhead { .. } => false,
         Node::Repeat { node, .. } => holds_end(node),
         Node::Concat(nodes) => nodes.iter().any(holds_end),
         Node::Alt { alternatives, .. } => alternatives.iter().any(holds_end),
@@ -1389,7 +1457,7 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
                 .iter()
                 .fold(First::default(), |all, first| all.or(*first))
         }
-        Node::NotAhead(_) | Node::End => First {
+        Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => First {
             nullable: true,
             ..First::default()
         },
@@ -1554,7 +1622,7 @@ impl Parser<'_> {
                 max,
                 possessive,
             },
-            Node::NotAhead(_) | Node::End => return None,
+            Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => return None,
             // A possessive group would need the engine's rule for the choices
             // inside it (an atomic group): declined.
             _ if possessive => return None,
@@ -1656,8 +1724,40 @@ impl Parser<'_> {
                 let class = self.add_class(class);
                 Some(Node::NotAhead(class))
             }
+            '=' => self.parse_groups_ahead(),
             _ => None,
         }
+    }
+
+    /// `(?=(?:\d{n})*\b)`, the digit-grouping lookahead: a `Split` that cuts
+    /// a digit run into groups of `n` from its end puts it after `\d{1,n}`,
+    /// so the first group takes the remainder. Read as one op over the digit
+    /// run ahead ([`Node::GroupsAhead`]); any other positive lookahead is
+    /// outside the subset.
+    fn parse_groups_ahead(&mut self) -> Option<Node> {
+        if self.case_insensitive {
+            return None;
+        }
+        for expected in ['(', '?', ':', '\\', 'd', '{'] {
+            if self.chars.next()? != expected {
+                return None;
+            }
+        }
+        let size = self.parse_number().filter(|&size| size > 0)?;
+        for expected in ['}', ')', '*', '\\', 'b', ')'] {
+            if self.chars.next()? != expected {
+                return None;
+            }
+        }
+        let class = self.add_class(Class {
+            categories: CAT_DIGIT,
+            ..Class::default()
+        });
+        let word = self.add_class(Class {
+            categories: CAT_WORD,
+            ..Class::default()
+        });
+        Some(Node::GroupsAhead { class, size, word })
     }
 
     /// A group whose alternatives are each one character of a class
@@ -1729,6 +1829,7 @@ impl Parser<'_> {
                 class.categories |= self.parse_property()?;
                 class.negated = true;
             }
+            'd' => class.categories |= CAT_DIGIT,
             's' => class.categories |= CAT_SPACE,
             'S' => {
                 class.categories |= CAT_SPACE;
@@ -1808,12 +1909,17 @@ impl Parser<'_> {
                         first = false;
                         continue;
                     }
+                    'd' => {
+                        class.categories |= CAT_DIGIT;
+                        first = false;
+                        continue;
+                    }
                     's' => {
                         class.categories |= CAT_SPACE;
                         first = false;
                         continue;
                     }
-                    'P' | 'S' | 'd' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
+                    'P' | 'S' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
                     'u' => self.code_point()?,
                     other => escaped_literal(other)?,
                 },
@@ -1930,7 +2036,7 @@ mod tests {
     /// characters, the joiners as code-point escapes.
     const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 19] = [
+    const PATTERNS: [&str; 20] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -1950,6 +2056,7 @@ mod tests {
         END_SPACES,
         END_LETTERS,
         END_GROUP,
+        DIGIT_GROUPS,
     ];
 
     /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
@@ -1960,6 +2067,11 @@ mod tests {
     const END_LETTERS: &str = r"[a-z]+$|[a-z]+";
     /// The anchor after a group whose alternatives nest a prefix.
     const END_GROUP: &str = r" ?(?:ab|b)$| ?[a-z]+";
+    /// The digit-grouping split of the 255k command-a family, before its
+    /// cased template: a digit run ends in groups of three, the first group
+    /// taking the remainder, and a run that meets a word character stays
+    /// whole.
+    const DIGIT_GROUPS: &str = r"\d{1,3}(?=(?:\d{3})*\b)";
 
     /// Characters that exercise every class the patterns use: ASCII of all
     /// kinds, spaces and line breaks of several scripts, letters with and
@@ -2184,8 +2296,18 @@ mod tests {
             r"[&&a]",
             r"[^&&a]",
             r"[\p{L}&&[^]]",
-            r"\d+",
             r"(?=a)",
+            r"\b",
+            r"(?=\d)",
+            r"(?=(?:\d{3})*)",
+            r"(?=(?:\d{3})*\b)",
+            r"(?=(?:\d{2,3})*\b)",
+            r"(?=(?:[0-9]{3})*\b)",
+            r"(?=(?:\p{N}{3})*\b)",
+            r"(?=(?:\d{3})+\b)",
+            r"(?=(?:\d{0})*\b)",
+            r"\d(?=(?:\d{3})*\b)?",
+            r"(?i:\d(?=(?:\d{3})*\b))",
             r"\p{Hiragana}",
             r"a{3,1}",
             r"[z-a]",
@@ -2214,6 +2336,119 @@ mod tests {
             r"(?:a|$)",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    /// Our matches of `pattern` in `text`.
+    fn matches_of(pattern: &str, text: &str) -> Vec<(usize, usize)> {
+        Pattern::parse(pattern)
+            .expect("parses")
+            .find_iter(text)
+            .collect()
+    }
+
+    /// `\d` is the engine's decimal digit class: the digits of every
+    /// script and none of the other numbers (a superscript, a fraction, a
+    /// circled digit, a Roman numeral).
+    #[test]
+    fn the_digit_class_is_the_engines() {
+        let text = POOL.iter().collect::<String>() + "0123456789\u{663}\u{664}\u{6F4}\u{7C0}\u{969}\u{E52}\u{1D7D8}\u{2460}\u{216B}\u{B2}\u{BD}\u{2469}";
+        for pattern in [r"\d+", r"\d", r"\d{1,3}", r"[a-z]\d*", r"\d{2}|[^\d]+"] {
+            assert_eq!(
+                matches_of(pattern, &text),
+                oracle_matches(pattern, &text),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// The digit-grouping lookahead counts the digit run ahead as the
+    /// engine does: a run of a multiple of the group's size that ends the
+    /// text or meets a character outside the word class holds the
+    /// boundary, so the groups are cut from the end of the run, the first
+    /// taking the remainder; a run that meets a word character (a letter,
+    /// a mark, an underscore, a joiner, a Roman numeral) matches nowhere;
+    /// after a character outside the word class the boundary holds at the
+    /// position itself.
+    #[test]
+    fn the_digit_grouping_lookahead_counts_the_run_as_the_engine_does() {
+        let runs = [
+            "",
+            "1",
+            "12",
+            "123",
+            "1234",
+            "12345",
+            "123456",
+            "1234567",
+            "123456789012",
+            "\u{663}\u{664}\u{665}",
+            "\u{663}\u{664}\u{665}\u{666}",
+            "1\u{663}4",
+            "\u{969}\u{969}\u{969}",
+        ];
+        let prefixes = ["", "x", " ", ",", "\u{663}", "_", "\u{301}"];
+        let suffixes = [
+            "",
+            " ",
+            "a",
+            "\u{E9}",
+            "\u{301}",
+            "_",
+            ",",
+            ".",
+            "$",
+            "\u{2460}",
+            "\u{216B}",
+            "\u{B2}",
+            "\u{BD}",
+            "\u{200D}",
+            "\u{AA}",
+            "\u{2B0}",
+            "\u{4E2D}",
+            "\u{1F600}",
+            "\n",
+            "\u{A0}",
+            "\u{663}",
+        ];
+        for pattern in [
+            DIGIT_GROUPS,
+            r"\d{1,3}(?=(?:\d{2})*\b)",
+            r"\d(?=(?:\d{4})*\b)",
+            r"[,a](?=(?:\d{3})*\b)",
+            r"\d{2}(?=(?:\d{3})*\b)|\d",
+        ] {
+            for prefix in prefixes {
+                for run in runs {
+                    for suffix in suffixes {
+                        let text = format!("{prefix}{run}{suffix}{run}{suffix}");
+                        assert_eq!(
+                            matches_of(pattern, &text),
+                            oracle_matches(pattern, &text),
+                            "{pattern} on {text:?}"
+                        );
+                    }
+                }
+            }
+        }
+        for text in [
+            "12,345,678.90",
+            "1 000 000",
+            "2026-11-12T03:00Z",
+            "v1.2.3",
+            "1234abc 5678 90",
+            "123_456",
+            "007",
+            "\u{663}\u{664}\u{665}\u{666}\u{667}\u{668}\u{669} \u{661}\u{662}\u{663}",
+            "1\u{2460}2",
+            "x1_",
+            "99\n100",
+        ] {
+            assert_eq!(
+                matches_of(DIGIT_GROUPS, text),
+                oracle_matches(DIGIT_GROUPS, text),
+                "{text:?}"
+            );
         }
     }
 

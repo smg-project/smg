@@ -63,6 +63,10 @@ const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?
 /// The cased template without the clitic group and with one digit at a
 /// time.
 const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// The digit-grouping split before the cased template: a digit run is cut
+/// into groups of three from its end, the first group taking the
+/// remainder.
+const DIGIT_GROUPS: &str = r"\d{1,3}(?=(?:\d{3})*\b)";
 
 const POOL: &[char] = &[
     'a',
@@ -447,6 +451,22 @@ fn shapes() -> Vec<Shape> {
             ],
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
+        // The digit-grouping split before the cased template and a
+        // `ByteLevel` without its regex: a digit run is cut into groups of
+        // three from its end, the first group taking the remainder, and a
+        // run that meets a word character stays whole for the template.
+        Shape {
+            name: "digit-groups-then-cased-template",
+            nfc: false,
+            pre_tokenizers: vec![
+                split(DIGIT_GROUPS, SplitDelimiterBehavior::Isolated, false),
+                split(CASED, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
             added: &[],
         },
         // `Digits` in runs before a split and the `ByteLevel`.
@@ -915,6 +935,58 @@ fn an_end_anchored_chain_keeps_a_long_text_whole() {
             Ok(reference.get_ids().to_vec()),
             "parallel {parallel}"
         );
+    }
+}
+
+#[test]
+fn digit_groups_are_cut_from_the_end_of_a_run_as_the_library_does() {
+    // The digit-grouping shape on runs of every length up to twelve beside
+    // spaces, letters, punctuation, a mark, an underscore, a joiner and
+    // digits of another script, and on a long text of such runs, whole and
+    // through the pool.
+    let mut state = 0xD161_7C40_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "digit-groups-then-cased-template")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let mut texts: Vec<String> = [
+        "1234 ",
+        "123456",
+        "1234abc",
+        "12,345,678.90",
+        "1 000 000",
+        "\u{663}\u{664}\u{665}\u{666} ",
+        "1\u{2460}",
+        "x1_",
+        "99\n",
+        "7",
+        "2026-11-12",
+        "abc1234",
+        "123\u{200D}x",
+        "123_456",
+        "a 1000000 b",
+        "\u{663}\u{664}\u{665}\u{666}\u{667}\u{668}\u{669} \u{661}\u{662}\u{663}",
+        "3.14159265358979",
+    ]
+    .iter()
+    .map(|text| (*text).to_owned())
+    .collect();
+    let runs: String = (1..=12)
+        .map(|n| format!("{} {}a {}_ ", "9".repeat(n), "8".repeat(n), "7".repeat(n)))
+        .collect();
+    texts.push(runs.clone());
+    texts.push(runs.repeat(1 + 2 * PARALLEL_MIN_BYTES / runs.len()));
+    for text in &texts {
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "{text:?} parallel {parallel}"
+            );
+        }
     }
 }
 
