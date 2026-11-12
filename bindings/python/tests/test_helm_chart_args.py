@@ -1225,19 +1225,35 @@ def services(documents: list[dict]) -> dict[str, dict]:
 
 
 @needs_helm
+def test_an_admin_host_without_an_admin_port_is_refused_at_render():
+    """A host without the port fails at the gateway's start; the chart refuses
+    it where the values are written."""
+    assert "router.adminPort" in render_error("router.adminHost=0.0.0.0")
+
+
+LISTENER_PORT_KEYS = ("router.port", "router.metrics.port", "router.mesh.port")
+
+
+@needs_helm
 @pytest.mark.parametrize(
-    "settings, words",
+    "settings, key",
     [
-        (("router.adminHost=0.0.0.0",), "router.adminPort"),
         (("router.adminPort=30000",), "router.port"),
         (("router.adminPort=29000", "router.metrics.port=29000"), "router.metrics.port"),
         (("router.mesh.enabled=true", "router.adminPort=39527"), "router.mesh.port"),
     ],
 )
-def test_an_admin_listener_the_gateway_would_refuse_is_refused_at_render(settings, words):
-    """A host without the port, or a port another listener holds, fails at the
-    gateway's start; the chart refuses both where the values are written."""
-    assert words in render_error(*settings)
+def test_an_admin_port_another_listener_holds_is_refused_naming_that_listener(settings, key):
+    """A port another listener holds fails at the gateway's start; the chart
+    refuses it where the values are written and names the one key that
+    matched, so the operator reads which listener to move and not a list."""
+    error = render_error(*settings)
+    port = next(s for s in settings if s.startswith("router.adminPort=")).split("=")[1]
+    assert (
+        f"router.adminPort {port} equals {key}: the gateway refuses two listeners on one port"
+        in error
+    ), error
+    assert not any(other in error for other in LISTENER_PORT_KEYS if other != key), error
 
 
 @needs_helm
