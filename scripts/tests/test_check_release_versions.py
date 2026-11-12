@@ -346,7 +346,10 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "upsilon": "0.6.0",
         "zeta": "0.2.0",
     }
-    put(root, "Cargo.toml", root_manifest(pins))
+    xi_pin = 'smg-xi = {{ package = "xi", version = "{}", path = "crates/xi" }}\n'
+    put(root, "Cargo.toml", root_manifest(pins) + xi_pin.format("0.1.0"))
+    put(root, "crates/xi/Cargo.toml", manifest("xi", "0.1.0"))
+    put(root, "crates/xi/src/lib.rs", "// xi\n")
     put(root, "crates/kappa/Cargo.toml", manifest("kappa", "0.2.0") + '\n[lib]\nname = "kap"\n')
     put(root, "crates/kappa/src/lib.rs", "pub struct Thing;\n")
     put(root, "crates/lambda/Cargo.toml", manifest("lambda", "1.0.0"))
@@ -371,6 +374,8 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     for name, source in sources.items():
         put(root, f"crates/{name}/Cargo.toml", manifest(name, pins[name]) + deps)
         put(root, f"crates/{name}/src/lib.rs", source)
+    dev = '\n[dev-dependencies]\nxi = { path = "../xi", version = "0.1.0" }\n'
+    put(root, "crates/pi/Cargo.toml", manifest("pi", pins["pi"]) + deps + dev)
     renamed = '\n[dependencies]\nkap_alias = { package = "kappa", path = "../kappa", version = "0.2.0" }\n'
     put(root, "crates/tau/Cargo.toml", manifest("tau", "0.1.0") + renamed)
     put(root, "crates/tau/src/lib.rs", "pub use kap_alias::Thing;\n")
@@ -407,6 +412,11 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     put(root, "crates/zeta/src/lib.rs", "pub use kap::Thing;\n// tidy\n")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "fix(zeta): tidy")
+    put(root, "crates/xi/src/lib.rs", "// xi 2\n")
+    put(root, "crates/xi/Cargo.toml", manifest("xi", "0.2.0"))
+    put(root, "Cargo.toml", root_manifest(pins) + xi_pin.format("0.2.0"))
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "feat(xi): more")
 
     assert mod.caret_accepts("1.0.0", "1.0.1") and mod.caret_accepts("1.2.0", "1.9.9")
     assert not mod.caret_accepts("1.2.0", "2.0.0") and not mod.caret_accepts("1.2.0", "1.1.9")
@@ -478,6 +488,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         mod.crate("pi", "crates/pi", "pi"),
         mod.crate("upsilon", "crates/upsilon", "upsilon"),
         mod.crate("zeta", "crates/zeta", "zeta"),
+        mod.crate("xi", "crates/xi", "smg-xi"),
     )
     by_name = {c.name: c for c in crates}
     repo = mod.Repo(root)
@@ -547,9 +558,11 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
     )
     # tau's own requirement on kappa (a version beside the path) is what cargo reads: an issue until it holds
     assert "crates/tau/Cargo.toml has kap_alias v0.2.0, expected v0.3.0" in out
-    assert "crates/rho/Cargo.toml has" not in out, "lambda 1.0.1 sits inside rho's ^1.0.0"
-    assert "Summary: 16 crate(s) with changes, 2 unchanged" in out
-    assert "17 issue(s) found." in out
+    # pi's dev entry names xi by its package name, under a root key that differs (smg-xi): read, and left behind
+    assert "crates/pi/Cargo.toml has xi v0.1.0, expected v0.2.0" in out
+    assert "crates/rho/Cargo.toml has" not in out, "rho's entries are the root's (workspace = true)"
+    assert "Summary: 17 crate(s) with changes, 2 unchanged" in out
+    assert "18 issue(s) found." in out
 
     code, out = check("plan")
     assert code == 0
@@ -570,6 +583,7 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "  minor zeta v0.2.0 → v0.3.0 (crates/zeta/Cargo.toml)",
         "  minor kappa v0.2.0 → v0.3.0 (crates/kappa/Cargo.toml)",
         "  sync crates/tau/Cargo.toml kap_alias v0.2.0 → v0.3.0",
+        "  sync crates/pi/Cargo.toml xi v0.1.0 → v0.2.0",
     ):
         assert line in out, line
     assert out.count("sync workspace Cargo.toml eta") == 1, out
@@ -608,6 +622,9 @@ def test_a_held_crate_moves_when_a_dependencys_new_version_leaves_its_published_
         "0.3.0", "0.4.0"
     )
     assert mod.write_dep_version(tau, "kappa", "0.3.0", "0.4.0") is None
+    pi = (root / "crates/pi/Cargo.toml").read_text()
+    assert 'xi = { path = "../xi", version = "0.2.0" }' in pi, pi
+    assert mod.workspace_dep_version(root_toml, "smg-xi") == "0.2.0"
     code, out = check()
     assert code == 0, out
     assert "All versions consistent." in out

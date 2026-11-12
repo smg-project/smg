@@ -760,14 +760,17 @@ def direct_requirements(
     """The requirements the component's manifest writes itself on the workspace crates it reaches
     by path (a ``version`` beside the ``path``; the root pins a ``workspace = true`` entry), in
     every dependency table cargo resolves, dev-dependencies too: the entry's key, the crate's name,
-    the requirement. Read from the working tree, as cargo reads it and as the fix leaves it."""
+    the requirement. A direct entry names the package (its ``package =``, else its key), not the
+    root's workspace key. Read from the working tree, as cargo reads it and as the fix leaves it."""
     try:
         manifest = tomllib.loads(repo.read(component.version_file))
     except FileNotFoundError:
         return []
     except tomllib.TOMLDecodeError as error:
         raise Fatal(f"{component.version_file} is not TOML: {error}") from None
-    by_key = {c.dep_key or c.name: c.name for c in crates}
+    packages = {
+        c.name for c in crates
+    }  # a direct entry names the package: its `package =`, else its key
     tables = [manifest, *(t for t in manifest.get("target", {}).values() if isinstance(t, dict))]
     found: list[tuple[str, str, str]] = []
     for table in tables:
@@ -775,8 +778,8 @@ def direct_requirements(
             for key, spec in table.get(section, {}).items():
                 if not isinstance(spec, dict) or spec.get("workspace") or not spec.get("path"):
                     continue
-                name, requirement = by_key.get(spec.get("package", key)), spec.get("version")
-                if name is None or name == component.name:
+                name, requirement = spec.get("package", key), spec.get("version")
+                if name not in packages or name == component.name:
                     continue
                 if isinstance(requirement, str) and SEMVER.match(requirement):
                     found.append((key, name, requirement))
