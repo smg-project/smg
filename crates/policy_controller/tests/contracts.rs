@@ -96,6 +96,7 @@ fn candidate_record() -> &'static [&'static str] {
             vision,
             host_local,
             active_sessions,
+            key,
         }
     )
 }
@@ -564,6 +565,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("vision", Type::Bool),
                 ("host_local", Type::Bool),
                 ("active_sessions", Type::Uint32),
+                ("key", Type::Uint32),
             ],
             repeated: &[],
             optional: &[],

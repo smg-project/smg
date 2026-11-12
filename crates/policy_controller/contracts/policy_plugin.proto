@@ -312,6 +312,11 @@ message Candidate {
   bool host_local = 24;
   // Session keys with a request in flight on this worker; u16.
   uint32 active_sessions = 25;
+  // The worker's stable identity for placement: its registration key's
+  // fingerprint (the low 32 bits), equal across the handles of one worker and
+  // across gateway replicas where the id is the handle's; 0 when the host
+  // carries none; u32.
+  uint32 key = 26;
 }
 
 // One request as a decision sees it (design 4.1 `RequestFacts`). The

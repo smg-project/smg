@@ -4,14 +4,14 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    identity, BatchFacts, BatchOutcome, GatewayId, HealthSink, KvEventSink, LeaseRecord,
-    LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource, MembershipChange, MembershipTail,
-    MemoryStore, Pin, PollMode, ReservationKind, ReservationStore, ResyncReason, SessionsStore,
-    SnapshotChunk, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    identity, identity_of, BatchFacts, BatchOutcome, GatewayId, HealthSink, KvEventSink,
+    LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource, MembershipChange,
+    MembershipTail, MemoryStore, Pin, PollMode, ReservationKind, ReservationStore, ResyncReason,
+    SessionsStore, SnapshotChunk, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
 };
 use crate::{
     lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
-    view::{LoadRow, SignalSource, WorkerId},
+    view::{fingerprint, LoadRow, SignalSource, WorkerId},
 };
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
@@ -858,4 +858,14 @@ fn hello_pages_restore_exactly_what_they_list_and_a_gone_gateway_loses_its_lease
     assert_eq!(leases.drop_gateway(g1), 2);
     assert_eq!(leases.live(g1), 0);
     assert_eq!(leases.live(g2), 1);
+}
+
+#[test]
+fn the_identity_rule_reads_a_key_through_its_fingerprint() {
+    assert_eq!(
+        identity("http://w:8000", 3),
+        identity_of(fingerprint(b"http://w:8000"), 3),
+        "the wrapper and the rule agree"
+    );
+    assert_ne!(identity_of(0, 0), WorkerId(0), "an id is never 0");
 }

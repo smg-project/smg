@@ -1390,6 +1390,12 @@ impl PowerOfTwoLoadMetric {
     }
 }
 
+/// The encode policy of an encode-prefill-decode deployment that names none:
+/// consistent hashing, because encode routing is item-cache affinity and not
+/// the request-level main policy. The one place the default is spelled; the
+/// router factory, the policy registry and the engine's validator read it.
+pub const DEFAULT_ENCODE_POLICY: PolicyConfig = PolicyConfig::ConsistentHashing;
+
 /// Policy configuration for routing.
 ///
 /// `Deserialize` and `Serialize` are the derived ones behind one check: the
