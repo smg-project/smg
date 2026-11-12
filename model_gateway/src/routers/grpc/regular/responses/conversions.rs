@@ -1786,6 +1786,7 @@ mod tests {
             "unsupported_content_part"
         );
     }
+
     /// A function output with a part that has no text (an image, a file, a
     /// refusal) is refused under the chat route's `unsupported_content_part`,
     /// and the refusal names the part, as the refusal of a message part does;

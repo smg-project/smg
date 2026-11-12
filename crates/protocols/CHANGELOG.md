@@ -77,6 +77,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   supported by this text-only backend`. The gateway's `400 unsupported_content_part` for a function
   output now names the part, as the same route's refusal of a message part does; the code and the
   status are unchanged.
+  The message reaches a client on both routes that read it: the chat-family Responses conversion
+  (`400 unsupported_content_part`) and the Harmony builder's tool message
+  (`400 harmony_build_failed`).
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
