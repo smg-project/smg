@@ -22,6 +22,8 @@ pub mod test_app;
 pub mod test_certs;
 pub mod test_config;
 pub mod tls_mock_worker;
+#[cfg(test)]
+mod worker_name_census;
 
 // Re-export commonly used test builders
 use std::{
