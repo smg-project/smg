@@ -17,6 +17,7 @@ pub mod policy_completion_test;
 pub mod policy_engine_test;
 pub mod power_of_two_test;
 pub mod prefix_hash_test;
+pub mod realtime_worker_filter_test;
 pub mod service_discovery_test;
 pub mod stream_relay_disconnect_test;
 pub mod stream_request_body_test;
