@@ -7,8 +7,9 @@
 //! `None` means the registry does not know the model, and the caller reads its output another
 //! way; the gateway keeps its older parsers for such a model.
 //!
-//! The groups are bellwether's: the checkpoints that share a tokenizer and a template, recorded
-//! once by the group's primary. Every group whose table is on main is here, its primary and its
+//! The groups are bellwether's: the checkpoints that share a tokenizer and the wire the table
+//! reads (a template too, but for a checkpoint `docs/tables.md` notes as differing only outside
+//! the wire), recorded once by the group's primary. Every group whose table is on main is here, its primary and its
 //! other checkpoints under the primary's organisation, spelled in `groups.json` beside this
 //! module (one group per line; the crate's build script writes the file as the `GROUPS`
 //! constant); `tests/readme.rs` writes the README's models table from the same groups and checks
@@ -653,12 +654,11 @@ mod tests {
         );
     }
 
-    /// MiniMax-M3.1-Flash is a checkpoint of the MiniMax-M3 group: the same
-    /// tokenizer and special tokens, the same turn and tool wire (the think
-    /// tags, the separator before every tool tag, the XML call tree), so the
-    /// `minimax_m3` table reads it by its repository name as it reads the
-    /// primary's. Its template differs where no table looks: the system
-    /// block writes an effort tag and no longer branches on a thinking mode.
+    /// MiniMax-M3.1-Flash is a checkpoint of the MiniMax-M3 group (the
+    /// MiniMax M3 section of `docs/tables.md`: the same tokenizer and wire,
+    /// a template that differs only outside the wire), so the `minimax_m3`
+    /// table reads it by its repository name as it reads the primary's; the
+    /// near-miss `MiniMax-M3.1` stays unknown.
     #[test]
     fn the_minimax_m3_1_flash_checkpoint_reads_with_the_m3_table() {
         let primary = for_model("MiniMaxAI/MiniMax-M3").expect("MiniMax-M3");
