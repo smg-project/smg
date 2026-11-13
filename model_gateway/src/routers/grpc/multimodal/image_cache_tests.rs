@@ -348,19 +348,25 @@ async fn repeated_cold_images_keep_every_occurrence() {
 async fn cache_separates_preprocessing_model_and_tokenizer_parameters() {
     let (components, calls, config) = setup(true, false);
     run(&components, &config, &[3, 4], "tok").await;
-    let mut config = model_config(
-        &calls,
-        true,
-        false,
-        PreProcessorConfig {
-            rescale_factor: Some(2.0),
-            ..PreProcessorConfig::default()
-        },
-    );
+    let rescaled = || {
+        model_config(
+            &calls,
+            true,
+            false,
+            PreProcessorConfig {
+                rescale_factor: Some(2.0),
+                ..PreProcessorConfig::default()
+            },
+        )
+    };
+    let config = rescaled();
     calls.batches.lock().unwrap().clear();
     let result = run(&components, &config, &[3, 4], "tok").await;
     assert_eq!(result.encoder_input.flat_f32().into_owned(), [6.0, 8.0]);
     assert_eq!(calls.batches.lock().unwrap().len(), 2);
+    // A loaded config never changes in place (a reload is a new one): the
+    // changed model config is a config of its own.
+    let mut config = rescaled();
     config.config["revision"] = serde_json::json!(2);
     calls.batches.lock().unwrap().clear();
     run(&components, &config, &[3, 4], "tok").await;

@@ -724,21 +724,31 @@ async fn cached_images(
     .map(Some)
 }
 
-/// Identify the model, wire format and image policy in the pixel cache.
+/// Identify the model, wire format and image policy in the pixel cache:
+/// hashed by the first request of a loaded config with this model, wire
+/// and policy, read back by every later one.
 fn image_cache_fingerprint(ctx: &PlanContext<'_>) -> Result<u64> {
-    let config = serde_json::json!({
-        "model_id": ctx.model_id,
-        "model_type": ctx.model_type,
-        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
-        // A one-pass result is only right for its own wire.
-        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
-        "transparency": ctx.transparency,
-    });
-    Ok(config_fingerprint(
+    ctx.model_config.image_fingerprint(
         ctx.tokenizer_id,
-        &config,
-        &ctx.model_config.config,
-    )?)
+        ctx.model_id,
+        ctx.image_wire_dtype,
+        ctx.transparency,
+        || {
+            let config = serde_json::json!({
+                "model_id": ctx.model_id,
+                "model_type": ctx.model_type,
+                "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
+                // A one-pass result is only right for its own wire.
+                "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
+                "transparency": ctx.transparency,
+            });
+            Ok(config_fingerprint(
+                ctx.tokenizer_id,
+                &config,
+                &ctx.model_config.config,
+            )?)
+        },
+    )
 }
 
 /// `work` on the blocking pool, with the time its task waited in the pool's
