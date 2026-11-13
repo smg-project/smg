@@ -1377,6 +1377,7 @@ impl CliArgs {
 
         Ok(ServerConfig {
             router_config,
+            routing_flags_given: self.given_flags.clone(),
             log_dir: self.serving.log_dir.clone(),
             log_level: Some(self.serving.log_level.clone()),
             log_json: self.serving.log_json,

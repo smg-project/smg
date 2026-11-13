@@ -27,7 +27,7 @@ pub use smg_external_router::metrics::{
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
 use crate::{
-    config::{ConfigError, ConfigResult},
+    config::{policy_spec::ROUTING_FLAGS_REMOVED_IN, ConfigError, ConfigResult},
     routers::grpc::regular::symphony::telemetry as symphony_telemetry,
     worker::Worker,
 };
@@ -1296,6 +1296,13 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
+    );
+    describe_gauge!(
+        "smg_config_deprecated_flags",
+        format!(
+            "A routing flag the start compiled into the policy specification, one series per \
+             flag at 1: the flag is removed in release {ROUTING_FLAGS_REMOVED_IN}"
+        )
     );
     describe_counter!(
         "smg_manual_policy_branch_total",
@@ -2984,6 +2991,12 @@ impl Metrics {
     /// Set manual policy cache entries count
     pub fn set_manual_policy_cache_entries(count: usize) {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
+    }
+
+    /// One series per routing flag the start compiled into the policy
+    /// specification, at 1 for the life of the process.
+    pub fn set_config_deprecated_flag(flag: &'static str) {
+        gauge!("smg_config_deprecated_flags", "flag" => flag).set(1.0);
     }
 
     /// Record which source supplied the sticky routing key for a keyed request

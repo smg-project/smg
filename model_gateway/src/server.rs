@@ -66,7 +66,10 @@ pub use tls::{blocking_http_client, http_client, http_client_builder, install_cr
 
 use crate::{
     app_context::AppContext,
-    config::{redacted, ParserChoice, RouterConfig},
+    config::{
+        policy_spec::{self, GivenFlags},
+        redacted, ParserChoice, RouterConfig,
+    },
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::{
         discovery::{start_mesh_discovery, MeshDiscoveryConfig},
@@ -1158,6 +1161,12 @@ pub struct ServerConfig {
     /// them as the route does. Nothing to watch without a file source; the
     /// start says so.
     pub secrets_auto_reload: bool,
+    /// The routing flags the command line carried, by clap id: the start
+    /// compiles the routing flags into a policy specification and logs one
+    /// deprecation line per flag it consumed, a flag given at its default
+    /// included. A caller that did not track them leaves the default, and
+    /// only the flags whose values differ from their defaults are named.
+    pub routing_flags_given: GivenFlags,
 }
 
 impl ServerConfig {
@@ -1185,6 +1194,7 @@ impl ServerConfig {
             secret_sources: Default::default(),
             secret_files: Default::default(),
             secrets_auto_reload: false,
+            routing_flags_given: Default::default(),
         }
     }
 }
@@ -2235,6 +2245,21 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
+/// The routing flags compiled into a policy specification: one deprecation
+/// line per flag the start consumed, a flag given at its default included,
+/// and one `smg_config_deprecated_flags` series each. A function of its own
+/// so the compiled document never lives across an await of the start.
+fn report_deprecated_routing_flags(config: &ServerConfig) {
+    let compiled = policy_spec::compile_given(&config.router_config, &config.routing_flags_given);
+    for row in &compiled.report.consumed {
+        warn!(
+            "{}",
+            row.deprecation_line(policy_spec::ROUTING_FLAGS_REMOVED_IN, false)
+        );
+        metrics::Metrics::set_config_deprecated_flag(row.id);
+    }
+}
+
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     install_crypto_provider();
@@ -2405,6 +2430,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
         handle
     });
+
+    // After the recorder, so the deprecated-flag series land in it.
+    report_deprecated_routing_flags(&config);
 
     // The JPEG decoder report and the TurboJPEG policy come after the
     // recorder: the report sets its gauges (`smg_mm_turbojpeg_available`,

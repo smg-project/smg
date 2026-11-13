@@ -9,6 +9,7 @@ mod listener_ports_startup_test;
 mod log_dir_startup_test;
 mod mesh_tls_startup_test;
 mod numeric_flag_bounds_startup_test;
+mod policy_flags_startup_test;
 mod priority_scheduler_config_startup_test;
 mod rdma_listen_ip_startup_test;
 mod secrets_auto_reload_startup_test;

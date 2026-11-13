@@ -520,6 +520,7 @@ async fn test_v1_messages_thread_store_follows_the_operator_memory_bounds() {
         secret_sources: Default::default(),
         secret_files: Default::default(),
         secrets_auto_reload: false,
+        routing_flags_given: Default::default(),
         router_config: ctx.config.clone(),
         log_dir: None,
         log_level: None,

@@ -1578,6 +1578,24 @@ impl Router {
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .build()
     }
+
+    /// One `DeprecationWarning` per routing keyword whose value differs from its default:
+    /// the keywords compile into a policy specification at start (the design's step 2), and
+    /// the warning names the field each landed in. A configuration the validator refuses
+    /// warns nothing here; `start` reports it.
+    fn warn_deprecated_policy_keywords(&self, py: Python<'_>) -> PyResult<()> {
+        let Ok(router_config) = self.to_router_config() else {
+            return Ok(());
+        };
+        let category = py.get_type::<pyo3::exceptions::PyDeprecationWarning>();
+        for row in &config::policy_spec::compile(&router_config).report.consumed {
+            let message = std::ffi::CString::new(
+                row.keyword_warning(config::policy_spec::ROUTING_FLAGS_REMOVED_IN),
+            )?;
+            PyErr::warn(py, &category, &message, 2)?;
+        }
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -1812,7 +1830,10 @@ impl Router {
     ))]
     #[expect(clippy::too_many_arguments)]
     /// Store launcher settings; configuration validation runs before the server starts.
+    /// A routing keyword whose value differs from its default raises one `DeprecationWarning`
+    /// here: the flags compile into a policy specification, and `policy_spec` is their home.
     fn new(
+        py: Python<'_>,
         worker_urls: Vec<String>,
         policy: PolicyType,
         host: String,
@@ -2091,7 +2112,7 @@ impl Router {
 
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
-        Ok(Router {
+        let router = Router {
             worker_urls,
             policy,
             host,
@@ -2315,7 +2336,9 @@ impl Router {
             zmq_engine_count,
             zmq_startup_timeout_secs,
             connection_mode,
-        })
+        };
+        router.warn_deprecated_policy_keywords(py)?;
+        Ok(router)
     }
 
     /// Run the gateway with the configured propagation window and shared shutdown deadline.
@@ -2398,6 +2421,7 @@ impl Router {
             );
             Box::pin(server::startup(server::ServerConfig {
                 router_config,
+                routing_flags_given: Default::default(),
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,

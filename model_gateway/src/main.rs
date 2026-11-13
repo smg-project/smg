@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{parser::ValueSource, ArgAction, Parser, Subcommand, ValueEnum};
 
 // Jemalloc as the global allocator: glibc malloc retains freed pages badly
 // under the gateway's allocation churn. Prefixed symbols only — vendored C
@@ -26,7 +26,8 @@ pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg::{
     config::{
-        AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        policy_spec::GivenFlags, AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy,
+        DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
     secrets::SecretFiles,
@@ -187,6 +188,11 @@ struct CliArgs {
     model: ModelArgs,
     #[command(flatten)]
     integrations: IntegrationArgs,
+    /// The routing flags the command line carried, by clap id, for the
+    /// deprecation lines and the `smg_config_deprecated_flags` series: read
+    /// from clap's value sources after the parse, never a flag itself.
+    #[arg(skip)]
+    given_flags: GivenFlags,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1940,13 +1946,34 @@ fn version_flag(args: &[String]) -> Option<String> {
 /// them; the second value says whether this call turned IGW on, for the
 /// announcement.
 fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
-    let cli = Cli::parse_from(clap_args);
+    let mut matches = <Cli as clap::CommandFactory>::command().get_matches_from(clap_args);
+    let given_flags = given_flags(&matches);
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)
+        .unwrap_or_else(|error| error.exit());
     let mut cli_args = match cli.command {
         Some(Commands::Launch { args }) => args,
         None => cli.router_args,
     };
+    cli_args.given_flags = given_flags;
     let igw_enabled_for_discovery = cli_args.enable_igw_for_discovery();
     (cli_args, igw_enabled_for_discovery)
+}
+
+/// The flags the command line or the environment set, by clap id, from the
+/// `launch` subcommand's matches or the bare form's: the routing flags among
+/// them earn their deprecation line even at their default value.
+fn given_flags(matches: &clap::ArgMatches) -> GivenFlags {
+    let scope = matches.subcommand_matches("launch").unwrap_or(matches);
+    scope
+        .ids()
+        .filter(|id| {
+            matches!(
+                scope.value_source(id.as_str()),
+                Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+            )
+        })
+        .map(|id| id.as_str().to_string())
+        .collect()
 }
 
 /// Phase 4, serve: the async runtime (tokio's container-aware default size
@@ -5526,5 +5553,33 @@ mod tests {
             }
         }
         assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
+    }
+
+    /// The routing flags the command line carried are read from clap's
+    /// value sources, in the bare form and under `launch`; a flag left at
+    /// its default is not among them.
+    #[test]
+    fn the_given_routing_flags_are_read_from_the_value_sources() {
+        let argv = |args: &[&str]| args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let (bare, _) = parse_cli_args(argv(&[
+            "smg",
+            "--policy",
+            "least_load",
+            "--cache-threshold",
+            "0.3",
+        ]));
+        assert!(bare.given_flags.contains("policy"));
+        assert!(bare.given_flags.contains("cache_threshold"));
+        assert!(!bare.given_flags.contains("balance_abs_threshold"));
+        let (launched, _) = parse_cli_args(argv(&[
+            "smg",
+            "launch",
+            "--worker-urls",
+            "http://worker-a:8000",
+            "--policy",
+            "random",
+        ]));
+        let launched: Vec<&str> = launched.given_flags.iter().map(String::as_str).collect();
+        assert_eq!(launched, ["policy", "worker_urls"]);
     }
 }
