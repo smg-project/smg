@@ -606,6 +606,10 @@ struct Stage {
     pattern: Pattern,
     /// The spans of the stage's text that go on as pieces.
     pieces: Pieces,
+    /// A `Digits` split: from it on, every piece that holds a decimal digit
+    /// lies inside a run of numeric characters, which holds no whitespace
+    /// (`NativeEncoder::check_anchors` reads it).
+    digits: bool,
 }
 
 /// The spans of a stage's text that go on as its pieces: the reference's
@@ -1759,6 +1763,15 @@ impl NativeEncoder {
                  own encoder reads with another word class: {pattern}"
             )));
         }
+        // The one stage of this path runs over a unit of the thread pool as
+        // over the text between two specials, and would read the unit's
+        // bounds as the text's: a pattern anchored to its text is declined
+        // on this path (see `Self::check_anchors`).
+        if parsed.anchored() {
+            return Err(Declined::from(format!(
+                "a split pattern anchored to its text (\\A, \\z or \\G): {pattern}"
+            )));
+        }
         if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
             return Err(Declined::from(format!(
                 "special token {content:?} without content"
@@ -1793,6 +1806,7 @@ impl NativeEncoder {
         let stages = vec![Stage {
             pattern: parsed,
             pieces: Pieces::Matches,
+            digits: false,
         }];
         let chain = chain::Scanner::recognize(&stages);
         let specials: Vec<Added> = specials
@@ -1860,13 +1874,16 @@ impl NativeEncoder {
             })?;
         let mut stages = Vec::with_capacity(items.len());
         for split in &items[..at] {
-            stages.push(Self::split_stage(split)?);
+            let stage = Self::split_stage(split)?;
+            Self::check_anchors(&stage, &stages)?;
+            stages.push(stage);
         }
         if items[at].get("use_regex").and_then(Value::as_bool) == Some(true) {
             stages.push(Stage {
                 pattern: Pattern::parse(BYTE_LEVEL_PATTERN)
                     .ok_or_else(|| Declined::from("the ByteLevel split pattern"))?,
                 pieces: Pieces::MatchesAndGaps,
+                digits: false,
             });
         }
         // A stage after the `ByteLevel` cuts the mapped text. It cuts the
@@ -1881,9 +1898,52 @@ impl NativeEncoder {
                     "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII",
                 ));
             }
+            Self::check_anchors(&stage, &stages)?;
             stages.push(stage);
         }
         Ok(stages)
+    }
+
+    /// A stage anchored to its text (`\A`, `\z` or `\G`) reads the bounds of
+    /// the piece the stage before it cut, and where its search in that piece
+    /// began, as the reference runs it ([`Self::pieces`] runs every stage
+    /// over the pieces of the one before). Three things keep it honest: the
+    /// first stage runs over a unit of the thread pool as over the text, and
+    /// would read the unit's bounds as the text's; the pool's cut check runs
+    /// every stage over a window of the text instead of over pieces
+    /// ([`Self::piece_starts_at`]), which stays right only when the stage's
+    /// matches are runs of decimal digits, which neither span nor start at a
+    /// cut candidate (a space); and the stage's own input pieces must meet
+    /// the same bounds in a unit as in the text, which a gap of an earlier
+    /// stage that holds digits and spans a cut would not (it ends at the
+    /// unit's end, where the text goes on): after a `Digits` split every
+    /// piece that holds a decimal digit lies inside a run of numeric
+    /// characters, which holds no whitespace and so spans no cut candidate,
+    /// and the stages after it only cut pieces finer. An anchored first
+    /// stage, an anchored stage over anything but decimal digits and an
+    /// anchored stage without a `Digits` split before it decline.
+    fn check_anchors(stage: &Stage, earlier: &[Stage]) -> Result<(), Declined> {
+        if !stage.pattern.anchored() {
+            return Ok(());
+        }
+        if earlier.is_empty() {
+            return Err(Declined::from(
+                "a first split pattern anchored to its text (\\A, \\z or \\G)",
+            ));
+        }
+        if !stage.pattern.decimal_digits_only() {
+            return Err(Declined::from(
+                "a split pattern anchored to its text (\\A, \\z or \\G) over more than decimal \
+                 digits",
+            ));
+        }
+        if !earlier.iter().any(|stage| stage.digits) {
+            return Err(Declined::from(
+                "a split pattern anchored to its text (\\A, \\z or \\G) without a Digits split \
+                 before it",
+            ));
+        }
+        Ok(())
     }
 
     /// One `Split` as a stage: a regex or a literal the pattern engine takes,
@@ -1912,6 +1972,7 @@ impl NativeEncoder {
                     .map(|pattern| Stage {
                         pattern,
                         pieces: Pieces::MatchesAndGaps,
+                        digits: true,
                     })
                     .ok_or_else(|| Declined::from("the Digits split pattern"));
             }
@@ -1930,6 +1991,7 @@ impl NativeEncoder {
                     .map(|pattern| Stage {
                         pattern,
                         pieces: Pieces::MatchesAndGaps,
+                        digits: false,
                     })
                     .ok_or_else(|| Declined::from("the Punctuation split pattern"));
             }
@@ -1973,7 +2035,11 @@ impl NativeEncoder {
                 "a split pattern outside the supported regex subset: {regex}"
             ))
         })?;
-        Ok(Stage { pattern, pieces })
+        Ok(Stage {
+            pattern,
+            pieces,
+            digits: false,
+        })
     }
 
     /// The ids of `text`, framed by the post-processor's special tokens when
