@@ -92,12 +92,26 @@ impl ReasoningParser for BaseReasoningParser {
             return Ok(ParserResult::default());
         }
 
-        // Strip start token if present
-        if !self.stripped_think_start && current_text.contains(&self.config.think_start_token) {
-            current_text = current_text.replace(&self.config.think_start_token, "");
-            self.buffer.clone_from(&current_text);
-            self.stripped_think_start = true;
-            self.in_reasoning = true;
+        if !self.stripped_think_start {
+            if self.in_reasoning {
+                // Decide after leading whitespace and any partial opener.
+                let token = &self.config.think_start_token;
+                let trimmed = current_text.trim_start();
+                if trimmed.is_empty() || self.is_partial_token(trimmed) {
+                    return Ok(ParserResult::default());
+                }
+                if trimmed.starts_with(token) {
+                    let start = current_text.len() - trimmed.len();
+                    current_text.replace_range(start..start + token.len(), "");
+                    self.buffer.clone_from(&current_text);
+                }
+                self.stripped_think_start = true;
+            } else if current_text.contains(&self.config.think_start_token) {
+                current_text = current_text.replace(&self.config.think_start_token, "");
+                self.buffer.clone_from(&current_text);
+                self.stripped_think_start = true;
+                self.in_reasoning = true;
+            }
         }
 
         // Handle end of reasoning block
