@@ -182,6 +182,10 @@ struct EngineSubscription {
     id: u64,
     handle: JoinHandle<()>,
     kind: SubscriptionKind,
+    /// The model of the worker the subscription started for. An events
+    /// subscription feeds that model's index and no other, so a worker of
+    /// another model does not join it.
+    model_id: String,
     /// Workers join and leave through the task's channel; the stream is not
     /// restarted for them.
     changes: mpsc::UnboundedSender<MemberChange>,
@@ -318,6 +322,16 @@ impl KvEventMonitor {
     /// stream until the next add, the worker's next registration or label
     /// refresh.
     ///
+    /// An events subscription feeds the index of the model it started for,
+    /// so a worker of another model does not join it. An engine registered
+    /// again in place under another model id has every rank replaced in
+    /// the registry before the first one is added: that add ends the
+    /// memberships of the ranks the registry no longer holds and, once the
+    /// task has ended, starts the engine's next subscription for its own
+    /// model, which the other ranks join. Beside a worker of the other
+    /// model that the registry still holds, the worker gets no stream
+    /// until its next add.
+    ///
     /// The add reads the registry it was given (`set_worker_registry`)
     /// under the slot lock on every turn, before it ends a membership for
     /// another object and before it inserts the new one, so a worker the
@@ -408,6 +422,51 @@ impl KvEventMonitor {
                     // ending: the next worker waits for the end and starts
                     // a subscription of its own.
                     Some(engine) if engine.members == 0 => (engine.done.clone(), true),
+                    // An events subscription feeds the index of the model it
+                    // started for: a worker of another model does not join
+                    // it. An engine registered again in place under another
+                    // model id has every rank replaced in the registry and
+                    // then added in turn, so the memberships it still has
+                    // for workers the registry no longer holds end here
+                    // (their own adds come after this one in the same step
+                    // and could not end them while it waited), and the
+                    // worker starts the engine's next subscription once the
+                    // task has ended, on a later turn. Beside a worker of
+                    // the other model that the registry still holds it gets
+                    // no stream: that worker's stream is not ended for it.
+                    Some(engine)
+                        if engine.kind == SubscriptionKind::Events
+                            && engine.model_id != model_id =>
+                    {
+                        let (engine_id, engine_model) = (engine.id, engine.model_id.clone());
+                        let replaced = self.replaced_members_of(&subs, &address, engine_id);
+                        if replaced.is_empty() {
+                            warn!(
+                                worker_url = %Endpoint::redacted_str(&url),
+                                engine = %Endpoint::redacted_str(&address),
+                                model_id = %model_id,
+                                engine_model_id = %engine_model,
+                                "No KV event stream for a worker whose engine streams another model's KV events"
+                            );
+                            return;
+                        }
+                        info!(
+                            engine = %Endpoint::redacted_str(&address),
+                            model_id = %model_id,
+                            engine_model_id = %engine_model,
+                            replaced = replaced.len(),
+                            "Replaced workers leave the KV event subscription of an engine registered under another model"
+                        );
+                        for member in &replaced {
+                            Self::begin_member_removal(
+                                &mut subs,
+                                &self.indexers,
+                                &self.block_sizes,
+                                member,
+                            );
+                        }
+                        continue;
+                    }
                     Some(engine) => {
                         // The engine streams already: the worker joins. The
                         // task takes the join at its next turn (between
@@ -571,6 +630,7 @@ impl KvEventMonitor {
                 id,
                 handle,
                 kind,
+                model_id,
                 changes: changes_tx,
                 members: 1,
                 shutdown_tx: Some(shutdown_tx),
@@ -700,6 +760,32 @@ impl KvEventMonitor {
                     engine,
                     ..
                 } if slot_address == address && *engine == id => Some(url.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The worker URLs on the engine subscription `id` at `address` whose
+    /// objects the registry no longer holds: replaced by a registration or
+    /// removed, with their own adds or removals yet to end their
+    /// memberships.
+    fn replaced_members_of(&self, subs: &Subscriptions, address: &str, id: u64) -> Vec<String> {
+        subs.workers
+            .iter()
+            .filter_map(|(url, slot)| match slot {
+                Slot::Member {
+                    address: slot_address,
+                    engine,
+                    started_for,
+                    ..
+                } if slot_address == address
+                    && *engine == id
+                    && !started_for
+                        .upgrade()
+                        .is_some_and(|member| self.still_held(&member)) =>
+                {
+                    Some(url.clone())
+                }
                 _ => None,
             })
             .collect()

@@ -1672,18 +1672,20 @@ mod tests {
 
     /// A rank worker of a data-parallel engine at `addr`: rank `rank` of `size`.
     fn rank_worker(addr: SocketAddr, rank: usize, size: usize) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://{addr}"))
-                .worker_type(WorkerType::Regular)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::TokenSpeed)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .dp_config(rank, size)
-                .build(),
-        )
+        Arc::new(rank_builder(addr, rank, size).build())
+    }
+
+    /// [`rank_worker`] before it is built, for a test that names its model.
+    fn rank_builder(addr: SocketAddr, rank: usize, size: usize) -> BasicWorkerBuilder {
+        BasicWorkerBuilder::new(format!("grpc://{addr}"))
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .dp_config(rank, size)
     }
 
     /// The test scheduler served on a loopback port bound before it is
@@ -3676,5 +3678,190 @@ mod tests {
                 server.abort();
             });
         });
+    }
+
+    /// The rank worker `rank` of the two-rank engine at `addr`, serving `model`.
+    fn rank_serving(addr: SocketAddr, rank: usize, model: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            rank_builder(addr, rank, 2)
+                .model(ModelCard::new(model))
+                .build(),
+        )
+    }
+
+    /// A monitor that reads a registry of its own, with the two rank workers
+    /// of the engine at `addr` registered serving `model` and on the
+    /// engine's subscription of `kind`.
+    async fn engine_of_two_ranks(
+        addr: SocketAddr,
+        model: &str,
+        kind: SubscriptionKind,
+    ) -> (KvEventMonitor, Arc<WorkerRegistry>, [Arc<dyn Worker>; 2]) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let monitor = KvEventMonitor::new();
+        monitor.set_worker_registry(&registry);
+        let ranks = [rank_serving(addr, 0, model), rank_serving(addr, 1, model)];
+        for worker in &ranks {
+            registry
+                .register(Arc::clone(worker))
+                .expect("the rank registers");
+            monitor.on_worker_added(worker, kind).await;
+        }
+        (monitor, registry, ranks)
+    }
+
+    /// The blocks `index` holds for `worker`; `None` when it has no id there.
+    fn blocks_in(index: &KvIndex, worker: &Arc<dyn Worker>) -> Option<usize> {
+        index
+            .worker_id(worker.url())
+            .map(|id| index.worker_block_count(id))
+    }
+
+    /// A data-parallel engine registered again in place under another model
+    /// id: the registry replaces both ranks, then each one's add comes in
+    /// turn. The first does not join the subscription that feeds the old
+    /// model's index: the memberships of the ranks the registry replaced
+    /// end with it, and the engine's next subscription feeds the new
+    /// model's index, which the other rank joins. The old model's index
+    /// goes with its last worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_engine_registered_again_under_another_model_feeds_that_models_index() {
+        let (addr, server) = serve(Subscribe::Counted {
+            calls: Arc::default(),
+            script: vec![Ok(ranked_batch_at(0, 1)), Ok(ranked_batch_at(1, 1))],
+        })
+        .await;
+        let (monitor, registry, old) =
+            engine_of_two_ranks(addr, "before", SubscriptionKind::Events).await;
+        let before = monitor
+            .get_indexer("before")
+            .expect("the first model's index");
+        wait_until(
+            "both ranks' batches land in the first model's index",
+            || {
+                old.iter()
+                    .all(|worker| blocks_in(&before, worker) == Some(1))
+            },
+        )
+        .await;
+        let (first_subscription, _) = monitor.slot_ids(old[0].url()).await;
+
+        let new = [
+            rank_serving(addr, 0, "after"),
+            rank_serving(addr, 1, "after"),
+        ];
+        for worker in &new {
+            registry.register_or_replace(Arc::clone(worker));
+        }
+        for worker in &new {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                monitor.on_worker_added(worker, SubscriptionKind::Events),
+            )
+            .await
+            .expect("an add waits for no other rank's add");
+        }
+
+        let after = monitor
+            .get_indexer("after")
+            .expect("the engine's next subscription feeds the new model's index");
+        wait_until("both ranks' batches land in the new model's index", || {
+            new.iter()
+                .all(|worker| blocks_in(&after, worker) == Some(1))
+        })
+        .await;
+        assert!(
+            monitor.get_indexer("before").is_none(),
+            "the old model's index went with its last worker"
+        );
+        assert_eq!(engine_members(&monitor, new[0].base_url()).await, Some(2));
+        let (subscription, _) = monitor.slot_ids(new[1].url()).await;
+        assert!(
+            subscription.is_some() && subscription != first_subscription,
+            "the other rank is on the engine's next subscription"
+        );
+        monitor.stop().await;
+        server.abort();
+    }
+
+    /// Beside a rank worker the registry still holds under the old model, a
+    /// worker of another model gets no stream and does not wait for one:
+    /// the held worker keeps the engine's subscription and its blocks, the
+    /// newcomer enters no index, and the log says so.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_of_another_model_gets_no_stream_beside_one_the_registry_holds() {
+        let (addr, server) = serve(Subscribe::Counted {
+            calls: Arc::default(),
+            script: vec![Ok(ranked_batch_at(0, 1)), Ok(ranked_batch_at(1, 1))],
+        })
+        .await;
+        let (monitor, registry, old) =
+            engine_of_two_ranks(addr, "before", SubscriptionKind::Events).await;
+        let before = monitor
+            .get_indexer("before")
+            .expect("the first model's index");
+        wait_until(
+            "both ranks' batches land in the first model's index",
+            || {
+                old.iter()
+                    .all(|worker| blocks_in(&before, worker) == Some(1))
+            },
+        )
+        .await;
+
+        // Rank 0 alone is registered again; rank 1 stays as it is.
+        let newcomer = rank_serving(addr, 0, "after");
+        registry.register_or_replace(Arc::clone(&newcomer));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            monitor.on_worker_added(&newcomer, SubscriptionKind::Events),
+        )
+        .await
+        .expect("the add does not wait for the held worker to leave");
+
+        assert_eq!(monitor.slot_ids(newcomer.url()).await, (None, None));
+        assert!(monitor.get_indexer("after").is_none());
+        assert_eq!(
+            blocks_in(&before, &newcomer),
+            None,
+            "the newcomer entered no index"
+        );
+        assert_eq!(
+            blocks_in(&before, &old[1]),
+            Some(1),
+            "the held rank keeps its blocks"
+        );
+        assert_eq!(engine_members(&monitor, newcomer.base_url()).await, Some(1));
+        assert!(logs_contain(
+            "whose engine streams another model's KV events"
+        ));
+        monitor.stop().await;
+        server.abort();
+    }
+
+    /// A loads-only subscription feeds no index, so a worker of another
+    /// model joins it as any rank does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loads_only_subscription_takes_a_worker_of_another_model() {
+        let (addr, server) = serve(Subscribe::Open).await;
+        let (monitor, registry, old) =
+            engine_of_two_ranks(addr, "before", SubscriptionKind::Loads).await;
+        let (subscription, _) = monitor.slot_ids(old[1].url()).await;
+
+        let newcomer = rank_serving(addr, 0, "after");
+        registry.register_or_replace(Arc::clone(&newcomer));
+        monitor
+            .on_worker_added(&newcomer, SubscriptionKind::Loads)
+            .await;
+
+        assert_eq!(
+            monitor.slot_ids(newcomer.url()).await,
+            (subscription, None),
+            "the newcomer is on the subscription its sibling keeps"
+        );
+        assert_eq!(engine_members(&monitor, newcomer.base_url()).await, Some(2));
+        monitor.stop().await;
+        server.abort();
     }
 }
