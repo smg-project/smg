@@ -1335,7 +1335,10 @@ mod tests {
     pub(super) static RETIRE_WAITS: AtomicUsize = AtomicUsize::new(0);
 
     use super::*;
-    use crate::view::{Health, LoadRow};
+    use crate::{
+        decision::Pair,
+        view::{Health, LoadRow},
+    };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
         Candidate {
@@ -1994,7 +1997,7 @@ mod tests {
             position: 0,
             id: WorkerId(1),
             dp_rank: 0,
-            pair: Some(crate::decision::Pair {
+            pair: Some(Pair {
                 decode_position: 0,
                 decode_id: WorkerId(2),
                 decode_dp_rank: 0,
@@ -2069,7 +2072,7 @@ mod tests {
             position: 0,
             id: WorkerId(1),
             dp_rank: 0,
-            pair: Some(crate::decision::Pair {
+            pair: Some(Pair {
                 decode_position: 1,
                 decode_id: WorkerId(7),
                 decode_dp_rank: 1,

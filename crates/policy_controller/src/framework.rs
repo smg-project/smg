@@ -1214,10 +1214,10 @@ impl Lifecycle for Engine {
 mod tests {
     use super::*;
     use crate::{
-        builtins::{Best, Healthy, LeastRequests, NotTried},
+        builtins::{Best, Healthy, LeastRequests, NotOverloaded, NotTried},
         sessions::Recovery,
         spec::PolicySpec,
-        view::{Health, Identity, WorkerId},
+        view::{Health, Identity, MediaCounts, Role, WorkerId},
     };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
@@ -1371,7 +1371,7 @@ mod tests {
     fn strict_profile() -> Profile {
         Profile {
             name: "strict".into(),
-            filters: vec![Box::new(Healthy), Box::new(crate::builtins::NotOverloaded)],
+            filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
             scorers: vec![],
             picker: Box::new(Best),
         }
@@ -2656,7 +2656,7 @@ mod tests {
 
     fn encode_candidate(position: u32, ec_compatible: bool, vision: bool) -> Candidate {
         Candidate {
-            role: crate::view::Role::Encode,
+            role: Role::Encode,
             ec_compatible,
             vision,
             ..candidate(position, 0)
@@ -2684,9 +2684,9 @@ mod tests {
         RequestFacts {
             model: "m",
             phase: Phase::Encode,
-            media: crate::view::MediaCounts {
+            media: MediaCounts {
                 images,
-                ..crate::view::MediaCounts::default()
+                ..MediaCounts::default()
             },
             ..RequestFacts::default()
         }
