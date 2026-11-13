@@ -2346,28 +2346,7 @@ impl PDRouter {
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
-        // With the prefill's log-probabilities to merge, each decode chunk is
-        // split into its frames (a frame cut across chunks waits for its
-        // delimiter) and every data frame is re-encoded with them merged in;
-        // without them, each chunk is read for the `[DONE]` sentinel alone,
-        // anchored at a line start when the previous chunk ended with an end
-        // of line. Either reading ends the relay at the sentinel.
-        let hook: Box<dyn ChunkHook> = match prefill_logprobs.filter(|_| return_logprob) {
-            Some(prefill_logprobs) => Box::new(LogprobMerge::new(prefill_logprobs)),
-            None => {
-                let mut at_line_start = true;
-                Box::new(move |chunk: Bytes| {
-                    let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-                    if let Some(&last) = chunk.last() {
-                        at_line_start = last == b'\n' || last == b'\r';
-                    }
-                    ChunkStep {
-                        bytes: chunk,
-                        last: is_done,
-                    }
-                })
-            }
-        };
+        let hook = Self::decode_chunk_hook(prefill_logprobs, return_logprob);
         relay_streaming_body(
             stream,
             Relay {
@@ -2651,6 +2630,38 @@ impl PDRouter {
 
         // Re-serialize via the shared encoder (reuses its buffer across chunks).
         encoder.encode_data(&decode_json).map_err(|_| ())
+    }
+}
+
+impl PDRouter {
+    /// The decode side's reading of its stream. With the prefill's
+    /// log-probabilities to merge, each decode chunk is split into its frames
+    /// (a frame cut across chunks waits for its delimiter) and every data
+    /// frame is re-encoded with them merged in; without them, or when the
+    /// request did not ask for log-probabilities, each chunk is read for the
+    /// `[DONE]` sentinel alone, anchored at a line start when the previous
+    /// chunk ended with an end of line. Either reading ends the relay at the
+    /// sentinel.
+    fn decode_chunk_hook(
+        prefill_logprobs: Option<Value>,
+        return_logprob: bool,
+    ) -> Box<dyn ChunkHook> {
+        match prefill_logprobs.filter(|_| return_logprob) {
+            Some(prefill_logprobs) => Box::new(LogprobMerge::new(prefill_logprobs)),
+            None => {
+                let mut at_line_start = true;
+                Box::new(move |chunk: Bytes| {
+                    let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
+                    if let Some(&last) = chunk.last() {
+                        at_line_start = last == b'\n' || last == b'\r';
+                    }
+                    ChunkStep {
+                        bytes: chunk,
+                        last: is_done,
+                    }
+                })
+            }
+        }
     }
 }
 
@@ -3570,6 +3581,101 @@ mod tests {
             Bytes::from_static(b"data: {\"choices\":[{\"delta")
         );
         assert!(merge.finish().is_empty(), "the tail leaves once");
+    }
+
+    /// The prefill's log-probabilities stay out of a stream the request did
+    /// not ask them for: the sentinel reading relays each chunk byte for byte
+    /// and ends at `[DONE]`; asked for, the same frame comes back merged.
+    #[test]
+    fn a_request_without_logprobs_keeps_the_sentinel_reading() {
+        let prefill = json!([[-0.1, 1, null]]);
+        let frame = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n",
+        );
+        let mut plain = PDRouter::decode_chunk_hook(Some(prefill.clone()), false);
+        let step = plain.step(frame.clone());
+        assert_eq!(step.bytes, frame, "relayed as it came");
+        assert!(!step.last);
+        assert!(plain.step(Bytes::from_static(b"data: [DONE]\n\n")).last);
+        let mut merging = PDRouter::decode_chunk_hook(Some(prefill), true);
+        let step = merging.step(frame);
+        let body = std::str::from_utf8(&step.bytes).unwrap();
+        let merged: Value =
+            serde_json::from_str(body.trim_end().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            merged["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
+    }
+
+    /// A frame delimiter cut across two chunks (`\n\n` and `\r\r` after
+    /// their first byte, `\r\n\r\n` after any of its first three bytes): the
+    /// look-back over the held bytes finds it on the second chunk and the
+    /// frame is merged whole. The cut after the third byte needs all three
+    /// held bytes, so a shorter look-back is red here.
+    #[test]
+    fn a_delimiter_cut_across_chunks_completes_its_frame_on_the_second() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}";
+        for (delimiter, cut) in [
+            ("\n\n", 1),
+            ("\r\r", 1),
+            ("\r\n\r\n", 1),
+            ("\r\n\r\n", 2),
+            ("\r\n\r\n", 3),
+        ] {
+            let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+            let (head, tail) = delimiter.split_at(cut);
+            let first = merge.step(Bytes::from(format!("{body}{head}")));
+            assert!(
+                first.bytes.is_empty() && !first.last,
+                "{delimiter:?}: {:?}",
+                first.bytes
+            );
+            let second = merge.step(Bytes::from(tail.to_owned()));
+            assert!(!second.last, "{delimiter:?}");
+            let out = std::str::from_utf8(&second.bytes).unwrap();
+            let (event, rest) = out.split_once("\n\n").expect("one frame");
+            let merged: Value =
+                serde_json::from_str(event.strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(
+                merged["meta_info"]["input_token_logprobs"],
+                json!([[-0.1, 1, null], [-0.5, 2, null]]),
+                "{delimiter:?}: {out}"
+            );
+            assert!(rest.is_empty(), "{delimiter:?}: {out}");
+            assert!(merge.finish().is_empty(), "{delimiter:?}: nothing held");
+        }
+    }
+
+    /// A partial past the re-chunker's bound is no longer waited for: the
+    /// held bytes leave as they came on the chunk that crosses the bound,
+    /// and the frame's rest follows unmerged.
+    #[test]
+    fn a_partial_past_the_bound_passes_as_it_came() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let head = Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}",
+            "x".repeat(MAX_FRAME_BYTES / 2)
+        ));
+        let first = merge.step(head.clone());
+        assert!(
+            first.bytes.is_empty() && !first.last,
+            "held under the bound"
+        );
+        let more = Bytes::from("y".repeat(MAX_FRAME_BYTES / 2 + 1));
+        let second = merge.step(more.clone());
+        assert!(!second.last);
+        assert_eq!(second.bytes.len(), head.len() + more.len());
+        assert_eq!(&second.bytes[..head.len()], &head[..]);
+        assert_eq!(&second.bytes[head.len()..], &more[..]);
+        let rest = Bytes::from_static(b"\"}}]}\n\n");
+        assert_eq!(
+            merge.step(rest.clone()).bytes,
+            rest,
+            "the rest passes unmerged"
+        );
+        assert!(merge.finish().is_empty(), "nothing held past the bound");
     }
 
     #[test]
