@@ -23,7 +23,7 @@ use engine_zmq_client::{
     },
 };
 use futures::Stream;
-use smg_grpc_client::{seeded_word, vllm_proto as vllm};
+use smg_grpc_client::vllm_proto as vllm;
 
 use crate::{
     context_window::admit_prompt,
@@ -461,10 +461,9 @@ impl Stream for VllmGenerateStream {
 ///   make all n samples identical, and deriving distinct per-sample seeds from
 ///   the request seed is the established engine convention (each of the n
 ///   sequences gets its own sampler state for exactly this reason) while
-///   staying deterministic for repeat runs. A derived seed that lands on
-///   `-1`, which the engine reads as "no seed", becomes the word's minimum
-///   like any other seed word on this wire (`seeded_word`), so no sub runs
-///   unseeded; the subs stay distinct.
+///   staying deterministic for repeat runs. The wire carries each seed word
+///   in its unsigned form (see the translation), so a derived seed never
+///   reaches the engine as `-1`, which it reads as "no seed".
 /// - Usage: every sub reports the full `prompt_tokens` on its `Complete` (the
 ///   subs share one prompt), matching the gRPC engines' n>1 contract — the
 ///   pipeline de-duplicates (max per prompt), so nothing is counted n times.
@@ -474,8 +473,8 @@ pub(crate) fn fan_out_requests(req: vllm::GenerateRequest) -> Vec<vllm::Generate
         sub.request_id = format!("{}-{i}", sub.request_id);
         if let Some(sp) = sub.sampling_params.as_mut() {
             sp.n = 1;
-            // An explicit seed must still yield distinct samples per sub, and never -1.
-            sp.seed = sp.seed.map(|seed| seeded_word(seed.wrapping_add(i as i32)));
+            // An explicit seed must still yield distinct samples per sub.
+            sp.seed = sp.seed.map(|seed| seed.wrapping_add(i as i32));
         }
     })
 }
@@ -897,7 +896,10 @@ pub(crate) fn translate_sampling(
         stop_token_ids,
         eos_token_id: (!sp.ignore_eos).then_some(eos.primary).flatten(),
         all_stop_token_ids,
-        seed: sp.seed.map(i64::from),
+        // The seed word in its unsigned form: the engine reads a seed of -1 as "no seed", and a
+        // word that is never negative never is one, whether it came from the request or was
+        // derived per sub by an offset; the form is one-to-one, so distinct words stay distinct.
+        seed: sp.seed.map(|seed| i64::from(seed as u32)),
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,

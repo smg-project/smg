@@ -302,9 +302,10 @@ pub fn seeded_folded_i32(seed: u64) -> i32 {
 
 /// A seed word for the wire whose engine reads `-1` as "no seed": `-1` alone becomes the word's
 /// minimum, which the fold also reaches (the one shared value a 32-bit field costs); every other
-/// word is itself. Applied wherever such a word is made, the conversions above and a per-choice
-/// seed derived from a request's by an offset.
-pub fn seeded_word(seed: i32) -> i32 {
+/// word is itself. The engine's in-repo servicers hand it the word's unsigned form, so a seed they
+/// derive per choice is never `-1` either; this rule covers the request seed for a servicer older
+/// than the gateway.
+fn seeded_word(seed: i32) -> i32 {
     if seed == -1 {
         i32::MIN
     } else {

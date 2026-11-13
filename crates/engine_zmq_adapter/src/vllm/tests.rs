@@ -1159,21 +1159,32 @@ fn fan_out_splits_n_into_single_sample_requests() {
     assert_eq!(single[0].request_id, "r1");
 }
 
-/// A derived per-sub seed never lands on `-1`, which the engine reads as
-/// "no seed": the base `-2` (the public seed 4294967294 folded) with n=2
-/// gives `[-2, i32::MIN]`, distinct and both seeded.
+/// The engine reads a seed of `-1` as "no seed", and a derived per-sub seed
+/// can land there (`-2 + 1`): the wire carries each seed word in its
+/// unsigned form, so a base `-2` (the public seed 4294967294 folded) with
+/// n=2 reaches the engine as `[4294967294, 4294967295]`, distinct and both
+/// seeded; a request seed of `-1` itself reaches it as `4294967295`.
 #[test]
-fn fan_out_keeps_every_derived_seed_seeded() {
+fn fan_out_seeds_reach_the_engine_unsigned() {
+    let engine_seed = |req| {
+        translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .expect("translated")
+            .sampling_params
+            .seed
+    };
     let subs = fan_out_requests(tokenized_req(vllm::SamplingParams {
         n: 2,
         seed: Some(-2),
         ..Default::default()
     }));
-    let seeds: Vec<Option<i32>> = subs
-        .iter()
-        .map(|sub| sub.sampling_params.as_ref().unwrap().seed)
-        .collect();
-    assert_eq!(seeds, vec![Some(-2), Some(i32::MIN)]);
+    let seeds: Vec<Option<i64>> = subs.into_iter().map(engine_seed).collect();
+    assert_eq!(seeds, vec![Some(4_294_967_294), Some(4_294_967_295)]);
+
+    let single = tokenized_req(vllm::SamplingParams {
+        seed: Some(-1),
+        ..Default::default()
+    });
+    assert_eq!(engine_seed(single), Some(4_294_967_295));
 }
 
 /// n=2 over a vLLM EngineCore: two engine-side requests with distinct

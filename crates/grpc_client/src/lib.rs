@@ -24,7 +24,6 @@ pub mod media_identity;
 pub mod mlx_engine;
 pub mod request_deadline;
 mod request_fields;
-pub use request_fields::seeded_word;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;
