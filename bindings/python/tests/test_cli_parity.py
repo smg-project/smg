@@ -483,7 +483,9 @@ def constructor_defaults() -> dict[str, tuple[str, object]]:
         if not entry or entry == "*":
             continue
         name, _, raw = entry.partition("=")
-        raw = re.sub(r"\bDEFAULT_[A-Z0-9_]+\b", lambda m: constants.get(m.group(0), m.group(0)), raw.strip())
+        raw = re.sub(
+            r"\bDEFAULT_[A-Z0-9_]+\b", lambda m: constants.get(m.group(0), m.group(0)), raw.strip()
+        )
         defaults[name.strip()] = (raw, signature_literal(raw) if raw else None)
     return defaults
 
@@ -503,7 +505,10 @@ def test_the_constructor_reader_resolves_a_named_default():
     assert defaults["eviction_interval_secs"] == ("120", 120)
     assert defaults["policy"] == ("PolicyType::CacheAware", "cache_aware")
     assert defaults["cache_index"] == ('String::from("tree")', "tree")
-    assert defaults["routing_key_headers"] == ('vec![String::from("x-smg-routing-key")]', "x-smg-routing-key")
+    assert defaults["routing_key_headers"] == (
+        'vec![String::from("x-smg-routing-key")]',
+        "x-smg-routing-key",
+    )
     unresolved = sorted(name for name, (raw, _) in defaults.items() if "DEFAULT_" in raw)
     assert unresolved == [], unresolved
 
@@ -599,7 +604,9 @@ def test_the_eviction_interval_default_is_one_value_on_every_surface(rust, launc
     chart_values = repo / "deploy" / "helm" / "smg" / "values.yaml"
     signature = constructor_defaults()["eviction_interval_secs"][1]
     chart = re.search(r"^\s*evictionIntervalSecs:\s*(\d+)\s*$", chart_values.read_text(), re.M)
-    assert isinstance(signature, int) and chart, "the Python Router's signature or the chart's value moved"
+    assert isinstance(signature, int) and chart, (
+        "the Python Router's signature or the chart's value moved"
+    )
     surfaces = {
         "cli": rust.flags["--eviction-interval"],
         "launcher": launcher["--eviction-interval"].default,
