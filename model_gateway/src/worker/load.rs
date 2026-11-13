@@ -39,33 +39,44 @@ impl WorkerRoutingKeyLoad {
     }
 
     pub fn increment(&self, routing_key: &str) {
-        *self
-            .active_routing_keys
-            .entry(routing_key.to_string())
-            .or_insert(0) += 1;
+        // A key already in flight, the common case of a sticky session, is
+        // bumped in place; the map's own copy of the key is built only for
+        // the key's first request, after the lookup has let its shard go.
+        match self.active_routing_keys.get_mut(routing_key) {
+            Some(mut count) => *count += 1,
+            None => {
+                *self
+                    .active_routing_keys
+                    .entry(routing_key.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
         self.update_metrics();
     }
 
     pub fn decrement(&self, routing_key: &str) {
-        use dashmap::mapref::entry::Entry;
-
-        match self.active_routing_keys.entry(routing_key.to_string()) {
-            Entry::Occupied(mut entry) => {
-                let counter = entry.get_mut();
-                if *counter > 0 {
-                    *counter -= 1;
-                    if *counter == 0 {
-                        entry.remove();
-                    }
-                } else {
-                    tracing::warn!(
-                        worker_url = %Endpoint::redacted_str(&self.url),
-                        routing_key = %routing_key,
-                        "Attempted to decrement routing key counter that is already at 0"
-                    );
-                }
+        // One pass over the key's shard, with nothing built for the lookup:
+        // the count moves in place and the key leaves the map with its last
+        // request. What the count was is kept for the warnings, which are
+        // written once the shard is released.
+        let mut before = None;
+        self.active_routing_keys
+            .remove_if_mut(routing_key, |_, count| {
+                let was = *count;
+                before = Some(was);
+                *count = was.saturating_sub(1);
+                was == 1
+            });
+        match before {
+            Some(1..) => {}
+            Some(0) => {
+                tracing::warn!(
+                    worker_url = %Endpoint::redacted_str(&self.url),
+                    routing_key = %routing_key,
+                    "Attempted to decrement routing key counter that is already at 0"
+                );
             }
-            Entry::Vacant(_) => {
+            None => {
                 tracing::warn!(
                     worker_url = %Endpoint::redacted_str(&self.url),
                     routing_key = %routing_key,
@@ -103,13 +114,18 @@ pub struct WorkerLoadGuard {
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
-        let key = extract_routing_key(headers).map(String::from);
-        Self::with_key(worker, key.as_deref())
+        Self::with_owned_key(worker, extract_routing_key(headers).map(String::from))
     }
 
     /// Guard keyed by the caller-resolved effective sticky key (rid-derived
     /// wins over the header), so keyed-load accounting matches selection.
     pub fn with_key(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
+        Self::with_owned_key(worker, routing_key.map(String::from))
+    }
+
+    /// The guard's one copy of the key, made by the constructor that resolved
+    /// it; the worker's keyed-load bookkeeping borrows it from here on.
+    fn with_owned_key(worker: Arc<dyn Worker>, routing_key: Option<String>) -> Self {
         worker.increment_load();
         Self::from_acquired_load(worker, routing_key)
     }
@@ -131,7 +147,10 @@ impl WorkerLoadGuard {
         if !worker.try_increment_load(max) {
             return None;
         }
-        Some(Self::from_acquired_load(worker, routing_key))
+        Some(Self::from_acquired_load(
+            worker,
+            routing_key.map(String::from),
+        ))
     }
 
     /// Acquire another load guard for the same worker and routing key.
@@ -150,8 +169,7 @@ impl WorkerLoadGuard {
         }
     }
 
-    fn from_acquired_load(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
-        let routing_key = routing_key.map(String::from);
+    fn from_acquired_load(worker: Arc<dyn Worker>, routing_key: Option<String>) -> Self {
         if let Some(ref key) = routing_key {
             worker.increment_routing_key_load(key);
         }
