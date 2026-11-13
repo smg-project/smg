@@ -625,6 +625,8 @@ impl PrometheusConfig {
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
+pub(crate) const REQUEST_LIFETIME_SECONDS: &str = "smg_request_lifetime_seconds";
+
 /// Histogram buckets for `smg_cache_aware_match_ratio`. The ratio is
 /// dimensionless (matched/input, 0..1), so it takes deciles instead of the
 /// duration buckets; `le="0"` isolates requests with no cached prefix at all.
@@ -875,6 +877,10 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_http_request_duration_seconds",
         "HTTP request duration by method and path"
+    );
+    describe_histogram!(
+        REQUEST_LIFETIME_SECONDS,
+        "HTTP request lifetime in seconds from entry to body completion, error or drop, including requests without a response, by method and path"
     );
     describe_gauge!(
         "smg_http_inflight_request_age_count",
@@ -1790,6 +1796,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     let mm_per_request_matcher = Matcher::Full(String::from("smg_mm_media_per_request"));
 
     HashMap::from([
+        (
+            Matcher::Full(REQUEST_LIFETIME_SECONDS.into()),
+            duration_bucket.clone(),
+        ),
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
         (tpot_matcher, duration_bucket),
@@ -2083,6 +2093,16 @@ impl Metrics {
                 },
             );
         });
+    }
+
+    /// Record the full HTTP request lifetime, including response-body delivery.
+    pub fn record_request_lifetime(method: &'static str, path: &str, duration: Duration) {
+        histogram!(
+            REQUEST_LIFETIME_SECONDS,
+            "method" => method,
+            "path" => intern_string(path)
+        )
+        .record(duration.as_secs_f64());
     }
 
     /// Set `smg_http_connections_active`: the count of HTTP requests in flight

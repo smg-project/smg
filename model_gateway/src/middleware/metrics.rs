@@ -31,6 +31,10 @@
 //! before it answered: a handler that panicked (the edge stack catches no
 //! panic) and a connection cut by a forced shutdown after the drain timeout
 //! look the same from here, a request's future dropped without a response.
+//!
+//! `smg_request_lifetime_seconds` records the time from entry to body end,
+//! error or drop, once per request, including requests that never answer.
+//! It includes all outcomes; the existing HTTP duration still ends at the head.
 
 use std::{
     future::Future,
@@ -205,7 +209,7 @@ where
         // the handler answered (what the server does with a request whose
         // client closed the connection), it counts the request as closed by
         // the client.
-        let outcome = ResponseOutcome::pending(path);
+        let outcome = ResponseOutcome::pending(path, method, start);
         // The inner service is called here, not from the future: the layer
         // keeps no clone of the stack inside it per request (a clone of a
         // route is a heap copy of the service in it), and its future is the
@@ -345,15 +349,19 @@ impl EdgeDuty {
 /// the head, a client-closed request when the client left first.
 pub(super) struct ResponseOutcome {
     path: PathLabel,
+    method: &'static str,
+    start: Instant,
     /// The response head's status and gateway error code, once there is one.
     head: Option<(u16, String)>,
     recorded: bool,
 }
 
 impl ResponseOutcome {
-    pub(super) fn pending(path: PathLabel) -> Self {
+    pub(super) fn pending(path: PathLabel, method: &'static str, start: Instant) -> Self {
         Self {
             path,
+            method,
+            start,
             head: None,
             recorded: false,
         }
@@ -374,7 +382,7 @@ impl ResponseOutcome {
 
     /// The response went out in full: count its head's status.
     pub(super) fn completed(&mut self) {
-        if std::mem::replace(&mut self.recorded, true) {
+        if !self.finish() {
             return;
         }
         if let Some((status_code, error_code)) = &self.head {
@@ -385,7 +393,7 @@ impl ResponseOutcome {
     /// The body failed after the head went out: count the head's status,
     /// with the failure named unless the head carried a gateway error code.
     pub(super) fn body_failed(&mut self) {
-        if std::mem::replace(&mut self.recorded, true) {
+        if !self.finish() {
             return;
         }
         if let Some((status_code, error_code)) = &self.head {
@@ -400,7 +408,7 @@ impl ResponseOutcome {
 
     /// The client closed the connection before the response completed.
     pub(super) fn client_closed(&mut self) {
-        if std::mem::replace(&mut self.recorded, true) {
+        if !self.finish() {
             return;
         }
         Metrics::record_http_response(
@@ -410,9 +418,22 @@ impl ResponseOutcome {
         );
     }
 
-    /// Nothing to count: the inner service failed instead of answering.
+    /// No response to count: the inner service failed instead of answering.
     fn forget(&mut self) {
-        self.recorded = true;
+        self.finish();
+    }
+
+    /// All terminal paths share the same once-only lifetime observation.
+    fn finish(&mut self) -> bool {
+        if std::mem::replace(&mut self.recorded, true) {
+            return false;
+        }
+        Metrics::record_request_lifetime(
+            self.method,
+            self.path.as_str(),
+            clock_now().saturating_duration_since(self.start),
+        );
+        true
     }
 }
 

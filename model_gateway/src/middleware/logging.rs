@@ -3,14 +3,21 @@
 //! [`RequestTraceLayer`] opens one `http_request` span per request with the
 //! `tower_http::trace` handlers below (W3C trace context in, the request ID
 //! and trace ID on the span, HTTP-level metrics), runs the handler under it
-//! and logs the response. The span is entered for the request, the handler
-//! and the response log, and once more if the response stream fails; it is
+//! and logs the response. The span is entered for the request, the handler,
+//! the response log and the terminal record, and when the stream fails; it is
 //! not entered per body frame, so a long SSE stream costs no span bookkeeping
 //! per chunk. The span stays open until the body ends, so an exported trace
 //! still covers the whole stream: it rides on the edge's one body wrapper
 //! (the metrics layer's `EdgeBody`), handed
 //! over through the response's extensions with the client-close line the
 //! access log owes if the body is dropped first.
+//!
+//! `smg::request_finished` emits one `request_finished` event at the body's
+//! last frame, declared length, error or drop, including cancellation before
+//! the handler answers. `duration_ms` uses the edge's entry clock; the old
+//! `latency` remains time to response readiness. `response_status` is the
+//! response object's status, not proof the peer received its headers or that
+//! the application-level response succeeded.
 
 use std::{
     borrow::Cow,
@@ -581,7 +588,7 @@ where
             });
             request_bytes = Some(count);
         }
-        let close_log = ClientCloseLog::new(span.clone(), start, request_bytes.clone());
+        let close_log = ClientCloseLog::new(span.clone(), start, request_bytes.clone(), &request);
         // The handler's future is created here and polled under the span, as
         // the trace layer did, so everything it logs carries the span. The
         // layer keeps no clone of the stack inside it per request (a clone of
@@ -661,7 +668,7 @@ impl RecordDuty {
         let mut response = match answer {
             Ok(response) => response,
             Err(error) => {
-                close_log.done();
+                close_log.finish();
                 return Err(error);
             }
         };
@@ -675,7 +682,7 @@ impl RecordDuty {
         );
         let head_at = clock_now();
         ResponseLogger.on_response(&response, head_at.saturating_duration_since(start), &span);
-        close_log.head_sent();
+        close_log.head_sent(&response);
         let count_bytes = fields.contains(AccessLogField::ResponseBytes);
         // A body without a declared length is a stream: its bytes are
         // known at its end, which then gets a line of its own.
@@ -697,7 +704,7 @@ impl RecordDuty {
     }
 }
 
-/// The one line a request whose client closed the connection first gets, at
+/// The terminal record and the existing line for a client close, at
 /// INFO: a client that gives up (an SDK's timeout, a user who navigated away,
 /// a proxy cutting an idle stream) is a normal outcome, which the metrics
 /// layer counts as status 499; nothing on the gateway's side failed. Logged
@@ -712,6 +719,8 @@ struct ClientCloseLog {
     stage: Stage,
     /// The request body's bytes read so far, when the record carries them.
     request_bytes: Option<Arc<AtomicU64>>,
+    response_status: Option<u16>,
+    quiet: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -726,21 +735,59 @@ enum Stage {
 }
 
 impl ClientCloseLog {
-    fn new(span: Span, start: Instant, request_bytes: Option<Arc<AtomicU64>>) -> Self {
+    fn new(
+        span: Span,
+        start: Instant,
+        request_bytes: Option<Arc<AtomicU64>>,
+        request: &Request,
+    ) -> Self {
         Self {
             span,
             start,
             stage: Stage::BeforeResponse,
             request_bytes,
+            response_status: None,
+            quiet: is_probe_path(request.uri().path()),
         }
     }
 
-    fn head_sent(&mut self) {
+    fn head_sent(&mut self, response: &Response) {
         self.stage = Stage::Streaming;
+        self.response_status = Some(response.status().as_u16());
+        self.quiet |= response.extensions().get::<ProbeResponse>().is_some()
+            || response.extensions().get::<ReportedRefusal>().is_some();
     }
 
     fn done(&mut self) {
         self.stage = Stage::Done;
+    }
+
+    /// Once, at body completion or drop, not at response-head readiness.
+    /// This measures delivery to the HTTP server, not receipt by the client.
+    fn finish(&mut self) {
+        if std::mem::replace(&mut self.stage, Stage::Done) == Stage::Done {
+            return;
+        }
+        let duration_ms = clock_now()
+            .saturating_duration_since(self.start)
+            .as_secs_f64()
+            * 1000.0;
+        let _enter = self.span.enter();
+        macro_rules! finished {
+            ($level:expr) => {
+                tracing::event!(
+                    target: "smg::request_finished", $level,
+                    event = "request_finished", duration_ms,
+                    response_status = self.response_status,
+                    "request_finished"
+                );
+            };
+        }
+        if self.quiet {
+            finished!(tracing::Level::DEBUG);
+        } else {
+            finished!(tracing::Level::INFO);
+        }
     }
 
     /// The client closed the connection: one line for the stage the request
@@ -750,7 +797,7 @@ impl ClientCloseLog {
     /// line and the text format appends a second value rather than replacing
     /// the first.
     fn client_closed(&mut self, bytes_sent: Option<u64>) {
-        match std::mem::replace(&mut self.stage, Stage::Done) {
+        match self.stage {
             Stage::BeforeResponse => {
                 // The access-log fields the response line would have carried.
                 self.span
@@ -779,6 +826,7 @@ impl ClientCloseLog {
             }
             Stage::Done => {}
         }
+        self.finish();
     }
 }
 
@@ -812,7 +860,7 @@ impl SpanDuty {
     /// when the output ended) is read here, where the finish line went out
     /// before it existed.
     pub(crate) fn ended(&mut self, bytes_sent: u64) {
-        self.close_log.done();
+        self.close_log.finish();
         if std::mem::replace(&mut self.end_line, false) {
             self.span.record("response_bytes", bytes_sent);
             let _enter = self.span.enter();
@@ -823,11 +871,14 @@ impl SpanDuty {
         }
     }
 
-    /// The response head went out but its body was never polled (the answer
-    /// to a HEAD request, a body complete before anyone read it): the span
-    /// closes with it, without an end line or a client-close line.
+    /// No edge took this duty (a standalone layer or a replaced response).
+    /// Do not claim completion at a boundary this layer did not observe.
     pub(crate) fn unpolled(&mut self) {
         self.close_log.done();
+    }
+
+    pub(crate) fn dropped_unpolled(&mut self) {
+        self.close_log.finish();
     }
 
     /// The body failed after its head: logged under the span, once, with the
@@ -842,7 +893,7 @@ impl SpanDuty {
             Duration::ZERO,
             &self.span,
         );
-        self.close_log.done();
+        self.close_log.finish();
     }
 
     /// The body was dropped before its end: the client closed the connection,
@@ -1289,6 +1340,7 @@ mod field_tests {
         io,
         net::SocketAddr,
         sync::{Arc, Mutex},
+        task::Poll,
         time::Duration,
     };
 
@@ -1298,10 +1350,13 @@ mod field_tests {
         http::{header, HeaderValue, Request, StatusCode},
         middleware::from_fn_with_state,
         response::{IntoResponse, Response},
-        routing::post,
+        routing::{get, post},
         Router,
     };
     use http_body_util::BodyExt;
+    use metrics_exporter_prometheus::{
+        Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+    };
     use serde_json::Value;
     use sha2::{Digest, Sha256};
     use tokio::sync::mpsc;
@@ -1313,12 +1368,14 @@ mod field_tests {
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         middleware::{
-            auth_middleware, route_request_meta_middleware, sse_keepalive_middleware, AuthConfig,
-            HttpMetricsLayer, SseKeepAlive, TenantResolutionState,
+            auth_middleware, edge_body::Permit, route_request_meta_middleware,
+            sse_keepalive_middleware, AuthConfig, HttpMetricsLayer, RequestIdLayer, SseKeepAlive,
+            TenantResolutionState,
         },
         observability::{
             inflight_tracker::InFlightRequestTracker,
             log_format::{JsonLine, SpanFields, TextFields, TextLine},
+            metrics::REQUEST_LIFETIME_SECONDS,
         },
     };
 
@@ -1480,9 +1537,10 @@ mod field_tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("a JSON line"))
             .filter(|line| {
-                line["target"]
-                    .as_str()
-                    .is_some_and(|target| target.starts_with("smg::"))
+                matches!(
+                    line["target"].as_str(),
+                    Some("smg::request" | "smg::response")
+                )
             })
             .map(|line| {
                 (
@@ -1500,6 +1558,206 @@ mod field_tests {
         keys
     }
 
+    fn finished_lines(capture: &Capture) -> Vec<Value> {
+        capture
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("JSON"))
+            .filter(|line| line["target"] == "smg::request_finished")
+            .collect()
+    }
+
+    fn lifetime_recorder() -> PrometheusRecorder {
+        PrometheusBuilder::new()
+            .set_buckets_for_metric(Matcher::Full(REQUEST_LIFETIME_SECONDS.into()), &[1.0, 5.0])
+            .unwrap()
+            .build_recorder()
+    }
+
+    fn assert_lifetime(handle: &PrometheusHandle, method: &str, seconds: u64) {
+        let rendered = handle.render();
+        let labels = format!("method=\"{method}\",path=\"/test\"");
+        for sample in [
+            format!("{REQUEST_LIFETIME_SECONDS}_count{{{labels}}} 1"),
+            format!("{REQUEST_LIFETIME_SECONDS}_sum{{{labels}}} {seconds}"),
+            format!("{REQUEST_LIFETIME_SECONDS}_bucket{{{labels},le=\"5\"}} 1"),
+        ] {
+            assert!(rendered.lines().any(|line| line == sample), "{rendered}");
+        }
+    }
+
+    fn finish_app(response: Response) -> Router {
+        let slot = Arc::new(Mutex::new(Some(response)));
+        Router::new()
+            .route(
+                "/test",
+                get(move || {
+                    let response = slot.lock().unwrap().take().unwrap();
+                    async move {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        response
+                    }
+                }),
+            )
+            .layer(create_logging_layer(AccessLogFields::NONE))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
+            .layer(RequestIdLayer::new(vec!["x-request-id".into()]))
+    }
+
+    fn finish_request(method: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri("/test")
+            .header("x-request-id", "finish-test")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_finished_includes_handler_and_body_time_once() {
+        for (status, empty, sized) in [
+            (200, false, true),
+            (200, false, false),
+            (200, true, true),
+            (400, false, true),
+            (503, false, true),
+        ] {
+            let recorder = lifetime_recorder();
+            let handle = recorder.handle();
+            let _metrics = metrics::set_default_local_recorder(&recorder);
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+            let body = if empty {
+                Body::empty()
+            } else if sized {
+                Body::from("ok")
+            } else {
+                Body::from_stream(futures::stream::iter([Ok::<_, Infallible>("ok")]))
+            };
+            let response = finish_app(Response::builder().status(status).body(body).unwrap())
+                .oneshot(finish_request("GET"))
+                .await
+                .unwrap();
+            if !empty {
+                assert!(finished_lines(&capture).is_empty());
+                assert!(!handle.render().contains(REQUEST_LIFETIME_SECONDS));
+            }
+            // The upstream answer is ready, but the server is not consuming it.
+            tokio::time::advance(Duration::from_secs(3)).await;
+            response.into_body().collect().await.unwrap();
+            let lines = finished_lines(&capture);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let line = &lines[0];
+            assert_eq!(line["event"], "request_finished");
+            assert_eq!(line["duration_ms"], if empty { 2000.0 } else { 5000.0 });
+            assert_eq!(line["response_status"], status);
+            assert_eq!(line["span"]["request_id"], "finish-test");
+            assert_eq!(line["span"]["latency"], 2_000_000);
+            assert_lifetime(&handle, "GET", if empty { 2 } else { 5 });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_finished_records_body_errors_and_early_ends_once() {
+        struct Preempted;
+        impl Permit for Preempted {
+            fn first_data_frame(&mut self) -> bool {
+                false
+            }
+        }
+        for case in ["body_error", "drop", "unpolled_drop", "preempted", "head"] {
+            let recorder = lifetime_recorder();
+            let handle = recorder.handle();
+            let _metrics = metrics::set_default_local_recorder(&recorder);
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+            let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+            let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+            if case == "preempted" {
+                BodyDuties::hand(&mut response, |duties| {
+                    duties.permit = Some(Box::new(Preempted));
+                });
+            }
+            let response = finish_app(response)
+                .oneshot(finish_request(if case == "head" { "HEAD" } else { "GET" }))
+                .await
+                .unwrap();
+            if case != "head" {
+                assert!(finished_lines(&capture).is_empty());
+            }
+            let mut body = response.into_body();
+            tokio::time::advance(Duration::from_secs(3)).await;
+            match case {
+                "body_error" => {
+                    tx.send(Err(io::Error::other("broken body"))).await.unwrap();
+                    assert!(body.frame().await.unwrap().is_err());
+                }
+                "drop" => {
+                    let mut frame = Box::pin(body.frame());
+                    assert!(matches!(futures::poll!(frame.as_mut()), Poll::Pending));
+                }
+                "preempted" => {
+                    tx.send(Ok(Bytes::from_static(FRAME))).await.unwrap();
+                    assert!(body.frame().await.is_none());
+                }
+                _ => {}
+            }
+            drop(body);
+            let lines = finished_lines(&capture);
+            assert_eq!(lines.len(), 1, "{case}: {lines:?}");
+            assert_eq!(
+                lines[0]["duration_ms"],
+                if case == "head" { 2000.0 } else { 5000.0 },
+                "{case}"
+            );
+            assert_eq!(lines[0]["response_status"], 200);
+            let (method, seconds) = if case == "head" {
+                ("HEAD", 2)
+            } else {
+                ("GET", 5)
+            };
+            assert_lifetime(&handle, method, seconds);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_finished_records_cancellation_before_the_response() {
+        let recorder = lifetime_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let mut pending =
+            Box::pin(finish_app(Response::new(Body::empty())).oneshot(finish_request("GET")));
+        assert!(matches!(futures::poll!(pending.as_mut()), Poll::Pending));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(pending);
+        let lines = finished_lines(&capture);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["duration_ms"], 1000.0);
+        assert!(lines[0]["response_status"].is_null());
+        assert_lifetime(&handle, "GET", 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_finished_keeps_probe_responses_at_debug() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let mut response = Response::new(Body::empty());
+        response.extensions_mut().insert(ProbeResponse);
+        finish_app(response)
+            .oneshot(finish_request("GET"))
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap();
+        let lines = finished_lines(&capture);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["level"], "DEBUG");
+    }
+
     /// The finish line's span fields as they have always been (no request
     /// id layer in these apps).
     const DEFAULT_FINISH_KEYS: [&str; 7] = [
@@ -1512,8 +1770,7 @@ mod field_tests {
         "version",
     ];
 
-    /// Without a selection, the record is byte for byte what it was: the
-    /// same two lines, the same span keys.
+    /// Without a selection, the two legacy access lines keep their fields.
     #[tokio::test]
     async fn the_default_record_keeps_its_fields_under_the_json_format() {
         let capture = Capture::default();
@@ -1617,7 +1874,7 @@ mod field_tests {
     }
 
     /// A streamed body's bytes are known at its end: the finish line carries
-    /// no count, a line at the end does; without the field, no third line.
+    /// no count, a line at the end does; without the field, no byte-count line.
     #[tokio::test]
     async fn a_streamed_response_gets_its_bytes_on_an_end_line() {
         for (fields, expected_lines) in [(AccessLogFields::all(), 3), (AccessLogFields::NONE, 2)] {

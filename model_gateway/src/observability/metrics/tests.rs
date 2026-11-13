@@ -516,6 +516,30 @@ fn first_token_and_per_output_token_families_render_on_their_own_edges() {
     }
 }
 
+#[test]
+fn request_lifetime_renders_as_a_histogram_with_duration_buckets() {
+    for (custom, le) in [(None, "2.5"), (Some(vec![1.0, 10.0]), "10")] {
+        let mut builder = PrometheusBuilder::new();
+        for (matcher, buckets) in histogram_bucket_overrides(custom) {
+            builder = builder.set_buckets_for_metric(matcher, &buckets).unwrap();
+        }
+        let recorder = builder.build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            init_metrics();
+            Metrics::record_request_lifetime("GET", "/test", Duration::from_secs(2));
+        });
+        let rendered = recorder.handle().render();
+        assert!(rendered.contains("# TYPE smg_request_lifetime_seconds histogram"));
+        assert!(rendered.contains("# HELP smg_request_lifetime_seconds "));
+        assert!(
+            rendered.contains(&format!(
+            "smg_request_lifetime_seconds_bucket{{method=\"GET\",path=\"/test\",le=\"{le}\"}} 1"
+        )),
+            "{rendered}"
+        );
+    }
+}
+
 /// An operator's `--prometheus-duration-buckets` list replaces the
 /// request-duration edges, the ones `smg_router_ttft_seconds` and
 /// `smg_router_tpot_seconds` share with it, and leaves the first-token and

@@ -208,7 +208,7 @@ impl EdgeBody {
         self.release();
         self.outcome.completed();
         if let Some(span) = &mut self.span {
-            span.unpolled();
+            span.ended(0);
         }
         self.permit = None;
         self.keep_alive = None;
@@ -335,7 +335,7 @@ impl Drop for EdgeBody {
             // the response it was.
             self.outcome.completed();
             if let Some(span) = &mut self.span {
-                span.unpolled();
+                span.dropped_unpolled();
             }
         }
         // The permit, held this long, goes with the fields.
@@ -348,7 +348,11 @@ impl Drop for EdgeBody {
 pub(crate) fn at_the_edge(mut response: Response) -> Response {
     let tracker = InFlightRequestTracker::new();
     let guard = tracker.track();
-    let mut outcome = ResponseOutcome::pending(super::metrics::PathLabel::Static("/test"));
+    let mut outcome = ResponseOutcome::pending(
+        super::metrics::PathLabel::Static("/test"),
+        "GET",
+        super::request_start::clock_now(),
+    );
     outcome.head(&response);
     let progress = BodyProgress::new(&response);
     let duties = BodyDuties::take(&mut response);
