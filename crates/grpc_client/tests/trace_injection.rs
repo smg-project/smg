@@ -52,6 +52,16 @@ async fn generate_carries_the_trace_context() {
 }
 
 #[tokio::test]
+async fn generate_framed_carries_the_trace_context() {
+    let (client, state) = traced_client().await.unwrap();
+    let _stream = client
+        .generate_framed(generate_request("traced-framed"))
+        .await
+        .unwrap();
+    assert_eq!(state.traced(), carried("Generate"));
+}
+
+#[tokio::test]
 async fn embed_carries_the_trace_context() {
     let (client, state) = traced_client().await.unwrap();
     client.embed(proto::EmbedRequest::default()).await.unwrap();
