@@ -735,6 +735,9 @@ impl ResponseProcessor {
             } else {
                 None
             };
+            let output_token_logprobs_length = output_token_logprobs
+                .as_ref()
+                .map(|entries| u32::try_from(entries.len()).unwrap_or(u32::MAX));
 
             // Build GenerateResponse struct
             let meta_info = GenerateMetaInfo {
@@ -748,6 +751,7 @@ impl ResponseProcessor {
                 .to_string(),
                 input_token_logprobs,
                 output_token_logprobs,
+                output_token_logprobs_length,
                 completion_tokens: complete.completion_tokens(),
                 cached_tokens: complete.cached_tokens(),
                 reasoning_tokens: Some(complete.reasoning_tokens()),

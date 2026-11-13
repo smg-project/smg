@@ -218,8 +218,14 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
         " \u{2028}",
         " {\"json\":[1,2]}",
     ];
-    let input_logprobs = [vec![None], vec![Some(-0.25)]];
-    let output_logprobs = [vec![Some(-0.5)], vec![None, Some(-1.0)]];
+    let input_logprobs = [
+        GenerateTokenLogprob(None, 1, None),
+        GenerateTokenLogprob(Some(-0.25), 2, None),
+    ];
+    let output_logprobs = [
+        GenerateTokenLogprob(Some(-0.5), 3, None),
+        GenerateTokenLogprob(Some(-1.0), 4, Some("four".to_string())),
+    ];
     for index in [0u32, 1, 7, u32::MAX] {
         let mut escaped = EscapedText::default();
         let mut raw = String::new();
@@ -236,10 +242,10 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
                         Some(0.0123),
                     ),
                 ] {
-                    let logprobs = with_logprobs.then_some(GenerateLogprobs {
-                        input_token_logprobs: Some(input_logprobs.as_slice()),
-                        output_token_logprobs: Some(output_logprobs.as_slice()),
-                    });
+                    let logprobs = with_logprobs.then_some(GenerateLogprobs::new(
+                        Some(input_logprobs.as_slice()),
+                        Some(output_logprobs.as_slice()),
+                    ));
                     let event = GenerateEvent {
                         text: &escaped,
                         output_ids: &ids,

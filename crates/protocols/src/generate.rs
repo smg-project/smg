@@ -336,6 +336,13 @@ pub struct GenerateResponse {
     pub meta_info: GenerateMetaInfo,
 }
 
+/// One token's log probability in a generate answer, as SGLang writes it: an
+/// array of the logprob, the token id and the token's text. The text is
+/// `null` unless the request asks for it (`return_text_in_logprobs`), and the
+/// logprob is `null` for a prompt's first token, which has no context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GenerateTokenLogprob(pub Option<f64>, pub u32, pub Option<String>);
+
 /// Metadata for a single generate completion
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -344,8 +351,11 @@ pub struct GenerateMetaInfo {
     pub finish_reason: GenerateFinishReason,
     pub prompt_tokens: u32,
     pub weight_version: String,
-    pub input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
-    pub output_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    pub input_token_logprobs: Option<Vec<GenerateTokenLogprob>>,
+    pub output_token_logprobs: Option<Vec<GenerateTokenLogprob>>,
+    /// The number of output logprob entries, written with them, as SGLang
+    /// writes it.
+    pub output_token_logprobs_length: Option<u32>,
     pub completion_tokens: u32,
     pub cached_tokens: u32,
     pub reasoning_tokens: Option<u32>,
@@ -384,6 +394,52 @@ mod tests {
 
     fn req() -> GenerateRequest {
         serde_json::from_value(serde_json::json!({"model": "m"})).expect("minimal request")
+    }
+
+    /// SGLang writes a logprob entry as `[logprob, token_id, text]`: the
+    /// text, and a prompt's first logprob, may be `null`. An entry is
+    /// written back as the three-element array, the id an integer.
+    #[test]
+    fn a_logprob_entry_reads_and_writes_as_sglang_writes_it() {
+        let entries: Vec<GenerateTokenLogprob> =
+            serde_json::from_value(serde_json::json!([[-0.25, 791, "Hello"], [null, 1, null]]))
+                .expect("SGLang's entries");
+        assert_eq!(
+            entries,
+            [
+                GenerateTokenLogprob(Some(-0.25), 791, Some("Hello".to_string())),
+                GenerateTokenLogprob(None, 1, None),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&GenerateTokenLogprob(Some(-0.25), 791, None))
+                .expect("serialize"),
+            "[-0.25,791,null]"
+        );
+
+        let meta: GenerateMetaInfo =
+            serde_json::from_value(sglang_meta_info()).expect("SGLang's meta_info");
+        assert_eq!(meta.output_token_logprobs_length, Some(1));
+        assert_eq!(
+            serde_json::to_value(&meta).expect("serialize"),
+            sglang_meta_info()
+        );
+    }
+
+    /// A `meta_info` as SGLang writes it with logprobs.
+    fn sglang_meta_info() -> Value {
+        serde_json::json!({
+            "id": "gen-1",
+            "finish_reason": {"type": "length", "length": 1},
+            "prompt_tokens": 1,
+            "weight_version": "default",
+            "input_token_logprobs": [[null, 1, null]],
+            "output_token_logprobs": [[-0.25, 791, "Hello"]],
+            "output_token_logprobs_length": 1,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "e2e_latency": 0.5
+        })
     }
 
     #[test]

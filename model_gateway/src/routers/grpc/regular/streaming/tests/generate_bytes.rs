@@ -22,7 +22,7 @@ struct GenerateScenario {
     /// Drive the loop that carries logprobs (the prefill-decode and logprob
     /// streams' loop) instead of the plain one.
     logprobs_loop: bool,
-    input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    input_token_logprobs: Option<Vec<GenerateTokenLogprob>>,
     weight_version: &'static str,
     expected_choices: u32,
     frames: Vec<proto::GenerateResponse>,
@@ -64,7 +64,10 @@ fn scenarios() -> Vec<GenerateScenario> {
         GenerateScenario {
             name: "generate_logprobs",
             logprobs_loop: true,
-            input_token_logprobs: Some(vec![vec![None], vec![Some(-0.25)]]),
+            input_token_logprobs: Some(vec![
+                GenerateTokenLogprob(None, 1, None),
+                GenerateTokenLogprob(Some(-0.25), 2, None),
+            ]),
             weight_version: "default",
             expected_choices: 1,
             frames: vec![
@@ -72,7 +75,7 @@ fn scenarios() -> Vec<GenerateScenario> {
                 chunk_with_logprobs(0, "c"),
                 complete(0, "stop"),
             ],
-            must_contain: r#""output_token_logprobs":[["#,
+            must_contain: r#""output_token_logprobs":[[-0.5,97,null],"#,
         },
         GenerateScenario {
             name: "generate_logprobs_loop_without_logprobs",

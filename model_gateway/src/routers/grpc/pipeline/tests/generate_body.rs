@@ -18,6 +18,7 @@ fn response(weight_version: &str) -> GenerateResponse {
             weight_version: weight_version.to_string(),
             input_token_logprobs: None,
             output_token_logprobs: None,
+            output_token_logprobs_length: None,
             completion_tokens: 3,
             cached_tokens: 0,
             reasoning_tokens: None,

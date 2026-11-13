@@ -24,7 +24,7 @@ use openai_protocol::{
         ToolChoiceValue, Usage,
     },
     completion::{CompletionStreamChoice, CompletionStreamResponse},
-    generate::GenerateFinishReason,
+    generate::{GenerateFinishReason, GenerateTokenLogprob},
     messages::{
         self, ContentBlock, ContentBlockDelta, Message, MessageDelta, MessageDeltaUsage,
         MessageStreamEvent,
@@ -329,11 +329,27 @@ struct GenerateMetaInfo<'a> {
     e2e_latency: Option<f64>,
 }
 
-/// The logprob fields of a generate event on the stream that carries them.
+/// The logprob fields of a generate event on the stream that carries them,
+/// with the output entries' count beside them, as SGLang writes it.
 #[derive(Serialize)]
 struct GenerateLogprobs<'a> {
-    input_token_logprobs: Option<&'a [Vec<Option<f64>>]>,
-    output_token_logprobs: Option<&'a [Vec<Option<f64>>]>,
+    input_token_logprobs: Option<&'a [GenerateTokenLogprob]>,
+    output_token_logprobs: Option<&'a [GenerateTokenLogprob]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_token_logprobs_length: Option<usize>,
+}
+
+impl<'a> GenerateLogprobs<'a> {
+    fn new(
+        input_token_logprobs: Option<&'a [GenerateTokenLogprob]>,
+        output_token_logprobs: Option<&'a [GenerateTokenLogprob]>,
+    ) -> Self {
+        Self {
+            input_token_logprobs,
+            output_token_logprobs,
+            output_token_logprobs_length: output_token_logprobs.map(<[GenerateTokenLogprob]>::len),
+        }
+    }
 }
 
 /// Shared streaming processor for both single and prefill/decode dispatch modes
@@ -1108,7 +1124,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
-        input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+        input_token_logprobs: Option<Vec<GenerateTokenLogprob>>,
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -1124,7 +1140,7 @@ impl StreamingProcessor {
 
         // Track state per index for n>1 case
         let mut choices: HashMap<u32, GenerateChoice> = HashMap::new();
-        let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
+        let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<GenerateTokenLogprob>>> =
             HashMap::new();
         let mut usage = GenerateStreamUsage::default();
         // The frame being written: the events ready at one poll share it
@@ -1235,10 +1251,10 @@ impl StreamingProcessor {
                                     chunk.weight_version(),
                                     Some(ctx.weight_version.as_str()),
                                 ),
-                                logprobs: Some(GenerateLogprobs {
-                                    input_token_logprobs: input_token_logprobs.as_deref(),
-                                    output_token_logprobs: current_output_logprobs,
-                                }),
+                                logprobs: Some(GenerateLogprobs::new(
+                                    input_token_logprobs.as_deref(),
+                                    current_output_logprobs,
+                                )),
                                 completion_tokens: current_completion_tokens,
                                 cached_tokens: chunk.cached_tokens(),
                                 reasoning_tokens: chunk.reasoning_tokens(),
@@ -1287,10 +1303,10 @@ impl StreamingProcessor {
                                     complete.weight_version(),
                                     Some(ctx.weight_version.as_str()),
                                 ),
-                                logprobs: Some(GenerateLogprobs {
-                                    input_token_logprobs: input_token_logprobs.as_deref(),
-                                    output_token_logprobs: final_output_logprobs,
-                                }),
+                                logprobs: Some(GenerateLogprobs::new(
+                                    input_token_logprobs.as_deref(),
+                                    final_output_logprobs,
+                                )),
                                 completion_tokens,
                                 cached_tokens: complete.cached_tokens(),
                                 reasoning_tokens: complete.reasoning_tokens(),

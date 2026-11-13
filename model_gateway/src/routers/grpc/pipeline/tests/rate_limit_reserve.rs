@@ -276,6 +276,7 @@ fn generate_settlement_takes_the_shared_prompt_once_and_sums_the_choices() {
                 weight_version: "default".to_string(),
                 input_token_logprobs: None,
                 output_token_logprobs: None,
+                output_token_logprobs_length: None,
                 completion_tokens,
                 cached_tokens,
                 reasoning_tokens,

@@ -3,7 +3,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::common::{ChatLogProbs, ChatLogProbsContent, LogProbs, TopLogProb};
+use openai_protocol::{
+    common::{ChatLogProbs, ChatLogProbsContent, LogProbs, TopLogProb},
+    generate::GenerateTokenLogprob,
+};
 
 use crate::routers::grpc::proto_wrapper::{ProtoInputLogProbs, ProtoOutputLogProbs};
 
@@ -95,40 +98,34 @@ pub(crate) fn has_entries(logprobs: Option<&ChatLogProbs>) -> bool {
     )
 }
 
-/// Convert OutputLogProbs to Generate format `Vec<Vec<Option<f64>>>`
-///
-/// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
-/// Each inner vec contains [logprob (f64), token_id (u32), ...]
+/// Convert OutputLogProbs to the generate answer's entries, as SGLang writes
+/// them: `[logprob, token_id, text]` per generated token. The text is `null`:
+/// writing it (`return_text_in_logprobs`) takes a decode per token, which the
+/// builder does not do.
 pub(crate) fn convert_generate_output_logprobs(
     proto_logprobs: ProtoOutputLogProbs<'_>,
-) -> Vec<Vec<Option<f64>>> {
+) -> Vec<GenerateTokenLogprob> {
     // `positions()` filters, so its size hint is not exact: the outer list is
     // sized from the position count, as `convert_proto_logprobs` sizes its own.
     let mut rows = Vec::with_capacity(proto_logprobs.len());
     rows.extend(proto_logprobs.positions().map(|position| {
-        vec![
-            Some(f64::from(position.logprob)),
-            Some(f64::from(position.token_id)),
-        ]
+        GenerateTokenLogprob(Some(f64::from(position.logprob)), position.token_id, None)
     }));
     rows
 }
 
-/// Convert InputLogProbs to Generate format `Vec<Vec<Option<f64>>>`
-///
-/// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
-/// First token has null logprob: [[null, token_id], [logprob, token_id], ...]
+/// Convert InputLogProbs to the generate answer's entries, as
+/// [`convert_generate_output_logprobs`] writes them. The first token's
+/// logprob is `null`: it has no context.
 pub(crate) fn convert_generate_input_logprobs(
     proto_logprobs: &ProtoInputLogProbs,
-) -> Vec<Vec<Option<f64>>> {
+) -> Vec<GenerateTokenLogprob> {
     proto_logprobs
         .token_logprobs
         .iter()
         .zip(proto_logprobs.token_ids.iter())
         .map(|(&token_logprob, &token_id)| {
-            // token_logprob is Option<f32> in unified type
-            let logprob_value = token_logprob.map(|v| v as f64);
-            vec![logprob_value, Some(token_id as f64)]
+            GenerateTokenLogprob(token_logprob.map(f64::from), token_id, None)
         })
         .collect()
 }
@@ -270,9 +267,20 @@ mod tests {
         assert_eq!(
             convert_generate_output_logprobs(ProtoOutputLogProbs::Vllm(&proto)),
             vec![
-                vec![Some(f64::from(-0.1_f32)), Some(1.0)],
-                vec![Some(f64::from(-0.2_f32)), Some(2.0)]
+                GenerateTokenLogprob(Some(f64::from(-0.1_f32)), 1, None),
+                GenerateTokenLogprob(Some(f64::from(-0.2_f32)), 2, None)
             ]
+        );
+        // SGLang's `[logprob, token_id, text]`: an integer id and the text slot.
+        assert_eq!(
+            serde_json::to_value(convert_generate_output_logprobs(ProtoOutputLogProbs::Vllm(
+                &proto
+            )))
+            .unwrap(),
+            serde_json::json!([
+                [f64::from(-0.1_f32), 1, null],
+                [f64::from(-0.2_f32), 2, null]
+            ])
         );
     }
 

@@ -602,6 +602,64 @@ async fn byte_fallback_generate_eof_reports_gateway_stop() {
     assert_eq!(wire["meta_info"]["matched_stop"], "�");
 }
 
+/// A unary generate answer with logprobs writes SGLang's entries,
+/// `[logprob, token_id, text]` with an integer id and the text `null`, and
+/// the output entries' count beside them.
+#[tokio::test]
+async fn a_unary_generate_answer_writes_sglangs_logprob_entries() {
+    let mut terminal = complete(0, "length");
+    if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
+        complete.output_ids = vec![1, 1];
+        complete.completion_tokens = 2;
+        complete.output_logprobs = Some(proto::OutputLogProbs {
+            token_logprobs: vec![-0.5, -0.25],
+            token_ids: vec![1, 1],
+            top_logprobs: Vec::new(),
+        });
+        complete.input_logprobs = Some(proto::InputLogProbs {
+            token_logprobs: vec![
+                proto::InputTokenLogProb { value: None },
+                proto::InputTokenLogProb { value: Some(-1.5) },
+            ],
+            token_ids: vec![7, 8],
+            top_logprobs: Vec::new(),
+        });
+    }
+    let (stream, server) = scripted_stream(vec![terminal], "0").await;
+    let mut decoder = StopSequenceDecoder::new(
+        byte_fallback_tokenizer(),
+        llm_tokenizer::StopSequenceConfig::default(),
+        true,
+    );
+    let processor = unary_processor(utils::ParserResolver::disabled());
+    let responses = processor
+        .process_non_streaming_generate_response(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
+            dispatch(),
+            &mut decoder,
+            true,
+            Instant::now(),
+            metrics_labels::ENDPOINT_GENERATE,
+        )
+        .await
+        .unwrap();
+    server.abort();
+    let wire = serde_json::to_value(&responses[0]).unwrap();
+    let meta = &wire["meta_info"];
+    assert_eq!(
+        meta["output_token_logprobs"],
+        serde_json::json!([[-0.5, 1, null], [-0.25, 1, null]])
+    );
+    assert_eq!(meta["output_token_logprobs_length"], 2);
+    assert_eq!(
+        meta["input_token_logprobs"],
+        serde_json::json!([[null, 7, null], [-1.5, 8, null]])
+    );
+}
+
 pub(super) fn chat_spec(with_tools: bool) -> ChatResponseSpec {
     chat_spec_with(with_tools, None)
 }

@@ -94,6 +94,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A generate answer's logprob entries read and write as SGLang writes them, `[logprob, token_id,
+  text]`: the gRPC path wrote `[-0.25, 791.0]`, a float id and no text slot, and an SGLang entry
+  with its text could not be read. `GenerateTokenLogprob` is the entry, and
+  `GenerateMetaInfo.output_token_logprobs_length`, the count of the output entries, is written with
+  them, unary and streamed. The text is `null`: the gRPC path does not decode it. Breaking:
+  `input_token_logprobs` and `output_token_logprobs` are lists of `GenerateTokenLogprob`, and
+  `GenerateMetaInfo` gains `output_token_logprobs_length`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
