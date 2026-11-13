@@ -5101,3 +5101,187 @@ fn a_long_uncut_piece_leaves_the_thread_a_bounded_scratch() {
         "the thread kept a scratch of {scratch} symbols"
     );
 }
+
+/// A greedy class run before a character that never comes used to cost half
+/// the square of the run's length: each start inside the run scanned to its
+/// end and failed, and the search moved on by one character. Over the
+/// byte-level image a space maps to a letter, so an ordinary text is one run
+/// of letters to `\p{L}+!`, and 128 KiB took minutes where the reference
+/// takes milliseconds. The search now leaves a failed run behind.
+#[test]
+fn a_failed_run_before_a_character_that_never_comes_is_left_behind() {
+    use std::time::{Duration, Instant};
+    let mut state = 0x4641_494C_4544_5255u64;
+    let shape = Shape {
+        name: "byte-level-then-letter-run-before-a-bang",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            byte_level(false),
+            split(r"\p{L}+!", SplitDelimiterBehavior::Isolated, false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let from = native.mapped_from.expect("the map");
+    let table = bytes_char();
+    let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+    let mut image = String::new();
+    for n in [8192usize, 32768, 131072] {
+        for text in [
+            "a".repeat(n),
+            format!("{}!", "a".repeat(n - 1)),
+            "ab cd ".repeat(n / 6),
+            format!("{}!{}", "ab cd ".repeat(n / 12), "ab cd ".repeat(n / 12)),
+        ] {
+            let mut split = PreTokenizedString::from(text.as_str());
+            pre_tokenizer
+                .pre_tokenize(&mut split)
+                .expect("the reference");
+            let theirs: Vec<String> = split
+                .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                .into_iter()
+                .map(|(piece, _, _)| piece.to_owned())
+                .collect();
+            let mut ours = Vec::new();
+            let started = Instant::now();
+            native.pieces_mapping(0, from, &text, &mut image, &mut |raw: &[u8]| {
+                ours.push(
+                    raw.iter()
+                        .map(|&b| table[usize::from(b)])
+                        .collect::<String>(),
+                );
+            });
+            let took = started.elapsed();
+            assert_eq!(
+                ours,
+                theirs,
+                "the pieces of {} bytes of {:?}",
+                text.len(),
+                &text[..8]
+            );
+            let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+            assert_eq!(
+                native.encode(Some(tokenizer.get_model()), &text, false),
+                Ok(reference.get_ids().to_vec()),
+                "{} bytes of {:?}",
+                text.len(),
+                &text[..8]
+            );
+            // Minutes before the skip at this size; milliseconds with it. The
+            // bound leaves room for a loaded machine and a debug build.
+            assert!(
+                took < Duration::from_secs(2),
+                "{} bytes of {:?} took {took:?} to cut",
+                text.len(),
+                &text[..8]
+            );
+        }
+    }
+}
+
+/// The skip changes no result: class-run patterns before a character the run
+/// may or may not reach, bounded and unbounded, as the first stage over the
+/// raw text and as a stage after the map over the image, on random short
+/// texts, pieces and ids against the reference.
+#[test]
+fn the_search_past_a_failed_run_cuts_as_the_reference_does() {
+    let patterns = [
+        r"\p{L}+!",
+        r"\p{L}+a",
+        r"\p{L}{1,3}!",
+        r"[a-z]+b",
+        r"\p{N}+\.",
+        r"\p{L}++!",
+        r" ?\p{L}+",
+        r"(?:\p{L}|\.)+!",
+    ];
+    let alphabet: Vec<char> = "ab c!a.1\n\u{E9}".chars().collect();
+    // A start outside the run (a `!`, a digit, a stop before the letters)
+    // must not skip the letters after it, so a few texts are fixed.
+    let fixed = ["!ab!", "1a!", ".aa!a!", "ab!", "a!!b!", "\u{E9}!a"];
+    let mut state = 0x5345_4152_4348_0001u64;
+    let random = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    };
+    let table = bytes_char();
+    for pattern in patterns {
+        for mapped in [false, true] {
+            let pre_tokenizers = if mapped {
+                vec![
+                    byte_level(false),
+                    split(pattern, SplitDelimiterBehavior::Isolated, false),
+                ]
+            } else {
+                vec![
+                    split(pattern, SplitDelimiterBehavior::Isolated, false),
+                    byte_level(false),
+                ]
+            };
+            let shape = Shape {
+                name: "class-run-before-a-character",
+                normalizer: Normalizer::None,
+                pre_tokenizers,
+                ignore_merges: false,
+                special: &[],
+                added: &[],
+                stripped: &[],
+            };
+            let tokenizer = tokenizer_of(&shape, &mut state);
+            let Ok(mut native) = NativeEncoder::from_tokenizer(&tokenizer) else {
+                // A shape the native path declines is the reference's alone.
+                continue;
+            };
+            native.seed_vocabulary(tokenizer.get_model(), None);
+            let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+            let mut image = String::new();
+            for i in 0..300 {
+                let text: String = if let Some(fixed) = fixed.get(i) {
+                    (*fixed).to_owned()
+                } else {
+                    let len = (random(&mut state) % 25) as usize;
+                    (0..len)
+                        .map(|_| alphabet[(random(&mut state) % alphabet.len() as u64) as usize])
+                        .collect()
+                };
+                let mut split = PreTokenizedString::from(text.as_str());
+                pre_tokenizer
+                    .pre_tokenize(&mut split)
+                    .expect("the reference");
+                let theirs: Vec<String> = split
+                    .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                    .into_iter()
+                    .map(|(piece, _, _)| piece.to_owned())
+                    .collect();
+                if let Some(from) = native.mapped_from {
+                    let mut ours = Vec::new();
+                    native.pieces_mapping(0, from, &text, &mut image, &mut |raw: &[u8]| {
+                        ours.push(
+                            raw.iter()
+                                .map(|&b| table[usize::from(b)])
+                                .collect::<String>(),
+                        );
+                    });
+                    assert_eq!(
+                        ours, theirs,
+                        "{pattern} after the map: the pieces of {text:?}"
+                    );
+                }
+                let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+                for parallel in [false, true] {
+                    assert_eq!(
+                        native.encode_with(Some(tokenizer.get_model()), &text, parallel, false),
+                        Ok(reference.get_ids().to_vec()),
+                        "{pattern} mapped {mapped}: {text:?} parallel {parallel}"
+                    );
+                }
+            }
+        }
+    }
+}
