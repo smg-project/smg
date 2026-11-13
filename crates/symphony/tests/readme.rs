@@ -320,6 +320,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "atria-dawn",
+        model: "internlm/Atria-Dawn",
+        also: &[],
+        released: "2026-10-23",
+        smg: (None, None),
+        table: Some(Table::Glm),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "atria-dawn-preview",
         model: "internlm/Atria-Dawn-Preview",
         also: &["Atria-Dawn-Preview-Ascend-w8a8"],

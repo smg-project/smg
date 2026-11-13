@@ -244,6 +244,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-24 | [d1-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-2b) | LiquidAI/d1-2B |  | `qwen3`, tagged calls | 9 | replaying the set | none |
 | 2026-10-24 | [d1-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-omni-2b) | LiquidAI/d1-Omni-2B |  | `qwen3`, tagged calls | — | awaiting fixtures | none |
 | 2026-10-24 | [nanbeige4.3-33b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.3-33b) | Nanbeige/Nanbeige4.3-33B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
+| 2026-10-23 | [atria-dawn](https://github.com/smg-project/bellwether/tree/main/fixtures/atria-dawn) | internlm/Atria-Dawn |  | `glm` | 28 | replaying the set | none |
 | 2026-10-23 | [lfm3-1.7b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-1.7b) | LiquidAI/LFM3-1.7B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-22 | [wevisone-vl-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/wevisone-vl-4b) | tencent/WeVisOne-VL-4B | WeVisOne-VL-2B | `qwen3` | 19 | replaying the set | none |
 | 2026-10-21 | [lfm3-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-omni-2b) | LiquidAI/LFM3-Omni-2B |  | `qwen3`, tagged calls | 19 | replaying the set | none |
