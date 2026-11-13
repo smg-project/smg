@@ -11,6 +11,7 @@
   {"model": "inclusionAI/AReaL-SEA-235B-A22B", "also": ["AReaL-tau2-merge-sft-235B"], "table": "qwen3", "opener": null, "after": null},
   {"model": "inclusionAI/AReaL-tau2-telecom-sft-30B", "also": ["AReaL-tau2-airline-sft-30B", "AReaL-tau2-retail-sft-30B"], "table": "qwen3", "opener": null, "after": null},
   {"model": "inclusionAI/AReaL-tau2-telecom-user-sft-30B", "also": [], "table": "qwen3", "opener": null, "after": null},
+  {"model": "NousResearch/Arete-27B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "BAAI/AREX-2", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "BAAI/AREX-Base", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "BAAI/AREX-Turbo", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},

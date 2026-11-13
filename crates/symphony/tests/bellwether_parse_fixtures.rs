@@ -378,6 +378,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
     ("nanbeige4.2-3b", GenerationPrompt::OpensTheThought),
     ("nanbeige4.3-33b", GenerationPrompt::OpensTheThought),
+    // Arete-27B (a Qwen 3.5 stack) writes Qwen 3.5's prompt shapes with a reasoning-effort sentence
+    // in the system turn.
+    ("arete-27b", GenerationPrompt::OpensTheThought),
     // MiMo writes Qwen 3.5's tags with the value between them directly, and its own `<think>`.
     ("mimo-v2.5", GenerationPrompt::ModelWritesTheThought),
     // The V2.6 line writes the same tags with no newline between them; the generation prompt
