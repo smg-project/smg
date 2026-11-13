@@ -403,12 +403,12 @@ What this table says beyond the DeepSeek one:
   block opened inside the answer (`content + tools_open = tools`): the region ended, however
   the model left it. These recovery rows remain valid for real structural tokens.
 - **Spelling is not token identity.** Ordinary token pieces can spell the same bytes inside
-  reasoning examples or JSON strings. A tokenized caller can bind the declared
-  `<|open|>` and `<|close|>` atoms to its vocabulary and supply their byte origins before
-  feeding the text. Only those origins authorize these framing transitions; an ordinary-token
+  reasoning examples or JSON strings. The tokenized gRPC gateway reader binds the declared
+  `<|open|>` and `<|close|>` atoms to the vocabulary and records their byte origins before
+  stop buffering. Only those origins authorize these framing transitions; an ordinary-token
   lookalike stays in its current channel. No quote-state heuristic is used: a genuine
   structural token still frames a transition after unmatched quotes or prose. Text-only
-  callers, and a caller without a complete vocabulary binding before output, retain the
+  callers, and a reader without a complete vocabulary binding before output, retain the
   existing string-marker behavior. Once bound, missing counting spans cannot change modes.
 - **The answer's closer ends a thought too.** On about 1 % of very long turns the model writes
   its reply straight into the prefilled thought and closes it with `<|close|>response<|sep|>`,

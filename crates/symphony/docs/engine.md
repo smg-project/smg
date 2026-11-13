@@ -238,3 +238,11 @@ Unbound text-only callers retain their prior behavior, as do formats without str
 Binding is an explicit caller contract: the caller verifies vocabulary atoms and supplies
 their ranges. The engine does not infer token identity from decoded spellings or counting
 spans, and adding this API does not bind an existing caller automatically.
+
+The tokenized gRPC gateway reader resolves every declared atom to a distinct vocabulary ID
+before its first generated delta, including an empty delta. Complete bindings use token origins;
+otherwise the reader keeps text-only compatibility for that output. The gateway exposes
+`smg_symphony_structural_bindings_total{table,mode}` with `bound` and `text_only` modes,
+without model text, request IDs or vocabulary IDs. Qualification must establish bound mode
+rather than infer it from a successful response. The decoder's origin coordinates describe the
+prefix through its first stop or reset; this reader does not use the legacy `resume` operation.

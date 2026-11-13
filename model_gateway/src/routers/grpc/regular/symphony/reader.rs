@@ -353,6 +353,10 @@ pub(crate) struct Reader {
     span: Span,
     /// The request's mark ([`Assignment::marked`]): set by the first reading that is not clean.
     marked: Arc<AtomicBool>,
+    /// Bound once, before generated output. Empty keeps text-only compatibility
+    /// when the vocabulary cannot identify every declared structural atom.
+    /// Once bound, counting-span quality never changes the framing mode.
+    structural_tokens: Option<Vec<(u32, String)>>,
 }
 
 impl Reader {
@@ -383,6 +387,7 @@ impl Reader {
             trap: isolation::test_trap(),
             span: assignment.span.clone(),
             marked: Arc::clone(&assignment.marked),
+            structural_tokens: None,
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
         // move from the replay's own buffer into the caller's one by one, whatever delta that one
@@ -420,6 +425,32 @@ impl Reader {
         delta: &'d mut Delta,
         out: &mut Events<'d>,
     ) -> Result<bool, SymphonyError> {
+        if self.structural_tokens.is_none() {
+            let atoms = self.engine.structural_token_texts();
+            let atom_count = atoms.len();
+            let resolved: Option<Vec<_>> = atoms
+                .iter()
+                .map(|atom| decoder.token_to_id(atom).map(|id| (id, atom.clone())))
+                .collect();
+            let resolved = resolved.filter(|values| {
+                values.iter().enumerate().all(|(index, (id, _))| {
+                    !values[..index].iter().any(|(previous, _)| previous == id)
+                })
+            });
+            let bound = atom_count > 0 && resolved.is_some();
+            if bound {
+                self.engine
+                    .bind_structural_token_origins()
+                    .map_err(|error| self.failed(error.to_string()))?;
+            }
+            self.structural_tokens = Some(resolved.unwrap_or_default());
+            if atom_count > 0 {
+                telemetry::record_structural_binding(self.table, bound);
+                debug!(target: "smg::symphony", table = self.table,
+                    structural_atoms = atom_count, token_origins_bound = bound,
+                    "Symphony selected structural-token provenance mode");
+            }
+        }
         delta.clear();
         // The step's tokens, reserved before the first push: a whole output read in one step
         // (the request that does not stream) grew both vectors by doubling from empty, eight
@@ -433,14 +464,32 @@ impl Reader {
         let mut stopped = false;
         for &token_id in token_ids {
             let start = delta.text.len();
-            stopped = decoder
-                .process_token_into(token_id, &mut delta.text)
-                .map_err(|e| {
-                    self.failed(format!(
-                        "Stop decoder failed to process token {token_id}: {e}"
-                    ))
-                })?
-                .stopped();
+            let atom = self.structural_tokens.as_ref().and_then(|tokens| {
+                tokens
+                    .iter()
+                    .find(|(id, _)| *id == token_id)
+                    .map(|(_, text)| text.as_str())
+            });
+            let decoded = decoder.process_token_into_with_origin(token_id, &mut delta.text, atom);
+            let (step, origin) = decoded.map_err(|e| {
+                self.failed(format!(
+                    "Stop decoder failed to process token {token_id}: {e}"
+                ))
+            })?;
+            if let Some(origin) = origin {
+                let atom = self.structural_tokens.as_ref().and_then(|tokens| {
+                    tokens
+                        .iter()
+                        .find(|(id, _)| *id == token_id)
+                        .map(|(_, text)| text.as_str())
+                });
+                if let Some(atom) = atom {
+                    self.engine
+                        .note_structural_token_origin(atom, origin)
+                        .map_err(|error| self.failed(error.to_string()))?;
+                }
+            }
+            stopped = step.stopped();
             delta.spans.push(TokenSpan {
                 token_id,
                 start,
@@ -768,6 +817,172 @@ fn release_before_the_finish(released: String, out: &mut Events<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_atomic_kimi(
+        prompt: &str,
+        ids: &[u32],
+        cut: usize,
+        stop: Option<&str>,
+    ) -> Vec<Event<'static>> {
+        let assignment = assignment(
+            Arc::new(symphony::formats::kimi_k3()),
+            "moonshotai/Kimi-K3",
+            prompt,
+            false,
+            false,
+        );
+        let mut rules = llm_tokenizer::StopSequenceConfig::default();
+        if let Some(stop) = stop {
+            rules = rules.with_stop_sequence(stop);
+        }
+        let mut decoder = StopSequenceDecoder::new(Arc::new(AtomicKimi::default()), rules, false);
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, Arc::default(), &mut events).unwrap();
+        let mut all: Vec<_> = events.into_owned().drain();
+        for chunk in [&ids[..cut], &ids[cut..]] {
+            let mut delta = Delta::default();
+            let mut events = Events::new();
+            reader
+                .read(&mut decoder, chunk, &mut delta, &mut events)
+                .unwrap();
+            all.extend(events.into_owned().drain());
+        }
+        assert_eq!(reader.structural_tokens.as_ref().unwrap().len(), 2);
+        let tail = match decoder.finish().unwrap() {
+            llm_tokenizer::SequenceDecoderOutput::Text(text)
+            | llm_tokenizer::SequenceDecoderOutput::StoppedWithText(text) => text,
+            _ => String::new(),
+        };
+        let mut delta = Delta::default();
+        let mut events = Events::new();
+        reader.tail(tail, &mut delta, &mut events).unwrap();
+        reader.end(EngineFinish::Stop, who(), &mut events).unwrap();
+        all.extend(events.into_owned().drain());
+        all
+    }
+
+    #[test]
+    fn structural_token_origins_survive_jail_release_at_every_engine_chunk_cut() {
+        let prompt = "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>";
+        let thought =
+            "Example {\"x\":\"<|open|>response<|sep|>\",\"y\":\"<|close|>think<|sep|>\"}. é🌍�";
+        let answer = "{\"x\":\"<|open|>response<|sep|>\",\"y\":\"<|close|>think<|sep|>\"}";
+        let parts = [
+            (thought, false),
+            ("<|close|>think<|sep|>", true),
+            ("<|open|>response<|sep|>", true),
+            (answer, false),
+            ("<|close|>response<|sep|>", true),
+            ("<|close|>message", true),
+        ];
+        let ids = atomic_kimi_ids(&parts);
+        let raw: String = parts.iter().map(|(text, _)| *text).collect();
+        for cut in 0..=ids.len() {
+            let events = read_atomic_kimi(prompt, &ids, cut, Some("<|close|>message<|sep|>"));
+            let reasoning: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Reasoning(text) => Some(text.text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reasoning, thought, "cut{cut}");
+            assert_eq!(content_of(&events), answer, "cut{cut}");
+            let bytes: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text)
+                    | Event::Reasoning(text)
+                    | Event::Dropped { text, .. }
+                    | Event::Malformed { text, .. } => Some(text.text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(bytes, raw, "cut{cut}");
+            let counted: u32 = events
+                .iter()
+                .map(|event| match event {
+                    Event::Content(text)
+                    | Event::Reasoning(text)
+                    | Event::Dropped { text, .. }
+                    | Event::Malformed { text, .. } => text.tokens.unwrap(),
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(counted, ids.len() as u32);
+        }
+    }
+
+    #[test]
+    fn structural_binding_mode_is_observable_without_text_or_token_ids() {
+        let ids = atomic_kimi_ids(&[("<|open|>response<|sep|>", true), ("ok", false)]);
+        let scrape = rendered(|| {
+            read_atomic_kimi("", &ids, 0, None);
+        });
+        assert!(line_with(
+            &scrape,
+            telemetry::STRUCTURAL_BINDINGS,
+            &["table=\"kimi_k3\"", "mode=\"bound\""]
+        )
+        .unwrap()
+        .ends_with(" 1"));
+    }
+
+    #[test]
+    fn unavailable_or_duplicate_atom_ids_select_text_only_before_even_an_empty_delta() {
+        let tokenizers: Vec<Arc<dyn Tokenizer>> = vec![
+            Arc::new(llm_tokenizer::MockTokenizer::new()),
+            Arc::new(Refusing::default()), // both atom names resolve to the same '<' ID
+        ];
+        for tokenizer in tokenizers {
+            let scrape = rendered(|| {
+                let assignment = assignment(
+                    Arc::new(symphony::formats::kimi_k3()),
+                    "moonshotai/Kimi-K3",
+                    "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+                    false,
+                    false,
+                );
+                let mut out = Events::new();
+                let mut reader = Reader::new(&assignment, Arc::default(), &mut out).unwrap();
+                let mut decoder =
+                    StopSequenceDecoder::new(tokenizer.clone(), Default::default(), false);
+                let mut delta = Delta::default();
+                reader
+                    .read(&mut decoder, &[], &mut delta, &mut out)
+                    .unwrap();
+                assert!(reader.structural_tokens.as_ref().unwrap().is_empty());
+                // The mode cannot silently change after that first delta, even
+                // if a caller substitutes a tokenizer with complete bindings.
+                let mut decoder = StopSequenceDecoder::new(
+                    Arc::new(AtomicKimi::default()),
+                    Default::default(),
+                    false,
+                );
+                let ids = atomic_kimi_ids(&[("<|open|>response<|sep|>answer", false)]);
+                let mut next = Events::new();
+                reader
+                    .read(&mut decoder, &ids, &mut delta, &mut next)
+                    .unwrap();
+                reader.end(EngineFinish::Stop, who(), &mut next).unwrap();
+                assert_eq!(content_of(next.as_slice()), "answer");
+                assert!(reader.structural_tokens.as_ref().unwrap().is_empty());
+            });
+            assert!(line_with(
+                &scrape,
+                telemetry::STRUCTURAL_BINDINGS,
+                &["table=\"kimi_k3\"", "mode=\"text_only\""]
+            )
+            .unwrap()
+            .ends_with(" 1"));
+            assert!(line_with(
+                &scrape,
+                telemetry::STRUCTURAL_BINDINGS,
+                &["table=\"kimi_k3\"", "mode=\"bound\""]
+            )
+            .is_none());
+        }
+    }
 
     #[test]
     fn a_shared_tables_asked_variant_is_kept_and_read_with_by_the_next_request() {
