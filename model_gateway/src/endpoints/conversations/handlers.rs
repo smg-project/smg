@@ -471,15 +471,15 @@ fn items_of(body: &Value, required: bool) -> Result<&[Value], Response> {
     Ok(items_array)
 }
 
+/// A parsed item and the warning of an accepted-but-unimplemented type.
+type OwnContent = (NewConversationItem, Option<String>);
+
 /// One item of a request batch once the stores have been asked and before
 /// anything is written: an item that exists already and is taken as it is (an
 /// `item_reference`, an item arriving under an id the caller may see), a new
 /// item to write with the warning of a type accepted but not implemented, or a
 /// repeat of an earlier item of the same batch (the same client-supplied id
 /// twice, a reference to an item the batch itself adds).
-/// A parsed item and the warning of an accepted-but-unimplemented type.
-type OwnContent = (NewConversationItem, Option<String>);
-
 enum PreparedItem {
     /// An `item_reference`: the stored item it names.
     Existing(ConversationItem),
@@ -492,10 +492,9 @@ enum PreparedItem {
     SameAs(usize),
 }
 
-/// An adopted item awaiting the re-check after the batch's writes: its place
-/// in the answer, its id and the request's own content.
+/// An adopted item awaiting the re-check after the batch's writes: its id and
+/// the request's own content.
 struct Adoption {
-    index: usize,
     id: ConversationItemId,
     own: Option<Box<OwnContent>>,
 }
@@ -637,8 +636,10 @@ async fn refuse_an_item_the_conversation_has(
 /// the batch, so nothing of it is linked (its new records stay in the store
 /// unlinked: the store's delete unlinks only, and a retry under the same id
 /// adopts them); an adopted id that is gone takes the request's own content
-/// under that id, as the write-as-you-go order answered. A batch without a
-/// new item asks the stores nothing more.
+/// under that id, as the write-as-you-go order answered, and every entry of
+/// the answer that names that id (the adoption, a reference to it, a repeat
+/// of it) lists the item as it is stored then. A batch without a new item
+/// asks the stores nothing more.
 async fn store_items(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
@@ -666,11 +667,11 @@ async fn store_items(
             }
             PreparedItem::Adopted(item, own) => {
                 adopted.push(Adoption {
-                    index: created_items.len(),
                     id: item.id.clone(),
                     own,
                 });
-                (item_to_json(&item), item.id.clone(), None)
+                let id = item.id.clone();
+                (item_to_json(item), id, None)
             }
             PreparedItem::New(new_item, warning) => {
                 wrote = true;
@@ -698,15 +699,12 @@ async fn store_items(
     // The references and adoptions were resolved before the writes; a bounded
     // store may have dropped one of them to make room for this batch's new
     // items. An adopted id that is gone takes the request's own content (a
-    // write of its own, read before the references); a reference that is gone
-    // ends the batch before anything is linked, as a missing reference does.
+    // write of its own, read before the references), and every entry of the
+    // answer that names that id lists the item as written; a reference that is
+    // gone ends the batch before anything is linked, as a missing reference
+    // does.
     if wrote {
-        for Adoption {
-            index,
-            id: item_id,
-            own,
-        } in adopted
-        {
+        for Adoption { id: item_id, own } in adopted {
             match item_storage.get_item(&item_id).await {
                 Ok(Some(_)) => {}
                 Ok(None) => match own.map(|boxed| *boxed) {
@@ -715,7 +713,12 @@ async fn store_items(
                             .create_item(new_item)
                             .await
                             .map_err(|e| store_error("Failed to create item", &e))?;
-                        created_items[index] = item_to_json(&created);
+                        let written = item_to_json(created);
+                        for (entry, id) in created_items.iter_mut().zip(&item_ids) {
+                            if *id == item_id {
+                                *entry = written.clone();
+                            }
+                        }
                         if let Some(w) = warning {
                             warnings.push(w);
                         }
@@ -1862,5 +1865,96 @@ mod tests {
             message.contains("msg_oldest") && !message.contains("Referenced"),
             "{body}"
         );
+    }
+    /// An adopted id the batch's writes evict is written once with the
+    /// request's own content, and every entry of the answer that names it (the
+    /// adoption, a reference to it, a repeat of it) lists the item as the
+    /// listing does, on both routes.
+    #[tokio::test]
+    async fn a_recreated_adopted_id_lists_the_same_in_every_entry_of_the_answer() {
+        let two_items = MemoryConfig {
+            max_items: 2,
+            ..MemoryConfig::default()
+        };
+        let stored = |id: &str| NewConversationItem {
+            id: Some(ConversationItemId::from(id)),
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([{"type": "input_text", "text": "stored"}]),
+            status: None,
+            tenant: None,
+        };
+        for route in ["create", "add-items"] {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let items: Arc<dyn ConversationItemStorage> =
+                Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+            // The oldest record goes first: the two stored items get distinct stamps.
+            items.create_item(stored("msg_oldest")).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            items.create_item(stored("msg_other")).await.unwrap();
+            let empty =
+                json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+            let conversation = empty["id"].as_str().unwrap().to_string();
+            // The new item evicts the oldest; the batch then adopts that id, references it and
+            // adopts it again.
+            let batch = json!({"items": [
+                {"type": "message", "role": "user", "content": "new"},
+                {"id": "msg_oldest", "type": "message", "role": "user", "content": "own"},
+                {"type": "item_reference", "id": "msg_oldest"},
+                {"id": "msg_oldest", "type": "message", "role": "user", "content": "own again"}
+            ]});
+            let response = match route {
+                "create" => create_conversation(&conversations, &items, None, batch).await,
+                _ => {
+                    create_conversation_items(&conversations, &items, None, &conversation, batch)
+                        .await
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            let body = json_of(response).await;
+            let listed_in = if route == "create" {
+                body["id"].as_str().unwrap().to_string()
+            } else {
+                let texts: Vec<&str> = body["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["content"][0]["text"].as_str().unwrap_or(""))
+                    .collect();
+                assert_eq!(texts, vec!["new", "own", "own", "own"], "{route}: {body}");
+                conversation.clone()
+            };
+            let listed = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    None,
+                    &listed_in,
+                    None,
+                    Some("asc"),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            let texts: Vec<&str> = listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["content"][0]["text"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(texts, vec!["new", "own"], "{route}: {listed}");
+            assert_eq!(listed["data"][1]["id"], "msg_oldest", "{route}: {listed}");
+            assert!(
+                items
+                    .get_item(&ConversationItemId::from("msg_other"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{route}: the other stored item went to make room for the recreation"
+            );
+        }
     }
 }
