@@ -1939,6 +1939,11 @@ async fn test_streaming_with_mcp_tool_calls() {
     let mut found_mcp_call_arguments_done = false;
     let mut found_mcp_call_done = false;
     let mut found_response_completed = false;
+    // The one change a client sees from the kept items: the `mcp_list_tools`
+    // item the stream announces and the item in the final response are the
+    // same item, with the same id.
+    let mut announced_list_tools_ids: Vec<String> = Vec::new();
+    let mut completed_list_tools_ids: Vec<String> = Vec::new();
 
     for (event_name, data) in &events {
         let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1950,6 +1955,12 @@ async fn test_streaming_with_mcp_tool_calls() {
                     if item.get("type").and_then(|v| v.as_str()) == Some("mcp_list_tools") {
                         found_mcp_list_tools = true;
                         println!("✓ Found mcp_list_tools added event");
+                        announced_list_tools_ids.push(
+                            item["id"]
+                                .as_str()
+                                .expect("the announced mcp_list_tools item carries its id")
+                                .to_string(),
+                        );
 
                         // Verify tools array is present (should be empty in added event)
                         assert!(
@@ -2058,6 +2069,14 @@ async fn test_streaming_with_mcp_tool_calls() {
             "response.completed" => {
                 found_response_completed = true;
                 println!("✓ Found response.completed event");
+                if let Some(output) = data["response"]["output"].as_array() {
+                    completed_list_tools_ids.extend(
+                        output
+                            .iter()
+                            .filter(|item| item["type"] == "mcp_list_tools")
+                            .filter_map(|item| item["id"].as_str().map(str::to_string)),
+                    );
+                }
             }
             _ => {
                 println!("  Other event: {event_type}");
@@ -2081,6 +2100,15 @@ async fn test_streaming_with_mcp_tool_calls() {
     println!("MCP call arguments done: {found_mcp_call_arguments_done}");
     println!("MCP call done: {found_mcp_call_done}");
     println!("Response completed: {found_response_completed}");
+
+    assert!(
+        !announced_list_tools_ids.is_empty(),
+        "the stream announces an mcp_list_tools item with an id"
+    );
+    assert_eq!(
+        completed_list_tools_ids, announced_list_tools_ids,
+        "the mcp_list_tools item in response.completed carries the id the stream announced"
+    );
 
     // Assert critical events are present
     assert!(
