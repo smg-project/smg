@@ -70,6 +70,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages web search result is written with its `type` (`web_search_result`) and its null
+  `page_age`, and the web search error `request_too_large` and a tool search's error result
+  (`tool_search_tool_result_error`) read, as the public API writes them. A result had been written
+  without the `type` that the public API requires of a replayed one, and each of the two errors
+  failed a whole answer or request that held it. A tool reference in a replayed tool search result
+  keeps its `cache_control`, which was dropped. Breaking: `WebSearchResultBlock` gains
+  `block_type`, `WebSearchToolResultErrorCode` gains `RequestTooLarge`, a tool search result's
+  `content` is the new `ToolSearchToolResultContent`, and `ToolReferenceBlock` gains
+  `cache_control`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
