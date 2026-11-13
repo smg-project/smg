@@ -1870,7 +1870,8 @@ fn the_decide_budget_fields_are_pinned() {
 /// The replication rejoin: `ReplicaHello` names its last applied position and
 /// the term it was written under, every batch names the write term of its
 /// events, a snapshot names the write term of the position it is consistent
-/// with, and a mismatch answers `resync_required`.
+/// with. The pin holds names, numbers and types; the mismatch answer is the
+/// conformance suite's to check.
 type ReplicaField = (&'static str, i32, Type);
 
 const REPLICA_FIELDS: &[(&str, &[ReplicaField])] = &[

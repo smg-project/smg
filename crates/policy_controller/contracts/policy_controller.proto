@@ -34,7 +34,9 @@
 // id is not the subject (the stream closes); PERMISSION_DENIED the scope or
 // role does not cover the RPC; FAILED_PRECONDITION not the leader (a
 // NotLeader in the status details), a floor above the term, a revision or
-// digest guard; INVALID_ARGUMENT a spec or registration rejected (the field
+// digest guard, or a rejoin position not held under its term (a
+// resync_required batch precedes it; the rejoin opens a new Replicate
+// stream); INVALID_ARGUMENT a spec or registration rejected (the field
 // path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
 // relay over its per-subscriber budget or a standby over its backlog (a
 // resync_required batch precedes it); UNAVAILABLE a standby not yet synced;
@@ -917,13 +919,14 @@ message ReplicaHello {
   uint64 term_seen = 3;
   // Events the standby can hold unacknowledged; the leader cuts a slower one.
   uint32 max_backlog = 4;
-  // The term the event at `last_applied_seq` was written under. A leader whose
-  // log holds that position under another term answers a resync_required
-  // batch, never a continuation: two replicas that agree on a position and its
-  // term share the prefix before it, and a WatchWorkers resume relies on that.
-  // A standby seeds both from a snapshot's `replication_seq` and
-  // `replication_term`; a non-zero `last_applied_seq` with a zero term is
-  // answered resync_required as well.
+  // The term the event at `last_applied_seq` was written under. A leader
+  // continues a standby only when its log holds `last_applied_seq` under
+  // `last_applied_term`; on another term, a position past its head, or one
+  // older than it retains, it answers a resync_required batch, never a
+  // continuation: two replicas that agree on a position and its term share
+  // the prefix before it. A standby seeds both from a snapshot's
+  // `replication_seq` and `replication_term`; a non-zero `last_applied_seq`
+  // with a zero term is answered resync_required as well.
   uint64 last_applied_term = 5;
 }
 
@@ -938,9 +941,11 @@ message ReplicationBatch {
   // records each position under its write term.
   uint64 term = 2;
   repeated ReplicationEvent events = 3;
-  // The standby's backlog was cut, or its `last_applied_seq` is held under
-  // another term: re-sync from GetSnapshot (its `replication_seq` and
-  // `replication_term` seed the next hello), then rejoin.
+  // The standby's backlog was cut, or its `last_applied_seq` is not held
+  // under `last_applied_term`: re-sync from GetSnapshot (its `replication_seq`
+  // and `replication_term` seed the next hello), then rejoin on a new
+  // Replicate stream. A standby that re-syncs ends its open WatchWorkers
+  // tails with SnapshotRequired: their positions came from the log it dropped.
   bool resync_required = 4;
 }
 
