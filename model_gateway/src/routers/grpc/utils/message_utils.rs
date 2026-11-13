@@ -664,7 +664,8 @@ fn convert_user_message(
                     InputContentBlock::Text(t) => {
                         user_parts.push(json!({"type": "text", "text": t.text}));
                     }
-                    InputContentBlock::Image(_) => {
+                    InputContentBlock::Image(image) => {
+                        file_image_refusal(image, index, position)?;
                         user_parts.push(json!({"type": "image"}));
                     }
                     // A document is prompt text for every template, not a
@@ -688,8 +689,10 @@ fn convert_user_message(
                         // sees them; `media_plan_messages` lists them at
                         // the same position, which keeps the plan aligned
                         // with the placeholders this message renders.
-                        user_parts
-                            .extend(tool_result_image_blocks(tr).map(|_| json!({"type": "image"})));
+                        for image in tool_result_image_blocks(tr) {
+                            file_image_refusal(image, index, position)?;
+                            user_parts.push(json!({"type": "image"}));
+                        }
                     }
                     // An MCP exchange belongs to the MCP loop, which no engine
                     // route runs: replayed here it is refused by name, as a
@@ -751,6 +754,12 @@ fn render_document(document: &messages::DocumentBlock, at: &str) -> Result<Strin
                  as a text or content source"
             ))
         }
+        messages::DocumentSource::File { .. } => {
+            return Err(format!(
+                "{at}: document source type 'file' is not supported; send the document \
+                 as a text or content source"
+            ))
+        }
     };
     Ok(document_text(document, text))
 }
@@ -784,6 +793,23 @@ pub(crate) fn tool_result_image_blocks(
         messages::ToolResultContentBlock::Image(image) => Some(image),
         _ => None,
     })
+}
+
+/// An image whose source is a file of the public API's Files API, which no
+/// engine route can read, refused naming the block that holds it, as a
+/// document source this gateway cannot render is; any other image passes.
+fn file_image_refusal(
+    image: &messages::ImageBlock,
+    index: usize,
+    position: usize,
+) -> Result<(), String> {
+    match image.source {
+        messages::ImageSource::File { .. } => Err(format!(
+            "messages.{index}.content.{position}: image source type 'file' is not supported; \
+             send the image as a base64 or url source"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Extract text content from a ToolResult block.
@@ -1733,6 +1759,69 @@ mod tests {
         ] {
             let err = process_message_content_format(
                 &document(source, None, None),
+                ChatTemplateContentFormat::OpenAI,
+                None,
+                MediaPartOrder::Authored,
+            )
+            .unwrap_err();
+            assert!(err.starts_with(needle), "{err}");
+        }
+    }
+
+    /// An image or document whose source is a file of the public API's Files
+    /// API, which no engine route can read, is refused naming the block that
+    /// holds it: an image, an image inside a tool result, a document.
+    #[test]
+    fn a_file_image_or_document_is_refused_naming_the_block() {
+        let file_image = || messages::ImageBlock {
+            source: messages::ImageSource::File {
+                file_id: "file_1".to_string(),
+            },
+            cache_control: None,
+        };
+        let user = |blocks: Vec<InputContentBlock>| {
+            vec![InputMessage {
+                role: Role::User,
+                content: InputContent::Blocks(blocks),
+            }]
+        };
+        let text = InputContentBlock::Text(TextBlock {
+            text: "Describe it.".to_string(),
+            cache_control: None,
+            citations: None,
+        });
+        let cases = [
+            (
+                user(vec![text, InputContentBlock::Image(file_image())]),
+                "messages.0.content.1: image source type 'file' is not supported",
+            ),
+            (
+                user(vec![InputContentBlock::ToolResult(
+                    messages::ToolResultBlock {
+                        tool_use_id: "toolu_1".to_string(),
+                        content: Some(ToolResultContent::Blocks(vec![
+                            messages::ToolResultContentBlock::Image(file_image()),
+                        ])),
+                        is_error: None,
+                        cache_control: None,
+                    },
+                )]),
+                "messages.0.content.0: image source type 'file' is not supported",
+            ),
+            (
+                document(
+                    messages::DocumentSource::File {
+                        file_id: "file_2".to_string(),
+                    },
+                    None,
+                    None,
+                ),
+                "messages.0.content.0: document source type 'file' is not supported",
+            ),
+        ];
+        for (messages, needle) in cases {
+            let err = process_message_content_format(
+                &messages,
                 ChatTemplateContentFormat::OpenAI,
                 None,
                 MediaPartOrder::Authored,

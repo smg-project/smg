@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages image or document whose source is a file uploaded through the Files API
+  (`{"type": "file", "file_id": ...}`) is accepted and forwarded as written, as the public API
+  takes it. The source was an unknown variant, which refused the whole request. The gRPC router,
+  which has no Files API to read the file from, refuses such an image or document naming the
+  block. Breaking: `ImageSource` and `DocumentSource` gain `File`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
