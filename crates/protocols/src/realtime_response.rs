@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use validator::{Validate, ValidationError};
 
 use crate::{
@@ -53,7 +53,7 @@ pub struct RealtimeResponse {
 pub struct RealtimeResponseCreateParams {
     pub audio: Option<RealtimeResponseCreateAudioOutput>,
     pub conversation: Option<ResponseConversation>,
-    pub input: Option<Vec<RealtimeConversationItem>>,
+    pub input: Option<Vec<RealtimeResponseInputItem>>,
     pub instructions: Option<String>,
     pub max_output_tokens: Option<MaxOutputTokens>,
     pub metadata: Option<HashMap<String, String>>,
@@ -211,14 +211,65 @@ pub enum ResponseConversationMode {
     None,
 }
 
+/// An item of a `response.create`'s input, as the public API takes it
+/// (`RealtimeResponseCreateParamsWithReferencesParam.input`): a conversation
+/// item, or a reference to an item already in the session by its id. A
+/// reference is taken here only, not as a new conversation item.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum RealtimeResponseInputItem {
+    ItemReference(RealtimeItemReference),
+    Item(RealtimeConversationItem),
+}
+
+/// The `type` picks the variant, so an item that is not a reference keeps
+/// its own refusals, an unknown `type` among them.
+impl<'de> Deserialize<'de> for RealtimeResponseInputItem {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let item = serde_json::Value::deserialize(deserializer)?;
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("item_reference") {
+            serde_json::from_value(item)
+                .map(Self::ItemReference)
+                .map_err(D::Error::custom)
+        } else {
+            serde_json::from_value(item)
+                .map(Self::Item)
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
+/// A reference to an item already in the session (SDK
+/// `ResponseItemReferenceParam`): `{"type": "item_reference", "id": ...}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealtimeItemReference {
+    #[serde(rename = "type")]
+    pub r#type: RealtimeItemReferenceType,
+    /// The id of an item already in the same session
+    pub id: String,
+}
+
+/// The `type` of an item reference, whose one value is `item_reference`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeItemReferenceType {
+    #[default]
+    ItemReference,
+}
+
 /// Schema-level validation
 fn validate_response_create_params(
     request: &RealtimeResponseCreateParams,
 ) -> Result<(), ValidationError> {
-    // validate role→content-part constraints per the OpenAI spec
+    // validate role→content-part constraints per the OpenAI spec; a
+    // reference names an item the session already holds
     if let Some(items) = &request.input {
         for item in items {
-            validate_conversation_item(item)?;
+            if let RealtimeResponseInputItem::Item(item) = item {
+                validate_conversation_item(item)?;
+            }
         }
     }
     Ok(())
@@ -274,5 +325,59 @@ impl RealtimeResponse {
     /// Create a builder for constructing a `RealtimeResponse`.
     pub fn builder(id: impl Into<String>) -> RealtimeResponseBuilder {
         RealtimeResponseBuilder::new(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The public API's `response.create` input may reference an item of the
+    /// session by its id beside new items (`openapi.transformed.yml`'s
+    /// example starts with one): it reads, passes the rules and is written
+    /// back as sent. A new item keeps its own rules, and a reference without
+    /// an id is refused.
+    #[test]
+    fn a_response_create_input_takes_an_item_reference() {
+        let params = json!({
+            "conversation": "none",
+            "input": [
+                {"type": "item_reference", "id": "item_12345"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Summarize the call so far."}]
+                }
+            ],
+            "output_modalities": ["text"]
+        });
+        let request: RealtimeResponseCreateParams =
+            serde_json::from_value(params.clone()).expect("a response.create with a reference");
+        assert!(request.validate().is_ok(), "a reference passes the rules");
+        assert!(matches!(
+            request.input.as_deref(),
+            Some([
+                RealtimeResponseInputItem::ItemReference(_),
+                RealtimeResponseInputItem::Item(_)
+            ])
+        ));
+        assert_eq!(serde_json::to_value(&request).expect("serialize"), params);
+
+        let refused: RealtimeResponseCreateParams = serde_json::from_value(json!({
+            "input": [{
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_audio", "audio": "AAAA"}]
+            }]
+        }))
+        .expect("parses");
+        assert!(refused.validate().is_err(), "a new item keeps its rules");
+
+        let no_id = serde_json::from_value::<RealtimeResponseCreateParams>(json!({
+            "input": [{"type": "item_reference"}]
+        }));
+        assert!(no_id.is_err(), "a reference names its item");
     }
 }
