@@ -187,8 +187,9 @@ pub struct GenerateRequest {
 impl GenerateRequest {
     /// The media fields of the request that carry something: `image_data`,
     /// `video_data` and `audio_data` when present and naming an item (a null,
-    /// an empty list, or a list of nulls and empty lists is no media, as the
-    /// engine reads it). One definition for every path that reads media.
+    /// an empty list, or a list of nulls and empty lists is no media; any
+    /// other value, an empty string included, is, as the engine reads it).
+    /// One definition for every path that reads media.
     pub fn media_fields(&self) -> Vec<&'static str> {
         [
             ("image_data", &self.image_data),
@@ -742,6 +743,18 @@ mod tests {
             request(serde_json::json!({"video_data": ["clip.mp4"], "audio_data": "a.wav"}))
                 .media_fields(),
             ["video_data", "audio_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"audio_data": ""})).media_fields(),
+            ["audio_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"audio_data": [""]})).media_fields(),
+            ["audio_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"image_data": {"url": "a.png"}})).media_fields(),
+            ["image_data"]
         );
         assert!(request(serde_json::json!({"audio_data": "a.wav"})).carries_media());
     }

@@ -103,8 +103,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - The generate route's request rule refuses an empty `text` under `prompt_empty` only when no media
   field carries an item (a media-only prompt is sent with an empty `text`, as the engine reads it);
   a body with two prompts (two of `text`, `input_ids` and `input_embeds`) is served, the engine
-  taking the embeds, then the ids, then the text, and the gateway's gRPC generate path now reads
-  them in that order too, where it read the text first and dropped the ids without a word. The
+  taking the ids over the text (and the embeds only without a text), and the gateway's gRPC
+  generate path now reads the ids before the text too, where it read the text first and dropped
+  the ids without a word. The
   request's media read (`GenerateRequest::media_fields`, `carries_media`) is one definition here,
   read by the gRPC path's media refusal as well.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
