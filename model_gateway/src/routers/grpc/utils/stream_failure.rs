@@ -240,9 +240,14 @@ impl StreamFailure {
 
     /// The prefill side's stream ended with `status` before its completion.
     pub(crate) fn prefill(status: tonic::Status) -> Self {
+        Self::prefill_after_output(status, 0)
+    }
+
+    /// A late prompt-side failure after Decode has already emitted output.
+    pub(crate) fn prefill_after_output(status: tonic::Status, completion_tokens: u32) -> Self {
         Self::Upstream {
             status,
-            completion_tokens: 0,
+            completion_tokens,
             stream: UpstreamStream::Prefill,
             rendezvous: None,
         }

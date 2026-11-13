@@ -736,6 +736,7 @@ async fn sequential_prefill_side(
         None => prefill_stream,
     };
     if let Err(e) = first_prefill_response_within(
+        false,
         &mut prefill_stream,
         bound,
         prefill_worker,
