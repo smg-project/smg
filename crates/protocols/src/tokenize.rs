@@ -39,6 +39,11 @@ pub struct TokenizeResponse {
 
     /// Character count(s) of input - single int for single input, list for batch
     pub char_count: CountResult,
+
+    /// The model's context window, as SGLang's `/tokenize` writes it: the
+    /// smallest any of the model's workers reports, or -1, SGLang's value
+    /// when there is none
+    pub max_model_len: i64,
 }
 
 /// Token IDs result - either single or batch
@@ -267,11 +272,13 @@ mod tests {
             tokens: TokensResult::Single(vec![1, 2, 3]),
             count: CountResult::Single(3),
             char_count: CountResult::Single(11),
+            max_model_len: 32768,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("[1,2,3]"));
         assert!(json.contains("\"count\":3"));
         assert!(json.contains("\"char_count\":11"));
+        assert!(json.contains("\"max_model_len\":32768"));
     }
 
     #[test]
@@ -280,6 +287,7 @@ mod tests {
             tokens: TokensResult::Batch(vec![vec![1, 2], vec![3, 4, 5]]),
             count: CountResult::Batch(vec![2, 3]),
             char_count: CountResult::Batch(vec![5, 5]),
+            max_model_len: -1,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("[[1,2],[3,4,5]]"));

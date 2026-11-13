@@ -158,8 +158,24 @@ pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Re
         tokens,
         count,
         char_count,
+        max_model_len: model_context_window(&context.worker_registry, &request.model),
     })
     .into_response()
+}
+
+/// The smallest context window the workers of `model` (an alias read as the
+/// model it names) report, as SGLang's `/tokenize` answers its own as
+/// `max_model_len`; -1, SGLang's value when there is none, when no worker
+/// reports one.
+fn model_context_window(workers: &WorkerRegistry, model: &str) -> i64 {
+    let canonical = workers.resolve_model_alias(model);
+    let model = canonical.as_deref().unwrap_or(model);
+    workers
+        .get_by_model(model)
+        .iter()
+        .filter_map(|worker| worker.context_length(model))
+        .min()
+        .map_or(-1, i64::from)
 }
 
 /// Handle POST /v1/detokenize

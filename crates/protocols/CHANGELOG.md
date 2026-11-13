@@ -94,6 +94,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `/v1/tokenize` answer carries `max_model_len`, as SGLang's `/tokenize` writes it: the smallest
+  context window any of the model's workers reports, or -1, SGLang's value when there is none.
+  SGLang's own `TokenizeResponse` refused the gateway's answer without it. Breaking:
+  `TokenizeResponse` gains `max_model_len`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
