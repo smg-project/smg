@@ -178,7 +178,7 @@ commands_of() {
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)
             local selectors
-            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller"
+            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller --features smg-policy-controller/controller"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
