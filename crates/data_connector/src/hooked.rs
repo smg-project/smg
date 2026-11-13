@@ -483,7 +483,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::StoreResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -519,7 +519,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::StoreResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -1585,6 +1585,72 @@ mod tests {
             stored.safety_identifier.as_deref(),
             Some("user-1"),
             "the rest of the record stays"
+        );
+    }
+
+    /// A hook's refusal of a conditional store is the refusal it is on a
+    /// plain store: `Rejected` with the hook's message, nothing written, no
+    /// after-hook; not the `StorageError` of a failed backend.
+    #[tokio::test]
+    async fn hooked_conditional_store_refused_by_the_hook_is_rejected() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner.clone(), hook.clone());
+        hook.set_reject("tenant quota");
+
+        let mut stored = StoredResponse::new(None);
+        stored.id = ResponseId::from("resp_1");
+        stored.raw_response = json!({"background": true, "status": "queued"});
+        let err = hooked
+            .store_response_if_open(stored)
+            .await
+            .expect_err("the hook refuses the store");
+        assert!(
+            matches!(err, ResponseStorageError::Rejected(ref msg) if msg == "tenant quota"),
+            "{err}"
+        );
+        assert_eq!(hook.before_calls(), 1);
+        assert_eq!(hook.after_calls(), 0, "nothing was written");
+        assert!(inner
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The same for a status transition: the refusal is `Rejected`, and the
+    /// object does not move.
+    #[tokio::test]
+    async fn hooked_transition_refused_by_the_hook_is_rejected() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner.clone(), hook.clone());
+        let mut stored = StoredResponse::new(None);
+        stored.id = ResponseId::from("resp_1");
+        stored.raw_response = json!({"background": true, "status": "queued"});
+        hooked.store_response(stored).await.unwrap();
+        hook.set_reject("tenant quota");
+
+        let err = hooked
+            .update_response_object_if_open(
+                &ResponseId::from("resp_1"),
+                json!({"background": true, "status": "failed"}),
+            )
+            .await
+            .expect_err("the hook refuses the transition");
+        assert!(
+            matches!(err, ResponseStorageError::Rejected(ref msg) if msg == "tenant quota"),
+            "{err}"
+        );
+        assert_eq!(hook.after_calls(), 1, "the one write before the refusal");
+        let current = inner
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.raw_response["status"], "queued",
+            "the object did not move"
         );
     }
 
