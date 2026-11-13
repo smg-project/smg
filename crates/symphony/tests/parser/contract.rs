@@ -139,6 +139,10 @@ fn hy4() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Hy4.format(), keyed_tools()))
 }
 
+fn hy_v3() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::HyV3.format(), keyed_tools()))
+}
+
 fn ling() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Ling.format(), keyed_tools()))
 }
@@ -836,6 +840,12 @@ const FORMATS: &[Subject] = &[
         new: hy4,
         outputs: HY4_OUTPUTS,
         table: Some(Table::Hy4),
+    },
+    Subject {
+        name: "hy_v3",
+        new: hy_v3,
+        outputs: HY_V3_OUTPUTS,
+        table: Some(Table::HyV3),
     },
     Subject {
         name: "ling",
@@ -1671,6 +1681,29 @@ const HY4_OUTPUTS: &[&str] = &[
     "</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
      <arg_key:opensource>city</arg_key:opensource><arg_value:opensource>a <</tool_call:opensource>\
      </tool_calls:opensource>",
+];
+
+/// Keyed arguments in Hy V3's spelling: the recorded shapes with `<tool_sep>` after the name and
+/// K2-Horizon's newlines, a cut stream, a call without arguments, prose where a call should be,
+/// a name without its separator, text after the separator.
+const HY_V3_OUTPUTS: &[&str] = &[
+    "The user asks.</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n\
+     <arg_value>Paris</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>\n\
+     <tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>Par",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>Par\
+     </tool_call>\n</tool_calls>",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>note</arg_key>\n\
+     <arg_value>null</arg_value>\n<arg_key>extra</arg_key>\n<arg_value>[1, 2]</arg_value>\n\
+     </tool_call>\n</tool_calls>",
+    "</think><tool_calls>\nprose<tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
+    "</think>Hello!",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>a <\
+     </tool_call>\n</tool_calls>",
+    "<tool_calls>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n\
+     </tool_call>\n</tool_calls>",
+    "<tool_calls>\n<tool_call>get_weather<tool_sep>prose<arg_key>city</arg_key>\n\
+     <arg_value>Paris</arg_value>\n</tool_call>\n</tool_calls>",
 ];
 
 /// Keyed arguments in Ling's spelling, with its newlines.
@@ -2750,6 +2783,10 @@ const CALLS_WITHOUT_ARGUMENTS: &[(&str, &str)] = &[
         "hy4",
         "<tool_calls:opensource><tool_call:opensource>get_weather</tool_call:opensource>\
          </tool_calls:opensource>",
+    ),
+    (
+        "hy_v3",
+        "<tool_calls>\n<tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
     ),
     ("ling", "<tool_call>get_weather\n</tool_call>"),
     ("glm", "<tool_call>get_weather</tool_call>"),

@@ -505,6 +505,86 @@ async fn chat_usage_is_the_same_streamed_and_not() {
     }
 }
 
+/// The image tokens the gateway's expansion wrote are reported on the usage
+/// chunk and on the non-streamed answer alike, beside the engine's counts; a
+/// request without them reports no image count, the shape every chat answer
+/// had.
+#[tokio::test]
+async fn chat_usage_reports_the_image_tokens_streamed_and_not() {
+    let counters = Counters {
+        prompt: 535,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let request = |stream: bool| -> ChatCompletionRequest {
+        let mut request = json!({"model": "eof-test", "messages": [], "stream": stream});
+        if stream {
+            request["stream_options"] = json!({"include_usage": true});
+        }
+        serde_json::from_value(request).expect("chat request")
+    };
+    for image_tokens in [Some(324), None] {
+        let streaming_request = request(true);
+        let mut spec = ChatResponseSpec::from(&streaming_request);
+        spec.image_tokens = image_tokens;
+        let (stream, server) = engine_stream(frames(&["hi"], 1, counters)).await;
+        let (tx, rx) = sse_channel();
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                tokenizer(),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        let streamed = usage_chunk(&events);
+
+        let whole_request = request(false);
+        let mut spec = ChatResponseSpec::from(&whole_request);
+        spec.image_tokens = image_tokens;
+        let (stream, server) = engine_stream(frames(&["hi"], 1, counters)).await;
+        let tokenizer = tokenizer();
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let (response, _) = response_processor()
+            .process_non_streaming_chat_response(
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
+                spec,
+                dispatch(),
+                tokenizer,
+                &mut decoder,
+                false,
+            )
+            .await
+            .unwrap_or_else(|response| panic!("{}", response.status()));
+        server.abort();
+        let whole = serde_json::to_value(response).expect("a JSON response")["usage"].clone();
+
+        assert_eq!(
+            streamed, whole,
+            "image tokens {image_tokens:?}: the streamed usage chunk vs the non-streamed usage"
+        );
+        assert_eq!(streamed["prompt_tokens"], 535);
+        assert_eq!(
+            streamed["prompt_tokens_details"]
+                .get("image_tokens")
+                .and_then(Value::as_u64),
+            image_tokens.map(u64::from),
+            "{streamed}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn completion_usage_is_the_same_streamed_and_not() {
     let plain = Counters {
@@ -1475,7 +1555,7 @@ fn mixed_stream_snapshot_preserves_unknown_rejected() {
             ..Default::default()
         },
     );
-    let json = serde_json::to_value(usage.snapshot(0)).unwrap();
+    let json = serde_json::to_value(usage.snapshot(0, None)).unwrap();
     assert_eq!(
         json["completion_tokens_details"]["accepted_prediction_tokens"],
         3
@@ -1576,7 +1656,7 @@ fn continuous_spec_usage_terminal_coverage_controls() {
             }))
         };
         let snapshot =
-            |tracker: &ChatStreamUsage| serde_json::to_value(tracker.snapshot(3)).unwrap();
+            |tracker: &ChatStreamUsage| serde_json::to_value(tracker.snapshot(3, None)).unwrap();
         let mut tracker = ChatStreamUsage::new(2);
         tracker.reasoning_parsed = true;
         tracker.record_reasoning(0, 3);

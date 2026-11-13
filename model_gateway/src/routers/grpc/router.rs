@@ -17,7 +17,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -47,7 +47,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    config::types::RetryConfig,
+    config::{types::RetryConfig, GroupedDpSticky},
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
     routers::{
@@ -145,6 +145,26 @@ impl GrpcRouter {
         // The gRPC request timeout bounds each attempt's calls to its workers
         // and the streams they open; zero, the default, arms no deadline.
         let request_timeout = Duration::from_secs(ctx.router_config.grpc_request_timeout_secs);
+        // `--grouped-dp-sticky`: a sticky request to a grouped data-parallel
+        // worker is pinned to one of its engines at dispatch, and a
+        // disaggregated one to an engine of its grouped prefill worker
+        // through its bootstrap room. EPD requests are not pinned, so only
+        // the regular and PD routers announce the setting.
+        let grouped_dp_sticky = ctx.router_config.grouped_dp_sticky;
+        if grouped_dp_sticky != GroupedDpSticky::Off {
+            match mode {
+                Mode::Regular => info!(
+                    grouped_dp_sticky = grouped_dp_sticky.as_str(),
+                    "Sticky keys are pinned to the engines of grouped data-parallel workers"
+                ),
+                Mode::PrefillDecode => info!(
+                    grouped_dp_sticky = grouped_dp_sticky.as_str(),
+                    "Sticky keys are pinned to the engines of grouped data-parallel prefill \
+                     workers through their bootstrap rooms"
+                ),
+                Mode::EncodePrefillDecode => {}
+            }
+        }
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -157,7 +177,8 @@ impl GrpcRouter {
             ctx.rate_limit_manager.clone(),
             queue_timeout,
         )
-        .with_request_timeout(request_timeout);
+        .with_request_timeout(request_timeout)
+        .with_grouped_dp_sticky(grouped_dp_sticky);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
@@ -167,7 +188,8 @@ impl GrpcRouter {
             ctx.rate_limit_manager.clone(),
             queue_timeout,
         )
-        .with_request_timeout(request_timeout);
+        .with_request_timeout(request_timeout)
+        .with_grouped_dp_sticky(grouped_dp_sticky);
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)

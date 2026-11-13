@@ -588,6 +588,10 @@ impl Tokenizer for CachedTokenizer {
         self.inner.native_thinking_mode(template_kwargs, thinking)
     }
 
+    fn template_reads(&self, name: &str) -> bool {
+        self.inner.template_reads(name)
+    }
+
     fn eos_token_ids(&self) -> &[TokenIdType] {
         self.inner.eos_token_ids()
     }

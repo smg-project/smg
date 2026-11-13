@@ -159,6 +159,13 @@ impl ChatRequestBuildingStage {
         };
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
+        // The image tokens the expansion wrote into the prompt, read before
+        // the plan's assembly takes the intermediate; the usage reports them.
+        let image_tokens = ctx
+            .state
+            .multimodal_intermediate
+            .as_ref()
+            .and_then(|intermediate| intermediate.image_prompt_tokens());
         // The model's profile as preparation derived it, read by the
         // reasoning decision, the plan and the response spec below.
         let provider = ctx
@@ -227,6 +234,7 @@ impl ChatRequestBuildingStage {
         // Only the client-facing usage drops them; settlement keeps the engine's count.
         let mut spec = ChatResponseSpec::for_request(chat_request.as_ref(), provider);
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
+        spec.image_tokens = image_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
         spec.parser_names.clone_from(&ctx.state.parser_names);
@@ -278,10 +286,12 @@ mod tests {
     use super::*;
     use crate::routers::grpc::{
         context::{ClientSelection, ExecutionPlanKind},
+        multimodal::{single_image_intermediate, MultimodalIntermediate},
         proto_wrapper::ProtoRequest,
         regular::stages::testing::{
             assert_fixed_request_plan, components, mock_backend_client, FORCED_CALL_TAG,
         },
+        ProcessedMessages,
     };
 
     const MODEL: &str = "test-model";
@@ -327,6 +337,61 @@ mod tests {
         engine.abort();
         assert!(!reasoning_in_prefill);
         assert_fixed_request_plan(&plan, &stamp, "chatcmpl-");
+    }
+
+    /// The handoff the usage depends on, through the stage's own entry: the
+    /// image tokens the expansion wrote sit on the state's intermediate,
+    /// request building reads them before the plan's assembly takes the
+    /// intermediate, and the chat spec carries them; with no intermediate
+    /// the spec carries none.
+    #[tokio::test]
+    async fn the_spec_carries_the_image_tokens_the_intermediate_holds() {
+        for image_tokens in [Some(326_u32), None] {
+            let (client, engine) = mock_backend_client(MODEL).await;
+            let chat: Arc<ChatCompletionRequest> = Arc::new(
+                serde_json::from_value(json!({
+                    "model": MODEL, "max_tokens": 7,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .expect("a chat request"),
+            );
+            let mut ctx =
+                RequestContext::for_chat(Arc::clone(&chat), None, MODEL.to_string(), components());
+            ctx.state.clients = Some(ClientSelection::Single { client });
+            ctx.state.preparation = Some(PreparationOutput::Chat {
+                token_ids: vec![1, 2, 3],
+                processed_messages: ProcessedMessages {
+                    text: "<prompt>".to_string(),
+                    unbilled_prompt_tokens: 0,
+                    continued_final_message: false,
+                    generation_prompt: true,
+                },
+                tool_constraints: Ok(symphony::Prepared::None),
+            });
+            ctx.state.multimodal_intermediate = image_tokens.map(|count| {
+                MultimodalIntermediate::try_new(vec![single_image_intermediate()])
+                    .expect("one image batch")
+                    .with_image_prompt_tokens(Some(count))
+            });
+            let stage = ChatRequestBuildingStage::new(PlanSettings {
+                inject_pd_metadata: false,
+                plan_kind: ExecutionPlanKind::Single,
+            });
+            let built = stage
+                .build_plan(&mut ctx)
+                .await
+                .map_err(|refusal| refusal.status())
+                .expect("built");
+            engine.abort();
+            let ResponseSpec::Chat(spec) = built.spec else {
+                panic!("a chat spec");
+            };
+            assert_eq!(spec.image_tokens, image_tokens);
+            assert!(
+                ctx.state.multimodal_intermediate.is_none(),
+                "the plan's assembly took the intermediate after the read"
+            );
+        }
     }
 
     /// The set-aside reaches the builder through the shared sequence: the
