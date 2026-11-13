@@ -1235,7 +1235,10 @@ fn is_content_empty(content: &Content) -> bool {
         | Content::UrlContextResult { call_id, .. }
         | Content::GoogleSearchResult { call_id, .. } => is_option_blank(call_id.as_ref()),
         // A user input step is empty as a turn is: without content, or with
-        // an empty item. A model output step that ended with an error is not.
+        // an empty item. A model output step is the model's own turn,
+        // replayed as written, so it is empty only with neither content nor
+        // an error: an empty item in it, which a model may well have written,
+        // is not refused.
         Content::UserInput { content } => content
             .as_ref()
             .is_none_or(|contents| contents.is_empty() || contents.iter().any(is_content_empty)),
@@ -1312,6 +1315,34 @@ mod tests {
         let errors = empty.validate().expect_err("an empty step").to_string();
         assert!(
             errors.contains("Input content array contains empty content items"),
+            "{errors}"
+        );
+
+        let bare: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"type": "model_output"}], "store": false
+        }))
+        .unwrap();
+        let errors = bare
+            .validate()
+            .expect_err("a bare model output")
+            .to_string();
+        assert!(
+            errors.contains("Input content array contains empty content items"),
+            "{errors}"
+        );
+
+        let nested_file_search: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": [{"type": "user_input", "content": [{"type": "file_search_call", "id": "fs_1"}]}],
+            "store": false
+        }))
+        .unwrap();
+        let errors = nested_file_search
+            .validate()
+            .expect_err("a file search inside a step")
+            .to_string();
+        assert!(
+            errors.contains("file_search_content_not_supported"),
             "{errors}"
         );
     }
