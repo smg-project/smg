@@ -37,9 +37,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - `ValidatedJson` refuses a body under a `Content-Encoding` the gateway does not decode (any but
   `identity`, in whichever field of a repeated header or position of a comma-separated list it
   stands) before it reads the body, as a `415` in the gateway's JSON error envelope (`error.code`
-  `json_parse_error`, the encoding named in the message) with `Accept-Encoding: identity`; it
-  parsed the compressed bytes as JSON and
-  refused them as a `400` with a syntax error. `undecodable_content_encoding`,
+  `json_parse_error`, the encoding named in the message, at most 64 characters of it, a longer
+  one cut and marked with `...`) with `Accept-Encoding: identity`; it parsed the compressed bytes
+  as JSON and refused them as a `400` with a syntax error. `undecodable_content_encoding`,
   `content_encoding_message` and `with_accept_encoding_identity`, behind the `axum` feature, are
   the header's reading, the message and the answer's header, shared with the gateway's
   control-plane JSON extractor, which answers the same.
