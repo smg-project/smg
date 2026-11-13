@@ -58,8 +58,8 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
             .chain(&context.data.removed_workers)
             .collect();
         let mut released = 0usize;
-        for model_id in Self::candidates(app_context, &removed) {
-            if Self::release(app_context, &model_id) {
+        for (model_id, entry_id) in Self::candidates(app_context, &removed) {
+            if Self::release(app_context, &model_id, &entry_id) {
                 released += 1;
             }
         }
@@ -81,8 +81,9 @@ impl ReleaseTokenizerStep {
     /// worker of either wire (the registration step loads under the primary
     /// alone; a model served over both wires keeps its entry until its last
     /// worker of either leaves), served by no worker any more, whose entry a
-    /// worker's registration loaded.
-    fn candidates(app_context: &AppContext, removed: &[&Arc<dyn Worker>]) -> Vec<String> {
+    /// worker's registration loaded; with that entry's id, the one the
+    /// release takes (an entry that replaces it under the name is not).
+    fn candidates(app_context: &AppContext, removed: &[&Arc<dyn Worker>]) -> Vec<(String, String)> {
         let mut asked: HashSet<String> = HashSet::new();
         let mut candidates = Vec::new();
         for worker in removed {
@@ -103,22 +104,24 @@ impl ReleaseTokenizerStep {
                 );
                 continue;
             }
-            candidates.push(model_id);
+            candidates.push((model_id, entry.id));
         }
         candidates
     }
 
-    /// Removes the model's entry and the multimodal config keyed by it, unless
-    /// a worker of the model appeared since the candidates were read (its
-    /// registration's tokenizer job read the entry as already loaded): then
+    /// Removes the entry inspected under the model's name, by its id (an entry
+    /// that replaced it under the name since the look, an operator's say, is
+    /// not taken), and the multimodal config keyed by it, unless a worker of
+    /// the model appeared since the candidates were read (its registration's
+    /// tokenizer job read the entry as already loaded): then
     /// the entry goes back as it was, under its own id, and the config stays
     /// (see [`Self::put_back`] for the job that loaded afresh instead). The
     /// put-back runs on its own task: its wait on the registry's per-name
     /// lock, which a registration's load of the same name may hold for its
     /// whole load, is not the step's budget to cut, and a step cut with the
     /// removed entry in hand would lose it. Whether the entry left.
-    fn release(app_context: &Arc<AppContext>, model_id: &str) -> bool {
-        let Some(entry) = app_context.tokenizer_registry.remove(model_id) else {
+    fn release(app_context: &Arc<AppContext>, model_id: &str, entry_id: &str) -> bool {
+        let Some(entry) = app_context.tokenizer_registry.remove_by_id(entry_id) else {
             return false;
         };
         if app_context.worker_registry.contains_model(model_id) {
@@ -183,17 +186,20 @@ impl ReleaseTokenizerStep {
     /// last worker while its registration's load ran (that removal's release
     /// found no entry to take), so a model no worker serves any more loses
     /// the entry under its name again, config and record with it, when a
-    /// worker's registration loaded it. The per-name lock orders the insert
-    /// before any later removal's remove, so this look closes the window.
+    /// worker's registration loaded it: that entry and no replacement (the
+    /// release takes it by id). The per-name lock orders the insert before
+    /// any later removal's remove, so this look closes the window.
     pub(crate) fn release_if_unserved(app_context: &Arc<AppContext>, model_id: &str) {
         if app_context.worker_registry.contains_model(model_id) {
             return;
         }
-        let loaded_by_a_worker = app_context
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .is_some_and(|entry| app_context.worker_loaded_tokenizers.contains(&entry.id));
-        if loaded_by_a_worker && Self::release(app_context, model_id) {
+        let Some(entry) = app_context.tokenizer_registry.get_by_name(model_id) else {
+            return;
+        };
+        if !app_context.worker_loaded_tokenizers.contains(&entry.id) {
+            return;
+        }
+        if Self::release(app_context, model_id, &entry.id) {
             debug!(
                 model = %model_id,
                 "Released the tokenizer of a model whose last worker left while it was put back or loaded"
@@ -539,12 +545,12 @@ mod tests {
         remove_from_registries(&app_context, Arc::clone(&first)).await;
 
         let candidates = ReleaseTokenizerStep::candidates(&app_context, &[&first]);
-        assert_eq!(candidates, vec!["m".to_string()]);
+        assert_eq!(candidates, vec![("m".to_string(), id.clone())]);
         // The registration that lands now: its worker, then its tokenizer job.
         worker(&app_context, "http://w2:8000", "m", "/tok/m");
         worker_tokenizer(&app_context, "m", "/tok/m").await;
 
-        assert!(!ReleaseTokenizerStep::release(&app_context, "m"));
+        assert!(!ReleaseTokenizerStep::release(&app_context, "m", &id));
         settle().await;
         let entry = app_context.tokenizer_registry.get_by_name("m").unwrap();
         assert_eq!(entry.id, id, "the entry went back as it was");
@@ -662,7 +668,7 @@ mod tests {
         remove_from_registries(&app_context, Arc::clone(&first)).await;
         assert_eq!(
             ReleaseTokenizerStep::candidates(&app_context, &[&first]),
-            vec!["m".to_string()]
+            vec![("m".to_string(), old.clone())]
         );
 
         // The release's remove; the registration that lands now (its worker,
@@ -812,5 +818,33 @@ mod tests {
         ReleaseTokenizerStep::release_if_unserved(&app_context, "m");
         assert_eq!(app_context.tokenizer_registry.len(), 0, "the entry left");
         assert!(!app_context.worker_loaded_tokenizers.contains(&id));
+    }
+
+    /// A replacement registered under the model's name between the release's
+    /// look and its remove (a competing removal took the worker's entry and
+    /// its record, then an operator registered one of their own): the
+    /// release takes the entry it inspected, by id, and the replacement
+    /// stays.
+    #[tokio::test]
+    async fn a_replacement_registered_between_the_look_and_the_release_stays() {
+        let app_context = app_context();
+        let only = worker(&app_context, "http://w1:8000", "m", "/tok/m");
+        worker_tokenizer(&app_context, "m", "/tok/m").await;
+        let id = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
+        remove_from_registries(&app_context, Arc::clone(&only)).await;
+        let candidates = ReleaseTokenizerStep::candidates(&app_context, &[&only]);
+        assert_eq!(candidates, vec![("m".to_string(), id.clone())]);
+
+        // The competing removal's release takes the worker's entry and its
+        // record; an operator registers a replacement under the name.
+        app_context.tokenizer_registry.remove_by_id(&id).unwrap();
+        app_context.worker_loaded_tokenizers.remove(&id);
+        tokenizer(&app_context, "m", "/tok/operator").await;
+        let replacement = app_context.tokenizer_registry.get_by_name("m").unwrap().id;
+
+        assert!(!ReleaseTokenizerStep::release(&app_context, "m", &id));
+        let entry = app_context.tokenizer_registry.get_by_name("m").unwrap();
+        assert_eq!(entry.id, replacement, "the operator's replacement stays");
+        assert!(!app_context.worker_loaded_tokenizers.contains(&replacement));
     }
 }

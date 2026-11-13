@@ -482,6 +482,17 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
         assert!(Instant::now() < deadline, "the tokenizer did not register");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // The entry the step's load registered is the worker's: the release
+    // step takes it with the model's last worker.
+    let id = ctx
+        .tokenizer_registry
+        .get_by_name("m")
+        .expect("registered")
+        .id;
+    assert!(
+        ctx.worker_loaded_tokenizers.contains(&id),
+        "the entry a worker's registration loaded is the worker's"
+    );
 
     let response = router
         .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
