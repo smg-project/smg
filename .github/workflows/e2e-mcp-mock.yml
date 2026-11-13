@@ -8,6 +8,7 @@ on:
       - e2e_test/pyproject.toml
       - scripts/ci_install_e2e_deps.sh
       - scripts/ci_setup_sglang_rocm_image.sh
+      - scripts/ci_verify_sglang_rocm_cohort.py
       - scripts/tests/test_ci_engine_http_dependencies.py
       - .github/workflows/e2e-mcp-mock.yml
 
