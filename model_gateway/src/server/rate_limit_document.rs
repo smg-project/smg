@@ -38,8 +38,10 @@ const RESOURCE: &str = "rate-limits/tenants";
 /// the named-origin CORS policy exposes both to browser clients.
 pub(super) const REVISION_HEADER: HeaderName = HeaderName::from_static("x-smg-config-revision");
 
-/// `?dry_run=true` on a write.
+/// `?dry_run=true` on a write. Any other key is refused by name, so a
+/// misspelt dry run never applies the document it meant to preview.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteQuery {
     #[serde(default)]
     dry_run: bool,
@@ -325,6 +327,14 @@ mod tests {
         })
     }
 
+    /// The JSON body of `response`.
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body read");
+        serde_json::from_slice(&bytes).expect("a JSON body")
+    }
+
     /// A write of `document` against `etag` by the admin principal `ops`,
     /// as the control-plane gate hands it to the handler.
     fn write(path: &str, etag: &str, document: &str) -> Request {
@@ -408,5 +418,43 @@ mod tests {
             assert_eq!(manager.document().map(|live| live.revision), Some(2));
             assert!(logs_contain("principal=ops"));
         });
+    }
+
+    /// A dry-run key spelt any other way is refused by name with nothing
+    /// applied: a current `If-Match` and a valid document ride along, and the
+    /// revision stays where it was.
+    #[tokio::test]
+    async fn a_misspelt_dry_run_key_is_refused_by_name_and_applies_nothing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let state = documented_state(dir.path());
+        let manager = Arc::clone(
+            state
+                .context
+                .rate_limit_manager
+                .as_ref()
+                .expect("a tenant rate limiter"),
+        );
+        let live = manager.document().expect("the start's document");
+        for key in ["dryRun", "dry-run", "dryrun"] {
+            let refused = put(
+                State(Arc::clone(&state)),
+                write(
+                    &format!("/rate-limits/tenants?{key}=true"),
+                    &live.etag,
+                    NEXT,
+                ),
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{key}");
+            let body = body_json(refused).await;
+            assert_eq!(body["code"], "BAD_REQUEST", "{key}: {body}");
+            let error = body["error"].as_str().expect("an error message");
+            assert!(error.contains(key), "{key}: {error}");
+            assert_eq!(
+                manager.document().expect("the document").revision,
+                1,
+                "{key} applied the document"
+            );
+        }
     }
 }
