@@ -2,9 +2,10 @@
 //! engine family (the client crate's public clients, the same `GetLoads`
 //! the gateway asks, answers normalised by the same conversions), kept per
 //! endpoint and family across polls and dropped on a transport failure so
-//! the next poll redials, and one HTTP client for the scrape.
+//! the next poll redials, and one HTTP client for the scrape, built at the
+//! first one.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::OnceLock, time::Duration};
 
 use openai_protocol::worker::{RuntimeType, WorkerLoadResponse};
 use parking_lot::Mutex;
@@ -15,13 +16,18 @@ use smg_grpc_client::{
 };
 use tokio::time::timeout;
 use tonic::Code;
+use tracing::error;
 
 use super::loads::{LoadProbe, ReadError, Target};
 
 /// The engines' probe.
 pub struct EngineProbe {
     clients: Mutex<HashMap<String, Family>>,
-    http: reqwest::Client,
+    /// The scrape's client, built at the first scrape: building it reads the
+    /// system's certificates, a few milliseconds and their memory that a
+    /// fleet of servicers alone never needs. The build is tried once: a
+    /// failure is kept as the text every later scrape fails with.
+    http: OnceLock<Result<reqwest::Client, String>>,
 }
 
 /// One connected client, by family.
@@ -131,13 +137,62 @@ fn failed(error: reqwest::Error, timeout: Duration) -> ReadError {
     }
 }
 
+/// A refused `GetLoads` as a failed read. A failure below gRPC and an engine
+/// that could not be reached (the channel's `UNAVAILABLE` over a refused or
+/// timed-out dial) are the transport's; any other status is the engine's
+/// answer. The text is the status's own and names no address.
+fn refused(status: &tonic::Status) -> ReadError {
+    if is_transport_failure(status) || status.code() == Code::Unavailable {
+        ReadError::Transport(status.message().to_owned())
+    } else {
+        ReadError::Answer(format!("{:?}: {}", status.code(), status.message()))
+    }
+}
+
+impl Default for EngineProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EngineProbe {
-    /// A probe with no connection yet.
-    pub fn new() -> Result<Self, reqwest::Error> {
-        Ok(Self {
+    /// A probe with no connection and no HTTP client yet.
+    pub fn new() -> Self {
+        Self {
             clients: Mutex::new(HashMap::new()),
-            http: http_client()?,
-        })
+            http: OnceLock::new(),
+        }
+    }
+
+    /// The scrape's client, built by the first scrape, once a process. A
+    /// client that cannot be built is a fault of this host (its
+    /// certificates, its TLS provider), not of an engine, and it does not
+    /// pass by itself: where the client was built at the start, the
+    /// controller refused to start. Built here, the failure writes one error
+    /// line with its cause and is kept: every scrape after it is a transport
+    /// failure with that cause, and none builds again.
+    fn http(&self) -> Result<&reqwest::Client, ReadError> {
+        self.http_built_by(http_client)
+    }
+
+    /// [`Self::http`] over the function that builds the client.
+    fn http_built_by(
+        &self,
+        build: impl FnOnce() -> Result<reqwest::Client, reqwest::Error>,
+    ) -> Result<&reqwest::Client, ReadError> {
+        self.http
+            .get_or_init(|| {
+                build().map_err(|failure| {
+                    let cause = format!("{failure:?}");
+                    error!(
+                        %cause,
+                        "the scrape's HTTP client could not be built: scraping is off for the life of this process"
+                    );
+                    format!("no HTTP client: {cause}")
+                })
+            })
+            .as_ref()
+            .map_err(|kept| ReadError::Transport(kept.clone()))
     }
 
     /// The client of the target's endpoint, dialed on the first poll and
@@ -175,16 +230,7 @@ impl LoadProbe for EngineProbe {
     ) -> Result<WorkerLoadResponse, ReadError> {
         let call = async {
             let client = self.client(target).await?;
-            // A failure below gRPC and an engine that could not be reached
-            // (the channel's `UNAVAILABLE` over a refused or timed-out dial)
-            // are the transport's; any other status is the engine's answer.
-            client.get_loads().await.map_err(|status| {
-                if is_transport_failure(&status) || status.code() == Code::Unavailable {
-                    ReadError::Transport(status.message().to_owned())
-                } else {
-                    ReadError::Answer(format!("{:?}: {}", status.code(), status.message()))
-                }
-            })
+            client.get_loads().await.map_err(|status| refused(&status))
         };
         let outcome = match timeout(deadline, call).await {
             Ok(outcome) => outcome,
@@ -203,7 +249,7 @@ impl LoadProbe for EngineProbe {
 
     async fn scrape(&self, url: &str, timeout: Duration) -> Result<String, ReadError> {
         let response = self
-            .http
+            .http()?
             .get(format!("{}/metrics", url.trim_end_matches('/')))
             .timeout(timeout)
             .send()
@@ -226,7 +272,10 @@ impl LoadProbe for EngineProbe {
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
+    use std::{
+        io::ErrorKind,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use tokio::{net::TcpListener, task::JoinSet};
 
@@ -277,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_that_stalls_past_the_timeout_is_a_deadline_like_headers_that_never_came() {
         let (url, _held) = stalled_body().await;
-        let probe = EngineProbe::new().expect("an HTTP client");
+        let probe = EngineProbe::new();
         let timeout = Duration::from_millis(300);
 
         let read = probe.scrape(&url, timeout).await;
@@ -285,6 +334,116 @@ mod tests {
         assert!(
             matches!(read, Err(ReadError::Deadline(bound)) if bound == timeout),
             "{read:?}"
+        );
+    }
+
+    /// A metrics server that takes the connection and never answers: the
+    /// address to scrape, and the set whose task holds the socket open until
+    /// the set is dropped.
+    async fn silent() -> (String, JoinSet<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        let mut held = JoinSet::new();
+        held.spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("the scrape's connection");
+            std::future::pending::<()>().await;
+        });
+        (url, held)
+    }
+
+    #[tokio::test]
+    async fn headers_that_never_come_within_the_timeout_are_a_deadline() {
+        let (url, _held) = silent().await;
+        let probe = EngineProbe::new();
+        let timeout = Duration::from_millis(300);
+
+        let read = probe.scrape(&url, timeout).await;
+
+        assert!(
+            matches!(read, Err(ReadError::Deadline(bound)) if bound == timeout),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_http_client_is_built_by_the_first_scrape_not_with_the_probe() {
+        let probe = EngineProbe::new();
+        assert!(probe.http.get().is_none(), "a new probe has no client");
+
+        // A closed port: the scrape fails on the transport, and has built the
+        // client to find that out.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        drop(listener);
+        let read = probe.scrape(&url, Duration::from_secs(5)).await;
+
+        assert!(matches!(read, Err(ReadError::Transport(_))), "{read:?}");
+        assert!(matches!(probe.http.get(), Some(Ok(_))), "the client, built");
+    }
+
+    /// A client that cannot be built is tried once: the failure is kept, and
+    /// every scrape after it is a transport failure with the same cause that
+    /// asks the builder nothing.
+    #[tokio::test]
+    async fn a_client_that_cannot_be_built_is_tried_once_and_its_failure_kept() {
+        let probe = EngineProbe::new();
+        let builds = AtomicUsize::new(0);
+        // A user agent that is no header value: the builder refuses it.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a builder the test refuses: no client is built"
+        )]
+        let refused = || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            reqwest::Client::builder().user_agent("no\nheader").build()
+        };
+
+        let first = probe.http_built_by(refused).map(|_client| ());
+        let second = probe.http_built_by(refused).map(|_client| ());
+
+        assert!(
+            matches!(&first, Err(ReadError::Transport(text)) if text.starts_with("no HTTP client: ")),
+            "{first:?}"
+        );
+        assert_eq!(
+            format!("{first:?}"),
+            format!("{second:?}"),
+            "the kept failure"
+        );
+        assert_eq!(builds.load(Ordering::Relaxed), 1, "built once");
+
+        // A scrape answers the kept failure: it reaches no builder and no
+        // engine.
+        let read = probe
+            .scrape("http://127.0.0.1:9", Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(&read, Err(ReadError::Transport(text)) if text.starts_with("no HTTP client: ")),
+            "{read:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_call_is_written_in_the_status_own_words() {
+        let unreachable = refused(&tonic::Status::unavailable("tcp connect error"));
+        assert!(
+            matches!(&unreachable, ReadError::Transport(text) if text == "tcp connect error"),
+            "{unreachable:?}"
+        );
+        let answered = refused(&tonic::Status::unimplemented("no such method"));
+        assert!(
+            matches!(&answered, ReadError::Answer(text) if text == "Unimplemented: no such method"),
+            "{answered:?}"
         );
     }
 }

@@ -208,7 +208,7 @@ const TEN: Duration = Duration::from_secs(10);
 /// One tick, then every call it started lands: the fake engines answer at
 /// once, so the test reads the rows the tick asked for.
 async fn tick(driver: &LoadDriver<MemoryStore, FakeProbe>, schedule: &mut Schedule) {
-    driver.tick(schedule);
+    driver.tick(schedule, tokio::time::Instant::now());
     while let Some(joined) = schedule.calls.join_next().await {
         driver.land(&mut schedule.due, joined);
     }
@@ -523,6 +523,73 @@ async fn a_failed_poll_leaves_the_row_on_file_and_counts() {
     assert_eq!(stats.rows.load(Ordering::Relaxed), 1);
 }
 
+/// A polled usage that is not a number is no row for its rank: converted it
+/// reads zero, and the engine nobody knows the pressure of would look idle.
+/// The rank beside it keeps its own row, and the poll counts once as one
+/// that carried no load, however many ranks it left without a row.
+#[tokio::test(start_paused = true)]
+async fn a_polled_usage_that_is_not_a_number_writes_no_row_for_its_rank() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let rank0 = ready(
+        &store,
+        "grpc://b:1@0",
+        "grpc://b:1",
+        0,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    let rank1 = ready(
+        &store,
+        "grpc://b:1@1",
+        "grpc://b:1",
+        1,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    let figures = |running, usage| Figures {
+        running,
+        waiting: 0,
+        usage,
+    };
+    probe.answers("grpc://b:1", &[figures(7, f64::NAN), figures(2, 0.2)]);
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    tick(&driver, &mut schedule).await;
+
+    assert!(row(&store, rank0, 0).is_none(), "no row at zero usage");
+    let (beside, source) = row(&store, rank1, 1).expect("the rank beside it");
+    assert_eq!(
+        (beside.running, beside.kv_usage_permille, source),
+        (2, 200, LoadSource::Poll)
+    );
+    let stats = driver.stats();
+    assert_eq!(stats.rows.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.poll_failures.no_load.load(Ordering::Relaxed), 1);
+
+    // Both ranks without a number: the row on file stands, and the poll is
+    // one poll.
+    probe.answers(
+        "grpc://b:1",
+        &[figures(7, f64::NEG_INFINITY), figures(9, f64::INFINITY)],
+    );
+    tokio::time::advance(TEN + Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+
+    assert_eq!(probe.polls().len(), 2);
+    assert!(row(&store, rank0, 0).is_none());
+    assert_eq!(
+        row(&store, rank1, 1).map(|(row, _)| row.running),
+        Some(2),
+        "the old row stands"
+    );
+    assert_eq!(stats.rows.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.poll_failures.no_load.load(Ordering::Relaxed), 2);
+}
+
 #[tokio::test(start_paused = true)]
 async fn rows_the_controller_never_dials_are_not_polled() {
     let store = Arc::new(MemoryStore::new());
@@ -688,6 +755,41 @@ async fn a_scrape_whose_kv_usage_is_not_a_number_writes_no_row() {
     assert_eq!(stats.rows.load(Ordering::Relaxed), 0);
 }
 
+/// Two samples of the usage gauge, each a number, whose mean is not one. The
+/// parser reads one sample at a time and keeps both; the conversion refuses
+/// the row, and the scrape counts as a body without its load.
+#[tokio::test(start_paused = true)]
+async fn a_scrape_whose_usage_samples_do_not_average_to_a_number_writes_no_row() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let id = ready(
+        &store,
+        "http://h:1",
+        "http://h:1",
+        0,
+        1,
+        WireModes::HTTP,
+        500,
+    );
+    probe.texts.lock().insert(
+        "http://h:1".to_owned(),
+        "vllm:num_requests_running{model_name=\"m\"} 3\n\
+         vllm:kv_cache_usage_perc{model_name=\"m\"} 1.7e308\n\
+         vllm:kv_cache_usage_perc{model_name=\"n\"} 1.7e308\n"
+            .to_owned(),
+    );
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    tick(&driver, &mut schedule).await;
+
+    assert!(row(&store, id, 0).is_none(), "no row at a made-up usage");
+    let stats = driver.stats();
+    assert_eq!(stats.scrape_failures.no_load.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.scrapes.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.rows.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_two_rank_engine_without_a_servicer_has_no_row_after_a_scrape_tick_and_a_one_rank_engine_has_its_row(
 ) {
@@ -782,6 +884,122 @@ async fn a_two_rank_engine_without_a_servicer_has_no_row_after_a_scrape_tick_and
     );
 }
 
+/// A ready HTTP engine of one rank with a scrape interval on its row, of the
+/// family `kind` names.
+fn scraped(store: &MemoryStore, key: &str, kind: &str) -> WorkerId {
+    let id = store
+        .upsert(WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            role: Role::Single,
+            wire_modes: WireModes::HTTP,
+            engine_kind: kind.to_owned(),
+            models: vec!["m".to_owned()],
+            dp_rank: 0,
+            dp_size: 1,
+            signals: Signals {
+                events: false,
+                loads: false,
+                scrape_interval_ms: 500,
+            },
+            ..WorkerFacts::default()
+        })
+        .id();
+    let revision = store.get(id).expect("the row").revision;
+    store.set_status(id, WorkerStatus::Ready, revision);
+    id
+}
+
+/// A family without a gauge table has nothing a scrape could read, and
+/// neither has an engine whose family is unnamed or unknown: none is asked,
+/// where a body fetched every interval would only count as one without its
+/// load.
+#[tokio::test(start_paused = true)]
+async fn an_engine_whose_family_has_no_gauge_table_is_not_scraped() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let read = scraped(&store, "http://v:1", RuntimeType::Vllm.as_str());
+    let others = [
+        scraped(&store, "http://g:1", RuntimeType::Generic.as_str()),
+        scraped(&store, "http://u:1", ""),
+        scraped(&store, "http://x:1", "no such family"),
+    ];
+    for url in ["http://v:1", "http://g:1", "http://u:1", "http://x:1"] {
+        probe
+            .texts
+            .lock()
+            .insert(url.to_owned(), METRICS_TEXT.to_owned());
+    }
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    tick(&driver, &mut schedule).await;
+    tokio::time::advance(Duration::from_millis(500)).await;
+    tick(&driver, &mut schedule).await;
+
+    assert_eq!(*probe.scrapes.lock(), vec!["http://v:1", "http://v:1"]);
+    assert!(row(&store, read, 0).is_some());
+    for id in others {
+        assert!(row(&store, id, 0).is_none());
+    }
+    let stats = driver.stats();
+    assert_eq!(stats.scrapes.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.scrape_failures.no_load.load(Ordering::Relaxed), 0);
+}
+
+/// A scrape that came due while the rank's own records served it stays due:
+/// the first tick after they go quiet takes it, however long the scrape
+/// interval. Were the due instant moved at the suppressed tick, the engine
+/// would wait a scrape interval more without a row.
+#[tokio::test(start_paused = true)]
+async fn a_scrape_due_while_the_records_were_fresh_goes_out_at_the_first_tick_they_are_stale() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    // The scrape interval, 30 s, is longer than the freshness bound, 10 s.
+    let id = ready(
+        &store,
+        "http://h:1",
+        "http://h:1",
+        0,
+        1,
+        WireModes::HTTP,
+        30_000,
+    );
+    probe
+        .texts
+        .lock()
+        .insert("http://h:1".to_owned(), METRICS_TEXT.to_owned());
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    tick(&driver, &mut schedule).await;
+    assert_eq!(probe.scrapes.lock().len(), 1);
+
+    tokio::time::advance(Duration::from_millis(29_900)).await;
+    let own = LoadRow {
+        running: 1,
+        source: SignalSource::Events,
+        ..LoadRow::default()
+    };
+    store.record(id, 0, own, now(), LoadSource::Stream);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(
+        probe.scrapes.lock().len(),
+        1,
+        "due, and the rank's own records serve it: no call"
+    );
+
+    tokio::time::advance(TEN).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(
+        probe.scrapes.lock().len(),
+        2,
+        "the records went quiet: the due scrape goes out at this tick"
+    );
+}
+
 /// A record that arrives while the scrape is out is the rank's row: the
 /// scrape's sample is dropped, and it is not counted as a scrape that
 /// produced a row.
@@ -806,8 +1024,8 @@ async fn a_scrape_that_lands_after_the_ranks_own_record_writes_no_row_and_is_not
     let driver = driver(&store, &probe, TEN);
     let mut schedule = Schedule::default();
 
-    driver.tick(&mut schedule);
-    tokio::task::yield_now().await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
     assert_eq!(probe.scrapes.lock().len(), 1, "the scrape is out");
     let own = LoadRow {
         running: 1,
@@ -908,6 +1126,71 @@ async fn run_ticks_until_told_to_stop() {
     assert!(tasks.is_empty());
 }
 
+/// Lets the loop's task and the calls it started run: the test's own task
+/// yields until they are idle. The paused clock moves only when the test
+/// moves it.
+async fn settle() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The loop runs a tick a moment after the instant it was scheduled for, by
+/// a different amount each time. Here the tick of the second call runs 3 ms
+/// late and the tick one interval after it runs on time: the third call goes
+/// at that tick, one interval after the second, not one tick later.
+#[tokio::test(start_paused = true)]
+async fn an_interval_of_whole_ticks_ends_on_its_tick_though_a_tick_ran_late() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    // A poll every second on the 100 ms tick: ten ticks an interval.
+    let driver = Arc::new(driver(&store, &probe, Duration::from_secs(1)));
+    let (stop, stopped) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run(stopped).await });
+
+    // The loop's first tick, on time: the first call.
+    settle().await;
+    assert_eq!(probe.polls().len(), 1);
+    // Ticks 1 to 9 on time, then tick 10 run 3 ms late: the second call.
+    for _ in 1..10 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+    }
+    assert_eq!(probe.polls().len(), 1, "nine ticks: inside the interval");
+    tokio::time::advance(Duration::from_millis(103)).await;
+    settle().await;
+    assert_eq!(probe.polls().len(), 2, "tick 10: the second call");
+    // Tick 11 back on time, ticks 12 to 19, then tick 20: the third call.
+    tokio::time::advance(Duration::from_millis(97)).await;
+    settle().await;
+    for _ in 12..20 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+    }
+    assert_eq!(
+        probe.polls().len(),
+        2,
+        "nineteen ticks: inside the second interval"
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    settle().await;
+    assert_eq!(
+        probe.polls().len(),
+        3,
+        "tick 20, one interval after the second call: the third"
+    );
+
+    stop.send_replace(true);
+    tasks
+        .join_next()
+        .await
+        .expect("the run task")
+        .expect("it ended without a panic");
+}
+
 #[tokio::test(start_paused = true)]
 async fn with_one_silent_engine_the_others_advance_every_period_and_it_holds_exactly_one_call() {
     let store = Arc::new(MemoryStore::new());
@@ -987,11 +1270,11 @@ async fn an_engine_whose_call_passed_its_deadline_is_asked_again() {
     let driver = driver(&store, &probe, Duration::from_secs(1));
     let mut schedule = Schedule::default();
 
-    driver.tick(&mut schedule);
+    driver.tick(&mut schedule, tokio::time::Instant::now());
     tokio::task::yield_now().await;
     for second in 1..3 {
         tokio::time::advance(Duration::from_secs(1)).await;
-        driver.tick(&mut schedule);
+        driver.tick(&mut schedule, tokio::time::Instant::now());
         tokio::task::yield_now().await;
         assert_eq!(
             probe.polls_of("grpc://a:1"),
@@ -999,12 +1282,434 @@ async fn an_engine_whose_call_passed_its_deadline_is_asked_again() {
             "t = {second} s: due, and its call still out"
         );
     }
-    // The mark is the call's deadline: a call that never came back (an
-    // aborted task, a probe that ignored its deadline) frees its engine then.
+    // The mark is one tick past the call's deadline: at the deadline the
+    // call is still its probe's to end, and the engine is not asked.
     tokio::time::advance(Duration::from_secs(1)).await;
-    driver.tick(&mut schedule);
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(probe.polls_of("grpc://a:1"), 1, "t = 3 s: the deadline");
+    // At the mark a call that never came back (an aborted task, a probe
+    // that ignored its deadline) frees its engine.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
     tokio::task::yield_now().await;
     assert_eq!(probe.polls_of("grpc://a:1"), 2);
+}
+
+/// A probe that keeps no deadline of its own (the fake's held call never
+/// returns): the driver's bound ends the call one tick past the deadline and
+/// it lands as a deadline failure. The calls out do not grow by one every
+/// deadline.
+#[tokio::test(start_paused = true)]
+async fn a_call_its_probe_never_ends_lands_at_the_drivers_bound() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    probe.held.lock().insert("grpc://a:1".to_owned());
+    // The default three-second deadline on the 100 ms tick.
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    settle().await;
+    assert!(
+        schedule.calls.try_join_next().is_none(),
+        "at the deadline the call is the probe's to end"
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    settle().await;
+    let joined = schedule
+        .calls
+        .try_join_next()
+        .expect("one tick past the deadline the driver ended the call");
+    driver.land(&mut schedule.due, joined);
+    assert!(schedule.calls.is_empty());
+    let deadline = ReadError::Deadline(Duration::ZERO).label();
+    let counted = driver
+        .stats()
+        .poll_failures
+        .each()
+        .into_iter()
+        .find(|(label, _)| *label == deadline)
+        .map(|(_, count)| count);
+    assert_eq!(counted, Some(1), "counted as a deadline");
+}
+
+/// A call that lands late clears the mark it set and no other: the call that
+/// followed it is still out, and the engine is not asked a third time behind
+/// it. Live when the tick at a call's mark runs before the call the driver
+/// ended there is joined: an engine due at that instant is asked again
+/// first.
+#[tokio::test(start_paused = true)]
+async fn a_late_landing_does_not_free_the_engine_of_the_call_that_followed() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    probe.held.lock().insert("grpc://a:1".to_owned());
+    // A poll due every second under the default three-second deadline.
+    let driver = driver(&store, &probe, Duration::from_secs(1));
+    let mut schedule = Schedule::default();
+
+    // The first call does not come back; at its mark, one tick past its
+    // deadline, the engine is asked again.
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    tokio::time::advance(Duration::from_millis(3_100)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    assert_eq!(probe.polls_of("grpc://a:1"), 2);
+
+    // The first call, ended at that instant by the driver's bound, lands
+    // after the tick that asked again: the second call is out.
+    let joined = schedule
+        .calls
+        .try_join_next()
+        .expect("the first call, ended at the bound");
+    driver.land(&mut schedule.due, joined);
+
+    // A second after its second call the engine is due again, and is not
+    // asked.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    assert_eq!(
+        probe.polls_of("grpc://a:1"),
+        2,
+        "the second call is out: no third behind it"
+    );
+}
+
+/// A tick the loop runs late is handed the instant it was scheduled for, an
+/// instant in the past. The call it starts goes now: its mark counts from
+/// the clock, and the engine is not asked again behind it at the next tick,
+/// though the scheduled instant and the deadline have long passed. The mark
+/// is read on the clock too: at a later tick the loop runs late, a call
+/// whose mark has passed frees its engine.
+#[tokio::test(start_paused = true)]
+async fn a_call_started_by_a_late_tick_is_out_until_its_own_mark() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    probe.held.lock().insert("grpc://a:1".to_owned());
+    // A poll every ten seconds under the default three-second deadline.
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+    let start = tokio::time::Instant::now();
+
+    // The loop stalls: the tick scheduled for t = 10 s runs at t = 20 s.
+    tokio::time::advance(Duration::from_secs(20)).await;
+    driver.tick(&mut schedule, start + TEN);
+    settle().await;
+    assert_eq!(probe.polls_of("grpc://a:1"), 1, "the late tick's call goes");
+
+    // One tick later, on time, the engine is due again (ten seconds after
+    // the scheduled instant) and its call is 100 ms old.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    assert_eq!(
+        (probe.polls_of("grpc://a:1"), schedule.calls.len()),
+        (1, 1),
+        "one call out: the engine is not asked again behind it"
+    );
+
+    // The loop stalls again: the tick scheduled for t = 20.2 s runs at
+    // t = 23.1 s, the call's mark. On the clock the mark has passed.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    driver.tick(&mut schedule, start + Duration::from_millis(20_200));
+    settle().await;
+    assert_eq!(probe.polls_of("grpc://a:1"), 2, "asked again at its mark");
+}
+
+/// What a second call over the first would lose. The call of a late tick is
+/// answered slowly, with the figures its engine had when it was asked; a
+/// call beside it would be answered at once, with newer ones, and the slow
+/// answer, landing last, would be the sample on file: the store keeps the
+/// answer written last. One call an engine keeps the order: the slow answer
+/// lands, the next call goes, and the newer sample stays.
+#[tokio::test(start_paused = true)]
+async fn after_a_late_tick_and_a_slow_answer_the_newer_sample_stays() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let id = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+    let start = tokio::time::Instant::now();
+    let figures = |running| Figures {
+        running,
+        waiting: 0,
+        usage: 0.5,
+    };
+
+    // The tick scheduled for t = 10 s runs at t = 20 s, and its call is held
+    // by its engine.
+    probe.held.lock().insert("grpc://a:1".to_owned());
+    tokio::time::advance(Duration::from_secs(20)).await;
+    driver.tick(&mut schedule, start + TEN);
+    settle().await;
+
+    // One tick later a call would be answered at once: seven running.
+    probe.held.lock().clear();
+    probe.answers("grpc://a:1", &[figures(7)]);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    while let Some(joined) = schedule.calls.try_join_next() {
+        driver.land(&mut schedule.due, joined);
+    }
+
+    // A second later the held call answers with what its engine had when it
+    // was asked: one running.
+    probe.answers("grpc://a:1", &[figures(1)]);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    probe.release.notify_waiters();
+    settle().await;
+    while let Some(joined) = schedule.calls.try_join_next() {
+        driver.land(&mut schedule.due, joined);
+    }
+
+    // The engine is free and due: the call of this tick is answered at once.
+    probe.answers("grpc://a:1", &[figures(7)]);
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    while let Some(joined) = schedule.calls.try_join_next() {
+        driver.land(&mut schedule.due, joined);
+    }
+
+    assert_eq!(
+        row(&store, id, 0).map(|(row, _)| row.running),
+        Some(7),
+        "the newer sample stays"
+    );
+}
+
+/// A probe that overruns its deadline, at an engine due again at that
+/// deadline (an interval at or under it). The engine is not asked while its
+/// call is out, up to the driver's bound: an answer that comes in that last
+/// tick lands before the next call goes, and the newer sample stays.
+#[tokio::test(start_paused = true)]
+async fn a_call_that_overruns_its_deadline_holds_its_engine_until_the_bound() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let id = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    // A poll due every second under the default three-second deadline.
+    let driver = driver(&store, &probe, Duration::from_secs(1));
+    let mut schedule = Schedule::default();
+    let figures = |running| Figures {
+        running,
+        waiting: 0,
+        usage: 0.5,
+    };
+
+    probe.held.lock().insert("grpc://a:1".to_owned());
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+
+    // At the deadline the engine is due, and a call would be answered at
+    // once: seven running.
+    probe.held.lock().clear();
+    probe.answers("grpc://a:1", &[figures(7)]);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    while let Some(joined) = schedule.calls.try_join_next() {
+        driver.land(&mut schedule.due, joined);
+    }
+    assert_eq!(
+        probe.polls_of("grpc://a:1"),
+        1,
+        "its call is out until the bound: not asked at the deadline"
+    );
+
+    // Inside the last tick the first call answers, with what its engine had
+    // when it was asked: one running.
+    probe.answers("grpc://a:1", &[figures(1)]);
+    tokio::time::advance(Duration::from_millis(50)).await;
+    probe.release.notify_waiters();
+    settle().await;
+    while let Some(joined) = schedule.calls.try_join_next() {
+        driver.land(&mut schedule.due, joined);
+    }
+
+    // The next tick finds the engine free and due.
+    probe.answers("grpc://a:1", &[figures(7)]);
+    tokio::time::advance(Duration::from_millis(50)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    while let Some(joined) = schedule.calls.try_join_next() {
+        driver.land(&mut schedule.due, joined);
+    }
+
+    assert_eq!(probe.polls_of("grpc://a:1"), 2);
+    assert_eq!(
+        row(&store, id, 0).map(|(row, _)| row.running),
+        Some(7),
+        "the newer sample stays"
+    );
+}
+
+/// The driver's bound counts from the instant the call went, not from the
+/// first run of the call's task: a task the runtime first runs two seconds
+/// late is still ended at its mark.
+#[tokio::test(start_paused = true)]
+async fn the_drivers_bound_counts_from_the_instant_the_call_went() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    probe.held.lock().insert("grpc://a:1".to_owned());
+    // The default three-second deadline on the 100 ms tick.
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    // The call goes, and its task first runs two seconds later.
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    settle().await;
+    assert_eq!(probe.polls_of("grpc://a:1"), 1);
+
+    tokio::time::advance(Duration::from_millis(1_100)).await;
+    settle().await;
+    assert!(
+        schedule.calls.try_join_next().is_some(),
+        "ended 3.1 s after it went, whenever its task first ran"
+    );
+}
+
+/// An engine whose scrape is out is not scraped again when its interval
+/// comes round: a scrape interval under the scrape timeout holds one call.
+#[tokio::test(start_paused = true)]
+async fn an_engine_whose_scrape_is_out_is_not_scraped_again_before_its_timeout() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(
+        &store,
+        "http://h:1",
+        "http://h:1",
+        0,
+        1,
+        WireModes::HTTP,
+        500,
+    );
+    probe.held.lock().insert("http://h:1".to_owned());
+    // A scrape due every half second under the default five-second timeout.
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    for second in 1..=5 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        driver.tick(&mut schedule, tokio::time::Instant::now());
+        settle().await;
+        assert_eq!(
+            probe.scrapes.lock().len(),
+            1,
+            "t = {second} s: due, and its call still out"
+        );
+    }
+    tokio::time::advance(Duration::from_millis(100)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    assert_eq!(
+        probe.scrapes.lock().len(),
+        2,
+        "one tick past the timeout: asked again"
+    );
+}
+
+/// The scrape's mark counts from the clock as the poll's does: a scrape
+/// started by a tick the loop ran late is out until its own mark, and the
+/// mark is read on the clock.
+#[tokio::test(start_paused = true)]
+async fn a_scrape_started_by_a_late_tick_is_out_until_its_own_mark() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(
+        &store,
+        "http://h:1",
+        "http://h:1",
+        0,
+        1,
+        WireModes::HTTP,
+        500,
+    );
+    probe.held.lock().insert("http://h:1".to_owned());
+    // A scrape due every half second under the default five-second timeout.
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+    let start = tokio::time::Instant::now();
+
+    // The loop stalls: the tick scheduled for t = 10 s runs at t = 20 s.
+    tokio::time::advance(Duration::from_secs(20)).await;
+    driver.tick(&mut schedule, start + TEN);
+    settle().await;
+    assert_eq!(probe.scrapes.lock().len(), 1, "the late tick's call goes");
+
+    // One tick later, on time: due, and its call 100 ms old.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    assert_eq!(
+        probe.scrapes.lock().len(),
+        1,
+        "one call out: the engine is not scraped again behind it"
+    );
+
+    // The loop stalls again: the tick scheduled for t = 20.2 s runs at
+    // t = 25.1 s, the call's mark. On the clock the mark has passed.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    driver.tick(&mut schedule, start + Duration::from_millis(20_200));
+    settle().await;
+    assert_eq!(probe.scrapes.lock().len(), 2, "asked again at its mark");
+}
+
+/// The scrape is under the same bound: one its probe never ends lands one
+/// tick past the scrape timeout, counted as a deadline.
+#[tokio::test(start_paused = true)]
+async fn a_scrape_its_probe_never_ends_lands_at_the_drivers_bound() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(
+        &store,
+        "http://h:1",
+        "http://h:1",
+        0,
+        1,
+        WireModes::HTTP,
+        500,
+    );
+    probe.held.lock().insert("http://h:1".to_owned());
+    // The default five-second scrape timeout on the 100 ms tick.
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    driver.tick(&mut schedule, tokio::time::Instant::now());
+    settle().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert!(
+        schedule.calls.try_join_next().is_none(),
+        "at the timeout the call is the probe's to end"
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    settle().await;
+    let joined = schedule
+        .calls
+        .try_join_next()
+        .expect("one tick past the timeout the driver ended the call");
+    driver.land(&mut schedule.due, joined);
+    assert!(schedule.calls.is_empty());
+    let deadline = ReadError::Deadline(Duration::ZERO).label();
+    let counted = driver
+        .stats()
+        .scrape_failures
+        .each()
+        .into_iter()
+        .find(|(label, _)| *label == deadline)
+        .map(|(_, count)| count);
+    assert_eq!(counted, Some(1), "counted as a deadline");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1054,7 +1759,7 @@ async fn a_poll_that_lands_after_its_worker_left_writes_nothing() {
     let driver = driver(&store, &probe, TEN);
     let mut schedule = Schedule::default();
 
-    driver.tick(&mut schedule);
+    driver.tick(&mut schedule, tokio::time::Instant::now());
     tokio::task::yield_now().await;
     assert_eq!(probe.polls_of("grpc://a:1"), 1, "the call is out");
 
@@ -1088,7 +1793,7 @@ async fn a_call_that_lands_after_its_engine_left_leaves_no_connection_behind() {
     let mut schedule = Schedule::default();
 
     // The engine's first call is out and its dial has not completed.
-    driver.tick(&mut schedule);
+    driver.tick(&mut schedule, tokio::time::Instant::now());
     tokio::task::yield_now().await;
     assert_eq!(probe.polls_of("grpc://a:1"), 1, "the call is out");
 
@@ -1096,7 +1801,7 @@ async fn a_call_that_lands_after_its_engine_left_leaves_no_connection_behind() {
     // it, which finds nothing to drop yet.
     let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision);
-    driver.tick(&mut schedule);
+    driver.tick(&mut schedule, tokio::time::Instant::now());
     assert_eq!(*probe.forgotten.lock(), vec!["grpc://a:1"]);
     assert_eq!(probe.connections(), 0);
 

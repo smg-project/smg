@@ -57,9 +57,10 @@ pub struct LoadDriverConfig {
     /// record is older than this is polled). The gateway's
     /// `--load-monitor-interval`, 10 s.
     pub poll_interval: Duration,
-    /// The bound on one poll, dial included: how long an engine's one call
-    /// stays out before the engine can be asked again. A poll past it is a
-    /// slow engine, not a dead one.
+    /// The bound on one poll, dial included, as its probe is given it. The
+    /// driver ends a call one tick past it, and the engine is not asked
+    /// again before its call has landed. A poll past it is a slow engine,
+    /// not a dead one.
     pub poll_deadline: Duration,
     /// The bound on one scrape.
     pub scrape_timeout: Duration,
@@ -101,8 +102,9 @@ pub enum ReadError {
     /// The deadline passed.
     #[error("no answer within {0:?}")]
     Deadline(Duration),
-    /// The metrics body carried no load for this family.
-    #[error("no load in the metrics of a {0} engine")]
+    /// The answer carried no load to read: a metrics body without the
+    /// family's usage gauge, an answer whose usage is not a number.
+    #[error("no load in the answer of a {0} engine")]
     NoLoad(String),
     /// The family has no `GetLoads`.
     #[error("no GetLoads on a {0} engine")]
@@ -154,7 +156,8 @@ pub struct Stats {
     /// and poll interval: the arbitration is asked at every tick while a
     /// poll is due, and the count moves on the scale of the two above.
     pub suppressed: AtomicU64,
-    /// Polls that produced no report, by label.
+    /// Polls that produced no report, by label. Under `no_load`: a poll
+    /// whose report left a rank without a row, its usage not a number.
     pub poll_failures: Failures,
     /// Scrapes that produced a row.
     pub scrapes: AtomicU64,
@@ -249,7 +252,8 @@ struct Engine {
     /// gateway dials speaks gRPC.
     poll: Option<Target>,
     /// Where a scrape goes, and how often: an HTTP engine of one rank
-    /// without a poll (no servicer) with a scrape interval on its row.
+    /// without a poll (no servicer) with a scrape interval on its row, of a
+    /// family whose gauges the scrape reads.
     scrape: Option<(String, Duration)>,
     /// The ready rows, by rank.
     ranks: Vec<(u16, WorkerId)>,
@@ -274,9 +278,13 @@ struct Due {
     /// When a suppressed poll counts next (see [`Stats::suppressed`]).
     suppressed: tokio::time::Instant,
     /// The engine's one call (its poll, or its scrape when it has no
-    /// servicer) is out until this instant, the call's deadline: set when
-    /// the call goes, cleared when its answer lands. The engine is not asked
-    /// again before, so a slow engine holds one call, never a queue of them.
+    /// servicer) is out until this instant, the call's mark: set when the
+    /// call goes, cleared when its answer lands. The mark is the instant the
+    /// call went, read from the clock, plus its deadline and one tick, and
+    /// the driver ends the call at it (see [`bounded`]). The engine is not
+    /// asked again before, so no call outlives its mark and an engine holds
+    /// one call, never two. After a missed deadline the engine is asked
+    /// again one tick later than the deadline alone would allow.
     out: Option<tokio::time::Instant>,
 }
 
@@ -386,7 +394,7 @@ where
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
                 Some(joined) = schedule.calls.join_next() => self.land(&mut schedule.due, joined),
-                _ = ticker.tick() => self.tick(&mut schedule),
+                at = ticker.tick() => self.tick(&mut schedule, at),
             }
         }
     }
@@ -413,9 +421,22 @@ where
 
     /// One tick: the membership read, the engines that left dropped, the due
     /// calls started. Nothing here waits on an engine.
-    fn tick(&self, schedule: &mut Schedule) {
+    ///
+    /// `tick_at` is the instant the loop's interval scheduled this tick for,
+    /// not the clock read when it runs. A tick runs a moment late, by a
+    /// different amount each time: a due instant set from one late reading
+    /// and compared with a later one ends an interval of whole ticks a moment
+    /// before or after its tick, and a period is the interval or the interval
+    /// and a tick. On the scheduled instants it is the interval.
+    ///
+    /// The due instants alone take it. A call goes now, whatever instant its
+    /// tick was scheduled for, so its mark counts from the clock, read once
+    /// for the tick's calls: on a tick the loop runs seconds late the
+    /// scheduled instant is in the past, and a mark set from it would free
+    /// the engine while its call is still out.
+    fn tick(&self, schedule: &mut Schedule, tick_at: tokio::time::Instant) {
         let engines = self.engines();
-        let tick_at = tokio::time::Instant::now();
+        let sent_at = tokio::time::Instant::now();
         let live: HashSet<&str> = engines.iter().map(|engine| engine.key.as_str()).collect();
         schedule.due.retain(|key, _| {
             let kept = live.contains(key.as_str());
@@ -435,9 +456,9 @@ where
                 // ranks are all served by their stream is asked again at the
                 // next tick, so a rank whose records stop is polled within
                 // one tick of the freshness bound, not one interval later.
-                if tick_at >= slot.poll && !slot.is_out(tick_at) {
+                if tick_at >= slot.poll && !slot.is_out(sent_at) {
                     if let Some(ranks) = self.ranks_to_poll(engine) {
-                        let mark = tick_at + self.config.poll_deadline;
+                        let mark = sent_at + self.config.poll_deadline + self.config.tick;
                         slot.poll = tick_at + self.config.poll_interval;
                         slot.suppressed = slot.poll;
                         slot.out = Some(mark);
@@ -447,7 +468,8 @@ where
                         let engines = Arc::clone(&engines);
                         let polled_at = now();
                         schedule.calls.spawn(async move {
-                            let answer = probe.poll(&target, deadline).await;
+                            let answer =
+                                bounded(mark, deadline, probe.poll(&target, deadline)).await;
                             Done {
                                 engines,
                                 engine: index,
@@ -469,8 +491,8 @@ where
                 // moves only when a call goes: an engine whose rank is
                 // served by its own records is not scraped, and is scraped
                 // within one tick of the freshness bound once they stop.
-                if tick_at >= slot.scrape && !slot.is_out(tick_at) && self.scrape_wanted(engine) {
-                    let mark = tick_at + self.config.scrape_timeout;
+                if tick_at >= slot.scrape && !slot.is_out(sent_at) && self.scrape_wanted(engine) {
+                    let mark = sent_at + self.config.scrape_timeout + self.config.tick;
                     slot.scrape = tick_at + *every;
                     slot.out = Some(mark);
                     let probe = Arc::clone(&self.probe);
@@ -479,7 +501,7 @@ where
                     let engines = Arc::clone(&engines);
                     let polled_at = now();
                     schedule.calls.spawn(async move {
-                        let text = probe.scrape(&url, timeout).await;
+                        let text = bounded(mark, timeout, probe.scrape(&url, timeout)).await;
                         Done {
                             engines,
                             engine: index,
@@ -495,9 +517,10 @@ where
 
     /// One call landed: its engine is free to be asked again and its answer
     /// is written. A call that ended abnormally frees its engine when the
-    /// mark it set passes, at the call's deadline. A call whose engine left
-    /// while it was out has the probe forget the engine once more: the
-    /// connection its dial made after the first forget would stay for good.
+    /// mark it set passes, one tick past the call's deadline. A call whose
+    /// engine left while it was out has the probe forget the engine once
+    /// more: the connection its dial made after the first forget would stay
+    /// for good.
     fn land(&self, due: &mut BTreeMap<String, Due>, joined: Result<Done, JoinError>) {
         let done = match joined {
             Ok(done) => done,
@@ -564,8 +587,9 @@ where
 
     /// Writes one call's answer: a poll's rows for the ranks it was for, a
     /// scrape's sample for its engine's rank unless the rank's own records
-    /// are fresher; a failure counts and writes nothing. The store drops a
-    /// row for a worker that left while the call was out.
+    /// are fresher; a failure counts and writes nothing, and so does a usage
+    /// that is not a number, for the rank it was reported for. The store
+    /// drops a row for a worker that left while the call was out.
     fn apply(&self, engine: &Engine, polled_at: Instant, read: Read) {
         match read {
             Read::Poll { ranks, answer } => {
@@ -583,6 +607,7 @@ where
                 // unavailable: nothing is written for it, never another
                 // rank's figures.
                 let parallel = engine.dp_size > 1;
+                let mut refused = false;
                 for (rank, id) in ranks {
                     let Some(scoped) = report
                         .clone()
@@ -590,29 +615,54 @@ where
                     else {
                         continue;
                     };
-                    let row =
-                        load_row(&scoped, engine.role, received, received, SignalSource::Poll);
+                    // A rank whose usage is not a number has no row either:
+                    // the conversion refuses it, and the ranks beside it
+                    // keep theirs.
+                    let Some(row) =
+                        load_row(&scoped, engine.role, received, received, SignalSource::Poll)
+                    else {
+                        refused = true;
+                        continue;
+                    };
                     self.store
                         .report(id, &[(rank, row)], polled_at, LoadSource::Poll);
                     self.stats.rows.fetch_add(1, Ordering::Relaxed);
                 }
+                if refused {
+                    let error =
+                        ReadError::NoLoad(engine.kind.unwrap_or_default().as_str().to_owned());
+                    debug!(engine = peer(&engine.key), %error, "the load poll left a rank without a row");
+                    self.stats.poll_failures.count(&error);
+                }
             }
             Read::Scrape { text } => {
                 let kind = engine.kind.unwrap_or_default();
-                let snapshot = text.and_then(|text| {
+                let received = now();
+                // The body's sample as a row. A body without the family's
+                // usage gauge has none, and neither has one whose samples
+                // do not average to a number: the conversion refuses what
+                // the parser, which reads one sample at a time, cannot see.
+                let row = text.and_then(|text| {
                     scrape::snapshot(kind, &text)
+                        .and_then(|snapshot| {
+                            load_row(
+                                &scrape::single_rank(snapshot),
+                                engine.role,
+                                received,
+                                received,
+                                SignalSource::Scrape,
+                            )
+                        })
                         .ok_or_else(|| ReadError::NoLoad(kind.as_str().to_owned()))
                 });
-                let snapshot = match snapshot {
-                    Ok(snapshot) => snapshot,
+                let row = match row {
+                    Ok(row) => row,
                     Err(error) => {
                         debug!(engine = peer(&engine.key), %error, "the scrape produced no row");
                         self.stats.scrape_failures.count(&error);
                         return;
                     }
                 };
-                let received = now();
-                let response = scrape::single_rank(snapshot);
                 let mut wrote = false;
                 // The gauges are engine-wide and only an engine of one rank
                 // is scraped (the grouping schedules none for a
@@ -627,13 +677,6 @@ where
                     {
                         continue;
                     }
-                    let row = load_row(
-                        &response,
-                        engine.role,
-                        received,
-                        received,
-                        SignalSource::Scrape,
-                    );
                     self.store
                         .report(id, &[(rank, row)], polled_at, LoadSource::Scrape);
                     self.stats.rows.fetch_add(1, Ordering::Relaxed);
@@ -647,6 +690,23 @@ where
                 }
             }
         }
+    }
+}
+
+/// A call under the driver's own bound: it is ended at `mark`, its engine's
+/// out-mark, one tick past the deadline its probe was given, both counted
+/// from the instant the call went. A probe keeps its deadline itself and
+/// reports that failure in its own words; the bound is for one that does
+/// not, so every call lands by its mark and no engine gathers calls behind
+/// a probe that lost track of time.
+async fn bounded<T>(
+    mark: tokio::time::Instant,
+    deadline: Duration,
+    call: impl Future<Output = Result<T, ReadError>>,
+) -> Result<T, ReadError> {
+    match tokio::time::timeout_at(mark, call).await {
+        Ok(read) => read,
+        Err(_elapsed) => Err(ReadError::Deadline(deadline)),
     }
 }
 
@@ -699,8 +759,10 @@ fn engines(rows: Vec<WorkerRow>) -> Vec<Engine> {
         // servicer is not scraped, and its ranks have no row until a
         // per-rank source (its stream, a `GetLoads`) names them. A row holds
         // a figure measured for its rank, never an aggregate or a share of
-        // one.
-        if engine.poll.is_none() && engine.dp_size <= 1 {
+        // one. Nor is an engine of a family without a gauge table, an
+        // unnamed one included: its body would be fetched every interval
+        // and dropped as one without its load.
+        if engine.poll.is_none() && engine.dp_size <= 1 && engine.kind.is_some_and(scrape::reads) {
             if let Some(every) = scrapes.remove(&engine.key) {
                 engine.scrape = Some((engine.key.clone(), Duration::from_millis(u64::from(every))));
             }

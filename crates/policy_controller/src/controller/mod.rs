@@ -151,9 +151,6 @@ pub enum Error {
     /// The admin listener could not be bound or failed while serving.
     #[error("admin listener: {0}")]
     Admin(#[source] io::Error),
-    /// The engines' HTTP client could not be built.
-    #[error("the engines' probe: {0}")]
-    Probe(#[source] reqwest::Error),
     /// A listener returned before the shutdown signal.
     #[error("a listener stopped before the shutdown")]
     Stopped,
@@ -224,7 +221,7 @@ impl Controller {
         let admin_addr = admin.local_addr().map_err(Error::Admin)?;
         info!(controller_id = %config.controller_id, addr = %admin_addr, "admin listener bound");
         let (state, readiness) = readiness::channel();
-        let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
+        let probe = Arc::new(EngineProbe::new());
         Ok(Self {
             config,
             store: Arc::new(MemoryStore::new()),

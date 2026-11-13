@@ -860,7 +860,9 @@ impl LoadSink for HostStores {
             ..WorkerLoadResponse::default()
         };
         Some(LoadSample {
-            row: load_row(&one, *worker.worker_type(), Instant::now(), sampled_at),
+            // A usage that is not a number is no sample: the rank reads as
+            // one with nothing on file.
+            row: load_row(&one, *worker.worker_type(), Instant::now(), sampled_at)?,
             // The published entry keeps its sample instant alone.
             received_at: sampled_at,
             sampled_at,
@@ -1439,6 +1441,36 @@ mod tests {
             sample.sampled_at,
             received_at - Duration::from_millis(300),
             "the age, with no one-way margin"
+        );
+    }
+
+    /// A published report whose usage is not a number is no sample for its
+    /// rank: converted it reads zero, an idle worker's figure. The rank
+    /// beside it keeps its sample.
+    #[test]
+    fn a_published_usage_that_is_not_a_number_is_no_sample_through_the_host() {
+        let (runtime, registry, monitor, host) = monitor_host();
+        let _enter = runtime.enter();
+        let worker = ready_worker("http://w:8000", "m");
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let polled_at = Instant::now();
+        let entry = |dp_rank, token_usage| SchedulerLoadSnapshot {
+            dp_rank,
+            num_running_reqs: 4,
+            token_usage,
+            ..SchedulerLoadSnapshot::default()
+        };
+        monitor.ingest_polled_report(
+            &worker,
+            polled_report_of(vec![entry(0, f64::NAN), entry(1, 0.5)], polled_at),
+            polled_at,
+        );
+        assert!(host.load(id, 0).is_none(), "a usage that is not a number");
+        assert_eq!(
+            host.load(id, 1)
+                .map(|sample| (sample.row.running, sample.row.kv_usage_permille)),
+            Some((4, 500))
         );
     }
 

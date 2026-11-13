@@ -82,6 +82,22 @@ impl PromScrape {
     }
 }
 
+/// A family's gauge table, the one list of the families that have one: the
+/// read of a body and the question whether to fetch one both ask it.
+fn table(kind: RuntimeType) -> Option<fn(&str) -> Option<SchedulerLoadSnapshot>> {
+    match kind {
+        RuntimeType::Vllm => Some(vllm),
+        RuntimeType::Sglang => Some(sglang),
+        _ => None,
+    }
+}
+
+/// Whether a family has a gauge table. A scrape of any other family has
+/// nothing to read: its body would be fetched to be dropped.
+pub fn reads(kind: RuntimeType) -> bool {
+    table(kind).is_some()
+}
+
 /// The engine's scheduler state from its metrics text, by family. `None`
 /// for a family with no gauge schema to parse (its native load routes are
 /// its only path) and for a body without the KV-usage gauge: that gauge is
@@ -89,11 +105,7 @@ impl PromScrape {
 /// would default to `0.0` and make an engine of unknown pressure look idle,
 /// so the read says unavailable instead.
 pub fn snapshot(kind: RuntimeType, text: &str) -> Option<SchedulerLoadSnapshot> {
-    match kind {
-        RuntimeType::Vllm => vllm(text),
-        RuntimeType::Sglang => sglang(text),
-        _ => None,
-    }
+    table(kind).and_then(|read| read(text))
 }
 
 /// The first family's table: the KV-cache usage ratio (0.0 to 1.0) maps
@@ -280,6 +292,27 @@ sglang:utilization{model="llama"} 0.9
         let second = "sglang:num_running_reqs 2\nsglang:token_usage NaN\n";
         assert!(sglang(second).is_none());
         assert!(snapshot(RuntimeType::Sglang, second).is_none());
+    }
+
+    /// The families a scrape is scheduled for are the families whose table
+    /// reads a body: one list answers both.
+    #[test]
+    fn a_family_is_scraped_exactly_when_its_table_reads_a_body() {
+        let body = "vllm:kv_cache_usage_perc 0.5\nsglang:token_usage 0.5\n";
+        let families = [
+            RuntimeType::Unspecified,
+            RuntimeType::Sglang,
+            RuntimeType::Vllm,
+            RuntimeType::Trtllm,
+            RuntimeType::Mlx,
+            RuntimeType::TokenSpeed,
+            RuntimeType::Generic,
+            RuntimeType::External,
+        ];
+        for kind in families {
+            assert_eq!(reads(kind), snapshot(kind, body).is_some(), "{kind:?}");
+        }
+        assert_eq!(families.into_iter().filter(|kind| reads(*kind)).count(), 2);
     }
 
     #[test]

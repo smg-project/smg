@@ -882,15 +882,15 @@ impl Decider {
             WorkerType::Encode => Role::Encode,
             WorkerType::Regular => Role::Single,
         };
-        let (load, load_sampled_at_micros) = snapshot.and_then(|s| s.report(worker.url())).map_or(
-            (None, 0),
-            |(report, sampled_at)| {
-                (
-                    Some(load_row(report, worker_type, now, sampled_at)),
-                    self.micros_since_origin(sampled_at),
-                )
-            },
-        );
+        // A report whose usage is not a number is no load row: the worker
+        // reads as one without a report, never as an idle one.
+        let (load, load_sampled_at_micros) = snapshot
+            .and_then(|s| s.report(worker.url()))
+            .and_then(|(report, sampled_at)| {
+                load_row(report, worker_type, now, sampled_at)
+                    .map(|row| (Some(row), self.micros_since_origin(sampled_at)))
+            })
+            .unwrap_or((None, 0));
         let (id, key) = worker_identity(worker.as_ref());
         Candidate {
             position,
@@ -1417,13 +1417,15 @@ impl Retired {
 /// One worker's load row from its report: the controller crate's
 /// conversion (`ingest::rows::load_row`), the worker's type as the row's
 /// role; the source reads `poll` until the monitor's feed names which of
-/// the poll tick and the pushed records produced an entry.
+/// the poll tick and the pushed records produced an entry. `None` for a
+/// report whose KV usage is not a number: the worker has no load row, as
+/// one without a report.
 pub(crate) fn load_row(
     report: &WorkerLoadResponse,
     worker_type: WorkerType,
     now: Instant,
     sampled_at: Instant,
-) -> LoadRow {
+) -> Option<LoadRow> {
     let role = match worker_type {
         WorkerType::Regular => Role::Single,
         WorkerType::Prefill => Role::Prefill,
@@ -1966,6 +1968,48 @@ mod tests {
         }
     }
 
+    /// A usage that is not a number converts to zero, and the worker nobody
+    /// knows the pressure of would read as the idle one: its report is no
+    /// load row, as for a worker without a report.
+    #[test]
+    fn a_report_whose_usage_is_not_a_number_is_no_load_row_for_the_candidate() {
+        let decider = decider(&PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        });
+        let workers = pool(2);
+        let mut unknown = one_rank_load(0, 0.5, 2000.0);
+        unknown.loads[0].token_usage = f64::NAN;
+        let known = one_rank_load(0, 0.5, 2000.0);
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (workers[0].url().to_string(), unknown),
+            (workers[1].url().to_string(), known),
+        ]));
+        decider.set_load_receiver(Some(rx));
+
+        let snapshot = decider.snapshot().expect("the feed");
+        let build = ViewBuild {
+            snapshot: Some(&snapshot),
+            now: Instant::now(),
+            session_key: None,
+        };
+        let unknown = decider.candidate(&build, 0, &workers[0], true, 0, None);
+        assert_eq!((unknown.load, unknown.load_sampled_at_micros), (None, 0));
+        let known = decider.candidate(&build, 1, &workers[1], true, 0, None);
+        assert_eq!(known.load.map(|row| row.kv_usage_permille), Some(500));
+    }
+
+    /// The row of a report whose usage is a number.
+    fn row_of(
+        report: &WorkerLoadResponse,
+        worker_type: WorkerType,
+        now: Instant,
+        sampled_at: Instant,
+    ) -> LoadRow {
+        load_row(report, worker_type, now, sampled_at).expect("a usage that is a number")
+    }
+
     /// A rank with no running request contributes no generation rate (its
     /// gauge is stale); a prefill reads its prefill throughput whatever runs.
     #[test]
@@ -1973,19 +2017,16 @@ mod tests {
         let now = Instant::now();
         let mut report = one_rank_load(0, 0.1, 2000.0);
         report.loads[0].num_running_reqs = 0;
-        assert_eq!(
-            load_row(&report, WorkerType::Regular, now, now).live_rate,
-            0
-        );
+        assert_eq!(row_of(&report, WorkerType::Regular, now, now).live_rate, 0);
         report.loads[0].num_running_reqs = 1;
         assert_eq!(
-            load_row(&report, WorkerType::Regular, now, now).live_rate,
+            row_of(&report, WorkerType::Regular, now, now).live_rate,
             2000
         );
         report.loads[0].num_running_reqs = 0;
         report.loads[0].prefill_throughput = Some(1500.0);
         assert_eq!(
-            load_row(&report, WorkerType::Prefill, now, now).live_rate,
+            row_of(&report, WorkerType::Prefill, now, now).live_rate,
             1500
         );
     }
@@ -2001,7 +2042,7 @@ mod tests {
         second.token_usage = 0.8;
         second.active_token_usage = Some(0.4);
         report.loads.push(second);
-        let row = load_row(&report, WorkerType::Regular, now, now);
+        let row = row_of(&report, WorkerType::Regular, now, now);
         assert_eq!((row.kv_usage_permille, row.active_kv_permille), (500, 300));
         assert_eq!((row.running, row.live_rate), (2, 4000));
     }
@@ -2019,22 +2060,16 @@ mod tests {
         second.prefill_throughput = None;
         report.loads.push(second);
         report.dp_rank_count = 2;
-        assert_eq!(
-            load_row(&report, WorkerType::Prefill, now, now).live_rate,
-            0
-        );
+        assert_eq!(row_of(&report, WorkerType::Prefill, now, now).live_rate, 0);
         report.loads[1].prefill_throughput = Some(3000.0);
         assert_eq!(
-            load_row(&report, WorkerType::Prefill, now, now).live_rate,
+            row_of(&report, WorkerType::Prefill, now, now).live_rate,
             8000
         );
         report.dp_rank_count = 4;
+        assert_eq!(row_of(&report, WorkerType::Prefill, now, now).live_rate, 0);
         assert_eq!(
-            load_row(&report, WorkerType::Prefill, now, now).live_rate,
-            0
-        );
-        assert_eq!(
-            load_row(&report, WorkerType::Regular, now, now).live_rate,
+            row_of(&report, WorkerType::Regular, now, now).live_rate,
             4000,
             "a regular worker's drain is its ranks' generation rate"
         );

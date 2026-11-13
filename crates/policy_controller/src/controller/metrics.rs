@@ -27,9 +27,11 @@ pub const START_TIME_SECONDS: &str = "smg_policy_controller_start_time_seconds";
 /// `suppressed`; a suppressed one made no call), each counted once per
 /// engine and poll interval.
 pub const LOAD_POLLS_TOTAL: &str = "smg_policy_controller_load_polls_total";
-/// Load polls that produced no report, by `reason`.
+/// Load polls that produced no report, by `reason`; under `no_load`, a poll
+/// whose report left a rank without a row.
 pub const LOAD_POLL_FAILURES_TOTAL: &str = "smg_policy_controller_load_poll_failures_total";
-/// Metrics scrapes that produced the engine's sample.
+/// Metrics scrapes that wrote the engine's row: one whose rank took a record
+/// of its own while the call was out wrote none and is not counted.
 pub const LOAD_SCRAPES_TOTAL: &str = "smg_policy_controller_load_scrapes_total";
 /// Metrics scrapes that produced no sample, by `reason`.
 pub const LOAD_SCRAPE_FAILURES_TOTAL: &str = "smg_policy_controller_load_scrape_failures_total";
@@ -89,7 +91,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_SCRAPES_TOTAL),
             None,
-            "Metrics scrapes that produced the engine's sample".into(),
+            "Metrics scrapes that wrote the engine's row".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_SCRAPE_FAILURES_TOTAL),

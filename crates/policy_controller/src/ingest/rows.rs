@@ -18,13 +18,17 @@ use crate::view::{LoadRow, Role, SignalSource};
 /// role's drain is the generation rate of the ranks with a request running.
 /// `source` is where the report came from; `report_age_ms` is `now` less
 /// `sampled_at`.
+///
+/// `None` when a rank's KV usage, or the active usage it reports, is not a
+/// finite number: the report says nothing of the worker's pressure, and its
+/// reader has no row, as for a report that never came.
 pub fn load_row(
     report: &WorkerLoadResponse,
     role: Role,
     now: Instant,
     sampled_at: Instant,
     source: SignalSource,
-) -> LoadRow {
+) -> Option<LoadRow> {
     let mut running: i64 = 0;
     let mut queued: i64 = 0;
     let mut uncached: i64 = 0;
@@ -57,11 +61,17 @@ pub fn load_row(
         }
         resident = resident.zip(rank.num_resident_tokens).map(|(a, b)| a + b);
     }
+    // One figure that is not a finite number makes its sum one. As a ratio
+    // it would convert to zero (a NaN, the negative infinity), and the
+    // worker whose pressure nobody knows would read as the idle one.
+    if !(kv_usage.is_finite() && active_kv.is_finite()) {
+        return None;
+    }
     if role == Role::Prefill {
         live_rate = prefill_rate.unwrap_or(0.0);
     }
     let ranks = report.loads.len().max(1) as f64;
-    LoadRow {
+    Some(LoadRow {
         running: narrow(running),
         queued: narrow(queued),
         waiting_uncached_tokens: narrow(uncached),
@@ -77,7 +87,7 @@ pub fn load_row(
             .unwrap_or(u32::MAX),
         source,
         max_running: narrow(max_running),
-    }
+    })
 }
 
 /// A summed engine count as the row's field: negative reads as none.
@@ -85,7 +95,8 @@ fn narrow(count: i64) -> u32 {
     u32::try_from(count.max(0)).unwrap_or(u32::MAX)
 }
 
-/// A ratio as the row's permille field.
+/// A ratio as the row's permille field: below zero reads zero, over one
+/// reads one.
 fn permille(ratio: f64) -> u16 {
     (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
@@ -125,6 +136,17 @@ mod tests {
         }
     }
 
+    /// The row of a report whose usage is a number.
+    fn row_of(
+        report: &WorkerLoadResponse,
+        role: Role,
+        now: Instant,
+        sampled_at: Instant,
+        source: SignalSource,
+    ) -> LoadRow {
+        load_row(report, role, now, sampled_at, source).expect("a usage that is a number")
+    }
+
     #[test]
     fn counts_add_over_the_ranks_and_ratios_average() {
         let now = Instant::now();
@@ -132,7 +154,7 @@ mod tests {
             rank(3, 1, 0.2, 100.0, None),
             rank(5, 2, 0.6, 50.0, None),
         ]);
-        let row = load_row(&two, Role::Single, now, now, SignalSource::Poll);
+        let row = row_of(&two, Role::Single, now, now, SignalSource::Poll);
         assert_eq!((row.running, row.queued), (8, 3));
         assert_eq!(row.kv_usage_permille, 400);
         assert_eq!(row.active_kv_permille, 400);
@@ -150,7 +172,7 @@ mod tests {
             rank(0, 0, 0.0, 999.0, None),
             rank(1, 0, 0.1, 40.0, None),
         ]);
-        let row = load_row(&one_idle, Role::Decode, now, now, SignalSource::Events);
+        let row = row_of(&one_idle, Role::Decode, now, now, SignalSource::Events);
         assert_eq!(row.live_rate, 40);
     }
 
@@ -162,7 +184,7 @@ mod tests {
             rank(1, 0, 0.1, 0.0, Some(3_000.0)),
         ]);
         assert_eq!(
-            load_row(&complete, Role::Prefill, now, now, SignalSource::Poll).live_rate,
+            row_of(&complete, Role::Prefill, now, now, SignalSource::Poll).live_rate,
             5_000
         );
         let one_rate_missing = report(vec![
@@ -170,7 +192,7 @@ mod tests {
             rank(1, 0, 0.1, 0.0, None),
         ]);
         assert_eq!(
-            load_row(
+            row_of(
                 &one_rate_missing,
                 Role::Prefill,
                 now,
@@ -183,7 +205,7 @@ mod tests {
         let mut partial = report(vec![rank(1, 0, 0.1, 0.0, Some(2_000.0))]);
         partial.dp_rank_count = 2;
         assert_eq!(
-            load_row(&partial, Role::Prefill, now, now, SignalSource::Poll).live_rate,
+            row_of(&partial, Role::Prefill, now, now, SignalSource::Poll).live_rate,
             0
         );
     }
@@ -192,7 +214,7 @@ mod tests {
     fn the_age_is_the_decision_instant_less_the_sample_instant() {
         let sampled = Instant::now();
         let now = sampled + Duration::from_millis(1_500);
-        let row = load_row(
+        let row = row_of(
             &report(vec![rank(0, 0, 0.0, 0.0, None)]),
             Role::Single,
             now,
@@ -207,9 +229,101 @@ mod tests {
     fn negative_counts_and_ratios_over_one_are_clamped() {
         let now = Instant::now();
         let odd = report(vec![rank(-4, -1, 1.7, -5.0, None)]);
-        let row = load_row(&odd, Role::Single, now, now, SignalSource::Poll);
+        let row = row_of(&odd, Role::Single, now, now, SignalSource::Poll);
         assert_eq!((row.running, row.queued), (0, 0));
         assert_eq!(row.kv_usage_permille, 1_000);
         assert_eq!(row.live_rate, 0);
+    }
+
+    /// Converted, a NaN and the negative infinity are zero and the positive
+    /// infinity is one: two of the three read as an idle worker.
+    #[test]
+    fn a_usage_that_is_not_a_finite_number_is_no_row() {
+        let now = Instant::now();
+        for usage in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            let one = report(vec![rank(3, 1, usage, 100.0, None)]);
+            assert_eq!(
+                load_row(&one, Role::Single, now, now, SignalSource::Poll),
+                None,
+                "{usage}"
+            );
+            // One rank of a report is enough: a mean over the others would be
+            // a figure nobody measured.
+            let two = report(vec![
+                rank(3, 1, 0.2, 100.0, None),
+                rank(5, 2, usage, 50.0, None),
+            ]);
+            assert_eq!(
+                load_row(&two, Role::Decode, now, now, SignalSource::Events),
+                None,
+                "{usage} beside a rank with a figure"
+            );
+            // The usage alone is enough, beside an active usage the rank
+            // states as a number: without one the active usage falls back
+            // to the usage, and the first two reports refuse on either.
+            let mut stated = rank(3, 1, usage, 100.0, None);
+            stated.active_token_usage = Some(0.25);
+            assert_eq!(
+                load_row(
+                    &report(vec![stated]),
+                    Role::Single,
+                    now,
+                    now,
+                    SignalSource::Poll
+                ),
+                None,
+                "{usage} beside a stated active usage"
+            );
+        }
+    }
+
+    /// The active usage is the figure the pressure reads: one that is not a
+    /// finite number is no row either, beside a usage that is a number.
+    #[test]
+    fn an_active_usage_that_is_not_a_finite_number_is_no_row() {
+        let now = Instant::now();
+        for active in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            let mut one = rank(3, 1, 0.6, 100.0, None);
+            one.active_token_usage = Some(active);
+            assert_eq!(
+                load_row(
+                    &report(vec![one]),
+                    Role::Single,
+                    now,
+                    now,
+                    SignalSource::Poll
+                ),
+                None,
+                "{active}"
+            );
+        }
+        let mut stated = rank(3, 1, 0.6, 100.0, None);
+        stated.active_token_usage = Some(0.25);
+        let row = row_of(
+            &report(vec![stated]),
+            Role::Single,
+            now,
+            now,
+            SignalSource::Poll,
+        );
+        assert_eq!((row.kv_usage_permille, row.active_kv_permille), (600, 250));
+    }
+
+    /// A negative usage is a number: the row is kept and the field reads
+    /// zero, as a count below zero reads none.
+    #[test]
+    fn a_negative_usage_is_kept_and_reads_zero() {
+        let now = Instant::now();
+        let mut below = rank(1, 0, -0.3, 100.0, None);
+        below.active_token_usage = Some(-2.0);
+        let row = row_of(
+            &report(vec![below]),
+            Role::Single,
+            now,
+            now,
+            SignalSource::Poll,
+        );
+        assert_eq!((row.kv_usage_permille, row.active_kv_permille), (0, 0));
+        assert_eq!(row.running, 1);
     }
 }
