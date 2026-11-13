@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 use super::{
     schema::{joined, keyword, shape, Definitions},
-    CallMarkers, Count, Grammar, Tag,
+    words, CallMarkers, Count, Grammar, Tag,
 };
 use crate::{
     format::Whitespace,
@@ -235,16 +235,6 @@ fn json_string() -> Grammar {
         excludes: Vec::new(),
         whitespace: Whitespace::Free,
     }
-}
-
-/// One of the words.
-fn words(words: &[&str]) -> Grammar {
-    Grammar::Or(
-        words
-            .iter()
-            .map(|word| Grammar::ConstString(word.to_string()))
-            .collect(),
-    )
 }
 
 /// A value the schema does not type: any text that holds no `)`.

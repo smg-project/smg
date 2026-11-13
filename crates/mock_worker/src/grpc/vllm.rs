@@ -120,7 +120,7 @@ impl VllmEngine for MockScheduler {
                 Some(params) => Rendezvous::Emptied {
                     field: "kv_transfer_params",
                     host: params.remote_host,
-                    port: i32::try_from(params.remote_port).unwrap_or(i32::MAX),
+                    port: params.remote_port,
                 },
                 None => Rendezvous::None,
             }
@@ -918,11 +918,11 @@ mod tests {
         }
     }
 
-    /// A typed pair that names no host or port is refused as that pair, not
-    /// as a missing `kv_transfer_params_json`: the legacy connector path sends
-    /// the typed pair, so an unresolved bootstrap host there reads under its
-    /// own field. The prefill side takes it, as it takes a request without
-    /// the parameters.
+    /// A typed pair that names no host or no port is refused as that pair,
+    /// not as a missing `kv_transfer_params_json`: the legacy connector path
+    /// sends the typed pair, so an unresolved bootstrap host there reads under
+    /// its own field, with the port as the wire carried it. The prefill side
+    /// takes it, as it takes a request without the parameters.
     #[tokio::test]
     async fn an_emptied_typed_pair_is_refused_under_its_own_field() {
         let (decode, _stop) = MockScheduler::for_tests(
@@ -962,6 +962,22 @@ mod tests {
             .expect("no port, not a stream");
         assert!(
             refused.message().contains("host \"10.0.0.9\", port 0"),
+            "{refused:?}"
+        );
+        // The other half of the guard, with a port the wire's uint32 carries
+        // and an i32 would not: the refusal names it whole.
+        let mut no_host = request("vw-e4", &[1, 2, 3], false);
+        no_host.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: String::new(),
+            remote_port: 3_000_000_000,
+        });
+        let refused = decode
+            .generate(Request::new(no_host))
+            .await
+            .err()
+            .expect("no host, not a stream");
+        assert!(
+            refused.message().contains("host \"\", port 3000000000"),
             "{refused:?}"
         );
         let (prefill, _stop) = MockScheduler::for_tests(

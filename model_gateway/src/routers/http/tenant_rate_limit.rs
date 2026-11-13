@@ -89,7 +89,8 @@ pub(crate) trait TenantCharge: GenerationRequest {
 
 /// What the assistant's turns in the history carry beside their content and
 /// reasoning: a refusal, and the arguments of their tool calls and of a
-/// deprecated function call. A call's name is not counted.
+/// deprecated function call, by the words of their JSON. A call's name is not
+/// counted.
 impl TenantCharge for ChatCompletionRequest {
     fn unrouted_words(&self) -> usize {
         self.messages
@@ -107,7 +108,7 @@ impl TenantCharge for ChatCompletionRequest {
                         .map(|call| &call.function)
                         .chain(function_call.as_deref())
                         .filter_map(|function| function.arguments.as_deref())
-                        .map(word_count)
+                        .map(argument_words)
                         .sum();
                     arguments + refusal.as_deref().map_or(0, word_count)
                 }
@@ -190,8 +191,8 @@ impl TenantCharge for GenerateRequest {
 }
 
 /// The instructions, and the function and custom tool calls in the history
-/// with their outputs. Images, files and the built-in tools' items are not
-/// counted.
+/// with their outputs, a function call's arguments by the words of their
+/// JSON. Images, files and the built-in tools' items are not counted.
 impl TenantCharge for ResponsesRequest {
     fn unrouted_words(&self) -> usize {
         let instructions = self.instructions.as_deref().map_or(0, word_count);
@@ -203,7 +204,7 @@ impl TenantCharge for ResponsesRequest {
             .map(|item| match item {
                 ResponseInputOutputItem::FunctionToolCall {
                     arguments, output, ..
-                } => word_count(arguments) + output.as_deref().map_or(0, word_count),
+                } => argument_words(arguments) + output.as_deref().map_or(0, word_count),
                 ResponseInputOutputItem::FunctionCallOutput { output, .. } => match output {
                     StringOrContentParts::String(text) => word_count(text),
                     StringOrContentParts::Array(parts) => parts
@@ -302,6 +303,22 @@ fn json_words(value: &Value) -> usize {
             .map(|(key, value)| word_count(key) + json_words(value))
             .sum(),
         Value::Null | Value::Bool(_) | Value::Number(_) => 1,
+    }
+}
+
+/// The words of a call's arguments: of their JSON when they parse, as a tool
+/// use's input counts, since JSON written without spaces (as clients send it,
+/// and as an object-form `arguments` is kept) is one word of text. Arguments
+/// that do not parse, as a call cut off mid-way leaves them, count the runs
+/// between spaces and JSON punctuation, so a cut-off compact object still
+/// counts its keys and values.
+fn argument_words(arguments: &str) -> usize {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value) => json_words(&value),
+        Err(_) => arguments
+            .split(|c: char| c.is_whitespace() || "{}[]:,\"".contains(c))
+            .filter(|word| !word.is_empty())
+            .count(),
     }
 }
 
@@ -1019,6 +1036,73 @@ mod tests {
         // 3 words of text, 10 of refusal and 10 of arguments: ceil(23 * 1.3).
         assert_eq!(chat.estimated_input_tokens(None), 30);
         assert_eq!(chat.estimated_input_tokens(Some("weather in Paris")), 30);
+    }
+
+    /// A call's arguments count by the words of their JSON, as a tool use's
+    /// input does: written without spaces, as clients send them and as an
+    /// object-form `arguments` is kept, they are not one word. Arguments that
+    /// are not JSON, a call cut off mid-way among them, count the runs between
+    /// spaces and JSON punctuation.
+    #[test]
+    fn a_call_s_compact_json_arguments_reserve_their_words() {
+        let compact = "{\"city\":\"Paris\",\"days\":3,\"units\":\"metric\"}";
+        let chat: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": compact},
+                }]},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "weather",
+                    "arguments": {"city": "Paris", "days": 3, "units": "metric"},
+                }},
+            ],
+        }));
+        assert_eq!(chat.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text and 6 of each call's arguments (three keys, two
+        // words and a number): ceil(15 * 1.3).
+        assert_eq!(chat.estimated_input_tokens(None), 20);
+
+        let responses: ResponsesRequest = request(json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "weather in Paris"},
+                {"type": "function_call", "call_id": "c1", "name": "weather",
+                 "arguments": compact},
+            ],
+        }));
+        assert_eq!(responses.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text and 6 of arguments: ceil(9 * 1.3).
+        assert_eq!(responses.estimated_input_tokens(None), 12);
+
+        let text: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": "city Paris, three days"},
+                }]},
+            ],
+        }));
+        // Not JSON: 3 words of text and 4 of arguments: ceil(7 * 1.3).
+        assert_eq!(text.estimated_input_tokens(None), 10);
+
+        let cut_off: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Paris\",\"days\":3,\"uni"},
+                }]},
+            ],
+        }));
+        // Cut off mid-way, so not JSON: 3 words of text and 5 of arguments
+        // (`city`, `Paris`, `days`, `3`, `uni`): ceil(8 * 1.3).
+        assert_eq!(cut_off.estimated_input_tokens(None), 11);
     }
 
     /// A tool result's text, a string or text blocks, and a tool use's input.

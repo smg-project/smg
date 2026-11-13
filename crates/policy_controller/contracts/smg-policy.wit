@@ -2,25 +2,23 @@
 /// (design 4.5 and appendix B). The records mirror the engine crate's view,
 /// decision and lifecycle types field for field and in the same order, less
 /// the fields the host keeps for itself (a candidate's position and sample
-/// instant, a request's host clock, a lease's issue instant); a crate test
-/// holds the two together until the file is generated from the types.
+/// instant, a request's host clock, a lease's issue instant and session
+/// verdict); a crate test holds the two together.
 ///
-/// Versioning: the package carries the world version; the engine accepts
-/// `smg:policy@1.x` within a stated range, the spec may pin `abi: 1.0`, the
-/// loader's error names the module's version and the accepted range, and
-/// the WIT is published per release. The component model types a record,
-/// variant, flags or function by its exact shape, so within 1.x no type or
-/// signature here changes: a 1.y release adds host functions, interfaces or
-/// worlds a module may leave unused, a module's extra exports are ignored,
-/// and a changed shape is a new type or the next major.
+/// Versioning: the package carries the world version. Within a published 1.x
+/// no type or signature changes (the component model types a record by its
+/// exact shape): a 1.y release adds host functions, interfaces or worlds a
+/// module may leave unused, a module's extra exports are ignored, and a
+/// changed shape is a new type or the next major. The world is pre-release
+/// until the first shipped release that carries it; the rule binds from then
+/// on. The loader's error names the module's version and the accepted range.
 ///
-/// Sandbox (design 4.5): no WASI. Validation refuses a component importing
-/// any `wasi:` interface; the only imports are `host` below. One instance per
-/// module per shard thread, created at apply and kept; the call runs in the
-/// deciding thread under fuel metering with a memory cap; a trap, an
-/// exhausted budget or a decline falls back to the configured stage. After a
-/// trap or an exhausted budget the instance is re-instantiated, never reused;
-/// a decline keeps the instance.
+/// Sandbox (design 4.5): no WASI, the only imports are `host` below. One
+/// instance per module per shard thread, created at apply and kept; the call
+/// runs under fuel metering with a memory cap. A trap, an exhausted budget or
+/// a decline falls back to the configured stage; a trap or an exhausted
+/// budget re-instantiates the instance, a decline keeps it.
+
 package smg:policy@1.0.0;
 
 /// The view (design 4.1) and the lifecycle (4.3) as the guest sees them.
@@ -41,16 +39,14 @@ interface types {
   /// The transport outcome of a dispatch, beside its status.
   enum transport-class { ok, client-error, server-error, connect-failed, timeout, cancelled }
   /// Why a lease was released before its completion.
-  enum release-reason { abandoned, late-decision, client-gone, commit-failed }
+  enum release-reason { abandoned, late-decision, client-gone, commit-failed, expired, worker-removed }
 
-  /// A tenant or a session key under the plugin's exposure (design 4.5):
-  /// `hash` unless the spec says `plain`, `none` when withheld. A plugin
-  /// cannot mistake one form for the other.
+  /// A tenant or a session key under the plugin's exposure: `hash` unless the
+  /// spec says `plain`, `none` when withheld.
   variant identity { none, hash(u64), plain(string) }
 
-  /// One load row, the engine load record's routing core in the record's own
-  /// names, rounded to narrow fields by the host. Permille fields are the
-  /// record's ratios times 1000.
+  /// The engine load record's routing core, rounded to narrow fields by the
+  /// host; permille fields are the record's ratios times 1000.
   record load {
     running: u32,
     queued: u32,
@@ -64,14 +60,14 @@ interface types {
     max-running: u32,
   }
 
-  /// One candidate row: a worker, or one DP rank of a data-parallel worker.
-  /// Positions are the row's index in the list the decision was given; the
-  /// stage results name positions. `zone`, `engine-kind` and `connector` are
-  /// one-based positions into the spec's declared lists (1 is the first
-  /// declared entry; 0 is unzoned, unspecified or none; `zone-capacity.zone`
-  /// uses the same numbering and is never 0); `labels` are bits over the
-  /// declared label list (at most 64 labels; validation refuses a longer
-  /// list). `load` is absent when the host has no report for the worker.
+  /// One candidate row: a worker, or one DP rank of one. Positions are the
+  /// row's index in the list the decision was given; the stage results name
+  /// positions. `zone`, `engine-kind` and `connector` are one-based positions
+  /// into the spec's declared lists (0 is unzoned, unspecified or none;
+  /// `zone-capacity.zone` is never 0); `labels` are bits over the declared
+  /// label list (at most 64; validation refuses a longer list). `load` is
+  /// absent when the host has no report; `admitted-age-ms` saturates at the
+  /// u32 maximum, never wraps.
   record candidate {
     id: u64,
     role: role,
@@ -98,16 +94,16 @@ interface types {
     vision: bool,
     host-local: bool,
     active-sessions: u16,
+    key: u32,
   }
 
   /// Media on the request: counts and bytes.
   record media { images: u16, audio: u16, video: u16, bytes: u32 }
 
-  /// One request as a decision sees it. `headers` pairs a position into the
-  /// spec's `view.headers` list with the value (zero-based: 0 is the first
-  /// declared name, unlike the one-based `zone`, `engine-kind` and
-  /// `connector`); `budget-micros` is relative
-  /// to the host's receipt; `seed` is the only randomness (see `host`).
+  /// One request as a decision sees it. `headers` pairs a zero-based position
+  /// into the spec's `view.headers` list with the value (unlike the one-based
+  /// `zone`, `engine-kind` and `connector`); `budget-micros` is relative to
+  /// the host's receipt; `seed` is the only randomness (see `host`).
   record request {
     model: string,
     namespace-seed: u64,
@@ -144,12 +140,12 @@ interface types {
   /// A stage that steps aside without a trap: the configured fallback runs.
   variant decline { not-applicable, budget, internal(string) }
 
-  /// The record of one issued decision, or of one side of a pair decision,
-  /// as the lifecycle names it. The id is the host's and unique within the
-  /// host's lifecycle stream: the controller mints the ids a plugin sees
-  /// (unique across gateways and terms: the minting term in the id's high
-  /// bits) and re-mints a gateway-minted fallback id before it reaches a
-  /// plugin; an embedded host is one gateway.
+  /// The record of one issued decision, or of one side of a pair decision. The
+  /// id is the host's and unique within its lifecycle stream: the controller
+  /// mints the ids a plugin sees (unique across gateways and terms: the
+  /// minting term in the high bits, under the bounds LeaseOrigin states in the
+  /// proto) and re-mints a gateway-minted fallback id before it reaches a
+  /// plugin.
   record lease {
     id: u64,
     kind: lease-kind,
@@ -167,12 +163,12 @@ interface types {
   /// pair, and the target itself is then the prefill.
   record target { id: u64, dp-rank: u16, pair: option<pair> }
 
-  /// The host dispatched to `target` on `side`, `since-decision-micros`
-  /// after the decision on its clock: a load credit dates from the dispatch,
-  /// not from a decision a queue may have held.
+  /// The host dispatched to `target` on `side`, `since-decision-micros` after
+  /// the decision on its clock: a load credit dates from the dispatch.
   record dispatched { lease: lease, target: target, side: side, since-decision-micros: u32 }
 
-  /// What a completed dispatch reported.
+  /// What a completed dispatch reported; `duration-micros` saturates at the
+  /// u32 maximum, never wraps.
   record completed {
     lease: lease,
     side: side,
@@ -198,10 +194,11 @@ interface types {
 
   /// A signal about one worker: a load row for (worker, rank), a health
   /// transition, or the worker's standing veto for the given microseconds,
-  /// aggregated over every gateway (it stands while any gateway holds one,
-  /// the microseconds are the longest remaining, 0 only when none remains;
-  /// an embedded host is one gateway); whose decisions a veto binds is the
-  /// deciding gateway's constraint, not this signal.
+  /// aggregated over every gateway (it stands while any gateway holds one, the
+  /// microseconds are the longest remaining, 0 only when none remains). The
+  /// deciding gateway's own veto is applied before any stage runs: in that
+  /// gateway's candidate rows alone the worker reads breaker-open (a breaker
+  /// veto) or stalled (a liveness veto).
   variant signal {
     load(tuple<u64, u16, load>),
     health(tuple<u64, health>),
@@ -219,13 +216,13 @@ interface types {
   }
 }
 
-/// What the host lends a plugin (design 4.5): a log line rate-limited per
-/// plugin with a level cap, the host's clock, counters over ids the spec
-/// declared (`plugins[].metrics`), and a draw from the decision's seed, so a
-/// decision replays from its trace. `now-micros` is the decision's instant
-/// inside `filter`, `score` and `pick` (the request's clock, fixed for the
-/// whole decision and supplied again by a replay) and the live clock inside
-/// `observe`; its origin is the host's, so only differences mean anything.
+/// What the host lends a plugin: a rate-limited log line with a level cap,
+/// the host's clock, counters over the ids the spec declared
+/// (`plugins[].metrics`), and a draw from the decision's seed, so a decision
+/// replays from its trace. `now-micros` is the decision's instant inside
+/// `filter`, `score` and `pick` (fixed for the decision, supplied again by a
+/// replay) and the live clock inside `observe`; its origin is the host's, so
+/// only differences mean anything.
 interface host {
   log: func(level: u8, msg: string);
   now-micros: func() -> u64;
@@ -234,13 +231,12 @@ interface host {
 }
 
 /// The record form. One `decision` resource per decision per module: the
-/// host constructs it once, calls the stages it asked for, drops it.
-/// Validity rules, enforced by the host; a violation is a trap for the
-/// plugin: `filter` returns positions that are unique and in range; `score`
-/// returns one finite value per candidate, clamped to 0..1 by the host (a
-/// NaN is a trap); `pick` returns a position within the surviving set the
-/// host passes back through `scores` (a score below zero marks a
-/// filtered-out row). `init` failure fails the whole apply.
+/// host constructs it once, calls the stages it asked for, drops it. Validity
+/// rules, enforced by the host (a violation is a trap): `filter` returns
+/// positions unique and in range; `score` one finite value per candidate,
+/// clamped to 0..1 by the host (a NaN is a trap); `pick` a position within
+/// the surviving set the host passes back through `scores` (a score below
+/// zero marks a filtered-out row). `init` failure fails the whole apply.
 interface plugin {
   use types.{request, candidate, pool, decline, lifecycle-event};
 
@@ -261,9 +257,7 @@ interface plugin {
 }
 
 /// The packed form: the same view written once into guest memory as
-/// little-endian rows the module keeps between the stage calls (measured
-/// 0.48, 0.61 and 1.4 microseconds at 8, 64 and 512 candidates against 1.0,
-/// 2.7 and 14.6 for the record form).
+/// little-endian rows the module keeps between the stage calls.
 ///
 /// Candidate row, 96 bytes, offsets in bytes:
 ///   0 id u64; 8 in-flight u32; 12 running u32; 16 queued u32;
@@ -278,7 +272,7 @@ interface plugin {
 ///   (0 none, 1 events, 2 scrape, 3 relay, 4 poll); 80 bits u8 (bit 0
 ///   session-hit, 1 has-capacity, 2 has-room, 3 ec-compatible, 4 vision,
 ///   5 host-local, 6 load-present); 81 zero; 82 active-sessions u16;
-///   84 to 87 zero; 88 labels u64.
+///   84 key u32; 88 labels u64.
 /// Request block: a 72-byte header, then the variable sections in the order
 /// below (the header carries their counts, not offsets: a reader walks the
 /// sections in order), offsets relative to the block's start:

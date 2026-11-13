@@ -197,15 +197,34 @@ impl<'a> ModelMetadata<'a> {
         Self::find_value(self.config, path).and_then(|value| value.as_u64().map(|v| v as u32))
     }
 
-    /// The token id a config field names, or the error naming the field: the
-    /// placeholder and delimiter ids a registry entry reads from its model
-    /// config.
+    /// The token id a config field names: the placeholder and delimiter ids a
+    /// registry entry reads from its model config. An absent field is
+    /// `MissingConfigField`, and so is a field set to `null`, which is how a
+    /// hub config writes an attribute the checkpoint never set; a present
+    /// value that is not a token id (negative, fractional, quoted, or above
+    /// the id range) is `InvalidConfigField` naming what was found, so the
+    /// operator reads the fault that is there.
     pub fn config_token_id(&self, field: &str) -> RegistryResult<TokenId> {
-        self.config_u32(&[field])
-            .map(|id| id as TokenId)
+        let value = Self::find_value(self.config, &[field])
+            .filter(|value| !value.is_null())
             .ok_or_else(|| ModelRegistryError::MissingConfigField {
                 field: field.to_string(),
-            })
+            })?;
+        let invalid = |reason: String| ModelRegistryError::InvalidConfigField {
+            field: field.to_string(),
+            reason,
+        };
+        let id = value.as_u64().ok_or_else(|| {
+            invalid(format!(
+                "expected a non-negative integer token id, found {value}"
+            ))
+        })?;
+        TokenId::try_from(id).map_err(|_| {
+            invalid(format!(
+                "token id {id} is above the id range (at most {})",
+                TokenId::MAX
+            ))
+        })
     }
 
     pub fn config_model_type(&self) -> Option<&str> {
@@ -1059,6 +1078,72 @@ mod tests {
             ModelRegistryError::MissingConfigField {
                 field: "video_token_id".to_string(),
             }
+        );
+    }
+
+    /// `image_token_id` read from `config` through the registry helper.
+    fn image_token_id_of(config: &Value) -> RegistryResult<TokenId> {
+        let encoding = TestTokenizer::new(&[]);
+        ModelMetadata {
+            model_id: "m",
+            tokenizer: &encoding,
+            config,
+        }
+        .config_token_id("image_token_id")
+    }
+
+    /// The error a present but unusable `image_token_id` produces, its reason
+    /// returned for the caller's assertion on the value it names.
+    fn invalid_image_token_id_reason(config: &Value) -> String {
+        match image_token_id_of(config).unwrap_err() {
+            ModelRegistryError::InvalidConfigField { field, reason } => {
+                assert_eq!(field, "image_token_id");
+                reason
+            }
+            other => panic!("expected InvalidConfigField, got {other:?}"),
+        }
+    }
+
+    /// A null id is an attribute the checkpoint never set, as a hub config
+    /// writes it: the error an absent field gives, naming the field to add.
+    #[test]
+    fn a_null_token_id_is_missing_not_invalid() {
+        assert_eq!(
+            image_token_id_of(&json!({ "image_token_id": null })).unwrap_err(),
+            image_token_id_of(&json!({})).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn a_negative_token_id_is_invalid_not_missing() {
+        let reason = invalid_image_token_id_reason(&json!({ "image_token_id": -1 }));
+        assert!(reason.contains("found -1"), "{reason}");
+    }
+
+    #[test]
+    fn a_fractional_token_id_is_invalid_not_missing() {
+        let reason = invalid_image_token_id_reason(&json!({ "image_token_id": 151655.0 }));
+        assert!(reason.contains("found 151655.0"), "{reason}");
+    }
+
+    #[test]
+    fn a_quoted_token_id_is_invalid_not_missing() {
+        let reason = invalid_image_token_id_reason(&json!({ "image_token_id": "151655" }));
+        assert!(reason.contains("found \"151655\""), "{reason}");
+    }
+
+    #[test]
+    fn a_token_id_above_the_id_range_is_invalid() {
+        let above = i64::from(TokenId::MAX) + 1;
+        let reason = invalid_image_token_id_reason(&json!({ "image_token_id": above }));
+        assert!(reason.contains("2147483648"), "{reason}");
+        assert!(reason.contains("(at most 2147483647)"), "{reason}");
+        let reason =
+            invalid_image_token_id_reason(&json!({ "image_token_id": u64::from(u32::MAX) + 1 }));
+        assert!(reason.contains("4294967296"), "{reason}");
+        assert_eq!(
+            image_token_id_of(&json!({ "image_token_id": TokenId::MAX })).unwrap(),
+            TokenId::MAX
         );
     }
 }

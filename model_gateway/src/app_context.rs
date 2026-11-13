@@ -806,11 +806,7 @@ impl AppContextBuilder {
                 config.routing_key_override.clone(),
             )
             .with_pd_pairing_mode(config.pd_pairing_mode)
-            .with_policy_engine(
-                config.policy_engine,
-                config.mode.get_prefill_policy(&config.policy),
-                config.mode.get_decode_policy(&config.policy),
-            ),
+            .with_policy_engine_for(config.policy_engine, &config.mode, &config.policy),
         ));
         self
     }
@@ -938,8 +934,9 @@ impl AppContextBuilder {
     /// cache-aware policy streams its KV events into the model's index, every
     /// other gRPC worker streams its load records alone, so load-aware
     /// routing prices a worker by a record at the engine's cadence rather
-    /// than by the last poll (the `UpdatePoliciesStep` picks the kind per
-    /// worker; HTTP and ZMQ workers are never subscribed). The monitor itself
+    /// than by the last poll (`start_kv_stream` picks the kind per worker,
+    /// for a registration and for an update that rebuilt the worker alike;
+    /// HTTP and ZMQ workers are never subscribed). The monitor itself
     /// is cheap (empty maps) and stays dormant until workers are added; a
     /// model without an events subscription has no index and no index
     /// gauges.
@@ -949,6 +946,11 @@ impl AppContextBuilder {
         // The load records on the streams are polls of the worker.
         if let Some(worker_monitor) = &self.worker_monitor {
             monitor.set_load_sink(worker_monitor);
+        }
+        // The add reads the registry before it stops or starts a stream: a
+        // worker the registry no longer holds under its URL gets none.
+        if let Some(registry) = &self.worker_registry {
+            monitor.set_worker_registry(registry);
         }
         monitor.start_stats_task();
 
@@ -997,14 +999,16 @@ fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::worker::WorkerStatus;
+    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
         worker::{
             test_support::{select_worker, worker_of},
-            BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType,
+            BasicWorkerBuilder, ConnectionMode, PrefillAdmissionAttempt, SubscriptionKind, Worker,
+            WorkerType,
         },
     };
 
@@ -1515,6 +1519,55 @@ policy:
         drop(selected);
         drop(occupied);
     }
+
+    /// The app wires its worker registry into the monitor: an add for a
+    /// gRPC worker the registry does not hold starts no stream, and the
+    /// same worker gets one once registered.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_kv_event_monitor_reads_the_apps_worker_registry() {
+        let config = config_with_policy(PolicyConfig::Random);
+        let builder = AppContextBuilder::new()
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_kv_event_monitor();
+        let monitor = builder
+            .kv_event_monitor
+            .as_ref()
+            .expect("the monitor is built");
+        let registry = builder
+            .worker_registry
+            .as_ref()
+            .expect("the worker registry is built");
+        // A port that refuses connections at once: the stream's task loops
+        // on reconnects until `stop`, with no engine involved.
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        assert!(logs_contain(
+            "no KV event stream for a worker the registry no longer holds"
+        ));
+        assert!(!logs_contain("Starting KV event subscription"));
+
+        registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        assert!(logs_contain("Starting KV event subscription"));
+        monitor.stop().await;
+    }
 }
 
 #[cfg(test)]
@@ -1580,10 +1633,10 @@ pub(crate) mod testing {
                     router_config.policy.clone(),
                     router_config.routing_key_override.clone(),
                 )
-                .with_policy_engine(
+                .with_policy_engine_for(
                     router_config.policy_engine,
-                    router_config.mode.get_prefill_policy(&router_config.policy),
-                    router_config.mode.get_decode_policy(&router_config.policy),
+                    &router_config.mode,
+                    &router_config.policy,
                 ),
             ),
             reasoning_parser_factory: None,

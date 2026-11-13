@@ -117,12 +117,16 @@ The stores report their record counts through `stored_record_count()` (the
 gateway samples them into `smg_history_memory_records{kind}`); the other
 backends answer `None`.
 
+The gateway's Messages route keeps its message threads in a store of this
+kind under every backend: at most `max_responses` turns, each kept for
+`retention_secs`.
+
 ### `PostgresConfig`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `db_url` | `String` | Connection URL (`postgres://user:pass@host:port/dbname`). Validated for scheme, host, and database name. |
-| `pool_max` | `usize` | Maximum connections in the deadpool pool (default helper: 16). Must be > 0. |
+| `pool_max` | `usize` | Maximum connections in the deadpool pool (default 16). Must be > 0. |
 | `op_timeout_secs` | `u64` | Bound in seconds on one call to the store (pool wait, connect and the statement; default 5, must be > 0). A call past it fails as a `Timeout` error, which the gateway answers `503 storage_unavailable`. |
 | `schema` | `Option<SchemaConfig>` | Optional schema customization. See [Schema Configuration](#schema-configuration). |
 

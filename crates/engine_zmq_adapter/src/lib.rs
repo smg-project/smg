@@ -64,15 +64,15 @@ pub use sglang_encode::{
 };
 pub use sglang_mm_hash::SglangCpuMmHasher;
 pub use sockets::{zmq_handshake_address, Handshake};
-pub use stream::ZmqGenerateStream;
+pub use stream::{FrontendFinish, ZmqGenerateStream};
 pub use structured_outputs::{
     refuse_unenforceable_constraint, ConstraintKinds, ConstraintRef,
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
 pub use tokenspeed::{
-    qwen35_lineage, to_tokenspeed_response, translate_encode_request, EncodeRendezvous,
-    GridTensors, MropeLayout, OmniLayout, PositionFacts, PositionRule, RuleFamily,
-    TokenSpeedGenerateStream,
+    qwen35_lineage, tensor_dtype_width, to_tokenspeed_response, translate_encode_request,
+    wire_tensor_tokenspeed, EncodeRendezvous, GridTensors, MropeLayout, OmniLayout, PositionFacts,
+    PositionRule, RuleFamily, TokenSpeedGenerateStream,
 };
 pub use trtllm::{to_trtllm_response, TrtllmGenerateStream};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};

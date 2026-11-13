@@ -11,15 +11,17 @@
 //! 1. added tokens are cut out of the text the way `AddedVocabulary` does it
 //!    (leftmost-longest, the non-normalized set on the raw text first, the
 //!    normalized set after normalization);
-//! 2. normalization is NFC or nothing, read from the tables `tokenizers`
-//!    normalizes with (the crate `unicode-normalization-alignments`, every
-//!    NFC read of this module: a newer crate's tables know marks and
-//!    compositions the library's do not and would compose other text); a
-//!    text already in NFC (its ASCII stretches are not read at all, the
-//!    quick check answers for most of the rest and normalizing settles what
-//!    it cannot, so marks-heavy scripts cost no copy) is used as it is, any
-//!    other text is normalized gap by gap between its raw added tokens, as
-//!    `tokenizers` normalizes it, and encoded from those buffers;
+//! 2. normalization is NFC, NFKC or nothing, read from the tables
+//!    `tokenizers` normalizes with (the crate
+//!    `unicode-normalization-alignments`, every normalization read of this
+//!    module: a newer crate's tables know marks and compositions the
+//!    library's do not and would compose other text); a text already in
+//!    the normalizer's form (its ASCII stretches are not read at all, the
+//!    quick check answers for most of the rest under NFC and normalizing
+//!    settles what it cannot, so marks-heavy scripts cost no copy) is used
+//!    as it is, any other text is normalized gap by gap between its raw
+//!    added tokens, as `tokenizers` normalizes it, and encoded from those
+//!    buffers;
 //! 3. each `Split` pre-tokenizer runs as a [`pattern::Pattern`] over `&str`,
 //!    with the same leftmost-first semantics and Unicode tables as the regex
 //!    engine `tokenizers` uses, producing byte ranges instead of strings (a
@@ -42,8 +44,9 @@
 //! their kin) has no `ByteLevel` stage and no stages here at all: the text
 //! between two added tokens is one word of the model, which the module
 //! [`sentencepiece`] cuts into pieces no merge crosses, with the word marker
-//! for the text's spaces and, by the `Metaspace` scheme, before it; the
-//! pieces take the same cache, seed and merge table, from character symbols.
+//! for the text's spaces and, by the `Metaspace` scheme or the `Prepend`
+//! normalizer, before it; the pieces take the same cache, seed and merge
+//! table, from character symbols.
 //!
 //! The shape is checked once at load time; a tokenizer that does not fit
 //! (another normalizer, a pre-tokenizer or regex construct outside the
@@ -440,9 +443,10 @@ fn first_non_ascii(bytes: &[u8]) -> Option<usize> {
 /// characters U+4000..=U+9FFF, each a lead byte E4..=E9 and two continuation
 /// bytes in UTF-8 (E4 80 80 is U+4000, E9 BF BF is U+9FFF; the kana under E3
 /// and the Hangul syllables under EA..=ED are not in it). Every one of them
-/// has combining class 0, no canonical decomposition and no part in any
-/// canonical composition (`the_ideograph_range_is_settled_by_the_crates_own_tables`
-/// walks the range against the crate's tables), so a run of them is in NFC
+/// has combining class 0, no canonical or compatibility decomposition and
+/// no part in any canonical composition
+/// (`the_ideograph_range_is_settled_by_the_crates_own_tables` walks the
+/// range against the crate's tables), so a run of them is in NFC and NFKC
 /// and either side of it is a cut, like an ASCII stretch.
 fn ideograph_run(bytes: &[u8]) -> usize {
     let mut at = 0;
@@ -466,14 +470,15 @@ fn checked_run(bytes: &[u8]) -> usize {
 
 /// The stretches of `text` that normalization reads on their own, each with
 /// its byte offset and whether it is settled: ASCII, or CJK ideographs. An
-/// ASCII stretch is in NFC in every version of Unicode and no normalization
-/// changes it; so is a run of ideographs (see [`ideograph_run`]), and
-/// nothing composes with an ideograph on either side. A run of other
-/// non-ASCII characters goes with the ASCII character before it, the letter
-/// an accent at its start composes with; nothing else crosses a cut: no
-/// composition has an ASCII character or an ideograph as its second
-/// element, no decomposition reaches across one, and both are starters, so
-/// the canonical order of marks never spans one.
+/// ASCII stretch is in NFC and NFKC in every version of Unicode and no
+/// normalization changes it; so is a run of ideographs (see
+/// [`ideograph_run`]), and nothing composes with an ideograph on either
+/// side. A run of other non-ASCII characters goes with the ASCII character
+/// before it, the letter an accent at its start composes with; nothing else
+/// crosses a cut: no composition has an ASCII character or an ideograph as
+/// its second element, no decomposition (canonical or compatibility)
+/// reaches across one, and both are starters, so the canonical order of
+/// marks never spans one.
 fn stretches(text: &str) -> impl Iterator<Item = (usize, &str, bool)> {
     let bytes = text.as_bytes();
     let mut at = 0;
@@ -505,31 +510,31 @@ fn stretches(text: &str) -> impl Iterator<Item = (usize, &str, bool)> {
     })
 }
 
-/// Whether `text` is in NFC by the tables `tokenizers` normalizes with: the
-/// crate's check on each stretch that is not settled (the quick check
+/// Whether `text` is in `form` by the tables `tokenizers` normalizes with:
+/// the crate's check on each stretch that is not settled (the quick check
 /// answers for most text; where it cannot, marks that might compose or
 /// reorder, the stretch is normalized and compared), none on the ASCII and
 /// ideograph ones.
-fn is_nfc(text: &str) -> bool {
-    stretches(text)
-        .all(|(_, stretch, settled)| settled || unicode_normalization_alignments::is_nfc(stretch))
+fn is_normalized(text: &str, form: Normalizer) -> bool {
+    stretches(text).all(|(_, stretch, settled)| settled || form.holds(stretch))
 }
 
-/// `text` in NFC by the tables `tokenizers` normalizes with, borrowed when
-/// it is in NFC already: only a stretch that is not settled and not in NFC
-/// goes through the crate's normalizer (its iterator reports a byte-offset
-/// shift with each character, which this path has no use for), the other
-/// stretches are copied. A stretch is read by the quick check where the
-/// caller has one (its tables place most characters; the library reads the
-/// windows they cannot), by the library's check otherwise.
-fn nfc<'a>(text: &'a str, quick: Option<&NfcQuick>) -> Cow<'a, str> {
-    let in_nfc = |stretch: &str| match quick {
-        Some(quick) => quick.is_nfc(stretch),
-        None => unicode_normalization_alignments::is_nfc(stretch),
+/// `text` in `form` by the tables `tokenizers` normalizes with, borrowed
+/// when it is in that form already: only a stretch that is not settled and
+/// not in the form goes through the crate's normalizer (its iterator
+/// reports a byte-offset shift with each character, which this path has no
+/// use for), the other stretches are copied. A stretch is read by the NFC
+/// quick check where the form is NFC and the caller has one (its tables
+/// place most characters; the library reads the windows they cannot), by
+/// the library's check for the form otherwise.
+fn normalize<'a>(text: &'a str, form: Normalizer, quick: Option<&NfcQuick>) -> Cow<'a, str> {
+    let in_form = |stretch: &str| match (form, quick) {
+        (Normalizer::Nfc, Some(quick)) => quick.is_nfc(stretch),
+        _ => form.holds(stretch),
     };
     let mut owned: Option<String> = None;
     for (start, stretch, settled) in stretches(text) {
-        if settled || in_nfc(stretch) {
+        if settled || in_form(stretch) {
             if let Some(out) = &mut owned {
                 out.push_str(stretch);
             }
@@ -539,7 +544,7 @@ fn nfc<'a>(text: &'a str, quick: Option<&NfcQuick>) -> Cow<'a, str> {
                 out.push_str(&text[..start]);
                 out
             });
-            out.extend(stretch.nfc().map(|(ch, _)| ch));
+            form.normalize_into(stretch, out);
         }
     }
     owned.map_or(Cow::Borrowed(text), Cow::Owned)
@@ -564,18 +569,68 @@ fn bytes_char() -> [char; 256] {
     table
 }
 
+/// The normalizer the path applies before the cut after normalization:
+/// none, or one of the two composed Unicode forms `tokenizers` has
+/// (compatibility characters, fullwidth forms and ligatures among them,
+/// spell out under NFKC and stay as they are under NFC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Normalizer {
     None,
     Nfc,
+    Nfkc,
+}
+
+impl Normalizer {
+    /// Whether `stretch` is in this form by the library's tables (every
+    /// text is, under no normalizer).
+    fn holds(self, stretch: &str) -> bool {
+        match self {
+            Self::None => true,
+            Self::Nfc => unicode_normalization_alignments::is_nfc(stretch),
+            Self::Nfkc => unicode_normalization_alignments::is_nfkc(stretch),
+        }
+    }
+
+    /// `stretch` in this form, appended to `out`.
+    fn normalize_into(self, stretch: &str, out: &mut String) {
+        match self {
+            Self::None => out.push_str(stretch),
+            Self::Nfc => out.extend(stretch.nfc().map(|(ch, _)| ch)),
+            Self::Nfkc => out.extend(stretch.nfkc().map(|(ch, _)| ch)),
+        }
+    }
 }
 
 /// One `Split` of the pre-tokenizer chain.
 struct Stage {
     pattern: Pattern,
-    /// `Isolated`: the text between matches forms pieces too. Otherwise
-    /// (`Removed` with `invert`) only the matches do.
-    keep_gaps: bool,
+    /// The spans of the stage's text that go on as pieces.
+    pieces: Pieces,
+}
+
+/// The spans of a stage's text that go on as its pieces: the reference's
+/// split behaviors the path reproduces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pieces {
+    /// `Isolated`: the matches and the text between them.
+    MatchesAndGaps,
+    /// `Removed` inverted: the matches alone.
+    Matches,
+    /// `Removed`: the text between the matches alone; a match is dropped
+    /// and the pieces on either side of it stay apart.
+    Gaps,
+}
+
+impl Pieces {
+    /// Whether the text between and around the matches goes on.
+    fn gaps(self) -> bool {
+        self != Self::Matches
+    }
+
+    /// Whether the matches go on.
+    fn matches(self) -> bool {
+        self != Self::Gaps
+    }
 }
 
 /// Added tokens by content and id, the list a matcher is built from.
@@ -810,9 +865,9 @@ impl<'t> Units<'t> {
     }
 }
 
-/// A raw added token, or a text between raw added tokens in NFC: borrowed
-/// where it was in NFC already, owned where normalizing changed it (see
-/// [`NativeEncoder::nfc_gaps`]).
+/// A raw added token, or a text between raw added tokens in the
+/// normalizer's form: borrowed where it was in that form already, owned
+/// where normalizing changed it (see [`NativeEncoder::normalized_gaps`]).
 enum Gap<'t> {
     Text(Cow<'t, str>),
     Added(u32),
@@ -841,8 +896,12 @@ struct Template {
 pub(crate) struct NativeEncoder {
     normalizer: Normalizer,
     /// The NFC quick check's tables, read when the normalizer is NFC: the
-    /// check every encode under it starts with (see [`Self::in_nfc`]).
+    /// check every encode under it starts with (see [`Self::in_form`]; the
+    /// NFKC form has no quick check and reads the library's).
     nfc_quick: Option<NfcQuick>,
+    /// Whether a stage holds the end anchor `$`: such a text is never cut
+    /// into units for the thread pool (see [`Self::stable_cut`]).
+    end_anchored: bool,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
     /// Added tokens matched after normalization (`normalized: true`).
@@ -977,6 +1036,7 @@ impl NativeEncoder {
         };
         let chain = chain::Scanner::recognize(&stages);
         Ok(Self {
+            end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
             nfc_quick: (normalizer == Normalizer::Nfc).then(NfcQuick::read),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
@@ -1000,10 +1060,14 @@ impl NativeEncoder {
     /// the word marker by a `Replace` normalizer alone (a `Split` on the
     /// space behind it cuts nothing then, and is accepted) or by the
     /// `Metaspace` pre-tokenizer of the Llama class with no normalizer, whose
-    /// prepend scheme places the marker; anything else declines, as does an
-    /// added token matched after the `Replace` with a space or a marker in
-    /// it (matched on the raw text here, its spelling would not be the one
-    /// `tokenizers` matches after the normalizer).
+    /// prepend scheme places the marker, or by a `Prepend` of the marker
+    /// before the `Replace` (the legacy conversion's shape), which places it
+    /// before every text; anything else declines, as does an added token
+    /// matched after the `Replace` with a space or a marker in it (matched
+    /// on the raw text here, its spelling would not be the one `tokenizers`
+    /// matches after the normalizer), and any added token matched after the
+    /// `Prepend` (a text after it gets no marker there; one after a raw
+    /// added token does).
     fn sentencepiece_from<M: Model + ModelView>(
         tokenizer: &TokenizerOf<M>,
         pre_tokenizer: &Value,
@@ -1015,6 +1079,12 @@ impl NativeEncoder {
             tokenizer.get_post_processor(),
         )?)?;
         let (raw, normalized) = Self::added_tokens_of(tokenizer, Normalizer::None)?;
+        if marker == Marker::Every && !normalized.is_empty() {
+            return Err(Declined::from(
+                "a byte-fallback vocabulary with an added token matched after the Prepend \
+                 normalizer",
+            ));
+        }
         if replaces
             && normalized
                 .iter()
@@ -1033,10 +1103,12 @@ impl NativeEncoder {
         tracing::debug!(
             merges = chars.merges(),
             bytes = chars.bytes(),
+            bytes_without_a_token = chars.bytes_without_a_token(),
             ?marker,
             "the native encode path takes the byte-fallback vocabulary from character symbols"
         );
         Ok(Self {
+            end_anchored: false,
             normalizer: Normalizer::None,
             nfc_quick: None,
             raw_added: AddedTokens::build(&raw)?,
@@ -1070,28 +1142,37 @@ impl NativeEncoder {
     /// Where the word marker comes from on a byte-fallback vocabulary, and
     /// whether a `Replace` normalizer puts it for the spaces (true in the
     /// answer; the `Metaspace` pre-tokenizer does so itself): `Never` under
-    /// the normalizer, the scheme of the pre-tokenizer without one; or why
-    /// the pipeline declines.
+    /// the normalizer, `Every` under a `Prepend` of the marker before it, the
+    /// scheme of the pre-tokenizer without one; or why the pipeline declines.
     fn marker_from(normalizer: &Value, pre_tokenizer: &Value) -> Result<(Marker, bool), Declined> {
         let replace = serde_json::json!(
             {"type": "Replace", "pattern": {"String": " "}, "content": WORD_MARKER.to_string()}
         );
-        // Alone, or as the one step of a `Sequence`, as some conversions
-        // write it.
-        let replaces = *normalizer == replace
-            || normalizer.get("type").and_then(Value::as_str) == Some("Sequence")
-                && normalizer
-                    .get("normalizers")
-                    .and_then(Value::as_array)
-                    .is_some_and(|steps| matches!(steps.as_slice(), [step] if *step == replace));
+        let prepend = serde_json::json!({"type": "Prepend", "prepend": WORD_MARKER.to_string()});
+        // Alone, as the one step of a `Sequence`, as some conversions write
+        // it, or after a `Prepend` of the marker (the legacy conversion's
+        // shape, which puts the marker before every text).
+        let steps = match normalizer.get("type").and_then(Value::as_str) {
+            Some("Sequence") => normalizer
+                .get("normalizers")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice),
+            _ => None,
+        };
+        let prepends =
+            matches!(steps, Some([first, second]) if *first == prepend && *second == replace);
+        let replaces =
+            prepends || *normalizer == replace || matches!(steps, Some([step]) if *step == replace);
         if !(normalizer.is_null() || replaces) {
             return Err(Declined::from(
-                "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) \
-                 or none",
+                "a byte-fallback vocabulary with a normalizer other than Replace(space, marker), \
+                 alone or after Prepend(marker), or none",
             ));
         }
         if pre_tokenizer.is_null() {
-            return if replaces {
+            return if prepends {
+                Ok((Marker::Every, true))
+            } else if replaces {
                 Ok((Marker::Never, true))
             } else {
                 Err(Declined::from(
@@ -1105,6 +1186,7 @@ impl NativeEncoder {
             // No space is left after the normalizer: the split cuts nothing.
             "Split"
                 if replaces
+                    && !prepends
                     && field("pattern") == Some(&serde_json::json!({"String": " "}))
                     && field("behavior").and_then(Value::as_str) == Some("MergedWithPrevious")
                     && field("invert").and_then(Value::as_bool) == Some(false) =>
@@ -1125,6 +1207,10 @@ impl NativeEncoder {
                     ))),
                 }
             }
+            other if prepends => Err(Declined::from(format!(
+                "a byte-fallback vocabulary with the pre-tokenizer {other} under the Prepend \
+                 normalizer (the path takes that normalizer with none)"
+            ))),
             other => Err(Declined::from(format!(
                 "a byte-fallback vocabulary with the pre-tokenizer {other} (only none or a Split \
                  on the space after the Replace normalizer, or Metaspace without split)"
@@ -1132,13 +1218,14 @@ impl NativeEncoder {
         }
     }
 
-    /// The normalizer this path applies: none, or NFC alone.
+    /// The normalizer this path applies: none, or NFC or NFKC alone.
     fn normalizer_from(normalizer: &Value) -> Result<Normalizer, Declined> {
         if normalizer.is_null() {
             return Ok(Normalizer::None);
         }
         match type_of("normalizer", normalizer)? {
             "NFC" => Ok(Normalizer::Nfc),
+            "NFKC" => Ok(Normalizer::Nfkc),
             "Sequence" => {
                 let steps = normalizer
                     .get("normalizers")
@@ -1148,12 +1235,12 @@ impl NativeEncoder {
                     Ok(Normalizer::None)
                 } else {
                     Err(Declined::from(
-                        "a normalizer sequence with steps (only NFC alone or none)",
+                        "a normalizer sequence with steps (only NFC or NFKC alone, or none)",
                     ))
                 }
             }
             other => Err(Declined::from(format!(
-                "normalizer {other} (only NFC or none)"
+                "normalizer {other} (only NFC, NFKC or none)"
             ))),
         }
     }
@@ -1316,7 +1403,7 @@ impl NativeEncoder {
             if token.normalized {
                 let content = match normalizer {
                     Normalizer::None => token.content.clone(),
-                    Normalizer::Nfc => nfc(&token.content, None).into_owned(),
+                    form => normalize(&token.content, form, None).into_owned(),
                 };
                 normalized.push((content, id));
             } else {
@@ -1545,11 +1632,30 @@ impl NativeEncoder {
         pattern: &str,
         specials: &[(String, u32)],
     ) -> Result<Self, Declined> {
-        let pattern = Pattern::parse(pattern).ok_or_else(|| {
+        let parsed = Pattern::parse(pattern).ok_or_else(|| {
             Declined::from(format!(
                 "a split pattern outside the supported regex subset: {pattern}"
             ))
         })?;
+        // The file's own encoder reads `$` as the end of the text only, where
+        // the subset reads it as the Hugging Face engine does (before a
+        // newline too): a pattern with the anchor is declined on this path.
+        if parsed.end_anchored() {
+            return Err(Declined::from(format!(
+                "a split pattern with the end anchor, which the file's own encoder reads as the \
+                 end of the text only: {pattern}"
+            )));
+        }
+        // The file's own encoder reads the word boundary with another word
+        // class (the UTS#18 set, without the other numbers such as `²`),
+        // where the subset reads it as the Hugging Face engine does: a
+        // pattern with the digit-grouping lookahead is declined on this path.
+        if parsed.reads_word_boundary() {
+            return Err(Declined::from(format!(
+                "a split pattern with the digit-grouping lookahead, whose word boundary the file's \
+                 own encoder reads with another word class: {pattern}"
+            )));
+        }
         if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
             return Err(Declined::from(format!(
                 "special token {content:?} without content"
@@ -1582,8 +1688,8 @@ impl NativeEncoder {
             "the native encode path merges a tiktoken vocabulary's piece-cache misses itself"
         );
         let stages = vec![Stage {
-            pattern,
-            keep_gaps: false,
+            pattern: parsed,
+            pieces: Pieces::Matches,
         }];
         let chain = chain::Scanner::recognize(&stages);
         Ok(Self {
@@ -1591,6 +1697,7 @@ impl NativeEncoder {
             raw_added: AddedTokens::build(specials)?,
             normalized_added: None,
             nfc_quick: None,
+            end_anchored: false,
             stages,
             chain,
             frame: Frame::default(),
@@ -1652,7 +1759,7 @@ impl NativeEncoder {
             stages.push(Stage {
                 pattern: Pattern::parse(BYTE_LEVEL_PATTERN)
                     .ok_or_else(|| Declined::from("the ByteLevel split pattern"))?,
-                keep_gaps: true,
+                pieces: Pieces::MatchesAndGaps,
             });
         }
         // A stage after the `ByteLevel` cuts the mapped text. It cuts the
@@ -1673,16 +1780,17 @@ impl NativeEncoder {
     }
 
     /// One `Split` as a stage: a regex or a literal the pattern engine takes,
-    /// `Isolated`, or `Removed` inverted. A `Digits` is the `Isolated` split
-    /// on numeric characters, each one a piece under `individual_digits`,
-    /// else each run: the reference splits on `char::is_numeric`, the
-    /// toolchain's numeric set ([`unicode::STD_NUMERIC`]), which is not the
-    /// engine's `\p{N}` (the regex engine's Unicode version). A `Punctuation`
-    /// is the `Isolated` split on the reference's punctuation set, one
-    /// character a piece, or one run under `Contiguous`: the reference
-    /// pre-tokenizer's own set ([`unicode::REFERENCE_PUNCTUATION`]: ASCII
-    /// punctuation, or the punctuation category of the Unicode tables it
-    /// carries), not the engine's `\p{P}`, which has moved on since.
+    /// `Isolated`, `Removed`, or `Removed` inverted. A `Digits` is the
+    /// `Isolated` split on numeric characters, each one a piece under
+    /// `individual_digits`, else each run: the reference splits on
+    /// `char::is_numeric`, the toolchain's numeric set
+    /// ([`unicode::STD_NUMERIC`]), which is not the engine's `\p{N}` (the
+    /// regex engine's Unicode version). A `Punctuation` is the `Isolated`
+    /// split on the reference's punctuation set, one character a piece, or
+    /// one run under `Contiguous`: the reference pre-tokenizer's own set
+    /// ([`unicode::REFERENCE_PUNCTUATION`]: ASCII punctuation, or the
+    /// punctuation category of the Unicode tables it carries), not the
+    /// engine's `\p{P}`, which has moved on since.
     fn split_stage(split: &Value) -> Result<Stage, Declined> {
         match type_of("pre-tokenizer stage", split)? {
             "Split" => {}
@@ -1696,7 +1804,7 @@ impl NativeEncoder {
                 return Pattern::parse(&class_pattern(unicode::STD_NUMERIC, !each))
                     .map(|pattern| Stage {
                         pattern,
-                        keep_gaps: true,
+                        pieces: Pieces::MatchesAndGaps,
                     })
                     .ok_or_else(|| Declined::from("the Digits split pattern"));
             }
@@ -1714,7 +1822,7 @@ impl NativeEncoder {
                 return Pattern::parse(&class_pattern(unicode::REFERENCE_PUNCTUATION, runs))
                     .map(|pattern| Stage {
                         pattern,
-                        keep_gaps: true,
+                        pieces: Pieces::MatchesAndGaps,
                     })
                     .ok_or_else(|| Declined::from("the Punctuation split pattern"));
             }
@@ -1739,16 +1847,17 @@ impl NativeEncoder {
             ),
             _ => return Err(Declined::from("a Split pattern neither Regex nor String")),
         };
-        let keep_gaps = match (
+        let pieces = match (
             split.get("behavior").and_then(Value::as_str),
             split.get("invert").and_then(Value::as_bool),
         ) {
-            (Some("Isolated"), Some(false)) => true,
-            (Some("Removed"), Some(true)) => false,
+            (Some("Isolated"), Some(false)) => Pieces::MatchesAndGaps,
+            (Some("Removed"), Some(false)) => Pieces::Gaps,
+            (Some("Removed"), Some(true)) => Pieces::Matches,
             (behavior, invert) => {
                 return Err(Declined::from(format!(
-                    "Split behavior {behavior:?} with invert {invert:?} (only Isolated, or \
-                     Removed inverted)"
+                    "Split behavior {behavior:?} with invert {invert:?} (only Isolated, Removed, \
+                     or Removed inverted)"
                 )))
             }
         };
@@ -1757,7 +1866,7 @@ impl NativeEncoder {
                 "a split pattern outside the supported regex subset: {regex}"
             ))
         })?;
-        Ok(Stage { pattern, keep_gaps })
+        Ok(Stage { pattern, pieces })
     }
 
     /// The ids of `text`, framed by the post-processor's special tokens when
@@ -1845,11 +1954,11 @@ impl NativeEncoder {
         // length (`WORD_SCAN_MIN_BYTES`): every unit of a long input takes
         // them, a short input walks its runs byte by byte.
         let words = text.len() >= WORD_SCAN_MIN_BYTES;
-        // Text not in NFC under the NFC normalizer (by the library's tables,
-        // as every NFC read here) is normalized gap by gap first; the units
-        // then borrow from those gaps.
-        let gaps = (self.normalizer == Normalizer::Nfc && !self.in_nfc(text))
-            .then(|| self.nfc_gaps(text, added));
+        // Text not in the normalizer's form (by the library's tables, as
+        // every normalization read here) is normalized gap by gap first;
+        // the units then borrow from those gaps.
+        let gaps = (self.normalizer != Normalizer::None && !self.in_form(text))
+            .then(|| self.normalized_gaps(text, added));
         let units = match &gaps {
             Some(gaps) => self.units_of(gaps, parallel, added),
             None => self.units(text, parallel, added),
@@ -1924,13 +2033,14 @@ impl NativeEncoder {
         }
     }
 
-    /// Whether `text` is in NFC by the library's tables: the quick check's
-    /// own tables first, the library's stretch-wise check where they cannot
-    /// tell (an encoder without the NFC normalizer never asks).
-    fn in_nfc(&self, text: &str) -> bool {
+    /// Whether `text` is in the normalizer's form by the library's tables:
+    /// the NFC quick check's own tables first, the library's stretch-wise
+    /// check where they cannot tell and under NFKC (an encoder without a
+    /// normalizer never asks).
+    fn in_form(&self, text: &str) -> bool {
         match &self.nfc_quick {
             Some(quick) => quick.is_nfc(text),
-            None => is_nfc(text),
+            None => is_normalized(text, self.normalizer),
         }
     }
 
@@ -1971,9 +2081,10 @@ impl NativeEncoder {
         units
     }
 
-    /// [`Self::units`] over the gaps of a text that was not in NFC
-    /// ([`Self::nfc_gaps`]): the raw cut is done and every text is in NFC,
-    /// what remains is the cut after normalization and the chunking.
+    /// [`Self::units`] over the gaps of a text that was not in the
+    /// normalizer's form ([`Self::normalized_gaps`]): the raw cut is done
+    /// and every text is in that form, what remains is the cut after
+    /// normalization and the chunking.
     fn units_of<'g>(&self, gaps: &'g [Gap<'_>], chunked: bool, added: bool) -> Units<'g> {
         let mut units = Units::new();
         for gap in gaps {
@@ -1987,16 +2098,18 @@ impl NativeEncoder {
     }
 
     /// The text cut at its raw added tokens (not at all with `added` off),
-    /// each text between them in NFC: as it is where it was, normalized
-    /// into an owned buffer where it was not. `tokenizers` normalizes each
-    /// such text on its own, after the raw cut and before the cut after
-    /// normalization: a mark right after a raw token has nothing to compose
-    /// with, and a token's spelling is never matched across what
-    /// normalization changed.
-    fn nfc_gaps<'t>(&self, text: &'t str, added: bool) -> Vec<Gap<'t>> {
+    /// each text between them in the normalizer's form: as it is where it
+    /// was, normalized into an owned buffer where it was not. `tokenizers`
+    /// normalizes each such text on its own, after the raw cut and before
+    /// the cut after normalization: a mark right after a raw token has
+    /// nothing to compose with, and a token's spelling is never matched
+    /// across what normalization changed.
+    fn normalized_gaps<'t>(&self, text: &'t str, added: bool) -> Vec<Gap<'t>> {
         let mut gaps = Vec::new();
-        let quick = self.nfc_quick.as_ref();
-        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| gaps.push(Gap::Text(nfc(text, quick)));
+        let (form, quick) = (self.normalizer, self.nfc_quick.as_ref());
+        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| {
+            gaps.push(Gap::Text(normalize(text, form, quick)));
+        };
         match self.raw_added.as_ref().filter(|_| added) {
             Some(raw) => raw.split(text, |segment| match segment {
                 Segment::Added(id) => gaps.push(Gap::Added(id)),
@@ -2038,8 +2151,11 @@ impl NativeEncoder {
     /// that is not whitespace, where the patterns, run over the text around
     /// it, cut cleanly ([`Self::piece_starts_at`]). No piece spans such a
     /// point (letters, digits and punctuation stop at the space, a whitespace
-    /// run cannot start before it) and the patterns have no lookbehind, so
-    /// the pieces of the two halves are the pieces of the whole. `None` when
+    /// run cannot start before it) and the patterns read nothing before a
+    /// match's start (the digit-grouping lookahead's word boundary reads the
+    /// character before it, one its match consumed: the parser declines the
+    /// lookahead where it could lead a match), so the pieces of the two
+    /// halves are the pieces of the whole. `None` when
     /// the text has no such point past `from`, or when
     /// [`MAX_REJECTED_CUT_CANDIDATES`] candidates past `from` failed the
     /// check: a stretch without candidates (a blob, a table of numbers) costs
@@ -2052,7 +2168,9 @@ impl NativeEncoder {
             let bytes = text.as_bytes();
             return (from.max(1)..text.len()).find(|&p| chars.cuts_at(bytes, p));
         }
-        if self.stages.is_empty() {
+        // A stage that reads the end of the text (`$`) would read the
+        // window's end as one: no cut, the text stays one unit.
+        if self.stages.is_empty() || self.end_anchored {
             return None;
         }
         let bytes = text.as_bytes();
@@ -2163,7 +2281,9 @@ impl NativeEncoder {
         // `encode_single_stage`, out of line, where the scanner's own loop
         // probes each piece in place (no recursive walk); the chain hands
         // its pieces, as offsets into the unit, to the same probe through
-        // its static callback; any other shape walks.
+        // its static callback; any other shape walks, a lone `Removed`
+        // stage among them (its matches are no pieces: the scanner loop
+        // stays the loop of a stage whose matches are).
         match (&self.chain, self.stages.as_slice()) {
             (Some(chain), _) => {
                 chain.pieces(text, &mut |start, end| {
@@ -2174,7 +2294,7 @@ impl NativeEncoder {
                     }
                 });
             }
-            (None, [stage]) => {
+            (None, [stage]) if stage.pieces.matches() => {
                 if let Err(declined) =
                     self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
                 {
@@ -2206,13 +2326,15 @@ impl NativeEncoder {
         };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.keep_gaps && cursor < start {
+            if stage.pieces.gaps() && cursor < start {
                 self.pieces(depth + 1, &text[cursor..start], f);
             }
-            self.pieces(depth + 1, &text[start..end], f);
+            if stage.pieces.matches() {
+                self.pieces(depth + 1, &text[start..end], f);
+            }
             cursor = end;
         }
-        if stage.keep_gaps && cursor < text.len() {
+        if stage.pieces.gaps() && cursor < text.len() {
             self.pieces(depth + 1, &text[cursor..], f);
         }
     }
@@ -2277,7 +2399,7 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let keep_gaps = stage.keep_gaps;
+        let gaps = stage.pieces.gaps();
         let mut cursor = 0;
         let mut fallback = None;
         // The probe compiles into the scanner's loop. As a closure of its
@@ -2291,7 +2413,7 @@ impl NativeEncoder {
             words,
             #[inline(always)]
             |start, end| {
-                if keep_gaps && cursor < start {
+                if gaps && cursor < start {
                     if let Err(declined) =
                         self.tokenize_gap(model, text, cursor..start, mapped, ids, cache)
                     {
@@ -2306,7 +2428,7 @@ impl NativeEncoder {
                 cursor = end;
             },
         );
-        if keep_gaps && cursor < text.len() {
+        if gaps && cursor < text.len() {
             if let Err(declined) =
                 self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
             {
@@ -2494,8 +2616,11 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) {
         let bytes = text.as_bytes();
-        // A text that starts with a space or a marker has its marker already.
-        let mut leading = marker && !(text.starts_with(' ') || text.starts_with(WORD_MARKER));
+        // A text that starts with a space or a marker has its marker already,
+        // unless the normalizer prepends one regardless.
+        let mut leading = marker
+            && (chars.prepends_to_a_marked_text()
+                || !(text.starts_with(' ') || text.starts_with(WORD_MARKER)));
         if leading && chars.cuts_at(&[b' ', bytes[0]], 1) {
             self.tokenize_leading_piece(chars, "", mapped, ids, cache);
             leading = false;

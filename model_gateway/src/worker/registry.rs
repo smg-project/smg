@@ -196,6 +196,9 @@ pub(crate) struct ModelWorkerSnapshot {
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
     pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
+    /// Whether a worker of this generation serves a Harmony model, kept from
+    /// the first request's reading (see [`Self::harmony`]).
+    harmony: OnceLock<bool>,
 }
 
 impl ModelWorkerSnapshot {
@@ -204,7 +207,22 @@ impl ModelWorkerSnapshot {
             all,
             pools: std::array::from_fn(|_| OnceLock::new()),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
+            harmony: OnceLock::new(),
         }
+    }
+
+    /// Whether a worker of this membership generation serves a Harmony
+    /// model: `decide` reads the snapshot's workers on the first request
+    /// after the membership change, every request after it reads the kept
+    /// answer. A registration, a removal and a property rebuild each publish
+    /// a new snapshot, so the per-worker card scans run once, not per
+    /// request. A lazy model refresh (`Worker::set_models`) rewrites a
+    /// worker's cards in place without one and is read at the next
+    /// membership change; only external workers, which the gRPC pipeline
+    /// does not serve, are refreshed today. The rule itself stays with the
+    /// router's detector.
+    pub(crate) fn harmony(&self, decide: impl FnOnce(&[Arc<dyn Worker>]) -> bool) -> bool {
+        *self.harmony.get_or_init(|| decide(&self.all))
     }
 
     /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor

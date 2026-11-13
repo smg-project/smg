@@ -218,6 +218,18 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
             StatusCode::BAD_REQUEST,
         ),
         (
+            "media refused as the request sent it, with its code in the trailer",
+            stamp_media_code(
+                WorkerMediaFault::Client.stamp(Status::invalid_argument(
+                    "Failed to finalize multimodal tracker: data URL parse error: missing comma \
+                     in data url",
+                )),
+                "invalid_multimodal_request",
+            ),
+            "invalid_multimodal_request",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
             "a worker that predates the trailer",
             Status::unavailable(
                 "Failed to finalize multimodal tracker: HTTP error while fetching media: error \

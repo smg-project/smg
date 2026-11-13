@@ -1,3 +1,4 @@
+mod cut_jpeg;
 mod decode_limit;
 mod exif_orientation;
 mod hop_budget;
@@ -7,6 +8,7 @@ mod seek_decode;
 mod sixteen_bit_colour;
 mod sixteen_bit_grey;
 mod transparency;
+mod video_decoder_gap;
 mod video_frame_cap;
 mod video_sampling;
 

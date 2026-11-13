@@ -382,7 +382,7 @@ class Repo:
             if len(crossed) >= 40:
                 return None, crossed
             crossed.append(candidate)
-            pointee = (self.show("HEAD", candidate) or "").strip()
+            pointee = self.show("HEAD", candidate) or ""
             if not pointee or os.path.isabs(pointee):
                 return None, crossed
             remaining = [*pointee.split("/"), *remaining]
@@ -405,7 +405,7 @@ class Repo:
                 if not entry.startswith("120000 "):
                     continue
                 link = entry.split("\t", 1)[1]
-                pointee = (self.show("HEAD", link) or "").strip()
+                pointee = self.show("HEAD", link) or ""
                 if not pointee or os.path.isabs(pointee):
                     continue
                 target, crossed = self.resolve_path(os.path.join(os.path.dirname(link), pointee))
@@ -485,12 +485,13 @@ def component_paths(repo: Repo, component: Component) -> list[str]:
 
 def files_changed(repo: Repo, tag: str, component: Component) -> int:
     """The component's files changed since the tag, the targets of its symlinks among them; pure
-    renames and a version-only edit do not count."""
-    version_name = os.path.basename(component.version_file)
+    renames and a version-only edit of the component's own version file do not count (a manifest
+    of the same name a link reaches is content)."""
+    version_files = with_legacy(component.version_file)
     count = sum(
         1
         for line in repo.changed_since(tag, component_paths(repo, component))
-        if not line.startswith("R100") and not line.endswith(version_name)
+        if not line.startswith("R100") and line.rsplit("\t", 1)[-1] not in version_files
     )
     if version_file_has_other_changes(repo, tag, component.version_file):
         count += 1

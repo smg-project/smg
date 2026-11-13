@@ -18,6 +18,7 @@ use openai_protocol::{
         ResponsesResponse, ResponsesUsage,
     },
 };
+use serde::Serialize;
 use serde_json::json;
 use smg_mcp::{self as mcp};
 use tokio::sync::oneshot;
@@ -48,6 +49,7 @@ pub(crate) enum OutputItemKind {
     Message,
     McpListTools,
     FunctionCall,
+    CustomToolCall,
     Reasoning,
 }
 
@@ -57,8 +59,17 @@ impl OutputItemKind {
             Self::Message => "msg",
             Self::McpListTools => "mcpl",
             Self::FunctionCall => "fc",
+            Self::CustomToolCall => "ctc",
             Self::Reasoning => "rs",
         }
+    }
+
+    /// A fresh id for an output item of this kind: the kind's prefix and a
+    /// unique suffix, the one shape an item id has on every path, streamed or
+    /// not. An item's id is its own; a function call's `call_id` is another
+    /// string, the one the client echoes in its `function_call_output`.
+    pub(crate) fn new_id(&self) -> String {
+        ResponseStreamEventEmitter::generate_item_id(self.id_prefix())
     }
 }
 
@@ -109,6 +120,21 @@ fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
     }
 }
 
+/// The `response.output_text.delta` event of one token, serialized straight
+/// into its frame: the fields in the event's order (the bytes the `json!` map
+/// wrote under `preserve_order`), the item id and the delta borrowed rather
+/// than copied into a map per token.
+#[derive(Serialize)]
+struct OutputTextDelta<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    output_index: usize,
+    item_id: &'a str,
+    content_index: usize,
+    delta: &'a str,
+}
+
 /// OpenAI-compatible event emitter for /v1/responses streaming
 ///
 /// Manages state and sequence numbers to emit proper event types:
@@ -139,7 +165,6 @@ pub(crate) struct ResponseStreamEventEmitter {
     pub response_id: String,
     model: String,
     created_at: u64,
-    message_id: String,
     accumulated_text: String,
     has_emitted_output_item_added: bool,
     has_emitted_content_part_added: bool,
@@ -170,6 +195,10 @@ pub(crate) struct ResponseStreamEventEmitter {
     last_error: Option<serde_json::Value>,
     /// Frames every event of the stream through one reusable buffer.
     encoder: SseEncoder,
+    /// The client is gone: nothing more is sent, and nothing counts as
+    /// delivered; the items still open close into the final object without
+    /// their events, so the record of a stored response keeps them.
+    abandoned: bool,
 }
 
 /// Streaming state for the reasoning output item of the current turn.
@@ -207,14 +236,11 @@ impl ResponseStreamEventEmitter {
     }
 
     pub fn new(response_id: String, model: String, created_at: u64) -> Self {
-        let message_id = format!("msg_{}", Uuid::now_v7());
-
         Self {
             sequence_number: 0,
             response_id,
             model,
             created_at,
-            message_id,
             accumulated_text: String::new(),
             has_emitted_output_item_added: false,
             has_emitted_content_part_added: false,
@@ -230,6 +256,7 @@ impl ResponseStreamEventEmitter {
             background: false,
             last_error: None,
             encoder: SseEncoder::new(),
+            abandoned: false,
         }
     }
 
@@ -247,6 +274,19 @@ impl ResponseStreamEventEmitter {
     /// of an earlier turn never reads for a later one.
     pub(crate) fn set_finish_reason(&mut self, finish_reason: Option<&str>) {
         self.finish_reason = finish_reason.map(str::to_string);
+    }
+
+    /// The finish reason the stream has read so far, if any.
+    pub(crate) fn finish_reason(&self) -> Option<&str> {
+        self.finish_reason.as_deref()
+    }
+
+    /// The client left: from here on nothing is sent and nothing counts as
+    /// delivered, so the items still open can be closed into the final
+    /// object (`close_items`, then `finalize`) for the record of a stored
+    /// response the client will come back for.
+    pub(crate) fn abandon(&mut self) {
+        self.abandoned = true;
     }
 
     /// Update tool call output items with tool execution results.
@@ -356,24 +396,6 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub fn emit_text_delta(
-        &mut self,
-        delta: &str,
-        output_index: usize,
-        item_id: &str,
-        content_index: usize,
-    ) -> serde_json::Value {
-        self.accumulated_text.push_str(delta);
-        json!({
-            "type": OutputTextEvent::DELTA,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "content_index": content_index,
-            "delta": delta
-        })
-    }
-
     pub fn emit_text_done(
         &mut self,
         output_index: usize,
@@ -425,20 +447,8 @@ impl ResponseStreamEventEmitter {
             })
             .collect();
 
-        // If no items were tracked (legacy path), fall back to generic message
-        let output = if output.is_empty() {
-            vec![json!({
-                "id": std::mem::take(&mut self.message_id),
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": std::mem::take(&mut self.accumulated_text)
-                }]
-            })]
-        } else {
-            output
-        };
+        // A turn without items reads `output: []` here as it does in the
+        // stored object: no message is invented that nothing announced.
 
         // The event's status is read where the stored object and the
         // non-streaming conversion read theirs: a `length` finish is incomplete
@@ -540,6 +550,18 @@ impl ResponseStreamEventEmitter {
         event
     }
 
+    /// Close the item event sequences still open (the reasoning item, the
+    /// message, the tool calls), retaining unfinished wire statuses, so the
+    /// final object reads every streamed item under the id its events carry.
+    /// A stream that ended on a finish chunk has closed them already; one cut
+    /// short before its finish (an upstream error, a body that ended) closes
+    /// them here, before its final object is read and stored.
+    pub(crate) async fn close_items(&mut self, tx: &SseSender) -> Result<(), String> {
+        self.close_reasoning_item(tx).await?;
+        self.close_message_item(tx).await?;
+        self.close_tool_call_items(tx).await
+    }
+
     /// Close remaining item event sequences, retaining unfinished wire statuses,
     /// and emit exactly one terminal event.
     pub async fn emit_terminal(
@@ -551,9 +573,7 @@ impl ResponseStreamEventEmitter {
         if error.is_some() {
             self.finish_reason = Some("failed".into());
         }
-        self.close_reasoning_item(tx).await?;
-        self.close_message_item(tx).await?;
-        self.close_tool_call_items(tx).await?;
+        self.close_items(tx).await?;
         let event = match error {
             Some(error) => self.emit_failed(usage, error),
             None => self.emit_completed(usage),
@@ -603,11 +623,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Helper to add optional fields to JSON object
-    fn add_optional_field<T: serde::Serialize>(
-        obj: &mut serde_json::Value,
-        key: &str,
-        value: Option<&T>,
-    ) {
+    fn add_optional_field<T: Serialize>(obj: &mut serde_json::Value, key: &str, value: Option<&T>) {
         if let Some(val) = value {
             obj[key] = json!(val);
         }
@@ -1063,13 +1079,13 @@ impl ResponseStreamEventEmitter {
         let Some(reasoning) = self.reasoning_item.take() else {
             return Ok(());
         };
-        let event = self.emit_reasoning_text_done(
+        // Built and stored before any send, as the message item is.
+        let text_done = self.emit_reasoning_text_done(
             reasoning.output_index,
             &reasoning.item_id,
             &reasoning.text,
         );
-        self.send_event(&event, tx).await?;
-        let event = json!({
+        let part_done = json!({
             "type": "response.content_part.done",
             "sequence_number": self.next_sequence(),
             "output_index": reasoning.output_index,
@@ -1077,34 +1093,37 @@ impl ResponseStreamEventEmitter {
             "content_index": 0,
             "part": { "type": "reasoning_text", "text": reasoning.text }
         });
-        self.send_event(&event, tx).await?;
-
         let mut item = json!({
             "id": reasoning.item_id,
             "type": "reasoning",
             "summary": [],
             "content": [{ "type": "reasoning_text", "text": reasoning.text }],
-            "status": "completed"
+            "status": self.message_status()
         });
         if self.include_encrypted_reasoning() {
             item["encrypted_content"] =
                 json!(super::utils::encode_reasoning_content(&reasoning.text));
         }
-        let event = self.emit_output_item_done(reasoning.output_index, &item);
-        self.send_event(&event, tx).await?;
+        let item_done = self.emit_output_item_done(reasoning.output_index, &item);
         self.complete_output_item(reasoning.output_index);
+        for event in [&text_done, &part_done, &item_done] {
+            self.send_event(event, tx).await?;
+        }
         Ok(())
     }
 
-    /// The status of the message item a stream closes, under the turn's finish
-    /// reason: `in_progress` when the generation failed (closing the event
-    /// sequence does not imply it succeeded; the partial message belongs in
-    /// the terminal output all the same), else `completed`. A stream that
-    /// drives the emitter through its own events and closes its message item
-    /// itself reads it here, so its item carries the status the typed read of
-    /// the stored object requires.
+    /// The status of the message or reasoning item a stream closes, under the turn's finish
+    /// reason: `in_progress` when the generation failed or the stream was
+    /// cancelled before its end (closing the event sequence does not imply it
+    /// succeeded; the partial message belongs in the terminal output all the
+    /// same), else `completed`. A stream that drives the emitter through its
+    /// own events and closes its message item itself reads it here, so its
+    /// item carries the status the typed read of the stored object requires.
     pub(crate) fn message_status(&self) -> &'static str {
-        if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
+        if matches!(
+            self.finish_reason.as_deref(),
+            Some("failed" | "error" | "cancelled")
+        ) {
             "in_progress"
         } else {
             "completed"
@@ -1132,11 +1151,14 @@ impl ResponseStreamEventEmitter {
         ) else {
             return Ok(());
         };
+        // The item's closing events are built, and the item stored and
+        // completed, before any of them is sent: a send that fails because the
+        // client left must not lose an item the stream had generated (the
+        // record of the departure reads the item from here).
+        let mut events = Vec::with_capacity(3);
         if std::mem::take(&mut self.has_emitted_content_part_added) {
-            let event = self.emit_text_done(output_index, &item_id, 0);
-            self.send_event(&event, tx).await?;
-            let event = self.emit_content_part_done(output_index, &item_id, 0);
-            self.send_event(&event, tx).await?;
+            events.push(self.emit_text_done(output_index, &item_id, 0));
+            events.push(self.emit_content_part_done(output_index, &item_id, 0));
         }
         if std::mem::take(&mut self.has_emitted_output_item_added) {
             let item = json!({
@@ -1146,10 +1168,12 @@ impl ResponseStreamEventEmitter {
                 "content": [{"type": "output_text", "text": std::mem::take(&mut self.accumulated_text)}],
                 "status": self.message_status(),
             });
-            let event = self.emit_output_item_done(output_index, &item);
-            self.send_event(&event, tx).await?;
+            events.push(self.emit_output_item_done(output_index, &item));
         }
         self.complete_output_item(output_index);
+        for event in &events {
+            self.send_event(event, tx).await?;
+        }
         Ok(())
     }
 
@@ -1160,6 +1184,9 @@ impl ResponseStreamEventEmitter {
     /// turn, and those (possibly partial) calls still belong in the final
     /// output, so they must be closed and collected here.
     async fn close_tool_call_items(&mut self, tx: &SseSender) -> Result<(), String> {
+        // Every call's closing events are built, and the calls stored and
+        // completed, before any event is sent (as for the message item).
+        let mut events = Vec::new();
         for item in std::mem::take(&mut self.tool_call_items) {
             // The call's status as a function call, read before a custom
             // tool's call becomes its item.
@@ -1170,14 +1197,13 @@ impl ResponseStreamEventEmitter {
                     ("response.custom_tool_call_input.delta", "delta"),
                     ("response.custom_tool_call_input.done", "input"),
                 ] {
-                    let event = json!({
+                    events.push(json!({
                         "type": event_type,
                         "sequence_number": self.next_sequence(),
                         "output_index": item.output_index,
                         "item_id": item.item_id,
                         field: input,
-                    });
-                    self.send_event(&event, tx).await?;
+                    }));
                 }
                 json!({
                     "id": item.item_id,
@@ -1187,12 +1213,11 @@ impl ResponseStreamEventEmitter {
                     "input": input,
                 })
             } else {
-                let event = self.emit_function_call_arguments_done(
+                events.push(self.emit_function_call_arguments_done(
                     item.output_index,
                     &item.item_id,
                     &item.arguments,
-                );
-                self.send_event(&event, tx).await?;
+                ));
                 json!({
                     "id": item.item_id,
                     "type": "function_call",
@@ -1202,9 +1227,11 @@ impl ResponseStreamEventEmitter {
                     "status": status,
                 })
             };
-            let event = self.emit_output_item_done(item.output_index, &full);
-            self.send_event(&event, tx).await?;
+            events.push(self.emit_output_item_done(item.output_index, &full));
             self.complete_output_item(item.output_index);
+        }
+        for event in &events {
+            self.send_event(event, tx).await?;
         }
         Ok(())
     }
@@ -1315,24 +1342,42 @@ impl ResponseStreamEventEmitter {
 
         // output_index and item_id are always set in the block above
         // when current_item_id was None and we allocated new ones
-        if let (Some(output_index), Some(item_id)) = (
-            self.current_message_output_index,
-            self.current_item_id.clone(),
-        ) {
-            let content_index = 0; // Single content part for now
+        let Some(output_index) = self.current_message_output_index else {
+            return Ok(());
+        };
+        let content_index = 0; // Single content part for now
 
-            // Emit content_part.added before first delta
-            if !self.has_emitted_content_part_added {
-                let event = self.emit_content_part_added(output_index, &item_id, content_index);
-                self.send_event(&event, tx).await?;
-                self.has_emitted_content_part_added = true;
-            }
-
-            // Emit text delta
-            let event = self.emit_text_delta(content, output_index, &item_id, content_index);
+        // Emit content_part.added before first delta: once per item, so the
+        // id's copy for the borrow split stays on this branch.
+        if !self.has_emitted_content_part_added {
+            let Some(item_id) = self.current_item_id.clone() else {
+                return Ok(());
+            };
+            let event = self.emit_content_part_added(output_index, &item_id, content_index);
             self.send_event(&event, tx).await?;
+            self.has_emitted_content_part_added = true;
         }
-        Ok(())
+
+        // Emit text delta: the id borrowed from the emitter, the counter
+        // advanced on its field (the method would take the whole emitter while
+        // the id is borrowed, and the guard must not cost a number when it
+        // fires) and the frame written over the encoder alone, so no copy of
+        // the id is made per token.
+        let Some(item_id) = self.current_item_id.as_deref() else {
+            return Ok(());
+        };
+        let sequence_number = self.sequence_number;
+        self.sequence_number += 1;
+        self.accumulated_text.push_str(content);
+        let event = OutputTextDelta {
+            kind: OutputTextEvent::DELTA,
+            sequence_number,
+            output_index,
+            item_id,
+            content_index,
+            delta: content,
+        };
+        Self::send_frame(&mut self.encoder, OutputTextEvent::DELTA, &event, tx).await
     }
 
     /// A chat tool-call delta as Responses function_call events; without this
@@ -1386,6 +1431,12 @@ impl ResponseStreamEventEmitter {
         if let Some(name) = arriving_name {
             item.name = name.to_string();
             item.custom = arriving_custom;
+            // The id was minted as a function call's before the name arrived;
+            // a custom tool's call takes its own kind's id while nothing has
+            // announced the first one (`added` waits for a name or arguments).
+            if arriving_custom && !item.added_emitted {
+                item.item_id = OutputItemKind::CustomToolCall.new_id();
+            }
         }
         if let Some(args) = args_delta {
             item.arguments.push_str(args);
@@ -1438,12 +1489,39 @@ impl ResponseStreamEventEmitter {
         event: &serde_json::Value,
         tx: &SseSender,
     ) -> Result<(), String> {
+        if self.abandoned {
+            return Ok(());
+        }
         let event_type = event
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("message");
-        let frame = self
-            .encoder
+        self.send_typed(event_type, event, tx).await
+    }
+
+    /// One event of any serializable shape under `event_type`: the frame
+    /// writer over `self`, [`Self::send_frame`] with this emitter's encoder.
+    async fn send_typed<T: Serialize>(
+        &mut self,
+        event_type: &str,
+        event: &T,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        Self::send_frame(&mut self.encoder, event_type, event, tx).await
+    }
+
+    /// The one frame writer of this emitter, over the encoder alone: `event`
+    /// serialized once into the frame under `event_type`. [`Self::send_typed`]
+    /// delegates here; a caller holding a borrow of another field while the
+    /// frame goes out (the per-token delta borrows the current item's id)
+    /// calls it directly.
+    async fn send_frame<T: Serialize>(
+        encoder: &mut SseEncoder,
+        event_type: &str,
+        event: &T,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let frame = encoder
             .encode_event(event_type, event)
             .map_err(|e| match e {
                 SseEncodeError::Json(e) => format!("Failed to serialize event: {e}"),
@@ -1451,24 +1529,70 @@ impl ResponseStreamEventEmitter {
                     "Failed to serialize event: its type breaks the frame".to_string()
                 }
             })?;
-
         if tx.send(Ok(frame)).await.is_err() {
             return Err("Client disconnected".to_string());
         }
-
         Ok(())
+    }
+
+    /// The `response.output_text.delta` event of one token, sent as
+    /// [`OutputTextDelta`]; the text accumulates as it did under the map.
+    pub async fn send_text_delta(
+        &mut self,
+        delta: &str,
+        output_index: usize,
+        item_id: &str,
+        content_index: usize,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        self.accumulated_text.push_str(delta);
+        let event = OutputTextDelta {
+            kind: OutputTextEvent::DELTA,
+            sequence_number: self.next_sequence(),
+            output_index,
+            item_id,
+            content_index,
+            delta,
+        };
+        self.send_typed(OutputTextEvent::DELTA, &event, tx).await
+    }
+
+    /// [`Self::send_text_delta`] for the streams that log a failed send
+    /// instead of ending on it; `true` when the event went out.
+    pub async fn send_text_delta_best_effort(
+        &mut self,
+        delta: &str,
+        output_index: usize,
+        item_id: &str,
+        content_index: usize,
+        tx: &SseSender,
+    ) -> bool {
+        match self
+            .send_text_delta(delta, output_index, item_id, content_index, tx)
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("Failed to send event (likely client disconnect): {}", e);
+                false
+            }
+        }
     }
 
     /// Send event and log any errors (typically client disconnect)
     ///
     /// This is a convenience method for streaming scenarios where client
     /// disconnection is expected and should be logged but not fail the operation.
-    /// Returns true if sent successfully, false if client disconnected.
+    /// Returns true if sent successfully, false if client disconnected (or
+    /// the stream was abandoned: nothing is delivered then).
     pub async fn send_event_best_effort(
         &mut self,
         event: &serde_json::Value,
         tx: &SseSender,
     ) -> bool {
+        if self.abandoned {
+            return false;
+        }
         match self.send_event(event, tx).await {
             Ok(()) => true,
             Err(e) => {
@@ -1680,6 +1804,54 @@ mod tests {
         assert_responses_api_usage, responses_api_test_usage,
     };
 
+    /// The typed text-delta event writes the frame the `json!` event wrote,
+    /// byte for byte (the same keys in the same order, the same escaping, the
+    /// same sequence number), and accumulates the text the same way.
+    #[tokio::test]
+    async fn the_typed_text_delta_is_the_json_event_frame_byte_for_byte() {
+        let frames = |mut emitter: ResponseStreamEventEmitter, typed: bool| async move {
+            let (tx, mut rx) = sse_channel();
+            for (index, delta) in ["héllo \"there\"\n", "", "\u{1F600} tab\t"]
+                .into_iter()
+                .enumerate()
+            {
+                if typed {
+                    emitter
+                        .send_text_delta(delta, 1, "msg_1", index, &tx)
+                        .await
+                        .unwrap();
+                } else {
+                    // The event as the `json!` map wrote it before the typed form.
+                    emitter.accumulated_text.push_str(delta);
+                    let event = json!({
+                        "type": OutputTextEvent::DELTA,
+                        "sequence_number": emitter.next_sequence(),
+                        "output_index": 1,
+                        "item_id": "msg_1",
+                        "content_index": index,
+                        "delta": delta
+                    });
+                    emitter.send_event(&event, &tx).await.unwrap();
+                }
+            }
+            drop(tx);
+            let mut frames = Vec::new();
+            while let Some(Ok(bytes)) = rx.recv().await {
+                frames.push(bytes);
+            }
+            (frames, emitter.accumulated_text.clone())
+        };
+        let new =
+            |seq| ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), seq);
+        let (json_frames, json_text) = frames(new(7), false).await;
+        let (typed_frames, typed_text) = frames(new(7), true).await;
+        assert_eq!(typed_frames, json_frames);
+        assert_eq!(typed_text, json_text);
+        assert!(std::str::from_utf8(&typed_frames[0])
+            .unwrap()
+            .starts_with("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":"));
+    }
+
     /// The frame of an event: its `type` on the `event:` line and the JSON on
     /// the `data:` line, the text escaped as JSON; an error frame has no
     /// `event:` line.
@@ -1688,8 +1860,10 @@ mod tests {
         let mut emitter =
             ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
         let (tx, mut rx) = sse_channel();
-        let event = emitter.emit_text_delta("héllo \"there\"\n", 1, "msg_1", 0);
-        emitter.send_event(&event, &tx).await.unwrap();
+        emitter
+            .send_text_delta("héllo \"there\"\n", 1, "msg_1", 0, &tx)
+            .await
+            .unwrap();
         emitter
             .emit_error("engine unavailable", Some("server_error"), &tx)
             .await;
@@ -2102,6 +2276,11 @@ mod process_chunk_tests {
         assert_eq!(events[2]["input"], "pwd");
         assert_eq!(output[0]["type"], "custom_tool_call");
         assert_eq!(output[0]["input"], "pwd");
+        // The item's id is a custom tool call's own, the same on the event and
+        // in the final output.
+        let id = events[0]["item"]["id"].as_str().unwrap_or_default();
+        assert!(id.starts_with("ctc_"), "{}", events[0]);
+        assert_eq!(output[0]["id"], id);
         assert_eq!(output[0]["call_id"], "call_c");
         assert_eq!(events[3]["item"], output[0]);
     }
@@ -2147,6 +2326,20 @@ mod process_chunk_tests {
         assert!(output[0].get("encrypted_content").is_none());
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "Hello");
+        // The deltas through the emitter's own path carry the item's id, the
+        // text of their chunk and consecutive sequence numbers.
+        assert_eq!(events[8]["item_id"], output[1]["id"]);
+        assert_eq!(events[9]["item_id"], output[1]["id"]);
+        assert_eq!(
+            (events[8]["delta"].as_str(), events[9]["delta"].as_str()),
+            (Some("Hel"), Some("lo"))
+        );
+        for pair in events.windows(2) {
+            assert_eq!(
+                pair[1]["sequence_number"].as_u64(),
+                pair[0]["sequence_number"].as_u64().map(|s| s + 1)
+            );
+        }
     }
 
     #[tokio::test]

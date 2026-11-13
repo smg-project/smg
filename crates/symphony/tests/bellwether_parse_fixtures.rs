@@ -197,6 +197,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen3-vl-2b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-4b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-8b-instruct", GenerationPrompt::Plain),
+    // The AesCode pair are Qwen3-VL-8B-Instruct checkpoints by their `also` names; bellwether records
+    // them as members of the Visual-ERM group, whose sets replay through that table.
+    ("aescode-8b", GenerationPrompt::Plain),
+    ("aescode-32b", GenerationPrompt::Plain),
+    // Visual-ERM is that group's bellwether primary (the AesCode pair carries its files): its sets replay
+    // under their own slug too.
+    ("visual-erm", GenerationPrompt::Plain),
     ("qwen3-vl-30b-a3b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-32b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-235b-a22b-instruct", GenerationPrompt::Plain),
@@ -251,6 +258,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen3.5-2b", GenerationPrompt::OpensTheThoughtWhenAsked),
     ("qwen3.5-4b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-9b", GenerationPrompt::OpensTheThought),
+    // UserRepGen-4B is a member of the Qwen3.5-9B group: its group's sets replay through the table
+    // its `also` name resolves to.
+    ("userrepgen-4b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-27b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-122b-a10b", GenerationPrompt::OpensTheThought),

@@ -47,6 +47,7 @@ FAKE_ROUTER = textwrap.dedent(
         parser.add_argument(role, nargs="+", action="append", default=[])
     parser.add_argument("--fake", default="serve", choices=["serve", "exit", "hold-last"])
     parser.add_argument("--fake-dp", action="store_true", help="register rank-suffixed URLs")
+    parser.add_argument("--fake-dp-ranks", type=int, default=1, help="rank entries per worker")
     args, _ = parser.parse_known_args()
 
     if args.fake == "exit":
@@ -71,17 +72,24 @@ FAKE_ROUTER = textwrap.dedent(
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path == "/workers":
-                workers = [
-                    {"url": f"{u}@0", "dp_base_url": u} if args.fake_dp else {"url": u}
+            # The router lists and counts rank entries: a data-parallel worker
+            # is one entry per rank, "<url>@<rank>" with its base in dp_base_url.
+            if args.fake_dp:
+                entries = [
+                    {"url": f"{u}@{rank}", "dp_base_url": u}
                     for u in urls
+                    for rank in range(args.fake_dp_ranks)
                 ]
-                body = {"total": len(urls), "workers": workers}
+            else:
+                entries = [{"url": u} for u in urls]
+            if self.path == "/workers":
+                body = {"total": len(entries), "workers": entries}
             elif self.path == "/readiness":
                 # Like the router's disaggregated readiness: held while no
-                # worker of a role is registered.
+                # worker of a role is registered; the healthy count is of
+                # entries, as the router's.
                 status = "ready" if urls else "waiting"
-                body = {"status": status, "healthy_workers": len(urls)}
+                body = {"status": status, "healthy_workers": len(entries)}
             elif self.path == "/health":
                 body = {"status": "ok"}
             else:
@@ -228,6 +236,7 @@ def test_a_pd_launch_waits_on_the_readiness_gate(fake_router):
         gateway.shutdown()
     message = str(excinfo.value)
     assert "workers: 1/2" in message
+    assert f"missing: {WORKERS[1]}" in message
     assert "readiness: waiting for workers" in message
 
 
@@ -258,6 +267,7 @@ def test_an_epd_launch_waits_on_the_readiness_gate(fake_router):
         gateway.shutdown()
     message = str(excinfo.value)
     assert "workers: 2/3" in message
+    assert f"missing: {WORKERS[1]}" in message
     assert "readiness: waiting for workers" in message
 
 
@@ -275,6 +285,45 @@ def test_the_timeout_names_a_data_parallel_worker_by_its_base_url(fake_router):
         gateway.shutdown()
     # The first worker's rank registered as "<url>@0": only the second is missing.
     assert f"missing: {WORKERS[1]}, readiness" in str(excinfo.value)
+
+
+def test_the_wait_holds_for_a_missing_worker_behind_a_data_parallel_count(fake_router):
+    """A data-parallel worker registers one entry per rank, so the first
+    worker's two ranks satisfy a count of two while the second worker is
+    still absent: the wait holds for the missing worker's URL, not for the
+    count, and the timeout names it."""
+    gateway = Gateway()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            gateway.start(
+                worker_urls=WORKERS,
+                model_path="m",
+                timeout=4,
+                extra_args=["--fake", "hold-last", "--fake-dp", "--fake-dp-ranks", "2"],
+            )
+    finally:
+        gateway.shutdown()
+    message = str(excinfo.value)
+    assert "workers: 1/2" in message
+    assert f"missing: {WORKERS[1]}" in message
+
+
+def test_a_data_parallel_fleet_releases_the_wait_once_each_worker_is_registered(fake_router):
+    """Each worker registered with two ranks: four entries for two workers
+    release the wait, since the gate is each worker's URL. A gate comparing
+    the rank entries with the worker count would never release on a
+    data-parallel fleet, the wait timing out at ``workers: 2/2``."""
+    gateway = Gateway()
+    try:
+        gateway.start(
+            worker_urls=WORKERS,
+            model_path="m",
+            timeout=15,
+            extra_args=["--fake-dp", "--fake-dp-ranks", "2"],
+        )
+        assert gateway.is_running
+    finally:
+        gateway.shutdown()
 
 
 def test_the_log_goes_under_e2e_log_dir_when_start_gets_no_log_dir(

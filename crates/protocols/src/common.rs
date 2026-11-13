@@ -32,18 +32,6 @@ pub fn to_value_exact<T: Serialize>(value: &T) -> serde_json::Result<Value> {
     serde_json::from_slice(&serde_json::to_vec(value)?)
 }
 
-/// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
-pub(crate) fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
-}
-
 /// The routing text of a JSON `input`: the string itself, an array's string
 /// members joined on spaces, nothing for any other shape.
 pub(crate) fn routing_text_of_input(input: &Value) -> String {
@@ -297,6 +285,10 @@ impl<'a> Iterator for StringOrArrayIter<'a> {
 
 impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
 /// A validation error with the public API's `code` and message.
 pub(crate) fn invalid(
     code: &'static str,
@@ -331,6 +323,18 @@ pub(crate) fn on_field(
 ) -> validator::ValidationError {
     error.add_param(Cow::Borrowed(FIELD_PARAM), &field.into());
     error
+}
+
+/// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
+pub(crate) fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Validates `logit_bias` as the public API bounds it: every key a
@@ -3273,5 +3277,16 @@ mod tests {
         assert_eq!(routing_text_of_input(&json!([[1, 2], [3]])), "");
         assert_eq!(routing_text_of_input(&json!({"text": "x"})), "");
         assert_eq!(routing_text_of_input(&json!(7)), "");
+    }
+
+    /// The type names the validation messages print, one per JSON shape.
+    #[test]
+    fn a_json_values_type_name_is_the_word_a_validation_message_prints() {
+        assert_eq!(json_type_name(&Value::Null), "null");
+        assert_eq!(json_type_name(&json!(true)), "a boolean");
+        assert_eq!(json_type_name(&json!(1)), "a number");
+        assert_eq!(json_type_name(&json!("x")), "a string");
+        assert_eq!(json_type_name(&json!([])), "an array");
+        assert_eq!(json_type_name(&json!({})), "an object");
     }
 }

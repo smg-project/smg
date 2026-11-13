@@ -33,6 +33,7 @@ use crate::{
         Random, RoundRobin, SessionAffinity,
     },
     framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, Weighted},
+    ring::ConsistentHash,
     sessions::SessionRule,
     view::Phase,
 };
@@ -1700,7 +1701,10 @@ fn scorer_of(stage: &ScoreStage) -> Resolved<Box<dyn Scorer>> {
         ScoreStage::KvPressure(_) => Resolved::NotInBuild("the kv-pressure scorer"),
         ScoreStage::WarmupSlice(_) => Resolved::NotInBuild("the warmup-slice scorer"),
         ScoreStage::Bucket(_) => Resolved::NotInBuild("the bucket scorer"),
-        ScoreStage::ConsistentHash(_) => Resolved::NotInBuild("the consistent-hash scorer"),
+        ScoreStage::ConsistentHash(p) if p.prefix_tokens.is_some() => {
+            Resolved::NotInBuild("the consistent-hash prefix key")
+        }
+        ScoreStage::ConsistentHash(p) => built_scorer(ConsistentHash::new(p.bounded_load.as_ref())),
         ScoreStage::ResidentWork(_) => Resolved::NotInBuild("the resident-work scorer"),
     }
 }
@@ -2046,11 +2050,7 @@ fn check_binding_rules(
 }
 
 /// The binding's plan and sides, resolved to profile positions.
-fn resolve_plan(
-    b: &BindingSpec,
-    cx: &BindingContext<'_>,
-    deferred: &mut Deferred,
-) -> Result<Option<Binding>, SpecError> {
+fn resolve_plan(b: &BindingSpec, cx: &BindingContext<'_>) -> Result<Option<Binding>, SpecError> {
     let index = cx.index;
     let plan = b.plan.unwrap_or_default();
     for key in b.profiles.keys() {
@@ -2129,9 +2129,8 @@ fn resolve_plan(
         (PlanName::PdPair, &[prefill, decode]) => {
             Some(binding(Plan::PdPair, prefill, Some(decode)))
         }
-        (PlanName::Epd, _) => {
-            deferred.note(format!("bindings[{index}].plan"), "the epd plan");
-            None
+        (PlanName::Epd, &[encode, prefill, decode]) => {
+            Some(binding(Plan::Epd { encode }, prefill, Some(decode)))
         }
         _ => None,
     })
@@ -2146,7 +2145,7 @@ fn check_binding(
     let at = At::new(format!("bindings[{}]", cx.index));
     check_matcher(&b.matcher, cx, &at, deferred)?;
     check_binding_rules(b, cx, &at, deferred)?;
-    let mut built = resolve_plan(b, cx, deferred)?;
+    let mut built = resolve_plan(b, cx)?;
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
         let rule = session_rule(sessions, cx.index, binding.plan)?;
         needs.active_sessions |= rule.assignment == Assignment::MinGroup;
@@ -2200,12 +2199,13 @@ fn session_rule(
 
 /// The ten preset names of today, as whole profiles. The ones whose stages
 /// this build does not carry yet answer `UnknownPreset`.
-pub const PRESETS: [&str; 6] = [
+pub const PRESETS: [&str; 7] = [
     "random",
     "round_robin",
     "passthrough",
     "power_of_two",
     "least_load",
+    "consistent_hashing",
     "manual",
 ];
 
@@ -2249,6 +2249,14 @@ impl PolicySpec {
             "least_load" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["least-load".into()],
+                pick: "best".into(),
+            },
+            // The ring owner of the decision's key (an encode item's content
+            // hash, a request's routing key), the ring's next members as the
+            // alternates; a keyless decision is the picker's draw.
+            "consistent_hashing" => ProfileSpec {
+                filter: standard_filters(),
+                score: vec!["consistent-hash".into()],
                 pick: "best".into(),
             },
             // Sticky sessions over a random assignment: a key stays with the
@@ -2323,6 +2331,24 @@ impl PolicySpec {
             profiles,
             ..BindingSpec::default()
         }];
+        Ok(spec)
+    }
+
+    /// An encode-prefill-decode spec: the `encode` preset over the encode
+    /// pool and the pair presets of [`PolicySpec::pair_presets`], under the
+    /// `epd` plan.
+    pub fn epd_presets(encode: &str, prefill: &str, decode: &str) -> Result<Self, SpecError> {
+        let mut spec = Self::pair_presets(prefill, decode)?;
+        let encode_profile = Self::preset(encode)?
+            .profiles
+            .remove(encode)
+            .ok_or(SpecError::Empty)?;
+        spec.profiles.insert("encode".into(), encode_profile);
+        let binding = spec.bindings.first_mut().ok_or(SpecError::Empty)?;
+        binding.plan = Some(PlanName::Epd);
+        binding
+            .profiles
+            .insert("encode".to_string(), "encode".to_string());
         Ok(spec)
     }
 
@@ -2518,6 +2544,7 @@ mod tests {
             let engine = spec.validate().expect(name);
             let load_aware = name == "least_load" || name == "power_of_two";
             assert_eq!(engine.needs().loads, load_aware, "{name}");
+            assert_eq!(engine.needs().ring, name == "consistent_hashing", "{name}");
             assert!(!engine.needs().events, "{name}");
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
@@ -2835,15 +2862,99 @@ mod tests {
         assert!(err.contains("unknown variant `triple`"), "{err}");
     }
 
+    /// The document's `bounded_load` reaches the scorer: a decision through
+    /// the validated engine passes a loaded owner on, where the plain ring
+    /// would keep it.
     #[test]
-    fn the_epd_plan_is_well_formed_and_not_in_this_build() {
+    fn the_document_s_bounded_load_reaches_the_consistent_hash_scorer() {
+        use crate::{
+            framework::Scratch,
+            view::{Candidate, Constraints, Health, Identity, PoolFacts, RequestFacts, WorkerId},
+        };
+        let engine = doc(
+            r#"{"apiVersion": "smg.policy/v1", "profiles": {"p": {"filter": ["healthy"],
+                "score": [{"consistent-hash": {"bounded_load": {"factor": 1.0, "abs_margin": 0}}}],
+                "pick": "best"}}}"#,
+        )
+        .validate()
+        .expect("a bounded consistent-hash profile validates");
+        let pool: Vec<Candidate> = (0..4u32)
+            .map(|i| Candidate {
+                position: i,
+                id: WorkerId(100 + u64::from(i)),
+                health: Health {
+                    healthy: true,
+                    ..Health::default()
+                },
+                ..Candidate::default()
+            })
+            .collect();
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(5),
+            seed: 1,
+            ..RequestFacts::default()
+        };
+        let pool_facts = PoolFacts {
+            pool_size: 4,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let first = |decision: &crate::Decision| {
+            decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .as_slice()
+                .first()
+                .expect("a target")
+                .position
+        };
+        let plain = engine.decide(&facts, &pool_facts, &pool, &cx, &mut scratch);
+        let owner = first(&plain);
+        let mut loaded = pool.clone();
+        loaded[owner as usize].in_flight = 8;
+        let bounded = engine.decide(&facts, &pool_facts, &loaded, &cx, &mut scratch);
+        assert_ne!(
+            first(&bounded),
+            owner,
+            "the document's rule passes the loaded owner on"
+        );
+    }
+
+    /// The `epd` plan binds its three sides: the encode phase resolves to
+    /// the encode profile, the pair phases to theirs, and a single request
+    /// to none; a side left unnamed or a phase list leaving one out is
+    /// refused by name.
+    #[test]
+    fn the_epd_plan_binds_its_three_sides() {
         let epd = spec_with_binding(
             r#"{"plan":"epd","profiles":{"encode":"q","prefill":"p","decode":"p"}}"#,
         );
-        assert_eq!(
-            not_in_build(&epd),
-            ("bindings[0].plan".to_string(), "the epd plan")
-        );
+        let engine = epd.validate().expect("the epd plan is in this build");
+        let binding = engine.binding("m", Phase::Encode).expect("bound");
+        assert_eq!(binding.plan, Plan::Epd { encode: 1 });
+        assert_eq!((binding.profile, binding.decode_profile), (0, Some(0)));
+        let side = |phase: Phase| engine.profile_for("m", phase).map(|(_, p)| p.name.clone());
+        assert_eq!(side(Phase::Encode), Some("q".to_string()));
+        assert_eq!(side(Phase::Prefill), Some("p".to_string()));
+        assert_eq!(side(Phase::Decode), Some("p".to_string()));
+        assert_eq!(side(Phase::Single), None, "no side of the plan");
+        let presets = PolicySpec::epd_presets("consistent_hashing", "least_load", "round_robin")
+            .expect("the epd presets");
+        assert_eq!(presets.bindings[0].plan, Some(PlanName::Epd));
+        assert_eq!(presets.profiles["encode"].score.len(), 1);
+        assert!(presets.profiles["prefill"]
+            .filter
+            .contains(&"has-capacity".to_string()));
+        let engine = presets.validate().expect("validates");
+        assert!(engine.needs().ring && engine.needs().loads);
+        assert!(matches!(
+            engine.binding("m", Phase::Prefill).map(|b| b.plan),
+            Some(Plan::Epd { .. })
+        ));
         let no_encode =
             spec_with_binding(r#"{"plan":"epd","profiles":{"prefill":"p","decode":"p"}}"#);
         assert_eq!(
@@ -3130,6 +3241,7 @@ mod tests {
             "fewest-sessions",
             "session-affinity",
             "prefix-affinity",
+            "consistent-hash",
         ];
         for name in SCORERS {
             let bare = spec_with_score(&format!("{name:?}"));
@@ -3170,6 +3282,17 @@ mod tests {
             assert_eq!(path, format!("profiles.p.score[0].{name}"), "{score}");
             assert!(what.contains(name), "{what}");
         }
+        // The consistent-hash scorer is in the build with its bounded-load
+        // rule; the prefix key form waits for the block hashes in the view.
+        let bounded = spec_with_score(r#"{"consistent-hash":{"bounded_load":{"factor":1.5}}}"#);
+        assert!(bounded.validate().expect("validates").needs().ring);
+        assert_eq!(
+            not_in_build(&spec_with_score(
+                r#"{"consistent-hash":{"prefix_tokens":512}}"#
+            ))
+            .1,
+            "the consistent-hash prefix key"
+        );
     }
 
     #[test]

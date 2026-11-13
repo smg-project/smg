@@ -17,7 +17,7 @@ Usage:
     pytest e2e_test/router/test_pd_responses.py -v
 
     # vLLM
-    E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_responses.py -v
+    E2E_RUNTIME=vllm E2E_ENGINE=vllm pytest e2e_test/router/test_pd_responses.py -v
 """
 
 from __future__ import annotations

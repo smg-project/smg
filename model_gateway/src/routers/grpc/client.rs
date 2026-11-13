@@ -965,6 +965,7 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
+    "multimodal_encoder_dtype",
     media_contract::LABEL,
     "mm_processor",
     "mm_media_ref_schemes",
@@ -1666,6 +1667,7 @@ mod tests {
         assert!(!silent.contains_key("reasoning_parser"));
     }
 
+    /// SGLang server facts expose routing capabilities while filtering secrets.
     #[test]
     fn server_info_to_labels_sglang_picks_curated_keys_and_version() {
         let info = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
@@ -1695,6 +1697,10 @@ mod tests {
                         "mm_item_limits".to_string(),
                         string_value("image=1,video=1"),
                     ),
+                    (
+                        "multimodal_encoder_dtype".to_string(),
+                        string_value("bfloat16"),
+                    ),
                     // Not in SGLANG_GRPC_KEYS — must not become a label.
                     ("api_key".to_string(), string_value("secret")),
                 ]),
@@ -1717,6 +1723,10 @@ mod tests {
         );
         assert_eq!(labels.get("version").map(String::as_str), Some("0.4.0"));
         assert!(!labels.contains_key("api_key"));
+        assert_eq!(
+            labels.get("multimodal_encoder_dtype").map(String::as_str),
+            Some("bfloat16")
+        );
         // The pairing-protocol facts survive: transport, bootstrap port, KV layout.
         assert_eq!(
             labels

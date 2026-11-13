@@ -2,8 +2,11 @@
 //!
 //! Provides tokenization, detokenization, and tokenizer management operations.
 //! These handlers use the TokenizerRegistry for tokenizer storage and retrieval.
-//! The management routes refuse in the control plane's envelope
-//! (`{"error", "code"}`), the shape the worker routes use.
+//! A model named by an alias tokenizes as the model the worker registry
+//! resolves it to, as every serving route reads it. The management routes
+//! refuse in the control plane's envelope (`{"error", "code"}`), the shape
+//! the worker routes use; an empty or whitespace name or source is refused
+//! up front, before a load job is queued for it.
 
 use std::sync::Arc;
 
@@ -24,7 +27,7 @@ use tracing::{debug, error, warn};
 use crate::{
     app_context::AppContext,
     routers::grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
-    worker::{admin_json::refusal, UNKNOWN_MODEL_ID},
+    worker::{admin_json::refusal, WorkerRegistry, UNKNOWN_MODEL_ID},
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
 
@@ -42,12 +45,30 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
         .into_response()
 }
 
-/// Get a tokenizer by model name, with fallback strategies
-fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn Tokenizer>, String> {
+/// Get a tokenizer by model name, with fallback strategies: the name or id as
+/// given, then the model the worker registry resolves an alias to (the
+/// name the serving routes use), then any tokenizer for the unknown or empty
+/// model.
+fn get_tokenizer(
+    workers: &WorkerRegistry,
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<Arc<dyn Tokenizer>, String> {
     // First, try exact match (by name or ID)
     if let Some(tokenizer) = registry.get(model) {
         debug!("Found tokenizer for model: {}", model);
         return Ok(tokenizer);
+    }
+
+    // An alias tokenizes as the model it resolves to
+    if let Some(canonical) = workers.resolve_model_alias(model) {
+        if let Some(tokenizer) = registry.get(&canonical) {
+            debug!(
+                "Found tokenizer for model: {} (alias of {})",
+                model, canonical
+            );
+            return Ok(tokenizer);
+        }
     }
 
     // Try UNKNOWN_MODEL_ID if model is "unknown" or empty
@@ -82,10 +103,14 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
 // ============================================================================
 
 /// Handle POST /v1/tokenize
-pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeRequest) -> Response {
+pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Response {
     debug!("Tokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
+    let tokenizer = match get_tokenizer(
+        &context.worker_registry,
+        &context.tokenizer_registry,
+        &request.model,
+    ) {
         Ok(t) => t,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
@@ -148,10 +173,14 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
 }
 
 /// Handle POST /v1/detokenize
-pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRequest) -> Response {
+pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -> Response {
     debug!("Detokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
+    let tokenizer = match get_tokenizer(
+        &context.worker_registry,
+        &context.tokenizer_registry,
+        &request.model,
+    ) {
         Ok(t) => t,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
@@ -195,6 +224,29 @@ pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRe
 
 /// Handle POST /v1/tokenizers - async version using job queue
 pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerRequest) -> Response {
+    // An empty or whitespace name is refused up front: the registry's load
+    // refuses an empty one only once the job runs, after a 202, and takes a
+    // whitespace one as a name.
+    if request.name.trim().is_empty() {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "A tokenizer name must not be empty".to_string(),
+        );
+    }
+
+    // An empty or whitespace source is refused up front too: the registry's
+    // load refuses an empty one only once the job runs, after a 202, and a
+    // whitespace one fails its local load and falls back to a worker fetch
+    // under the request's name.
+    if request.source.trim().is_empty() {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "A tokenizer source must not be empty".to_string(),
+        );
+    }
+
     // A name in use is refused; the error names the tokenizer that holds it.
     if let Some(entry) = context.tokenizer_registry.get_by_name(&request.name) {
         return refusal(
@@ -393,8 +445,9 @@ mod tests {
 
     #[test]
     fn test_get_tokenizer_empty_registry() {
+        let workers = WorkerRegistry::new();
         let registry = Arc::new(TokenizerRegistry::new());
-        let result = get_tokenizer(&registry, "any");
+        let result = get_tokenizer(&workers, &registry, "any");
         match result {
             Err(e) => assert!(e.contains("No tokenizers available")),
             Ok(_) => panic!("Expected error"),

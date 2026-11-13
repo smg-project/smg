@@ -15,7 +15,7 @@ use smg_grpc_client::{sglang_proto, SglangSchedulerClient, VllmEngineClient};
 use super::*;
 use crate::{
     routers::grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
-    worker::{BasicWorkerBuilder, WorkerType},
+    worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
 };
 
 fn worker_with_defaults(url: &str, defaults_json: Option<&str>) -> WorkerSelection {
@@ -177,4 +177,64 @@ async fn glm_flash_sampling_reaches_vllm_and_sglang() {
         let params = sglang.sampling_params.unwrap();
         assert_eq!((params.temperature, params.top_p, params.top_k), expected);
     }
+}
+
+/// The mask of a chat request that set no sampling field: every default applies.
+fn chat_mask() -> SamplingDefaultsMask {
+    SamplingDefaultsMask::from_request_type(&RequestType::Chat(Arc::new(
+        ChatCompletionRequest::default(),
+    )))
+    .expect("chat requests always carry a mask")
+}
+
+/// A disaggregated pair whose sides carry the given default-sampling labels
+/// (`None` leaves a side unlabelled).
+fn labelled_pair(prefill_json: Option<&str>, decode_json: Option<&str>) -> WorkerSelection {
+    fn side(url: &str, worker_type: WorkerType, json: Option<&str>) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(worker_type);
+        if let Some(json) = json {
+            builder = builder.label(DEFAULT_SAMPLING_PARAMS_LABEL, json);
+        }
+        Arc::new(builder.build())
+    }
+    WorkerSelection::Disaggregated {
+        encode_assignments: None,
+        prefill: side("grpc://prefill:30000", WorkerType::Prefill, prefill_json),
+        decode: side("grpc://decode:30000", WorkerType::Decode, decode_json),
+        runtime_type: RuntimeType::Sglang,
+    }
+}
+
+fn sglang_params_of(request: &ProtoGenerateRequest) -> &sglang_proto::SamplingParams {
+    match request {
+        ProtoGenerateRequest::Sglang(req) => req.sampling_params.as_ref().unwrap(),
+        _ => panic!("expected an SGLang request"),
+    }
+}
+
+/// A disaggregated request samples under the decode worker's defaults: that
+/// side produces the visible tokens, so its label is the one read.
+#[test]
+fn a_disaggregated_request_takes_the_decode_workers_defaults() {
+    let pair = labelled_pair(
+        Some(r#"{"temperature":0.2,"top_k":5}"#),
+        Some(r#"{"temperature":0.8,"top_k":11}"#),
+    );
+    let mut request = sglang_request();
+    apply_sampling_defaults(&mut request, Some(chat_mask()), Some(&pair));
+    let params = sglang_params_of(&request);
+    assert_eq!(params.temperature, 0.8, "the decode worker's default");
+    assert_eq!(params.top_k, 11, "the decode worker's default");
+}
+
+/// The prefill worker's label is not read: a pair whose decode side carries
+/// none leaves the request as it was built.
+#[test]
+fn a_prefill_workers_label_alone_defaults_nothing() {
+    let pair = labelled_pair(Some(r#"{"temperature":0.2,"top_k":5}"#), None);
+    let mut request = sglang_request();
+    apply_sampling_defaults(&mut request, Some(chat_mask()), Some(&pair));
+    let params = sglang_params_of(&request);
+    assert_eq!(params.temperature, 1.0, "the request's own value");
+    assert_eq!(params.top_k, 3, "the request's own value");
 }

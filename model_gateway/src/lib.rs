@@ -21,6 +21,7 @@
 //! - [`worker`]: the worker domain: identity, registry, health, load, resilience, monitoring, and the RL control plane's read-only view of the registry.
 //! - [`workflow`]: the workflow engine and its steps: worker registration and lifecycle, tokenizer, MCP and WASM registration.
 
+pub mod admin;
 pub mod app_context;
 pub mod config;
 pub mod endpoints;

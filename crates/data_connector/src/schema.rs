@@ -273,8 +273,15 @@ impl SchemaConfig {
     }
 }
 
-fn primary_key_columns_for(_label: &str) -> &'static [&'static str] {
-    &["id"]
+/// The primary key of each table, by logical column name: the columns a
+/// configuration may not skip. The links table has no `id`; its key is the
+/// pair that names the link.
+fn primary_key_columns_for(label: &str) -> &'static [&'static str] {
+    match label {
+        "conversations" | "responses" | "conversation_items" => &["id"],
+        "conversation_item_links" => &["conversation_id", "item_id"],
+        _ => &[],
+    }
 }
 
 /// Core logical column names for each table, used by validation to reject
@@ -695,6 +702,43 @@ mod tests {
             err.contains("cannot skip 'id'") && err.contains("primary key"),
             "unexpected: {err}"
         );
+    }
+
+    /// Each table's own key is refused, not `id` everywhere: the links table
+    /// has no `id`, its key is (`conversation_id`, `item_id`), and a skip of
+    /// either is a configuration error at start-up instead of passing
+    /// validation and being ignored by every backend, which build the links
+    /// statements from those columns unconditionally.
+    #[test]
+    fn validate_rejects_skip_of_each_tables_own_key_columns() {
+        for (table, key) in [
+            ("conversations", "id"),
+            ("conversation_items", "id"),
+            ("conversation_item_links", "conversation_id"),
+            ("conversation_item_links", "item_id"),
+        ] {
+            let mut cfg = SchemaConfig::default();
+            let tc = match table {
+                "conversations" => &mut cfg.conversations,
+                "conversation_items" => &mut cfg.conversation_items,
+                _ => &mut cfg.conversation_item_links,
+            };
+            tc.skip_columns.insert(key.to_string());
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.contains(&format!("{table}.skip_columns: cannot skip '{key}'"))
+                    && err.contains("primary key"),
+                "unexpected: {err}"
+            );
+        }
+
+        // `id` is not a column of the links table at all: unknown, not a key.
+        let mut cfg = SchemaConfig::default();
+        cfg.conversation_item_links
+            .skip_columns
+            .insert("id".to_string());
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("not a recognized column"), "unexpected: {err}");
     }
 
     // ── validate_sql_type ─────────────────────────────────────────────────

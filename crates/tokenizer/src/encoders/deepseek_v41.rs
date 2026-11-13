@@ -30,9 +30,9 @@ pub use super::deepseek_v32::ThinkingMode;
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
-        has_tools, merge_tool_messages, push_tools_and_response_format, render_v4_tools_template,
-        sort_tool_results_by_call_order, task_sp_token, text, to_json, tool_schemas, DsmlTags,
-        IncomingBlocks, Turn,
+        has_tools, merge_tool_messages, push_tools_and_response_format, render_system_message,
+        render_v4_tools_template, sort_tool_results_by_call_order, task_sp_token, text, to_json,
+        tool_schemas, DsmlTags, IncomingBlocks, Turn,
     },
     truthy, RendererProfile,
 };
@@ -490,13 +490,7 @@ fn render_system(turn: &Turn<'_>, prompt: &mut String) {
     if turn.index > 0 {
         prompt.push_str(SYSTEM);
     }
-    prompt.push_str(turn.content);
-    push_tools_and_response_format(
-        prompt,
-        turn.tools.as_deref(),
-        turn.response_format,
-        render_tools,
-    );
+    render_system_message(prompt, turn, render_tools);
 }
 
 /// A developer turn renders as a user turn; an empty one is refused.

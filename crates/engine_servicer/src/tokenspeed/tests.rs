@@ -234,6 +234,16 @@ async fn recv_abort(engine: &mut MockEngineInput) -> Vec<String> {
     decode_msgpack(frames[1].as_ref()).unwrap()
 }
 
+/// Nothing reaches the scheduler within a grace period.
+async fn assert_engine_idle(engine: &mut MockEngineInput) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), engine.recv_frames())
+            .await
+            .is_err(),
+        "nothing should have reached the scheduler"
+    );
+}
+
 /// The mock scheduler's step for the health probe the servicer sends: its
 /// one token, finished, so nothing lingers.
 async fn answer_probe(engine: &mut MockEngine) {
@@ -972,6 +982,76 @@ async fn string_stops_are_matched_by_the_servicer() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The servicer's own matched-stop terminal for a fan-out's second choice
+/// carries that choice's index, as the engine's completes do: the stop string
+/// matches on choice 1 while choice 0 is still open, and choice 0 then ends on
+/// the engine's own complete with index 0.
+#[tokio::test]
+async fn a_matched_stop_ends_the_second_choice_with_its_own_index() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let mut h = harness(model_info(), Some(tokenizer)).await;
+    let mut request = generate_request("r8", true, vec!["Hello world".to_string()]);
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r8-1", vec![1], 1, None, None)).await;
+    send(&mut h.engine_out, &batch("r8-1", vec![2], 2, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![1]
+    );
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![2]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (1, "stop", vec![1, 2])
+    );
+    assert_eq!(
+        done.matched_stop,
+        Some(ts::generate_complete::MatchedStop::MatchedStopStr(
+            "Hello world".to_string()
+        ))
+    );
+
+    send(
+        &mut h.engine_out,
+        &batch("r8-0", vec![30], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![30]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (0, "length", vec![30])
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    // The scheduler gets the abort for the choice the servicer ended, and
+    // only that one: nothing follows it.
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r8-1".to_string()]);
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A stop string that is one token (`world` is mock token 2) also reaches
 /// the scheduler as a stop id, so it finishes on the tick the string
 /// matches; the choice ends with the scheduler's own `Complete`.
@@ -1128,6 +1208,70 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         })
         .await
         .expect("abort of an unknown id");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("r7", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r7-1", vec![21], 1, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![21]
+    );
+
+    let response = h
+        .client
+        .abort(ts::AbortRequest {
+            request_id: "r7".to_string(),
+            reason: "test".to_string(),
+        })
+        .await
+        .expect("abort")
+        .into_inner();
+    assert!(response.success);
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.index,
+                done.finish_reason.clone(),
+                done.output_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

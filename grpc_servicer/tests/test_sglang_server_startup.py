@@ -290,18 +290,18 @@ def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod
 
 def test_the_planned_warm_up_stays_off_on_a_disaggregation_role(monkeypatch, server_mod, caplog):
     """This servicer's own warm-up request carried the stand-in bootstrap
-    already; the planned pass on a prefill or decode leg is the Rust
+    already; the planned pass on a prefill or decode side is the Rust
     launcher's, so the planner is never asked here, and a single engine still
     plans."""
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(
         server_mod, "DisaggregationMode", SimpleNamespace(NULL=SimpleNamespace(value="null"))
     )
-    never = Mock(side_effect=AssertionError("the planner must not be asked on a leg"))
+    never = Mock(side_effect=AssertionError("the planner must not be asked on a side"))
     monkeypatch.setattr(server_mod, "warmup_inputs", never)
     for mode in ("prefill", "decode"):
-        leg = SimpleNamespace(disaggregation_mode=mode)
-        assert server_mod._planned_warmup(leg, SimpleNamespace(), channel=None) is None
+        side = SimpleNamespace(disaggregation_mode=mode)
+        assert server_mod._planned_warmup(side, SimpleNamespace(), channel=None) is None
     never.assert_not_called()
     assert any(
         "Planned warm-up: none on a disaggregation role on this servicer" in r.getMessage()

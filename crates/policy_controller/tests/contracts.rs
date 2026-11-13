@@ -96,6 +96,7 @@ fn candidate_record() -> &'static [&'static str] {
             vision,
             host_local,
             active_sessions,
+            key,
         }
     )
 }
@@ -425,6 +426,8 @@ fn enum_mirrors() -> Vec<(
                     LateDecision,
                     ClientGone,
                     CommitFailed,
+                    Expired,
+                    WorkerRemoved,
                 }
             ),
         ),
@@ -564,6 +567,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("vision", Type::Bool),
                 ("host_local", Type::Bool),
                 ("active_sessions", Type::Uint32),
+                ("key", Type::Uint32),
             ],
             repeated: &[],
             optional: &[],
@@ -1603,5 +1607,149 @@ fn the_packed_request_block_keeps_its_u64_sections_aligned() {
             wit.contains(sentence),
             "the world states the alignment rule: {sentence:?}"
         );
+    }
+}
+
+/// The lease-id layout's bounds as `LeaseOrigin` states them: terms below
+/// 2^31 fit the 31 id bits, the per-term counter starts at 1 and never wraps
+/// into the term bits, so a controller-minted id is never 0 and never repeats
+/// across terms. The sentences are pinned beside the layout they bound.
+#[test]
+fn the_lease_id_layout_states_its_bounds() {
+    let proto = std::fs::read_to_string(contracts_dir().join(PLUGIN_PROTO))
+        .expect("the plugin protocol reads");
+    for sentence in [
+        "terms\n// stay below 2^31",
+        "the counter starts at 1",
+        "bumps its term before it mints again",
+        "never 0 and\n// never repeats across terms",
+    ] {
+        assert!(
+            proto.contains(sentence),
+            "LeaseOrigin states the id bounds: {sentence:?}"
+        );
+    }
+}
+
+/// The hello version fields: `PluginHello` offers a range on a Decide stream
+/// and one version (`protocol_min` = `protocol_max`) on an Observe stream;
+/// `PluginHelloAck.protocol` is the version a Decide stream settled, the one
+/// every Observe hello of that instance then names.
+type HelloField = (&'static str, i32, Type);
+
+const HELLO_FIELDS: &[(&str, &[HelloField])] = &[
+    (
+        "PluginHello",
+        &[
+            ("protocol_min", 1, Type::Uint32),
+            ("protocol_max", 2, Type::Uint32),
+        ],
+    ),
+    ("PluginHelloAck", &[("protocol", 1, Type::Uint32)]),
+];
+
+#[test]
+fn the_hello_version_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in HELLO_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "{message_name}: a hello version field moved"
+        );
+    }
+}
+
+/// The decline a plugin answers a stage with: `stage` is Stage bits, `reason`
+/// the enum, `detail` free text; a frame declining a stage and filling that
+/// stage's answer field is invalid.
+type DeclineField = (&'static str, i32, Type);
+
+const DECLINE_FIELDS: &[(&str, &[DeclineField])] = &[(
+    "Decline",
+    &[
+        ("stage", 1, Type::Uint32),
+        ("reason", 2, Type::Enum),
+        ("detail", 3, Type::String),
+    ],
+)];
+
+#[test]
+fn the_decline_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECLINE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a decline field moved");
+    }
+}
+
+/// Every lease end names exactly one lifecycle event: a completion, or a
+/// release with its reason. An end with no event is the leak a stateful plugin
+/// cannot see, so a `LeaseEnd` cause without a row here fails the test.
+const LEASE_END_EVENTS: &[(&str, &str)] = &[
+    ("CAUSE_COMPLETED", "completed"),
+    ("CAUSE_RELEASED", "released(reason)"),
+    ("CAUSE_EXPIRED", "released(REASON_EXPIRED)"),
+    ("CAUSE_WORKER_REMOVED", "released(REASON_WORKER_REMOVED)"),
+];
+
+#[test]
+fn every_lease_end_cause_names_one_lifecycle_event() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let causes: Vec<String> = enum_values(controller, "LeaseEnd.Cause")
+        .expect("LeaseEnd.Cause is an enum")
+        .into_iter()
+        .filter(|(_, number)| *number != 0)
+        .map(|(name, _)| name)
+        .collect();
+    let mapped: Vec<String> = LEASE_END_EVENTS
+        .iter()
+        .map(|(cause, _)| (*cause).to_owned())
+        .collect();
+    assert_eq!(causes, mapped, "a LeaseEnd cause has no lifecycle event");
+    let reasons: Vec<String> = enum_values(plugin, "Released.Reason")
+        .expect("Released.Reason is an enum")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for (cause, event) in LEASE_END_EVENTS {
+        if let Some(reason) = event
+            .strip_prefix("released(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .filter(|reason| reason.starts_with("REASON_"))
+        {
+            assert!(
+                reasons.iter().any(|r| r == reason),
+                "{cause}: {reason} is not a Released.Reason"
+            );
+        }
     }
 }

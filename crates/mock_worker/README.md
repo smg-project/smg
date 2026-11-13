@@ -54,12 +54,38 @@ mock, so the gateway forwards media references to it), and answers every
 completion, the media identity (the prompt ids as sent, one hash per media
 item) and one pull handle per hash naming its own address. On the TokenSpeed
 wire the worker mounts the engine's encoder service beside the scheduler's:
-its `Encode` takes a request's media with one rendezvous room per item
-(refused without), runs the realistic engine's admission hooks, counts in the
-admin API's `encodes` and answers accepted; its `Generate` is refused as the
-wrong pool, and a prefill worker on that wire refuses a request whose
-`encode_bootstrap_info` does not name a rendezvous for each media item once.
-The SGLang wire has no encode role.
+its `Encode` takes a request's one media item with its rendezvous room and a
+request id (refused without, as the engine's adapter refuses them), runs the
+realistic engine's admission hooks, counts in the admin API's `encodes` and
+answers accepted; it reports health under the encoder service's name, as the
+engine does in that role; its `Generate` is refused as the wrong pool, and a
+prefill worker on that wire refuses a request whose `encode_bootstrap_info`
+does not name a rendezvous for each media item once.
+The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
+request's media items are checked against the shape the engine's adapter
+requires before the canned answer: a known modality, the TokenSpeed item's
+content hash and, on the prefill and regular roles, its encoder input (or the
+encode room that hands the item over; a decode worker takes the gateway's
+pixel-free clone, metadata alone), the SGLang batch's pixel tensor (or its
+feature hash) and a video's placeholder token id, every tensor read as the
+engine reads it (bytes matching the shape at the dtype's width; the SGLang
+reader refuses a dtype outside its six, the TokenSpeed reader passes one it
+does not know; on the TokenSpeed wire an inline payload through the adapter's
+reader, an SHM handle with the servicer's checks: that byte length, a bare
+name and, for the scheduler's feature, a dtype of bfloat16, float16 or float32,
+the encoder reading its feature generically, a remote handle on a feature as
+it came, pulled by the servicer, and a remote handle on a side tensor refused
+as the servicer's generic reader refuses it), one SGLang batch per modality
+(image or
+video, an empty list reading as image) beside a primary batch, placeholder spans
+inside the prompt and disjoint across the request's items, and, when the item
+names its placeholder token id, spans that cover exactly the prompt's tokens of
+that id; a wrong item is refused with `InvalidArgument` naming the item and the
+field, so a gateway regression in a wire's items reads as a red row on the mock.
+A reference batch on the SGLang wire (media URLs without a pixel tensor, the
+form the gateway hands a worker that processes media itself) is the primary
+batch's alone, travels with no extra batch, and is accepted as it stands: the
+worker's processor or an encoder would resolve it, and the mock has neither.
 `--capture` records the TokenSpeed wire's requests only. Beside the scheduler
 service the server hosts the standard `grpc.health.v1` service (`Check`,
 `Watch`): the empty name and the served scheduler service are SERVING exactly
@@ -334,9 +360,10 @@ the request arrives); an HTTP worker answers the bare 499.
 
 ## Prefill/decode roles
 
-`--worker-type prefill|decode` gives the HTTP, the gRPC or the ZMQ workers of
-a process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
-<url> <bootstrap port> --decode <url>`) runs with no engine behind it. The
+`--worker-type prefill|decode` gives a process's HTTP workers alone, or its
+gRPC workers and ZMQ ranks together, a role in a disaggregated fleet, so a
+gateway in PD mode (`--prefill <url> <bootstrap port> --decode <url>`) runs
+with no engine behind it. The
 gateway detects the mock by the scheduler service it serves (or, on the HTTP
 wire, by its model list) and runs that wire's PD protocol: both sides get the
 same request, with the rendezvous the gateway mints (the wire's rendezvous
@@ -347,10 +374,13 @@ own code path), and the client reads the decode side's output.
 A ZMQ rank declares the role in its handshake's ready response as the engines
 do (`disaggregation_mode`, the request types it takes, and for a prefill the
 `bootstrap_host` and `bootstrap_port` of the port it binds, numbered after
-the gRPC workers), which is where a gateway checks a worker registered for a
-role. A prefill rank answers the prompt side alone, as on the gRPC wires;
-the vLLM dialect's request carries no rendezvous, so there is none to read.
-The encode role stays the gRPC wire's.
+the gRPC workers: rank `I`, counting `--zmq-start-index`, binds
+`base + grpc_count + I` of `--bootstrap-base-port <base>`), which is where a
+gateway checks a worker registered for a role. A ZMQ prefill rank needs the
+base port: its handshake is the only place the port reaches the gateway, so
+the flags are refused without one. A prefill rank answers the prompt side
+alone, as on the gRPC wires; the vLLM dialect's request carries no
+rendezvous, so there is none to read. The encode role stays the gRPC wire's.
 
 - A **prefill** worker answers every request with the prompt side's
   completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
@@ -382,10 +412,11 @@ The encode role stays the gRPC wire's.
   for a prefill worker registered without a port): the worker on that port
   takes it, one on another refuses it.
 
-No KV moves between the two: the decode side has the prompt. ZMQ workers
-take no role, and one process gives the role to one wire's workers (worker
-`i` of either wire would bind the same bootstrap port); the encode role is
-the vLLM and the TokenSpeed gRPC wires'.
+No KV moves between the two: the decode side has the prompt. One process
+gives the role to its HTTP workers alone or to its gRPC workers and ZMQ ranks
+together (an HTTP worker `i` and a gRPC worker `i` would bind the same
+bootstrap port; the ZMQ ranks bind after the gRPC workers); the encode role
+is the vLLM and the TokenSpeed gRPC wires'.
 
 Every gRPC worker advertises the pairing protocol its environment names
 (`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:

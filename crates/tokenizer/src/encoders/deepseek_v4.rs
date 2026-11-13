@@ -25,8 +25,8 @@ use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
         find_last_user_index, merge_tool_messages, push_tools_and_response_format,
-        render_v4_tools_template, sort_tool_results_by_call_order, task_sp_token, to_json,
-        tool_schemas, DsmlTags, IncomingBlocks, Turn,
+        render_system_message, render_v4_tools_template, sort_tool_results_by_call_order,
+        task_sp_token, to_json, tool_schemas, DsmlTags, IncomingBlocks, Turn,
     },
     RendererProfile,
 };
@@ -167,7 +167,7 @@ fn render_message(
     }
 
     match turn.role {
-        "system" => render_system(&mut prompt, &turn),
+        "system" => render_system_message(&mut prompt, &turn, render_tools),
         "developer" => render_developer(&mut prompt, &turn)?,
         "user" => render_user(&mut prompt, turn.msg, turn.content),
         "latest_reminder" => {
@@ -207,18 +207,6 @@ fn render_message(
         last_user_idx,
     )?;
     Ok(prompt)
-}
-
-/// A system message: its content, then the tools and the response format
-/// it carries.
-fn render_system(prompt: &mut String, turn: &Turn<'_>) {
-    prompt.push_str(turn.content);
-    push_tools_and_response_format(
-        prompt,
-        turn.tools.as_deref(),
-        turn.response_format,
-        render_tools,
-    );
 }
 
 /// A developer message: the user token, its content, then the tools and
@@ -961,6 +949,49 @@ mod tests {
                      You MUST strictly adhere to the following schema to reply:\n\
                      {{\"type\": \"json_object\"}}{ASSISTANT_SP_TOKEN}{thinking_token}"
                 )
+            );
+        }
+    }
+
+    /// A system message renders its content first, then the tools block and
+    /// the response-format section it carries, each after a blank line, in
+    /// that order, before the user turn; the same in both thinking modes.
+    #[test]
+    fn a_system_message_renders_its_content_then_its_tools_then_its_response_format() {
+        let messages = [
+            json!({
+                "role": "system",
+                "content": "Use the tool.",
+                "tools": [{ "type": "function", "function": { "name": "lookup_weather",
+                    "description": "Look up", "parameters": { "type": "object",
+                    "properties": { "query": { "type": "string" } }, "required": ["query"] } } }],
+                "response_format": { "type": "json_object" },
+            }),
+            user("hello"),
+        ];
+        for (mode, thinking_token) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
+            let out = encode_messages(&messages, mode, &EncodeParams::default()).unwrap();
+            let tools = out.find("## Tools\n").expect("the tools block");
+            let format = out
+                .find("## Response Format:\n\n")
+                .expect("the response-format section");
+            assert!(
+                out.starts_with(&format!(
+                    "{BOS_TOKEN}Use the tool.\n\n## Tools\n\nYou have access"
+                )),
+                "{out}"
+            );
+            assert!(tools < format, "{out}");
+            assert!(
+                out[tools..format].contains(r#""name": "lookup_weather""#)
+                    && out.ends_with(&format!(
+                        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n\
+                         {{\"type\": \"json_object\"}}{USER_SP_TOKEN}hello{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    )),
+                "{out}"
             );
         }
     }

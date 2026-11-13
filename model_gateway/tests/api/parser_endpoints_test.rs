@@ -232,7 +232,7 @@ mod parse_function_call_tests {
 
         let resp = app.clone().oneshot(req).await.unwrap();
 
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // Missing 'tool_call_parser' field
         let payload = json!({
@@ -248,7 +248,7 @@ mod parse_function_call_tests {
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         ctx.shutdown().await;
     }
@@ -385,7 +385,7 @@ mod separate_reasoning_tests {
 
         let resp = app.clone().oneshot(req).await.unwrap();
 
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // Missing 'reasoning_parser' field
         let payload = json!({
@@ -400,7 +400,7 @@ mod separate_reasoning_tests {
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         ctx.shutdown().await;
     }
@@ -595,6 +595,111 @@ mod api_routing_tests {
             resp.status()
         );
 
+        ctx.shutdown().await;
+    }
+}
+
+/// The plain-body routes of the admin plane (the two parse routes, the two
+/// profile routes) refuse a body the type does not take in the control
+/// plane's envelope (`{"error", "code"}`), as the worker, WASM module and
+/// tokenizer routes do, not with the framework's text/plain answer.
+#[cfg(test)]
+mod admin_body_refusals {
+    use super::*;
+
+    /// The status and the body of `body` posted to `path` under
+    /// `content_type` (no header when `None`).
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder().method("POST").uri(path);
+        if let Some(content_type) = content_type {
+            req = req.header(CONTENT_TYPE, content_type);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// `text` is the control plane's envelope: an `error` string and the
+    /// code `BAD_REQUEST`; the panic names the route and the body otherwise.
+    fn assert_refusal(case: &str, status: StatusCode, text: &str) {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {text}");
+        let body: serde_json::Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("{case}: not the control plane's envelope ({e}): {text}"));
+        assert_eq!(body["code"], "BAD_REQUEST", "{case}: {text}");
+        assert!(body["error"].is_string(), "{case}: {text}");
+    }
+
+    /// An array, null, a string and broken JSON under `application/json`
+    /// are a 400 in the envelope on the parse routes and on `/start_profile`;
+    /// `/stop_profile` refuses the same bodies but an array, which serde
+    /// reads as a struct of defaults from an empty positional form. An object
+    /// under no content type is refused on the parse routes, whose body is
+    /// required, and read as no body on the profile routes, whose optional
+    /// form reads a request without a content-type header as no body, as
+    /// the framework's does. A profile route with no body at all answers as
+    /// it does with an empty object: the defaults.
+    #[tokio::test]
+    async fn the_plain_body_routes_refuse_a_body_the_type_does_not_take_in_the_envelope() {
+        let ctx = ParserTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+        let bodies = [
+            (Some("application/json"), "[]"),
+            (Some("application/json"), "null"),
+            (Some("application/json"), r#""text""#),
+            (Some("application/json"), "{not json"),
+            (None, "{}"),
+        ];
+        for path in [
+            "/parse/function_call",
+            "/parse/reasoning",
+            "/start_profile",
+            "/stop_profile",
+        ] {
+            for (content_type, body) in bodies {
+                if path == "/stop_profile" && body == "[]" {
+                    continue;
+                }
+                if path.ends_with("_profile") && content_type.is_none() {
+                    continue;
+                }
+                let (status, text) = post(&app, path, content_type, body).await;
+                assert_refusal(
+                    &format!("{path} {content_type:?} {body}"),
+                    status,
+                    text.as_str(),
+                );
+            }
+        }
+        for path in ["/start_profile", "/stop_profile"] {
+            let (without_body, _) = post(&app, path, None, "").await;
+            let (empty_object, _) = post(&app, path, Some("application/json"), "{}").await;
+            assert_eq!(
+                without_body, empty_object,
+                "{path}: no body and an empty object take the same defaults"
+            );
+            assert_ne!(
+                without_body,
+                StatusCode::BAD_REQUEST,
+                "{path}: no body is not a refusal"
+            );
+            let (no_content_type, _) = post(&app, path, None, "{}").await;
+            assert_eq!(
+                without_body, no_content_type,
+                "{path}: an object under no content type is read as no body"
+            );
+        }
         ctx.shutdown().await;
     }
 }

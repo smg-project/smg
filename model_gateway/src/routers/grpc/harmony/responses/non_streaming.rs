@@ -33,7 +33,9 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, load_history,
-                persist_response_if_needed, tool_call_limit,
+                persist_response_if_needed,
+                streaming::OutputItemKind,
+                tool_call_limit,
                 utils::{
                     function_call_status, generation_failure_error, resolve_function_identity,
                     response_status,
@@ -449,7 +451,7 @@ fn build_tool_response(
     // Add reasoning output item if analysis exists
     if let Some(analysis_text) = analysis {
         output.push(ResponseOutputItem::new_reasoning(
-            format!("reasoning_{request_id}"),
+            OutputItemKind::Reasoning.new_id(),
             vec![],
             vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,
@@ -461,7 +463,7 @@ fn build_tool_response(
     // Add message output item if partial text exists
     if !partial_text.is_empty() {
         output.push(ResponseOutputItem::Message {
-            id: format!("msg_{request_id}"),
+            id: OutputItemKind::Message.new_id(),
             role: "assistant".to_string(),
             content: vec![ResponseContentPart::OutputText {
                 text: partial_text,
@@ -481,7 +483,7 @@ fn build_tool_response(
         let (name, namespace) =
             resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id.clone()),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id: tool_call.id.clone(),
             name,
             namespace,
@@ -508,7 +510,7 @@ fn build_tool_response(
         let status = function_call_status(finish_reason, &arguments);
         cut_call |= status == "incomplete";
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id,
             name,
             namespace,

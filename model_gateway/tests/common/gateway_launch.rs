@@ -337,7 +337,7 @@ pub enum Reply {
 
 /// One keep-alive `GET path` on `stream` (no `Connection: close`), and what
 /// it got back.
-pub fn keep_alive_get(stream: &mut TcpStream, path: &str) -> Reply {
+pub fn keep_alive_get<S: Read + Write>(stream: &mut S, path: &str) -> Reply {
     let _ = stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes());
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];
@@ -383,11 +383,13 @@ pub fn answered_200(reply: Reply) -> bool {
     matches!(reply, Reply::Answered(response) if response.starts_with("HTTP/1.1 200"))
 }
 
-/// A connection the gateway serves and keeps: connected and answered 200 on
-/// `GET /health` within `within`, retried while the gateway refuses (a permit
-/// on its way back). The read answer proves the connection holds a permit,
-/// where a bare connect returns before the acceptor has admitted it.
-pub fn served_connection(addr: SocketAddr, within: Duration) -> TcpStream {
+/// A connection the gateway serves and keeps on `addr`: connected and answered
+/// 200 on `GET /health` within `within`, retried while the gateway refuses (a
+/// permit on its way back). The read answer proves the connection holds a
+/// permit, where a bare connect returns before the acceptor has admitted it.
+/// At the deadline the panic carries the gateway's log at `log`: a leaked
+/// permit shows as its refusal lines, which the retries alone would hide.
+pub fn served_connection(addr: SocketAddr, within: Duration, log: &Path) -> TcpStream {
     let deadline = Instant::now() + within;
     loop {
         if let Some(mut stream) = connect(addr) {
@@ -397,7 +399,8 @@ pub fn served_connection(addr: SocketAddr, within: Duration) -> TcpStream {
         }
         assert!(
             Instant::now() < deadline,
-            "no connection was served within {within:?}"
+            "no connection on {addr} was served within {within:?}\n{}",
+            fs::read_to_string(log).unwrap_or_default()
         );
         thread::sleep(Duration::from_millis(50));
     }
