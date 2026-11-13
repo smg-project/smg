@@ -42,17 +42,18 @@ const WIT_VERSION: &str = "1.0.0";
 /// The header deny-list of design section 4.6: the names no view may read
 /// and no routing-key override may key on, lowercase, in this order, each
 /// once. A name added or moved here is a contract change.
-const DENIED_HEADER_NAMES: [&str; 6] = [
+const DENIED_HEADER_NAMES: [&str; 7] = [
     "authorization",
     "proxy-authorization",
     "cookie",
     "set-cookie",
     "x-api-key",
     "api-key",
+    "x-goog-api-key",
 ];
 
 #[test]
-fn the_header_deny_list_holds_its_six_names() {
+fn the_header_deny_list_holds_its_seven_names() {
     assert_eq!(DENIED_HEADERS, DENIED_HEADER_NAMES, "the deny-list moved");
     for name in DENIED_HEADERS {
         assert_eq!(name, name.to_ascii_lowercase(), "{name} is not lowercase");

@@ -57,7 +57,7 @@
       "type": "object",
       "properties": {
         "headers": {
-          "description": "The request headers a stage may read, lowercase, in the order their\npositions take on the wire. A name on the deny-list (`authorization`,\n`proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`,\nthe host's tenant header) is refused. Every header a binding's\n`sessions`, `canary` or `match.header` names must be listed here. At\nmost 256: a view names a header by its position in one byte.",
+          "description": "The request headers a stage may read, lowercase, in the order their\npositions take on the wire. A name on the deny-list (`authorization`,\n`proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`,\n`x-goog-api-key`, the host's tenant header) is refused. Every header a\nbinding's `sessions`, `canary` or `match.header` names must be listed\nhere. At most 256: a view names a header by its position in one byte.",
           "type": "array",
           "items": {
             "type": "string"
