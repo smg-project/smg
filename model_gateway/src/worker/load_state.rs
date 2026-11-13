@@ -43,6 +43,8 @@ use parking_lot::Mutex;
 use tokio::sync::{watch, Notify};
 
 use super::{registry::WorkerRegistry, Worker};
+#[cfg(any(test, feature = "test-util"))]
+use crate::policies::LoadBalancingPolicy;
 
 /// Subscription handle to the published load snapshots. `borrow().clone()`
 /// yields an `Arc<LoadSnapshot>`; the watch guard must not be held across a
@@ -132,7 +134,7 @@ pub struct TestFeed(watch::Sender<Arc<LoadSnapshot>>);
 
 #[cfg(any(test, feature = "test-util"))]
 impl TestFeed {
-    pub fn attached_to(policy: &dyn crate::policies::LoadBalancingPolicy) -> Self {
+    pub fn attached_to(policy: &dyn LoadBalancingPolicy) -> Self {
         let (tx, rx) = watch::channel(Arc::new(LoadSnapshot::default()));
         policy.set_load_receiver(Some(rx));
         Self(tx)
