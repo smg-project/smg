@@ -477,23 +477,37 @@ struct View {
     /// each for the bar.
     open_partners: Vec<OpenPartner>,
     scratch: Scratch,
-    /// The affinity rows and block hashes of a cache-aware decision.
+    /// The affinity rows and block facts of a cache-aware decision: the
+    /// single request's, or a pair's prefill rows with the pair's one set of
+    /// block facts (the decode side's fill hands its own over when the
+    /// prefill side reads none).
     affinity: AffinityRows,
+    /// The affinity rows of a pair's cache-aware decode side: one row per
+    /// decode row this view holds for the decision (the open partners of
+    /// each distinct partner list) and no more. The fill is one read of the
+    /// decode policy's index for the request, placed over those rows.
+    decode_affinity: AffinityRows,
 }
 
 /// The decode side of a pair decision as the host hands it to
 /// [`Decider::decide_pair`]: each open prefill's partner list, shared between
 /// the prefills of one pairing descriptor, so the decision keys one pair
 /// class per list by `Arc` identity; the live filter over a list's workers,
-/// which reads the decode alone and never the prefill; and whether the
+/// which reads the decode alone and never the prefill; whether the
 /// decode pool is over the overload thresholds on every worker with its veto
 /// lifted, in which case a list's rows are its least-loaded open partners
-/// alone (`LoadBar`).
+/// alone (`LoadBar`); and the index source of a cache-aware decode policy,
+/// read into the decode rows as [`HostRequest::affinity`] is read into the
+/// prefill rows.
 #[derive(Clone, Copy)]
 pub struct PairPartners<'a, 'p> {
     pub list: &'a dyn Fn(usize) -> &'p Arc<[Arc<dyn Worker>]>,
     pub open: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
     pub lift_decode: bool,
+    /// The decode policy's index and trees when it is cache-aware; `None`
+    /// for every other decode policy, and for a decode pool paired by load
+    /// under the lift, which its policy does not place.
+    pub affinity: Option<Affinity<'a>>,
 }
 
 /// An open partner of a lifted list: its position in the list, whether its
@@ -556,7 +570,9 @@ pub struct HostRequest<'a> {
     pub sequence: Option<LeaseId>,
     /// The index source of a cache-aware decision: the legacy policy's
     /// event index and approximate trees, read into the view's affinity
-    /// rows and block hashes. `None` for every other policy.
+    /// rows and block hashes. For a pair decision it is the prefill
+    /// policy's, read into the prefill rows ([`PairPartners::affinity`] is
+    /// the decode side's). `None` for every other policy.
     pub affinity: Option<Affinity<'a>>,
 }
 
@@ -645,6 +661,25 @@ struct ViewBuild<'a> {
     snapshot: Option<&'a LoadSnapshot>,
     now: Instant,
     session_key: Option<&'a str>,
+}
+
+/// A worker's affinity facts onto a row built without them: a pair's rows,
+/// each side's index read once the decision holds that side's rows. The
+/// destructuring names every fact, so one the index gains fails the build
+/// here, beside the five `candidate` initialises.
+fn carry_affinity(row: &mut Candidate, held: &AffinityRow) {
+    let AffinityRow {
+        overlap_blocks,
+        predicted_blocks,
+        admitted_age_ms,
+        indexed_growth,
+        indexed_blocks,
+    } = *held;
+    row.overlap_blocks = overlap_blocks;
+    row.predicted_blocks = predicted_blocks;
+    row.admitted_age_ms = admitted_age_ms;
+    row.indexed_growth = indexed_growth;
+    row.indexed_blocks = indexed_blocks;
 }
 
 impl Decider {
@@ -1126,8 +1161,12 @@ impl Decider {
     /// costs P + D rows and never P x D. Under the decode pool's lifted veto
     /// a list's rows are its least-loaded open partners alone, the ones with
     /// a free room first (`LoadBar`). The request's tried URLs and
-    /// `excluded` reach both sides. The returned workers are the decode rows
-    /// in position order, for the target's decode side.
+    /// `excluded` reach both sides. A cache-aware side reads its affinity
+    /// rows from its own policy's index ([`HostRequest::affinity`] for the
+    /// prefill rows, [`PairPartners::affinity`] for the decode rows); the
+    /// request's block facts are one set for the pair, the prefill side's
+    /// fill when it has one, else the decode side's. The returned workers
+    /// are the decode rows in position order, for the target's decode side.
     pub fn decide_pair(
         &self,
         request: &HostRequest<'_>,
@@ -1158,7 +1197,8 @@ impl Decider {
                 lists,
                 open_partners,
                 scratch,
-                ..
+                affinity,
+                decode_affinity,
             } = &mut *view;
             candidates.clear();
             decodes.clear();
@@ -1223,10 +1263,42 @@ impl Decider {
                 }
                 candidates.push(candidate);
             }
+            // Each cache-aware side's affinity, from that side's own policy's
+            // index, once the decision's rows are whole: one read over the
+            // side's rows, carried onto them. The rows above are built as a
+            // pair with no such side builds them.
+            match request.affinity {
+                Some(source) => {
+                    source.policy.fill_affinity(prefills, source.info, affinity);
+                    for (row, held) in candidates.iter_mut().zip(&affinity.rows) {
+                        carry_affinity(row, held);
+                    }
+                }
+                None => affinity.clear(),
+            }
+            if let Some(source) = partners.affinity {
+                source
+                    .policy
+                    .fill_affinity(&decode_workers, source.info, decode_affinity);
+                for (row, held) in decodes.iter_mut().zip(&decode_affinity.rows) {
+                    carry_affinity(row, held);
+                }
+                // The request's block facts are one set per pair decision,
+                // read from the first buffer as a single decision reads
+                // them: the prefill side's fill when the prefill policy is
+                // cache-aware, else this one's.
+                if request.affinity.is_none() {
+                    affinity.take_block_facts(decode_affinity);
+                }
+            }
             let now_micros = self.micros_since_origin(now);
             let facts = RequestFacts {
                 model: request.model,
+                namespace_seed: affinity.namespace_seed,
                 prompt_tokens: request.prompt_tokens,
+                block_hashes: &affinity.hashes,
+                hash_kind: affinity.hash_kind,
+                block_size: affinity.block_size,
                 session_key,
                 phase: Phase::Prefill,
                 attempt: u8::try_from(request.tried.len()).unwrap_or(u8::MAX),
@@ -1446,12 +1518,13 @@ mod tests {
 
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use openai_protocol::worker::WorkerStatus;
+    use smg_policy_controller::HashKind;
     use tokio::sync::watch;
 
     use super::*;
     use crate::{
         config::types::ManualAssignmentMode,
-        policies::{test_support, CacheAwareConfig, PolicyFactory},
+        policies::{test_support, CacheAwareConfig, PolicyFactory, WorkerRole},
         worker::{
             load_state::{one_rank_load, LoadSnapshot},
             test_support::{no_health_check, worker_of},
@@ -2290,6 +2363,7 @@ mod tests {
             list: &list,
             open: &|_| true,
             lift_decode: false,
+            affinity: None,
         };
         let tried = [decodes[0].base_url().to_string()];
         let after_d0 = HostRequest {
@@ -2353,6 +2427,7 @@ mod tests {
             list: &list,
             open: &|_| true,
             lift_decode: false,
+            affinity: None,
         };
         let request = HostRequest {
             phase: Phase::Prefill,
@@ -2403,6 +2478,7 @@ mod tests {
             list: &list,
             open: &|_| true,
             lift_decode: false,
+            affinity: None,
         };
         let request = HostRequest {
             phase: Phase::Prefill,
@@ -2452,6 +2528,7 @@ mod tests {
             list: &list,
             open: &|_| true,
             lift_decode: false,
+            affinity: None,
         };
         let request = HostRequest {
             phase: Phase::Prefill,
@@ -2530,6 +2607,7 @@ mod tests {
             list: &list,
             open: &|_| true,
             lift_decode: false,
+            affinity: None,
         };
         let request = HostRequest {
             phase: Phase::Prefill,
@@ -2599,6 +2677,7 @@ mod tests {
                 list: &list,
                 open,
                 lift_decode,
+                affinity: None,
             };
             let (_, _, rows) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
             rows.iter().map(|w| w.url().to_string()).collect::<Vec<_>>()
@@ -2634,6 +2713,7 @@ mod tests {
             list: &list,
             open: &|_| true,
             lift_decode: false,
+            affinity: None,
         };
         let full = prefills[0].url().to_string();
         let has_capacity = |w: &Arc<dyn Worker>| w.url() != full;
@@ -3026,6 +3106,7 @@ mod tests {
             list: &list,
             open: &open,
             lift_decode: false,
+            affinity: None,
         };
         let pair_request = |prompt_tokens| HostRequest {
             phase: Phase::Prefill,
@@ -4040,5 +4121,261 @@ mod tests {
             .map(|_| leader(&decider, &request, &workers))
             .collect();
         assert_eq!(seen.len(), 2, "a miss is placed by load, both idle");
+    }
+
+    /// A decider whose pair sides run `prefill` and `decode`, round robin
+    /// behind every other request.
+    fn pair_decider(prefill: &PolicyConfig, decode: &PolicyConfig) -> Decider {
+        Decider::from_configs(
+            &PolicyConfig::RoundRobin,
+            prefill,
+            decode,
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("carried policies")
+    }
+
+    fn prefill_side(n: usize) -> Vec<Arc<dyn Worker>> {
+        (0..n)
+            .map(|i| worker_of(&format!("http://p{i}:8000"), WorkerType::Prefill))
+            .collect()
+    }
+
+    /// One partner list every prefill shares.
+    fn decode_side(n: usize) -> Arc<[Arc<dyn Worker>]> {
+        (0..n)
+            .map(|i| worker_of(&format!("http://d{i}:8000"), WorkerType::Decode))
+            .collect()
+    }
+
+    /// The block facts the last decision on this thread read: the block
+    /// size, the number of block hashes and their kind.
+    fn block_facts() -> (u32, usize, HashKind) {
+        VIEW.with(|view| {
+            let view = view.borrow();
+            (
+                view.affinity.block_size,
+                view.affinity.hashes.len(),
+                view.affinity.hash_kind,
+            )
+        })
+    }
+
+    /// The pair a decision leads with: the prefill's position and the decode
+    /// row's URL.
+    fn leading_pair(decision: &Decision, rows: &[Arc<dyn Worker>]) -> (u32, String) {
+        let target = decision.pick().expect("a pair").targets.as_slice()[0];
+        let pair = target.pair.expect("the decode side");
+        (
+            target.position,
+            rows[pair.decode_position as usize].url().to_string(),
+        )
+    }
+
+    /// With a cache-aware policy on both sides, each side's rows come from
+    /// its own policy's index: the prefill that holds the prompt in the
+    /// prefill policy's tree and the decode that holds it in the decode
+    /// policy's tree are the pair on every seed, though the two trees name
+    /// different positions. A side handed no source is placed by load, the
+    /// other side's holder kept.
+    #[test]
+    fn a_cache_aware_pair_keeps_each_sides_holder_by_that_sides_own_index() {
+        let config = cache_aware_config(16);
+        let decider = pair_decider(&config, &config);
+        let (prefill_policy, decode_policy) = (cache_aware_policy(16), cache_aware_policy(16));
+        let prefills = prefill_side(2);
+        let decodes = decode_side(2);
+        let text = "the one prompt whose prefix lives on one prefill and on one decode of the pair";
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            role: WorkerRole::Prefill,
+            ..SelectWorkerInfo::default()
+        };
+        let decode_info = SelectWorkerInfo {
+            role: WorkerRole::Decode,
+            ..info.clone()
+        };
+        prefill_policy.record_route(&prefills, 1, &info);
+        decode_policy.record_route(&decodes, 0, &decode_info);
+        let list = |_: usize| &decodes;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+            affinity: Some(Affinity {
+                policy: &decode_policy,
+                info: &decode_info,
+            }),
+        };
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            affinity: Some(Affinity {
+                policy: &prefill_policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        let pairs = |request: &HostRequest<'_>, partners: PairPartners<'_, '_>| {
+            (0..32)
+                .map(|_| {
+                    let (decision, _, rows) =
+                        decider.decide_pair(request, &prefills, &|_| true, partners, &[]);
+                    leading_pair(&decision, &rows)
+                })
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let both = (1, decodes[0].url().to_string());
+        assert_eq!(
+            pairs(&request, partners),
+            [both.clone()].into(),
+            "each side's holder, by its own tree"
+        );
+        let no_prefill_source = pairs(
+            &HostRequest {
+                affinity: None,
+                ..request
+            },
+            partners,
+        );
+        assert_eq!(
+            no_prefill_source,
+            [(0, both.1.clone()), both.clone()].into(),
+            "the prefill by load, the decode holder kept"
+        );
+        let no_decode_source = pairs(
+            &request,
+            PairPartners {
+                affinity: None,
+                ..partners
+            },
+        );
+        assert_eq!(
+            no_decode_source,
+            [both, (1, decodes[1].url().to_string())].into(),
+            "the prefill holder kept, the decode by load"
+        );
+    }
+
+    /// The pair's block facts are the prefill side's fill when the prefill
+    /// policy is cache-aware, whatever the decode side counts in. At 64
+    /// tokens a block with a margin price of 8 tokens, a one-block prefill
+    /// holder seven requests deep stays under its margin of 8 (64 / 8) and
+    /// keeps the prompt. Had the facts come from the decode side's fill (16
+    /// tokens a block here; the registry keeps such a pair on the legacy
+    /// path) or been left unset, the block would price at 2, the margin
+    /// would fall to 4 and the holder would spill.
+    #[test]
+    fn a_pairs_block_facts_are_the_prefill_sides_fill_when_it_reads_one() {
+        let mut prefill_config = cache_aware_config(64);
+        if let PolicyConfig::CacheAware {
+            balance_prefix_margin_tokens,
+            ..
+        } = &mut prefill_config
+        {
+            *balance_prefix_margin_tokens = 8;
+        }
+        let decider = pair_decider(&prefill_config, &cache_aware_config(16));
+        let (prefill_policy, decode_policy) = (cache_aware_policy(64), cache_aware_policy(16));
+        let prefills = prefill_side(3);
+        let decodes = decode_side(2);
+        let tokens: Vec<u32> = (1..=64).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..SelectWorkerInfo::default()
+        };
+        prefill_policy.record_route(&prefills, 0, &info);
+        for _ in 0..7 {
+            prefills[0].increment_load();
+        }
+        let list = |_: usize| &decodes;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+            affinity: Some(Affinity {
+                policy: &decode_policy,
+                info: &info,
+            }),
+        };
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            prompt_tokens: 64,
+            affinity: Some(Affinity {
+                policy: &prefill_policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        for _ in 0..20 {
+            let (decision, _, _) =
+                decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+            assert_eq!(
+                decision.pick().expect("a pair").targets.as_slice()[0].position,
+                0,
+                "the priced prefix keeps its holder under the gate"
+            );
+            assert_eq!(
+                block_facts(),
+                (64, 0, HashKind::Token),
+                "the prefill side's block size; a token tree sends no hashes"
+            );
+        }
+    }
+
+    /// With no affinity source on the prefill side, the pair's block facts
+    /// are the decode side's fill and the decode holder leads; a later pair
+    /// with a source on neither side reads none.
+    #[test]
+    fn a_pairs_block_facts_are_the_decode_sides_fill_when_the_prefill_side_reads_none() {
+        let decider = pair_decider(&PolicyConfig::RoundRobin, &cache_aware_config(64));
+        let decode_policy = cache_aware_policy(64);
+        let prefills = prefill_side(2);
+        let decodes = decode_side(2);
+        // 200 characters: three whole windows of 64.
+        let text = "a prompt of two hundred characters, give or take; ".repeat(4);
+        let info = SelectWorkerInfo {
+            request_text: Some(&text),
+            role: WorkerRole::Decode,
+            ..SelectWorkerInfo::default()
+        };
+        decode_policy.record_route(&decodes, 1, &info);
+        let list = |_: usize| &decodes;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+            affinity: Some(Affinity {
+                policy: &decode_policy,
+                info: &info,
+            }),
+        };
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            ..request()
+        };
+        for _ in 0..20 {
+            let (decision, _, rows) =
+                decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+            assert_eq!(
+                leading_pair(&decision, &rows).1,
+                decodes[1].url(),
+                "the decode holder"
+            );
+            assert_eq!(
+                block_facts(),
+                (64, 3, HashKind::Text),
+                "the decode side's block size and the text's whole windows"
+            );
+        }
+        let no_source = PairPartners {
+            affinity: None,
+            ..partners
+        };
+        decider.decide_pair(&request, &prefills, &|_| true, no_source, &[]);
+        assert_eq!(
+            block_facts(),
+            (0, 0, HashKind::Token),
+            "a pair with no source reads no block facts"
+        );
     }
 }

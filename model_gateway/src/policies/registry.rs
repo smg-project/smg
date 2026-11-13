@@ -441,12 +441,15 @@ impl PolicyRegistry {
     /// keyed request keeps the keyed path when the sticky routing-key
     /// override places it on either side or a side's policy pins the key
     /// itself (`manual`: the engine's pair binding pins no session), and
-    /// the pins move behind the engine's view in a later step. A pair with
-    /// a `cache_aware` side keeps the legacy path as well: the pair request
-    /// carries no affinity facts yet, so the engine would place that side
-    /// by load alone and record no route; the legacy policy's own match
-    /// places it until the pair path carries the facts the single request
-    /// does.
+    /// the pins move behind the engine's view in a later step. A
+    /// `cache_aware` side is the engine's: the pair decision reads each
+    /// side's affinity rows from that side's own policy. One pair keeps the
+    /// legacy path: both sides `cache_aware` under configurations that count
+    /// a request's blocks differently
+    /// (`CacheAwarePolicy::shares_block_facts`). The engine's pair
+    /// decision carries one set of block facts for both sides, so the side
+    /// whose facts it did not carry would be scored in the other's blocks;
+    /// each legacy policy counts in its own.
     pub(crate) fn pair_engine_for(&self, info: &SelectWorkerInfo<'_>) -> Option<&Arc<Decider>> {
         let decider = self.decider.as_ref()?;
         let (prefill, decode) = (self.get_prefill_policy(), self.get_decode_policy());
@@ -455,14 +458,19 @@ impl PolicyRegistry {
             || ((Self::pins_its_own_key(prefill.as_ref())
                 || Self::pins_its_own_key(decode.as_ref()))
                 && Self::carries_its_own_key(info));
-        let affine =
-            as_cache_aware(prefill.as_ref()).is_some() || as_cache_aware(decode.as_ref()).is_some();
-        (!keyed && !affine).then_some(decider)
+        let split_facts = match (
+            as_cache_aware(prefill.as_ref()),
+            as_cache_aware(decode.as_ref()),
+        ) {
+            (Some(prefill), Some(decode)) => !prefill.shares_block_facts(decode),
+            _ => false,
+        };
+        (!keyed && !split_facts).then_some(decider)
     }
 
     /// Whether `policy` pins a keyed request itself (`manual` and
     /// `consistent_hashing`, the policies the sticky override leaves alone).
-    pub(crate) fn pins_its_own_key(policy: &dyn LoadBalancingPolicy) -> bool {
+    fn pins_its_own_key(policy: &dyn LoadBalancingPolicy) -> bool {
         !Self::routing_key_override_applies(policy.name())
     }
 
@@ -470,7 +478,7 @@ impl PolicyRegistry {
     /// placement derived it, else the routing-key header, else the
     /// rid-derived key, the precedence of [`ManualPolicy`] itself
     /// ([`Self::engine_session_key`] feeds a `manual` default this key).
-    pub(crate) fn own_key<'a>(info: &SelectWorkerInfo<'a>) -> Option<&'a str> {
+    fn own_key<'a>(info: &SelectWorkerInfo<'a>) -> Option<&'a str> {
         info.routing_key
             .or_else(|| extract_routing_key_hint(info.headers))
             .or(info.rid_key)
@@ -1473,6 +1481,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::CacheIndexKind,
         policies::{
             engine_host::HostRequest,
             test_support::{decider_over, headers_with_routing_key},
@@ -3627,33 +3636,96 @@ mod tests {
         }
     }
 
-    /// A pair with a `cache_aware` side keeps the legacy path under the
-    /// engine, keyed or not: the pair request carries no affinity facts, so
-    /// the legacy policy's own match places that side. A pair of other
-    /// presets takes the engine.
+    /// Whether the engine serves the pair of `prefill` and `decode`. The
+    /// engine is hosted over two cache-aware sides and each side's policy is
+    /// built from the configuration given: a side on the hash index can only
+    /// be set as a policy, since the engine's own build refuses that form.
+    fn engine_serves_the_pair(prefill: &PolicyConfig, decode: &PolicyConfig) -> bool {
+        let cache_aware = cache_aware_config();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &cache_aware,
+            &cache_aware,
+        );
+        policies.set_prefill_policy(PolicyFactory::create_from_config(prefill));
+        policies.set_decode_policy(PolicyFactory::create_from_config(decode));
+        policies
+            .pair_engine_for(&SelectWorkerInfo::default())
+            .is_some()
+    }
+
+    /// The cache-aware configuration of these tests with one change.
+    fn cache_aware_with(change: impl FnOnce(&mut PolicyConfig)) -> PolicyConfig {
+        let mut config = cache_aware_config();
+        change(&mut config);
+        config
+    }
+
+    /// A pair with a `cache_aware` side is the engine's, whichever side it
+    /// is, and so is a pair of two sides under one configuration: each
+    /// side's affinity is read from its own policy.
     #[test]
-    fn a_pair_with_a_cache_aware_side_keeps_the_legacy_path() {
+    fn a_pair_with_a_cache_aware_side_is_the_engines() {
         let round_robin = PolicyConfig::RoundRobin;
         let cache_aware = cache_aware_config();
-        for (prefill, decode) in [(&cache_aware, &round_robin), (&round_robin, &cache_aware)] {
-            let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-                PolicyEngineMode::Engine,
-                prefill,
-                decode,
-            );
-            policies.set_prefill_policy(PolicyFactory::create_from_config(prefill));
-            policies.set_decode_policy(PolicyFactory::create_from_config(decode));
-            assert!(policies
-                .pair_engine_for(&SelectWorkerInfo::default())
-                .is_none());
-        }
-        let plain = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &round_robin,
-            &round_robin,
-        );
-        assert!(plain
-            .pair_engine_for(&SelectWorkerInfo::default())
-            .is_some());
+        assert!(engine_serves_the_pair(&cache_aware, &round_robin));
+        assert!(engine_serves_the_pair(&round_robin, &cache_aware));
+        assert!(engine_serves_the_pair(&cache_aware, &cache_aware));
+        assert!(engine_serves_the_pair(&round_robin, &round_robin));
+    }
+
+    /// Two `cache_aware` sides at different block sizes keep the legacy
+    /// path: the engine's pair decision carries one block size, and the
+    /// side it did not come from would be scored in the other's blocks. One
+    /// such side beside a side that reads no block facts is the engine's.
+    #[test]
+    fn a_cache_aware_pair_at_two_block_sizes_keeps_the_legacy_path() {
+        let cache_aware = cache_aware_config();
+        let wider = cache_aware_with(|config| {
+            if let PolicyConfig::CacheAware { block_size, .. } = config {
+                *block_size *= 2;
+            }
+        });
+        assert!(!engine_serves_the_pair(&cache_aware, &wider));
+        assert!(!engine_serves_the_pair(&wider, &cache_aware));
+        assert!(engine_serves_the_pair(&wider, &wider));
+        assert!(engine_serves_the_pair(&wider, &PolicyConfig::RoundRobin));
+    }
+
+    /// Two `cache_aware` sides over different kinds of index keep the
+    /// legacy path: the hash kind keeps no tree for the pair's fill to read.
+    #[test]
+    fn a_cache_aware_pair_over_two_kinds_of_index_keeps_the_legacy_path() {
+        let cache_aware = cache_aware_config();
+        let hashed = cache_aware_with(|config| {
+            if let PolicyConfig::CacheAware { cache_index, .. } = config {
+                *cache_index = CacheIndexKind::Hash;
+            }
+        });
+        assert!(!engine_serves_the_pair(&cache_aware, &hashed));
+        assert!(!engine_serves_the_pair(&hashed, &cache_aware));
+    }
+
+    /// Two `cache_aware` sides that differ in a field the request's block
+    /// facts do not read are the engine's: each side's rows and profile
+    /// carry its own threshold and margins.
+    #[test]
+    fn a_cache_aware_pair_differing_outside_its_block_facts_is_the_engines() {
+        let cache_aware = cache_aware_config();
+        let stricter = cache_aware_with(|config| {
+            if let PolicyConfig::CacheAware {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_prefix_margin_tokens,
+                ..
+            } = config
+            {
+                *cache_threshold = 0.9;
+                *balance_abs_threshold = 8;
+                *balance_prefix_margin_tokens = 1024;
+            }
+        });
+        assert!(engine_serves_the_pair(&cache_aware, &stricter));
+        assert!(engine_serves_the_pair(&stricter, &cache_aware));
     }
 }

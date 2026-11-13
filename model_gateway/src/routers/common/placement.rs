@@ -1564,16 +1564,20 @@ pub(crate) fn pair_decider<'a>(
     clippy::large_enum_variant,
     reason = "the decided side carries the engine's decision by value across the one hop from the decision to the commit; boxing it would cost one allocation per pair placement"
 )]
-pub(crate) enum PairProposal {
+pub(crate) enum PairProposal<'a> {
     /// The prelude's own pair (the steering default over an all-vetoed pool):
     /// the caller re-validates the prefill's window alone.
     Settled(Pair),
     /// The engine's decision, committed over its ordered targets.
-    Decided(PairDecision),
+    Decided(PairDecision<'a>),
 }
 
 /// The engine's pair decision with what its commit indexes and re-validates.
-pub(crate) struct PairDecision {
+pub(crate) struct PairDecision<'a> {
+    /// The request as the prefill policy read it: what a cache-aware side
+    /// records its route with at the commit (the decode side under
+    /// [`decode_reading`]).
+    info: SelectWorkerInfo<'a>,
     decision: Decision,
     lease: Lease,
     /// The decode side's booking of a request of unknown size: the decode
@@ -1594,7 +1598,9 @@ pub(crate) struct PairDecision {
 /// over the open prefills with their capacity bits (`has_capacity`: the
 /// admission window as the lock reads it) and their open partners with
 /// their room bits; `excluded` are the ids a commit of this request just
-/// refused, for the one re-decision. A prefill picker that declines a
+/// refused, for the one re-decision. A `cache_aware` side reads its affinity
+/// through its own policy, as each of the legacy pair's two selections
+/// does. A prefill picker that declines a
 /// lifted pool all over the thresholds is steered by the least-loaded
 /// default, as the legacy path steers it. Runs inside the admission
 /// callback, under the lock, as the legacy selection does: an open pool
@@ -1604,7 +1610,7 @@ pub(crate) struct PairDecision {
     clippy::too_many_arguments,
     reason = "the engine seam threads every routing input plus the window"
 )]
-pub(crate) fn decide_pair(
+pub(crate) fn decide_pair<'a>(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     decider: &Decider,
@@ -1613,9 +1619,9 @@ pub(crate) fn decide_pair(
     wire: Option<WireConstraint>,
     homogeneous_runtime: bool,
     has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
-    inputs: PlacementInputs<'_>,
+    inputs: PlacementInputs<'a>,
     excluded: &[WorkerId],
-) -> Result<PairProposal, Box<PairFailure>> {
+) -> Result<PairProposal<'a>, Box<PairFailure>> {
     let prefill_policy = policies.get_prefill_policy();
     let (live, open, pair_runtime) = match pair_prelude(
         registry,
@@ -1659,16 +1665,51 @@ pub(crate) fn decide_pair(
     // one pair class per list and builds its rows once.
     let list = |i: usize| &pairs.partners[open[i]];
     let partner_open = |d: &Arc<dyn Worker>| live.partner_open(d, pair_runtime);
+    // The header key is read once per pair decision: the affinity reading
+    // carries it, and the session is keyed in `PolicyRegistry::sticky_key`'s
+    // order, this key before the request id's.
+    let routing_key = policies.sticky_header_key(inputs.headers);
+    // The request as the prefill policy reads it, the legacy pair's first
+    // reading. A cache-aware side reads its affinity through its own
+    // policy's index and trees, the decode side under its own reading; a
+    // decode pool paired by load under the lift is not its policy's
+    // selection and reads none.
+    let info = SelectWorkerInfo {
+        request_text: inputs.text,
+        tokens: inputs.tokens,
+        headers: inputs.headers,
+        routing_key,
+        rid_key: inputs.rid_key,
+        cache_namespace: inputs.cache_namespace,
+        hash_ring: None,
+        role: WorkerRole::Prefill,
+        overload_lifted: live.lift_prefill,
+    };
+    let decode_policy = policies.get_decode_policy();
+    let decode_info;
+    let decode_affinity = match as_cache_aware(decode_policy.as_ref()) {
+        Some(policy) if !live.lift_decode => {
+            decode_info = decode_reading(&info);
+            Some(Affinity {
+                policy,
+                info: &decode_info,
+            })
+        }
+        _ => None,
+    };
     let request = HostRequest {
         model: model_id,
         prompt_tokens: decider.prefill_prompt_tokens(inputs.tokens),
-        session_key: policies.sticky_key(inputs.headers, inputs.rid_key),
+        session_key: routing_key.or(inputs.rid_key),
         tried: inputs.tried,
         overload_lifted: live.lift_prefill,
         phase: Phase::Prefill,
         has_capacity: None,
         sequence: inputs.sequence,
-        affinity: None,
+        affinity: as_cache_aware(prefill_policy.as_ref()).map(|policy| Affinity {
+            policy,
+            info: &info,
+        }),
     };
     // The capture observes the open prefills before the engine reads them,
     // as the single seam does; the row follows the shed or the commit.
@@ -1681,6 +1722,7 @@ pub(crate) fn decide_pair(
             list: &list,
             open: &partner_open,
             lift_decode: live.lift_decode,
+            affinity: decode_affinity,
         },
         excluded,
     );
@@ -1709,6 +1751,7 @@ pub(crate) fn decide_pair(
         return Err(failure);
     }
     Ok(PairProposal::Decided(PairDecision {
+        info,
         decision,
         lease,
         decode_tokens: decider.decode_prompt_tokens(inputs.tokens),
@@ -1759,6 +1802,17 @@ fn pair_shed(
     Box::new(PairFailure { role, verdict })
 }
 
+/// The request as a pair's decode policy reads it: the prefill side's
+/// reading under the decode role with the overload veto kept, the legacy
+/// pair's second reading.
+fn decode_reading<'a>(info: &SelectWorkerInfo<'a>) -> SelectWorkerInfo<'a> {
+    SelectWorkerInfo {
+        role: WorkerRole::Decode,
+        overload_lifted: false,
+        ..info.clone()
+    }
+}
+
 /// The decode rows a pair decision read for the committed pair: the slice of
 /// `decodes` that is the committed prefill's pair class, and the committed
 /// decode's position in it. The decision hands back the rows of every pair
@@ -1768,11 +1822,11 @@ fn pair_shed(
 /// `partners`, the committed prefill's list: the row before belongs while
 /// it is an earlier partner, the row after while it is a later one. A row
 /// of another class never matches, because the partners past either end of
-/// the class are closed and a closed decode has no row in any class. One
-/// pass over the list, nothing allocated; a committed decode the list does
-/// not hold is its own row alone. The reading does not hold under the
-/// lifted decode veto, where a list keeps its least-loaded partners alone:
-/// no decode row is written there.
+/// the class are closed and a closed decode has no row in any class. At
+/// most two passes over the list, nothing allocated; a committed decode the
+/// list does not hold is its own row alone. The reading does not hold under
+/// the lifted decode veto, where a list keeps its least-loaded partners
+/// alone: no decode row is written there.
 fn partner_rows<'d>(
     partners: &[Arc<dyn Worker>],
     decodes: &'d [Arc<dyn Worker>],
@@ -1810,15 +1864,17 @@ fn partner_rows<'d>(
 /// when every target misses, the missed ids go to
 /// `missed` for the one re-decision and the request waits for a slot. The
 /// room itself is claimed at dispatch (`pd_admission::admit_decode`), as
-/// under the legacy path. A traced pair leaves its rows here: the prefill's
-/// at the commit or the miss, the decode's over the committed prefill's
-/// partners in `pairs`, the index the decision read.
+/// under the legacy path. A `cache_aware` side records the committed route
+/// in its own policy, where its legacy selection records it; a pair that
+/// commits nothing records none. A traced pair leaves its rows here: the
+/// prefill's at the commit or the miss, the decode's over the committed
+/// prefill's partners in `pairs`, the index the decision read.
 pub(crate) fn commit_pair(
     policies: &PolicyRegistry,
     decider: &Decider,
     model_id: &str,
     pairs: &PdPairIndex,
-    proposal: PairProposal,
+    proposal: PairProposal<'_>,
     has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
     missed: &mut Vec<WorkerId>,
 ) -> Result<Pair, Box<PairFailure>> {
@@ -1842,8 +1898,10 @@ pub(crate) fn commit_pair(
             && open_under(prefill, pd.lift_prefill)
             && decode_of(target).is_some_and(|d| partner_live(d, pd.lift_decode, pd.pair_runtime))
     };
-    // The policy the trace rows and the selection metric name.
-    let prefill_policy = policies.get_prefill_policy().name();
+    // The prefill policy: the name on the trace rows and the selection
+    // metric, the index a cache-aware side records its route in.
+    let prefill_side = policies.get_prefill_policy();
+    let prefill_policy = prefill_side.name();
     let Some(target) = decider.commit_pair(&pd.lease, pd.decode_tokens, &pd.decision, accept)
     else {
         // Every target missed: the decision's row names no worker, and the
@@ -1860,13 +1918,15 @@ pub(crate) fn commit_pair(
             PlacementFailure::PrefillAtCapacity,
         ));
     };
-    cache_trace::selection(
-        prefill_policy,
-        "policy",
-        &pd.prefills,
-        Some(target.position as usize),
-    );
-    let prefill = Arc::clone(&pd.prefills[target.position as usize]);
+    let position = target.position as usize;
+    // Each side's route goes into its own policy's tree where the legacy
+    // pair records it (the event index is the engines'): after the commit,
+    // before the side's row.
+    if let Some(index) = as_cache_aware(prefill_side.as_ref()) {
+        index.record_route(&pd.prefills, position, &pd.info);
+    }
+    cache_trace::selection(prefill_policy, "policy", &pd.prefills, Some(position));
+    let prefill = Arc::clone(&pd.prefills[position]);
     let decode_row = target
         .pair
         .map(|pair| pair.decode_position as usize)
@@ -1894,7 +1954,11 @@ pub(crate) fn commit_pair(
     // A decode paired by load under the lift is the veto fallback's pick,
     // counted above, not a selection of the decode policy.
     if !pd.lift_decode {
-        let decode_policy = policies.get_decode_policy().name();
+        let decode_side = policies.get_decode_policy();
+        let decode_policy = decode_side.name();
+        if let Some(index) = as_cache_aware(decode_side.as_ref()) {
+            index.record_route(&pd.decodes, decode_row, &decode_reading(&pd.info));
+        }
         if cache_trace::enabled() {
             // The decode side's row, as the legacy pair leaves it: the
             // committed prefill's partners among the decode rows the
@@ -2052,7 +2116,7 @@ mod tests {
         observability::logging::test_support::test_subscriber,
         policies::{
             CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
-            PowerOfTwoPolicy, RoundRobinPolicy,
+            PolicyFactory, PowerOfTwoPolicy, RoundRobinPolicy,
         },
         worker::{
             load_state::{one_rank_load, TestFeed},
@@ -2792,6 +2856,35 @@ mod tests {
         assert_eq!(picked, ["grpc://d:1", "grpc://d:3"]);
     }
 
+    /// A class of more than two rows is read whole from either end: with
+    /// four open partners, and a closed one among them, the row lists every
+    /// open partner whether the pick is the first of them, the last or one
+    /// between. Round robin takes the four in turn.
+    #[tokio::test]
+    async fn a_decode_row_is_its_whole_class_from_either_end() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:3", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:4", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:5", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        registry
+            .get_by_url("grpc://d:3")
+            .expect("registered")
+            .set_status(WorkerStatus::NotReady);
+        let open = ["grpc://d:1", "grpc://d:2", "grpc://d:4", "grpc://d:5"];
+        let mut picked = Vec::new();
+        for (_, decode, listed, named) in decode_rows(&registry, 4).await {
+            assert_eq!(listed, open, "every open partner, the pick {decode}");
+            assert_eq!(named, serde_json::json!(decode), "the row names the pick");
+            picked.push(decode);
+        }
+        picked.sort_unstable();
+        assert_eq!(picked, open, "each of the four is the pick once");
+    }
+
     /// A committed decode its prefill's list does not hold is its own row
     /// alone, never the rows of every class. The index and the decision are
     /// one snapshot on the request path, so this is the reading of a list
@@ -2883,6 +2976,325 @@ mod tests {
             rows.is_empty(),
             "the prelude's verdict writes no row: {rows:?}"
         );
+    }
+
+    /// The pair path under the engine carries the request's affinity as the
+    /// single path does: with `cache_aware` on both roles the prefill that
+    /// holds a prompt's prefix keeps it, a load on the holder notwithstanding
+    /// (a pair request with no affinity facts moves to the idle prefill).
+    #[test]
+    fn a_cache_aware_pair_keeps_the_prefill_that_holds_the_prefix_under_the_engine() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(cache_aware_policy()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &cache_aware_policy(),
+            &cache_aware_policy(),
+        );
+        policies.set_prefill_policy(PolicyFactory::create_from_config(&cache_aware_policy()));
+        policies.set_decode_policy(PolicyFactory::create_from_config(&cache_aware_policy()));
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let text = "a prompt long enough to fill a few blocks of the tree on its first request";
+        let inputs = PlacementInputs {
+            text: Some(text),
+            ..Default::default()
+        };
+        let place = || {
+            place_pair_through_engine(
+                &registry,
+                &policies,
+                decider,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                &|_| true,
+                inputs,
+            )
+            .expect("the engine pairs")
+        };
+        let holder = place().prefill;
+        holder.increment_load();
+        for turn in 1..=4 {
+            assert_eq!(
+                place().prefill.url(),
+                holder.url(),
+                "turn {turn}: the prefix keeps its holder under the engine"
+            );
+        }
+    }
+
+    /// A policy registry that hosts the engine for a pair of `prefill` and
+    /// `decode`, each side's legacy policy built from its configuration as
+    /// the startup builds it.
+    fn engine_pair_of(prefill: &PolicyConfig, decode: &PolicyConfig) -> PolicyRegistry {
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_policy_engine(
+            PolicyEngineMode::Engine,
+            prefill,
+            decode,
+        );
+        policies.set_prefill_policy(PolicyFactory::create_from_config(prefill));
+        policies.set_decode_policy(PolicyFactory::create_from_config(decode));
+        policies
+    }
+
+    /// A prompt of a few blocks, sent as text.
+    const PROMPT: &str =
+        "a prompt long enough to fill a few blocks of the tree on its first request";
+
+    /// One pair placed for [`PROMPT`] as the routers place it: through the
+    /// engine the registry hands the pair, every prefill window open.
+    fn prompt_pair(registry: &WorkerRegistry, policies: &PolicyRegistry) -> Pair {
+        let inputs = PlacementInputs {
+            text: Some(PROMPT),
+            ..Default::default()
+        };
+        place_pair_through_engine(
+            registry,
+            policies,
+            pair_decider(policies, &inputs).expect("the engine serves the pair"),
+            MODEL,
+            &pairs_of(registry, policies),
+            None,
+            true,
+            &|_| true,
+            inputs,
+        )
+        .expect("the engine pairs")
+    }
+
+    /// The workers `policy`'s text tree routes the model's prompts to,
+    /// sorted: the routes a cache-aware policy has recorded.
+    fn routed(policy: &Arc<dyn LoadBalancingPolicy>) -> Vec<String> {
+        as_cache_aware(policy.as_ref())
+            .expect("a cache-aware policy")
+            .tree_tenants_for_test(MODEL)
+    }
+
+    /// The decode side reads its own policy's index the same way: the
+    /// decode that holds the prompt keeps it under a load, where a decode
+    /// side placed by load alone moves to the idle partner.
+    #[test]
+    fn a_cache_aware_pair_keeps_the_decode_that_holds_the_prefix_under_the_engine() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_pair_of(&cache_aware_policy(), &cache_aware_policy());
+        let holder = prompt_pair(&registry, &policies).decode;
+        holder.increment_load();
+        for turn in 1..=4 {
+            assert_eq!(
+                prompt_pair(&registry, &policies).decode.url(),
+                holder.url(),
+                "turn {turn}: the prefix keeps its decode holder under the engine"
+            );
+        }
+    }
+
+    /// A pair with one `cache_aware` side is the engine's too: that side
+    /// keeps its holder while the other side's policy places as it always
+    /// does (round robin takes its partners in turn).
+    #[test]
+    fn a_pair_with_one_cache_aware_side_keeps_that_sides_holder_under_the_engine() {
+        let two_a_side = || {
+            pd_registry(&[
+                ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+            ])
+        };
+        let round_robin = PolicyConfig::RoundRobin;
+
+        let registry = two_a_side();
+        let policies = engine_pair_of(&cache_aware_policy(), &round_robin);
+        let first = prompt_pair(&registry, &policies);
+        first.prefill.increment_load();
+        let later: Vec<Pair> = (0..4).map(|_| prompt_pair(&registry, &policies)).collect();
+        assert!(
+            later
+                .iter()
+                .all(|pair| pair.prefill.url() == first.prefill.url()),
+            "the cache-aware prefill side keeps its holder"
+        );
+        assert!(
+            later
+                .iter()
+                .any(|pair| pair.decode.url() != first.decode.url()),
+            "round robin still rotates the decode side"
+        );
+
+        let registry = two_a_side();
+        let policies = engine_pair_of(&round_robin, &cache_aware_policy());
+        let first = prompt_pair(&registry, &policies);
+        first.decode.increment_load();
+        let later: Vec<Pair> = (0..4).map(|_| prompt_pair(&registry, &policies)).collect();
+        assert!(
+            later
+                .iter()
+                .all(|pair| pair.decode.url() == first.decode.url()),
+            "the cache-aware decode side keeps its holder"
+        );
+        assert!(
+            later
+                .iter()
+                .any(|pair| pair.prefill.url() != first.prefill.url()),
+            "round robin still rotates the prefill side"
+        );
+    }
+
+    /// One pair request records its route on both sides, each in its own
+    /// policy, as the legacy pair's two selections record theirs: after the
+    /// first placement the prefill policy routes the prompt to the placed
+    /// prefill alone and the decode policy to the placed decode alone.
+    #[test]
+    fn one_cache_aware_pair_request_records_its_route_in_each_sides_policy() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_pair_of(&cache_aware_policy(), &cache_aware_policy());
+        assert!(routed(&policies.get_prefill_policy()).is_empty());
+        assert!(routed(&policies.get_decode_policy()).is_empty());
+        let pair = prompt_pair(&registry, &policies);
+        assert_eq!(
+            routed(&policies.get_prefill_policy()),
+            [pair.prefill.url()],
+            "the prefill policy holds the prefill's route"
+        );
+        assert_eq!(
+            routed(&policies.get_decode_policy()),
+            [pair.decode.url()],
+            "the decode policy holds the decode's route"
+        );
+    }
+
+    /// The route is recorded at the commit: a pair every target of which
+    /// the commit refuses records none on either side, and the request
+    /// waits for a slot.
+    #[test]
+    fn a_refused_cache_aware_pair_commit_records_no_route() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_pair_of(&cache_aware_policy(), &cache_aware_policy());
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let proposal = decide_pair(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &|_| true,
+            PlacementInputs {
+                text: Some(PROMPT),
+                ..Default::default()
+            },
+            &[],
+        )
+        .expect("a pair is open");
+        let refused = commit_pair(
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            proposal,
+            &|_| false,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("the window closed before the commit");
+        assert!(matches!(
+            refused.verdict,
+            PlacementFailure::PrefillAtCapacity
+        ));
+        assert!(routed(&policies.get_prefill_policy()).is_empty());
+        assert!(routed(&policies.get_decode_policy()).is_empty());
+    }
+
+    /// A decode pool paired by load under the lift is not the decode
+    /// policy's selection: the decode policy records no route for it, as
+    /// the legacy pair's fallback records none, and the prefill side still
+    /// records its own.
+    #[test]
+    fn a_decode_paired_by_load_under_the_lift_records_no_decode_route() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_pair_of(&cache_aware_policy(), &cache_aware_policy());
+        for url in ["grpc://d:1", "grpc://d:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let pair = prompt_pair(&registry, &policies);
+        assert_eq!(routed(&policies.get_prefill_policy()), [pair.prefill.url()]);
+        assert!(
+            routed(&policies.get_decode_policy()).is_empty(),
+            "a decode paired by load is no route of the decode policy"
+        );
+    }
+
+    /// Under the lift the decode side reads no affinity either: with the
+    /// prompt's route held by one of two equally loaded decodes, the pairs
+    /// still spread over both by load, as the legacy fallback spreads them.
+    #[test]
+    fn a_decode_paired_by_load_under_the_lift_reads_no_affinity() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_pair_of(&cache_aware_policy(), &cache_aware_policy());
+        let held = prompt_pair(&registry, &policies).decode;
+        assert_eq!(routed(&policies.get_decode_policy()), [held.url()]);
+        for url in ["grpc://d:1", "grpc://d:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let decodes: std::collections::BTreeSet<String> = (0..32)
+            .map(|_| prompt_pair(&registry, &policies).decode.url().to_string())
+            .collect();
+        assert_eq!(
+            decodes.len(),
+            2,
+            "by load alone, the holder and its partner both take pairs"
+        );
+    }
+
+    /// The decode policy reads the request the prefill policy read, under
+    /// the decode role and with the overload veto kept, as the legacy pair
+    /// hands it to the decode selection.
+    #[test]
+    fn the_decode_reading_is_the_prefill_reading_under_the_decode_role() {
+        let tokens = [1u32, 2, 3];
+        let prefill = SelectWorkerInfo {
+            request_text: Some(PROMPT),
+            tokens: Some(&tokens),
+            rid_key: Some("conversation-7"),
+            role: WorkerRole::Prefill,
+            overload_lifted: true,
+            ..SelectWorkerInfo::default()
+        };
+        let decode = decode_reading(&prefill);
+        assert_eq!(decode.role, WorkerRole::Decode);
+        assert!(!decode.overload_lifted);
+        assert_eq!(decode.request_text, prefill.request_text);
+        assert_eq!(decode.tokens, prefill.tokens);
+        assert_eq!(decode.rid_key, prefill.rid_key);
     }
 
     /// A window that closes between the prelude's read and the engine's:
@@ -3008,7 +3420,10 @@ mod tests {
 
     /// The engine's proposal of one pair, decided with an open window and
     /// nothing excluded, for a test that reads the decision itself.
-    fn proposed_pair(registry: &WorkerRegistry, policies: &PolicyRegistry) -> PairDecision {
+    fn proposed_pair(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+    ) -> PairDecision<'static> {
         let decider = pair_decider(policies, &PlacementInputs::default())
             .expect("the engine serves the pair");
         let pairs = pairs_of(registry, policies);
@@ -3032,7 +3447,7 @@ mod tests {
     }
 
     /// The decode of a proposal's first target.
-    fn proposed_decode(pd: &PairDecision) -> Arc<dyn Worker> {
+    fn proposed_decode(pd: &PairDecision<'_>) -> Arc<dyn Worker> {
         let target = pd
             .decision
             .pick()
@@ -5734,6 +6149,7 @@ mod tests {
             }
         }
     }
+
     /// Under the switch the hint keys nothing for a default the override
     /// places: with the override's configured list naming other headers, a
     /// round-robin request carrying the hint alone rotates under both switch
@@ -5764,6 +6180,7 @@ mod tests {
             assert_eq!(seen.len(), 3, "{mode:?}: the hint alone rotates: {seen:?}");
         }
     }
+
     /// Under the switch a key whose owner is not ready takes a failover and
     /// returns to its first owner once that worker is back under the manual
     /// policy, as under legacy; under the override it stays on the failover,

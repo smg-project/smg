@@ -3533,6 +3533,25 @@ impl AffinityRows {
         self.block_size = 0;
         self.namespace_seed = 0;
     }
+
+    /// Take the request's block facts of `other` (the hashes, their kind,
+    /// the block size, the namespace seed), the rows of both left where
+    /// they are: a pair decision reads one set of block facts, from the
+    /// buffer a single decision reads them from, whichever side filled
+    /// them. The hash buffers trade places, so nothing is copied.
+    pub(crate) fn take_block_facts(&mut self, other: &mut Self) {
+        let Self {
+            hashes,
+            hash_kind,
+            block_size,
+            namespace_seed,
+            rows: _,
+        } = other;
+        std::mem::swap(&mut self.hashes, hashes);
+        self.hash_kind = *hash_kind;
+        self.block_size = *block_size;
+        self.namespace_seed = *namespace_seed;
+    }
 }
 
 /// A count as the view's narrow field.
@@ -3561,6 +3580,43 @@ fn text_windows(text: &str, block_size: usize, out: &mut Vec<u64>) {
 
 // The index source of the policy engine's cache-aware decisions.
 impl CacheAwarePolicy {
+    /// Whether a pair decision can read one request's block facts (the
+    /// hashes, their kind and the block size of [`AffinityRows`]) once for
+    /// this policy and `other`: both count a request's blocks at one size,
+    /// over the same kind of index. Every field of the configuration is
+    /// classed here, and a new one does not compile until it is.
+    pub(crate) fn shares_block_facts(&self, other: &Self) -> bool {
+        let read_by_the_facts = |config: &CacheAwareConfig| {
+            let CacheAwareConfig {
+                // The size a request's blocks are counted and hashed at; an
+                // event index's learned size falls back to it.
+                block_size,
+                // The index the blocks are counted for: the hash kind keeps
+                // no tree for the fill to read.
+                cache_index,
+                // Read by a side's own rows, its profile or its trees'
+                // upkeep, never by the request's block facts.
+                cache_threshold: _,
+                balance_abs_threshold: _,
+                balance_rel_threshold: _,
+                balance_prefix_margin_tokens: _,
+                balance_uncached_credit: _,
+                eviction_interval_secs: _,
+                max_tree_size: _,
+                balance_token_usage_threshold: _,
+                overload_token_usage_threshold: _,
+                overlap_decay: _,
+                selection_temperature: _,
+                cache_ttl_secs: _,
+                cache_boundaries: _,
+                selection_policy: _,
+                selection_accounting_ttl_ms: _,
+            } = config;
+            (*block_size, *cache_index)
+        };
+        read_by_the_facts(&self.config) == read_by_the_facts(&other.config)
+    }
+
     /// Read the request's affinity over `workers` into `out`: the event
     /// index's overlap per holder (capped by the holder's cache groups) and
     /// the warm-up facts when the pool table has a warming worker; else the

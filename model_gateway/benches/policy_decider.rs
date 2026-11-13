@@ -650,6 +650,7 @@ fn engine_pair_decision(
         list: &list,
         open: &|_| true,
         lift_decode: false,
+        affinity: None,
     };
     let (decision, lease, decodes) =
         decider.decide_pair(&request, prefills, has_capacity, partners, excluded);
