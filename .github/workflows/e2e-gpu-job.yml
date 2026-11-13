@@ -397,6 +397,7 @@ jobs:
 
       # Run tests
       - name: Run E2E tests
+        id: e2e-tests
         timeout-minutes: ${{ inputs.test_timeout }}
         shell: bash
         env:
@@ -491,11 +492,12 @@ jobs:
             fi
             exit "$stderr_status"
           fi
-          pytest "${pytest_args[@]}"
+          mkdir -p e2e-logs
+          pytest "${pytest_args[@]}" --junitxml=e2e-logs/e2e-results.xml -o junit_logging=no
 
       - name: Identify row evidence
         id: evidence-identity
-        if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        if: always()
         env:
           EVIDENCE_INPUTS: ${{ toJSON(inputs) }}
         run: |
@@ -533,7 +535,18 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print(f"complete_artifact=sglang-complete-results-{contract}-{invocation}", file=output)
               print(f"worker_artifact=e2e-worker-logs-{contract}-{invocation}", file=output)
+              print(f"junit_artifact=e2e-junit-{os.environ['GITHUB_RUN_ID']}-{contract}-{invocation}", file=output)
           PYTHON
+
+
+      - name: Upload ordinary E2E JUnit report
+        if: always() && !inputs.final_environment_check && (steps.e2e-tests.outcome == 'success' || steps.e2e-tests.outcome == 'failure' || steps.e2e-tests.outcome == 'cancelled')
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.evidence-identity.outputs.junit_artifact }}
+          path: e2e-logs/e2e-results.xml
+          retention-days: 7
+          if-no-files-found: error
 
 
       - name: Check final AMD SGLang environment
