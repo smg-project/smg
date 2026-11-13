@@ -1076,16 +1076,19 @@ pub enum ResponseModality {
     Audio,
 }
 
-/// Whether a `response_format` is the legacy form, a raw JSON schema: an
-/// object whose `type` is none of the typed formats' (`text`, `image`,
-/// `audio`, `video`). A list holds typed formats.
+/// Whether a `response_format` is, or holds, the legacy form, a raw JSON
+/// schema: an object whose `type` is none of the typed formats' (`text`,
+/// `image`, `audio`, `video`), or absent. A list counts as legacy when one of
+/// its formats is.
 fn is_legacy_response_format(format: &Value) -> bool {
-    format.as_object().is_some_and(|object| {
-        !matches!(
+    match format {
+        Value::Object(object) => !matches!(
             object.get("type").and_then(Value::as_str),
             Some("text" | "image" | "audio" | "video")
-        )
-    })
+        ),
+        Value::Array(formats) => formats.iter().any(is_legacy_response_format),
+        _ => false,
+    }
 }
 
 fn is_option_blank(v: Option<&String>) -> bool {
@@ -1280,6 +1283,13 @@ mod tests {
         let schema = serde_json::json!({"type": "object", "properties": {}});
         let (code, _) = refusal(validate_interactions_request(&request(schema.clone())));
         assert_eq!(code, "response_mime_type_required");
+        for legacy in [
+            serde_json::json!([schema.clone()]),
+            serde_json::json!({"properties": {"city": {"type": "string"}}}),
+        ] {
+            let (code, _) = refusal(validate_interactions_request(&request(legacy)));
+            assert_eq!(code, "response_mime_type_required");
+        }
         let with_mime = InteractionsRequest {
             response_mime_type: Some("application/json".to_string()),
             ..request(schema)
