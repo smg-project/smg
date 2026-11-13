@@ -2038,8 +2038,8 @@ mod tests {
     }
 
     /// The message content of an input item's parts: no part is an empty
-    /// string, one text part is that text (moved, not copied), and several
-    /// parts stay a list in their order.
+    /// string, one text part is that text, one part of another kind stays a
+    /// one-part list, and several parts stay a list in their order.
     #[test]
     fn input_parts_become_text_or_an_ordered_list() {
         let text = |text: &str| ResponseContentPart::InputText {
@@ -2057,6 +2057,11 @@ mod tests {
         assert_eq!(
             response_parts_to_message_content(&[text("one")]).unwrap(),
             MessageContent::Text("one".to_string())
+        );
+        let lone_image = response_parts_to_message_content(std::slice::from_ref(&image)).unwrap();
+        assert!(
+            matches!(&lone_image, MessageContent::Parts(parts) if parts.len() == 1 && matches!(parts[0], ContentPart::ImageUrl { .. })),
+            "a lone part of another kind stays a one-part list, got {lone_image:?}"
         );
         let several =
             response_parts_to_message_content(&[text("first"), image, text("last")]).unwrap();
