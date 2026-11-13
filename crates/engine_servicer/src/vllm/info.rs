@@ -126,9 +126,9 @@ pub(super) async fn server_info(state: &State) -> vllm::GetServerInfoResponse {
 
 fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
     let ready = state.shared.ready();
-    // The ranks this servicer serves (the gateway expands the worker into
-    // that many under `--dp-aware`): the connected engines, as `GetLoads`
-    // counts them, not the handshake's figure.
+    // The ranks this servicer serves (the gateway registers one worker per
+    // rank): the connected engines, as `GetLoads` counts them, not the
+    // handshake's figure.
     let data_parallel_size =
         i32::try_from(state.shared.rank_count(state.model.data_parallel_size)).unwrap_or(i32::MAX);
     let model = &state.model;

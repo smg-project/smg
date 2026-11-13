@@ -260,11 +260,16 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             resolve_zmq_health_config(config.health.apply_to(&health_base), *connection_mode, &url);
         let health_endpoint = &app_context.router_config.health_check.endpoint;
 
-        let dp_ranks: Vec<Option<(usize, usize)>> = if app_context.router_config.dp_aware {
-            dp_rank_expansion(context.data.dp_info.as_ref(), *connection_mode, &config.url)?
-        } else {
-            vec![None] // single worker, no DP
-        };
+        // One worker per data-parallel rank the engine reported (discover_dp),
+        // else one worker. The routing policy's pick among the rank workers
+        // is the rank choice, so a rank scheduler has nothing left to choose.
+        let dp_ranks = dp_rank_expansion(context.data.dp_info.as_ref());
+        if let Some(warning) = rank_scheduler_scope_warning(
+            dp_ranks.len(),
+            app_context.router_config.dp_minimum_tokens_scheduler,
+        ) {
+            warn!("{warning} ({})", Endpoint::redacted_str(&config.url));
+        }
 
         // Under Symphony the failure classes of the table that reads the model
         // exist at zero from the registration of a worker the pipeline reads
@@ -1097,51 +1102,47 @@ fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u
         .then_some(size as u64)
 }
 
-/// Ranks to register for a dp-aware worker. A width above one expands into
-/// one dp-annotated worker per rank. A width-1 advertisement (older
-/// servicers emit it as a capability signal) and a missing one both
-/// register a plain worker: there is no placement to choose, and pinning
-/// rank 0 anyway still alters engine-side scheduling. discover_dp already
-/// logged the degradation for the missing-label case.
-fn dp_rank_expansion(
-    dp_info: Option<&DpInfo>,
-    connection_mode: ConnectionMode,
-    url: &str,
-) -> Result<Vec<Option<(usize, usize)>>, WorkflowError> {
+/// The workers to register for the rank count discover_dp left: one
+/// rank-annotated worker per rank when the width is above one, else one plain
+/// worker. A width-1 advertisement (older servicers emit it as a capability
+/// signal) and a missing one both register a plain worker: there is no
+/// placement to choose, and pinning rank 0 anyway still alters engine-side
+/// scheduling. A gRPC or HTTP engine's width reaches here (discover_dp
+/// leaves a ZMQ worker without one), so no expansion ever fights over a ZMQ
+/// worker's socket binds: ZMQ data parallelism is the grouped worker.
+fn dp_rank_expansion(dp_info: Option<&DpInfo>) -> Vec<Option<(usize, usize)>> {
     match dp_info {
-        Some(dp_info) if dp_info.dp_size > 1 => {
-            validate_zmq_dp(connection_mode, dp_info.dp_size, url)?;
-            Ok((0..dp_info.dp_size)
-                .map(|r| Some((r, dp_info.dp_size)))
-                .collect())
-        }
-        Some(_) | None => Ok(vec![None]),
+        Some(dp_info) if dp_info.dp_size > 1 => (0..dp_info.dp_size)
+            .map(|r| Some((r, dp_info.dp_size)))
+            .collect(),
+        Some(_) | None => vec![None],
     }
 }
 
-/// Reject a data-parallel worker the ZMQ path cannot serve.
-///
-/// dp-aware expansion creates one rank-pinned worker per DP rank, but each
-/// ZMQ worker owns its own socket bind — N expanded workers would fight over
-/// the same ipc paths. ZMQ DP runs as a *grouped* worker instead (`dp_size: N`
-/// on the worker spec: one worker, one socket set, N engines dialing in), so
-/// reject the expansion loudly and point at the grouped form. gRPC/HTTP
-/// expansion and single-engine ZMQ are fine.
-fn validate_zmq_dp(
-    connection_mode: ConnectionMode,
-    dp_size: usize,
-    url: &str,
-) -> Result<(), WorkflowError> {
-    if connection_mode == ConnectionMode::Zmq && dp_size > 1 {
-        return Err(WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message: format!(
-                "ZMQ worker {url} cannot be dp-aware expanded (dp_size={dp_size}); \
-                 configure a grouped ZMQ worker (`dp_size` on the worker spec) instead"
-            ),
-        });
-    }
-    Ok(())
+/// The warning for `--dp-minimum-tokens-scheduler` on an engine registered
+/// as `rank_workers` workers, `None` when the scheduler is off or the engine
+/// is one worker. The scheduler chooses a data-parallel rank for a request
+/// from the ranks' reported token loads where an engine is registered as one
+/// worker (the HTTP prefill-decode router's rank choice); an engine
+/// registered as one worker per rank has the routing policy's pick among
+/// those workers as its rank choice, and the scheduler, asked about a worker
+/// that is one rank, can only answer that rank: it chooses nothing. Advice at
+/// the registration, not a refusal: the engine serves as it would without
+/// the flag, whose cache of per-rank token loads is kept up for nothing. Pure
+/// over the two inputs so the rule is testable; the step logs it with the
+/// worker's address.
+fn rank_scheduler_scope_warning(
+    rank_workers: usize,
+    dp_minimum_tokens_scheduler: bool,
+) -> Option<String> {
+    (rank_workers > 1 && dp_minimum_tokens_scheduler).then(|| {
+        format!(
+            "dp_minimum_tokens_scheduler chooses nothing for this engine: its {rank_workers} \
+             data-parallel ranks are registered as workers and the routing policy's pick among \
+             them is the rank choice; the scheduler applies to the HTTP prefill-decode router \
+             for an engine registered as one worker"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1531,9 +1532,10 @@ mod tests {
         );
     }
 
-    /// A dp-aware registration of one model under the DP label, as a local
-    /// HTTP worker with a client, before the engine's report is set on it.
-    fn dp_aware_local_http_data() -> WorkerWorkflowData {
+    /// A registration of one model under the DP label, as a local HTTP
+    /// worker with a client, before the engine's report and the rank count
+    /// are set on it.
+    fn data_parallel_local_http_data() -> WorkerWorkflowData {
         use openai_protocol::worker::WorkerModels;
 
         use crate::workflow::steps::create_worker_workflow_data;
@@ -1543,7 +1545,6 @@ mod tests {
         spec.labels = HashMap::from([("enable_dp_attention".to_string(), "true".to_string())]);
         let router_config = crate::config::RouterConfig::builder()
             .worker_startup_timeout_secs(1)
-            .dp_aware(true)
             .build_unchecked();
 
         let mut data = create_worker_workflow_data(
@@ -1557,7 +1558,7 @@ mod tests {
         data
     }
 
-    /// On a dp-aware registration the engine's report is mapped to the rank's
+    /// On a data-parallel registration the engine's report is mapped to the rank's
     /// space before the config's keys leave it: a DP label the config also
     /// names still sizes the window share the record carries, so a later
     /// refresh reads that share, not the whole engine window, as the engine's.
@@ -1565,7 +1566,7 @@ mod tests {
     async fn a_dp_label_the_config_also_sets_still_sizes_the_recorded_window_share() {
         use wfaas::WorkflowInstanceId;
 
-        let mut data = dp_aware_local_http_data();
+        let mut data = data_parallel_local_http_data();
         data.discovered_labels = HashMap::from([
             ("enable_dp_attention".to_string(), "true".to_string()),
             ("max_running_requests".to_string(), "256".to_string()),
@@ -1601,7 +1602,7 @@ mod tests {
     async fn a_dp_flag_only_the_config_sets_sizes_the_recorded_window_share_too() {
         use wfaas::WorkflowInstanceId;
 
-        let mut data = dp_aware_local_http_data();
+        let mut data = data_parallel_local_http_data();
         data.discovered_labels =
             HashMap::from([("max_running_requests".to_string(), "256".to_string())]);
         data.dp_info = Some(DpInfo {
@@ -1935,6 +1936,9 @@ mod tests {
         );
     }
 
+    /// The discovered width alone decides the expansion: a width above one
+    /// is one rank worker per rank, a width of one and no width are one
+    /// plain worker.
     #[test]
     fn dp_expansion_pins_only_multi_rank_widths() {
         let multi = DpInfo {
@@ -1942,7 +1946,7 @@ mod tests {
             model_id: "m".to_string(),
         };
         assert_eq!(
-            dp_rank_expansion(Some(&multi), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
+            dp_rank_expansion(Some(&multi)),
             vec![Some((0, 3)), Some((1, 3)), Some((2, 3))]
         );
 
@@ -1952,14 +1956,8 @@ mod tests {
             dp_size: 1,
             model_id: "m".to_string(),
         };
-        assert_eq!(
-            dp_rank_expansion(Some(&single), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
-            vec![None]
-        );
-        assert_eq!(
-            dp_rank_expansion(None, ConnectionMode::Grpc, "grpc://w:1").unwrap(),
-            vec![None]
-        );
+        assert_eq!(dp_rank_expansion(Some(&single)), vec![None]);
+        assert_eq!(dp_rank_expansion(None), vec![None]);
     }
 
     #[test]
@@ -2306,31 +2304,25 @@ mod tests {
         }
     }
 
+    /// The minimum-tokens scheduler on an engine registered as rank workers
+    /// is a warning, not a refusal: the pure rule names the rank count and
+    /// the scheduler's scope, and says nothing for one worker or with the
+    /// scheduler off.
     #[test]
-    fn zmq_data_parallel_is_rejected_as_a_create_worker_failure() {
-        // dp_size > 1 over ZMQ is the only rejected combination, and it must
-        // surface as a create_worker StepFailed.
-        let err = validate_zmq_dp(ConnectionMode::Zmq, 2, "ipc:///tmp/smg-zmq/ts0.ipc")
-            .expect_err("dp_size > 1 over ZMQ must be rejected");
-        match err {
-            WorkflowError::StepFailed { step_id, message } => {
-                assert_eq!(step_id, StepId::new("create_worker"));
-                assert!(message.contains("dp_size=2"), "message was: {message}");
-            }
-            other => panic!("expected StepFailed, got {other:?}"),
+    fn the_minimum_tokens_scheduler_over_rank_workers_warns_without_a_refusal() {
+        let warning = rank_scheduler_scope_warning(4, true).expect("a warning");
+        assert!(
+            warning.contains("its 4 data-parallel ranks are registered as workers")
+                && warning.contains("HTTP prefill-decode router"),
+            "{warning}"
+        );
+        for (rank_workers, scheduler) in [(1, false), (4, false), (1, true)] {
+            assert_eq!(
+                rank_scheduler_scope_warning(rank_workers, scheduler),
+                None,
+                "{rank_workers} workers, scheduler {scheduler}"
+            );
         }
-    }
-
-    #[test]
-    fn single_engine_zmq_and_data_parallel_grpc_are_accepted() {
-        // Single-engine ZMQ is the supported ZMQ shape; gRPC/HTTP data
-        // parallelism is untouched by the ZMQ guard.
-        validate_zmq_dp(ConnectionMode::Zmq, 1, "ipc:///tmp/smg-zmq/ts0.ipc")
-            .expect("single-engine ZMQ must be accepted");
-        validate_zmq_dp(ConnectionMode::Grpc, 4, "grpc://worker:8080")
-            .expect("gRPC data parallelism must be accepted");
-        validate_zmq_dp(ConnectionMode::Http, 4, "http://worker:8080")
-            .expect("HTTP data parallelism must be accepted");
     }
 
     #[test]
@@ -2544,7 +2536,7 @@ mod rank_window_tests {
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
         routers::grpc::client::ServerInfo,
-        worker::{basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
+        worker::{basic::merge_labels, BasicWorkerBuilder, Worker},
         workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
     };
 
@@ -2572,9 +2564,8 @@ mod rank_window_tests {
                         ..Default::default()
                     }));
                 let engine = info.to_labels();
-                let dp = dp_info_from_labels(&engine).unwrap();
-                let ranks =
-                    dp_rank_expansion(Some(&dp), ConnectionMode::Grpc, "grpc://w:30000").unwrap();
+                let dp = dp_info_from_labels(&engine).unwrap().unwrap();
+                let ranks = dp_rank_expansion(Some(&dp));
                 assert_eq!(ranks.len(), size as usize);
                 for rank in ranks {
                     let worker = BasicWorkerBuilder::new("grpc://w:30000")

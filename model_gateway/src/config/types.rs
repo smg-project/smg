@@ -434,6 +434,10 @@ pub struct RouterConfig {
     /// `SMG_LOG_MM_TIMING`.
     #[serde(default)]
     pub log_mm_timing: bool,
+    /// Deprecated and ignored: data-parallel ranks are discovered at every
+    /// registration (one worker per rank of a gRPC or SGLang HTTP engine; a ZMQ
+    /// engine stays one grouped worker). Accepted for one release, removed in 1.17.
+    #[serde(default)]
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,

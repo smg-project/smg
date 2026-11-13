@@ -583,26 +583,33 @@ impl WorkerService {
         let worker_url = config.url.clone();
         let queue = self.get_job_queue()?;
 
-        // Reserve (or retrieve) a stable ID for the 202 response.
-        // If this URL already has an active worker, reject with 409. A worker
-        // its removal is draining holds the URL for the drain window; that
-        // answer says so and when to retry, instead of offering a PUT or a
-        // PATCH of a worker that is leaving.
-        let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
-        if let Some(existing) = self.worker_registry.get(&worker_id) {
-            return Err(if existing.status() == WorkerStatus::Draining {
-                WorkerServiceError::RemovalInProgress {
-                    url: worker_url,
-                    worker_id,
-                    drain_secs: existing.metadata().health_config.drain_settle_secs,
-                }
-            } else {
-                WorkerServiceError::Conflict {
-                    url: worker_url,
-                    worker_id,
-                }
-            });
-        }
+        // Reserve (or retrieve) a stable ID for the 202 response, under the
+        // URL's group lock with the check that nothing live answers to it:
+        // a plain worker, or a data-parallel group, whose rows hold their
+        // own IDs and whose reservation a second POST must not release (the
+        // first one's Location resolves through it). A row's removal holds
+        // the same lock from its departure to its group's retirement. A
+        // worker its removal is draining holds the URL for the drain window;
+        // that answer says so and when to retry, instead of offering a PUT
+        // or a PATCH of a worker that is leaving.
+        let worker_id = match self.worker_registry.reserve_for_create(&worker_url) {
+            Ok(worker_id) => worker_id,
+            Err(worker_id) => {
+                return Err(match self.worker_registry.get(&worker_id) {
+                    Some(existing) if existing.status() == WorkerStatus::Draining => {
+                        WorkerServiceError::RemovalInProgress {
+                            url: worker_url,
+                            worker_id,
+                            drain_secs: existing.metadata().health_config.drain_settle_secs,
+                        }
+                    }
+                    _ => WorkerServiceError::Conflict {
+                        url: worker_url,
+                        worker_id,
+                    },
+                });
+            }
+        };
 
         let job = Job::AddWorker {
             config: Box::new(config),
@@ -657,12 +664,20 @@ impl WorkerService {
     ) -> Result<UpdateWorkerResult, WorkerServiceError> {
         let worker_id = Self::parse_worker_id(worker_id_raw)?;
 
-        let existing =
-            self.worker_registry
-                .get(&worker_id)
-                .ok_or_else(|| WorkerServiceError::NotFound {
+        let Some(existing) = self.worker_registry.get(&worker_id) else {
+            // A data-parallel group's own id, the one its Location named and
+            // GET, PATCH and DELETE resolve to its rank rows, has no row of
+            // its own: its PUT is refused as a rank's is below, not told the
+            // group does not exist.
+            return Err(match self.worker_registry.get_url_by_id(&worker_id) {
+                Some(url) if !self.dp_group_for_url(&url).is_empty() => {
+                    Self::refuse_data_parallel_put(&url)
+                }
+                _ => WorkerServiceError::NotFound {
                     worker_id: worker_id_raw.to_string(),
-                })?;
+                },
+            });
+        };
         // Before the body is read: a discovered worker's own spec, sent back,
         // carries the reserved labels, and the useful answer is where to make
         // the change, not which labels to strip.
@@ -671,18 +686,15 @@ impl WorkerService {
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
-        // A data-parallel router expands one spec into one worker per rank,
-        // each registered under a rank-suffixed URL. Re-running registration
-        // for a single ID cannot express that, so refuse here instead of
-        // answering 202 and failing in the background.
-        if self.router_config.dp_aware {
-            return Err(WorkerServiceError::BadRequest {
-                message: format!(
-                    "Worker '{url}' belongs to a data-parallel group. \
-                    PUT is not supported for data-parallel workers. \
-                    Use DELETE + POST instead."
-                ),
-            });
+        // A data-parallel engine registers as one worker per rank, each under
+        // a rank-suffixed URL, so one rank's ID cannot stand for a new
+        // registration of its engine: a PUT of a rank worker is refused here
+        // rather than answered 202 and failed in the background. (A PUT of a
+        // plain worker whose engine now reports several ranks passes this
+        // check and is refused by the register step's batch rule, which takes
+        // exactly one worker for one ID.)
+        if existing.is_dp_aware() {
+            return Err(Self::refuse_data_parallel_put(&url));
         }
 
         // Validate that the URL in the request body matches the existing worker.
@@ -772,6 +784,33 @@ impl WorkerService {
         }
     }
 
+    /// The refusal of a PUT that names a data-parallel engine, by one rank's
+    /// id (`url` the rank's) or by the group's (`url` the engine's): its
+    /// registration is one worker per rank, which a replacement by one id
+    /// cannot express.
+    fn refuse_data_parallel_put(url: &str) -> WorkerServiceError {
+        WorkerServiceError::BadRequest {
+            message: format!(
+                "Worker '{url}' belongs to a data-parallel group. \
+                PUT is not supported for data-parallel workers. \
+                Use DELETE + POST instead."
+            ),
+        }
+    }
+
+    /// The rank rows a data-parallel engine registered under `url`, lowest
+    /// rank first; empty for a plain worker's URL and for an unknown one.
+    fn dp_group_for_url(&self, url: &str) -> Vec<Arc<dyn Worker>> {
+        let mut ranks: Vec<Arc<dyn Worker>> = self
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .filter(|worker| worker.is_dp_aware() && worker.registered_base_url() == url)
+            .collect();
+        ranks.sort_by_key(|worker| worker.dp_rank());
+        ranks
+    }
+
     pub fn get_worker(&self, worker_id_raw: &str) -> Result<GetWorkerResponse, WorkerServiceError> {
         let worker_id = Self::parse_worker_id(worker_id_raw)?;
         let job_queue = self.get_job_queue()?;
@@ -787,6 +826,19 @@ impl WorkerService {
         }
 
         if let Some(worker_url) = self.worker_registry.get_url_by_id(&worker_id) {
+            // A data-parallel engine registered under this URL holds one row
+            // per rank, each under its own ID; the ID the POST answered with
+            // resolves to the group's first rank, so its Location can be
+            // followed to a registered worker (and its group size).
+            let ranks = self.dp_group_for_url(&worker_url);
+            if let Some(first) = ranks.first() {
+                let mut worker_info = worker_to_info(first);
+                worker_info.id = worker_id.as_str().to_string();
+                if let Some(status) = job_queue.get_status(&worker_url) {
+                    worker_info.job_status = Some(status);
+                }
+                return Ok(GetWorkerResponse(worker_info));
+            }
             if let Some(status) = job_queue.get_status(&worker_url) {
                 return Ok(GetWorkerResponse(WorkerInfo::pending(
                     worker_id.as_str(),
@@ -843,7 +895,12 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
-        let worker = self.worker_registry.get_by_url(&url);
+        // A data-parallel engine's group answers to its bare URL: the first
+        // rank stands for the group's provider and labels.
+        let worker = self
+            .worker_registry
+            .get_by_url(&url)
+            .or_else(|| self.dp_group_for_url(&url).into_iter().next());
         // Only a PATCH of labels edits what a provider publishes. Decided
         // before the body is validated, as for a PUT, so reserved labels sent
         // to a discovered worker are told where to make the change.
@@ -857,6 +914,7 @@ impl WorkerService {
 
         let job = Job::UpdateWorker {
             url: url.clone(),
+            expected_id: worker_id.as_str().to_string(),
             update: Box::new(update),
         };
 
@@ -952,6 +1010,97 @@ mod tests {
 
     fn worker_spec(url: &str) -> WorkerSpec {
         serde_json::from_value(json!({ "url": url })).expect("worker spec")
+    }
+
+    /// A PUT of one rank worker of a data-parallel engine is refused up
+    /// front, whatever the configuration says: the engine's registration is
+    /// one worker per rank, which a replacement by one ID cannot express. A
+    /// plain worker's PUT passes the check and reaches the queue, under the
+    /// retired flag too.
+    #[tokio::test]
+    async fn put_of_a_rank_worker_is_refused_and_a_plain_workers_passes() {
+        for dp_aware in [false, true] {
+            let registry = Arc::new(WorkerRegistry::new());
+            let rank = BasicWorkerBuilder::new("grpc://10.0.0.12:8000")
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(1, 4)
+                .build();
+            let rank_url = rank.url().to_string();
+            registry.register(Arc::new(rank)).unwrap();
+            register_worker(&registry, "grpc://10.0.0.13:8000", Some("m"));
+            let rank_id = registry.reserve_id_for_url(&rank_url);
+            let plain_id = registry.reserve_id_for_url("grpc://10.0.0.13:8000");
+            let service = WorkerService::new(
+                Arc::clone(&registry),
+                Arc::new(std::sync::OnceLock::new()),
+                RouterConfig {
+                    dp_aware,
+                    ..RouterConfig::default()
+                },
+            );
+            let err = service
+                .replace_worker(rank_id.as_str(), worker_spec(&rank_url))
+                .await
+                .expect_err("a rank worker's PUT");
+            assert!(
+                matches!(&err, WorkerServiceError::BadRequest { message }
+                    if message.contains("data-parallel")),
+                "dp_aware {dp_aware}: {err}"
+            );
+            // Past the rank check: the queue is the next thing the plain
+            // worker's PUT meets, uninitialized in this harness.
+            assert!(
+                matches!(
+                    service
+                        .replace_worker(plain_id.as_str(), worker_spec("grpc://10.0.0.13:8000"))
+                        .await
+                        .expect_err("queue is uninitialized"),
+                    WorkerServiceError::QueueNotInitialized
+                ),
+                "dp_aware {dp_aware}"
+            );
+        }
+    }
+
+    /// A PUT that names a data-parallel group by the group's own id, the
+    /// one its Location named and GET, PATCH and DELETE resolve to the rank
+    /// rows, is refused as a PUT of one rank is, not answered 404. An id
+    /// reserved for a plain worker still registering is no group: its PUT
+    /// is answered 404 as before.
+    #[tokio::test]
+    async fn put_of_a_group_by_its_id_is_refused_like_a_ranks() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.14:8000";
+        let group_id = registry.reserve_id_for_url(url);
+        for rank in 0..2 {
+            let row = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(rank, 2)
+                .build();
+            registry.register(Arc::new(row)).unwrap();
+        }
+        let pending_url = "grpc://10.0.0.15:8000";
+        let pending_id = registry.reserve_id_for_url(pending_url);
+        let service = make_service(Arc::clone(&registry));
+
+        let err = service
+            .replace_worker(group_id.as_str(), worker_spec(url))
+            .await
+            .expect_err("a group's PUT");
+        assert!(
+            matches!(&err, WorkerServiceError::BadRequest { message }
+                if message.contains("data-parallel") && message.contains(url)),
+            "{err}"
+        );
+        assert!(matches!(
+            service
+                .replace_worker(pending_id.as_str(), worker_spec(pending_url))
+                .await
+                .expect_err("a pending worker's PUT"),
+            WorkerServiceError::NotFound { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1300,6 +1449,136 @@ mod tests {
                 .await
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// A PATCH by a data-parallel group's ID (the bare URL the POST answered
+    /// with) keeps the checks a plain worker's PATCH gets: no row sits under
+    /// the bare URL, so the group's first rank stands for its provider and
+    /// its labels.
+    #[tokio::test]
+    async fn update_worker_by_a_groups_id_keeps_the_provider_check() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let rank = BasicWorkerBuilder::new("http://10.0.0.14:8000")
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .dp_config(0, 2)
+            .labels(HashMap::from([(
+                DISCOVERY_PROVIDER_LABEL.to_string(),
+                "provider-a".to_string(),
+            )]))
+            .build();
+        registry.register(Arc::new(rank)).unwrap();
+        let group_id = registry.reserve_id_for_url("http://10.0.0.14:8000");
+        let service = make_service(Arc::clone(&registry));
+        let update: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k": "v"}})).expect("an update");
+        let err = service
+            .update_worker(group_id.as_str(), update)
+            .await
+            .expect_err("a provider-owned group");
+        assert!(
+            matches!(&err, WorkerServiceError::DiscoveryOwned { provider, .. } if provider == "provider-a"),
+            "{err}"
+        );
+    }
+
+    /// A deleted group's id is not the next registration's: the base
+    /// reservation behind the group id leaves with the last rank row, so a
+    /// POST of the same URL answers a new id, and the deleted Location does
+    /// not resolve to the replacement.
+    #[tokio::test]
+    async fn a_deleted_groups_id_is_not_reused_by_the_next_registration() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "http://10.0.0.15:8000";
+        let row = |rank: usize| {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .model(ModelCard::new("m"))
+                    .dp_config(rank, 2)
+                    .build(),
+            )
+        };
+        let group_id = registry.reserve_id_for_url(url);
+        let rows: Vec<WorkerId> = (0..2)
+            .map(|rank| registry.register(row(rank)).unwrap())
+            .collect();
+        assert!(service.get_worker(group_id.as_str()).is_ok());
+
+        // The DELETE of the group: every rank row leaves.
+        for id in &rows {
+            registry.remove(id);
+        }
+        // The POST of the same URL: a new group under a new id.
+        let next_id = registry.reserve_id_for_url(url);
+        assert_ne!(next_id, group_id, "the deleted group's id was reused");
+        registry.register(row(0)).unwrap();
+        assert!(matches!(
+            service.get_worker(group_id.as_str()),
+            Err(WorkerServiceError::NotFound { .. })
+        ));
+        assert!(service.get_worker(next_id.as_str()).is_ok());
+    }
+
+    /// A data-parallel engine posted with a trailing slash (a form the URL
+    /// check accepts and the join trims) keeps one key through its group's
+    /// life: the creation's reservation, the rows' registration, the GET by
+    /// the group's id, the refusal of a second creation and the id's
+    /// retirement with the last row all meet on the registered base, not on
+    /// the join form.
+    #[tokio::test]
+    async fn a_slashed_engine_url_keeps_one_group_key_through_its_life() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "http://10.0.0.16:8000/";
+        let row = |rank: usize| {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .model(ModelCard::new("m"))
+                    .dp_config(rank, 2)
+                    .build(),
+            )
+        };
+        let group_id = registry
+            .reserve_for_create(url)
+            .expect("nothing answers to the URL yet");
+        let rows: Vec<WorkerId> = (0..2)
+            .map(|rank| registry.register(row(rank)).unwrap())
+            .collect();
+        // The Location's id resolves to the group's first rank.
+        assert!(service.get_worker(group_id.as_str()).is_ok());
+        // A second creation of the URL is refused with the group's id.
+        assert_eq!(registry.reserve_for_create(url), Err(group_id.clone()));
+
+        // The DELETE of the group: the id retires with the last row, so the
+        // next creation of the URL gets a fresh one.
+        for id in &rows {
+            registry.remove(id);
+        }
+        let next_id = registry
+            .reserve_for_create(url)
+            .expect("the URL is free once the group left");
+        assert_ne!(next_id, group_id, "the retired group's id came back");
+        assert!(matches!(
+            service.get_worker(group_id.as_str()),
+            Err(WorkerServiceError::NotFound { .. })
         ));
     }
 

@@ -6020,9 +6020,9 @@ async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held()
 
 /// A data-parallel engine whose ranks were launched independently: each
 /// rank's handshake says a data-parallel size of one while the servicer
-/// serves two. `GetServerInfo` advertises the two (the gateway expands the
-/// worker into that many rank workers under `--dp-aware`) and the
-/// zero-filled `GetLoads` before the first snapshot names both ranks.
+/// serves two. `GetServerInfo` advertises the two (the gateway registers one
+/// worker per rank) and the zero-filled `GetLoads` before the first snapshot
+/// names both ranks.
 #[tokio::test]
 async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
     let mut model = model_info();

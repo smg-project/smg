@@ -65,8 +65,8 @@ struct WorkerResponse {
 
 /// Fan out requests to workers in parallel
 ///
-/// Requests are addressed to `worker.base_url()`, so under `--dp-aware`
-/// every rank of the same base worker targets the rank-free endpoint —
+/// Requests are addressed to `worker.base_url()`, so every rank worker of
+/// one data-parallel engine targets the rank-free endpoint —
 /// `worker.url()` carries an `@{dp_rank}` suffix that is SMG-internal and
 /// not a valid server address (#1993). Callers that want one request per
 /// base worker must dedupe by base URL first (see `get_engine_metrics`).
@@ -1002,9 +1002,10 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
     {
         return;
     }
+    // A rank row's url carries its `@{rank}`; the engine listens at the base.
     let read = tokio::time::timeout(
         timeout,
-        discover_grpc_kv_engine_id(worker.url(), spec.runtime_type.as_str()),
+        discover_grpc_kv_engine_id(worker.base_url(), spec.runtime_type.as_str()),
     )
     .await;
     // A read that did not complete leaves the id unconfirmed, so the next
@@ -1281,8 +1282,10 @@ impl WorkerManager {
             .collect()
     }
 
-    /// Fan an admin operation out to workers in parallel, collecting
-    /// successful worker URLs and per-worker failure messages.
+    /// Fan an admin operation out to workers in parallel, collecting the
+    /// engine addresses that succeeded and per-engine failure messages (a
+    /// data-parallel row stands for its engine and is named by the engine's
+    /// address, see [`Self::one_per_engine`]).
     ///
     /// The connection-mode dispatch (HTTP endpoint vs gRPC RPC) lives in
     /// the [`Worker`] admin methods, so the fan-out is uniform.
@@ -1297,7 +1300,7 @@ impl WorkerManager {
         let futures: Vec<_> = workers
             .into_iter()
             .map(|worker| {
-                let url = worker.url().to_string();
+                let url = worker.base_url().to_string();
                 let fut = op(worker);
                 async move { (url, fut.await) }
             })
@@ -1319,21 +1322,41 @@ impl WorkerManager {
         (successful, failed)
     }
 
-    /// Workers targeted by an admin op: all registered workers, or only
-    /// the worker(s) whose URL matches the filter.
+    /// Workers targeted by an admin op, one per engine: every engine, or
+    /// the one the filter names by its address or by one of its rank rows.
     fn admin_target_workers(
         worker_registry: &WorkerRegistry,
         url_filter: Option<&str>,
     ) -> Vec<Arc<dyn Worker>> {
         let workers = worker_registry.get_all();
-        match url_filter {
-            Some(url) => workers.into_iter().filter(|w| w.url() == url).collect(),
+        let matching = match url_filter {
+            Some(url) => workers
+                .into_iter()
+                // The filter in its join form, as the rows' base URL is, so a
+                // trailing slash matches either way.
+                .filter(|w| w.url() == url || w.base_url() == super::metadata::join_base(url))
+                .collect(),
             None => workers,
-        }
+        };
+        Self::one_per_engine(matching)
+    }
+
+    /// One worker per engine, in the order given. A data-parallel engine
+    /// registers one row per rank, all at the engine's address, and an admin
+    /// call reaches the engine (its HTTP route and its RPC connection take
+    /// the base URL), so one row stands for its group: a call made once per
+    /// rank reached the engine that many times, and an engine running one
+    /// profiler refuses every start after the first.
+    fn one_per_engine(workers: Vec<Arc<dyn Worker>>) -> Vec<Arc<dyn Worker>> {
+        let mut seen = HashSet::with_capacity(workers.len());
+        workers
+            .into_iter()
+            .filter(|worker| seen.insert(worker.base_url().to_string()))
+            .collect()
     }
 
     pub async fn flush_cache_all(worker_registry: &WorkerRegistry) -> FlushCacheResult {
-        let all_workers = worker_registry.get_all();
+        let all_workers = Self::one_per_engine(worker_registry.get_all());
         let total_workers = all_workers.len();
         let http_workers = all_workers
             .iter()
@@ -1561,8 +1584,8 @@ impl WorkerManager {
     /// with no HTTP worker gets the comment lines alone, a 200: the
     /// aggregate of zero HTTP workers, not a failed scrape.
     ///
-    /// An address is scraped once. Under `--dp-aware` all ranks share one
-    /// base URL (#1993). Registrations of one host and port under other
+    /// An address is scraped once. The rank workers of one data-parallel
+    /// engine share one base URL (#1993). Registrations of one host and port under other
     /// credentials share the masked address the label carries, and the
     /// aggregator refuses two series with one label set: they are tried in
     /// the order of their URLs, one per round, until one answers or a
@@ -1573,24 +1596,20 @@ impl WorkerManager {
     /// that answered, the one that closed the address, or an address none
     /// answered for.
     pub async fn get_engine_metrics(worker_registry: &WorkerRegistry) -> EngineMetricsResult {
-        let workers = worker_registry.get_all();
+        let workers = Self::one_per_engine(worker_registry.get_all());
 
         if workers.is_empty() {
             return EngineMetricsResult::Err("No available workers".to_string());
         }
 
-        // One scrape target per base URL (the DP ranks share one), grouped
-        // by the masked address the `worker_addr` label carries; a worker
-        // on another transport is named once per address.
-        let mut seen = HashSet::new();
+        // One scrape target per engine, grouped by the masked address the
+        // `worker_addr` label carries; a worker on another transport is
+        // named once per address.
         let mut named = HashSet::new();
         let mut not_scraped = String::new();
         let mut registrations: BTreeMap<String, Vec<Arc<dyn Worker>>> = BTreeMap::new();
         for worker in workers {
             let base_url = worker.base_url().to_string();
-            if !seen.insert(base_url.clone()) {
-                continue;
-            }
             let address = Endpoint::redacted_url(&base_url);
             if *worker.connection_mode() == ConnectionMode::Http {
                 registrations.entry(address).or_default().push(worker);

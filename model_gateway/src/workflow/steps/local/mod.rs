@@ -23,7 +23,7 @@ use std::{sync::Arc, time::Duration};
 pub use create_worker::CreateLocalWorkerStep;
 pub use detect_backend::DetectBackendStep;
 pub use detect_connection::DetectConnectionModeStep;
-pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
+pub use discover_dp::{DiscoverDPInfoStep, DpInfo};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use drain_workers::DrainWorkersStep;
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
@@ -261,6 +261,7 @@ pub fn create_worker_update_workflow_data(
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
+        expected_id: None,
         refresh_discovered_labels: false,
         fresh_engine_labels: None,
         snapshot: None,

@@ -9,16 +9,28 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use mock_worker::config::SchedulerWire;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tonic::transport::server::{Router, TcpIncoming};
 
 /// A mock engine serving `model_id` on a loopback port, as its URL and its
 /// server task.
+pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
+    mock_engine_reporting(model_id, SchedulerWire::TokenSpeed, &[]).await
+}
+
+/// `mock_engine` serving the scheduler proto of `wire` (the gateway reads it
+/// as the engine's runtime), its server info carrying `server_args` the way
+/// an engine's own arguments set it (a `kv_engine_id`, a `kv_connector`).
 #[expect(
     clippy::disallowed_methods,
     reason = "bounded test fixture; server task is explicitly aborted"
 )]
-pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
+pub(crate) async fn mock_engine_reporting(
+    model_id: &str,
+    wire: SchedulerWire,
+    server_args: &[(&str, &str)],
+) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock worker");
@@ -40,6 +52,11 @@ pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
         output_tokens: 0,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        grpc_wire: wire,
+        server_args: server_args
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
         ..mock_worker::config::Config::default()
     });
     // A port an earlier test's engine served on keeps that engine's

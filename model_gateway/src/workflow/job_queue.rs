@@ -44,6 +44,10 @@ pub enum Job {
     },
     UpdateWorker {
         url: String,
+        /// The id the request named, a worker's or a data-parallel group's,
+        /// resolved to `url` when the request was accepted; the update
+        /// applies while the id still resolves to it.
+        expected_id: String,
         update: Box<WorkerUpdateRequest>,
     },
     /// Re-read a registered worker's labels from its engine and rebuild the
@@ -758,17 +762,22 @@ impl JobQueue {
                     .wait_for_completion(instance_id, &config.url, timeout_duration)
                     .await
             }
-            Job::UpdateWorker { url, update } => {
+            Job::UpdateWorker {
+                url,
+                expected_id,
+                update,
+            } => {
                 let engines = context
                     .workflow_engines
                     .get()
                     .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let workflow_data = create_worker_update_workflow_data(
+                let mut workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
                     (**update).clone(),
                     Arc::clone(context),
                 );
+                workflow_data.expected_id = Some(expected_id.clone());
 
                 let instance_id = engines
                     .worker_update

@@ -92,17 +92,52 @@ async fn a_hanging_engine_id_read_expires_and_keeps_the_previous_id() {
     hold.abort();
 }
 
+/// A data-parallel rank row's re-read dials its engine's address: the row's
+/// own url is `{base}@{rank}`, which a dial reads as a userinfo delimiter, so
+/// a re-read of it never reaches the engine and the id of the dead process
+/// stays on every rank row (#2491).
+#[tokio::test]
+async fn a_rank_rows_engine_id_re_read_dials_the_engine() {
+    let (url, engine) = mock_engine_reporting(
+        "test-model",
+        SchedulerWire::Vllm,
+        &[("kv_engine_id", "eng-new")],
+    )
+    .await;
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url.replacen("http://", "grpc://", 1))
+            .worker_type(WorkerType::Prefill)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MooncakeConnector")
+            .kv_engine_id("eng-old")
+            .dp_config(0, 2)
+            .build(),
+    );
+    assert!(worker.url().ends_with("@0"), "{}", worker.url());
+
+    refresh_kv_engine_id_after_recovery(&worker, Duration::from_secs(5)).await;
+
+    assert_eq!(worker.kv_engine_id().as_deref(), Some("eng-new"));
+    assert!(worker.kv_engine_id_confirmed());
+    engine.abort();
+}
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use http::{header::AUTHORIZATION, HeaderMap};
+use mock_worker::config::SchedulerWire;
 use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerStatus},
 };
 
 use super::*;
-use crate::worker::{
-    circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
-    ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry, WorkerType,
+use crate::{
+    routers::grpc::test_engine::mock_engine_reporting,
+    worker::{
+        circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
+        ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry, WorkerType,
+    },
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -1911,9 +1946,9 @@ fn test_state_machine_success_resets_failure_counter() {
 
 #[tokio::test]
 async fn test_removal_candidate_strips_dp_rank_suffix() {
-    // Regression test: a DP-aware worker is registered under
+    // Regression test: a rank worker is registered under
     // "{base}@{rank}", but the removal workflow prefix-matches
-    // "{url}@" in dp_aware mode. Submitting the registered (suffixed)
+    // "{url}@" for a data-parallel group. Submitting the registered (suffixed)
     // URL made the prefix "{base}@{rank}@", which matched nothing, so
     // unhealthy DP workers were never removed.
     let registry = Arc::new(WorkerRegistry::new());
@@ -2472,4 +2507,134 @@ async fn test_profile_all_url_filter_without_match() {
     assert!(result.successful.is_empty());
     assert!(result.failed.is_empty());
     assert!(result.message.contains("No worker matching"));
+}
+
+/// Spawn a loopback HTTP server standing for one engine's admin endpoints:
+/// its profiler starts once and refuses a second start while it runs, as an
+/// engine does; the flush and the stop answer 200. The counter is the number
+/// of admin calls the engine received.
+async fn spawn_single_profiler_admin_stub() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = |status: StatusCode| {
+        let calls = Arc::clone(&calls);
+        move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                status
+            }
+        }
+    };
+    let start = {
+        let calls = Arc::clone(&calls);
+        let starts = Arc::new(AtomicUsize::new(0));
+        move || {
+            let calls = Arc::clone(&calls);
+            let starts = Arc::clone(&starts);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/flush_cache", axum::routing::post(counted(StatusCode::OK)))
+        .route("/start_profile", axum::routing::post(start))
+        .route(
+            "/stop_profile",
+            axum::routing::post(counted(StatusCode::OK)),
+        );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), calls)
+}
+
+/// The rank rows of one data-parallel engine at `url`, `ranks` of them.
+fn engine_rows(url: &str, ranks: usize) -> Vec<Arc<dyn Worker>> {
+    (0..ranks)
+        .map(|rank| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .health_config(HealthCheckConfig {
+                        success_threshold: 1,
+                        failure_threshold: 1,
+                        timeout_secs: 1,
+                        check_interval_secs: 1,
+                        disable_health_check: false,
+                        drain_settle_secs: 0,
+                    })
+                    .dp_config(rank, ranks)
+                    .build(),
+            )
+        })
+        .collect()
+}
+
+/// A data-parallel engine registers one row per rank, all at the engine's
+/// address, and runs one profiler: the fleet form of a profiling call and
+/// of a cache flush reach the engine once and count it once, where a call
+/// per rank reached it four times and met the profiler's refusal of every
+/// start after the first.
+#[tokio::test]
+async fn admin_calls_reach_a_data_parallel_engine_once() {
+    let (url, calls) = spawn_single_profiler_admin_stub().await;
+    let registry = WorkerRegistry::new();
+    for row in engine_rows(&url, 4) {
+        registry.register(row).unwrap();
+    }
+
+    let result =
+        WorkerManager::start_profile_all(&registry, &ProfileOptions::default(), None).await;
+    assert_eq!(result.successful, vec![url.clone()], "{}", result.message);
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(result.total_workers, 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one start reached the engine"
+    );
+
+    let result = WorkerManager::flush_cache_all(&registry).await;
+    assert_eq!(result.successful, vec![url.clone()], "{}", result.message);
+    assert_eq!((result.total_workers, result.http_workers), (1, 1));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one flush reached the engine"
+    );
+}
+
+/// The single-engine form names the engine by its address, the URL its
+/// operator registered, or by one of its rank rows; either reaches the
+/// engine once.
+#[tokio::test]
+async fn an_admin_call_filtered_by_an_engines_address_or_a_rank_reaches_it_once() {
+    let (url, calls) = spawn_single_profiler_admin_stub().await;
+    let registry = WorkerRegistry::new();
+    let rows = engine_rows(&url, 4);
+    let rank_url = rows[2].url().to_string();
+    assert_ne!(rank_url, url, "a rank row's URL carries its rank");
+    for row in rows {
+        registry.register(row).unwrap();
+    }
+
+    let result = WorkerManager::stop_profile_all(&registry, Some(url.as_str())).await;
+    assert_eq!(result.successful, vec![url.clone()], "{}", result.message);
+    assert_eq!(result.total_workers, 1);
+    let result = WorkerManager::stop_profile_all(&registry, Some(rank_url.as_str())).await;
+    assert_eq!(result.successful, vec![url.clone()], "{}", result.message);
+    assert_eq!(result.total_workers, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }

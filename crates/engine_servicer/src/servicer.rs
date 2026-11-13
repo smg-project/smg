@@ -199,7 +199,7 @@ impl Shared {
     /// else the launcher's figure before the engines are up, else one. Not
     /// the handshake's `data_parallel_size`: ranks launched independently
     /// each report a size of one, so a four-rank engine read as one rank and
-    /// the gateway's `--dp-aware` expanded nothing.
+    /// the gateway registered one worker for it.
     pub(crate) fn rank_count(&self, launcher: i32) -> usize {
         self.engine
             .client

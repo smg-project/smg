@@ -11,6 +11,7 @@ against each other, and build the real router, with no engine behind it.
 from __future__ import annotations
 
 import inspect
+import warnings
 from unittest.mock import patch
 
 import pytest
@@ -129,3 +130,30 @@ def test_shutdown_settle_reaches_native_constructor(settle):
         Router.from_args(args)
     assert constructor.call_args.kwargs["shutdown_settle_secs"] == settle
     assert isinstance(Router.from_args(args), Router)
+
+
+def test_dp_aware_is_accepted_with_a_deprecation_line_and_changes_nothing():
+    """The retired ``dp_aware`` keyword still parses, draws one deprecation line
+    that names the release it leaves in, and reaches the native constructor
+    beside otherwise identical keywords: the gateway discovers data-parallel
+    ranks at every registration whatever it says."""
+    kwargs = {}
+    for dp_aware in (False, True):
+        args = RouterArgs(worker_urls=["http://worker:8000"], dp_aware=dp_aware)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with patch("smg.router._Router") as constructor:
+                Router.from_args(args)
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        if dp_aware:
+            assert len(deprecations) == 1, [str(w.message) for w in caught]
+            message = str(deprecations[0].message)
+            assert "dp_aware is deprecated and ignored" in message
+            assert "removed in 1.17" in message
+        else:
+            assert deprecations == []
+        kwargs[dp_aware] = dict(constructor.call_args.kwargs)
+    assert kwargs[True].pop("dp_aware") is True
+    assert kwargs[False].pop("dp_aware") is False
+    assert kwargs[True] == kwargs[False]
+    assert isinstance(Router.from_args(RouterArgs(worker_urls=["http://worker:8000"])), Router)

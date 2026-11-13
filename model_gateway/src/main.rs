@@ -215,17 +215,19 @@ struct RoutingArgs {
     #[arg(long, help_heading = "Worker Configuration")]
     health_check_port: Option<u16>,
 
-    /// Desired number of prefill workers used as the stable readiness
-    /// percentage denominator. This does not enable a percentage gate by
-    /// itself; set `--prefill-min-ready-percent` to do that.
+    /// Desired number of prefill engines (a data-parallel engine counts once)
+    /// used as the stable readiness percentage denominator. This does not
+    /// enable a percentage gate by itself; set `--prefill-min-ready-percent`
+    /// to do that.
     #[arg(long = "prefill-expected-workers", help_heading = "Health Checks")]
     readiness_prefill_expected_workers: Option<usize>,
 
-    /// Absolute minimum number of healthy prefill workers required.
+    /// Absolute minimum number of healthy prefill engines required (a
+    /// data-parallel engine counts once, healthy when every rank is).
     #[arg(long = "prefill-min-ready-workers", help_heading = "Health Checks")]
     readiness_prefill_min_healthy_workers: Option<usize>,
 
-    /// Minimum healthy percentage of the expected prefill workers (1-100).
+    /// Minimum healthy percentage of the expected prefill engines (1-100).
     #[arg(
         long = "prefill-min-ready-percent",
         value_parser = clap::value_parser!(u8).range(1..=100),
@@ -233,14 +235,16 @@ struct RoutingArgs {
     )]
     readiness_prefill_min_healthy_percent: Option<u8>,
 
-    /// Absolute minimum number of healthy decode workers required (default 1).
+    /// Absolute minimum number of healthy decode engines required (default 1;
+    /// a data-parallel engine counts once, healthy when every rank is).
     #[arg(long = "decode-min-ready-workers", help_heading = "Health Checks")]
     readiness_decode_min_healthy_workers: Option<usize>,
-    /// Desired decode fleet size used as the fixed readiness percentage denominator.
+    /// Desired number of decode engines (a data-parallel engine counts once)
+    /// used as the fixed readiness percentage denominator.
     #[arg(long = "decode-expected-workers", help_heading = "Health Checks")]
     readiness_decode_expected_workers: Option<usize>,
 
-    /// Minimum healthy percentage of expected decode workers (1-100).
+    /// Minimum healthy percentage of the expected decode engines (1-100).
     #[arg(
         long = "decode-min-ready-percent",
         value_parser = clap::value_parser!(u8).range(1..=100),
@@ -574,7 +578,9 @@ struct RoutingArgs {
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 
-    /// Enable data parallelism aware scheduling
+    /// Deprecated and ignored: data-parallel ranks are discovered at every
+    /// registration (one worker per rank of a gRPC or SGLang HTTP engine; a ZMQ
+    /// engine stays one grouped worker). The flag is removed in release 1.17
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
@@ -631,9 +637,9 @@ struct RoutingArgs {
 
     /// Choose a data-parallel rank per request from the ranks' reported token
     /// loads: the HTTP prefill-decode router, for an engine registered as one
-    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
-    /// pick among them is the rank choice, so this flag chooses nothing there
-    /// (warned at start-up)
+    /// worker. A data-parallel engine's ranks are workers (gRPC and HTTP alike)
+    /// and the policy's pick among them is the rank choice, so this flag chooses
+    /// nothing there (warned at the engine's registration)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 

@@ -858,6 +858,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().base_url()
     }
 
+    /// The base URL as the engine registered it: the key a data-parallel
+    /// group's id and lock are taken under. [`Worker::base_url`] is its join
+    /// form.
+    fn registered_base_url(&self) -> &str {
+        self.metadata().registered_base_url()
+    }
+
     /// Compose an endpoint URL for a specific route.
     fn endpoint_url(&self, route: &str) -> String {
         self.metadata().endpoint_url(route)

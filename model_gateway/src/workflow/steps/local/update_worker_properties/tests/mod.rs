@@ -91,6 +91,7 @@ fn make_context(
         app_context: Some(app_context),
         workers_to_update: Some(vec![worker]),
         updated_workers: None,
+        expected_id: None,
         refresh_discovered_labels: false,
         fresh_engine_labels: None,
         snapshot: Some(snapshot),
@@ -151,6 +152,7 @@ fn make_refresh_context(
         app_context: Some(app_context),
         workers_to_update: Some(vec![worker]),
         updated_workers: None,
+        expected_id: None,
         refresh_discovered_labels: true,
         fresh_engine_labels: Some(fresh),
         snapshot: Some(snapshot),
@@ -1363,6 +1365,7 @@ async fn a_refused_rank_leaves_no_partial_update_behind() {
         app_context: Some(Arc::clone(&app_ctx)),
         workers_to_update: Some(vec![Arc::clone(&first), Arc::clone(&second)]),
         updated_workers: None,
+        expected_id: None,
         refresh_discovered_labels: false,
         fresh_engine_labels: None,
         snapshot: Some(snapshot_of(

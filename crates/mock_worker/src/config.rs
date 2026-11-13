@@ -27,6 +27,11 @@ pub struct Config {
     /// requests of its own otherwise, and reports one `GetLoads` entry and one
     /// KV-event stream per rank. 1 (the default) is a single-rank engine.
     pub grpc_dp_size: u16,
+    /// Data-parallel ranks an HTTP worker advertises in its `/server_info`
+    /// (`dp_size`): the gateway registers one row per rank and pins each
+    /// request's `data_parallel_rank`; the mock serves them as one engine and
+    /// ignores the pin. 1 (the default) is a single-rank engine.
+    pub http_dp_size: u16,
     /// The scheduler proto the gRPC workers serve (`--grpc-wire`). The
     /// gateway tells a worker's runtime by the proto whose health check it
     /// answers, so a worker serves exactly one.
@@ -351,6 +356,7 @@ impl Default for Config {
             grpc_base_port: 0,
             grpc_count: 0,
             grpc_dp_size: 1,
+            http_dp_size: 1,
             grpc_wire: SchedulerWire::TokenSpeed,
             zmq_handshake: None,
             zmq_count: 0,
@@ -415,6 +421,7 @@ impl Config {
                 "--grpc-base-port" => cfg.grpc_base_port = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-count" => cfg.grpc_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-dp-size" => cfg.grpc_dp_size = parse(value(&mut args, &flag)?, &flag)?,
+                "--http-dp-size" => cfg.http_dp_size = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-wire" => cfg.grpc_wire = value(&mut args, &flag)?.parse()?,
                 "--zmq-handshake" => cfg.zmq_handshake = Some(value(&mut args, &flag)?),
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
@@ -576,6 +583,9 @@ impl Config {
         }
         if cfg.grpc_dp_size == 0 {
             return Err("--grpc-dp-size must be at least 1".to_string());
+        }
+        if cfg.http_dp_size == 0 {
+            return Err("--http-dp-size must be at least 1".to_string());
         }
         if cfg.grpc_dp_size > 1 && !cfg.realistic {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
@@ -802,6 +812,8 @@ pub fn usage() -> String {
                                 rank, an unpinned one on the rank with the fewest of its own requests,\n\
                                 GetLoads and the KV-event stream report per rank; no\n\
                                 --kv-events-zmq-base-port publisher (it would carry rank 0 alone)\n\
+       --http-dp-size <n>       data-parallel ranks an HTTP worker advertises in /server_info (default 1):\n\
+                                the gateway registers one row per rank; the mock serves them as one engine\n\
        --grpc-wire <tokenspeed|vllm|sglang>  the scheduler proto the gRPC workers serve (default\n\
                                 tokenspeed): the same answers, engine, ranks and roles behind each;\n\
                                 the gateway detects the runtime from it (--capture: tokenspeed only)\n\

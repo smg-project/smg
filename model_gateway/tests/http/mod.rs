@@ -1,5 +1,6 @@
 //! HTTP application integration tests
 
+mod data_parallel_registration_test;
 mod decisions_http_test;
 mod embeddings_relay_test;
 mod inflight_tracker_test;
