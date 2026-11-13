@@ -246,6 +246,14 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
+        "nvidia-nemotronlabs-ai-for-media-sports-basketball/render/thinking-history-with-reasoning-content",
+        "both sides hand this template the assistant turn's text as a parts list; its \
+         reasoning-content branch joins the list to the thought with `~`, which Jinja2 \
+         writes as Python's repr and minijinja in its own spelling, the operator the \
+         gateway's Python spelling cannot hook (crates/tokenizer/src/chat_template.rs); \
+         the cases that print the list through `string` match",
+    ),
+    (
         "nvidia-nemotronlabs-ai-for-media-sports-tennis/render/*",
         "the gateway hands this template the text of an assistant or system turn as a \
          parts list, which the template prints as JSON where the reference run had the \

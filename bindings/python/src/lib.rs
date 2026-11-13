@@ -333,6 +333,9 @@ pub struct PyOracleConfig {
     pub pool_max: usize,
     #[pyo3(get, set)]
     pub pool_timeout_secs: u64,
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for PyOracleConfig {
@@ -346,6 +349,7 @@ impl std::fmt::Debug for PyOracleConfig {
             .field("pool_min", &self.pool_min)
             .field("pool_max", &self.pool_max)
             .field("pool_timeout_secs", &self.pool_timeout_secs)
+            .field("op_timeout_secs", &self.op_timeout_secs)
             .finish()
     }
 }
@@ -363,6 +367,7 @@ impl PyOracleConfig {
         pool_min = 1,
         pool_max = 16,
         pool_timeout_secs = 30,
+        op_timeout_secs = 5,
     ))]
     fn new(
         password: Option<String>,
@@ -373,6 +378,7 @@ impl PyOracleConfig {
         pool_min: usize,
         pool_max: usize,
         pool_timeout_secs: u64,
+        op_timeout_secs: u64,
     ) -> PyResult<Self> {
         if pool_min == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -394,6 +400,7 @@ impl PyOracleConfig {
             pool_min,
             pool_max,
             pool_timeout_secs,
+            op_timeout_secs,
         })
     }
 }
@@ -409,6 +416,7 @@ impl PyOracleConfig {
             pool_min: self.pool_min,
             pool_max: self.pool_max,
             pool_timeout_secs: self.pool_timeout_secs,
+            op_timeout_secs: self.op_timeout_secs,
             schema: None,
         }
     }

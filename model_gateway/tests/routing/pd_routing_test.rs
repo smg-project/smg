@@ -11,7 +11,10 @@ use axum::{
 };
 use openai_protocol::model_card::ModelCard;
 use serde_json::json;
-use smg::{config::RouterConfig, worker::BasicWorkerBuilder};
+use smg::{
+    config::{PolicyEngineMode, RouterConfig},
+    worker::BasicWorkerBuilder,
+};
 use tower::ServiceExt;
 
 use crate::common::{
@@ -155,6 +158,78 @@ mod pd_routing_tests {
         assert_eq!(
             success_count, 20,
             "All requests should succeed in PD mode with round robin"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Under `--policy-engine engine` the prefill-decode path places every
+    /// request through a pair decision of the engine, as it does under the
+    /// legacy default.
+    #[tokio::test]
+    async fn test_pd_mode_round_robin_through_the_engine() {
+        let mut config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![("http://127.0.0.1:19850".to_string(), None)],
+                vec![
+                    "http://127.0.0.1:19851".to_string(),
+                    "http://127.0.0.1:19852".to_string(),
+                ],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(3805)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        config.policy_engine = PolicyEngineMode::Engine;
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(19850),
+                TestWorkerConfig::decode(19851),
+                TestWorkerConfig::decode(19852),
+            ],
+        )
+        .await;
+
+        let app = ctx.create_app();
+        let mut success_count = 0;
+        for i in 0..20 {
+            let payload = json!({
+                "text": format!("PD round robin through the engine {}", i),
+                "stream": false
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            if resp.status() == StatusCode::OK {
+                success_count += 1;
+            }
+        }
+        assert_eq!(
+            success_count, 20,
+            "every request is placed through the engine"
+        );
+        let decider = ctx
+            .app_context
+            .policy_registry
+            .decider()
+            .expect("the engine is hosted under the switch");
+        assert_eq!(
+            decider.decisions(),
+            20,
+            "every request was a pair decision of the engine"
         );
 
         ctx.shutdown().await;
