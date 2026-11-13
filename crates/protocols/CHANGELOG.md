@@ -70,6 +70,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An Interactions request declaring a `computer_use`, `google_maps` or `retrieval` tool is
+  accepted, an `mcp_server` tool takes its `allowed_tools` as the list the public API declares, and
+  `google_search` keeps its `search_types`. The three tools were unknown variants and the list
+  failed to parse, each refusing the whole request, and `search_types` was dropped. Breaking:
+  `InteractionsTool` gains `ComputerUse`, `GoogleMaps` and `Retrieval`, `GoogleSearch` gains
+  `search_types`, and `McpServer.allowed_tools` is a `Vec<AllowedTools>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
