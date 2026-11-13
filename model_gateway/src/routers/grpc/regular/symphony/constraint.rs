@@ -35,13 +35,14 @@ use crate::{
     worker::{Worker, WorkerType},
 };
 
-/// The schema a JSON `response_format` asks the answer to follow: any object for `json_object`;
+/// The schema a JSON `response_format` asks the answer to follow, borrowed from the request (owned
+/// only for `json_object`'s synthesized object): any object for `json_object`;
 /// none for a structural tag, a grammar of the request's own that no table shapes
 /// (`Asks::own_structural_tag`).
-fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Value> {
+fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Cow<'_, Value>> {
     match response_format? {
-        ResponseFormat::JsonObject => Some(json!({"type": "object"})),
-        ResponseFormat::JsonSchema { json_schema } => Some(json_schema.schema.clone()),
+        ResponseFormat::JsonObject => Some(Cow::Owned(json!({"type": "object"}))),
+        ResponseFormat::JsonSchema { json_schema } => Some(Cow::Borrowed(&json_schema.schema)),
         ResponseFormat::Text | ResponseFormat::StructuralTag { .. } => None,
     }
 }
@@ -147,7 +148,7 @@ fn answer_tag(
     format: &Format,
     compiled: bool,
     model: &str,
-    schema: &Value,
+    schema: &Arc<Value>,
     reasoning_open: bool,
     start: GrammarStart,
     vocabulary: TagVocabulary,
@@ -294,11 +295,12 @@ impl<'a> Asks<'a> {
     }
 
     /// The JSON schema the request's answer must fit: a chat request's `response_format`'s, a
-    /// Messages request's `output_config.format`'s.
-    pub(super) fn answer_schema(self) -> Option<Value> {
+    /// Messages request's `output_config.format`'s, borrowed from the request; a caller that keeps it
+    /// takes the one copy ownership needs.
+    pub(super) fn answer_schema(self) -> Option<Cow<'a, Value>> {
         match self {
             Self::Chat(request) => answer_schema(request.response_format.as_ref()),
-            Self::Messages { request, .. } => request.output_schema().cloned(),
+            Self::Messages { request, .. } => request.output_schema().map(Cow::Borrowed),
         }
     }
 
@@ -310,11 +312,11 @@ impl<'a> Asks<'a> {
     /// constraint of its own (a legacy parser may give a forced call none and let the model
     /// write its native call). A chat request's reaches the engine through its request builder
     /// (`response_format_constraint`), so none is named here.
-    pub(crate) fn untabled_answer_schema(self, tools: &[Tool]) -> Option<Value> {
+    pub(crate) fn untabled_answer_schema(self, tools: &[Tool]) -> Option<Cow<'a, Value>> {
         match self {
             Self::Chat(_) => None,
             Self::Messages { .. } if self.forced_call(tools).is_some() => None,
-            Self::Messages { request, .. } => request.output_schema().cloned(),
+            Self::Messages { request, .. } => request.output_schema().map(Cow::Borrowed),
         }
     }
 
@@ -585,7 +587,7 @@ pub(crate) fn constraint_for(
             format,
             compiled,
             model: asks.model().to_string(),
-            schema,
+            schema: Arc::new(schema.into_owned()),
             reasoning_open,
             continues,
         })),
@@ -734,7 +736,8 @@ pub(crate) struct AnswerTag {
     /// cannot constrain ([`tagged`]).
     compiled: bool,
     model: String,
-    schema: Value,
+    /// The request's schema, the one copy, shared with every grammar the tag builds.
+    schema: Arc<Value>,
     /// The prompt leaves the model inside its thought.
     reasoning_open: bool,
     /// The prompt continues the assistant's message.
@@ -776,7 +779,7 @@ impl TagForStart for AnswerTag {
     }
 
     fn schema(&self) -> Option<&Value> {
-        Some(&self.schema)
+        Some(self.schema.as_ref())
     }
 }
 
@@ -1069,7 +1072,7 @@ pub(super) fn turn_of(
             callable: &callable,
             choice: output_choice(choice.as_deref()),
             parallel: asks.parallel(),
-            answer: asks.answer(schema.as_ref()),
+            answer: asks.answer(schema.as_deref()),
         },
         vocabulary,
     )
@@ -1134,6 +1137,7 @@ mod tests {
                 continues: false,
             }
             .untabled_answer_schema(&tools)
+            .map(Cow::into_owned)
         };
         assert_eq!(asks(&request(None)), Some(schema.clone()));
         assert_eq!(
@@ -1158,7 +1162,8 @@ mod tests {
                 request: &forced,
                 continues: false
             }
-            .untabled_answer_schema(&[]),
+            .untabled_answer_schema(&[])
+            .map(Cow::into_owned),
             Some(schema.clone()),
             "no callable tool: the choice forces nothing"
         );
