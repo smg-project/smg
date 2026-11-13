@@ -5589,4 +5589,27 @@ fn a_merged_with_next_stage_over_the_image_is_declined() {
         NativeEncoder::from_tokenizer(&before).is_ok(),
         "a merged-with-next stage before the map"
     );
+    // Within printable ASCII after the map the stage loads: no stage reads
+    // outside the image's alphabet, so the stages run over the raw text,
+    // where the merged pieces are the reference's.
+    let loads = tokenizer_of(
+        &shape_of(vec![
+            byte_level(false),
+            split("[!]+", SplitDelimiterBehavior::MergedWithNext, false),
+        ]),
+        &mut state,
+    );
+    let native = NativeEncoder::from_tokenizer(&loads)
+        .expect("a merged-with-next stage within printable ASCII after the map");
+    for text in ["a! b!!c", "!a!", "ab", "! !"] {
+        assert_eq!(
+            native.encode(Some(loads.get_model()), text, false),
+            Ok(loads
+                .encode(text, false)
+                .expect("encode")
+                .get_ids()
+                .to_vec()),
+            "{text:?} through the merged pieces over the raw text"
+        );
+    }
 }

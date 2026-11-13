@@ -1975,8 +1975,10 @@ impl NativeEncoder {
         }
         // A merged-with-next stage joins each match with the text after it
         // (see `Pieces::walk`); the walk over the image takes matches and
-        // gaps apart, so such a stage at or after the map is declined (no
-        // covered vocabulary has one there).
+        // gaps apart, so such a stage among those over the image is declined
+        // (no covered vocabulary has one there). One after the `ByteLevel`
+        // still loads when every stage after the map stays within printable
+        // ASCII: those stages run over the raw text, where `pieces` glues it.
         if let Some(from) = mapped_from {
             if stages[from..]
                 .iter()
@@ -2719,8 +2721,8 @@ impl NativeEncoder {
             f(raw);
             return;
         };
-        // `stages_from` declines a merged-with-next stage at or after the
-        // map, so the walk over the image takes the pieces apart.
+        // `stages_from` declines a merged-with-next stage among those over
+        // the image, so the walk over the image takes the pieces apart.
         let Walk::Apart { gaps, matches } = stage.pieces.walk() else {
             debug_assert!(false, "a merged-with-next stage over the byte-level image");
             f(raw);
