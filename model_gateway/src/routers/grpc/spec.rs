@@ -100,6 +100,12 @@ pub(crate) struct ChatResponseSpec {
     pub skip_special_tokens: bool,
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
+    /// The image tokens the gateway's multimodal expansion wrote into the
+    /// prompt, summed over the request's images, reported as
+    /// `prompt_tokens_details.image_tokens`; set by request building from the
+    /// multimodal intermediate. `None` for a request without an image the
+    /// gateway processed (no media, or media a worker processes itself).
+    pub image_tokens: Option<u32>,
     /// Whether the prompt ends inside the model's thinking block, decided by
     /// request building from the rendered prompt.
     pub reasoning_in_prefill: bool,
@@ -166,6 +172,7 @@ impl ChatResponseSpec {
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
             unbilled_prompt_tokens: 0,
+            image_tokens: None,
             reasoning_in_prefill: false,
             symphony: None,
             parser_names: None,

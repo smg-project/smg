@@ -49,7 +49,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, PolicyRegistry, WorkerRole},
+    policies::{CacheNamespace, Decider, PolicyRegistry, WorkerRole},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -375,7 +375,7 @@ impl PDRouter {
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{}/{endpoint}", worker.url());
+        let url = format!("{}/{endpoint}", worker.base_url());
         let mut request_builder = worker.http_client().get(&url);
 
         // A public route outside the auth middleware: the caller's headers go
@@ -586,10 +586,10 @@ impl PDRouter {
         body.insert(Self::BOOTSTRAP_ROOM_KEY, fields.room);
     }
 
-    fn inject_dp_rank(
-        body: &mut RawBody<'_>,
+    fn inject_dp_rank<'a>(
+        body: &mut RawBody<'a>,
         rank: isize,
-        rank_key: &str,
+        rank_key: &'a str,
     ) -> serde_json::Result<()> {
         body.insert(rank_key, to_raw_value(&rank)?);
         Ok(())
@@ -2168,18 +2168,26 @@ impl PDRouter {
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
-    /// the selection runs at the head of the admission queue.
+    /// the selection runs at the head of the admission queue, under the lock
+    /// on both paths: the legacy policies, or the engine's decision and
+    /// commit ([`Self::place_pd_pair_through_engine`]).
     async fn select_pd_pair_with_admission(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
+        let decider = placement::pair_decider(&self.policy_registry, &inputs);
         let ((prefill, decode), prefill_guard) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &PdPair| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, capacity),
+            |capacity| match decider {
+                Some(decider) => {
+                    self.place_pd_pair_through_engine(decider, model_id, inputs, capacity)
+                }
+                None => self.select_pd_pair(model_id, inputs, capacity),
+            },
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
@@ -2190,26 +2198,50 @@ impl PDRouter {
         Ok(((prefill, decode), guards))
     }
 
-    fn select_pd_pair(
+    /// [`Self::select_pd_pair`] through the policy engine under
+    /// `--policy-engine engine`, inside the admission callback as the legacy
+    /// selection runs: the pair decided over the window as the lock reads it
+    /// and committed under the same hold, by the request the queue lets
+    /// select; a commit every target of which missed re-decides once with
+    /// the misses excluded, then the request waits for a slot.
+    fn place_pd_pair_through_engine(
         &self,
+        decider: &Decider,
         model_id: &str,
         inputs: PlacementInputs<'_>,
-        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        capacity: Option<&PrefillSelectionContext<'_>>,
     ) -> Result<PdPair, Box<PairFailure>> {
-        debug!("Selecting PD pair: model_id={:?}", model_id);
+        let pairs = self.pd_pairs(model_id);
+        let has_capacity = |worker: &Arc<dyn Worker>| {
+            capacity.is_none_or(|capacity| capacity.has_capacity(worker))
+        };
+        placement::place_pair_through_engine(
+            &self.worker_registry,
+            &self.policy_registry,
+            decider,
+            model_id,
+            &pairs,
+            None,
+            false,
+            &has_capacity,
+            inputs,
+        )
+        .map(|pair| (pair.prefill, pair.decode))
+    }
 
-        // Shared HTTP-transport projections: this router proxies plain HTTP
-        // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. Both pools derive from ONE snapshot's pair index:
-        // separate lookups could straddle a concurrent membership change and
-        // pair workers that never coexisted.
+    /// The pair index `model_id` routes within. Shared HTTP-transport
+    /// projections: this router proxies plain HTTP to the selected worker's
+    /// URL, so a gRPC or ZMQ worker must never be selectable. Both pools
+    /// derive from ONE snapshot's pair index: separate lookups could straddle
+    /// a concurrent membership change and pair workers that never coexisted.
+    fn pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
         let mode = self.policy_registry.pd_pairing_mode();
         let by_model = self
             .worker_registry
             .model_routing_snapshot(model_id)
             .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
-        let pairs = match by_model {
+        match by_model {
             // A named model routes within its own entry. The wildcard's
             // literal "unknown" entry wins while it can pair at all; when it
             // cannot (a pool empty, or no compatible pair) both pools widen
@@ -2222,8 +2254,17 @@ impl PDRouter {
                 .get_routing_snapshot(UNKNOWN_MODEL_ID)
                 .pd_pairs(PdWire::Http, mode),
             _ => Arc::new(PdPairIndex::empty()),
-        };
+        }
+    }
 
+    fn select_pd_pair(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<PdPair, Box<PairFailure>> {
+        debug!("Selecting PD pair: model_id={:?}", model_id);
+        let pairs = self.pd_pairs(model_id);
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
@@ -2305,28 +2346,7 @@ impl PDRouter {
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
-        // With the prefill's log-probabilities to merge, each decode chunk is
-        // split into its frames (a frame cut across chunks waits for its
-        // delimiter) and every data frame is re-encoded with them merged in;
-        // without them, each chunk is read for the `[DONE]` sentinel alone,
-        // anchored at a line start when the previous chunk ended with an end
-        // of line. Either reading ends the relay at the sentinel.
-        let hook: Box<dyn ChunkHook> = match prefill_logprobs.filter(|_| return_logprob) {
-            Some(prefill_logprobs) => Box::new(LogprobMerge::new(prefill_logprobs)),
-            None => {
-                let mut at_line_start = true;
-                Box::new(move |chunk: Bytes| {
-                    let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-                    if let Some(&last) = chunk.last() {
-                        at_line_start = last == b'\n' || last == b'\r';
-                    }
-                    ChunkStep {
-                        bytes: chunk,
-                        last: is_done,
-                    }
-                })
-            }
-        };
+        let hook = Self::decode_chunk_hook(prefill_logprobs, return_logprob);
         relay_streaming_body(
             stream,
             Relay {
@@ -2613,6 +2633,38 @@ impl PDRouter {
     }
 }
 
+impl PDRouter {
+    /// The decode side's reading of its stream. With the prefill's
+    /// log-probabilities to merge, each decode chunk is split into its frames
+    /// (a frame cut across chunks waits for its delimiter) and every data
+    /// frame is re-encoded with them merged in; without them, or when the
+    /// request did not ask for log-probabilities, each chunk is read for the
+    /// `[DONE]` sentinel alone, anchored at a line start when the previous
+    /// chunk ended with an end of line. Either reading ends the relay at the
+    /// sentinel.
+    fn decode_chunk_hook(
+        prefill_logprobs: Option<Value>,
+        return_logprob: bool,
+    ) -> Box<dyn ChunkHook> {
+        match prefill_logprobs.filter(|_| return_logprob) {
+            Some(prefill_logprobs) => Box::new(LogprobMerge::new(prefill_logprobs)),
+            None => {
+                let mut at_line_start = true;
+                Box::new(move |chunk: Bytes| {
+                    let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
+                    if let Some(&last) = chunk.last() {
+                        at_line_start = last == b'\n' || last == b'\r';
+                    }
+                    ChunkStep {
+                        bytes: chunk,
+                        last: is_done,
+                    }
+                })
+            }
+        }
+    }
+}
+
 /// The decode side's reading of its stream when the request asked for
 /// log-probabilities: each chunk split into frames, every data frame
 /// re-encoded with the prefill's log-probabilities merged in, a frame cut
@@ -2738,12 +2790,12 @@ impl RouterTrait for PDRouter {
                 },
             };
 
-        let prefill_url = format!("{}/health_generate", prefill.url());
+        let prefill_url = prefill.endpoint_url("/health_generate");
         let (prefill_result, decode_result) = tokio::join!(
             prefill.http_client().get(&prefill_url).send(),
             decode
                 .http_client()
-                .get(format!("{}/health_generate", decode.url()))
+                .get(decode.endpoint_url("/health_generate"))
                 .send()
         );
 
@@ -2875,30 +2927,36 @@ impl RouterTrait for PDRouter {
         // The request is never borrowed here: a borrowed local keeps its slot
         // in the task across the awaits that follow, a second copy of the
         // request per count. It is moved out for its routing text, moved back,
-        // and serialized once a worker is selected and admitted.
-        let (request_text, body) =
-            Self::count_tokens_routing_text(body, self.policies_need_request_text());
-        let Some(worker) = placement::select_single(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            RoutingPool::HttpPrefill,
-            None,
-            PlacementInputs {
-                text: request_text.as_deref(),
-                tokens: None,
-                headers,
-                rid_key: None,
-                cache_namespace: None,
-                candidate_filter: None,
-                tried: &[],
-                sequence: None,
-            },
-        ) else {
-            return error::service_unavailable(
-                "no_prefill_servers",
-                "No available prefill servers to count tokens",
-            );
+        // and serialized once a worker is selected and admitted. The routing
+        // text, when a policy reads any, is owned by the selection's block and
+        // dropped at its end, before the first await: neither its slot nor
+        // its buffer rides in the task across the round trip.
+        let (worker, body) = {
+            let (request_text, body) =
+                Self::count_tokens_routing_text(body, self.policies_need_request_text());
+            let Some(worker) = placement::select_single(
+                &self.worker_registry,
+                &self.policy_registry,
+                model_id,
+                RoutingPool::HttpPrefill,
+                None,
+                PlacementInputs {
+                    text: request_text.as_deref(),
+                    tokens: None,
+                    headers,
+                    rid_key: None,
+                    cache_namespace: None,
+                    candidate_filter: None,
+                    tried: &[],
+                    sequence: None,
+                },
+            ) else {
+                return error::service_unavailable(
+                    "no_prefill_servers",
+                    "No available prefill servers to count tokens",
+                );
+            };
+            (worker, body)
         };
 
         if let Some(response) = overload::shed_if_worker_overloaded(
@@ -3073,6 +3131,7 @@ mod tests {
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
         crate::server::http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -3530,6 +3589,101 @@ mod tests {
         assert!(merge.finish().is_empty(), "the tail leaves once");
     }
 
+    /// The prefill's log-probabilities stay out of a stream the request did
+    /// not ask them for: the sentinel reading relays each chunk byte for byte
+    /// and ends at `[DONE]`; asked for, the same frame comes back merged.
+    #[test]
+    fn a_request_without_logprobs_keeps_the_sentinel_reading() {
+        let prefill = json!([[-0.1, 1, null]]);
+        let frame = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n",
+        );
+        let mut plain = PDRouter::decode_chunk_hook(Some(prefill.clone()), false);
+        let step = plain.step(frame.clone());
+        assert_eq!(step.bytes, frame, "relayed as it came");
+        assert!(!step.last);
+        assert!(plain.step(Bytes::from_static(b"data: [DONE]\n\n")).last);
+        let mut merging = PDRouter::decode_chunk_hook(Some(prefill), true);
+        let step = merging.step(frame);
+        let body = std::str::from_utf8(&step.bytes).unwrap();
+        let merged: Value =
+            serde_json::from_str(body.trim_end().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            merged["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
+    }
+
+    /// A frame delimiter cut across two chunks (`\n\n` and `\r\r` after
+    /// their first byte, `\r\n\r\n` after any of its first three bytes): the
+    /// look-back over the held bytes finds it on the second chunk and the
+    /// frame is merged whole. The cut after the third byte needs all three
+    /// held bytes, so a shorter look-back is red here.
+    #[test]
+    fn a_delimiter_cut_across_chunks_completes_its_frame_on_the_second() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}";
+        for (delimiter, cut) in [
+            ("\n\n", 1),
+            ("\r\r", 1),
+            ("\r\n\r\n", 1),
+            ("\r\n\r\n", 2),
+            ("\r\n\r\n", 3),
+        ] {
+            let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+            let (head, tail) = delimiter.split_at(cut);
+            let first = merge.step(Bytes::from(format!("{body}{head}")));
+            assert!(
+                first.bytes.is_empty() && !first.last,
+                "{delimiter:?}: {:?}",
+                first.bytes
+            );
+            let second = merge.step(Bytes::from(tail.to_owned()));
+            assert!(!second.last, "{delimiter:?}");
+            let out = std::str::from_utf8(&second.bytes).unwrap();
+            let (event, rest) = out.split_once("\n\n").expect("one frame");
+            let merged: Value =
+                serde_json::from_str(event.strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(
+                merged["meta_info"]["input_token_logprobs"],
+                json!([[-0.1, 1, null], [-0.5, 2, null]]),
+                "{delimiter:?}: {out}"
+            );
+            assert!(rest.is_empty(), "{delimiter:?}: {out}");
+            assert!(merge.finish().is_empty(), "{delimiter:?}: nothing held");
+        }
+    }
+
+    /// A partial past the re-chunker's bound is no longer waited for: the
+    /// held bytes leave as they came on the chunk that crosses the bound,
+    /// and the frame's rest follows unmerged.
+    #[test]
+    fn a_partial_past_the_bound_passes_as_it_came() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let head = Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}",
+            "x".repeat(MAX_FRAME_BYTES / 2)
+        ));
+        let first = merge.step(head.clone());
+        assert!(
+            first.bytes.is_empty() && !first.last,
+            "held under the bound"
+        );
+        let more = Bytes::from("y".repeat(MAX_FRAME_BYTES / 2 + 1));
+        let second = merge.step(more.clone());
+        assert!(!second.last);
+        assert_eq!(second.bytes.len(), head.len() + more.len());
+        assert_eq!(&second.bytes[..head.len()], &head[..]);
+        assert_eq!(&second.bytes[head.len()..], &more[..]);
+        let rest = Bytes::from_static(b"\"}}]}\n\n");
+        assert_eq!(
+            merge.step(rest.clone()).bytes,
+            rest,
+            "the rest passes unmerged"
+        );
+        assert!(merge.finish().is_empty(), "nothing held past the bound");
+    }
+
     #[test]
     fn test_merge_streaming_logprobs_sentinel_exact_match() {
         let mut encoder = SseEncoder::new();
@@ -3861,13 +4015,16 @@ mod tests {
     /// A Prefill admission refusal (the queue full, or a queued request that
     /// waited out its admission timeout) is this process's own backpressure:
     /// the retry layer does not replay it on another pair, where a plain
-    /// retryable answer, such as a worker's 503, is replayed.
+    /// retryable answer is replayed, a worker's 503 and its own 429 under
+    /// another code alike: the error code decides, not the status.
     #[test]
     fn a_prefill_admission_refusal_is_not_retried() {
         assert!(!PDRouter::should_retry_pd_response(&prefill_queue_full()));
         assert!(!PDRouter::should_retry_pd_response(&prefill_queue_timeout()));
         let worker_refusal = error::service_unavailable("worker_unavailable", "a worker is down");
         assert!(PDRouter::should_retry_pd_response(&worker_refusal));
+        let worker_busy = error::too_many_requests("worker_busy", "a worker is saturated");
+        assert!(PDRouter::should_retry_pd_response(&worker_busy));
     }
 
     /// A side that does not answer within the request's timeout ends the
@@ -6391,6 +6548,61 @@ mod tests {
                 .register_or_replace(Arc::from(create_test_worker(url, role, true)));
         }
         router
+    }
+
+    /// Under `--policy-engine engine` the pair is decided and committed
+    /// through the engine under the admission lock: the admitted
+    /// request holds its prefill seat, nobody is queued, and the next
+    /// request is decided and admitted once the seat is released.
+    #[tokio::test]
+    async fn the_engine_decides_the_pair_at_the_admission_head() {
+        use std::time::Duration;
+
+        use crate::config::PolicyEngineMode;
+
+        let round_robin = PolicyConfig::RoundRobin;
+        let router = PDRouter {
+            policy_registry: Arc::new(PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+                PolicyEngineMode::Engine,
+                &round_robin,
+                &round_robin,
+            )),
+            prefill_admission: Some(Arc::new(PrefillAdmission::new(
+                1,
+                1,
+                Duration::from_secs(5),
+            ))),
+            ..create_test_pd_router()
+        };
+        for (url, role) in [
+            ("http://prefill-1:8000", WorkerType::Prefill),
+            ("http://decode-1:8000", WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url.to_string(), role, true)));
+        }
+        let decider = router.policy_registry.decider().expect("hosted");
+        let ((prefill, decode), guards) = router
+            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
+            .await
+            .expect("a pair is admitted");
+        assert_eq!(prefill.url(), "http://prefill-1:8000");
+        assert_eq!(decode.url(), "http://decode-1:8000");
+        assert_eq!(decider.decisions(), 1, "the engine decided the pair");
+        assert_eq!(prefill.load(), 1, "the admitted request holds its seat");
+        assert_eq!(
+            router.prefill_admission.as_ref().unwrap().queued_requests(),
+            0
+        );
+        drop(guards);
+        assert_eq!(prefill.load(), 0, "the seat is released with the guards");
+        let ((_, _), guards) = router
+            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
+            .await
+            .expect("the next request is admitted");
+        assert_eq!(decider.decisions(), 2);
+        drop(guards);
     }
 
     /// The prefill side's answer frees its seat before the decode side's

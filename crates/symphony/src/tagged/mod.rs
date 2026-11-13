@@ -25,10 +25,16 @@ mod object;
 pub(crate) mod value;
 pub(crate) mod xml;
 
+use std::borrow::Cow;
+
 pub(crate) use assembler::Assembler;
 pub use assembler::{Placement, Spelling};
 
-use crate::event::{DropReason, Event, Events, MalformedReason, Text};
+use crate::{
+    event::{DropReason, Event, Events, MalformedReason, Text},
+    markers::{Piece, Scanner},
+    Declared,
+};
 
 /// The one event of a call, or a string value in it, that the stream's stop closed: the model's
 /// own end of output found the call open (the closing marker never came) or a streamed string
@@ -59,6 +65,54 @@ pub(super) fn take_owned<'d>(
         out.push(event.into_owned());
     }
     *scratch = events.recycle();
+}
+
+/// What the three tagged assemblers share above their syntaxes: the scanner's pieces of a delta
+/// taken one by one, a borrowed piece straight to the syntax, a copied one (the join's part after a
+/// hold, nobody's delta) through [`take_owned`] with the assembler's scratch swapped out around the
+/// syntax's borrow of it. The two call assemblers take the provided `feed` as well; the block
+/// assembler keeps its own, which answers with the byte count and is never done before its close.
+pub(super) trait TaggedAssembler {
+    /// Whether the assembler read its call's end: a done one takes nothing more.
+    fn done(&self) -> bool;
+    /// The scanner of the syntax's markers.
+    fn scanner(&mut self) -> &mut Scanner;
+    /// The events buffer a copied piece's events are built in ([`take_owned`]).
+    fn scratch(&mut self) -> &mut Events<'static>;
+    /// Text between markers, the syntax's to read.
+    fn text<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>);
+    /// A marker, by its position in the syntax's list.
+    fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events);
+
+    /// Append the next bytes of the call and push the events they complete. Every byte is the
+    /// call's until the engine says otherwise, so this takes them all.
+    fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
+        if self.done() {
+            return;
+        }
+        let scanned = self.scanner().feed(bytes);
+        for piece in scanned.pieces_of_delta() {
+            self.take(piece, declared, out);
+        }
+        self.scanner().reclaim(scanned);
+    }
+
+    /// One piece of the delta to the syntax: borrowed text as it is, a copy through
+    /// [`take_owned`] so that its events go out owned, a marker by its tag.
+    fn take<'d>(&mut self, piece: Piece<'d>, declared: &Declared, out: &mut Events<'d>) {
+        match piece {
+            Piece::Text(Cow::Borrowed(text)) => self.text(text, declared, out),
+            // The join's part after a hold is a copy, nobody's delta: its events go out owned.
+            Piece::Text(Cow::Owned(text)) => {
+                let mut scratch = std::mem::take(self.scratch());
+                take_owned(&text, &mut scratch, out, |text, out| {
+                    self.text(text, declared, out);
+                });
+                *self.scratch() = scratch;
+            }
+            Piece::Marker(tag) => self.tag(tag, declared, out),
+        }
+    }
 }
 
 /// The one event of a string value that one of a call's two own ends closed: the stream's stop

@@ -86,10 +86,13 @@ pub(super) struct CharSymbols {
 impl CharSymbols {
     /// The tables of `model`'s vocabulary (a BPE with byte fallback), or why
     /// the vocabulary declines: `ignore_merges` (it looks the whole text up,
-    /// which pieces cannot), a byte token missing or merges the table cannot
-    /// stand in for (the table's own declines, with the `<0xHH>` spelling of
-    /// the byte tokens), a token that spells a byte token inside it (a merge
-    /// could then cross a cut).
+    /// which pieces cannot), merges the table cannot stand in for (the
+    /// table's own declines, with the `<0xHH>` spelling of the byte tokens),
+    /// a byte token missing for a byte the fallback could reach (one beyond
+    /// ASCII, which may lie inside any character that is no token, or an
+    /// ASCII one whose character is no token; an ASCII character that is a
+    /// token never falls back, so its byte's token is not needed), a token
+    /// that spells a byte token inside it (a merge could then cross a cut).
     ///
     /// `read` is what the file's one-pass read saw of the model: the merge
     /// table takes the merges from it, and the entries are read by id when
@@ -119,6 +122,17 @@ impl CharSymbols {
         };
         for (id, token) in entries_of(bpe, read) {
             symbols.read_token(token.as_ref(), id)?;
+        }
+        // A byte without a token: the fallback spells the bytes of a
+        // character that is no token, so an ASCII byte whose character is
+        // one is never reached (a character beyond ASCII holds no ASCII
+        // byte); any other missing byte could be, and declines.
+        for byte in 0..=255u8 {
+            if symbols.merges.lacks_a_token_for_byte(byte)
+                && !(byte.is_ascii() && symbols.ascii[usize::from(byte)] != NO_ID)
+            {
+                return Err(Declined::from(format!("byte {byte:#04x} has no token")));
+            }
         }
         symbols.bridge_raw_text();
         Ok(symbols)
@@ -194,6 +208,12 @@ impl CharSymbols {
     /// Merges the table holds.
     pub(super) fn merges(&self) -> usize {
         self.merges.merges()
+    }
+
+    /// Bytes the vocabulary has no token for (none the fallback reaches,
+    /// see [`Self::from_model`]), for the load log.
+    pub(super) fn bytes_without_a_token(&self) -> usize {
+        self.merges.missing_bytes()
     }
 
     /// Whether the word marker goes before a text: one that starts a text
@@ -285,6 +305,13 @@ impl CharSymbols {
             }
             let mut utf8 = [0u8; 4];
             for &byte in c.encode_utf8(&mut utf8).as_bytes() {
+                // The construction declines a missing byte the fallback
+                // could reach (see `from_model`): one spelled here has a
+                // token.
+                debug_assert!(
+                    !self.merges.lacks_a_token_for_byte(byte),
+                    "a byte without a token reached the fallback: {byte:#04x} in {c:?}"
+                );
                 symbols.push(self.merges.byte_id(byte));
             }
         }

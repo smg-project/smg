@@ -144,7 +144,7 @@ pub(crate) unsafe fn start_chat_stream(
     let prompt_tokens = token_ids.len() as u32;
 
     let tool_constraint = match tool_constraint_for(&request) {
-        Ok(constraint) => constraint.map(|c| c.to_tuple()),
+        Ok(constraint) => constraint,
         Err(e) => {
             set_error_message(
                 error_out,
@@ -169,8 +169,17 @@ pub(crate) unsafe fn start_chat_stream(
         continued_final_message,
         tokenizer.as_ref(),
     );
-    let proto_request = match client.build_generate_request_from_chat(
+    // The readers replay the rendered prompt, as the gateway's readers do:
+    // the converter keeps the part they replay, taken before the request
+    // takes the text.
+    let mut converter = GrpcResponseConverterHandle::for_chat(
+        Arc::clone(tokenizer),
+        &request,
         request_id.clone(),
+        &text,
+    );
+    let proto_request = match client.build_generate_request_from_chat(
+        request_id,
         &request,
         text,
         token_ids,
@@ -196,8 +205,6 @@ pub(crate) unsafe fn start_chat_stream(
         }
     };
 
-    let mut converter =
-        GrpcResponseConverterHandle::for_chat(Arc::clone(tokenizer), &request, request_id);
     converter.initial_prompt_tokens = Some(prompt_tokens);
     converter.system_fingerprint = Some(weight_version.to_owned());
     Ok(SglangStreamHandle {

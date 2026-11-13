@@ -39,7 +39,7 @@ interface types {
   /// The transport outcome of a dispatch, beside its status.
   enum transport-class { ok, client-error, server-error, connect-failed, timeout, cancelled }
   /// Why a lease was released before its completion.
-  enum release-reason { abandoned, late-decision, client-gone, commit-failed }
+  enum release-reason { abandoned, late-decision, client-gone, commit-failed, expired, worker-removed }
 
   /// A tenant or a session key under the plugin's exposure: `hash` unless the
   /// spec says `plain`, `none` when withheld.
@@ -66,7 +66,8 @@ interface types {
   /// into the spec's declared lists (0 is unzoned, unspecified or none;
   /// `zone-capacity.zone` is never 0); `labels` are bits over the declared
   /// label list (at most 64; validation refuses a longer list). `load` is
-  /// absent when the host has no report.
+  /// absent when the host has no report; `admitted-age-ms` saturates at the
+  /// u32 maximum, never wraps.
   record candidate {
     id: u64,
     role: role,
@@ -94,6 +95,7 @@ interface types {
     host-local: bool,
     active-sessions: u16,
     key: u32,
+    indexed-blocks: u32,
   }
 
   /// Media on the request: counts and bytes.
@@ -121,6 +123,7 @@ interface types {
     headers: list<tuple<u8, string>>,
     media: media,
     seed: u64,
+    block-size: u32,
   }
 
   /// Healthy capacity of one zone, by the zone's position.
@@ -166,7 +169,8 @@ interface types {
   /// the decision on its clock: a load credit dates from the dispatch.
   record dispatched { lease: lease, target: target, side: side, since-decision-micros: u32 }
 
-  /// What a completed dispatch reported.
+  /// What a completed dispatch reported; `duration-micros` saturates at the
+  /// u32 maximum, never wraps.
   record completed {
     lease: lease,
     side: side,
@@ -257,7 +261,7 @@ interface plugin {
 /// The packed form: the same view written once into guest memory as
 /// little-endian rows the module keeps between the stage calls.
 ///
-/// Candidate row, 96 bytes, offsets in bytes:
+/// Candidate row, 104 bytes, offsets in bytes:
 ///   0 id u64; 8 in-flight u32; 12 running u32; 16 queued u32;
 ///   20 waiting-uncached-tokens u32; 24 overlap-blocks u32;
 ///   28 predicted-blocks u32; 32 resident-tokens u32; 36 pair-class u32;
@@ -270,8 +274,9 @@ interface plugin {
 ///   (0 none, 1 events, 2 scrape, 3 relay, 4 poll); 80 bits u8 (bit 0
 ///   session-hit, 1 has-capacity, 2 has-room, 3 ec-compatible, 4 vision,
 ///   5 host-local, 6 load-present); 81 zero; 82 active-sessions u16;
-///   84 key u32; 88 labels u64.
-/// Request block: a 72-byte header, then the variable sections in the order
+///   84 key u32; 88 labels u64; 96 indexed-blocks u32; 100 zero (the next
+///   row's u64 at 104).
+/// Request block: an 80-byte header, then the variable sections in the order
 /// below (the header carries their counts, not offsets: a reader walks the
 /// sections in order), offsets relative to the block's start:
 ///   0 namespace-seed u64; 8 seed u64; 16 tenant u64; 24 session-key u64
@@ -286,11 +291,12 @@ interface plugin {
 ///   3 encode); 57 hash-kind u8 (0 token, 1 text); 58 attempt u8;
 ///   59 bits u8 (bit 0 streaming, 1 tenant-plain-present,
 ///   2 session-plain-present); 60 media-images u16; 62 media-audio u16;
-///   64 media-video u16; 66 zero; 68 media-bytes u32;
+///   64 media-video u16; 66 zero; 68 media-bytes u32; 72 block-size u32;
+///   76 zero;
 ///   then: model bytes (UTF-8), zero bytes to the next multiple of 8 from
 ///   the block's start, block hashes u64 x hash-count, tried u64 x
 ///   tried-count (both 8-byte aligned for any name length: a 12-byte name
-///   puts the hashes at 88), headers as (u8 name, zero-based, u16 len, bytes) x
+///   puts the hashes at 96), headers as (u8 name, zero-based, u16 len, bytes) x
 ///   header-count, the plain tenant and session key as (u16 len, bytes)
 ///   when present. The host passes the block's total length; a module reads
 ///   nothing past it. The three counts are bounded by the engine's caps, far
@@ -322,7 +328,7 @@ interface plugin-packed {
 
   resource decision {
     /// `request` is one request block; `candidates` is `count` rows of
-    /// 96 bytes; `pool` is one pool block.
+    /// 104 bytes; `pool` is one pool block.
     constructor(request: list<u8>, candidates: list<u8>, count: u32, pool: list<u8>);
     filter: func() -> result<list<u32>, decline>;
     score: func() -> result<list<f32>, decline>;
