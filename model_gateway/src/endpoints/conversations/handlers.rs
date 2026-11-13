@@ -243,8 +243,9 @@ pub async fn create_conversation(
                 }
             }
             Err(response) => {
-                // Only a store fault reaches here: every refusal was found
-                // before the conversation was created.
+                // A store fault, or a referenced item the writes evicted,
+                // reaches here: every other refusal was found before the
+                // conversation was created.
                 if let Err(e) = storage.delete_conversation(&conversation.id).await {
                     warn!(
                         conversation_id = %conversation.id.0,
@@ -602,7 +603,12 @@ async fn refuse_an_item_the_conversation_has(
 /// The prepared items of one request written and linked into `conversation_id`
 /// in the order given: each item as the public API lists it, and the warnings
 /// of the item types accepted but not implemented. Every refusal was found by
-/// `prepare_items`; what ends the batch here is a store fault.
+/// `prepare_items`; what ends the batch here is a store fault, or a referenced
+/// item the batch's own writes evicted (a bounded store drops its oldest
+/// records on a write): every reference is read again after the writes and
+/// before the link, so nothing of such a batch is linked. Its new records stay
+/// in the store unlinked (the store's delete unlinks only; a retry under the
+/// same id adopts them).
 async fn store_items(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
@@ -613,6 +619,7 @@ async fn store_items(
     let mut warnings = Vec::new();
     let mut link_pairs = Vec::new();
     let mut seen_ids = HashSet::new();
+    let mut referenced: Vec<ConversationItemId> = Vec::new();
     // One stamp per item, each later than the one before: the stores order a conversation's
     // items by `added_at`, so the items of this call list in the order the request gave them.
     let mut stamps = AddedAtSequence::new();
@@ -621,6 +628,7 @@ async fn store_items(
         let added_at = stamps.next_added_at();
         let (item_json, item_id, warning) = match prepared {
             PreparedItem::Existing(item) => {
+                referenced.push(item.id.clone());
                 let id = item.id.clone();
                 (item_to_json(item), id, None)
             }
@@ -643,6 +651,22 @@ async fn store_items(
         item_ids.push(item_id);
         if let Some(w) = warning {
             warnings.push(w);
+        }
+    }
+
+    // The references were resolved before the writes; a bounded store may have
+    // dropped one of them to make room for this batch's new items. Nothing is
+    // linked then: the answer is the one a missing reference gets.
+    for item_id in &referenced {
+        match item_storage.get_item(item_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(not_found(format!(
+                    "Referenced item '{}' not found",
+                    item_id.0
+                )))
+            }
+            Err(e) => return Err(store_error("Failed to re-check referenced item", &e)),
         }
     }
 
@@ -875,7 +899,9 @@ pub fn conversation_to_json(conversation: &Conversation) -> Value {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
-    use smg_data_connector::{MemoryConversationItemStorage, MemoryConversationStorage};
+    use smg_data_connector::{
+        MemoryConfig, MemoryConversationItemStorage, MemoryConversationStorage,
+    };
 
     use super::*;
     use crate::middleware::test_support::json_of;
@@ -1451,6 +1477,213 @@ mod tests {
             assert_eq!(error["type"], route_error::error_type_for_status(status));
             assert!(error["message"].is_string());
             assert!(error["param"].is_null());
+        }
+    }
+
+    /// A reference to an item the same batch adds, and a new id given twice in
+    /// one batch, store the item once and list it once on both routes: the
+    /// batch's own ids are known before any write, so no store is asked for an
+    /// item that is not written yet; an accepted-but-unimplemented type warns
+    /// once.
+    #[tokio::test]
+    async fn a_reference_to_an_item_of_the_same_batch_and_a_repeated_id_store_the_item_once() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let empty =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let conversation = empty["id"].as_str().unwrap().to_string();
+        let message =
+            |id: &str| json!({"id": id, "type": "message", "role": "user", "content": "x"});
+        let ids_of = |listed: &Value| -> Vec<String> {
+            listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // The create route: a reference to the item the batch itself adds.
+        let before = items.stored_record_count().unwrap();
+        let created = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"items": [message("msg_a"), {"type": "item_reference", "id": "msg_a"}]}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = json_of(created).await;
+        assert!(created.get("warnings").is_none(), "{created}");
+        let with_items = created["id"].as_str().unwrap().to_string();
+        assert_eq!(items.stored_record_count(), Some(before + 1));
+        let listed = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &with_items,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(ids_of(&listed), vec!["msg_a"], "{listed}");
+
+        // The add-items route: the same new id twice, then an accepted-but-unimplemented
+        // type referenced by its own batch (one warning, not two).
+        for (batch, id, warnings) in [
+            (json!([message("msg_b"), message("msg_b")]), "msg_b", 0),
+            (
+                json!([
+                    {"id": "ws_c", "type": "web_search_call", "status": "completed"},
+                    {"type": "item_reference", "id": "ws_c"}
+                ]),
+                "ws_c",
+                1,
+            ),
+        ] {
+            let before = items.stored_record_count().unwrap();
+            let added = create_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &conversation,
+                json!({"items": batch}),
+            )
+            .await;
+            assert_eq!(added.status(), StatusCode::OK, "{id}");
+            let added = json_of(added).await;
+            assert_eq!(added["data"].as_array().map(Vec::len), Some(2), "{added}");
+            assert_eq!(added["data"][1]["id"], id, "{added}");
+            assert_eq!(
+                added["warnings"].as_array().map(Vec::len).unwrap_or(0),
+                warnings,
+                "{added}"
+            );
+            assert_eq!(items.stored_record_count(), Some(before + 1), "{id}");
+        }
+        let listed = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &conversation,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(ids_of(&listed), vec!["msg_b", "ws_c"], "{listed}");
+    }
+
+    /// A reference resolved before the writes can name an item a bounded
+    /// store drops to make room for the batch's own new items. Every reference
+    /// is read again after the writes: one that is gone fails the batch before
+    /// anything is linked, on both routes, with the answer of a missing
+    /// reference.
+    #[tokio::test]
+    async fn a_reference_the_batch_s_own_writes_evict_fails_the_batch_before_the_link() {
+        for route in ["create", "add-items"] {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let two_items = MemoryConfig {
+                max_items: 2,
+                ..MemoryConfig::default()
+            };
+            let items: Arc<dyn ConversationItemStorage> =
+                Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+            let stored = |id: &str| NewConversationItem {
+                id: Some(ConversationItemId::from(id)),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([{"type": "input_text", "text": id}]),
+                status: None,
+                tenant: None,
+            };
+            items.create_item(stored("msg_one")).await.unwrap();
+            items.create_item(stored("msg_two")).await.unwrap();
+            let empty =
+                json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+            let conversation = empty["id"].as_str().unwrap().to_string();
+            let conversations_before = conversations.stored_record_count();
+
+            // The new item takes the store over its bound: one of the two
+            // stored items goes, and the batch references both.
+            let batch = json!({"items": [
+                {"id": "msg_new", "type": "message", "role": "user", "content": "new"},
+                {"type": "item_reference", "id": "msg_one"},
+                {"type": "item_reference", "id": "msg_two"}
+            ]});
+            let response = match route {
+                "create" => create_conversation(&conversations, &items, None, batch).await,
+                _ => {
+                    create_conversation_items(&conversations, &items, None, &conversation, batch)
+                        .await
+                }
+            };
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{route}");
+            let body = json_of(response).await;
+            let message = body["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("msg_one") || message.contains("msg_two"),
+                "{route}: the answer names the evicted reference: {body}"
+            );
+            let kept = [
+                items
+                    .get_item(&ConversationItemId::from("msg_one"))
+                    .await
+                    .unwrap(),
+                items
+                    .get_item(&ConversationItemId::from("msg_two"))
+                    .await
+                    .unwrap(),
+            ];
+            assert_eq!(
+                kept.iter().filter(|item| item.is_some()).count(),
+                1,
+                "{route}: one stored item went to make room"
+            );
+            assert_eq!(
+                conversations.stored_record_count(),
+                conversations_before,
+                "{route}: no conversation is left behind"
+            );
+            let listed = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    None,
+                    &conversation,
+                    None,
+                    Some("asc"),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                listed["data"].as_array().map(Vec::len),
+                Some(0),
+                "{route}: {listed}"
+            );
+            assert!(
+                !items
+                    .is_item_linked(
+                        &ConversationId::from(conversation.as_str()),
+                        &ConversationItemId::from("msg_new")
+                    )
+                    .await
+                    .unwrap(),
+                "{route}: nothing of the batch is linked"
+            );
         }
     }
 }
