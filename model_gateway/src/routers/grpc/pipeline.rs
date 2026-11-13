@@ -1595,17 +1595,18 @@ impl RequestPipeline {
     /// per iteration. Each iteration takes the tenant rate-limit reservation
     /// a chat request takes: reserved at ingress under a charge id of its own,
     /// settled with the engine's counts the response stage recorded, closed
-    /// unsettled when the iteration fails.
+    /// unsettled when the iteration fails. The request is the loop's shared
+    /// one: the iteration's context takes a reference to it, not a copy.
     pub async fn execute_harmony_responses(
         &self,
-        request: &openai_protocol::responses::ResponsesRequest,
+        request: &Arc<openai_protocol::responses::ResponsesRequest>,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
-                Arc::new(request.clone()),
+                Arc::clone(request),
                 None,                  // No headers needed for internal pipeline execution
                 request.model.clone(), // Model ID from request
                 harmony_ctx.components.clone(),
@@ -1661,10 +1662,12 @@ impl RequestPipeline {
     /// reservation with the counts the stream brought
     /// ([`RateLimitCell::settle`]) or closes it when the stream broke
     /// ([`RateLimitCell::close_unsettled`]); a cell dropped before either
-    /// (the client left) abandons the reservation, its debit kept.
+    /// (the client left) abandons the reservation, its debit kept. The
+    /// request is the loop's shared one: the iteration's context takes a
+    /// reference to it, not a copy.
     pub async fn execute_harmony_responses_streaming(
         &self,
-        request: &openai_protocol::responses::ResponsesRequest,
+        request: &Arc<openai_protocol::responses::ResponsesRequest>,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
         stream_start: Option<StreamStartupSender>,
@@ -1680,7 +1683,7 @@ impl RequestPipeline {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
-                Arc::new(request.clone()),
+                Arc::clone(request),
                 None,
                 request.model.clone(),
                 harmony_ctx.components.clone(),
