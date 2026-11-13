@@ -422,6 +422,34 @@ impl JobQueue {
             })
     }
 
+    /// Submit `job` unless a registration (`AddWorker`) is pending or
+    /// processing under its URL: the check and the job's claim are one entry
+    /// operation, and the job's pending status is then written over its own
+    /// entry only, once it holds a slot, so a registration that claims the URL
+    /// during the wait keeps its entry. `Ok(false)` when a registration holds
+    /// the URL; any other entry (another type's, or an ended job's) is taken.
+    pub(crate) async fn submit_unless_registering(&self, job: Job) -> Result<bool, String> {
+        let worker_url = job.worker_url().to_string();
+        let job_type = job.job_type();
+        match self.status_map.entry(worker_url.clone()) {
+            Entry::Occupied(e)
+                if e.get().job_type == "AddWorker"
+                    && matches!(e.get().status.as_str(), "pending" | "processing") =>
+            {
+                return Ok(false);
+            }
+            entry => {
+                entry.insert(JobStatus::pending(job_type, &worker_url));
+            }
+        }
+        self.submit_inner(job, true, None)
+            .await
+            .map(|()| true)
+            .inspect_err(|_| {
+                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
+            })
+    }
+
     /// `submit_unless_in_flight` for a submission that must not be lost: a
     /// job that finds another of any type in flight under its URL is kept
     /// (one per URL, the latest) and run by that job's completion
@@ -733,7 +761,7 @@ impl JobQueue {
 
     /// Whether the status entry under `url` is a registration job that has
     /// not ended: queued, or running (the type name of [`Job::job_type`]).
-    pub(crate) fn add_worker_in_flight(&self, url: &str) -> bool {
+    fn add_worker_in_flight(&self, url: &str) -> bool {
         self.status_map.get(url).is_some_and(|status| {
             status.job_type == "AddWorker"
                 && matches!(status.status.as_str(), "pending" | "processing")
@@ -2203,6 +2231,76 @@ mod tests {
         assert_eq!(
             spec_for("http://127.0.0.1:8000", &config).max_connection_attempts,
             30
+        );
+    }
+
+    /// A PATCH's submission unless a registration is in flight: the check and
+    /// the claim are one entry operation, and the update's writes stay on its
+    /// own entry. A registration in flight refuses the update and keeps its
+    /// entry; a registration that claims the URL after the update's claim
+    /// keeps its entry through the update's writes.
+    #[tokio::test]
+    async fn an_update_submitted_unless_registering_leaves_a_registrations_entry() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        // A queue that accepts jobs and never runs one: no slot to run one in.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        let url = "http://w:8003";
+        let update = || Job::UpdateWorker {
+            url: url.to_string(),
+            update: Box::new(WorkerUpdateRequest {
+                priority: None,
+                cost: None,
+                labels: None,
+                api_key: None,
+                health: None,
+            }),
+        };
+        queue.hold_url_for_tests(url, "AddWorker");
+        assert_eq!(queue.submit_unless_registering(update()).await, Ok(false));
+        let entry = queue.get_status(url).expect("the registration's entry");
+        assert_eq!(
+            (entry.job_type.as_str(), entry.status.as_str()),
+            ("AddWorker", "processing")
+        );
+        JobQueue::record_job_completion(
+            "AddWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        assert_eq!(queue.submit_unless_registering(update()).await, Ok(true));
+        let entry = queue.get_status(url).expect("the update's entry");
+        assert_eq!(
+            (entry.job_type.as_str(), entry.status.as_str()),
+            ("UpdateWorker", "pending")
+        );
+        let registration = Job::AddWorker {
+            config: Box::new(WorkerSpec::new(url)),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+        };
+        assert!(
+            queue.claim_if_idle(&registration),
+            "the registration takes the entry"
+        );
+        JobQueue::record_job_completion(
+            "UpdateWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        let entry = queue.get_status(url).expect("the registration's entry");
+        assert_eq!(
+            (entry.job_type.as_str(), entry.status.as_str()),
+            ("AddWorker", "pending")
         );
     }
 }

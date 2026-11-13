@@ -907,31 +907,39 @@ impl WorkerService {
         if let (Some(labels), Some(worker)) = (&update.labels, &worker) {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
-        let job_queue = self.get_job_queue()?;
-        // An id whose URL's registration job is still in the queue is a
-        // registration in flight: it is polled (GET) or ended (DELETE), not
-        // edited. An update job for it would write its status over the
-        // registration's entry in the job queue, and with it the claim that
-        // keeps a second POST of the URL off the same id. An id with no
-        // worker under its URL and no such job is a completed data-parallel
-        // group (its ranks stand under the rank URLs, the POST's id maps to
-        // the base), whose update reaches every rank through the URL.
-        if worker.is_none() && job_queue.add_worker_in_flight(&url) {
-            return Err(WorkerServiceError::CreateInProgress {
-                url,
-                worker_id: Some(worker_id),
-            });
-        }
-
         let job = Job::UpdateWorker {
             url: url.clone(),
             update: Box::new(update),
         };
-
-        job_queue
-            .submit(job)
-            .await
-            .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+        let job_queue = self.get_job_queue()?;
+        if worker.is_some() {
+            job_queue
+                .submit(job)
+                .await
+                .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+        } else {
+            // An id whose URL's registration job is still in the queue is a
+            // registration in flight: it is polled (GET) or ended (DELETE), not
+            // edited. An update job for it would write its status over the
+            // registration's entry in the job queue, and with it the claim that
+            // keeps a second POST of the URL off the same id. An id with no
+            // worker under its URL and no such job is a completed data-parallel
+            // group (its ranks stand under the rank URLs, the POST's id maps to
+            // the base), whose update reaches every rank through the URL. The
+            // check and the update's claim are one entry operation, and the
+            // update writes only over its own entry once it holds a slot, so a
+            // registration that claims the URL in between keeps its entry.
+            let admitted = job_queue
+                .submit_unless_registering(job)
+                .await
+                .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
+            if !admitted {
+                return Err(WorkerServiceError::CreateInProgress {
+                    url,
+                    worker_id: Some(worker_id),
+                });
+            }
+        }
 
         Ok(UpdateWorkerResult { worker_id, url })
     }
