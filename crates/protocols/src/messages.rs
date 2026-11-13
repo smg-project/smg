@@ -1005,8 +1005,8 @@ pub enum Tool {
     /// match ToolSearchTool's less-restrictive shape if tried first)
     Custom(CustomTool),
     /// Tool search tool, and every other Anthropic-defined tool: a tool with a
-    /// `type` and a `name` and no `input_schema` reads here, its configuration
-    /// kept in [`ToolSearchTool::extra`].
+    /// `type` and a `name` and no `input_schema` that reads as one reads here,
+    /// its configuration kept in [`ToolSearchTool::extra`].
     ToolSearch(ToolSearchTool),
     /// Bash tool (computer use)
     Bash(BashTool),
