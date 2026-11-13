@@ -1068,9 +1068,12 @@ pub struct InteractionsUsage {
 
 /// A modality of the response, as the public API names them. Each also
 /// reads its uppercase name, which the SDK's own examples send
-/// (`response_modalities=["IMAGE"]`), and is written in lowercase.
+/// (`response_modalities=["IMAGE"]`), and is written in lowercase. The SDK
+/// keeps the set open, so a modality this build does not name is kept as
+/// written (`Other`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResponseModality {
     #[serde(alias = "TEXT")]
     Text,
@@ -1082,6 +1085,10 @@ pub enum ResponseModality {
     Video,
     #[serde(alias = "DOCUMENT")]
     Document,
+    /// A modality this build does not name, kept as the client or upstream
+    /// wrote it
+    #[serde(untagged)]
+    Other(String),
 }
 
 fn is_option_blank(v: Option<&String>) -> bool {
@@ -1274,6 +1281,25 @@ mod tests {
         .unwrap();
         let by_modality = usage.input_tokens_by_modality.unwrap();
         assert_eq!(by_modality[1].modality, Some(ResponseModality::Document));
+
+        let unknown: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Hello",
+            "store": false,
+            "response_modalities": ["a_modality_of_no_api"]
+        }))
+        .unwrap();
+        assert_eq!(
+            unknown.response_modalities,
+            Some(vec![ResponseModality::Other(
+                "a_modality_of_no_api".to_string()
+            )])
+        );
+        let written = crate::common::to_value_exact(&unknown).unwrap();
+        assert_eq!(
+            written["response_modalities"],
+            serde_json::json!(["a_modality_of_no_api"])
+        );
     }
 
     fn refusal(result: Result<(), ValidationError>) -> (String, String) {

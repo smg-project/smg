@@ -72,9 +72,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 - An Interactions response modality takes `video` and `document`, and each modality reads its
   uppercase name too (`"IMAGE"`), as the public API takes them and as the SDK's own examples send
-  `response_modalities`. Each is written in lowercase. An uppercase or a new modality refused the
-  whole request, and a usage entry that counted a new one failed the answer's parse. Breaking:
-  `ResponseModality` gains `Video` and `Document`.
+  `response_modalities`. Each is written in lowercase, and a modality this build does not name is
+  kept as written, as the SDK keeps the set open. An uppercase or a new modality refused the whole
+  request, and a usage entry that counted a new one failed the answer's parse. Breaking:
+  `ResponseModality` gains `Video`, `Document` and `Other`, and is `#[non_exhaustive]`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
