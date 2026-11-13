@@ -2019,10 +2019,12 @@ impl NativeEncoder {
     /// over the pieces of the one before). Three things keep it honest: the
     /// first stage runs over a unit of the thread pool as over the text, and
     /// would read the unit's bounds as the text's; the pool's cut check runs
-    /// every stage over a window of the text instead of over pieces
-    /// ([`Self::piece_starts_at`]), which stays right only when the stage's
-    /// matches are runs of decimal digits, which neither span nor start at a
-    /// cut candidate (a space); and the stage's own input pieces must meet
+    /// the stages over a window of the text ([`Self::piece_starts_at`]), each
+    /// over the pieces of the one before, from a start that can sit inside a
+    /// whitespace run of the text ([`Self::window_start`]), which stays right
+    /// only when the stage's matches are runs of decimal digits, which begin
+    /// at neither of the window's bounds nor at a cut candidate (all spaces)
+    /// and span none of them; and the stage's own input pieces must meet
     /// the same bounds in a unit as in the text, which a gap of an earlier
     /// stage that holds digits and spans a cut would not (it ends at the
     /// unit's end, where the text goes on): after a `Digits` split every
