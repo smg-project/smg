@@ -593,8 +593,10 @@ impl JobQueue {
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
         // A claimed submission holds its entry only as long as it lives:
-        // ended or dropped before a slot is held, the claim goes with it.
-        let mut claim = claimed.then_some(Claim {
+        // ended or dropped before a slot is held, the claim goes with it. A
+        // plain one builds no guard (built eagerly, a guard would drop at once
+        // and take another job's same-type entry with it).
+        let mut claim = claimed.then(|| Claim {
             status_map: &self.status_map,
             url: &worker_url,
             job_type,
@@ -2310,26 +2312,9 @@ mod tests {
         );
     }
 
-    /// A claimed submission dropped inside its wait for a slot (a cancelled
-    /// request on a full queue) leaves no entry under its URL: the claim an
-    /// update made against a registration in flight and a registration's
-    /// typed claim both go with the dropped caller, and the URL takes the
-    /// next claim.
-    #[tokio::test]
-    async fn a_claimed_submission_dropped_in_its_slot_wait_leaves_no_entry() {
-        use crate::service_discovery::testing::create_test_app_context;
-        let context = create_test_app_context();
-        // One slot and no job ever runs: the dispatcher parks the first job on
-        // the concurrency limit of zero, the second fills the slot, and every
-        // later submission waits.
-        let queue = JobQueue::new(
-            JobQueueConfig {
-                queue_capacity: 1,
-                max_concurrent_jobs: 0,
-            },
-            Arc::downgrade(&context),
-        );
-        let update = |url: &str| Job::UpdateWorker {
+    /// An update job for `url`, the plain shape the tests below submit.
+    fn an_update(url: &str) -> Job {
+        Job::UpdateWorker {
             url: url.to_string(),
             update: Box::new(WorkerUpdateRequest {
                 priority: None,
@@ -2338,9 +2323,22 @@ mod tests {
                 api_key: None,
                 health: None,
             }),
-        };
+        }
+    }
+
+    /// A one-slot queue that is full and runs no job: the dispatcher parks the
+    /// first job on the concurrency limit of zero, the second fills the slot,
+    /// and every later submission waits.
+    async fn a_full_one_slot_queue(context: &Arc<AppContext>) -> Arc<JobQueue> {
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 1,
+                max_concurrent_jobs: 0,
+            },
+            Arc::downgrade(context),
+        );
         queue
-            .submit(update("http://w:8006"))
+            .submit(an_update("http://w:8006"))
             .await
             .expect("the first job");
         for _ in 0..1000 {
@@ -2351,15 +2349,27 @@ mod tests {
         }
         assert_eq!(queue.tx.capacity(), 1, "the dispatcher took the first job");
         queue
-            .submit(update("http://w:8007"))
+            .submit(an_update("http://w:8007"))
             .await
             .expect("the slot");
         assert_eq!(queue.tx.capacity(), 0, "the queue is full");
+        queue
+    }
 
+    /// A claimed submission dropped inside its wait for a slot (a cancelled
+    /// request on a full queue) leaves no entry under its URL: the claim an
+    /// update made against a registration in flight and a registration's
+    /// typed claim both go with the dropped caller, and the URL takes the
+    /// next claim.
+    #[tokio::test]
+    async fn a_claimed_submission_dropped_in_its_slot_wait_leaves_no_entry() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = a_full_one_slot_queue(&context).await;
         let url = "http://w:8008";
         let wait = Duration::from_millis(50);
         let dropped =
-            tokio::time::timeout(wait, queue.submit_unless_registering(update(url))).await;
+            tokio::time::timeout(wait, queue.submit_unless_registering(an_update(url))).await;
         assert!(dropped.is_err(), "the update's submission waits for a slot");
         assert!(
             queue.get_status(url).is_none(),
@@ -2382,6 +2392,29 @@ mod tests {
         assert!(
             queue.get_status(url).is_none(),
             "the registration's claim went with its caller"
+        );
+    }
+
+    /// A plain submission touches no entry before it holds a slot: the entry
+    /// another job holds under the URL survives a plain submission of the
+    /// same type dropped inside its wait on a full queue.
+    #[tokio::test]
+    async fn a_plain_submission_dropped_in_its_slot_wait_leaves_the_entry_it_found() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = a_full_one_slot_queue(&context).await;
+        let url = "http://w:8009";
+        queue.hold_url_for_tests(url, "UpdateWorker");
+        let dropped =
+            tokio::time::timeout(Duration::from_millis(50), queue.submit(an_update(url))).await;
+        assert!(dropped.is_err(), "the plain submission waits for a slot");
+        let entry = queue
+            .get_status(url)
+            .expect("the entry the other job holds");
+        assert_eq!(
+            (entry.job_type.as_str(), entry.status.as_str()),
+            ("UpdateWorker", "processing"),
+            "the entry survives the dropped plain submission"
         );
     }
 }
