@@ -155,6 +155,7 @@ impl BuildStage for MessageRequestBuildingStage {
             symphony::Asks::Messages {
                 request: &messages_request,
                 continues: messages_request.continues_final_assistant(),
+                has_tools: spec.has_tools,
             },
             &spec.chat_tools,
             &processed_messages.text,
@@ -176,6 +177,7 @@ impl BuildStage for MessageRequestBuildingStage {
                         request: Arc::clone(&messages_request),
                         tools,
                         continues: continued_final_message,
+                        has_tools: spec.has_tools,
                     },
                     reasoning_open: require_reasoning,
                     thought_closed,

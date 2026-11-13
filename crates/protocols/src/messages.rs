@@ -1150,47 +1150,57 @@ pub struct InputSchema {
     pub additional: Map<String, Value>,
 }
 
-impl From<&InputSchema> for Value {
-    /// The schema as the JSON object a chat tool's `parameters` holds.
-    fn from(schema: &InputSchema) -> Self {
+impl From<InputSchema> for Value {
+    /// The schema as the JSON object a chat tool's `parameters` holds: the
+    /// properties and the additional fields move in, the `type` and the
+    /// `required` names are written as the strings they are.
+    fn from(schema: InputSchema) -> Self {
         let mut object = Map::new();
-        object.insert(
-            "type".to_string(),
-            Value::String(schema.schema_type.clone()),
-        );
-        if let Some(properties) = &schema.properties {
-            object.insert("properties".to_string(), Value::Object(properties.clone()));
+        object.insert("type".to_string(), Value::String(schema.schema_type));
+        if let Some(properties) = schema.properties {
+            object.insert("properties".to_string(), Value::Object(properties));
         }
-        if let Some(required) = &schema.required {
+        if let Some(required) = schema.required {
             object.insert(
                 "required".to_string(),
-                Value::Array(required.iter().cloned().map(Value::String).collect()),
+                Value::Array(required.into_iter().map(Value::String).collect()),
             );
         }
-        object.extend(
-            schema
-                .additional
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        object.extend(schema.additional);
         Value::Object(object)
     }
 }
 
-impl From<&CustomTool> for common::Tool {
+impl From<&InputSchema> for Value {
+    /// The same object from a borrowed schema: its fields are copied once, as
+    /// a caller that keeps its schema must.
+    fn from(schema: &InputSchema) -> Self {
+        Self::from(schema.clone())
+    }
+}
+
+impl From<CustomTool> for common::Tool {
     /// The chat tool a custom tool reads as: a function with the input
-    /// schema as its parameters.
-    fn from(tool: &CustomTool) -> Self {
+    /// schema as its parameters; the name, the description and the schema
+    /// move in.
+    fn from(tool: CustomTool) -> Self {
         Self {
             tool_type: "function".to_string(),
             function: common::Function {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: Some(Value::from(&tool.input_schema)),
+                name: tool.name,
+                description: tool.description,
+                parameters: Some(Value::from(tool.input_schema)),
                 strict: None,
                 extra: Default::default(),
             },
         }
+    }
+}
+
+impl From<&CustomTool> for common::Tool {
+    /// The same tool from a borrowed custom tool: a copy of it moves in.
+    fn from(tool: &CustomTool) -> Self {
+        Self::from(tool.clone())
     }
 }
 
@@ -1199,6 +1209,19 @@ impl From<&CustomTool> for common::Tool {
 pub fn chat_tools(tools: &[Tool]) -> Vec<common::Tool> {
     tools
         .iter()
+        .filter_map(|tool| match tool {
+            Tool::Custom(custom) => Some(common::Tool::from(custom)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The custom tools among the owned `tools` as chat tools, in order: their
+/// names, descriptions and schemas move into the chat tools instead of being
+/// copied; the other kinds are dropped here, as [`chat_tools`] leaves them out.
+pub fn into_chat_tools(tools: Vec<Tool>) -> Vec<common::Tool> {
+    tools
+        .into_iter()
         .filter_map(|tool| match tool {
             Tool::Custom(custom) => Some(common::Tool::from(custom)),
             _ => None,
@@ -4689,6 +4712,43 @@ mod tests {
                 .expect_err("no such entry")
                 .as_str(),
             "after_id: no model \"nope\" in the list"
+        );
+    }
+
+    /// The owned conversion and the borrowed one read the same chat tools: the
+    /// custom tools in order, each a function whose parameters are the input
+    /// schema with the client's keys in their order, the other kinds left out.
+    #[test]
+    fn into_chat_tools_moves_what_chat_tools_copies() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([
+            {"name": "weather", "description": "Get weather", "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "unit": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": false
+            }},
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"name": "calc", "input_schema": {"type": "object"}}
+        ]))
+        .expect("the tools deserialize");
+        let borrowed = serde_json::to_value(chat_tools(&tools)).unwrap();
+        let owned = serde_json::to_value(into_chat_tools(tools)).unwrap();
+        assert_eq!(owned, borrowed);
+        assert_eq!(
+            owned.as_array().map(Vec::len),
+            Some(2),
+            "the server tool is left out"
+        );
+        let keys: Vec<&str> = owned[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["city", "unit"], "the client's key order is kept");
+        assert_eq!(
+            owned[0]["function"]["parameters"]["additionalProperties"],
+            json!(false)
         );
     }
 }

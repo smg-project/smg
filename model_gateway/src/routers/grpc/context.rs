@@ -49,7 +49,7 @@ use super::{
         stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
         symphony::{PromptReplay, Reading},
     },
-    spec::ResponseSpec,
+    spec::{MessagesTools, ResponseSpec},
     utils::{Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
@@ -289,6 +289,13 @@ pub(crate) struct ProcessingState {
     /// endpoints whose preparation decides nothing, and when the names refused (the constraint
     /// carries the refusal); the assignment then decides itself.
     pub reading: Option<Reading>,
+
+    /// A Messages request's tools, taken out of the request by the route
+    /// while it still owned it (`MessagesTools::take_from`): the Messages
+    /// preparation builds the response spec from them. `None` when the
+    /// context was built from a request alone; the spec then converts the
+    /// request's tools by reference.
+    pub messages_tools: Option<MessagesTools>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request

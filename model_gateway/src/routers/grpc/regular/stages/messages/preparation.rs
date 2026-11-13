@@ -81,7 +81,10 @@ impl MessagePreparationStage {
         // narrowed by tool_choice and shared with count_tokens so both render
         // the same prompt; the constraints read the narrowed tools too, the
         // parsers read them all from the spec.
-        let spec = Box::new(MessagesResponseSpec::from(request));
+        let spec = Box::new(MessagesResponseSpec::with_tools(
+            request,
+            ctx.state.messages_tools.take(),
+        ));
         let filtered_tools =
             message_utils::template_tools(&spec.chat_tools, request.tool_choice.as_ref());
         let chat_tool_choice = request.tool_choice.as_ref().map(ToolChoice::from);
@@ -163,6 +166,7 @@ impl MessagePreparationStage {
             symphony::Asks::Messages {
                 request,
                 continues: request.continues_final_assistant(),
+                has_tools: spec.has_tools,
             },
             &filtered_tools,
             &processed_messages.text,

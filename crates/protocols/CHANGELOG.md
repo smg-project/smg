@@ -6,6 +6,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
+  a caller that owns a Messages request's tools converts them into chat tools without copying the
+  schemas (the properties and the additional fields move in); the by-reference forms stay for a
+  caller that keeps its tools and copy once, as before.
 - `MessagesBetas`, beside `CreateMessageRequest`: the betas a Messages request names in its
   `anthropic-beta` header, read once from the header's values as the public API names them (the
   dated form `name-YYYY-MM-DD`; a header that repeats or lists several; a longer name that begins

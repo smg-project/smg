@@ -250,10 +250,25 @@ pub(crate) enum Asks<'a> {
         request: &'a CreateMessageRequest,
         /// The prompt continues the assistant's message.
         continues: bool,
+        /// The request declared a `tools` field (an empty list being a declaration), as its
+        /// response spec recorded it: the route takes the tools out of a request it still owns,
+        /// so the request's own field reads `None` past the route.
+        has_tools: bool,
     },
 }
 
 impl<'a> Asks<'a> {
+    /// A Messages request's ask over a request that still carries its tools, as the tests build
+    /// theirs: the declaration is the request's own field.
+    #[cfg(test)]
+    pub(crate) fn for_messages(request: &'a CreateMessageRequest, continues: bool) -> Self {
+        Self::Messages {
+            request,
+            continues,
+            has_tools: request.tools.is_some(),
+        }
+    }
+
     pub(crate) fn model(self) -> &'a str {
         match self {
             Self::Chat(request) => &request.model,
@@ -432,7 +447,7 @@ impl<'a> Asks<'a> {
     pub(super) fn no_calls_for(self, provider: ProviderProfile) -> bool {
         match self {
             Self::Chat(request) => !scans_for_tool_calls_for(request, provider),
-            Self::Messages { request, .. } => request.tools.is_none(),
+            Self::Messages { has_tools, .. } => !has_tools,
         }
     }
 
@@ -450,10 +465,9 @@ impl<'a> Asks<'a> {
                     Some(ToolChoice::Value(ToolChoiceValue::None))
                 ) && scans_for_tool_calls_for(request, provider)
             }
-            Self::Messages { request, .. } => {
-                matches!(request.tool_choice, Some(MessagesToolChoice::None))
-                    && request.tools.is_some()
-            }
+            Self::Messages {
+                request, has_tools, ..
+            } => matches!(request.tool_choice, Some(MessagesToolChoice::None)) && has_tools,
         }
     }
 
@@ -864,6 +878,8 @@ pub(crate) enum AutoRequest {
         tools: Arc<[Tool]>,
         /// The prompt continues the assistant's message.
         continues: bool,
+        /// The request declared tools, as its response spec recorded ([`Asks::Messages`]).
+        has_tools: bool,
     },
 }
 
@@ -881,10 +897,12 @@ impl AutoTag {
                 request,
                 tools,
                 continues,
+                has_tools,
             } => (
                 Asks::Messages {
                     request,
                     continues: *continues,
+                    has_tools: *has_tools,
                 },
                 Cow::Borrowed(&tools[..]),
             ),
@@ -1132,12 +1150,9 @@ mod tests {
         ]))
         .expect("a tool");
         let asks = |request: &CreateMessageRequest| {
-            Asks::Messages {
-                request,
-                continues: false,
-            }
-            .untabled_answer_schema(&tools)
-            .map(Cow::into_owned)
+            Asks::for_messages(request, false)
+                .untabled_answer_schema(&tools)
+                .map(Cow::into_owned)
         };
         assert_eq!(asks(&request(None)), Some(schema.clone()));
         assert_eq!(
@@ -1158,12 +1173,9 @@ mod tests {
         );
         let forced = request(Some(json!({"type": "any"})));
         assert_eq!(
-            Asks::Messages {
-                request: &forced,
-                continues: false
-            }
-            .untabled_answer_schema(&[])
-            .map(Cow::into_owned),
+            Asks::for_messages(&forced, false)
+                .untabled_answer_schema(&[])
+                .map(Cow::into_owned),
             Some(schema.clone()),
             "no callable tool: the choice forces nothing"
         );
@@ -1203,10 +1215,7 @@ mod tests {
             answer
         };
         let for_chat = answer_of(Asks::Chat(&chat));
-        let for_messages = answer_of(Asks::Messages {
-            request: &messages,
-            continues: false,
-        });
+        let for_messages = answer_of(Asks::for_messages(&messages, false));
         assert_eq!(for_messages.schema(), Some(&schema));
         for start in [
             symphony::GrammarStart::FirstToken,
@@ -2008,10 +2017,7 @@ mod tests {
             auto_constraint(
                 ParserChoice::Symphony,
                 &ModelNames::default(),
-                Asks::Messages {
-                    request: &messages_auto,
-                    continues: false
-                },
+                Asks::for_messages(&messages_auto, false),
                 &tools,
                 false,
                 false,
@@ -2025,10 +2031,7 @@ mod tests {
         assert!(auto_constraint(
             ParserChoice::Symphony,
             &ModelNames::default(),
-            Asks::Messages {
-                request: &messages_auto,
-                continues: true
-            },
+            Asks::for_messages(&messages_auto, true),
             &tools,
             false,
             false,
@@ -2045,10 +2048,7 @@ mod tests {
         assert!(auto_constraint(
             ParserChoice::Symphony,
             &ModelNames::default(),
-            Asks::Messages {
-                request: &messages_any,
-                continues: false
-            },
+            Asks::for_messages(&messages_any, false),
             &tools,
             false,
             false,
@@ -2189,10 +2189,10 @@ mod tests {
         let no_calls = super::super::assign(
             symphony,
             &plain,
-            Asks::Messages {
-                request: &message_request(json!({"tool_choice": {"type": "none"}})),
-                continues: false,
-            },
+            Asks::for_messages(
+                &message_request(json!({"tool_choice": {"type": "none"}})),
+                false,
+            ),
             None,
             PROMPT,
             &templates(),
@@ -2205,13 +2205,10 @@ mod tests {
         let forbidden = super::super::assign(
             symphony,
             &plain,
-            Asks::Messages {
-                request: &message_request(json!({
+            Asks::for_messages(&message_request(json!({
                     "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
                     "tool_choice": {"type": "none"}
-                })),
-                continues: false,
-            },
+                })), false),
             None,
             PROMPT,
             &templates(),
@@ -2224,14 +2221,32 @@ mod tests {
             "the table keeps its calls under none over declared tools"
         );
         assert!(forbidden.forbids_calls);
+        // Past the route the request's own `tools` reads `None` (the route took them out while it
+        // owned the request): the declaration the spec recorded is what the table reads.
+        let taken = super::super::assign(
+            symphony,
+            &plain,
+            Asks::Messages {
+                request: &message_request(json!({"tool_choice": {"type": "none"}})),
+                continues: false,
+                has_tools: true,
+            },
+            None,
+            PROMPT,
+            &templates(),
+        )
+        .expect("read")
+        .expect("assigned");
+        assert!(
+            taken.format.call_syntax().is_some(),
+            "the declaration is read from the ask, not from the request's emptied field"
+        );
+        assert!(taken.forbids_calls);
         let constrain = |extra: Value| {
             super::constraint(
                 symphony,
                 &plain,
-                Asks::Messages {
-                    request: &message_request(extra),
-                    continues: false,
-                },
+                Asks::for_messages(&message_request(extra), false),
                 &tools(),
                 false,
                 false,
@@ -2259,10 +2274,7 @@ mod tests {
         let assigned = super::super::assign(
             symphony,
             &plain,
-            Asks::Messages {
-                request: &message_request(json!({})),
-                continues: false,
-            },
+            Asks::for_messages(&message_request(json!({})), false),
             None,
             PROMPT,
             &templates(),
@@ -2281,10 +2293,10 @@ mod tests {
         let why = super::constraint(
             symphony,
             &hf,
-            Asks::Messages {
-                request: &message_request(json!({"tool_choice": {"type": "any"}})),
-                continues: false,
-            },
+            Asks::for_messages(
+                &message_request(json!({"tool_choice": {"type": "any"}})),
+                false,
+            ),
             &tools(),
             false,
             false,
@@ -2732,6 +2744,7 @@ mod tests {
                     request: Arc::new(messages.clone()),
                     tools: tools().into(),
                     continues: false,
+                    has_tools: messages.tools.is_some(),
                 },
                 reasoning_open: true,
                 thought_closed: false,
@@ -2755,10 +2768,7 @@ mod tests {
                     AutoRequest::Messages { .. } => auto_constraint(
                         ParserChoice::Symphony,
                         &names,
-                        Asks::Messages {
-                            request: &messages,
-                            continues: false,
-                        },
+                        Asks::for_messages(&messages, false),
                         &tools(),
                         true,
                         false,
@@ -2980,10 +2990,7 @@ mod tests {
             assert_eq!(
                 tag(turn_of(
                     &turn_table(),
-                    Asks::Messages {
-                        request: &messages,
-                        continues: false
-                    },
+                    Asks::for_messages(&messages, false),
                     &messages.chat_tools(),
                     prompt,
                     TagVocabulary::Current,
