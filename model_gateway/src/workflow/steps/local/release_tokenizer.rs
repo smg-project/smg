@@ -861,11 +861,12 @@ mod tests {
     /// Two removals read the same entry (the model's last two workers leaving
     /// together); the first's release took it and, a worker having appeared,
     /// its put-back loads the entry again under its own id. The second's
-    /// release, with the id it read, takes nothing while that load runs: it
-    /// removes through the name's publication (`TokenizerRegistry::
-    /// remove_if_id`), so an entry stored under the id and not yet published
-    /// under the name is not taken either, and the put-back's entry is there,
-    /// name and id agreeing, once it publishes.
+    /// release, with the id it read, takes nothing while that load runs, and
+    /// the put-back's entry is there under its own id once it publishes. The
+    /// registry's publication window itself (an entry stored under the id and
+    /// not yet published under the name) is the registry's own test,
+    /// `test_remove_if_id_leaves_an_entry_not_yet_published`: a loader runs
+    /// before both of `load`'s writes, so a step test cannot reach it.
     #[tokio::test]
     async fn a_release_under_a_put_backs_load_of_the_same_entry_takes_nothing() {
         let app_context = app_context();

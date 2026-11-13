@@ -313,14 +313,14 @@ impl TokenizerRegistry {
 
     /// Remove a tokenizer by ID
     ///
-    /// Returns the entry if it was present.
+    /// The name goes with the entry only while it maps to this ID: a
+    /// replacement published under the name in the meantime (another ID)
+    /// keeps its name. Returns the entry if it was present.
     pub fn remove_by_id(&self, id: &str) -> Option<TokenizerEntry> {
-        if let Some((_, entry)) = self.tokenizers.remove(id) {
-            self.name_to_id.remove(&entry.name);
-            Some(entry)
-        } else {
-            None
-        }
+        let (_, entry) = self.tokenizers.remove(id)?;
+        self.name_to_id
+            .remove_if(&entry.name, |_, published| published == id);
+        Some(entry)
     }
 
     /// Remove the tokenizer under `name` when it is the entry with `id`
@@ -757,5 +757,40 @@ mod tests {
         assert_eq!(registry.get_by_name("model1").unwrap().id, id);
         assert_eq!(registry.remove_if_id("model1", &id).unwrap().id, id);
         assert!(registry.is_empty());
+    }
+
+    /// A removal by ID (the operator's DELETE, the removal job) while a
+    /// replacement is published under the name: the old entry goes and the
+    /// name keeps mapping to the replacement.
+    #[tokio::test]
+    async fn test_remove_by_id_leaves_a_replacements_name() {
+        let registry = TokenizerRegistry::new();
+        let old = TokenizerRegistry::generate_id();
+        registry
+            .load(&old, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        // The registry as a release leaves it between its two steps (the
+        // name taken, the entry still stored) once a load has published a
+        // replacement under the name.
+        registry.name_to_id.remove("model1").unwrap();
+        let replacement = TokenizerRegistry::generate_id();
+        registry
+            .load(&replacement, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        assert!(registry.contains_id(&old));
+
+        assert_eq!(registry.remove_by_id(&old).unwrap().id, old);
+        assert!(!registry.contains_id(&old));
+        assert_eq!(
+            registry.get_by_name("model1").unwrap().id,
+            replacement,
+            "the replacement keeps its name"
+        );
     }
 }
