@@ -337,3 +337,80 @@ async fn a_detokenize_body_of_the_wrong_type_is_a_400_in_the_public_envelope() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
     assert_eq!(public_envelope(&text)["code"], "model_not_found", "{text}");
 }
+
+/// A tokenizer whose post-processor adds a BOS token, `<s>` (id 0), when
+/// special tokens are added, as a Llama-style tokenizer's does.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn bos_tokenizer() -> Arc<dyn llm_tokenizer::traits::Tokenizer> {
+    let definition = serde_json::json!({
+        "version": "1.0",
+        "added_tokens": [{
+            "id": 0, "content": "<s>", "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true
+        }],
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": {
+            "type": "TemplateProcessing",
+            "single": [
+                {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}}
+            ],
+            "pair": [
+                {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"Sequence": {"id": "B", "type_id": 1}}
+            ],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [0], "tokens": ["<s>"]}}
+        },
+        "model": {
+            "type": "WordLevel",
+            "unk_token": "[UNK]",
+            "vocab": {"<s>": 0, "[UNK]": 1, "hello": 2, "world": 3}
+        }
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), serde_json::to_vec(&definition).unwrap()).unwrap();
+    Arc::new(llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().unwrap()).unwrap())
+}
+
+/// SGLang's `/tokenize` adds the tokenizer's special tokens unless the
+/// request says not to: the BOS leads the ids and counts by default, and
+/// `add_special_tokens: false` leaves it out.
+#[tokio::test]
+async fn tokenize_adds_the_special_tokens_unless_the_request_says_not_to() {
+    const BOS_MODEL: &str = "bos-model";
+    let registry = crate::common::tokenizer_registry_with(BOS_MODEL, bos_tokenizer()).await;
+    let context =
+        create_test_context_with_tokenizer_registry(TestRouterConfig::round_robin(4358), registry)
+            .await;
+    let router = RouterFactory::create_router(&context)
+        .await
+        .expect("the router builds");
+    let app = create_test_app_with_context_and_auth(Arc::from(router), Arc::clone(&context), None);
+
+    let answer = |text: &str| -> serde_json::Value {
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+    };
+    let body = format!(r#"{{"model":"{BOS_MODEL}","prompt":"hello world"}}"#);
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let by_default = answer(&text);
+    assert_eq!(by_default["tokens"], serde_json::json!([0, 2, 3]), "{text}");
+    assert_eq!(by_default["count"], 3, "{text}");
+
+    let body = format!(
+        r#"{{"model":"{BOS_MODEL}","prompt":["hello world","world"],"add_special_tokens":false}}"#
+    );
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let without = answer(&text);
+    assert_eq!(
+        without["tokens"],
+        serde_json::json!([[2, 3], [3]]),
+        "{text}"
+    );
+    assert_eq!(without["count"], serde_json::json!([2, 1]), "{text}");
+}

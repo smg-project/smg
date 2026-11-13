@@ -118,18 +118,25 @@ pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Re
 
     let mut budget = InPlaceBudget::default();
     for text in texts {
-        // Don't add special tokens for tokenize API (matches Python behavior)
-        let encoding =
-            match encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget).await {
-                Ok(enc) => enc,
-                Err(e) => {
-                    error!("Tokenization failed: {}", e);
-                    return error::internal_error(
-                        "tokenization_error",
-                        format!("Tokenization failed: {e}"),
-                    );
-                }
-            };
+        // The special tokens are added as the request asks, by default, as
+        // SGLang's `/tokenize` adds them.
+        let encoding = match encode_blocking_in_batch(
+            tokenizer.clone(),
+            text,
+            request.add_special_tokens,
+            &mut budget,
+        )
+        .await
+        {
+            Ok(enc) => enc,
+            Err(e) => {
+                error!("Tokenization failed: {}", e);
+                return error::internal_error(
+                    "tokenization_error",
+                    format!("Tokenization failed: {e}"),
+                );
+            }
+        };
 
         let token_ids: Vec<u32> = encoding.into_token_ids();
         let count = token_ids.len() as i32;

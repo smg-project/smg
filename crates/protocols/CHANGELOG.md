@@ -94,6 +94,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `/v1/tokenize` request's `add_special_tokens` is honored, defaulting to `true`, as SGLang's
+  `/tokenize` takes it: the handler always encoded without the special tokens and the type had no
+  such field. `TokenizeRequest` gains `add_special_tokens`. Breaking: the field is new, and the
+  default answer changes with a tokenizer that adds special tokens (a Llama-style BOS): its
+  `tokens` and `count` now carry them, as SGLang's do; `add_special_tokens: false` keeps the old
+  answer.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

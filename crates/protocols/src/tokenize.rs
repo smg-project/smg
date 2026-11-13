@@ -24,6 +24,11 @@ pub struct TokenizeRequest {
 
     /// Text(s) to tokenize - can be a single string or array of strings
     pub prompt: StringOrArray,
+
+    /// Whether the tokenizer adds its special tokens (a Llama-style
+    /// tokenizer's BOS, say), as SGLang's `/tokenize` does by default
+    #[serde(default = "default_true")]
+    pub add_special_tokens: bool,
 }
 
 impl Normalizable for TokenizeRequest {}
@@ -284,5 +289,19 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("[[1,2],[3,4,5]]"));
         assert!(json.contains("[2,3]"));
+    }
+
+    /// SGLang's `/tokenize` adds the special tokens unless the request says
+    /// not to.
+    #[test]
+    fn test_tokenize_request_add_special_tokens_defaults_to_true() {
+        let req: TokenizeRequest =
+            serde_json::from_str(r#"{"model": "llama", "prompt": "Hello"}"#).unwrap();
+        assert!(req.add_special_tokens);
+        let req: TokenizeRequest = serde_json::from_str(
+            r#"{"model": "llama", "prompt": "Hello", "add_special_tokens": false}"#,
+        )
+        .unwrap();
+        assert!(!req.add_special_tokens);
     }
 }
