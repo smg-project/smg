@@ -7,11 +7,14 @@ namespace), cards busy with a visible process, cards free; and by a scratch
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -34,7 +37,8 @@ class Guard:
     """One guard run: the shims on PATH, the stand-in's state, a scratch /proc
     tree, the knobs in the environment."""
 
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, *, real_holder: bool = False) -> None:
+        self.real_holder = real_holder
         self.state = tmp_path / "smi"
         self.state.mkdir()
         (self.state / "cards").write_text("0 GPU-aaaa\n1 GPU-bbbb\n")
@@ -42,6 +46,100 @@ class Guard:
         self.proc.mkdir()
         self.bin = tmp_path / "bin"
         shutil.copytree(SHIMS, self.bin)
+        # Signals are recorded, never forwarded unless this fixture explicitly
+        # registered its own live Popen child with exact /proc identity. All
+        # package/network commands and all other PIDs remain fully fake.
+        smi = self.bin / "nvidia-smi"
+        smi.write_text(
+            smi.read_text().replace('"/proc/$1/stat"', '"$CI_GPU_GUARD_PROC_ROOT/$1/stat"')
+        )
+        self.signals = self.state / "signals"
+        self.allowed_children = self.state / "allowed-children.json"
+        self.allowed_children.write_text("{}\n")
+        self.allowed_children.chmod(0o600)
+        self.apt_calls = self.state / "apt-calls"
+        self.network_calls = self.state / "network-calls"
+        scripts = {
+            "kill": f"#!{sys.executable}\n"
+            + r"""import json
+import os
+from pathlib import Path
+import signal
+import sys
+
+state = Path(os.environ["FAKE_SMI_STATE"])
+args = sys.argv[1:]
+with (state / "signals").open("a") as stream:
+    stream.write(" ".join(args) + "\n")
+allowed = json.loads((state / "allowed-children.json").read_text())
+for text in args:
+    if not text.isdecimal():
+        continue
+    pid = int(text)
+    scratch = Path(os.environ["CI_GPU_GUARD_PROC_ROOT"]) / text / "stat"
+    if scratch.is_file():
+        scratch.write_text(f"{pid} (fixture) Z 0\n")
+    identity = allowed.get(text)
+    if args[:1] != ["-9"] or identity is None:
+        continue
+    # pidfd pins the process before identity is re-read, so PID reuse cannot
+    # redirect the eventual signal. Nothing outside the explicit allowlist
+    # reaches this OS path; the original synthetic tests do not read /proc.
+    fd = None
+    try:
+        fd = os.pidfd_open(pid)
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        parent = identity["ppid"]
+        parent_fields = Path(f"/proc/{parent}/stat").read_text().rsplit(")", 1)[1].split()
+        if (pid <= 1 or fields[0] == "Z" or int(fields[1]) != parent
+                or fields[19] != identity["start_ticks"]
+                or parent_fields[19] != identity["parent_start_ticks"]):
+            continue
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+        with (state / "forwarded-signals").open("a") as stream:
+            stream.write(f"-9 {pid} {identity['start_ticks']} {parent}\n")
+    except (ProcessLookupError, FileNotFoundError):
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+""",
+            "apt-get": """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_SMI_STATE/apt-calls"
+exit 97
+""",
+            "sudo": '#!/bin/bash\nexec "$@"\n',
+            "fuser": "#!/bin/bash\nexit 1\n",
+            "curl": '#!/bin/bash\nprintf "curl %s\\n" "$*" >> "$FAKE_SMI_STATE/network-calls"\nexit 98\n',
+            "wget": '#!/bin/bash\nprintf "wget %s\\n" "$*" >> "$FAKE_SMI_STATE/network-calls"\nexit 98\n',
+        }
+        for name, source in scripts.items():
+            executable = self.bin / name
+            executable.write_text(source)
+            executable.chmod(0o755)
+        self.apt_root = tmp_path / "empty-apt"
+        self.apt_root.mkdir()  # no apt.conf.d: the old mirror helper returns without a probe
+        self.bootstrap = tmp_path / "guard-isolation.sh"
+
+    def register_holder(self, pid: int) -> None:
+        """Register the explicit process() holder only in the scoped real-child test."""
+        assert self.real_holder and pid > 1 and pid != os.getpid()
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        assert int(fields[1]) == os.getpid() and fields[0] != "Z"
+        parent = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
+        assert json.loads(self.allowed_children.read_text()) == {}
+        self.allowed_children.write_text(
+            json.dumps(
+                {
+                    str(pid): {
+                        "ppid": os.getpid(),
+                        "start_ticks": fields[19],
+                        "parent_start_ticks": parent[19],
+                    }
+                }
+            )
+            + "\n"
+        )
 
     def busy(self, mib: int = 80327, cards: tuple[int, ...] = (0, 1)) -> None:
         (self.state / "used").write_text("".join(f"{card} {mib}\n" for card in cards))
@@ -50,6 +148,10 @@ class Guard:
         (self.state / "free_after").write_text(str(int(time.time()) + seconds))
 
     def visible(self, pid: int) -> None:
+        if self.real_holder:
+            # Register its own Popen PID without a device fd: only the
+            # process-table kill may end this positive, as on main.
+            self.process(pid, "sleep 300", marker=THIS_JOB, device=None)
         (self.state / "visible_pid").write_text(str(pid))
 
     def listed_app(
@@ -65,8 +167,11 @@ class Guard:
     def process(self, pid: int, command: str, *, marker: str | None, device: str | None) -> None:
         """A process of the scratch /proc: its command line, its environment
         (with a job marker or not) and, when ``device`` is given, an fd on it."""
+        if self.real_holder:
+            self.register_holder(pid)
         directory = self.proc / str(pid)
         (directory / "fd").mkdir(parents=True)
+        (directory / "stat").write_text(f"{pid} (fixture) S 0\n")
         (directory / "cmdline").write_bytes(command.replace(" ", "\0").encode() + b"\0")
         environ = {"HOME": "/home/runner"}
         if marker:
@@ -90,6 +195,19 @@ class Guard:
             "RUNNER_NAME": "runner-new",
             "E2E_JOB_MARKER": THIS_JOB,
         }
+        original_hook = os.environ.get("BASH_ENV")
+        self.bootstrap.write_text(
+            (f"source {shlex.quote(original_hook)}\n" if original_hook else "")
+            + f'kill() {{ {shlex.quote(str(self.bin / "kill"))} "$@"; }}\n'
+            + """command() {
+    if [ "${1-}" = -v ]; then
+        case " ${FAKE_GUARD_MISSING_TOOLS:-} " in *" ${2-} "*) return 1 ;; esac
+    fi
+    builtin command "$@"
+}
+"""
+        )
+        env.update(BASH_ENV=str(self.bootstrap), CI_APT_ROOT=str(self.apt_root))
         started = time.monotonic()
         result = subprocess.run(
             ["bash", str(SCRIPT), "nuke_gpus"], env=env, capture_output=True, text=True, timeout=120
@@ -99,8 +217,17 @@ class Guard:
 
 
 @pytest.fixture
-def guard(tmp_path: Path) -> Guard:
-    return Guard(tmp_path)
+def guard(tmp_path: Path, request: pytest.FixtureRequest) -> Guard:
+    # Only these unchanged upstream positives ask cleanup to end their own
+    # real children. All other existing tests retain a fake-only guard.
+    return Guard(
+        tmp_path,
+        real_holder=request.node.name
+        in {
+            "test_a_visible_holder_is_ended_and_the_cards_pass",
+            "test_a_holder_of_a_device_file_is_ended_through_proc",
+        },
+    )
 
 
 def error_lines(out: str) -> list[str]:
@@ -397,3 +524,63 @@ echo() {
     )
     lines = result.stdout.splitlines()
     assert lines[lines.index(error) + 1 :] == ["GPU 0: 80327 MiB used", "GPU 1: 80327 MiB used"]
+
+
+@pytest.mark.parametrize("fuser_present", [True, False], ids=["fuser-present", "no-holder-tools"])
+def test_cleanup_needs_no_apt_even_when_lsof_is_missing(guard: Guard, monkeypatch, fuser_present):
+    # Keep an executable lsof trap so old-code control runs cannot fall through
+    # to a host utility, while command -v models its absence on the real runner.
+    missing = "lsof" if fuser_present else "lsof fuser"
+    monkeypatch.setenv("FAKE_GUARD_MISSING_TOOLS", missing)
+    result = guard.run(wait=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not guard.apt_calls.exists(), "cleanup attempted a forbidden runtime apt install"
+    assert not guard.network_calls.exists(), "cleanup attempted a forbidden network probe"
+    assert error_lines(result.stdout) == []
+
+
+def test_cleanup_records_only_scratch_device_holders_without_signalling(guard: Guard):
+    guard.process(4242, "python -m fixture.engine", marker=THIS_JOB, device="/dev/nvidia0")
+    guard.process(4243, "python -m fixture.other", marker=OLD_JOB, device="/dev/nvidia1")
+    guard.process(4244, "python -m fixture.cpu", marker=THIS_JOB, device=None)
+    result = guard.run(wait=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert guard.signals.read_text().splitlines() == ["-9", "-9 4242 4243"]
+    assert " S " in (guard.proc / "4244" / "stat").read_text()
+
+
+@pytest.mark.parametrize("identity", ["unregistered", "wrong-start", "wrong-parent"])
+def test_signal_recorder_never_forwards_an_unregistered_or_wrong_identity(
+    guard: Guard, identity: str
+) -> None:
+    holder = subprocess.Popen(["sleep", "300"])
+    try:
+        guard.real_holder = True  # Explicit opt-in only for identity-denial controls.
+        guard.process(holder.pid, "sleep 300", marker=THIS_JOB, device="/dev/nvidia0")
+        allowed = json.loads(guard.allowed_children.read_text())
+        if identity == "unregistered":
+            allowed = {}
+        elif identity == "wrong-start":
+            allowed[str(holder.pid)]["start_ticks"] = "0"
+        else:
+            allowed[str(holder.pid)]["ppid"] = 1
+        guard.allowed_children.write_text(json.dumps(allowed))
+        result = subprocess.run(
+            [str(guard.bin / "kill"), "-9", str(holder.pid)],
+            env={
+                **os.environ,
+                "FAKE_SMI_STATE": str(guard.state),
+                "CI_GPU_GUARD_PROC_ROOT": str(guard.proc),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert holder.poll() is None
+        assert not (guard.state / "forwarded-signals").exists()
+        assert f"-9 {holder.pid}" in guard.signals.read_text().splitlines()
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
