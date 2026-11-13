@@ -236,8 +236,7 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-241 groups, 431 checkpoints, newest first.
-12 ready, 175 replaying a recorded set, 5 on main awaiting fixtures, 49 pending.
+Newest first; the status column reads ready, replaying the set, awaiting fixtures, or pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
