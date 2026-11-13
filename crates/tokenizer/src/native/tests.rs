@@ -66,6 +66,11 @@ const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?
 /// The cased template without the clitic group and with one digit at a
 /// time.
 const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// The cased template whose number rule cuts a run of the numbers (the
+/// decimal digits and the other numerals) into groups of three from its
+/// end, the lookahead closed by a negative lookahead over the numbers,
+/// and a run of one or two beside it.
+const NUMBER_GROUPS: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 /// The digit-grouping split before the cased template: a digit run is cut
 /// into groups of three from its end, the first group taking the
 /// remainder.
@@ -488,6 +493,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[("<think>", false)],
+            stripped: &[],
         },
         // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
         // split on ASCII digits after the map (the reference cuts the mapped
@@ -527,6 +533,22 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[],
+            stripped: &[],
+        },
+        // The cased template with the number rule that cuts a run of the
+        // numbers into groups of three from its end, and a `ByteLevel`
+        // without its regex: a numeral beyond the decimal digits (a
+        // superscript, a fraction, a Roman numeral) counts in the run.
+        Shape {
+            name: "number-groups-in-the-cased-template",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(NUMBER_GROUPS, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[("<think>", false)],
             stripped: &[],
         },
         // The digit-grouping split before the cased template and a
@@ -1361,6 +1383,75 @@ fn a_removed_split_drops_its_matches_as_the_library_does() {
             Ok(reference.get_ids().to_vec()),
             "{text:?}"
         );
+    }
+}
+
+#[test]
+fn number_groups_are_cut_from_the_end_of_a_run_as_the_library_does() {
+    // The number-grouping rule inside the cased template on runs of the
+    // decimal digits of two scripts and of the other numerals, alone and
+    // mixed, of every length up to twelve, beside spaces, letters,
+    // punctuation, a mark, an underscore and a joiner, whole and through
+    // the pool.
+    let mut state = 0x9E5F_0A2B_0000_0003u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "number-groups-in-the-cased-template")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let mut texts: Vec<String> = [
+        "1234 ",
+        "123456",
+        "1234abc",
+        "12,345,678.90",
+        "1 000 000",
+        "x\u{B2}\u{B3}\u{B9}\u{2070}",
+        "\u{2160}\u{2161}\u{2162}\u{2163}\u{2164} ",
+        "1\u{B2}3\u{BD}",
+        "\u{2460}\u{2461}",
+        "\u{663}\u{664}\u{665}\u{666} ",
+        "\u{663}\u{664}\u{665}\u{666}\u{667}\u{668}\u{669} \u{661}\u{662}\u{663}",
+        "1\u{2460}",
+        "x1_",
+        "99\n",
+        "7",
+        "007",
+        "2026-11-12",
+        "v1.2.3",
+        "abc1234",
+        "Hello2World 3rdPlace",
+        "123\u{200D}x",
+        "123_456",
+        "a 1000000 b",
+        "3.14159265358979",
+        "\u{BD}\u{BD}\u{BD}\u{BD} \u{2167}\u{2168}",
+    ]
+    .iter()
+    .map(|text| (*text).to_owned())
+    .collect();
+    let runs: String = (1..=12)
+        .map(|n| {
+            format!(
+                "{} {}a {}_ {}\u{B2} ",
+                "9".repeat(n),
+                "8".repeat(n),
+                "7".repeat(n),
+                "\u{2461}".repeat(n)
+            )
+        })
+        .collect();
+    texts.push(runs.clone());
+    texts.push(runs.repeat(1 + 2 * PARALLEL_MIN_BYTES / runs.len()));
+    for text in &texts {
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "{text:?} parallel {parallel}"
+            );
+        }
     }
 }
 
@@ -4348,6 +4439,17 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
     assert_eq!(
         declined(&ranks, r"\d(?=\d{3}+\z)|[a-z]+|\s", &[]),
         r"a split pattern anchored to its text (\A, \z or \G): \d(?=\d{3}+\z)|[a-z]+|\s"
+    );
+    // A `+` after a bare interval inside the lookahead: a repeat of the
+    // interval to the tokenizers engine, a possessive mark to this file's
+    // own; the grouped repeat means the same to both and stays.
+    assert_eq!(
+        declined(&ranks, r"\p{N}(?=\p{N}{3}+(?!\p{N}))|[a-z]+|\s", &[]),
+        r"a split pattern with a `+` after a bare interval, which the file's own encoder reads as a possessive mark: \p{N}(?=\p{N}{3}+(?!\p{N}))|[a-z]+|\s"
+    );
+    assert!(
+        NativeEncoder::from_ranks(&ranks, r"\p{N}(?=(?:\p{N}{3})+(?!\p{N}))|[a-z]+|\s", &[])
+            .is_ok()
     );
     assert_eq!(
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),

@@ -1772,6 +1772,17 @@ impl NativeEncoder {
                 "a split pattern anchored to its text (\\A, \\z or \\G): {pattern}"
             )));
         }
+        // The file's own encoder reads a `+` after a bare interval as a
+        // possessive mark (one interval, nothing given back), where the
+        // subset reads it as the Hugging Face engine does (a repeat of the
+        // interval): a pattern with one inside the lookahead is declined on
+        // this path.
+        if parsed.repeats_bare_interval() {
+            return Err(Declined::from(format!(
+                "a split pattern with a `+` after a bare interval, which the file's own encoder \
+                 reads as a possessive mark: {pattern}"
+            )));
+        }
         if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
             return Err(Declined::from(format!(
                 "special token {content:?} without content"
