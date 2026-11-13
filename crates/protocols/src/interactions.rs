@@ -35,6 +35,7 @@ pub struct InteractionsRequest {
     pub input: InteractionsInput,
 
     /// System instruction for the model
+    #[serde(alias = "systemInstruction")]
     pub system_instruction: Option<String>,
 
     /// Available tools
@@ -42,9 +43,11 @@ pub struct InteractionsRequest {
     pub tools: Option<Vec<InteractionsTool>>,
 
     /// Response format for structured outputs
+    #[serde(alias = "responseFormat")]
     pub response_format: Option<Value>,
 
     /// MIME type for the response (required if response_format is set)
+    #[serde(alias = "responseMimeType")]
     pub response_mime_type: Option<String>,
 
     /// Whether to stream the response
@@ -60,22 +63,28 @@ pub struct InteractionsRequest {
     pub background: bool,
 
     /// Generation configuration
+    #[serde(alias = "generationConfig")]
     #[validate(nested)]
     pub generation_config: Option<GenerationConfig>,
 
     /// Agent configuration (only applicable when agent is specified)
+    #[serde(alias = "agentConfig")]
     pub agent_config: Option<AgentConfig>,
 
     /// Response modalities (text, image, audio)
+    #[serde(alias = "responseModalities")]
     pub response_modalities: Option<Vec<ResponseModality>>,
 
     /// Link to prior interaction for stateful conversations
+    #[serde(alias = "previousInteractionId")]
     pub previous_interaction_id: Option<String>,
 
     /// The request's other fields (`continuation_token`, `safety_settings`,
     /// `service_tier`, `webhook_config`, `environment`, `labels`,
     /// `cached_content`, and any the API adds), forwarded to the upstream as
-    /// written, as the Messages request's `other` is.
+    /// written, as the Messages request's `other` is. A modeled field takes its
+    /// camelCase spelling as an alias, so that spelling fills the typed field,
+    /// where the gateway's checks read it, and never rides here.
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -1243,6 +1252,51 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A modeled field's camelCase spelling fills the typed field, where the
+    /// gateway's checks read it, and leaves `other` empty; it is written back
+    /// for the upstream in snake_case. A body with both spellings of one field
+    /// is refused.
+    #[test]
+    fn a_modeled_fields_camel_case_spelling_fills_the_typed_field() {
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi", "store": false,
+            "systemInstruction": "be brief",
+            "responseFormat": {"type": "object"},
+            "responseMimeType": "application/json",
+            "generationConfig": {"temperature": 0.5},
+            "responseModalities": ["text"],
+            "previousInteractionId": "int_1"
+        }))
+        .unwrap();
+        assert!(request.other.is_empty(), "{:?}", request.other);
+        assert_eq!(request.system_instruction.as_deref(), Some("be brief"));
+        assert_eq!(
+            request.response_mime_type.as_deref(),
+            Some("application/json")
+        );
+        assert!(request.response_format.is_some());
+        assert!(request.generation_config.is_some());
+        assert!(request.response_modalities.is_some());
+        assert_eq!(request.previous_interaction_id.as_deref(), Some("int_1"));
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["previous_interaction_id"], "int_1");
+        assert!(written.get("previousInteractionId").is_none(), "{written}");
+
+        let agent: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "agent": "deep-research", "input": "hi",
+            "agentConfig": {"type": "deep-research"}
+        }))
+        .unwrap();
+        assert!(agent.agent_config.is_some() && agent.other.is_empty());
+
+        let both = serde_json::from_value::<InteractionsRequest>(serde_json::json!({
+            "model": "m", "input": "hi",
+            "previous_interaction_id": "int_1", "previousInteractionId": "int_2"
+        }));
+        let error = both.expect_err("both spellings of one field").to_string();
+        assert!(error.contains("duplicate field"), "{error}");
+    }
 
     /// The request's fields the gateway does not model are written back for
     /// the upstream as the client sent them: the continuation token of a

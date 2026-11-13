@@ -75,8 +75,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   and any the API adds), forwarded to the upstream as written, as the Messages request's `other`
   keeps its. The Gemini router rebuilds the upstream body from the typed request, which dropped
   them: the safety settings were lost, and a `store: false` client's continuation hop reached the
-  upstream without its token, so each hop started the answer over. Breaking: `InteractionsRequest`
-  gains `other: Map<String, Value>`.
+  upstream without its token, so each hop started the answer over. A modeled field also reads its
+  camelCase spelling (`previousInteractionId`, `systemInstruction`, `generationConfig`, ...) into
+  the typed field, where the gateway's checks see it, and a body with both spellings is refused.
+  Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
