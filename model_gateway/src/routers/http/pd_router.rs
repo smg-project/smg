@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use memchr::memmem;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{GenerationRequest, InputIds},
+    common::{GenerationRequest, InputIds, StringOrArray},
     completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
@@ -241,9 +241,11 @@ impl PdRoute for GenerateRequest {
     const ROUTE: &'static str = "/generate";
 
     fn batch_size(&self) -> Option<usize> {
-        // GenerateRequest doesn't support batch via arrays, only via input_ids
-        match &self.input_ids {
-            Some(InputIds::Batch(batches)) if !batches.is_empty() => Some(batches.len()),
+        // A batch is a list of id sequences or a list of texts, one prompt
+        // each, as the completion route's prompt is.
+        match (&self.input_ids, &self.text) {
+            (Some(InputIds::Batch(batches)), _) if !batches.is_empty() => Some(batches.len()),
+            (_, Some(StringOrArray::Array(texts))) if !texts.is_empty() => Some(texts.len()),
             _ => None,
         }
     }
@@ -257,7 +259,16 @@ impl PdRoute for GenerateRequest {
             // the generate route's validator refuses a negative `input_ids`
             // entry before routing: the cast of a validated id cannot wrap
             Some(ids) => (None, Some(ids.iter().map(|&id| id as u32).collect())),
-            None => (self.text.as_deref().map(str::to_string), None),
+            None => (
+                match &self.text {
+                    Some(StringOrArray::String(text)) => Some(text.clone()),
+                    // a batch is dispatched to one worker, so its first
+                    // prompt is the signal, as the completion route's is
+                    Some(StringOrArray::Array(texts)) => texts.first().cloned(),
+                    None => None,
+                },
+                None,
+            ),
         }
     }
 }
@@ -3230,6 +3241,9 @@ mod tests {
         assert_eq!(batched.batch_size(), Some(2));
         assert!(!batched.returns_logprob());
         assert_eq!(batched.routing_inputs(), (None, Some(vec![1, 2])));
+        let texts: GenerateRequest = req(json!({"text": ["a", "b", "c"]}));
+        assert_eq!(texts.batch_size(), Some(3));
+        assert_eq!(texts.routing_inputs(), (Some("a".to_string()), None));
 
         let chat: ChatCompletionRequest = req(json!({
             "model": "m", "messages": [{"role": "user", "content": "hello"}],

@@ -94,6 +94,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `/generate` request's `text` may be a batch of prompts, a list of texts, as SGLang's
+  `/generate` takes it (`Union[List[str], str]`). A list was refused as `invalid_type` on every
+  router that parses the body. An empty list is refused as an empty `input_ids` is
+  (`empty_array`, param `text`). A batch routes on its texts joined, as a batch of ids routes on
+  its ids, and the PD router counts its prompts for the bootstrap rooms. The gRPC path refuses a
+  batch of texts by name, as it refuses a batch of `input_ids`. Breaking: `GenerateRequest.text`
+  is an `Option<StringOrArray>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

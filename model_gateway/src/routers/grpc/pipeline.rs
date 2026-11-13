@@ -21,7 +21,7 @@ use axum::response::Response;
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
-    common::{InputIds, Usage},
+    common::{InputIds, StringOrArray, Usage},
     completion::CompletionRequest,
     decisions::{DecisionUsage, DecisionsRequest},
     embedding::EmbeddingRequest,
@@ -1217,10 +1217,11 @@ impl RequestPipeline {
         // the request now, before it moves into the context, instead of
         // retaining a handle across dispatch.
         //
-        // `single_prompt` is false for `InputIds::Batch`, but that shape
-        // never reaches here: the preparation stage 400s it first.
-        let single_prompt =
-            request.text.is_some() || matches!(request.input_ids, Some(InputIds::Single(_)));
+        // `single_prompt` is false for `InputIds::Batch` and a batch of
+        // texts, but neither shape gets past the preparation stage, which
+        // 400s them first.
+        let single_prompt = matches!(request.text, Some(StringOrArray::String(_)))
+            || matches!(request.input_ids, Some(InputIds::Single(_)));
         let n = request
             .sampling_params
             .as_ref()

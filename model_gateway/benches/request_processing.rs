@@ -9,6 +9,7 @@ use std::{hint::black_box, time::Instant};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::StringOrArray,
     completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     sampling_params::SamplingParams,
@@ -143,7 +144,9 @@ fn default_completion_request() -> CompletionRequest {
 // Sample request data for benchmarks
 fn create_sample_generate_request() -> GenerateRequest {
     GenerateRequest {
-        text: Some("Write a story about artificial intelligence".to_string()),
+        text: Some(StringOrArray::String(
+            "Write a story about artificial intelligence".to_string(),
+        )),
         sampling_params: Some(SamplingParams {
             max_new_tokens: Some(100),
             temperature: Some(0.8),
@@ -461,17 +464,19 @@ fn bench_throughput_by_size(c: &mut Criterion) {
 
     // Create requests of different sizes
     let small_generate = GenerateRequest {
-        text: Some("Hi".to_string()),
+        text: Some(StringOrArray::String("Hi".to_string())),
         ..default_generate_request()
     };
 
     let medium_generate = GenerateRequest {
-        text: Some("Write a medium length story about AI".repeat(10)),
+        text: Some(StringOrArray::String(
+            "Write a medium length story about AI".repeat(10),
+        )),
         ..default_generate_request()
     };
 
     let large_generate = GenerateRequest {
-        text: Some("Write a very long and detailed story about artificial intelligence and its impact on society".repeat(100)),
+        text: Some(StringOrArray::String("Write a very long and detailed story about artificial intelligence and its impact on society".repeat(100))),
         ..default_generate_request()
     };
 

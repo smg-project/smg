@@ -7,7 +7,7 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_false, invalid, invalid_at, is_false, join_ids,
-        CachePartition, GenerationRequest, InputIds,
+        CachePartition, GenerationRequest, InputIds, StringOrArray,
     },
     sampling_params::SamplingParams,
 };
@@ -23,9 +23,10 @@ use crate::validated::Normalizable;
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
-    /// Text input - the native format
+    /// Text input - the native format: one prompt, or a batch of prompts as
+    /// SGLang's `text` takes it (`Union[List[str], str]`)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
+    pub text: Option<StringOrArray>,
 
     #[serde(
         default = "super::common::default_unknown_model",
@@ -202,6 +203,15 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
         ));
     }
 
+    // An empty batch of texts is no prompt, as an empty list of ids is none.
+    if matches!(&req.text, Some(StringOrArray::Array(texts)) if texts.is_empty()) {
+        return Err(invalid_at(
+            "text",
+            "empty_array",
+            "Invalid 'text': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+        ));
+    }
+
     // An empty list of ids is no prompt, as an empty `messages` is no
     // conversation on the chat route: the same refusal.
     let no_ids = match &req.input_ids {
@@ -275,9 +285,13 @@ impl GenerationRequest for GenerateRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Check fields in priority order: text, input_ids
+        // Check fields in priority order: text, input_ids. A batch of texts
+        // joins them, as a batch of ids joins its ids.
         if let Some(ref text) = self.text {
-            return text.clone();
+            return match text {
+                StringOrArray::String(text) => text.clone(),
+                StringOrArray::Array(texts) => texts.join(" "),
+            };
         }
 
         if let Some(ref input_ids) = self.input_ids {
@@ -439,7 +453,7 @@ mod tests {
     #[test]
     fn routing_tokens_prefer_input_ids_over_text() {
         let mut r = req();
-        r.text = Some("hello".to_string());
+        r.text = Some(StringOrArray::String("hello".to_string()));
         r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
         assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
 
@@ -450,7 +464,7 @@ mod tests {
     #[test]
     fn routing_tokens_none_for_empty_input_ids_with_text() {
         let mut r = req();
-        r.text = Some("hello".to_string());
+        r.text = Some(StringOrArray::String("hello".to_string()));
         r.input_ids = Some(InputIds::Single(vec![]));
         assert_eq!(r.routing_tokens(), None);
         assert_eq!(r.extract_text_for_routing(), "hello");
@@ -626,5 +640,44 @@ mod tests {
         };
         assert_eq!(found[0].code, "invalid_value");
         assert_eq!(found[0].params["field"], "min_new_tokens");
+    }
+
+    /// SGLang's `text` takes a batch of prompts (`Union[List[str], str]`):
+    /// one is read and written back as a list, and routes on its texts
+    /// joined, as a batch of ids routes on its ids. An empty batch is no
+    /// prompt, refused as an empty `input_ids` is.
+    #[test]
+    fn a_generate_request_takes_a_batch_of_texts() {
+        use validator::ValidationErrorsKind;
+
+        let batch: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "text": ["a b", "c"]}))
+                .expect("a batch of texts");
+        assert_eq!(
+            batch.text,
+            Some(StringOrArray::Array(vec![
+                "a b".to_string(),
+                "c".to_string()
+            ]))
+        );
+        assert!(
+            batch.validate().is_ok(),
+            "a batch of texts passes the rules"
+        );
+        assert_eq!(batch.extract_text_for_routing(), "a b c");
+        assert_eq!(
+            serde_json::to_value(&batch).expect("serialize")["text"],
+            serde_json::json!(["a b", "c"])
+        );
+
+        let empty: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "text": []}))
+                .expect("an empty batch parses");
+        let errors = empty.validate().expect_err("an empty batch is refused");
+        let Some(ValidationErrorsKind::Field(found)) = errors.errors().get("__all__") else {
+            panic!("the refusal is a rule over the request: {errors:?}");
+        };
+        assert_eq!(found[0].code, "empty_array");
+        assert_eq!(found[0].params["field"], "text");
     }
 }

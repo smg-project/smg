@@ -167,7 +167,8 @@ impl TenantCharge for CreateMessageRequest {
 
 /// Every token id of every sequence: routing keys on the first sequence of
 /// a batch only, but each is a prompt of its own. Without ids, the words
-/// of its text. A request of `n` samples prefills each prompt once.
+/// of its text, or of each text of a batch. A request of `n` samples
+/// prefills each prompt once.
 impl TenantCharge for GenerateRequest {
     fn estimated_input_tokens(&self, _routing_text: Option<&str>) -> u32 {
         let ids = match &self.input_ids {
@@ -178,7 +179,11 @@ impl TenantCharge for GenerateRequest {
         if ids > 0 {
             return u32::try_from(ids).unwrap_or(u32::MAX);
         }
-        tokens_for_words(self.text.as_deref().map_or(0, word_count))
+        tokens_for_words(
+            self.text
+                .as_ref()
+                .map_or(0, |text| text.iter().map(word_count).sum()),
+        )
     }
 
     fn samples_per_prompt(&self) -> u32 {
@@ -889,7 +894,7 @@ mod tests {
     }
 
     /// Routing keys on the first sequence of a batch; the estimate counts
-    /// them all.
+    /// them all, and the words of every text of a batch of texts.
     #[test]
     fn a_generate_batch_reserves_every_sequence() {
         let batch: GenerateRequest =
@@ -900,6 +905,10 @@ mod tests {
         let leading_empty: GenerateRequest =
             request(json!({"model": "m", "input_ids": [[], [3, 4, 5]]}));
         assert_eq!(leading_empty.estimated_input_tokens(Some("3 4 5")), 3);
+
+        let texts: GenerateRequest =
+            request(json!({"model": "m", "text": ["one two three four", "five six seven"]}));
+        assert_eq!(texts.estimated_input_tokens(None), 10);
     }
 
     #[test]

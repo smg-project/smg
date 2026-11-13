@@ -192,6 +192,46 @@ mod generation_tests {
         ctx.shutdown().await;
     }
 
+    /// SGLang's `/generate` takes a batch of prompts as a list of texts:
+    /// the router reads the body into the typed request, so a list must
+    /// parse to reach the worker, and it reaches the worker as the list.
+    #[tokio::test]
+    async fn test_generate_batch_of_texts_reaches_the_worker_as_a_list() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18115, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18115,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "text": ["The capital of France is", "The capital of Japan is"],
+            "sampling_params": {"max_new_tokens": 4},
+            "stream": false
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let forwarded = recorder.only_body();
+        assert_eq!(
+            forwarded["text"], payload["text"],
+            "the batch reaches the worker as the list: {forwarded}"
+        );
+
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_generate_streaming() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {

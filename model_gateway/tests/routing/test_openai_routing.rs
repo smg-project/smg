@@ -18,6 +18,7 @@ use axum::{
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::StringOrArray,
     completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     responses::{ResponseInput, ResponsesRequest},
@@ -610,7 +611,7 @@ async fn test_unsupported_endpoints() {
         .unwrap();
 
     let generate_request = GenerateRequest {
-        text: Some("Hello world".to_string()),
+        text: Some(StringOrArray::String("Hello world".to_string())),
         model: "unknown".to_string(),
         input_ids: None,
         input_embeds: None,

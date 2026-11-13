@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::{common::InputIds, generate::GenerateRequest};
+use openai_protocol::{
+    common::{InputIds, StringOrArray},
+    generate::GenerateRequest,
+};
 use tracing::error;
 
 use crate::{
@@ -109,7 +112,7 @@ impl GeneratePreparationStage {
         worker_registry: &WorkerRegistry,
         model_id: &str,
     ) -> Result<(Option<String>, Vec<u32>), String> {
-        if let Some(text) = &request.text {
+        if let Some(text) = single_text(request)? {
             return self
                 .tokenize_single_text(tokenizer, text)
                 .await
@@ -149,6 +152,18 @@ impl GeneratePreparationStage {
             .await
             .map_err(|e| format!("Tokenization failed: {e}"))?;
         Ok((text.to_string(), encoding.into_token_ids()))
+    }
+}
+
+/// The request's text when it names one prompt. A batch of texts is refused
+/// by name, as a batch of `input_ids` is: this pipeline sends one prompt.
+fn single_text(request: &GenerateRequest) -> Result<Option<&str>, String> {
+    match &request.text {
+        Some(StringOrArray::String(text)) => Ok(Some(text)),
+        Some(StringOrArray::Array(_)) => {
+            Err("Batch text is not supported over gRPC generate yet".to_string())
+        }
+        None => Ok(None),
     }
 }
 
@@ -219,5 +234,20 @@ mod tests {
             )),
             ["video_data", "audio_data"]
         );
+    }
+
+    /// A batch of texts is refused by name, as a batch of `input_ids` is:
+    /// the pipeline sends one prompt. One text is the prompt, and a body of
+    /// ids names none.
+    #[test]
+    fn a_batch_of_texts_is_refused_by_name() {
+        assert_eq!(
+            single_text(&request(json!({"text": ["a", "b"]}))),
+            Err("Batch text is not supported over gRPC generate yet".to_string())
+        );
+        assert_eq!(single_text(&request(json!({}))), Ok(Some("hi")));
+        let ids: GenerateRequest =
+            serde_json::from_value(json!({"model": "m", "input_ids": [1, 2]})).expect("ids");
+        assert_eq!(single_text(&ids), Ok(None));
     }
 }
