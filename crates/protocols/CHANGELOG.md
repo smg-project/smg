@@ -70,6 +70,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages request's Anthropic-defined tools keep their configuration when the request is
+  written back for an upstream: a web search or web fetch tool's domain filters, use cap and
+  location, a computer tool's display size, a text editor's `max_characters`, and any tool's
+  `defer_loading`, `strict` or `input_examples`. The untagged `Tool` reads every tool with a
+  `type` and a `name` and no `input_schema` as `ToolSearch`, which kept only those two keys,
+  `allowed_callers` and `cache_control`, so the provider route dropped the rest. Breaking:
+  `ToolSearchTool` gains `extra: Map<String, Value>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
