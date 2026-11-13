@@ -184,21 +184,67 @@ pub struct GenerateRequest {
     pub other: Map<String, Value>,
 }
 
+impl GenerateRequest {
+    /// The media fields of the request that carry something: `image_data`,
+    /// `video_data` and `audio_data` when present and naming an item (a null,
+    /// an empty list, or a list of nulls and empty lists is no media, as the
+    /// engine reads it). One definition for every path that reads media.
+    pub fn media_fields(&self) -> Vec<&'static str> {
+        [
+            ("image_data", &self.image_data),
+            ("video_data", &self.video_data),
+            ("audio_data", &self.audio_data),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.as_ref().is_some_and(value_carries_media))
+        .map(|(name, _)| name)
+        .collect()
+    }
+
+    /// Whether a media field of the request carries an item.
+    pub fn carries_media(&self) -> bool {
+        !self.media_fields().is_empty()
+    }
+}
+
+/// Whether `value` names media as the engine reads it: anything but a null,
+/// or a list, nested to any depth, one of whose items does.
+fn value_carries_media(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(items) => items.iter().any(value_carries_media),
+        _ => true,
+    }
+}
+
 impl Normalizable for GenerateRequest {
     // Use default no-op implementation - no normalization needed for GenerateRequest
 }
 
 /// Validation function for GenerateRequest: a body with no prompt at all is
-/// refused, an empty `input_ids` is refused as the chat route refuses an
-/// empty `messages`, and a negative id in `input_ids` is refused.
+/// refused, an empty `text` with no media item is refused (a media-only prompt
+/// is sent with an empty `text`, as the engine reads it; a body with two of
+/// `text`, `input_ids` and `input_embeds` is served, the engine takes the
+/// embeds, then the ids, then the text), an empty `input_ids` is refused as
+/// the chat route refuses an empty `messages`, and a negative id in
+/// `input_ids` is refused.
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
     // A body with no prompt at all is refused. `input_embeds` is a prompt on
-    // the paths that forward the body as-is, and a body with both `text` and
-    // `input_ids` stays with the routers, which read `text` first today.
+    // the paths that forward the body as-is.
     if req.text.is_none() && req.input_ids.is_none() && req.input_embeds.is_none() {
         return Err(invalid(
             "missing_required_parameter",
             "One of 'text', 'input_ids' or 'input_embeds' is required.",
+        ));
+    }
+    // An empty text with no media is no prompt, as the completions route
+    // reads an empty prompt: the same refusal. With a media item it is the
+    // media-only prompt, sent with an empty text as the engine reads it.
+    if req.text.as_deref() == Some("") && !req.carries_media() {
+        return Err(invalid_at(
+            "text",
+            "prompt_empty",
+            "Invalid 'text': empty string. Expected a prompt with minimum length 1, but got an empty string instead.",
         ));
     }
 
@@ -581,22 +627,47 @@ mod tests {
         assert_eq!(found[0].params["field"], "input_ids");
     }
 
-    /// The shapes the routers serve today keep passing the request rule: a
-    /// body with both `text` and `input_ids`, and an `input_embeds`-only body.
-    /// Only a body with no prompt at all is refused, and a cross-field
-    /// sampling rule names its field.
+    /// One prompt per request: a body with `text`, `input_ids` or
+    /// `input_embeds` alone passes, as does a body with two prompts (the
+    /// engine takes the embeds, then the ids, then the text) and an empty
+    /// `text` beside a media item (the media-only prompt); an empty `text`
+    /// alone is refused under `text`, a body with no prompt at all as a rule
+    /// over the request, and a cross-field sampling rule names its field.
     #[test]
-    fn a_generate_request_is_refused_only_without_a_prompt() {
+    fn a_generate_request_is_refused_without_a_prompt_or_with_an_empty_text() {
         use validator::ValidationErrorsKind;
 
         let request = |value: Value| -> GenerateRequest {
             serde_json::from_value(value).expect("a generate request")
         };
         for served in [
-            serde_json::json!({"model": "m", "text": "hi", "input_ids": [1, 2]}),
+            serde_json::json!({"model": "m", "text": "hi"}),
+            serde_json::json!({"model": "m", "input_ids": [1, 2]}),
             serde_json::json!({"model": "m", "input_embeds": [[0.1, 0.2]]}),
+            serde_json::json!({"model": "m", "text": "hi", "input_ids": [1, 2]}),
+            serde_json::json!({"model": "m", "text": "", "audio_data": "a.wav"}),
+            serde_json::json!({"model": "m", "text": "", "image_data": [[null, "a.png"]]}),
         ] {
             assert!(request(served.clone()).validate().is_ok(), "{served}");
+        }
+        for (body, field, code) in [
+            (
+                serde_json::json!({"model": "m", "text": ""}),
+                "text",
+                "prompt_empty",
+            ),
+            (
+                serde_json::json!({"model": "m", "text": "", "audio_data": [null, []]}),
+                "text",
+                "prompt_empty",
+            ),
+        ] {
+            let errors = request(body.clone()).validate().expect_err("refused");
+            let Some(ValidationErrorsKind::Field(found)) = errors.errors().get("__all__") else {
+                panic!("{body}: the refusal is a rule over the request: {errors:?}");
+            };
+            assert_eq!(found[0].code, code, "{body}");
+            assert_eq!(found[0].params["field"], field, "{body}");
         }
 
         let none =
@@ -626,5 +697,52 @@ mod tests {
         };
         assert_eq!(found[0].code, "invalid_value");
         assert_eq!(found[0].params["field"], "min_new_tokens");
+    }
+
+    /// A body names media when one of the three fields carries something; a
+    /// text-only body, a null, an empty list and a list of nulls and empty
+    /// lists do not.
+    #[test]
+    fn the_media_fields_that_carry_something_are_named() {
+        let request = |extra: Value| -> GenerateRequest {
+            let mut body = serde_json::json!({"model": "m", "text": "hi"});
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            serde_json::from_value(body).expect("a generate request")
+        };
+        assert!(request(serde_json::json!({})).media_fields().is_empty());
+        assert!(request(serde_json::json!({"image_data": null}))
+            .media_fields()
+            .is_empty());
+        assert!(request(serde_json::json!({"image_data": []}))
+            .media_fields()
+            .is_empty());
+        assert!(request(serde_json::json!({"image_data": [null]}))
+            .media_fields()
+            .is_empty());
+        assert!(request(serde_json::json!({"video_data": [[]]}))
+            .media_fields()
+            .is_empty());
+        assert!(
+            request(serde_json::json!({"audio_data": [null, [], [null]]}))
+                .media_fields()
+                .is_empty()
+        );
+        assert_eq!(
+            request(serde_json::json!({"image_data": [[null, "a.png"]]})).media_fields(),
+            ["image_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"image_data": "data:image/png;base64,iVBORw0KGgo="}))
+                .media_fields(),
+            ["image_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"video_data": ["clip.mp4"], "audio_data": "a.wav"}))
+                .media_fields(),
+            ["video_data", "audio_data"]
+        );
+        assert!(request(serde_json::json!({"audio_data": "a.wav"})).carries_media());
     }
 }
