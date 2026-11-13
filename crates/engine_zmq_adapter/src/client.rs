@@ -2332,13 +2332,30 @@ mod tests {
     }
 
     /// A port held through every attempt exhausts them, and the panic names
-    /// the bind's own error rather than the neighbours alone.
+    /// the address the last bind failed on with the bind's own error, not
+    /// the neighbours alone.
     #[tokio::test]
-    #[should_panic(expected = "Address already in use")]
     async fn a_port_held_through_every_attempt_puts_the_bind_error_in_the_panic() {
         let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let held = holder.local_addr().unwrap().port();
-        connect_tcp_worker(|| held).await;
+        let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            connect_tcp_worker(|| held),
+        ))
+        .await
+        else {
+            panic!("the worker bound the held port");
+        };
+        let message = *panic
+            .downcast::<String>()
+            .expect("the retry's panic is a formatted message");
+        assert!(
+            message.contains(&format!("the last bind: tcp://127.0.0.1:{held}")),
+            "the panic names the address: {message}"
+        );
+        assert!(
+            message.contains("Address already in use"),
+            "the panic carries the bind's own error: {message}"
+        );
     }
 
     /// A probed port a neighbour took before the worker bound it is probed

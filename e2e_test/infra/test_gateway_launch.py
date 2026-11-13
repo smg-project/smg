@@ -310,8 +310,9 @@ def test_the_wait_holds_for_a_missing_worker_behind_a_data_parallel_count(fake_r
 
 def test_a_data_parallel_fleet_releases_the_wait_once_each_worker_is_registered(fake_router):
     """Each worker registered with two ranks: four entries for two workers
-    release the wait, since the gate is each worker's URL, not a count that
-    would hold out for more workers than were launched."""
+    release the wait, since the gate is each worker's URL. A gate comparing
+    the rank entries with the worker count would never release on a
+    data-parallel fleet, the wait timing out at ``workers: 2/2``."""
     gateway = Gateway()
     try:
         gateway.start(

@@ -193,7 +193,8 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
 
 /// Serve the admin API on `port` until `shutdown` resolves (the drain of a
 /// termination signal): the requests in flight are answered, no new one is
-/// accepted.
+/// accepted. A port another listener holds stops the server before it
+/// serves: the bind failure is logged and the future returns.
 pub async fn serve_until(
     cfg: Arc<Config>,
     host: String,
@@ -207,6 +208,22 @@ pub async fn serve_until(
             return;
         }
     };
+    serve_with_listener_until(cfg, listener, shutdown).await;
+}
+
+/// Serve the admin API on an already-bound listener until the process exits.
+/// A test that needs a free port binds port 0 and reads it back instead of
+/// probing one and binding it later: nothing takes the port in between.
+pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
+    serve_with_listener_until(cfg, listener, pending()).await;
+}
+
+/// [`serve_with_listener`] with the shutdown of [`serve_until`].
+pub async fn serve_with_listener_until(
+    cfg: Arc<Config>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let state = Arc::new(AdminState { cfg });
     if let Err(e) = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
@@ -776,6 +793,68 @@ mod tests {
             "a worker that never served is listed: {:?}",
             fleet_rows(&cfg)
         );
+        drop(taken);
+    }
+
+    /// The admin API serves a listener its caller bound: the port the caller
+    /// read back answers, and the shutdown ends the server.
+    #[tokio::test]
+    async fn the_admin_api_serves_a_listener_the_caller_bound_until_its_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the admin listener");
+        let port = listener.local_addr().expect("address").port();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the server task is joined at the end of the test"
+        )]
+        let server = tokio::spawn(serve_with_listener_until(
+            std::sync::Arc::new(Config::default()),
+            listener,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        crate::tls::install_crypto_provider();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's client; the process TLS crypto provider is installed first"
+        )]
+        let http = reqwest::Client::new();
+        let health = http
+            .get(format!("http://127.0.0.1:{port}/admin/health"))
+            .send()
+            .await
+            .expect("the admin API answers on the port read back");
+        assert_eq!(health.text().await.expect("the body"), "ok");
+        stop.send(()).expect("the server waits on its shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the server stops at its shutdown")
+            .expect("the server task");
+    }
+
+    /// A port another listener holds stops the server before it serves: the
+    /// bind failure is logged and the future returns, which is why a test
+    /// binds the admin listener itself and reads the port back.
+    #[tokio::test]
+    async fn a_taken_admin_port_stops_the_server_before_it_serves() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to occupy");
+        let port = taken.local_addr().expect("address").port();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            serve_until(
+                std::sync::Arc::new(Config::default()),
+                "127.0.0.1".to_string(),
+                port,
+                pending(),
+            ),
+        )
+        .await
+        .expect("the server stops at the bind");
         drop(taken);
     }
 

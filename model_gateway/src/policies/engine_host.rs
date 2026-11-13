@@ -36,6 +36,13 @@
 //! lease (a fresh key is claimed at its decision). The in-flight cap reads
 //! the host's per-key count on each worker, the one the load guard keeps
 //! under the raw key.
+//!
+//! A cache-aware decision reads its affinity through the legacy policy that
+//! holds the model's event index and approximate trees ([`Affinity`]): the
+//! host fills the rows' overlap and warm-up facts and the request's block
+//! hashes from them before the decision, and the seam records the route in
+//! the tree after the commit, so the index stays where it is until the
+//! controller's store takes it over.
 
 use std::{
     cell::RefCell,
@@ -52,8 +59,8 @@ use parking_lot::{Mutex, RwLock};
 use smg_policy_controller::{
     fingerprint,
     spec::{
-        BindingSpec, LeastLoadParams, PlanName, ProfileSpec, ScoreSpec, ScoreStage,
-        MANUAL_SESSION_HEADER,
+        BindingSpec, KvPressureParams, LeastLoadParams, PlanName, PrefixAffinityParams,
+        ProfileSpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER,
     },
     store::{identity, identity_of},
     Assignment, Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId,
@@ -65,11 +72,20 @@ use tracing::debug;
 
 use super::registry::STICKY_INFLIGHT_CAP;
 use crate::{
-    config::{ManualAssignmentMode, PolicyConfig, PowerOfTwoLoadMetric, RoutingKeyOverrideConfig},
-    policies::{host_stores::HostStores, normalize_model_key},
+    config::{
+        CacheIndexKind, ManualAssignmentMode, PolicyConfig, PowerOfTwoLoadMetric,
+        RoutingKeyOverrideConfig,
+    },
+    policies::{
+        cache_aware::{AffinityRow, AffinityRows},
+        cost,
+        host_stores::HostStores,
+        normalize_model_key, CacheAwarePolicy, SelectWorkerInfo,
+    },
     routers::common::pd_admission,
     worker::{
         expected_wait::DEFAULT_MEAN_PREFILL_TOKENS,
+        liveness,
         load_state::{LoadReceiver, LoadSnapshot},
         Worker, WorkerType,
     },
@@ -107,6 +123,9 @@ pub fn preset_name(config: &PolicyConfig) -> Option<&'static str> {
         } => return None,
         PolicyConfig::PowerOfTwo { .. } => "power_of_two",
         PolicyConfig::LeastLoad { .. } => "least_load",
+        PolicyConfig::CacheAware { .. } if cache_aware_unsupported(config).is_none() => {
+            "cache_aware"
+        }
         PolicyConfig::Manual { .. } => "manual",
         _ => return None,
     })
@@ -127,20 +146,67 @@ pub fn encode_preset_name(config: &PolicyConfig) -> Option<&'static str> {
     })
 }
 
-/// The name of what the engine does not carry in `config`, for the error.
-fn unsupported(config: &PolicyConfig) -> EngineHostError {
-    EngineHostError::Unsupported(match config {
+/// The form of a cache-aware configuration the engine does not carry yet,
+/// for the error: the hash index (its placement map is the controller
+/// store's), a selection policy other than the default, a selection
+/// temperature, the overlap decay, the optimistic accounting and the
+/// uncached credit, each a stage parameter the crate refuses as not in this
+/// build. `None` for the default form, which the engine serves.
+fn cache_aware_unsupported(config: &PolicyConfig) -> Option<&'static str> {
+    let PolicyConfig::CacheAware {
+        cache_index,
+        selection_policy,
+        selection_temperature,
+        overlap_decay,
+        selection_accounting_ttl_ms,
+        balance_uncached_credit,
+        ..
+    } = config
+    else {
+        return None;
+    };
+    Some(if *cache_index == CacheIndexKind::Hash {
+        "cache_aware with a hash index"
+    } else if selection_policy
+        .as_deref()
+        .is_some_and(|name| name != cost::DEFAULT_POLICY)
+    {
+        "cache_aware with a selection policy"
+    } else if *selection_temperature > 0.0 {
+        "cache_aware with a selection temperature"
+    } else if *overlap_decay > 0.0 {
+        "cache_aware with overlap decay"
+    } else if *selection_accounting_ttl_ms > 0 {
+        "cache_aware with selection accounting"
+    } else if *balance_uncached_credit {
+        "cache_aware with the uncached credit"
+    } else {
+        return None;
+    })
+}
+
+/// The name of what the engine does not carry in `config`: the policy, or
+/// the form of it (`power_of_two with resident_tokens`, `cache_aware with a
+/// hash index`), for the start-up refusal and the host's error.
+pub(crate) fn unsupported_form(config: &PolicyConfig) -> &'static str {
+    match config {
         PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::ResidentTokens { .. },
         } => "power_of_two with resident_tokens",
+        PolicyConfig::CacheAware { .. } => cache_aware_unsupported(config).unwrap_or("cache_aware"),
         other => other.name(),
-    })
+    }
+}
+
+fn unsupported(config: &PolicyConfig) -> EngineHostError {
+    EngineHostError::Unsupported(unsupported_form(config))
 }
 
 /// The preset profile of one policy configuration with its tunables carried
 /// over: the least-load parameters, and the stages the power-of-two metrics
 /// name (`requests` draws two and compares in-flight counts, `least_requests`
-/// takes the fewest in flight over every candidate).
+/// takes the fewest in flight over every candidate), and the cache-aware
+/// thresholds, gates and warm-up budgets.
 fn profile_of(config: &PolicyConfig) -> Result<ProfileSpec, EngineHostError> {
     let name = preset_name(config).ok_or_else(|| unsupported(config))?;
     let mut profile = PolicySpec::preset(name)?
@@ -220,6 +286,48 @@ fn tune(profile: &mut ProfileSpec, config: &PolicyConfig) {
                 profile.pick = "best".into();
             }
         },
+        // The preset's stages with the configuration's values: the match
+        // threshold, the spill gate and the KV gates as the policy applies
+        // them, the warm-up slice at the process's liveness budgets.
+        PolicyConfig::CacheAware {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            balance_prefix_margin_tokens,
+            balance_token_usage_threshold,
+            overload_token_usage_threshold,
+            ..
+        } => {
+            let warmup = liveness::budgets();
+            profile.score = vec![
+                ScoreSpec::Params(ScoreStage::WarmupSlice(WarmupSliceParams {
+                    weight: 8.0,
+                    secs: Some(warmup.warmup_secs.as_secs()),
+                    share: Some(warmup.warmup_share),
+                    blocks: Some(u64::try_from(warmup.warmup_blocks).unwrap_or(u64::MAX)),
+                    thin_ratio: Some(warmup.warmup_thin_ratio),
+                    divert_every: Some(warmup.warmup_divert_every),
+                    miss_share: Some(*cache_threshold),
+                })),
+                ScoreSpec::Params(ScoreStage::PrefixAffinity(PrefixAffinityParams {
+                    weight: 4.0,
+                    threshold: Some(*cache_threshold),
+                    spill: Some(SpillParams {
+                        abs: Some(u32::try_from(*balance_abs_threshold).unwrap_or(u32::MAX)),
+                        rel: Some(*balance_rel_threshold),
+                        prefix_margin_tokens: Some(*balance_prefix_margin_tokens),
+                        uncached_credit: None,
+                    }),
+                    ..PrefixAffinityParams::default()
+                })),
+                ScoreSpec::Params(ScoreStage::KvPressure(KvPressureParams {
+                    weight: 1.0,
+                    spread: Some(*balance_token_usage_threshold),
+                    ceiling: Some(*overload_token_usage_threshold),
+                })),
+                ScoreSpec::Name(LEAST_LOAD.into()),
+            ];
+        }
         _ => {}
     }
 }
@@ -360,7 +468,62 @@ struct View {
     candidates: Vec<Candidate>,
     decodes: Vec<Candidate>,
     tried: Vec<WorkerId>,
+    /// The partner lists a pair decision has emitted rows for, by address,
+    /// in pair-class order (the class is the index plus one).
+    lists: Vec<usize>,
+    /// One list's open partners under the lifted decode veto, read once
+    /// each for the bar.
+    open_partners: Vec<OpenPartner>,
     scratch: Scratch,
+    /// The affinity rows and block hashes of a cache-aware decision.
+    affinity: AffinityRows,
+}
+
+/// The decode side of a pair decision as the host hands it to
+/// [`Decider::decide_pair`]: each open prefill's partner list, shared between
+/// the prefills of one pairing descriptor, so the decision keys one pair
+/// class per list by `Arc` identity; the live filter over a list's workers,
+/// which reads the decode alone and never the prefill; and whether the
+/// decode pool is over the overload thresholds on every worker with its veto
+/// lifted, in which case a list's rows are its least-loaded open partners
+/// alone (`LoadBar`).
+#[derive(Clone, Copy)]
+pub struct PairPartners<'a, 'p> {
+    pub list: &'a dyn Fn(usize) -> &'p Arc<[Arc<dyn Worker>]>,
+    pub open: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    pub lift_decode: bool,
+}
+
+/// An open partner of a lifted list: its position in the list, whether its
+/// window has a free room, and the host's in-flight count on it.
+struct OpenPartner {
+    at: u32,
+    room: bool,
+    load: usize,
+}
+
+/// The bar a lifted list's rows meet, as the legacy path pairs a decode pool
+/// all over the thresholds by load: among the open partners with a free room
+/// when any has one (every open partner otherwise), the least-loaded alone.
+struct LoadBar {
+    needs_room: bool,
+    load: usize,
+}
+
+impl LoadBar {
+    /// The bar over `open`; `None` when the list leaves no partner open.
+    fn over(open: &[OpenPartner]) -> Option<Self> {
+        let needs_room = open.iter().any(|p| p.room);
+        open.iter()
+            .filter(|p| p.room || !needs_room)
+            .map(|p| p.load)
+            .min()
+            .map(|load| Self { needs_room, load })
+    }
+
+    fn admits(&self, partner: &OpenPartner) -> bool {
+        (partner.room || !self.needs_room) && partner.load == self.load
+    }
 }
 
 /// What a decision reads from the request as the host holds it.
@@ -389,6 +552,20 @@ pub struct HostRequest<'a> {
     /// retired after the draw is booked by neither commit. `None` numbers
     /// the lease when its view is built.
     pub sequence: Option<LeaseId>,
+    /// The index source of a cache-aware decision: the legacy policy's
+    /// event index and approximate trees, read into the view's affinity
+    /// rows and block hashes. `None` for every other policy.
+    pub affinity: Option<Affinity<'a>>,
+}
+
+/// What a cache-aware decision reads its affinity from: the policy that
+/// holds the model's index and trees, and the request as the host read it
+/// (its tokens or text, its cache namespace). The seam records the route
+/// through the same pair after the commit.
+#[derive(Clone, Copy)]
+pub struct Affinity<'a> {
+    pub policy: &'a CacheAwarePolicy,
+    pub info: &'a SelectWorkerInfo<'a>,
 }
 
 /// What the encode items of one request share, as the host holds it: the
@@ -440,6 +617,13 @@ pub struct Decider {
     /// The engine binds an encode profile: the `epd` plan decides the encode
     /// items of an encode-prefill-decode request.
     encode: bool,
+    /// The token-work a pair's request of unknown size is booked at on the
+    /// prefill side: the prefill profile's mean, as the prefill policy
+    /// prices it.
+    mean_prefill_prompt_tokens: u32,
+    /// The same on the decode side: the decode profile's mean, as the
+    /// decode policy prices it.
+    mean_decode_prompt_tokens: u32,
 }
 
 impl std::fmt::Debug for Decider {
@@ -509,6 +693,10 @@ impl Decider {
         }
         spec.profiles
             .insert("default".to_string(), profile_of(default)?);
+        // The block size a held prefix is priced by travels in the request
+        // facts (the index's learned size on an event-fed request, the
+        // configured one on a tree-fed request); the view's own size is the
+        // crate's fallback for a host that sends none, and stays its default.
         // The plan's binding covers its phases (the pair's two, the encode
         // phase too under `epd`); every other phase resolves to the default
         // profile.
@@ -555,6 +743,8 @@ impl Decider {
             seq: AtomicU64::new(1),
             mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
             encode: spec.bindings.iter().any(|b| b.plan == Some(PlanName::Epd)),
+            mean_prefill_prompt_tokens: spec.profiles.get("prefill").map_or(0, mean_prefill_of),
+            mean_decode_prompt_tokens: spec.profiles.get("decode").map_or(0, mean_prefill_of),
         })
     }
 
@@ -624,9 +814,23 @@ impl Decider {
     /// `mean_prefill_tokens`, as the legacy policy prices it; nothing under a
     /// policy that does not price tokens).
     pub fn prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
-        tokens.map_or(self.mean_prompt_tokens, |tokens| {
-            u32::try_from(tokens.len()).unwrap_or(u32::MAX)
-        })
+        counted_or(tokens, self.mean_prompt_tokens)
+    }
+
+    /// [`Self::prompt_tokens`] for a pair's prefill side: a request of
+    /// unknown size is booked at the prefill profile's mean, the prefill
+    /// policy's own estimate; the pair's lease carries it.
+    pub fn prefill_prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
+        counted_or(tokens, self.mean_prefill_prompt_tokens)
+    }
+
+    /// [`Self::prompt_tokens`] for a pair's decode side: a request of
+    /// unknown size is booked on the decode at the decode profile's mean,
+    /// the decode policy's own estimate ([`Self::commit_pair`]), so a
+    /// load-pricing decode behind a load-blind prefill is credited its own
+    /// work and never zero.
+    pub fn decode_prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
+        counted_or(tokens, self.mean_decode_prompt_tokens)
     }
 
     /// Hand the engine the worker monitor's load feed.
@@ -661,6 +865,7 @@ impl Decider {
         worker: &Arc<dyn Worker>,
         has_capacity: bool,
         pair_class: u32,
+        affinity: Option<&AffinityRow>,
     ) -> Candidate {
         let ViewBuild {
             snapshot,
@@ -724,6 +929,11 @@ impl Decider {
             pair_class,
             has_capacity,
             has_room: role != Role::Decode || pd_admission::has_free_room(worker.as_ref()),
+            overlap_blocks: affinity.map_or(0, |row| row.overlap_blocks),
+            predicted_blocks: affinity.map_or(0, |row| row.predicted_blocks),
+            admitted_age_ms: affinity.map_or(0, |row| row.admitted_age_ms),
+            indexed_growth: affinity.map_or(0, |row| row.indexed_growth),
+            indexed_blocks: affinity.map_or(0, |row| row.indexed_blocks),
             ..Candidate::default()
         }
     }
@@ -774,10 +984,15 @@ impl Decider {
                 candidates,
                 tried,
                 scratch,
+                affinity,
                 ..
             } = &mut *view;
             candidates.clear();
             tried.clear();
+            match request.affinity {
+                Some(source) => source.policy.fill_affinity(workers, source.info, affinity),
+                None => affinity.clear(),
+            }
             for (position, worker) in workers.iter().enumerate() {
                 let candidate = self.candidate(
                     &build,
@@ -785,6 +1000,7 @@ impl Decider {
                     worker,
                     request.has_capacity.is_none_or(|has| has(worker)),
                     0,
+                    affinity.rows.get(position),
                 );
                 if request.tried.iter().any(|url| url == worker.base_url()) {
                     tried.push(candidate.id);
@@ -794,7 +1010,11 @@ impl Decider {
             let now_micros = self.micros_since_origin(now);
             let facts = RequestFacts {
                 model: request.model,
+                namespace_seed: affinity.namespace_seed,
                 prompt_tokens: request.prompt_tokens,
+                block_hashes: &affinity.hashes,
+                hash_kind: affinity.hash_kind,
+                block_size: affinity.block_size,
                 session_key,
                 phase: request.phase,
                 attempt: u8::try_from(request.tried.len()).unwrap_or(u8::MAX),
@@ -857,7 +1077,7 @@ impl Decider {
             } = &mut *view;
             candidates.clear();
             for (position, worker) in encoders.iter().enumerate() {
-                let mut row = self.candidate(&build, position as u32, worker, true, 0);
+                let mut row = self.candidate(&build, position as u32, worker, true, 0, None);
                 row.ec_compatible = (request.pairs_with_prefill)(worker);
                 row.vision = (request.vision_capable)(worker);
                 candidates.push(row);
@@ -898,18 +1118,20 @@ impl Decider {
 
     /// Decide a prefill and decode pair: the prefill profile over `prefills`
     /// (with `has_capacity` as the admission window reads it now), the
-    /// decode profile over the partners of the chosen prefill. `partners(i)`
-    /// lists the open partners of `prefills[i]`; the decode rows of each
-    /// prefill form its pair class. The request's tried URLs and `excluded`
-    /// reach both sides. The returned workers are the decode rows in
-    /// position order, for the target's decode side.
+    /// decode profile over the partners of the chosen prefill. The decode
+    /// rows are built once per distinct partner list ([`PairPartners`]):
+    /// prefills sharing a list share its pair class, so a homogeneous fleet
+    /// costs P + D rows and never P x D. Under the decode pool's lifted veto
+    /// a list's rows are its least-loaded open partners alone, the ones with
+    /// a free room first (`LoadBar`). The request's tried URLs and
+    /// `excluded` reach both sides. The returned workers are the decode rows
+    /// in position order, for the target's decode side.
     pub fn decide_pair(
         &self,
         request: &HostRequest<'_>,
         prefills: &[Arc<dyn Worker>],
         has_capacity: CapacityCheck<'_>,
-        partners: &dyn Fn(usize) -> Vec<Arc<dyn Worker>>,
-        lift_decode: bool,
+        partners: PairPartners<'_, '_>,
         excluded: &[WorkerId],
     ) -> (Decision, Lease, Vec<Arc<dyn Worker>>) {
         let now = Instant::now();
@@ -931,28 +1153,73 @@ impl Decider {
                 candidates,
                 decodes,
                 tried,
+                lists,
+                open_partners,
                 scratch,
+                ..
             } = &mut *view;
             candidates.clear();
             decodes.clear();
             tried.clear();
+            lists.clear();
             for (i, prefill) in prefills.iter().enumerate() {
-                let class = i as u32 + 1;
-                let candidate =
-                    self.candidate(&build, i as u32, prefill, has_capacity(prefill), class);
+                // One pair class per distinct list, keyed by the list's
+                // address: the index holds every list for the whole
+                // decision, and the open filter reads the decode alone, so
+                // prefills sharing a list share its rows.
+                let list = (partners.list)(i);
+                let key = Arc::as_ptr(list).cast::<()>().addr();
+                let class = match lists.iter().position(|&seen| seen == key) {
+                    Some(seen) => seen as u32 + 1,
+                    None => {
+                        lists.push(key);
+                        let class = lists.len() as u32;
+                        let mut emit = |decode: &Arc<dyn Worker>| {
+                            let position = decode_workers.len() as u32;
+                            let row = self.candidate(&build, position, decode, true, class, None);
+                            if request.tried.iter().any(|url| url == decode.base_url()) {
+                                tried.push(row.id);
+                            }
+                            decodes.push(row);
+                            decode_workers.push(Arc::clone(decode));
+                        };
+                        if partners.lift_decode {
+                            open_partners.clear();
+                            open_partners.extend(
+                                list.iter()
+                                    .enumerate()
+                                    .filter(|(_, d)| (partners.open)(d))
+                                    .map(|(at, d)| OpenPartner {
+                                        at: at as u32,
+                                        room: pd_admission::has_free_room(d.as_ref()),
+                                        load: d.load(),
+                                    }),
+                            );
+                            if let Some(bar) = LoadBar::over(open_partners) {
+                                for kept in open_partners.iter().filter(|p| bar.admits(p)) {
+                                    emit(&list[kept.at as usize]);
+                                }
+                            }
+                        } else {
+                            for decode in list.iter().filter(|d| (partners.open)(d)) {
+                                emit(decode);
+                            }
+                        }
+                        class
+                    }
+                };
+                let candidate = self.candidate(
+                    &build,
+                    i as u32,
+                    prefill,
+                    has_capacity(prefill),
+                    class,
+                    None,
+                );
                 if request.tried.iter().any(|url| url == prefill.base_url()) {
                     tried.push(candidate.id);
                 }
                 candidates.push(candidate);
-                for decode in partners(i) {
-                    let position = decode_workers.len() as u32;
-                    let row = self.candidate(&build, position, &decode, true, class);
-                    if request.tried.iter().any(|url| url == decode.base_url()) {
-                        tried.push(row.id);
-                    }
-                    decodes.push(row);
-                    decode_workers.push(decode);
-                }
             }
             let now_micros = self.micros_since_origin(now);
             let facts = RequestFacts {
@@ -978,7 +1245,7 @@ impl Decider {
             };
             let decode_cx = Constraints {
                 excluded,
-                overload_lifted: lift_decode,
+                overload_lifted: partners.lift_decode,
                 ..Constraints::default()
             };
             self.engine.decide_pair(
@@ -1003,13 +1270,38 @@ impl Decider {
     /// The commit: walk the ordered targets, take the first one `accept`
     /// re-validates under the host's lock, and feed the engine's accounting
     /// for the target taken, on `side` and, for a pair, on the decode side
-    /// too. `None` when every target missed; the caller re-decides once with
-    /// the misses excluded, then falls back.
+    /// too with the lease's tokens. `None` when every target missed; the
+    /// caller re-decides once with the misses excluded, then falls back.
     pub fn commit(
         &self,
         lease: &Lease,
         decision: &Decision,
         side: Side,
+        accept: impl FnMut(&Target) -> bool,
+    ) -> Option<Target> {
+        self.commit_booking(lease, decision, side, None, accept)
+    }
+
+    /// [`Self::commit`] of a pair decision ([`Self::decide_pair`]): the
+    /// prefill side is booked with the lease's tokens, the decode side with
+    /// `decode_tokens`, each side's own estimate of a request of unknown
+    /// size ([`Self::decode_prompt_tokens`]).
+    pub fn commit_pair(
+        &self,
+        lease: &Lease,
+        decode_tokens: u32,
+        decision: &Decision,
+        accept: impl FnMut(&Target) -> bool,
+    ) -> Option<Target> {
+        self.commit_booking(lease, decision, Side::Prefill, Some(decode_tokens), accept)
+    }
+
+    fn commit_booking(
+        &self,
+        lease: &Lease,
+        decision: &Decision,
+        side: Side,
+        decode_tokens: Option<u32>,
         mut accept: impl FnMut(&Target) -> bool,
     ) -> Option<Target> {
         let pick = decision.pick()?;
@@ -1047,6 +1339,7 @@ impl Decider {
                     if book_decode {
                         let decode = Lease {
                             side: Side::Decode,
+                            tokens: decode_tokens.unwrap_or(booked.tokens),
                             ..booked
                         };
                         self.engine
@@ -1196,6 +1489,13 @@ fn narrow(count: i64) -> u32 {
 }
 
 /// A ratio as the row's permille field.
+/// A prompt's token count when the host has the tokens, else `mean`.
+fn counted_or(tokens: Option<&[u32]>, mean: u32) -> u32 {
+    tokens.map_or(mean, |tokens| {
+        u32::try_from(tokens.len()).unwrap_or(u32::MAX)
+    })
+}
+
 fn permille(ratio: f64) -> u16 {
     (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
@@ -1204,17 +1504,18 @@ fn permille(ratio: f64) -> u16 {
 mod tests {
     use std::sync::{mpsc, Arc};
 
+    use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use openai_protocol::worker::WorkerStatus;
     use tokio::sync::watch;
 
     use super::*;
     use crate::{
         config::types::ManualAssignmentMode,
-        policies::{test_support, PolicyFactory},
+        policies::{test_support, CacheAwareConfig, PolicyFactory},
         worker::{
             load_state::{one_rank_load, LoadSnapshot},
-            test_support::worker_of,
-            BasicWorkerBuilder, Worker,
+            test_support::{no_health_check, worker_of},
+            BasicWorkerBuilder, KvEventMonitor, KvIndex, Worker, WorkerBlocks,
         },
     };
 
@@ -1371,7 +1672,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(carried, 8, "the six presets, power_of_two in three forms");
+        assert_eq!(carried, 9, "the seven presets, power_of_two in three forms");
     }
 
     /// A removed worker's rows leave the engine's accounting with it: work
@@ -1704,7 +2005,7 @@ mod tests {
             session_key: None,
         };
         let row = decider
-            .candidate(&build, 0, &workers[0], true, 0)
+            .candidate(&build, 0, &workers[0], true, 0, None)
             .load
             .expect("a row for a reported worker");
         assert_eq!(
@@ -2043,7 +2344,13 @@ mod tests {
             worker_of("http://d0:8000", WorkerType::Decode),
             worker_of("http://d1:8000", WorkerType::Decode),
         ];
-        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { decodes.to_vec() };
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.to_vec());
+        let list = |_: usize| &all;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
         let tried = [decodes[0].base_url().to_string()];
         let after_d0 = HostRequest {
             phase: Phase::Prefill,
@@ -2061,7 +2368,7 @@ mod tests {
         };
         for _ in 0..20 {
             let (decision, _, _) =
-                decider.decide_pair(&after_d0, &prefills, &|_| true, &partners, false, &[]);
+                decider.decide_pair(&after_d0, &prefills, &|_| true, partners, &[]);
             assert_eq!(
                 decode_of(&decision),
                 Some(1),
@@ -2075,7 +2382,7 @@ mod tests {
         };
         for _ in 0..20 {
             let (decision, _, _) =
-                decider.decide_pair(&fresh, &prefills, &|_| true, &partners, false, &excluded);
+                decider.decide_pair(&fresh, &prefills, &|_| true, partners, &excluded);
             assert_eq!(
                 decode_of(&decision),
                 Some(1),
@@ -2097,11 +2404,15 @@ mod tests {
             worker_of("http://d2:8000", WorkerType::Decode),
         ];
         // p0 partners with d0 alone; p1 with d1 and d2.
-        let partners = |i: usize| -> Vec<Arc<dyn Worker>> {
-            match i {
-                0 => vec![decodes[0].clone()],
-                _ => vec![decodes[1].clone(), decodes[2].clone()],
-            }
+        let lists: [Arc<[Arc<dyn Worker>]>; 2] = [
+            Arc::from(vec![decodes[0].clone()]),
+            Arc::from(vec![decodes[1].clone(), decodes[2].clone()]),
+        ];
+        let list = |i: usize| &lists[i.min(1)];
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
         };
         let request = HostRequest {
             phase: Phase::Prefill,
@@ -2109,14 +2420,14 @@ mod tests {
         };
         for _ in 0..4 {
             let (decision, lease, rows) =
-                decider.decide_pair(&request, &prefills, &|_| true, &partners, false, &[]);
+                decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
             let target = decider
                 .commit(&lease, &decision, Side::Prefill, |_| true)
                 .expect("a pair");
             let pair = target.pair.expect("the decode side");
             let decode = &rows[pair.decode_position as usize];
             assert!(
-                partners(target.position as usize)
+                list(target.position as usize)
                     .iter()
                     .any(|w| w.url() == decode.url()),
                 "the decode is a partner of the chosen prefill"
@@ -2146,14 +2457,19 @@ mod tests {
             (decodes[1].url().to_string(), idle()),
         ]));
         decider.set_load_receiver(Some(rx));
-        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { decodes.to_vec() };
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.to_vec());
+        let list = |_: usize| &all;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
         let request = HostRequest {
             phase: Phase::Prefill,
             prompt_tokens: 512,
             ..request()
         };
-        let (first, lease, _) =
-            decider.decide_pair(&request, &prefills, &|_| true, &partners, false, &[]);
+        let (first, lease, _) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
         let taken = decider
             .commit(&lease, &first, Side::Prefill, |_| true)
             .expect("a pair");
@@ -2162,8 +2478,7 @@ mod tests {
         // picker draws the tie from the seed, so one or three decisions
         // could agree by chance.
         for _ in 0..20 {
-            let (next, _, _) =
-                decider.decide_pair(&request, &prefills, &|_| true, &partners, false, &[]);
+            let (next, _, _) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
             let pair = next
                 .pick()
                 .expect("a pair")
@@ -2178,6 +2493,193 @@ mod tests {
         }
     }
 
+    /// Prefills sharing one partner list (one pairing descriptor, as the
+    /// pair index shares them) share one pair class and one set of decode
+    /// rows: P + D rows, never P x D, and every prefill still pairs within
+    /// the list.
+    #[test]
+    fn prefills_sharing_a_partner_list_share_one_pair_class_and_its_decode_rows() {
+        let decider = decider(&PolicyConfig::RoundRobin);
+        let prefills: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| worker_of(&format!("http://p{i}:8000"), WorkerType::Prefill))
+            .collect();
+        let decodes: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| worker_of(&format!("http://d{i}:8000"), WorkerType::Decode))
+            .collect();
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.clone());
+        let list = |_: usize| &all;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            ..request()
+        };
+        let mut prefills_seen = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let (decision, _, rows) =
+                decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+            assert_eq!(
+                rows.len(),
+                decodes.len(),
+                "one row per decode of the shared list, not per (prefill, decode)"
+            );
+            let target = decision
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .copied()
+                .expect("a target");
+            let pair = target.pair.expect("the decode side");
+            assert!(
+                (pair.decode_position as usize) < rows.len(),
+                "the decode side indexes the shared rows: {target:?}"
+            );
+            prefills_seen.insert(target.position);
+        }
+        assert_eq!(
+            prefills_seen.len(),
+            3,
+            "every prefill pairs: {prefills_seen:?}"
+        );
+    }
+
+    /// A load-blind prefill beside a load-pricing decode, no token count:
+    /// the lease carries the prefill's estimate (nothing) and the decode
+    /// side is booked at the decode profile's own mean, so the booked
+    /// decode carries the credit and the next pairs take the other decode.
+    #[test]
+    fn a_mixed_pair_books_the_decode_side_at_the_decode_profiles_mean() {
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = Decider::from_configs(
+            &PolicyConfig::RoundRobin,
+            &PolicyConfig::RoundRobin,
+            &least_load,
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("carried policies");
+        assert_eq!(
+            decider.prefill_prompt_tokens(None),
+            0,
+            "round robin prices no tokens"
+        );
+        assert_eq!(decider.decode_prompt_tokens(None), 100);
+        assert_eq!(decider.decode_prompt_tokens(Some(&[1, 2, 3])), 3);
+        let prefills = vec![worker_of("http://p0:8000", WorkerType::Prefill)];
+        let decodes = [
+            worker_of("http://d0:8000", WorkerType::Decode),
+            worker_of("http://d1:8000", WorkerType::Decode),
+        ];
+        let idle = || one_rank_load(0, 0.1, 2000.0);
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (prefills[0].url().to_string(), idle()),
+            (decodes[0].url().to_string(), idle()),
+            (decodes[1].url().to_string(), idle()),
+        ]));
+        decider.set_load_receiver(Some(rx));
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.to_vec());
+        let list = |_: usize| &all;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            prompt_tokens: decider.prefill_prompt_tokens(None),
+            ..request()
+        };
+        let (first, lease, _) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+        let taken = decider
+            .commit_pair(&lease, decider.decode_prompt_tokens(None), &first, |_| true)
+            .expect("a pair");
+        let booked = taken.pair.expect("the decode side").decode_position;
+        // Twenty decisions: booked at the prefill's estimate of nothing the
+        // two decodes would tie and the picker would draw the tie from the
+        // seed.
+        for _ in 0..20 {
+            let (next, _, _) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+            let pair = next
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .and_then(|t| t.pair);
+            assert_eq!(
+                pair.map(|p| p.decode_position),
+                Some(1 - booked),
+                "the decode side carries its own credit: {next:?}"
+            );
+        }
+    }
+
+    /// Under the decode pool's lifted veto a list's rows are its least-loaded
+    /// open partners alone, the ones with a free room first: the pair goes
+    /// by load, as the legacy path pairs such a pool, whatever the decode
+    /// picker.
+    #[test]
+    fn a_lifted_decode_list_pairs_its_least_loaded_open_partners_alone() {
+        let decider = decider(&PolicyConfig::RoundRobin);
+        let prefills = vec![worker_of("http://p0:8000", WorkerType::Prefill)];
+        let gated = {
+            let mut labels = HashMap::new();
+            labels.insert("max_running_requests".to_string(), "1".to_string());
+            Arc::new(
+                BasicWorkerBuilder::new("http://d3:8000")
+                    .worker_type(WorkerType::Decode)
+                    .labels(labels)
+                    .health_config(no_health_check())
+                    .build(),
+            ) as Arc<dyn Worker>
+        };
+        let decodes: Vec<Arc<dyn Worker>> = vec![
+            worker_of("http://d0:8000", WorkerType::Decode),
+            worker_of("http://d1:8000", WorkerType::Decode),
+            worker_of("http://d2:8000", WorkerType::Decode),
+            gated,
+        ];
+        decodes[0].increment_load();
+        decodes[0].increment_load();
+        decodes[1].increment_load();
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.clone());
+        let list = |_: usize| &all;
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            ..request()
+        };
+        let rows_of = |open: &dyn Fn(&Arc<dyn Worker>) -> bool, lift_decode: bool| {
+            let partners = PairPartners {
+                list: &list,
+                open,
+                lift_decode,
+            };
+            let (_, _, rows) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+            rows.iter().map(|w| w.url().to_string()).collect::<Vec<_>>()
+        };
+        let d = |i: usize| decodes[i].url().to_string();
+        // No lift: every open partner is a row, in list order.
+        assert_eq!(rows_of(&|_| true, false), [d(0), d(1), d(2), d(3)]);
+        // The lift: the least-loaded open partners alone.
+        assert_eq!(rows_of(&|_| true, true), [d(2), d(3)]);
+        // A partner the filter closes is out before the bar is read.
+        assert_eq!(rows_of(&|w| w.url() != decodes[2].url(), true), [d(3)]);
+        // A partner with a free room comes before a less loaded one whose
+        // window is full; with no room anywhere the bar reads load alone.
+        assert!(decodes[3].try_admit_pd(1, 1), "d3's one room is taken");
+        assert_eq!(rows_of(&|_| true, true), [d(2)]);
+        let d0_or_d3 =
+            |w: &Arc<dyn Worker>| w.url() == decodes[0].url() || w.url() == decodes[3].url();
+        assert_eq!(rows_of(&d0_or_d3, true), [d(0)]);
+        assert_eq!(rows_of(&|w| w.url() == decodes[3].url(), true), [d(3)]);
+    }
+
     #[test]
     fn a_prefill_without_capacity_is_passed_over() {
         let decider = decider(&PolicyConfig::RoundRobin);
@@ -2185,8 +2687,14 @@ mod tests {
             worker_of("http://p0:8000", WorkerType::Prefill),
             worker_of("http://p1:8000", WorkerType::Prefill),
         ];
-        let decode = worker_of("http://d0:8000", WorkerType::Decode);
-        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { vec![decode.clone()] };
+        let decode: Arc<[Arc<dyn Worker>]> =
+            Arc::from(vec![worker_of("http://d0:8000", WorkerType::Decode)]);
+        let list = |_: usize| &decode;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
         let full = prefills[0].url().to_string();
         let has_capacity = |w: &Arc<dyn Worker>| w.url() != full;
         let request = HostRequest {
@@ -2195,7 +2703,7 @@ mod tests {
         };
         for _ in 0..3 {
             let (decision, _, _) =
-                decider.decide_pair(&request, &prefills, &has_capacity, &partners, false, &[]);
+                decider.decide_pair(&request, &prefills, &has_capacity, partners, &[]);
             let first = decision.pick().expect("a pair").targets.first().copied();
             assert_eq!(first.map(|t| t.position), Some(1));
         }
@@ -2571,21 +3079,22 @@ mod tests {
             (decodes[1].url().to_string(), idle()),
         ]));
         decider.set_load_receiver(Some(rx));
-        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { decodes.to_vec() };
+        let decode_list: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.to_vec());
+        let list = |_: usize| &decode_list;
+        let open = |_: &Arc<dyn Worker>| true;
+        let partners = || PairPartners {
+            list: &list,
+            open: &open,
+            lift_decode: false,
+        };
         let pair_request = |prompt_tokens| HostRequest {
             phase: Phase::Prefill,
             prompt_tokens,
             ..request()
         };
         let leading_decode = || {
-            let (decision, _, _) = decider.decide_pair(
-                &pair_request(512),
-                &prefills,
-                &|_| true,
-                &partners,
-                false,
-                &[],
-            );
+            let (decision, _, _) =
+                decider.decide_pair(&pair_request(512), &prefills, &|_| true, partners(), &[]);
             decision
                 .pick()
                 .expect("a pair")
@@ -2596,14 +3105,8 @@ mod tests {
         };
         // One small booking on the second decode first, so the first one
         // leads strictly and the pair below takes it.
-        let (decision, lease, _) = decider.decide_pair(
-            &pair_request(1),
-            &prefills,
-            &|_| true,
-            &partners,
-            false,
-            &[],
-        );
+        let (decision, lease, _) =
+            decider.decide_pair(&pair_request(1), &prefills, &|_| true, partners(), &[]);
         decider
             .commit(&lease, &decision, Side::Prefill, |t| {
                 t.pair.is_some_and(|p| p.decode_position == 1)
@@ -2624,7 +3127,7 @@ mod tests {
             ..pair_request(512)
         };
         let (decision, lease, _) =
-            decider.decide_pair(&under_sequence, &prefills, &|_| true, &partners, false, &[]);
+            decider.decide_pair(&under_sequence, &prefills, &|_| true, partners(), &[]);
         assert_eq!(
             lease.id, sequence,
             "the pair decision runs under the drawn sequence"
@@ -2645,14 +3148,8 @@ mod tests {
             "the retired decode reads idle: no commit under the drawn sequence booked on it"
         );
         // A pair request with no drawn sequence is numbered afresh.
-        let (_, fresh, _) = decider.decide_pair(
-            &pair_request(512),
-            &prefills,
-            &|_| true,
-            &partners,
-            false,
-            &[],
-        );
+        let (_, fresh, _) =
+            decider.decide_pair(&pair_request(512), &prefills, &|_| true, partners(), &[]);
         assert!(
             fresh.id.0 > sequence.0,
             "a pair request without a drawn sequence draws a new one: {:?} after {:?}",
@@ -3099,7 +3596,7 @@ mod tests {
                 session_key: Some("s1"),
             };
             decider
-                .candidate(&build, 0, &workers[0], true, 0)
+                .candidate(&build, 0, &workers[0], true, 0, None)
                 .session_in_flight
         };
         assert_eq!(row(&decider(&manual(ManualAssignmentMode::Random))), 0);
@@ -3315,5 +3812,293 @@ mod tests {
         let (id, key) = worker_identity(worker);
         assert_eq!(id, worker_id(worker), "the id under the store's rule");
         assert_eq!(key, fingerprint(worker.url().as_bytes()) as u32);
+    }
+
+    /// A pair's request of unknown size is booked at the prefill profile's
+    /// mean (the prefill policy's own estimate), whatever the default profile
+    /// prices; a counted prompt is booked as counted.
+    #[test]
+    fn a_pairs_unknown_prompt_size_is_booked_at_the_prefill_profiles_mean() {
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = Decider::from_configs(
+            &PolicyConfig::RoundRobin,
+            &least_load,
+            &least_load,
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("carried policies");
+        assert_eq!(
+            decider.prompt_tokens(None),
+            0,
+            "round robin prices no tokens"
+        );
+        assert_eq!(decider.prefill_prompt_tokens(None), 100);
+        assert_eq!(decider.prefill_prompt_tokens(Some(&[1, 2, 3])), 3);
+    }
+
+    fn cache_aware_config(block_size: usize) -> PolicyConfig {
+        let mut config = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+        if let PolicyConfig::CacheAware {
+            block_size: size, ..
+        } = &mut config
+        {
+            *size = block_size;
+        }
+        config
+    }
+
+    /// The legacy policy that holds the trees and the index, as the registry
+    /// builds it for the configuration.
+    fn cache_aware_policy(block_size: usize) -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            block_size,
+            ..CacheAwareConfig::default()
+        })
+    }
+
+    fn leader(decider: &Decider, request: &HostRequest<'_>, workers: &[Arc<dyn Worker>]) -> u32 {
+        let (decision, _) = decider.decide(request, workers, &[]);
+        decision.pick().expect("a pick").targets.as_slice()[0].position
+    }
+
+    /// A text request reads the approximate tree: the first decision is a
+    /// miss placed by load, its route is recorded for the taken worker, and
+    /// every later decision for the prompt keeps that holder whatever the
+    /// seed; the forms the engine does not carry are refused by name.
+    #[test]
+    fn a_cache_aware_decision_reads_the_tree_match_into_the_view_and_keeps_the_holder() {
+        let decider = decider(&cache_aware_config(16));
+        let policy = cache_aware_policy(16);
+        let workers = pool(2);
+        policy.init_workers(&workers);
+        let text = "the one prompt whose prefix lives on a single worker after the first request";
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            prompt_tokens: decider.prompt_tokens(None),
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        let (decision, lease) = decider.decide(&request, &workers, &[]);
+        let holder = decider
+            .commit(&lease, &decision, Side::Single, |_| true)
+            .expect("placed")
+            .position;
+        policy.record_route(&workers, holder as usize, &info);
+        let mut rows = AffinityRows::default();
+        policy.fill_affinity(&workers, &info, &mut rows);
+        let overlap: Vec<u32> = rows.rows.iter().map(|row| row.overlap_blocks).collect();
+        assert_eq!(overlap[holder as usize], 5, "74 characters at 16 a block");
+        assert_eq!(overlap[1 - holder as usize], 0, "the route alone holds it");
+        assert_eq!(rows.hashes.len(), 4, "the whole windows of the text");
+        assert_eq!(
+            rows.block_size, 16,
+            "the tree path counts at the configured size"
+        );
+        for _ in 0..20 {
+            assert_eq!(
+                leader(&decider, &request, &workers),
+                holder,
+                "the prefix pins the prompt to its holder"
+            );
+        }
+        let mut hashed = cache_aware_config(16);
+        if let PolicyConfig::CacheAware { cache_index, .. } = &mut hashed {
+            *cache_index = CacheIndexKind::Hash;
+        }
+        assert_eq!(preset_name(&hashed), None);
+        assert!(matches!(
+            Decider::from_configs(
+                &hashed,
+                &hashed,
+                &hashed,
+                &RoutingKeyOverrideConfig::default()
+            ),
+            Err(EngineHostError::Unsupported(
+                "cache_aware with a hash index"
+            ))
+        ));
+    }
+
+    /// The configured block size reaches the view: a held prefix is priced
+    /// by it. At 64 tokens a block with a margin price of 8 tokens, a
+    /// one-block holder seven requests deep stays under its margin of 8
+    /// (64 / 8) and keeps the prompt; had the host not carried the
+    /// configured size into the facts, the view's default of 16 would price
+    /// the block at 2, the margin would fall to 4 and the holder would spill.
+    #[test]
+    fn the_configured_block_size_reaches_the_prefix_price_through_the_facts() {
+        let mut config = cache_aware_config(64);
+        if let PolicyConfig::CacheAware {
+            balance_prefix_margin_tokens,
+            ..
+        } = &mut config
+        {
+            *balance_prefix_margin_tokens = 8;
+        }
+        let decider = decider(&config);
+        let policy = cache_aware_policy(64);
+        let workers = pool(3);
+        policy.init_workers(&workers);
+        let tokens: Vec<u32> = (1..=64).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            prompt_tokens: 64,
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        policy.record_route(&workers, 0, &info);
+        for _ in 0..7 {
+            workers[0].increment_load();
+        }
+        for _ in 0..20 {
+            assert_eq!(
+                leader(&decider, &request, &workers),
+                0,
+                "the priced prefix keeps its holder under the gate"
+            );
+        }
+    }
+
+    /// An event-fed request is counted at the index's learned block size
+    /// and its held prefix is priced at that size, not the configured one:
+    /// at a learned 128 under a configuration at 16 with a margin price of
+    /// 16 tokens, a one-block holder seven requests deep stays under its
+    /// margin of 8 (128 / 16) and keeps the prompt; at the configured 16 the
+    /// block would price at 1, the margin would fall to 4 and the holder
+    /// would spill.
+    #[test]
+    fn a_held_prefix_is_priced_at_the_learned_block_size_of_the_event_index() {
+        let mut config = cache_aware_config(16);
+        if let PolicyConfig::CacheAware {
+            balance_prefix_margin_tokens,
+            ..
+        } = &mut config
+        {
+            *balance_prefix_margin_tokens = 16;
+        }
+        let decider = decider(&config);
+        let policy = cache_aware_policy(16);
+        let workers = pool(3);
+        policy.init_workers(&workers);
+        let tokens: Vec<u32> = (1..=128).collect();
+        let indexer = Arc::new(KvIndex::chain());
+        let holder = indexer.intern_worker(workers[0].url()).expect("interned");
+        let blocks = [StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: compute_content_hash(&tokens),
+        }];
+        indexer
+            .apply_stored(holder, &blocks, None, &mut WorkerBlocks::default())
+            .expect("applied");
+        let monitor = Arc::new(KvEventMonitor::new());
+        let model = normalize_model_key(workers[0].model_id()).to_string();
+        monitor.indexers.insert(model.clone(), indexer);
+        monitor.set_block_size(&model, 128);
+        policy.set_kv_event_monitor(Some(monitor));
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            prompt_tokens: 128,
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        for _ in 0..7 {
+            workers[0].increment_load();
+        }
+        for _ in 0..20 {
+            assert_eq!(
+                leader(&decider, &request, &workers),
+                0,
+                "the priced prefix keeps its holder at the learned block size"
+            );
+        }
+    }
+
+    /// A tokenized request on a model with an event index reads the index's
+    /// overlap: the holder of the request's blocks leads every decision, a
+    /// novel prompt is a miss both idle workers take across the seeds.
+    #[test]
+    fn a_cache_aware_decision_reads_the_event_index_overlap_into_the_view() {
+        let decider = decider(&cache_aware_config(4));
+        let policy = cache_aware_policy(4);
+        let workers = pool(2);
+        policy.init_workers(&workers);
+        let indexer = Arc::new(KvIndex::chain());
+        let holder = indexer.intern_worker(workers[1].url()).expect("interned");
+        let blocks: Vec<StoredBlock> = [[1u32, 2, 3, 4], [5, 6, 7, 8]]
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| StoredBlock {
+                seq_hash: SequenceHash(i as u64 + 1),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer
+            .apply_stored(holder, &blocks, None, &mut WorkerBlocks::default())
+            .expect("applied");
+        let monitor = Arc::new(KvEventMonitor::new());
+        monitor.indexers.insert(
+            normalize_model_key(workers[0].model_id()).to_string(),
+            indexer,
+        );
+        policy.set_kv_event_monitor(Some(monitor));
+        let cached = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let info = SelectWorkerInfo {
+            tokens: Some(&cached),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            prompt_tokens: decider.prompt_tokens(Some(&cached)),
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        for _ in 0..20 {
+            assert_eq!(
+                leader(&decider, &request, &workers),
+                1,
+                "the holder of both blocks leads"
+            );
+        }
+        let novel = [101u32, 102, 103, 104, 105, 106, 107, 108];
+        let info = SelectWorkerInfo {
+            tokens: Some(&novel),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request
+        };
+        let seen: std::collections::HashSet<u32> = (0..32)
+            .map(|_| leader(&decider, &request, &workers))
+            .collect();
+        assert_eq!(seen.len(), 2, "a miss is placed by load, both idle");
     }
 }

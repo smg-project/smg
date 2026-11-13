@@ -17,12 +17,14 @@
 //! every keyword is. A property that pins no type, or a schema without properties, takes any text
 //! up to the call's `)`.
 
+use std::sync::Arc;
+
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use super::{
     schema::{joined, keyword, shape, Definitions},
-    CallMarkers, Count, Grammar, Tag,
+    words, CallMarkers, Count, Grammar, Tag,
 };
 use crate::{
     format::Whitespace,
@@ -230,21 +232,11 @@ fn quoted_string() -> Grammar {
 /// A JSON string, as `tojson` writes one.
 fn json_string() -> Grammar {
     Grammar::JsonSchema {
-        schema: json!({"type": "string"}),
+        schema: Arc::new(json!({"type": "string"})),
         style: None,
         excludes: Vec::new(),
         whitespace: Whitespace::Free,
     }
-}
-
-/// One of the words.
-fn words(words: &[&str]) -> Grammar {
-    Grammar::Or(
-        words
-            .iter()
-            .map(|word| Grammar::ConstString(word.to_string()))
-            .collect(),
-    )
 }
 
 /// A value the schema does not type: any text that holds no `)`.

@@ -495,6 +495,7 @@ impl ResponseProcessor {
             (reasoning_parser_available || chat_request.symphony.is_some())
                 .then_some(parsed_reasoning_tokens),
             chat_request.unbilled_prompt_tokens,
+            chat_request.image_tokens,
         );
 
         // Build final ChatCompletionResponse

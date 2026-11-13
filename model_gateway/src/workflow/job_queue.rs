@@ -12,19 +12,19 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
-use wfaas::WorkflowId;
+use wfaas::{StateStore, WorkflowError, WorkflowId, WorkflowStatus};
 
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    worker::endpoint::Endpoint,
+    worker::{endpoint::Endpoint, registry::WorkerId},
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -177,6 +177,13 @@ pub struct JobQueue {
     /// One job per URL, kept while another holds the URL
     /// (`submit_or_defer`) and run by that job's completion (`run_kept`).
     kept: Arc<DashMap<String, Job>>,
+    /// The ids (the ones their `POST /workers` reserved) whose registration a
+    /// `DELETE` ended before the job had saved a workflow state
+    /// (`cancel_registration`): the `POST`'s job reads its own id here before
+    /// and right after it starts the workflow, and clears it when it ends;
+    /// no other kind of registration job owns a mark (`own_mark_id`), so a
+    /// `PUT`'s or a discovery job of the same URL neither takes nor erases it.
+    cancelled_before_start: Arc<DashSet<WorkerId>>,
 }
 
 /// A job handed to the dispatcher with the id of the waiter for its outcome,
@@ -252,6 +259,25 @@ impl std::fmt::Debug for JobQueue {
     }
 }
 
+/// A claimed submission's hold on its own status entry while it waits for a
+/// slot: dropped with its caller before the slot is held (a cancelled request
+/// on a full queue) or ended by a refused submission, it takes the claim back
+/// out, so no pending entry outlives the submission it was made for.
+struct Claim<'a> {
+    status_map: &'a DashMap<String, JobStatus>,
+    url: &'a str,
+    job_type: &'static str,
+    held: bool,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if !self.held {
+            JobQueue::record_own_status(self.status_map, self.url, self.job_type, None);
+        }
+    }
+}
+
 impl JobQueue {
     /// Create a new job queue with semaphore-based concurrency control
     ///
@@ -269,6 +295,7 @@ impl JobQueue {
         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let outcomes: Outcomes = Arc::new(DashMap::new());
         let kept: Arc<DashMap<String, Job>> = Arc::new(DashMap::new());
+        let cancelled_before_start = Arc::new(DashSet::new());
 
         let queue = Arc::new(Self {
             tx,
@@ -278,6 +305,7 @@ impl JobQueue {
             outcomes: outcomes.clone(),
             next_waiter_id: AtomicU64::new(1),
             kept: kept.clone(),
+            cancelled_before_start: cancelled_before_start.clone(),
         });
 
         // Single dispatcher task
@@ -285,6 +313,7 @@ impl JobQueue {
         let status = status_map.clone();
         let sem = concurrency_limit.clone();
         let waiters = outcomes.clone();
+        let marks = cancelled_before_start.clone();
 
         #[expect(
             clippy::disallowed_methods,
@@ -302,6 +331,7 @@ impl JobQueue {
                 let status_clone = status.clone();
                 let waiters_clone = waiters.clone();
                 let kept_clone = kept.clone();
+                let marks_clone = marks.clone();
 
                 #[expect(
                     clippy::disallowed_methods,
@@ -314,6 +344,7 @@ impl JobQueue {
                         status_clone,
                         waiters_clone,
                         kept_clone,
+                        marks_clone,
                         permit,
                     )
                     .await;
@@ -343,24 +374,22 @@ impl JobQueue {
         (queue_depth, available_permits)
     }
 
-    /// Submit unless a job for this URL is already pending or processing.
-    /// Returns `Ok(false)` when an earlier submission is still in flight. The
-    /// status-map entry is taken atomically, so concurrent callers enqueue
-    /// exactly one job per URL (#1533).
-    pub async fn submit_if_idle(&self, job: Job) -> Result<bool, String> {
-        let worker_url = job.worker_url().to_string();
-        let job_type = job.job_type();
-        if !Self::claim(&self.status_map, &worker_url, job_type) {
-            return Ok(false);
-        }
-        self.submit_inner(job, true, None)
-            .await
-            .map(|()| true)
-            .inspect_err(|_| {
-                // A failed submission owns no job, so its claim must not block the
-                // next one; only its own entry goes.
-                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
-            })
+    /// Claim the URL of `job` for it, unless a job of its type is already
+    /// pending or processing there, in which case `false`. The status-map
+    /// entry is taken atomically, so of concurrent callers exactly one holds
+    /// the claim and enqueues, with [`Self::submit_claimed`] (#1533); what
+    /// that caller does between the two (a `POST` reserves the worker id its
+    /// 202 names) is behind the claim, so a caller refused here does none of
+    /// it.
+    pub fn claim_if_idle(&self, job: &Job) -> bool {
+        Self::claim(&self.status_map, job.worker_url(), job.job_type())
+    }
+
+    /// Submit a job whose URL the caller claimed with [`Self::claim_if_idle`].
+    /// A submission refused or dropped before it holds a slot owns no job, so
+    /// its claim goes with it (`submit_inner`'s hold on the entry).
+    pub async fn submit_claimed(&self, job: Job) -> Result<(), String> {
+        self.submit_inner(job, true, None).await
     }
 
     /// Only an in-flight job of the same type counts: the status map is keyed
@@ -388,24 +417,39 @@ impl JobQueue {
     /// guard admit a second registration). Returns `Ok(false)` when one is in
     /// flight; the caller's next occasion submits again. A job of another type
     /// submitted after the claim keeps its entry too: the pending status
-    /// written once a slot is held, the rollback of a failed submission and a
-    /// job's later status writes touch only this job's own entry
-    /// (`record_own_status`).
+    /// written once a slot is held, the claim's return on a refused or dropped
+    /// submission and a job's later status writes touch only this job's own
+    /// entry (`record_own_status`).
     pub async fn submit_unless_in_flight(&self, job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
         let job_type = job.job_type();
         if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
             return Ok(false);
         }
-        self.submit_inner(job, true, None)
-            .await
-            .map(|()| true)
-            .inspect_err(|_| {
-                // A failed submission owns no job, so its claim must not block the
-                // next one; only its own entry goes (another job's, taken during
-                // the wait for a slot, stays with that job).
-                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
-            })
+        self.submit_inner(job, true, None).await.map(|()| true)
+    }
+
+    /// Submit `job` unless a registration (`AddWorker`) is pending or
+    /// processing under its URL: the check and the job's claim are one entry
+    /// operation, and the job's pending status is then written over its own
+    /// entry only, once it holds a slot, so a registration that claims the URL
+    /// during the wait keeps its entry. `Ok(false)` when a registration holds
+    /// the URL; any other entry (another type's, or an ended job's) is taken.
+    pub(crate) async fn submit_unless_registering(&self, job: Job) -> Result<bool, String> {
+        let worker_url = job.worker_url().to_string();
+        let job_type = job.job_type();
+        match self.status_map.entry(worker_url.clone()) {
+            Entry::Occupied(e)
+                if e.get().job_type == "AddWorker"
+                    && matches!(e.get().status.as_str(), "pending" | "processing") =>
+            {
+                return Ok(false);
+            }
+            entry => {
+                entry.insert(JobStatus::pending(job_type, &worker_url));
+            }
+        }
+        self.submit_inner(job, true, None).await.map(|()| true)
     }
 
     /// `submit_unless_in_flight` for a submission that must not be lost: a
@@ -420,13 +464,7 @@ impl JobQueue {
         let job_type = job.job_type();
         loop {
             if Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
-                return self
-                    .submit_inner(job, true, None)
-                    .await
-                    .map(|()| true)
-                    .inspect_err(|_| {
-                        Self::record_own_status(&self.status_map, &worker_url, job_type, None);
-                    });
+                return self.submit_inner(job, true, None).await.map(|()| true);
             }
             self.kept.insert(worker_url.clone(), job);
             if Self::has_in_flight(&self.status_map, &worker_url) {
@@ -455,6 +493,7 @@ impl JobQueue {
         context: &Arc<AppContext>,
         status_map: &Arc<DashMap<String, JobStatus>>,
         kept: &DashMap<String, Job>,
+        cancelled_before_start: &DashSet<WorkerId>,
     ) {
         while let Some((_, job)) = kept.remove(worker_url) {
             let job_type = job.job_type();
@@ -477,8 +516,28 @@ impl JobQueue {
                 Some(JobStatus::processing(job_type, worker_url)),
             );
             let start = std::time::Instant::now();
-            let result = Self::execute_job(&job, context).await;
+            // A kept registration's cancel mark and reservation go as on the
+            // dispatcher's path (`process_job`): the job reads and clears its
+            // own mark, and a failed `POST`'s job releases its reservation
+            // before its status turns terminal.
+            let own_id = Self::own_mark_id(&job, &context.worker_registry);
+            let result =
+                Self::execute_job(&job, context, cancelled_before_start, own_id.as_ref()).await;
+            if result.is_err()
+                && matches!(
+                    job,
+                    Job::AddWorker {
+                        registration_mode: WorkerRegistrationMode::CreateOnly,
+                        ..
+                    }
+                )
+            {
+                context.worker_registry.release_reservation(worker_url);
+            }
             Self::record_job_completion(job_type, worker_url, start.elapsed(), &result, status_map);
+            if let Some(id) = own_id {
+                cancelled_before_start.remove(&id);
+            }
         }
     }
 
@@ -519,7 +578,7 @@ impl JobQueue {
     }
 
     /// `submit`, with the pending status written over this job's own claim
-    /// alone when `claimed` ([`Self::submit_if_idle`],
+    /// alone when `claimed` ([`Self::submit_claimed`],
     /// [`Self::submit_unless_in_flight`]): a job of another type that took the
     /// URL during the wait for a slot keeps its entry, where a plain submission
     /// writes its own over whatever is there. `waiter` is the id of the caller
@@ -530,14 +589,23 @@ impl JobQueue {
         claimed: bool,
         waiter: Option<u64>,
     ) -> Result<(), String> {
+        // Extract values before moving job
+        let job_type = job.job_type();
+        let worker_url = job.worker_url().to_string();
+        // A claimed submission holds its entry only as long as it lives:
+        // ended or dropped before a slot is held, the claim goes with it. A
+        // plain one builds no guard (built eagerly, a guard would drop at once
+        // and take another job's same-type entry with it).
+        let mut claim = claimed.then(|| Claim {
+            status_map: &self.status_map,
+            url: &worker_url,
+            job_type,
+            held: false,
+        });
         // Check if context is still alive before accepting jobs
         let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
         };
-
-        // Extract values before moving job
-        let job_type = job.job_type();
-        let worker_url = job.worker_url().to_string();
         let tokenizer_load = match &job {
             Job::AddTokenizer { config } => Some(config.name.clone()),
             _ => None,
@@ -556,6 +624,9 @@ impl JobQueue {
             ));
         };
 
+        if let Some(claim) = claim.as_mut() {
+            claim.held = true;
+        }
         // Record pending status
         Self::write_pending(&self.status_map, &worker_url, job_type, claimed);
         // A tokenizer load counts as in flight for its model from here (the
@@ -646,6 +717,128 @@ impl JobQueue {
         self.status_map.remove(worker_url);
     }
 
+    /// Cancels the `POST /workers` registration in flight for `worker_url`,
+    /// the one `worker_id` was reserved for, and says how many a `DELETE`
+    /// ends. A workflow the store holds is cancelled (one an earlier `DELETE`
+    /// cancelled, its job not ended yet, counts without a second cancel, so a
+    /// repeated `DELETE` queues no removal); a job that has not saved its
+    /// state yet is marked under `worker_id`, and ends when it reads the mark
+    /// (`execute_job`).
+    /// The cancelled job's end releases the URL's reservation and records its
+    /// status as for any registration that failed (`process_job`). A startup
+    /// or discovery registration of the same URL (`Upsert`) is not the API's
+    /// to end and runs on: none is cancelled, and no mark is set while one
+    /// runs (a `DELETE` then goes to the removal job as before).
+    pub async fn cancel_registration(
+        &self,
+        worker_url: &str,
+        worker_id: &WorkerId,
+    ) -> Result<usize, String> {
+        let Some(context) = self.context.upgrade() else {
+            return Err("Job queue shutting down: AppContext dropped".to_string());
+        };
+        let (cancelled, upsert_running) =
+            Self::cancel_registration_states(&context, worker_url).await?;
+        if cancelled > 0 || upsert_running || !self.add_worker_in_flight(worker_url) {
+            return Ok(cancelled);
+        }
+        // The job is queued, or started and has not saved its state yet. It
+        // may have saved it since the listing above: a second listing catches
+        // that, and the job's own read after its save catches the rest. A job
+        // that ended meanwhile, or an id that no longer names the URL (its
+        // registration over, a new one admitted), takes the mark back.
+        self.cancelled_before_start.insert(worker_id.clone());
+        let (cancelled, upsert_running) =
+            match Self::cancel_registration_states(&context, worker_url).await {
+                Ok(found) => found,
+                Err(message) => {
+                    self.cancelled_before_start.remove(worker_id);
+                    return Err(message);
+                }
+            };
+        if cancelled > 0
+            || upsert_running
+            || !self.add_worker_in_flight(worker_url)
+            || context.worker_registry.get_url_by_id(worker_id).as_deref() != Some(worker_url)
+        {
+            self.cancelled_before_start.remove(worker_id);
+            return Ok(cancelled);
+        }
+        Ok(1)
+    }
+
+    /// Whether the status entry under `url` is a registration job that has
+    /// not ended: queued, or running (the type name of [`Job::job_type`]).
+    fn add_worker_in_flight(&self, url: &str) -> bool {
+        self.status_map.get(url).is_some_and(|status| {
+            status.job_type == "AddWorker"
+                && matches!(status.status.as_str(), "pending" | "processing")
+        })
+    }
+
+    /// Cancels the `POST /workers` registration workflows the store holds for
+    /// `worker_url`: the active ones are cancelled, a cancelled one counts, one
+    /// that ended between the listing and the cancel is skipped. Says how many
+    /// it ended and whether a startup or discovery registration (`Upsert`) of
+    /// the URL is running, which is not the API's to end.
+    async fn cancel_registration_states(
+        context: &AppContext,
+        worker_url: &str,
+    ) -> Result<(usize, bool), String> {
+        let engine = &context
+            .workflow_engines
+            .get()
+            .ok_or_else(|| "Workflow engines not initialized".to_string())?
+            .worker_registration;
+        let states = engine
+            .state_store()
+            .list_all()
+            .await
+            .map_err(|e| format!("Failed to list registration workflows: {e:?}"))?;
+        let mut cancelled = 0;
+        let mut upsert_running = false;
+        for state in states {
+            if state.context.data.config.url != worker_url {
+                continue;
+            }
+            if !matches!(
+                state.context.data.registration_mode,
+                WorkerRegistrationMode::CreateOnly
+            ) {
+                // A `PUT`'s registration (`ReplaceById`) owns no id without a
+                // worker behind it, so it blocks no mark.
+                upsert_running |= matches!(
+                    state.context.data.registration_mode,
+                    WorkerRegistrationMode::Upsert
+                ) && matches!(
+                    state.status,
+                    WorkflowStatus::Pending | WorkflowStatus::Running
+                );
+                continue;
+            }
+            match state.status {
+                WorkflowStatus::Pending | WorkflowStatus::Running => {
+                    match engine.cancel_workflow(state.instance_id).await {
+                        Ok(()) => cancelled += 1,
+                        // Ended between the listing and the cancel: its job's
+                        // end path runs as for any registration that ended.
+                        Err(WorkflowError::NotFound(_)) => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "Failed to cancel registration workflow {}: {e:?}",
+                                state.instance_id
+                            ));
+                        }
+                    }
+                }
+                // Cancelled by an earlier DELETE; its job has not ended yet.
+                WorkflowStatus::Cancelled => cancelled += 1,
+                WorkflowStatus::Paused | WorkflowStatus::Completed | WorkflowStatus::Failed => {}
+            }
+        }
+        Ok((cancelled, upsert_running))
+    }
+
     /// Process a single job with status tracking and error handling
     async fn process_job(
         queued: Queued,
@@ -653,6 +846,7 @@ impl JobQueue {
         status_map: Arc<DashMap<String, JobStatus>>,
         outcomes: Outcomes,
         kept: Arc<DashMap<String, Job>>,
+        cancelled_before_start: Arc<DashSet<WorkerId>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let Queued { job, waiter } = queued;
@@ -684,7 +878,12 @@ impl JobQueue {
         // Execute job
         match context.upgrade() {
             Some(ctx) => {
-                let result = Self::execute_job(&job, &ctx).await;
+                // The id whose cancel mark this job owns (`own_mark_id`), read
+                // before the end path can release the reservation: the mark
+                // the job reads and clears is its own alone.
+                let own_id = Self::own_mark_id(&job, &ctx.worker_registry);
+                let result =
+                    Self::execute_job(&job, &ctx, &cancelled_before_start, own_id.as_ref()).await;
                 let duration = start.elapsed();
                 // Only `POST /workers` (CreateOnly) reserves an id for its 202; a failed
                 // upsert from discovery or startup owns no reservation to drop. Release
@@ -702,8 +901,19 @@ impl JobQueue {
                     ctx.worker_registry.release_reservation(&worker_url);
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
+                // A mark set for this job after its reads is over with it.
+                if let Some(id) = own_id {
+                    cancelled_before_start.remove(&id);
+                }
                 Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
-                Self::run_kept(&worker_url, &ctx, &status_map, &kept).await;
+                Self::run_kept(
+                    &worker_url,
+                    &ctx,
+                    &status_map,
+                    &kept,
+                    &cancelled_before_start,
+                )
+                .await;
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
@@ -721,13 +931,50 @@ impl JobQueue {
         }
     }
 
+    /// The id whose cancel mark a registration job owns: a `POST`'s job
+    /// (`CreateOnly`) owns the id its `POST` reserved, read from the URL's
+    /// mapping itself since the reservation has no worker behind it yet. A
+    /// `PUT`'s job and a startup or discovery registration own none: the mark
+    /// is a `DELETE` of a `POST`'s registration, and a job of another kind
+    /// started under that reservation (a `PUT` queued before the `POST`, a
+    /// discovery pass over the same URL) leaves it for the `POST`'s job.
+    fn own_mark_id(job: &Job, registry: &crate::worker::WorkerRegistry) -> Option<WorkerId> {
+        match job {
+            Job::AddWorker {
+                config,
+                registration_mode: WorkerRegistrationMode::CreateOnly,
+            } => registry.get_id_by_url_or_reservation(&config.url),
+            _ => None,
+        }
+    }
+
+    /// Takes the mark under `own_id`, if there is one: true when a `DELETE`
+    /// ended this registration before its job had saved a workflow state.
+    fn take_mark(marks: &DashSet<WorkerId>, own_id: Option<&WorkerId>) -> bool {
+        own_id.is_some_and(|id| marks.remove(id).is_some())
+    }
+
     /// Execute a specific job
-    async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
+    async fn execute_job(
+        job: &Job,
+        context: &Arc<AppContext>,
+        cancelled_before_start: &DashSet<WorkerId>,
+        own_id: Option<&WorkerId>,
+    ) -> Result<String, String> {
         match job {
             Job::AddWorker {
                 config,
                 registration_mode,
             } => {
+                // A DELETE that came before this job started ended the
+                // registration (`cancel_registration`): the job ends as a
+                // failed one, and its end path releases the URL. Only a POST's
+                // job owns a mark (`own_mark_id`): a PUT's job and a startup
+                // or discovery registration of the same URL read none, so no
+                // other kind can consume a mark meant for the POST's job.
+                if Self::take_mark(cancelled_before_start, own_id) {
+                    return Err("Registration cancelled before it started".to_string());
+                }
                 let engines = context
                     .workflow_engines
                     .get()
@@ -746,6 +993,18 @@ impl JobQueue {
                     .start_workflow(WorkflowId::new("worker_registration"), workflow_data)
                     .await
                     .map_err(|e| format!("Failed to start worker registration workflow: {e:?}"))?;
+                // A DELETE between the read above and the state's save found
+                // no state to cancel and left its mark: the workflow just
+                // started is cancelled here, and the wait below ends with it.
+                if Self::take_mark(cancelled_before_start, own_id) {
+                    engines
+                        .worker_registration
+                        .cancel_workflow(instance_id)
+                        .await
+                        .map_err(|e| {
+                            format!("Failed to cancel worker registration workflow: {e:?}")
+                        })?;
+                }
 
                 debug!(
                     "Started worker registration workflow for {} (instance: {})",
@@ -1504,9 +1763,9 @@ mod tests {
 
     /// A caller whose wait ended leaves the key free: a second wait under
     /// the same key is taken, carries the next waiter id, and is answered
-    /// with its own job's outcome once the dispatcher runs; a wait cancelled
-    /// while the queue is full frees the key the same way. The dispatcher's
-    /// one permit is held until the end, so the queued jobs wait.
+    /// with its own job's outcome once the dispatcher runs. The test holds
+    /// the dispatcher's one permit, so the queued jobs wait, and lets go of
+    /// it once the second wait holds the key.
     #[tokio::test]
     async fn a_second_wait_under_a_freed_key_is_taken_and_answered_with_its_own_outcome() {
         use crate::app_context::testing::app_context_for_tests;
@@ -1546,27 +1805,7 @@ mod tests {
             "the first caller's waiter left with it"
         );
 
-        // One plain submit fills the channel; a wait cancelled while it
-        // waits for a slot leaves nothing under the key either.
-        queue
-            .submit(refresh("http://other:8000"))
-            .await
-            .expect("the one slot");
-        let cancelled = tokio::time::timeout(
-            Duration::from_millis(20),
-            queue.submit_and_wait(refresh(&key), Duration::from_secs(5)),
-        )
-        .await;
-        assert!(
-            cancelled.is_err(),
-            "the wait for a slot outlives its bound: {cancelled:?}"
-        );
-        assert!(
-            queue.outcomes.is_empty(),
-            "the cancelled caller's waiter left with it"
-        );
-
-        // The second wait under the key is taken with the third id; once
+        // The second wait under the key is taken with the second id; once
         // the dispatcher runs, the first job's late outcome reaches nobody
         // and the second wait is answered by its own job.
         let second = queue.submit_and_wait(refresh(&key), Duration::from_secs(5));
@@ -1574,7 +1813,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert_eq!(
                 queue.outcomes.get(&key).map(|waiter| waiter.id),
-                Some(3),
+                Some(2),
                 "the second wait holds the key with the next id"
             );
             drop(held);
@@ -1971,7 +2210,14 @@ mod tests {
             &Ok("done".to_string()),
             &queue.status_map,
         );
-        JobQueue::run_kept(url, &context, &queue.status_map, &queue.kept).await;
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
         assert!(!queue.kept_for(url));
         let status = queue.get_status(url).expect("the kept job's own status");
         assert_eq!(status.job_type, "RemoveWorker");
@@ -2027,18 +2273,62 @@ mod tests {
         }
     }
 
+    /// A same-URL registration job of another kind started under a cancelled
+    /// `POST`'s reservation (a `PUT` queued before the `POST`, a discovery
+    /// pass over the URL) owns no mark and leaves the `POST`'s for the
+    /// `POST`'s own job, which takes it.
+    #[test]
+    fn a_put_or_discovery_job_under_a_cancelled_posts_reservation_leaves_its_mark() {
+        let registry = crate::worker::WorkerRegistry::new();
+        let url = "http://w:8000";
+        let reserved = registry.reserve_id_for_url(url);
+        let marks: DashSet<WorkerId> = DashSet::new();
+        marks.insert(reserved.clone());
+        let job = |mode| Job::AddWorker {
+            config: Box::new(WorkerSpec::new(url)),
+            registration_mode: mode,
+        };
+        for (kind, mode) in [
+            (
+                "a PUT's",
+                WorkerRegistrationMode::ReplaceById {
+                    worker_id: reserved.as_str().to_string(),
+                    expected_revision: 1,
+                },
+            ),
+            ("a discovery", WorkerRegistrationMode::Upsert),
+        ] {
+            let own = JobQueue::own_mark_id(&job(mode), &registry);
+            assert_eq!(own, None, "{kind} job owns no mark");
+            assert!(!JobQueue::take_mark(&marks, own.as_ref()));
+            assert!(marks.contains(&reserved), "{kind} job took the POST's mark");
+        }
+        let own = JobQueue::own_mark_id(&job(WorkerRegistrationMode::CreateOnly), &registry);
+        assert_eq!(
+            own.as_ref(),
+            Some(&reserved),
+            "the POST's job owns its reserved id"
+        );
+        assert!(JobQueue::take_mark(&marks, own.as_ref()));
+        assert!(marks.is_empty());
+    }
+
     /// A submission that fails must not leave its claim behind, or the next
     /// create for the URL would be told a job is in flight when none is (#1533).
     #[tokio::test]
-    async fn failed_submit_if_idle_releases_its_claim() {
+    async fn a_failed_claimed_submission_releases_its_claim() {
         let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
         let job = || Job::AddWorker {
             config: Box::new(WorkerSpec::new("http://w:8000")),
             registration_mode: WorkerRegistrationMode::CreateOnly,
         };
-        assert!(queue.submit_if_idle(job()).await.is_err());
-        // Before the rollback this returned Ok(false): a 202 with no job behind it.
-        assert!(queue.submit_if_idle(job()).await.is_err());
+        assert!(queue.claim_if_idle(&job()));
+        assert!(queue.submit_claimed(job()).await.is_err());
+        // Before the rollback the claim stayed: a 202 with no job behind it.
+        assert!(
+            queue.claim_if_idle(&job()),
+            "a failed submission left its claim"
+        );
     }
 
     /// The queue channel and dispatch semaphore are sized from the config,
@@ -2075,6 +2365,182 @@ mod tests {
         assert_eq!(
             spec_for("http://127.0.0.1:8000", &config).max_connection_attempts,
             30
+        );
+    }
+
+    /// A PATCH's submission unless a registration is in flight: the check and
+    /// the claim are one entry operation, and the update's writes stay on its
+    /// own entry. A registration in flight refuses the update and keeps its
+    /// entry; a registration that claims the URL after the update's claim
+    /// keeps its entry through the update's writes.
+    #[tokio::test]
+    async fn an_update_submitted_unless_registering_leaves_a_registrations_entry() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        // A queue that accepts jobs and never runs one: no slot to run one in.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        let url = "http://w:8003";
+        let update = || Job::UpdateWorker {
+            url: url.to_string(),
+            update: Box::new(WorkerUpdateRequest {
+                priority: None,
+                cost: None,
+                labels: None,
+                api_key: None,
+                health: None,
+            }),
+        };
+        queue.hold_url_for_tests(url, "AddWorker");
+        assert_eq!(queue.submit_unless_registering(update()).await, Ok(false));
+        let entry = queue.get_status(url).expect("the registration's entry");
+        assert_eq!(
+            (entry.job_type.as_str(), entry.status.as_str()),
+            ("AddWorker", "processing")
+        );
+        JobQueue::record_job_completion(
+            "AddWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        assert_eq!(queue.submit_unless_registering(update()).await, Ok(true));
+        let entry = queue.get_status(url).expect("the update's entry");
+        assert_eq!(
+            (entry.job_type.as_str(), entry.status.as_str()),
+            ("UpdateWorker", "pending")
+        );
+        let registration = Job::AddWorker {
+            config: Box::new(WorkerSpec::new(url)),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+        };
+        assert!(
+            queue.claim_if_idle(&registration),
+            "the registration takes the entry"
+        );
+        JobQueue::record_job_completion(
+            "UpdateWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        let entry = queue.get_status(url).expect("the registration's entry");
+        assert_eq!(
+            (entry.job_type.as_str(), entry.status.as_str()),
+            ("AddWorker", "pending")
+        );
+    }
+
+    /// An update job for `url`, the plain shape the tests below submit.
+    fn an_update(url: &str) -> Job {
+        Job::UpdateWorker {
+            url: url.to_string(),
+            update: Box::new(WorkerUpdateRequest {
+                priority: None,
+                cost: None,
+                labels: None,
+                api_key: None,
+                health: None,
+            }),
+        }
+    }
+
+    /// A one-slot queue that is full and runs no job: the dispatcher parks the
+    /// first job on the concurrency limit of zero, the second fills the slot,
+    /// and every later submission waits.
+    async fn a_full_one_slot_queue(context: &Arc<AppContext>) -> Arc<JobQueue> {
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 1,
+                max_concurrent_jobs: 0,
+            },
+            Arc::downgrade(context),
+        );
+        queue
+            .submit(an_update("http://w:8006"))
+            .await
+            .expect("the first job");
+        for _ in 0..1000 {
+            if queue.tx.capacity() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queue.tx.capacity(), 1, "the dispatcher took the first job");
+        queue
+            .submit(an_update("http://w:8007"))
+            .await
+            .expect("the slot");
+        assert_eq!(queue.tx.capacity(), 0, "the queue is full");
+        queue
+    }
+
+    /// A claimed submission dropped inside its wait for a slot (a cancelled
+    /// request on a full queue) leaves no entry under its URL: the claim an
+    /// update made against a registration in flight and a registration's
+    /// typed claim both go with the dropped caller, and the URL takes the
+    /// next claim.
+    #[tokio::test]
+    async fn a_claimed_submission_dropped_in_its_slot_wait_leaves_no_entry() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = a_full_one_slot_queue(&context).await;
+        let url = "http://w:8008";
+        let wait = Duration::from_millis(50);
+        let dropped =
+            tokio::time::timeout(wait, queue.submit_unless_registering(an_update(url))).await;
+        assert!(dropped.is_err(), "the update's submission waits for a slot");
+        assert!(
+            queue.get_status(url).is_none(),
+            "the update's claim went with its caller"
+        );
+
+        let registration = Job::AddWorker {
+            config: Box::new(WorkerSpec::new(url)),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+        };
+        assert!(
+            queue.claim_if_idle(&registration),
+            "the URL takes the next claim"
+        );
+        let dropped = tokio::time::timeout(wait, queue.submit_claimed(registration)).await;
+        assert!(
+            dropped.is_err(),
+            "the registration's submission waits for a slot"
+        );
+        assert!(
+            queue.get_status(url).is_none(),
+            "the registration's claim went with its caller"
+        );
+    }
+
+    /// A plain submission touches no entry before it holds a slot: the entry
+    /// another job holds under the URL survives a plain submission of the
+    /// same type dropped inside its wait on a full queue.
+    #[tokio::test]
+    async fn a_plain_submission_dropped_in_its_slot_wait_leaves_the_entry_it_found() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = a_full_one_slot_queue(&context).await;
+        let url = "http://w:8009";
+        queue.hold_url_for_tests(url, "UpdateWorker");
+        let dropped =
+            tokio::time::timeout(Duration::from_millis(50), queue.submit(an_update(url))).await;
+        assert!(dropped.is_err(), "the plain submission waits for a slot");
+        let entry = queue
+            .get_status(url)
+            .expect("the entry the other job holds");
+        assert_eq!(
+            (entry.job_type.as_str(), entry.status.as_str()),
+            ("UpdateWorker", "processing"),
+            "the entry survives the dropped plain submission"
         );
     }
 }

@@ -234,6 +234,16 @@ async fn recv_abort(engine: &mut MockEngineInput) -> Vec<String> {
     decode_msgpack(frames[1].as_ref()).unwrap()
 }
 
+/// Nothing reaches the scheduler within a grace period.
+async fn assert_engine_idle(engine: &mut MockEngineInput) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), engine.recv_frames())
+            .await
+            .is_err(),
+        "nothing should have reached the scheduler"
+    );
+}
+
 /// The mock scheduler's step for the health probe the servicer sends: its
 /// one token, finished, so nothing lingers.
 async fn answer_probe(engine: &mut MockEngine) {
@@ -1036,8 +1046,9 @@ async fn a_matched_stop_ends_the_second_choice_with_its_own_index() {
     );
     assert!(stream.message().bounded().await.unwrap().is_none());
     // The scheduler gets the abort for the choice the servicer ended, and
-    // only that one.
+    // only that one: nothing follows it.
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r8-1".to_string()]);
+    assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

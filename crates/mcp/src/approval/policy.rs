@@ -488,6 +488,32 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_listed_with_a_title_alone_keeps_the_default_decision() {
+        // The engine reads the entry's approval set, which a listing does not
+        // fill: a tool whose server declared no behaviour hint (a title alone)
+        // gets the default decision, not the refusal the spec's default for an
+        // absent destructive hint would mean. `from_yaml_config` registers no
+        // rule either, so this is the decision without an explicit policy.
+        use rmcp::model::{Tool, ToolAnnotations as RmcpToolAnnotations};
+
+        let mut tool = Tool::new(
+            "create_issue",
+            "Create an issue",
+            Arc::new(serde_json::Map::new()),
+        );
+        tool.annotations = Some(RmcpToolAnnotations::with_title("Create issue"));
+        let entry = crate::inventory::ToolEntry::from_server_tool("issues", tool);
+        let decision = test_engine().evaluate(
+            "issues",
+            "create_issue",
+            &entry.annotations,
+            &TenantContext::new("test"),
+            "req-1",
+        );
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
     fn test_tool_policy() {
         let engine = test_engine().with_tool_policy(
             QualifiedToolName::new("server", "dangerous_tool"),
