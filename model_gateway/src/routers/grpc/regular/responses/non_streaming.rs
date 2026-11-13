@@ -38,6 +38,7 @@ use crate::{
             persist_response_if_needed, NotStored, ReplayInto, ResponsesContext,
         },
     },
+    tenant::storage_tenant,
 };
 
 /// Internal implementation for non-streaming responses
@@ -58,7 +59,7 @@ pub(super) async fn route_responses_internal(
 ) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // 1. Load conversation history (as the caller's tenant may see it) and
     //    build modified request
-    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let tenant = storage_tenant(&params.tenant_request_meta);
     let modified_request = load_history(
         ctx.history_stores(),
         &request,

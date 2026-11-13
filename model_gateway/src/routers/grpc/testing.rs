@@ -30,6 +30,7 @@ use crate::{
     config::{ParserChoice, PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
     policies::PolicyRegistry,
     routers::grpc::context::WorkerSelection,
+    server::http_client,
     worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
 };
 
@@ -96,7 +97,7 @@ pub(crate) fn grpc_ctx_from(
     Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(crate::server::http_client())
+            .client(http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
             .tool_parser_factory(Some(ToolParserFactory::new()))
