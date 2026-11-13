@@ -595,6 +595,7 @@ mod tests {
             ),
             ("inclusionAI/Ling-3.1-flash-1019", Table::Ling),
             ("inclusionAI/Ling-3.0-flash-Sante", Table::Ling),
+            ("ibm-granite/granite-switch-4.1-30b", Table::Qwen2_5),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
