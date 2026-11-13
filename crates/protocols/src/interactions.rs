@@ -312,7 +312,7 @@ pub enum Delta {
         data: Option<String>,
         uri: Option<String>,
         mime_type: Option<AudioMimeType>,
-        /// The channel count and sample rate raw PCM (`audio/l16`) needs
+        /// The audio's channel count and sample rate, as the public API takes them
         channels: Option<u32>,
         sample_rate: Option<u32>,
     },
@@ -693,7 +693,7 @@ pub enum Content {
         data: Option<String>,
         uri: Option<String>,
         mime_type: Option<AudioMimeType>,
-        /// The channel count and sample rate raw PCM (`audio/l16`) needs
+        /// The audio's channel count and sample rate, as the public API takes them
         channels: Option<u32>,
         sample_rate: Option<u32>,
     },

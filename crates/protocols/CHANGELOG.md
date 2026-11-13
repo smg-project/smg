@@ -73,9 +73,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - Interactions content keeps the fields the public API added: an audio part's `channels` and
   `sample_rate` (and an audio delta's), a video part's `processing` and `name`, and a text
   annotation's `type` and that kind's fields (a URL citation's `url` and `title`, a file
-  citation's `file_name` and `page_number`, ...). Each was dropped on the way to the upstream, so
-  raw PCM audio lost the rate and channel count it is decoded with. Breaking: `Content::Audio`,
-  `Delta::Audio` and `Content::Video` gain the fields, and `Annotation` gains `other`.
+  citation's `file_name` and `page_number`, ...). Each was dropped on the way to the upstream.
+  Breaking: `Content::Audio`, `Delta::Audio` and `Content::Video` gain the fields, and
+  `Annotation` gains `other`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
