@@ -617,9 +617,10 @@ fn convert_tool_entry_to_anthropic_tool(entry: &ToolEntry, defer_loading: bool) 
 
 /// The answer's blocks as the assistant turn of the next round's request: each
 /// block in its input form. A block of a kind this build does not read goes
-/// back as the upstream wrote it when the request reads it; one the request
-/// cannot carry is the error, naming its type, so the loop stops before it
-/// runs a tool rather than send the upstream an incomplete history.
+/// back in the input form the request reads it into, so a field the crate does
+/// not model is dropped; one the request cannot carry is the error, naming its
+/// type, so the loop stops before it runs a tool rather than send the upstream
+/// an incomplete history.
 fn build_assistant_content_blocks(
     content: &[ContentBlock],
 ) -> Result<Vec<InputContentBlock>, String> {
@@ -1007,7 +1008,7 @@ mod tests {
     }
 
     /// A block of a kind the answer does not read goes back in the next
-    /// round's history as the upstream wrote it when the request reads it (a
+    /// round's history in its input form when the request reads it (a
     /// `search_result` here, which only the request names); one the request
     /// cannot read either is the loop's error, naming the block, so no tool
     /// runs with a history the upstream would get incomplete.
