@@ -2555,6 +2555,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .native_thinking_mode(template_kwargs, thinking)
     }
 
+    fn template_reads(&self, name: &str) -> bool {
+        self.template_answers().template_reads(name)
+    }
+
     /// Refresh media handling and the tools block only after a replacement
     /// template compiles successfully.
     fn set_chat_template(&mut self, template: String) -> Result<()> {
