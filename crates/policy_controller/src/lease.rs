@@ -87,6 +87,7 @@ pub struct Outcome {
     pub ttft_micros: u32,
     pub tokens_in: u32,
     pub tokens_out: u32,
+    /// Microseconds the dispatch took, saturating at `u32::MAX`, never wrapping.
     pub duration_micros: u32,
 }
 
@@ -101,6 +102,10 @@ pub enum ReleaseReason {
     ClientGone,
     /// The commit refused every target (a removed worker, a lost room).
     CommitFailed,
+    /// The stream rule's grace passed without a completion.
+    Expired,
+    /// An immediate deregistration released the worker's leases.
+    WorkerRemoved,
 }
 
 /// A membership change the host reports.

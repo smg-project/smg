@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use mock_worker::{config::Config, grpc::serve_with_listener};
+use mock_worker::{admin, config::Config, grpc::serve_with_listener};
 use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
 use tokio::net::TcpListener;
 
@@ -48,6 +48,23 @@ pub async fn start(cfg: Config) -> TokenSpeedSchedulerClient {
     TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
         .expect("connect to the mock worker")
+}
+
+/// Serve the admin API beside the process's workers on a port read back from
+/// a listener bound here: the server holds the port before the test reads
+/// it, so a neighbour of the test binary (or of the host) cannot take it
+/// between a probe and the bind.
+pub async fn start_admin(cfg: Config) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the admin listener");
+    let port = listener.local_addr().expect("listener address").port();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the admin server serves until the test process exits"
+    )]
+    let _admin = tokio::spawn(admin::serve_with_listener(Arc::new(cfg), listener));
+    port
 }
 
 /// Send `req` and read every frame of the response.

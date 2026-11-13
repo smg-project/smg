@@ -6,7 +6,9 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
+    common::{
+        AudioUrl, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, ResponseFormat, VideoUrl,
+    },
     profile::ProviderProfile,
 };
 use serde_json::json;
@@ -1119,7 +1121,12 @@ fn tool_choice_none_renders_the_tools_as_auto_does() {
 /// `build_chat_template_kwargs` with the profile the request's model
 /// derives, as the preparation stage carries it.
 fn kwargs_for(request: &ChatCompletionRequest) -> HashMap<String, Value> {
-    build_chat_template_kwargs(request, ProviderProfile::for_model(&request.model), None)
+    build_chat_template_kwargs(
+        request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| true,
+    )
 }
 
 /// `kwargs_for` under a template that reads the `thinking_mode` switch.
@@ -1128,6 +1135,7 @@ fn kwargs_for_switch(request: &ChatCompletionRequest) -> HashMap<String, Value> 
         request,
         ProviderProfile::for_model(&request.model),
         Some(ThinkingKeyName::ThinkingMode),
+        |_| true,
     )
 }
 
@@ -1178,6 +1186,73 @@ fn top_level_effort_overrides_a_chat_template_kwargs_entry() {
     )]));
     let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
+}
+
+/// A control the template never reads is not handed to it: a `response_format`
+/// (its schema copied node by node into the kwarg) or a `tool_choice` the
+/// template has no name for could not reach the prompt. The client's own
+/// entries and the effort pass as before, and a request whose controls are
+/// all unread renders with no kwargs at all.
+#[test]
+fn a_control_the_template_never_reads_is_not_handed_to_it() {
+    let mut request = effort_request(None);
+    request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        json_schema: Box::new(JsonSchemaFormat {
+            name: "answer".to_string(),
+            schema: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            strict: Some(true),
+            description: None,
+        }),
+    });
+    let read_all = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| true,
+    );
+    assert_eq!(read_all[TOOL_CHOICE_KEY], json!("auto"));
+    assert_eq!(
+        read_all[RESPONSE_FORMAT_KEY],
+        serde_json::to_value(request.response_format.as_ref().unwrap()).unwrap()
+    );
+
+    let unread = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| false,
+    );
+    assert!(unread.is_empty(), "{unread:?}");
+    assert_eq!(
+        unread.capacity(),
+        0,
+        "no map for controls the template never reads"
+    );
+    let only_format = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |name| name == RESPONSE_FORMAT_KEY,
+    );
+    assert!(!only_format.contains_key(TOOL_CHOICE_KEY));
+    assert_eq!(
+        only_format[RESPONSE_FORMAT_KEY],
+        read_all[RESPONSE_FORMAT_KEY]
+    );
+
+    request.reasoning_effort = Some("high".to_string());
+    request.chat_template_kwargs = Some(HashMap::from([("custom".to_string(), json!(true))]));
+    let unread = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| false,
+    );
+    assert_eq!(unread.get(REASONING_EFFORT_KEY), Some(&json!("high")));
+    assert_eq!(unread.get("custom"), Some(&json!(true)));
+    assert!(!unread.contains_key(TOOL_CHOICE_KEY));
+    assert!(!unread.contains_key(RESPONSE_FORMAT_KEY));
 }
 
 fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -2491,7 +2566,7 @@ fn resolved_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
 #[test]
 fn the_render_reads_the_carried_profile_not_the_model() {
     let effort_kwarg = |request: &ChatCompletionRequest, provider: ProviderProfile| {
-        build_chat_template_kwargs(request, provider, None)
+        build_chat_template_kwargs(request, provider, None, |_| true)
             .get(REASONING_EFFORT_KEY)
             .cloned()
     };
