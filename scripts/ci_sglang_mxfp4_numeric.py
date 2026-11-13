@@ -23,6 +23,8 @@ INPUT_SIZE = INTERMEDIATE = OUTPUT_SIZE = 64
 ALPHA, CLAMP = 1.702, 7.0
 REL_L2_LIMIT, SCALED_MAX_LIMIT = 0.02, 0.04
 COUNTERFACTUAL_MIN_REL_L2 = 0.05
+# Keep the alpha counterfactual distinguishable on the original biased slices.
+STIMULUS_AMPLITUDE = 2.0
 SUFFIXES = (
     "gate_up_proj_blocks",
     "gate_up_proj_scales",
@@ -198,6 +200,7 @@ def main():
         "status": "failed_or_incomplete",
         "model": MODEL,
         "revision": REVISION,
+        "stimulus_amplitude": STIMULUS_AMPLITUDE,
         "contract": {
             "relative_l2": REL_L2_LIMIT,
             "scaled_max": SCALED_MAX_LIMIT,
@@ -416,9 +419,10 @@ def execute(torch, material, record):
     w2, ref2 = decode("down_proj")
     b13 = material["gate_up_proj_bias"].to(torch.bfloat16)
     b2 = material["down_proj_bias"].to(torch.bfloat16)
-    x = (torch.sin(torch.arange(16 * 64, dtype=torch.float32).reshape(16, 64) * 0.173) * 0.125).to(
-        torch.bfloat16
-    )
+    x = (
+        torch.sin(torch.arange(16 * 64, dtype=torch.float32).reshape(16, 64) * 0.173)
+        * STIMULUS_AMPLITUDE
+    ).to(torch.bfloat16)
 
     def oracle(counter=None, fp32=False):
         def rounded(t):
