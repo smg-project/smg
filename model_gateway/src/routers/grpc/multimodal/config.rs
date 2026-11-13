@@ -413,6 +413,12 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
 }
 
 pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    // Native policy files are authoritative. A malformed file must not select
+    // an unrelated generic policy. The native processor rejects empty defaults.
+    let native_path = base_dir.join("image_preprocessing.json");
+    if native_path.exists() {
+        return load_preprocessor_config_file(&native_path, "image_preprocessing.json");
+    }
     with_feature_extractor_section(load_image_processor_section(base_dir), base_dir)
 }
 
@@ -1128,6 +1134,68 @@ mod tests {
             nested_without_legacy.image_processor_type.as_deref(),
             Some("NestedImageProcessor")
         );
+    }
+
+    fn native_policy() -> serde_json::Value {
+        serde_json::json!({
+            "patch_size":40,
+            "temporal_patch_size":2,
+            "include_extra_column":false,
+            "rescale_image_frac":null,
+            "rescale_image_max_upscaled_long_edge":null,
+            "stretch_to_padded_grid":false,
+            "overlay_rgba_images_on_checkerboard":true,
+            "requires_image_grid_thw":true
+        })
+    }
+
+    #[tokio::test]
+    async fn registry_loads_native_image_preprocessing_policy() {
+        use llm_multimodal::vision::processors::Inkling2ImageProcessor;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.json"),
+            r#"{"model_type":"inkling2_mm_model"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("image_preprocessing.json"),
+            native_policy().to_string(),
+        )
+        .unwrap();
+        // The native file must win over a generic processor policy.
+        fs::write(
+            tmp.path().join("preprocessor_config.json"),
+            r#"{"do_resize":true}"#,
+        )
+        .unwrap();
+        let registry = MultimodalConfigRegistry::new();
+        let loaded = registry
+            .get_or_load("native-policy", tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        Inkling2ImageProcessor::validate_config(&loaded.preprocessor_config).unwrap();
+    }
+
+    #[test]
+    fn missing_or_malformed_native_policy_cannot_use_generic_defaults() {
+        use llm_multimodal::vision::processors::Inkling2ImageProcessor;
+
+        let tmp = TempDir::new().unwrap();
+        let generic = tmp.path().join("preprocessor_config.json");
+        fs::write(&generic, r#"{"do_resize":true}"#).unwrap();
+        let missing = load_image_preprocessor_config(tmp.path()).unwrap();
+        assert!(Inkling2ImageProcessor::validate_config(&missing).is_err());
+        let native = tmp.path().join("image_preprocessing.json");
+        fs::write(&native, "{malformed").unwrap();
+        assert!(load_image_preprocessor_config(tmp.path()).is_none());
+        assert!(Inkling2ImageProcessor::validate_config(&PreProcessorConfig::default()).is_err());
+        let mut policy = native_policy();
+        policy["patch_size"] = serde_json::json!(39);
+        fs::write(&native, policy.to_string()).unwrap();
+        let wrong = load_image_preprocessor_config(tmp.path()).unwrap();
+        assert!(Inkling2ImageProcessor::validate_config(&wrong).is_err());
     }
 
     #[tokio::test]
