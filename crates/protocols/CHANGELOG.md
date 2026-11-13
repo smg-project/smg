@@ -95,6 +95,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
+- `EmbeddingRequest`, `ClassifyRequest`, `TokenizeRequest`, `DetokenizeRequest` and
+  `V1RerankReqInput` implement `Validate` and `Normalizable`, so the gateway reads
+  `/v1/embeddings`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize` and `/v1/rerank` through its
+  validated extractor: a body that does not parse, a body of the wrong type and a failed rule
+  answer the gateway's JSON error envelope (`400`, with `error.code` and `error.param`) where
+  axum's own text/plain `422`, `415` and `400` answered before. `V1RerankReqInput` refuses an
+  empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
+  its `top_n` keeps reading `0` as all documents. The four other types declare no rule.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses

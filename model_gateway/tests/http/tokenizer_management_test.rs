@@ -4,7 +4,9 @@
 //! 400, an empty or whitespace name or source a 400 up front. A loaded
 //! tokenizer keeps its answer shape; a model alias tokenizes as the model it
 //! names; a load that fails stays readable under its id as `failed`, with the
-//! error.
+//! error. The tokenize and detokenize routes refuse in the gateway's public
+//! envelope (`error.code`, `error.param`), as the model routes do: a body the
+//! type does not take is a 400, an unknown model a `404 model_not_found`.
 
 use std::{sync::Arc, time::Duration};
 
@@ -156,7 +158,7 @@ async fn a_loaded_tokenizer_keeps_its_answer_shape() {
 
 /// `POST /v1/tokenize` and `/v1/detokenize` by an alias answer as by the
 /// model the alias names, the way the chat route and the model card read it;
-/// a name no worker carries stays a 400 `tokenizer_not_found`.
+/// a name no worker carries is a `404 model_not_found` in the public envelope.
 #[tokio::test]
 async fn a_model_alias_tokenizes_and_detokenizes_as_the_model_it_names() {
     let (app, context) = app_and_context_with_a_loaded_tokenizer().await;
@@ -180,10 +182,9 @@ async fn a_model_alias_tokenizes_and_detokenizes_as_the_model_it_names() {
         "tokenize by the alias answers as by the model"
     );
     let (status, by_model) = send(&app, "POST", "/v1/detokenize", Some(&detokenize(LOADED))).await;
-    assert_ne!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "detokenize by the model: {by_model}"
+    assert!(
+        !matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND),
+        "detokenize by the model: {status} {by_model}"
     );
     let (status_by_alias, by_alias) = send(
         &app,
@@ -204,8 +205,8 @@ async fn a_model_alias_tokenizes_and_detokenizes_as_the_model_it_names() {
         Some(r#"{"model":"no-such-alias","prompt":"hi"}"#),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
-    assert!(text.contains("tokenizer_not_found"), "{text}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(public_envelope(&text)["code"], "model_not_found", "{text}");
 }
 
 /// An empty or whitespace name is refused before anything is queued: the
@@ -289,4 +290,50 @@ async fn a_failed_load_stays_readable_under_its_id_as_failed() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// The public envelope of a refused request (`error.message`, `type`, `param`,
+/// `code`), or the panic names what the route answered.
+#[expect(
+    clippy::panic,
+    reason = "test helper: a body that is not the envelope is the finding, named with the body"
+)]
+fn public_envelope(text: &str) -> serde_json::Value {
+    let body: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("not the public envelope ({e}): {text}"));
+    assert!(body["error"]["message"].is_string(), "{text}");
+    assert_eq!(body["error"]["type"], "invalid_request_error", "{text}");
+    body["error"].clone()
+}
+
+#[tokio::test]
+async fn a_tokenize_body_the_type_does_not_take_is_a_400_in_the_public_envelope() {
+    let app = app_with_a_loaded_tokenizer().await;
+    let without_prompt = format!(r#"{{"model":"{LOADED}"}}"#);
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(&without_prompt)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let error = public_envelope(&text);
+    assert_eq!(error["code"], "missing_required_parameter", "{text}");
+    assert_eq!(error["param"], "prompt", "{text}");
+
+    let unknown_model = r#"{"model":"no-such-model","prompt":"hello"}"#;
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(unknown_model)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(public_envelope(&text)["code"], "model_not_found", "{text}");
+}
+
+#[tokio::test]
+async fn a_detokenize_body_of_the_wrong_type_is_a_400_in_the_public_envelope() {
+    let app = app_with_a_loaded_tokenizer().await;
+    let words_for_ids = format!(r#"{{"model":"{LOADED}","tokens":["a"]}}"#);
+    let (status, text) = send(&app, "POST", "/v1/detokenize", Some(&words_for_ids)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let error = public_envelope(&text);
+    assert_eq!(error["code"], "invalid_type", "{text}");
+    assert_eq!(error["param"], "tokens", "{text}");
+
+    let unknown_model = r#"{"model":"no-such-model","tokens":[1,2]}"#;
+    let (status, text) = send(&app, "POST", "/v1/detokenize", Some(unknown_model)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(public_envelope(&text)["code"], "model_not_found", "{text}");
 }
