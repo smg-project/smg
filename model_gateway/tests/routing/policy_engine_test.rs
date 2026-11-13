@@ -76,11 +76,19 @@ async fn placed_through_the_engine(
     decider: Decider<'_>,
 ) {
     let name = decider.name().to_owned();
+    let documented = matches!(decider, Decider::Document(..));
     let ctx = AppTestContext::new_with_config(
         decider.config(port),
         TestWorkerConfig::healthy_workers(worker_port, workers),
     )
     .await;
+    if documented {
+        assert_eq!(
+            ctx.app_context.policy_registry.get_default_policy().name(),
+            "random",
+            "{name}: a document's registry stands over the neutral configuration, not the flags'"
+        );
+    }
     let app = ctx.create_app();
     let requests = 20;
     let mut placed = 0;

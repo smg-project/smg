@@ -103,6 +103,9 @@ pub enum EngineHostError {
     /// yet.
     #[error("the policy engine does not carry the stages of {0} yet")]
     Unsupported(&'static str),
+    /// A session header a document names that the HTTP layer cannot read.
+    #[error("the document's session header {0:?} is not an HTTP header name")]
+    SessionHeader(String),
     #[error(transparent)]
     Spec(#[from] SpecError),
 }

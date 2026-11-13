@@ -42,7 +42,7 @@ use smg::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
-    policies::PolicyRegistry,
+    app_context::policy_registry_for,
     routers::{gateway::Gateway, RouterFactory, RouterTrait},
     worker::{
         BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
@@ -481,10 +481,7 @@ async fn build_test_app_context(
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(
-        PolicyRegistry::with_override(config.policy.clone(), config.routing_key_override.clone())
-            .with_policy_engine_for(config.policy_engine, &config.mode, &config.policy),
-    );
+    let policy_registry = Arc::new(policy_registry_for(&config).expect("the policy registry"));
 
     // Initialize storage backends (Memory for tests, unless the caller brought
     // its own: a history store that is down, for one).

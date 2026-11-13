@@ -19,7 +19,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
 
 use crate::{
-    config::{ParserChoice, RouterConfig},
+    config::{ParserChoice, PolicyConfig, RouterConfig, RoutingKeyOverrideConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::{host_stores::HostStores, PolicyRegistry},
@@ -274,6 +274,31 @@ fn read_policy_spec(path: &std::path::Path) -> Result<PolicySpec, String> {
         serde_yaml::from_str(&text).map_err(|error| error.to_string())
     }
     .map_err(|error| format!("--policy-spec {}: {error}", path.display()))
+}
+
+/// The policy registry of `config`: the flags' policies, with the engine
+/// behind `--policy-engine engine`; or, when `--policy-spec` names a
+/// document, the document's engine over a neutral legacy configuration (the
+/// flags a document stands in for are refused by the validator or read as
+/// unset, so no instance of theirs is built). One constructor for the
+/// gateway and its test harness. A document the engine refuses, or one that
+/// cannot be read, is the error, naming the path and the field.
+pub fn policy_registry_for(config: &RouterConfig) -> Result<PolicyRegistry, String> {
+    let registry = match &config.policy_spec {
+        Some(path) => {
+            PolicyRegistry::with_override(PolicyConfig::Random, RoutingKeyOverrideConfig::default())
+                .with_pd_pairing_mode(config.pd_pairing_mode)
+                .with_policy_spec(&read_policy_spec(path)?)
+                .map_err(|error| format!("--policy-spec {}: {error}", path.display()))?
+        }
+        None => PolicyRegistry::with_override(
+            config.policy.clone(),
+            config.routing_key_override.clone(),
+        )
+        .with_pd_pairing_mode(config.pd_pairing_mode)
+        .with_policy_engine_for(config.policy_engine, &config.mode, &config.policy),
+    };
+    Ok(registry)
 }
 
 impl AppContextBuilder {
@@ -824,25 +849,10 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create policy registry: the engine behind `--policy-engine engine`
-    /// from the flags, or, when `--policy-spec` names a document, the
-    /// document's engine, read and applied here so a document the engine
-    /// refuses stops the start naming the field it refused.
+    /// Create policy registry ([`policy_registry_for`]): a document the
+    /// engine refuses stops the start naming the field it refused.
     fn with_policy_registry(mut self, config: &RouterConfig) -> Result<Self, String> {
-        let registry = PolicyRegistry::with_override(
-            config.policy.clone(),
-            config.routing_key_override.clone(),
-        )
-        .with_pd_pairing_mode(config.pd_pairing_mode);
-        let registry = match &config.policy_spec {
-            Some(path) => registry
-                .with_policy_spec(&read_policy_spec(path)?)
-                .map_err(|error| format!("--policy-spec {}: {error}", path.display()))?,
-            None => {
-                registry.with_policy_engine_for(config.policy_engine, &config.mode, &config.policy)
-            }
-        };
-        self.policy_registry = Some(Arc::new(registry));
+        self.policy_registry = Some(Arc::new(policy_registry_for(config)?));
         Ok(self)
     }
 
@@ -1622,6 +1632,7 @@ policy:
         let under = |path: &std::path::Path| {
             RouterConfig::builder()
                 .policy_engine(PolicyEngineMode::Engine)
+                .policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
                 .maybe_policy_spec(Some(path.to_path_buf()))
                 .build_unchecked()
         };
@@ -1631,6 +1642,12 @@ policy:
                 .expect("the document's engine");
             let registry = built.policy_registry.expect("a registry");
             assert!(registry.decider().is_some(), "{}", path.display());
+            assert_eq!(
+                registry.get_default_policy().name(),
+                "random",
+                "{}: the neutral legacy default, not the flags' cache_aware",
+                path.display()
+            );
         }
 
         let missing = dir.path().join("absent.yaml");

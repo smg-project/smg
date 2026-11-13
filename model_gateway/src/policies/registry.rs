@@ -376,10 +376,17 @@ impl PolicyRegistry {
     }
 
     /// Host the engine of `spec`, the `--policy-spec` document, in place of
-    /// the one the policy configuration describes: the apply at start. A
-    /// document the engine refuses is the caller's error, naming the field.
+    /// the one the policy configuration describes: the apply at start. The
+    /// registry then resolves a request's routing key from the headers the
+    /// document's bindings read a session key from (the gateway's own default
+    /// header stays for a document without sessions). A document the engine
+    /// refuses is the caller's error, naming the field.
     pub fn with_policy_spec(mut self, spec: &PolicySpec) -> Result<Self, EngineHostError> {
         let decider = Decider::from_spec(spec)?;
+        let headers = session_headers_of(spec)?;
+        if !headers.is_empty() {
+            self.routing_key_headers = Arc::new(headers);
+        }
         self.host(decider);
         Ok(self)
     }
@@ -1472,6 +1479,26 @@ impl std::fmt::Debug for PolicyRegistry {
             )
             .finish()
     }
+}
+
+/// The headers a document's bindings read a session key from, in binding
+/// order with each binding's sticky header first and every name once.
+fn session_headers_of(spec: &PolicySpec) -> Result<Vec<HeaderName>, EngineHostError> {
+    let mut names: Vec<HeaderName> = Vec::new();
+    for sessions in spec
+        .bindings
+        .iter()
+        .filter_map(|binding| binding.sessions.as_ref())
+    {
+        for name in std::iter::once(&sessions.sticky_header).chain(sessions.headers.iter()) {
+            let header = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| EngineHostError::SessionHeader(name.clone()))?;
+            if !names.contains(&header) {
+                names.push(header);
+            }
+        }
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -3689,5 +3716,26 @@ mod tests {
             .expect_err("an unknown scorer is refused")
             .to_string();
         assert!(error.contains("unknown scorer \"nope\""), "{error}");
+    }
+
+    /// Under a document whose binding keeps sessions, the registry resolves
+    /// a request's routing key from the document's session header, not from
+    /// the command line's list.
+    #[test]
+    fn with_policy_spec_resolves_the_documents_session_header() {
+        let mut spec = PolicySpec::preset("round_robin").expect("a preset document");
+        spec.view.headers.push("x-session-id".to_string());
+        spec.bindings[0].sessions =
+            Some(serde_json::from_str(r#"{"sticky_header":"x-session-id"}"#).expect("a rule"));
+        let registry = PolicyRegistry::new(PolicyConfig::Random)
+            .with_policy_spec(&spec)
+            .expect("the document's engine");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "k-1".parse().expect("a header value"));
+        assert_eq!(registry.resolve_routing_key(Some(&headers)), Some("k-1"));
+        assert_eq!(
+            registry.routing_key_header().map(HeaderName::as_str),
+            Some("x-session-id")
+        );
     }
 }

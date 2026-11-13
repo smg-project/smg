@@ -496,7 +496,71 @@ pub const POLICIES_THE_ENGINE_CARRIES: &str = "random, round_robin, passthrough,
     (expected_wait, requests, least_requests), least_load, manual and cache_aware in its default \
     form";
 
+/// The name `--policy` defaults to on the command line (main.rs pins it).
+/// The document rule reads this value as unset: this base keeps no record of
+/// which flags were given, so only a `--policy` off this default is a
+/// disagreement with a document the gateway can see.
+pub const CLI_DEFAULT_POLICY: &str = "cache_aware";
+
 impl ConfigValidator {
+    /// The first stage of the document-beside-flags rule. `--policy-spec`
+    /// stands in for the flags that choose and tune a policy, so one set
+    /// beside a document is refused by name, naming the document: `--policy`
+    /// off its command-line default ([`CLI_DEFAULT_POLICY`] reads as unset),
+    /// `--routing-key-override` and `--routing-key-headers` (read with the
+    /// override off too). On this base the pair sides still decide
+    /// through `--prefill-policy` and `--decode-policy` past any engine, so a
+    /// document is refused under the pair modes until the pair decider reads
+    /// it. A later stage reads the given flags themselves and compiles the
+    /// agreeing ones into the document.
+    fn validate_policy_spec_conflicts(config: &RouterConfig, path: &Path) -> ConfigResult<()> {
+        let document = path.display();
+        if matches!(
+            config.mode,
+            RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+        ) {
+            return Err(ConfigError::invalid_value(
+                "policy_spec",
+                document.to_string(),
+                "a document decides the regular path on this release: under a prefill-decode or \
+                 encode-prefill-decode deployment the pair sides read --prefill-policy and \
+                 --decode-policy, so --policy-spec is refused there until the pair decider \
+                 reads the document",
+            ));
+        }
+        if config.policy.name() != CLI_DEFAULT_POLICY {
+            return Err(ConfigError::invalid_value(
+                "policy",
+                config.policy.name(),
+                format!(
+                    "--policy-spec {document} stands in for --policy: drop the flag, or write the \
+                     profile under profiles: and bind it in the document"
+                ),
+            ));
+        }
+        if config.routing_key_override.enabled {
+            return Err(ConfigError::invalid_value(
+                "routing_key_override",
+                "enabled",
+                format!(
+                    "--policy-spec {document} stands in for --routing-key-override: drop it, or \
+                     write the sessions rule into the document's binding"
+                ),
+            ));
+        }
+        if config.routing_key_override.headers != RoutingKeyOverrideConfig::default().headers {
+            return Err(ConfigError::invalid_value(
+                "routing_key_override.headers",
+                config.routing_key_override.headers.join(","),
+                format!(
+                    "--policy-spec {document} stands in for --routing-key-headers: drop it, or \
+                     write the names under the binding's sessions.headers"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Under `--policy-engine engine` every policy that decides (the default,
     /// the two pair sides and, under encode-prefill-decode, the encode side)
     /// is one whose stages the engine carries in this build, and the engine
@@ -505,8 +569,9 @@ impl ConfigValidator {
     /// to the legacy path.
     ///
     /// A `--policy-spec` document needs the engine and stands in for the
-    /// flags' policies, so none of them is checked under it: the document is
-    /// read and validated where it is applied, at start.
+    /// flags' policies: [`Self::validate_policy_spec_conflicts`] refuses the
+    /// ones set beside it; the document itself is read and validated where it
+    /// is applied, at start.
     fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(path) = &config.policy_spec {
             if config.policy_engine != PolicyEngineMode::Engine {
@@ -517,7 +582,7 @@ impl ConfigValidator {
                      specification",
                 ));
             }
-            return Ok(());
+            return Self::validate_policy_spec_conflicts(config, path);
         }
         if config.policy_engine != PolicyEngineMode::Engine {
             return Ok(());
@@ -2852,35 +2917,84 @@ mod tests {
         assert!(ConfigValidator::validate(&legacy).is_ok());
     }
 
-    /// `--policy-spec` is the engine's: under the legacy default it is
-    /// refused by name, and under the engine it stands in for the flags'
-    /// policies, so a policy the engine does not carry passes beside it.
+    /// `--policy-spec` is the engine's and stands in for the flags: under the
+    /// legacy default it is refused by name; under the engine the command-line
+    /// default of `--policy` passes as unset, a `--policy` off it,
+    /// `--routing-key-override` and `--routing-key-headers` are refused naming
+    /// the document, and the pair modes refuse a document on this base.
     #[test]
-    fn a_policy_spec_needs_the_engine_and_stands_in_for_the_flags_policies() {
-        let config = RouterConfig {
-            policy_spec: Some(std::path::PathBuf::from("/etc/smg/policy/spec.yaml")),
+    fn a_policy_spec_needs_the_engine_and_refuses_the_flags_it_stands_in_for() {
+        let path = "/etc/smg/policy/spec.yaml";
+        let refusal = |config: &RouterConfig| -> (String, String, String) {
+            let error = ConfigValidator::validate(config).expect_err("refused");
+            let text = error.to_string();
+            match error {
+                ConfigError::InvalidValue { field, value, .. } => (field, value, text),
+                _ => (String::new(), String::new(), text),
+            }
+        };
+        let legacy = RouterConfig {
+            policy_spec: Some(std::path::PathBuf::from(path)),
             policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
             ..Default::default()
         };
-        let error = ConfigValidator::validate(&config).expect_err("refused under the legacy path");
-        assert!(
-            matches!(
-                error,
-                ConfigError::InvalidValue { ref field, ref value, .. }
-                    if field == "policy_spec" && value == "/etc/smg/policy/spec.yaml"
-            ),
-            "{error}"
-        );
-        assert!(
-            error.to_string().contains("--policy-engine engine"),
-            "{error}"
-        );
+        let (field, value, text) = refusal(&legacy);
+        assert_eq!((field.as_str(), value.as_str()), ("policy_spec", path));
+        assert!(text.contains("--policy-engine engine"), "{text}");
 
         let engine = RouterConfig {
             policy_engine: PolicyEngineMode::Engine,
-            ..config
+            ..legacy
         };
-        assert!(ConfigValidator::validate(&engine).is_ok());
+        assert!(
+            ConfigValidator::validate(&engine).is_ok(),
+            "the command-line default of --policy passes as unset"
+        );
+
+        let off_default = RouterConfig {
+            policy: PolicyConfig::Random,
+            ..engine.clone()
+        };
+        let (field, value, text) = refusal(&off_default);
+        assert_eq!((field.as_str(), value.as_str()), ("policy", "random"));
+        assert!(text.contains(path) && text.contains("--policy:"), "{text}");
+
+        let mut sticky = engine.clone();
+        sticky.routing_key_override.enabled = true;
+        let (field, _, text) = refusal(&sticky);
+        assert_eq!(field, "routing_key_override");
+        assert!(
+            text.contains(path) && text.contains("--routing-key-override"),
+            "{text}"
+        );
+
+        let mut headed = engine.clone();
+        headed.routing_key_override.headers = vec!["x-tenant-key".to_string()];
+        let (field, value, text) = refusal(&headed);
+        assert_eq!(
+            (field.as_str(), value.as_str()),
+            ("routing_key_override.headers", "x-tenant-key")
+        );
+        assert!(
+            text.contains(path) && text.contains("--routing-key-headers"),
+            "{text}"
+        );
+
+        let paired = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..engine
+        };
+        let (field, value, text) = refusal(&paired);
+        assert_eq!((field.as_str(), value.as_str()), ("policy_spec", path));
+        assert!(
+            text.contains("prefill-decode") && text.contains("pair decider"),
+            "{text}"
+        );
     }
 
     /// Under `engine` a policy, or a form of one, the engine does not carry
