@@ -596,6 +596,14 @@ impl WorkerRegistry {
         self.resolve_url_to_id(url)
     }
 
+    /// The id `url` maps to, a reservation from [`Self::reserve_id_for_url`]
+    /// included: a `POST`'s registration job owns its reserved id before any
+    /// worker stands behind it, where [`Self::get_id_by_url`] answers for
+    /// live workers alone. The exact URL, no scheme canonicalisation.
+    pub fn get_id_by_url_or_reservation(&self, url: &str) -> Option<WorkerId> {
+        self.url_to_id.get(url).map(|id| id.clone())
+    }
+
     /// Resolve a URL string to the `WorkerId` of a live worker.
     ///
     /// Tries exact match first. If the input has no recognized scheme
