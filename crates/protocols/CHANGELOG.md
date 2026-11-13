@@ -72,10 +72,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 - A Responses request's reasoning config keeps `mode`, `context` and the deprecated
   `generate_summary`, as the public API's `Reasoning` takes them, when the request is written back
-  for an upstream. The crate dropped all three, so a `pro`-mode request reached the upstream in its
-  default mode. Breaking: `ResponseReasoningParam` gains `mode: Option<String>`,
-  `context: Option<ReasoningContext>` and `generate_summary: Option<ReasoningSummary>`, and the
-  crate gains `ReasoningContext`.
+  for an upstream, and a Response's `reasoning` echoes the ones the request set. The crate dropped
+  all three, so a `pro`-mode request reached the upstream in its default mode. Breaking:
+  `ResponseReasoningParam` gains `mode: Option<String>`, `context: Option<ReasoningContext>` and
+  `generate_summary: Option<ReasoningSummary>`, `ReasoningInfo` gains the three as
+  `Option<String>`, and the crate gains `ReasoningContext`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

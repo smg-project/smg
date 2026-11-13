@@ -1599,6 +1599,17 @@ pub enum ReasoningContext {
     AllTurns,
 }
 
+impl ReasoningContext {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CurrentTurn => "current_turn",
+            Self::AllTurns => "all_turns",
+        }
+    }
+}
+
 #[expect(
     clippy::unnecessary_wraps,
     reason = "serde default function must match field type Option<T>"
@@ -2886,12 +2897,20 @@ pub struct IncompleteDetails {
 }
 
 /// The `reasoning` block of a Response object. The public API returns it on
-/// every response, both keys present (`null` when the request set none), so
-/// neither key is skipped here.
+/// every response with `effort` and `summary` present (`null` when the request
+/// set none), so neither is skipped here. `mode`, `context` and
+/// `generate_summary` echo the request's when it set them, and are left out
+/// otherwise.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReasoningInfo {
     pub effort: Option<String>,
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
 }
 
 impl From<&ResponseReasoningParam> for ReasoningInfo {
@@ -2899,6 +2918,11 @@ impl From<&ResponseReasoningParam> for ReasoningInfo {
         Self {
             effort: param.effort.map(|effort| effort.as_str().to_string()),
             summary: param.summary.map(|summary| summary.as_str().to_string()),
+            mode: param.mode.clone(),
+            context: param.context.map(|context| context.as_str().to_string()),
+            generate_summary: param
+                .generate_summary
+                .map(|summary| summary.as_str().to_string()),
         }
     }
 }

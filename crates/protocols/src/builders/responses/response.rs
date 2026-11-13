@@ -585,9 +585,9 @@ mod tests {
             reasoning: Some(ResponseReasoningParam {
                 effort: Some(ReasoningEffort::High),
                 summary: Some(ReasoningSummary::Concise),
-                mode: None,
-                context: None,
-                generate_summary: None,
+                mode: Some("pro".to_string()),
+                context: Some(ReasoningContext::AllTurns),
+                generate_summary: Some(ReasoningSummary::Detailed),
             }),
             service_tier: Some(ServiceTier::Flex),
             truncation: Some(Truncation::Auto),
@@ -614,7 +614,26 @@ mod tests {
 
         assert_eq!(
             wire["reasoning"],
-            serde_json::json!({"effort": "high", "summary": "concise"})
+            serde_json::json!({
+                "effort": "high",
+                "summary": "concise",
+                "mode": "pro",
+                "context": "all_turns",
+                "generate_summary": "detailed"
+            })
+        );
+        // Without the three, the echo is the two keys the public API always
+        // writes, `null` when unset.
+        let bare = ReasoningInfo::from(&ResponseReasoningParam {
+            effort: Some(ReasoningEffort::High),
+            summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
+        });
+        assert_eq!(
+            serde_json::to_value(bare).unwrap(),
+            serde_json::json!({"effort": "high", "summary": null})
         );
         assert_eq!(wire["service_tier"], "flex");
         assert_eq!(wire["truncation"], "auto");
