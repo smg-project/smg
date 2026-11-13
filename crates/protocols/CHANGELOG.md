@@ -70,6 +70,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- Interactions content takes every MIME type the public API names: audio in `audio/mpeg`, `m4a`,
+  `l16`, `opus`, `alaw`, `mulaw` and `webm`; images in `gif`, `bmp` and `tiff`; documents in
+  `text/csv` and the Office and OpenDocument formats beside PDF. Each was an unknown variant that
+  refused the whole request, or failed the answer that held it. Breaking: `AudioMimeType`,
+  `ImageMimeType` and `DocumentMimeType` gain the variants.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
