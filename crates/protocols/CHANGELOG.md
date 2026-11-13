@@ -88,7 +88,7 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A Realtime `response.create`'s input may reference an item already in the session,
   `{"type": "item_reference", "id": ...}`, as the public API takes it: such an input was refused as
   an unknown conversation item variant. `RealtimeResponseCreateParams.input` holds the new
-  `RealtimeResponseInputItem`, a conversation item or an `RealtimeItemReference`; a reference is
+  `RealtimeResponseInputItem`, a conversation item or a `RealtimeItemReference`; a reference is
   taken there only, as the API takes it, not as a new conversation item. Breaking: `input` changes
   type.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off

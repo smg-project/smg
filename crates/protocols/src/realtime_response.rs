@@ -379,5 +379,29 @@ mod tests {
             "input": [{"type": "item_reference"}]
         }));
         assert!(no_id.is_err(), "a reference names its item");
+
+        let unknown = serde_json::from_value::<RealtimeResponseCreateParams>(json!({
+            "input": [{"type": "item_refrence", "id": "item_12345"}]
+        }))
+        .expect_err("an unknown type is refused");
+        assert!(
+            unknown
+                .to_string()
+                .contains("unknown variant `item_refrence`"),
+            "an unknown type keeps the conversation item's refusal: {unknown}"
+        );
+
+        // the path a client takes: the params inside a response.create event
+        let event: crate::realtime_events::ClientEvent =
+            serde_json::from_value(json!({"type": "response.create", "response": params}))
+                .expect("a response.create event with a reference");
+        assert!(matches!(
+            event,
+            crate::realtime_events::ClientEvent::ResponseCreate { response: Some(ref r), .. }
+                if matches!(
+                    r.input.as_deref(),
+                    Some([RealtimeResponseInputItem::ItemReference(_), _])
+                )
+        ));
     }
 }
