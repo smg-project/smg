@@ -831,17 +831,22 @@ pub struct ServerToolUseBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchResultTextBlock {
     /// Block type (always "text")
-    #[serde(rename = "type", default = "SearchResultTextBlock::default_type")]
-    pub block_type: String,
+    #[serde(rename = "type", default)]
+    pub block_type: SearchResultTextType,
 
     #[serde(flatten)]
     pub text: TextBlock,
 }
 
-impl SearchResultTextBlock {
-    fn default_type() -> String {
-        "text".to_string()
-    }
+/// The `type` of a search result's text item: the public API defines only
+/// `text`, so any other value fails to read.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchResultTextType {
+    #[default]
+    Text,
 }
 
 /// Search result block
@@ -3702,6 +3707,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(serde_json::to_value(&untyped).unwrap(), search_result);
+
+        let other = serde_json::from_value::<InputContentBlock>(json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"type": "image", "text": "Run the installer."}]
+        }));
+        assert!(other.is_err(), "an item of a type the API does not define");
     }
 
     #[test]
