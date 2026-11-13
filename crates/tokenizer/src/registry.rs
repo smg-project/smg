@@ -313,14 +313,14 @@ impl TokenizerRegistry {
 
     /// Remove a tokenizer by ID
     ///
-    /// The name goes with the entry only while it maps to this ID: a
-    /// replacement published under the name in the meantime (another ID)
-    /// keeps its name. Returns the entry if it was present.
+    /// Through the name's publication, as [`Self::remove_if_id`]: the name
+    /// goes first, and only while it maps to this ID, then the entry. A
+    /// replacement published under the name (another ID) keeps its name, and
+    /// an entry `load` has stored and not yet published is not taken, so a
+    /// name never outlives its entry. Returns the entry if it was taken.
     pub fn remove_by_id(&self, id: &str) -> Option<TokenizerEntry> {
-        let (_, entry) = self.tokenizers.remove(id)?;
-        self.name_to_id
-            .remove_if(&entry.name, |_, published| published == id);
-        Some(entry)
+        let name = self.tokenizers.get(id)?.name.clone();
+        self.remove_if_id(&name, id)
     }
 
     /// Remove the tokenizer under `name` when it is the entry with `id`
@@ -760,8 +760,9 @@ mod tests {
     }
 
     /// A removal by ID (the operator's DELETE, the removal job) while a
-    /// replacement is published under the name: the old entry goes and the
-    /// name keeps mapping to the replacement.
+    /// replacement is published under the name: it takes nothing (the old
+    /// entry is the release's, whose first step took the name) and the name
+    /// keeps mapping to the replacement.
     #[tokio::test]
     async fn test_remove_by_id_leaves_a_replacements_name() {
         let registry = TokenizerRegistry::new();
@@ -785,12 +786,40 @@ mod tests {
             .unwrap();
         assert!(registry.contains_id(&old));
 
-        assert_eq!(registry.remove_by_id(&old).unwrap().id, old);
-        assert!(!registry.contains_id(&old));
+        // The removal by the old id takes nothing: the name is the
+        // replacement's, and the old entry is the release's to take.
+        assert!(registry.remove_by_id(&old).is_none());
+        assert!(registry.contains_id(&old));
         assert_eq!(
             registry.get_by_name("model1").unwrap().id,
             replacement,
             "the replacement keeps its name"
         );
+        assert_eq!(registry.remove_by_id(&replacement).unwrap().id, replacement);
+    }
+
+    /// `load` stores the entry, then publishes its name: a removal by ID
+    /// between the two writes takes nothing (the publication is not there),
+    /// so the publish lands whole and the next removal takes the entry.
+    #[tokio::test]
+    async fn test_remove_by_id_leaves_an_entry_not_yet_published() {
+        let registry = TokenizerRegistry::new();
+        let id = TokenizerRegistry::generate_id();
+        registry
+            .load(&id, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        // The registry as `load` leaves it between its two writes.
+        let (_, published) = registry.name_to_id.remove("model1").unwrap();
+
+        assert!(registry.remove_by_id(&id).is_none());
+        assert!(registry.contains_id(&id), "the stored entry is not taken");
+
+        // The publish lands whole, and the removal takes the entry then.
+        registry.name_to_id.insert("model1".to_string(), published);
+        assert_eq!(registry.remove_by_id(&id).unwrap().id, id);
+        assert!(registry.is_empty());
     }
 }
