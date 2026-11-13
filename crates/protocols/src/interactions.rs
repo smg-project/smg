@@ -111,6 +111,20 @@ impl GenerationRequest for InteractionsRequest {
         fn extract_from_content(content: &Content) -> Option<String> {
             match content {
                 Content::Text { text, .. } => text.clone(),
+                Content::UserInput {
+                    content: Some(contents),
+                }
+                | Content::ModelOutput {
+                    content: Some(contents),
+                    ..
+                } => {
+                    let text = contents
+                        .iter()
+                        .filter_map(extract_from_content)
+                        .collect::<Vec<String>>()
+                        .join(" ");
+                    (!text.is_empty()).then_some(text)
+                }
                 _ => None,
             }
         }
@@ -793,6 +807,17 @@ pub enum Content {
         result: Value,
         call_id: String,
     },
+
+    /// A user input step: the content the user gave for a turn. The SDK
+    /// sends every content list it builds as one.
+    UserInput { content: Option<Vec<Content>> },
+
+    /// A model output step of a replayed turn: the content the model gave,
+    /// or the error the turn ended with, kept as written.
+    ModelOutput {
+        content: Option<Vec<Content>>,
+        error: Option<Value>,
+    },
 }
 
 /// Content types allowed in thought summary (text or image only)
@@ -1157,10 +1182,17 @@ fn validate_input(input: &InteractionsInput) -> Result<(), ValidationError> {
 
     // Reject unsupported file search content
     fn has_file_search_content(content: &Content) -> bool {
-        matches!(
-            content,
-            Content::FileSearchCall { .. } | Content::FileSearchResult { .. }
-        )
+        match content {
+            Content::FileSearchCall { .. } | Content::FileSearchResult { .. } => true,
+            Content::UserInput {
+                content: Some(contents),
+            }
+            | Content::ModelOutput {
+                content: Some(contents),
+                ..
+            } => contents.iter().any(has_file_search_content),
+            _ => false,
+        }
     }
 
     fn check_turn(turn: &Turn) -> bool {
@@ -1202,6 +1234,14 @@ fn is_content_empty(content: &Content) -> bool {
         Content::CodeExecutionResult { call_id, .. }
         | Content::UrlContextResult { call_id, .. }
         | Content::GoogleSearchResult { call_id, .. } => is_option_blank(call_id.as_ref()),
+        // A user input step is empty as a turn is: without content, or with
+        // an empty item. A model output step that ended with an error is not.
+        Content::UserInput { content } => content
+            .as_ref()
+            .is_none_or(|contents| contents.is_empty() || contents.iter().any(is_content_empty)),
+        Content::ModelOutput { content, error } => {
+            error.is_none() && content.as_ref().is_none_or(Vec::is_empty)
+        }
         _ => false,
     }
 }
@@ -1235,6 +1275,46 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An input of steps, as the SDK sends every content list it builds and
+    /// a replayed conversation: each step keeps its type and content and is
+    /// written back as sent, the routing text is the steps' text, and the
+    /// replay validates. A user input step without content is refused as
+    /// empty.
+    #[test]
+    fn an_input_of_user_input_and_model_output_steps_is_read_as_sent() {
+        let steps = serde_json::json!([
+            {"type": "user_input", "content": [{"type": "text", "text": "What is the weather in Paris?"}]},
+            {"type": "thought", "signature": "c2lnbmF0dXJl"},
+            {"type": "function_call", "id": "call_1", "name": "get_weather", "arguments": {"city": "Paris"}},
+            {"type": "function_result", "call_id": "call_1", "name": "get_weather", "result": {"temp": 18}},
+            {"type": "model_output", "content": [{"type": "text", "text": "It is 18 degrees."}]},
+            {"type": "model_output", "error": {"code": 8, "message": "Resource exhausted"}},
+            {"type": "user_input", "content": [{"type": "text", "text": "And tomorrow?"}]}
+        ]);
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": steps, "store": false
+        }))
+        .unwrap();
+        assert!(matches!(request.input, InteractionsInput::Contents(_)));
+        assert!(request.validate().is_ok(), "{:?}", request.validate());
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "What is the weather in Paris? It is 18 degrees. And tomorrow?"
+        );
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["input"], steps);
+
+        let empty: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"type": "user_input"}], "store": false
+        }))
+        .unwrap();
+        let errors = empty.validate().expect_err("an empty step").to_string();
+        assert!(
+            errors.contains("Input content array contains empty content items"),
+            "{errors}"
+        );
+    }
 
     fn refusal(result: Result<(), ValidationError>) -> (String, String) {
         let err = result.expect_err("a refusal");
