@@ -7875,4 +7875,48 @@ mod tests {
         drop(setup);
         assert_eq!((prefill.load(), decode.load()), (0, 0));
     }
+
+    /// The pair's joins to a worker's URL, on workers registered with a
+    /// trailing slash: the public GET pass-through asks its worker for
+    /// `/get_server_info` and the deep probe asks both sides for
+    /// `/health_generate`, never a doubled slash. The stubs record the paths.
+    #[tokio::test]
+    async fn the_pairs_joins_to_a_slashed_registration_carry_one_slash() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                log.lock().unwrap().push(req.uri().path().to_owned());
+                ([(CONTENT_TYPE, "application/json")], "{}")
+            }
+        }));
+        let prefill_stub = spawn_stub(app.clone()).await;
+        let decode_stub = spawn_stub(app).await;
+        let router = create_test_pd_router();
+        register_pd_pair(
+            &router,
+            format!("{prefill_stub}/"),
+            format!("{decode_stub}/"),
+        );
+        let slashed: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("{prefill_stub}/"),
+            WorkerType::Prefill,
+            true,
+        ));
+
+        let passed = PDRouter::proxy_to_worker(&slashed, "get_server_info", None).await;
+        assert_eq!(passed.status(), StatusCode::OK);
+        let probed = router
+            .health_generate(Request::builder().body(Body::empty()).unwrap())
+            .await;
+        assert_eq!(probed.status(), StatusCode::OK);
+
+        let mut paths = seen.lock().unwrap().clone();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["/get_server_info", "/health_generate", "/health_generate"]
+        );
+    }
 }
