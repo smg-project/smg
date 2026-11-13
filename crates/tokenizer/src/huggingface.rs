@@ -39,7 +39,7 @@ use crate::{
         deepseek_v32, deepseek_v4, deepseek_v41, ends_with_generation_header, glm53, marks,
         PromptSegment, RendererProfile, TemplateAnswers,
     },
-    native::{AddedTokens, NativeEncoder},
+    native::{Added, AddedTokens, NativeEncoder},
     token_text::TokenTextTable,
     traits::{
         append_step_text, AppendedStep, ChatTemplateOutput, DecodeStep, Decoder, EncodeJob,
@@ -366,12 +366,12 @@ impl EncoderCore {
     fn added(&self) -> Option<&AddedTokens> {
         self.added
             .get_or_init(|| {
-                let added: Vec<(String, u32)> = self
+                let added: Vec<Added> = self
                     .tokenizer
                     .get_added_vocabulary()
                     .get_vocab()
                     .iter()
-                    .map(|(content, &id)| (content.clone(), id))
+                    .map(|(content, &id)| Added::plain(content.clone(), id))
                     .collect();
                 AddedTokens::build(&added).unwrap_or_else(|declined| {
                     debug!(%declined, "no matcher over the added tokens; prompts rendered by segments are encoded by segments");
