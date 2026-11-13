@@ -825,6 +825,25 @@ pub struct ServerToolUseBlock {
     pub cache_control: Option<CacheControl>,
 }
 
+/// A text item of a search result's content. The public API requires its
+/// `type`, so it is written with it; an item read without one, as this build
+/// wrote them before, reads as text.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchResultTextBlock {
+    /// Block type (always "text")
+    #[serde(rename = "type", default = "SearchResultTextBlock::default_type")]
+    pub block_type: String,
+
+    #[serde(flatten)]
+    pub text: TextBlock,
+}
+
+impl SearchResultTextBlock {
+    fn default_type() -> String {
+        "text".to_string()
+    }
+}
+
 /// Search result block
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -836,7 +855,7 @@ pub struct SearchResultBlock {
     pub title: String,
 
     /// Content of the search result
-    pub content: Vec<TextBlock>,
+    pub content: Vec<SearchResultTextBlock>,
 
     /// Cache control for this block
     pub cache_control: Option<CacheControl>,
@@ -3639,6 +3658,50 @@ mod tests {
             }
             _ => panic!("Expected ToolSearchToolResult variant"),
         }
+    }
+
+    /// A search result's text items are written with their `type`, which the
+    /// public API requires of them, whether the block stands in a message or
+    /// in a tool result; an item read without one is written with it.
+    #[test]
+    fn a_search_results_text_items_keep_their_type() {
+        let search_result = json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"type": "text", "text": "Run the installer."}]
+        });
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": [search_result.clone()]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {}}
+                ]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [search_result.clone()]
+                }]}
+            ]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(written["messages"][0]["content"][0], search_result);
+        assert_eq!(
+            written["messages"][2]["content"][0]["content"][0],
+            search_result
+        );
+
+        let untyped: InputContentBlock = serde_json::from_value(json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"text": "Run the installer."}]
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&untyped).unwrap(), search_result);
     }
 
     #[test]

@@ -70,6 +70,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages search result's text items are written with their `type`, which the public API
+  requires of them, in a message and in a tool result alike. They were read into untagged text
+  blocks, so a forwarded search result lost the `type` of each item. An item read without one
+  still reads, as text. Breaking: `SearchResultBlock.content` holds the new
+  `SearchResultTextBlock`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
