@@ -529,6 +529,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "colgrep-agent-2b",
+        model: "lightonai/colgrep-agent-2B",
+        also: &[],
+        released: "2026-10-03",
+        smg: (None, None),
+        table: Some(Table::MiniCpm5),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "contextpilot-14b",
         model: "tencent/ContextPilot-14B",
         also: &[
