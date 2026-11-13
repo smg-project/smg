@@ -909,7 +909,8 @@ mod tests {
         assert!(matches!(
             accepted.thinking,
             Some(ThinkingConfig::Adaptive {
-                display: Some(ThinkingDisplay::Updates)
+                display: Some(ThinkingDisplay::Updates),
+                ..
             })
         ));
         let Err(refused) = extract("full").await else {
