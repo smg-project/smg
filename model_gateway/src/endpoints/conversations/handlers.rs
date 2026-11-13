@@ -198,8 +198,10 @@ fn apply_metadata_patches(
 /// and one created empty and given the same items list the same. The whole
 /// batch is checked before the conversation exists (`prepare_items`: the
 /// bounds, an unsupported type, a message without a role, an unknown
-/// reference, an id of another tenant), so a refused create creates nothing;
-/// a store fault during the writes deletes the conversation just created.
+/// reference, an id of another tenant), so a refused create creates no
+/// conversation; a store fault during the writes, or a reference the writes
+/// evicted from a bounded store, deletes the conversation just created (the
+/// records the batch wrote stay in the item store, unlinked).
 pub async fn create_conversation(
     storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
@@ -475,10 +477,27 @@ fn items_of(body: &Value, required: bool) -> Result<&[Value], Response> {
 /// item to write with the warning of a type accepted but not implemented, or a
 /// repeat of an earlier item of the same batch (the same client-supplied id
 /// twice, a reference to an item the batch itself adds).
+/// A parsed item and the warning of an accepted-but-unimplemented type.
+type OwnContent = (NewConversationItem, Option<String>);
+
 enum PreparedItem {
+    /// An `item_reference`: the stored item it names.
     Existing(ConversationItem),
+    /// An item adopted under its own client-supplied id: the stored item, and
+    /// the request's own parsed content to write under that id should the
+    /// batch's writes evict the stored one (`None` for a bare id the parser
+    /// does not take).
+    Adopted(ConversationItem, Option<Box<OwnContent>>),
     New(NewConversationItem, Option<String>),
     SameAs(usize),
+}
+
+/// An adopted item awaiting the re-check after the batch's writes: its place
+/// in the answer, its id and the request's own content.
+struct Adoption {
+    index: usize,
+    id: ConversationItemId,
+    own: Option<Box<OwnContent>>,
 }
 
 /// The whole batch checked against the stores before any write, in the order
@@ -567,7 +586,15 @@ async fn prepare_item_with_id(
 
     match item_storage.get_item(&item_id).await {
         Ok(Some(existing)) if existing.is_visible_to(tenant) => {
-            Ok(PreparedItem::Existing(existing))
+            // The request's own content, kept beside the adoption: written
+            // under this id should the batch's writes evict the stored item.
+            let own = parse_item_from_value(item_val, tenant)
+                .ok()
+                .map(|(mut item, warning)| {
+                    item.id = Some(item_id.clone());
+                    Box::new((item, warning))
+                });
+            Ok(PreparedItem::Adopted(existing, own))
         }
         Ok(Some(_)) => Err(bad_request(format!("Item id '{id_str}' cannot be used"))),
         Ok(None) => {
@@ -605,10 +632,13 @@ async fn refuse_an_item_the_conversation_has(
 /// of the item types accepted but not implemented. Every refusal was found by
 /// `prepare_items`; what ends the batch here is a store fault, or a referenced
 /// item the batch's own writes evicted (a bounded store drops its oldest
-/// records on a write): every reference is read again after the writes and
-/// before the link, so nothing of such a batch is linked. Its new records stay
-/// in the store unlinked (the store's delete unlinks only; a retry under the
-/// same id adopts them).
+/// records on a write): after a batch that wrote a new item, every reference
+/// and adoption is read again before the link. A reference that is gone fails
+/// the batch, so nothing of it is linked (its new records stay in the store
+/// unlinked: the store's delete unlinks only, and a retry under the same id
+/// adopts them); an adopted id that is gone takes the request's own content
+/// under that id, as the write-as-you-go order answered. A batch without a
+/// new item asks the stores nothing more.
 async fn store_items(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
@@ -620,6 +650,8 @@ async fn store_items(
     let mut link_pairs = Vec::new();
     let mut seen_ids = HashSet::new();
     let mut referenced: Vec<ConversationItemId> = Vec::new();
+    let mut adopted: Vec<Adoption> = Vec::new();
+    let mut wrote = false;
     // One stamp per item, each later than the one before: the stores order a conversation's
     // items by `added_at`, so the items of this call list in the order the request gave them.
     let mut stamps = AddedAtSequence::new();
@@ -632,7 +664,16 @@ async fn store_items(
                 let id = item.id.clone();
                 (item_to_json(item), id, None)
             }
+            PreparedItem::Adopted(item, own) => {
+                adopted.push(Adoption {
+                    index: created_items.len(),
+                    id: item.id.clone(),
+                    own,
+                });
+                (item_to_json(&item), item.id.clone(), None)
+            }
             PreparedItem::New(new_item, warning) => {
+                wrote = true;
                 let created = item_storage
                     .create_item(new_item)
                     .await
@@ -654,19 +695,47 @@ async fn store_items(
         }
     }
 
-    // The references were resolved before the writes; a bounded store may have
-    // dropped one of them to make room for this batch's new items. Nothing is
-    // linked then: the answer is the one a missing reference gets.
-    for item_id in &referenced {
-        match item_storage.get_item(item_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return Err(not_found(format!(
-                    "Referenced item '{}' not found",
-                    item_id.0
-                )))
+    // The references and adoptions were resolved before the writes; a bounded
+    // store may have dropped one of them to make room for this batch's new
+    // items. An adopted id that is gone takes the request's own content (a
+    // write of its own, read before the references); a reference that is gone
+    // ends the batch before anything is linked, as a missing reference does.
+    if wrote {
+        for Adoption {
+            index,
+            id: item_id,
+            own,
+        } in adopted
+        {
+            match item_storage.get_item(&item_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => match own.map(|boxed| *boxed) {
+                    Some((new_item, warning)) => {
+                        let created = item_storage
+                            .create_item(new_item)
+                            .await
+                            .map_err(|e| store_error("Failed to create item", &e))?;
+                        created_items[index] = item_to_json(&created);
+                        if let Some(w) = warning {
+                            warnings.push(w);
+                        }
+                    }
+                    None => return Err(not_found(format!("Item '{}' not found", item_id.0))),
+                },
+                Err(e) => return Err(store_error("Failed to re-check item", &e)),
             }
-            Err(e) => return Err(store_error("Failed to re-check referenced item", &e)),
+        }
+        for item_id in &referenced {
+            match item_storage.get_item(item_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(not_found(format!(
+                        "Referenced item '{}' not found",
+                        item_id.0
+                    )))
+                }
+                Err(e) => return Err(store_error("Failed to re-check referenced item", &e)),
+            }
         }
     }
 
@@ -1685,5 +1754,113 @@ mod tests {
                 "{route}: nothing of the batch is linked"
             );
         }
+    }
+
+    /// An item adopted under its own id is not a reference: when the batch's
+    /// writes evict the stored item, the request's own content is written
+    /// under that id (the answer the write-as-you-go order gave), on both
+    /// routes; a bare id that is gone answers as a missing item.
+    #[tokio::test]
+    async fn an_adopted_id_the_batch_s_own_writes_evict_takes_the_request_s_content() {
+        let two_items = MemoryConfig {
+            max_items: 2,
+            ..MemoryConfig::default()
+        };
+        let stored = |id: &str| NewConversationItem {
+            id: Some(ConversationItemId::from(id)),
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([{"type": "input_text", "text": "stored"}]),
+            status: None,
+            tenant: None,
+        };
+        for route in ["create", "add-items"] {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let items: Arc<dyn ConversationItemStorage> =
+                Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+            // The oldest record goes first: the two stored items get distinct stamps.
+            items.create_item(stored("msg_oldest")).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            items.create_item(stored("msg_other")).await.unwrap();
+            let empty =
+                json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+            let conversation = empty["id"].as_str().unwrap().to_string();
+            let batch = json!({"items": [
+                {"type": "message", "role": "user", "content": "new"},
+                {"id": "msg_oldest", "type": "message", "role": "user", "content": "own"}
+            ]});
+            let response = match route {
+                "create" => create_conversation(&conversations, &items, None, batch).await,
+                _ => {
+                    create_conversation_items(&conversations, &items, None, &conversation, batch)
+                        .await
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            let body = json_of(response).await;
+            let listed_in = if route == "create" {
+                body["id"].as_str().unwrap().to_string()
+            } else {
+                assert_eq!(
+                    body["data"][1]["content"][0]["text"], "own",
+                    "{route}: {body}"
+                );
+                conversation.clone()
+            };
+            let listed = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    None,
+                    &listed_in,
+                    None,
+                    Some("asc"),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            let texts: Vec<&str> = listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["content"][0]["text"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(texts, vec!["new", "own"], "{route}: {listed}");
+            assert_eq!(listed["data"][1]["id"], "msg_oldest", "{route}: {listed}");
+        }
+
+        // A bare id (nothing the parser takes) adopted and then evicted by the
+        // batch's write answers as a missing item, not a reference.
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+        items.create_item(stored("msg_oldest")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        items.create_item(stored("msg_other")).await.unwrap();
+        let empty =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let conversation = empty["id"].as_str().unwrap().to_string();
+        let response = create_conversation_items(
+            &conversations,
+            &items,
+            None,
+            &conversation,
+            json!({"items": [
+                {"type": "message", "role": "user", "content": "new"},
+                {"id": "msg_oldest"}
+            ]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_of(response).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("msg_oldest") && !message.contains("Referenced"),
+            "{body}"
+        );
     }
 }
