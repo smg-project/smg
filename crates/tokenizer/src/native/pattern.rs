@@ -657,6 +657,20 @@ struct Parser<'a> {
 }
 
 impl Pattern {
+    /// Whether the program holds an unbounded run anywhere but as its first
+    /// op. The search passes over a leading run that failed (see
+    /// `Matches::next`); a run elsewhere is rescanned from every start inside
+    /// it, which costs half the square of the run's length. The template
+    /// scanners hold no such run.
+    pub(super) fn rescans_a_run(&self) -> bool {
+        matches!(self.matcher, Matcher::Program)
+            && self
+                .program
+                .iter()
+                .skip(1)
+                .any(|op| matches!(op, Op::Run { max: u32::MAX, .. }))
+    }
+
     /// `None` when the pattern uses anything outside the supported subset.
     pub(crate) fn parse(pattern: &str) -> Option<Self> {
         let mut parser = Parser {
@@ -1693,12 +1707,45 @@ impl Iterator for Matches<'_, '_> {
                     return Some((start, end));
                 }
                 _ => {
-                    // No match starts here: move on by one character. (A
-                    // pattern that can match empty is declined at parse time,
-                    // so an empty match does not occur; it would count as no
-                    // match.)
-                    let (_, len) = next_char(self.text, start)?;
+                    // No match starts here: move on by one character, or
+                    // past the run the attempt opened with. When the program
+                    // begins with an unbounded run and this character opens
+                    // it, every later start inside the run fails the same
+                    // way: the run ends at the same place, so what follows it
+                    // meets the same text, and the positions the run gives
+                    // back are a subset of the ones just tried. Without the
+                    // skip a run before a character that never comes costs
+                    // half the square of its length in character tests (a
+                    // text whose image is one run of letters, as a space maps
+                    // to one, took minutes at 128 KiB); with it each
+                    // character is read a bounded number of times. A run
+                    // anywhere else in the program is still rescanned from
+                    // every start inside it, so a stage over the image whose
+                    // program holds one is declined at load (see
+                    // `rescans_a_run`). (A pattern that can match empty is
+                    // declined at parse time, so an empty match does not
+                    // occur; it would count as no match.)
+                    let (c, len) = next_char(self.text, start)?;
                     self.pos = start + len;
+                    if let (
+                        Matcher::Program,
+                        Some(Op::Run {
+                            class,
+                            max: u32::MAX,
+                            ..
+                        }),
+                    ) = (&self.pattern.matcher, self.pattern.program.first())
+                    {
+                        let class = &self.pattern.classes[*class];
+                        if class.contains(c) {
+                            while let Some((c, len)) = next_char(self.text, self.pos) {
+                                if !class.contains(c) {
+                                    break;
+                                }
+                                self.pos += len;
+                            }
+                        }
+                    }
                 }
             }
         }
