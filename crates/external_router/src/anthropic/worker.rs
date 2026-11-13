@@ -596,9 +596,6 @@ mod tests {
         assert!(logs_contain(&format!("{MASKED_WORKER_URL}/v1/messages")));
     }
 
-    /// A send the request timeout cuts is the caller's 504 and one error
-    /// counted against the model under `timeout`/`deadline`, with a duration
-    /// sample; the upstream completes the handshake and never answers.
     /// An upstream that sends its headers and then stalls past the request's
     /// timeout is the 504 counted under `timeout`/`deadline`, as a send that
     /// times out is, not a `parse_error`.
@@ -657,6 +654,9 @@ mod tests {
         stalled.abort();
     }
 
+    /// A send the request timeout cuts is the caller's 504 and one error
+    /// counted against the model under `timeout`/`deadline`, with a duration
+    /// sample; the upstream completes the handshake and never answers.
     #[tokio::test]
     async fn a_send_that_times_out_is_counted_as_a_deadline_against_the_model() {
         let recorder = PrometheusBuilder::new().build_recorder();
