@@ -695,7 +695,11 @@ fn convert_user_message(
                     }
                     // A server tool's result or a container upload is the
                     // public API's own server tools at work, which no engine
-                    // route runs: refused by name, never dropped.
+                    // route runs: refused by name, not dropped. The older
+                    // server tool blocks (`server_tool_use`,
+                    // `web_search_tool_result`, `tool_search_tool_result`)
+                    // are still dropped, as before: refusing them would turn
+                    // requests that are answered today into 400s.
                     InputContentBlock::WebFetchToolResult(_)
                     | InputContentBlock::CodeExecutionToolResult(_)
                     | InputContentBlock::BashCodeExecutionToolResult(_)
@@ -828,7 +832,10 @@ fn mcp_block_refusal(block: &InputContentBlock, index: usize, position: usize) -
 /// route, naming the block and its place. No engine route runs those tools, so
 /// the prompt cannot carry the block faithfully, and dropping it in silence
 /// would answer a turn whose input it threw away (an upload-only user turn
-/// would leave no user turn at all).
+/// would leave no user turn at all). The server tool blocks the request read
+/// before these (`server_tool_use`, `web_search_tool_result`,
+/// `tool_search_tool_result`) are still dropped, as they were: refusing them
+/// is a separate choice, which would turn requests answered today into 400s.
 fn server_tool_block_refusal(block: &InputContentBlock, index: usize, position: usize) -> String {
     let kind = match block {
         InputContentBlock::WebFetchToolResult(_) => "web_fetch_tool_result",
@@ -880,7 +887,8 @@ fn convert_assistant_message(
             InputContentBlock::McpToolUse(_) | InputContentBlock::McpToolResult(_) => {
                 return Err(mcp_block_refusal(block, index, position));
             }
-            // A server tool's result, as the user turn's.
+            // A server tool's result, as the user turn's, the older
+            // server tool blocks still dropped.
             InputContentBlock::WebFetchToolResult(_)
             | InputContentBlock::CodeExecutionToolResult(_)
             | InputContentBlock::BashCodeExecutionToolResult(_)
