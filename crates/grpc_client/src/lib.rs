@@ -388,6 +388,10 @@ macro_rules! impl_engine_client_basics {
         ///
         /// The trace context is injected when the future is first polled, from
         /// the span active then, so an instrumented future's span is the parent.
+        /// The clients whose wire has a `generate_framed` (the request's large
+        /// tensors as body frames; the gateway's call on those wires) keep the
+        /// same shape there: the request becomes its frames before the future
+        /// exists.
         pub fn generate(
             &self,
             req: $proto::GenerateRequest,
