@@ -40,6 +40,7 @@ use tonic_health::pb::{
 
 use super::*;
 use crate::{
+    kv_events::{LoadFromState, LoadSource},
     testing::{
         assert_bucket_edges, assert_golden, bound_port, captured_logs, handshake_address, http_get,
         next_batch, servicer_config, Bounded,
@@ -4031,11 +4032,10 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![(1, 0)]
     );
-    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    let record =
-        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let record = LoadSource::load(&source, Some(1)).expect("the idle rank's record");
     assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
-    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    assert!(LoadSource::load(&source, Some(2)).is_none());
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -4339,8 +4339,8 @@ async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
     assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
     assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
     assert_eq!(rank0.num_waiting_uncached_tokens, 0);
-    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    let record = crate::kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let record = LoadSource::load(&source, Some(0)).expect("rank 0's record");
     assert_eq!(record.prefill_throughput, Some(rate));
     assert_eq!(record.waiting_uncached_tokens, Some(0));
     assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
@@ -4479,8 +4479,6 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
 /// connected ones has no record.
 #[tokio::test]
 async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
-    use crate::kv_events::RankLoads;
-
     let record_of = |load: &sg::SchedulerLoad| {
         let mut record = common::EngineLoad::from(load);
         record.waiting_uncached_tokens =

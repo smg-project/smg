@@ -51,7 +51,7 @@ use tonic::service::Routes;
 use crate::{
     engine_link::EngineLink,
     health_probe,
-    kv_events::KvEventRelay,
+    kv_events::{record_with_queue, KvEventRelay, RankLoads},
     metrics::{Identity, ServicerMetrics},
     proto_json,
     servicer::{self, Shared, WireState},
@@ -282,16 +282,13 @@ impl std::fmt::Debug for SglangServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-impl crate::kv_events::RankLoads for State {
+impl RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         // A connected rank reads its own entry (zero-filled until its first
         // load tail), never another rank's figures; a rank past the
         // connected ones gets no record.
         let load = info::rank_load(self, dp_rank)?;
-        Some(crate::kv_events::record_with_queue(
-            &load,
-            load.num_waiting_uncached_tokens,
-        ))
+        Some(record_with_queue(&load, load.num_waiting_uncached_tokens))
     }
 
     fn engine_link(&self) -> &EngineLink {
