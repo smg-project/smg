@@ -1572,6 +1572,58 @@ fn the_versioned_names_a_plugin_author_builds_against_are_pinned() {
     );
 }
 
+/// The resume fields a watcher hands back: `WorkerEvent.seq` is the
+/// replication log position and `term` the term it was written under,
+/// `WatchWorkersRequest` carries both back, and `SnapshotRequired` names the
+/// oldest position the log still holds.
+type ResumeField = (&'static str, i32, Type);
+
+const RESUME_FIELDS: &[(&str, &[ResumeField])] = &[
+    (
+        "WatchWorkersRequest",
+        &[
+            ("models", 1, Type::String),
+            ("resume_seq", 2, Type::Uint64),
+            ("with_needs", 3, Type::Bool),
+            ("resume_term", 4, Type::Uint64),
+        ],
+    ),
+    (
+        "WorkerEvent",
+        &[
+            ("seq", 1, Type::Uint64),
+            ("membership_epoch", 2, Type::Uint64),
+            ("term", 11, Type::Uint64),
+        ],
+    ),
+    ("SnapshotRequired", &[("oldest_seq", 1, Type::Uint64)]),
+];
+
+#[test]
+fn the_watch_workers_resume_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in RESUME_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a resume field moved");
+    }
+}
+
 /// The packed request block's layout as the world's comment states it: a
 /// 72-byte header, the model bytes, zero bytes to the next multiple of 8,
 /// then the u64 sections. The arithmetic is mirrored here so the alignment
