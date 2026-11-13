@@ -90,6 +90,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages web search result is written with its `type` (`web_search_result`) and its null
+  `page_age`, and the web search error `request_too_large` and a tool search's error result
+  (`tool_search_tool_result_error`) read, as the public API writes them. A result had been written
+  without the `type` that the public API requires of a replayed one, and each of the two errors
+  failed a whole answer or request that held it. A tool reference in a replayed tool search result
+  keeps its `cache_control`, which was dropped. Breaking: `WebSearchResultBlock` gains
+  `block_type`, `WebSearchToolResultErrorCode` gains `RequestTooLarge`, a tool search result's
+  `content` is the new `ToolSearchToolResultContent`, and `ToolReferenceBlock` gains
+  `cache_control`.
 - `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
   `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
   "input_image" in a function output for text-only backends: only text parts are carried as a tool
