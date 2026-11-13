@@ -259,6 +259,25 @@ impl std::fmt::Debug for JobQueue {
     }
 }
 
+/// A claimed submission's hold on its own status entry while it waits for a
+/// slot: dropped with its caller before the slot is held (a cancelled request
+/// on a full queue) or ended by a refused submission, it takes the claim back
+/// out, so no pending entry outlives the submission it was made for.
+struct Claim<'a> {
+    status_map: &'a DashMap<String, JobStatus>,
+    url: &'a str,
+    job_type: &'static str,
+    held: bool,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if !self.held {
+            JobQueue::record_own_status(self.status_map, self.url, self.job_type, None);
+        }
+    }
+}
+
 impl JobQueue {
     /// Create a new job queue with semaphore-based concurrency control
     ///
@@ -367,14 +386,10 @@ impl JobQueue {
     }
 
     /// Submit a job whose URL the caller claimed with [`Self::claim_if_idle`].
-    /// A failed submission owns no job, so its claim must not block the next
-    /// one; only its own entry goes.
+    /// A submission refused or dropped before it holds a slot owns no job, so
+    /// its claim goes with it (`submit_inner`'s hold on the entry).
     pub async fn submit_claimed(&self, job: Job) -> Result<(), String> {
-        let worker_url = job.worker_url().to_string();
-        let job_type = job.job_type();
-        self.submit_inner(job, true, None).await.inspect_err(|_| {
-            Self::record_own_status(&self.status_map, &worker_url, job_type, None);
-        })
+        self.submit_inner(job, true, None).await
     }
 
     /// Only an in-flight job of the same type counts: the status map is keyed
@@ -402,24 +417,16 @@ impl JobQueue {
     /// guard admit a second registration). Returns `Ok(false)` when one is in
     /// flight; the caller's next occasion submits again. A job of another type
     /// submitted after the claim keeps its entry too: the pending status
-    /// written once a slot is held, the rollback of a failed submission and a
-    /// job's later status writes touch only this job's own entry
-    /// (`record_own_status`).
+    /// written once a slot is held, the claim's return on a refused or dropped
+    /// submission and a job's later status writes touch only this job's own
+    /// entry (`record_own_status`).
     pub async fn submit_unless_in_flight(&self, job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
         let job_type = job.job_type();
         if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
             return Ok(false);
         }
-        self.submit_inner(job, true, None)
-            .await
-            .map(|()| true)
-            .inspect_err(|_| {
-                // A failed submission owns no job, so its claim must not block the
-                // next one; only its own entry goes (another job's, taken during
-                // the wait for a slot, stays with that job).
-                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
-            })
+        self.submit_inner(job, true, None).await.map(|()| true)
     }
 
     /// Submit `job` unless a registration (`AddWorker`) is pending or
@@ -442,12 +449,7 @@ impl JobQueue {
                 entry.insert(JobStatus::pending(job_type, &worker_url));
             }
         }
-        self.submit_inner(job, true, None)
-            .await
-            .map(|()| true)
-            .inspect_err(|_| {
-                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
-            })
+        self.submit_inner(job, true, None).await.map(|()| true)
     }
 
     /// `submit_unless_in_flight` for a submission that must not be lost: a
@@ -462,13 +464,7 @@ impl JobQueue {
         let job_type = job.job_type();
         loop {
             if Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
-                return self
-                    .submit_inner(job, true, None)
-                    .await
-                    .map(|()| true)
-                    .inspect_err(|_| {
-                        Self::record_own_status(&self.status_map, &worker_url, job_type, None);
-                    });
+                return self.submit_inner(job, true, None).await.map(|()| true);
             }
             self.kept.insert(worker_url.clone(), job);
             if Self::has_in_flight(&self.status_map, &worker_url) {
@@ -593,14 +589,21 @@ impl JobQueue {
         claimed: bool,
         waiter: Option<u64>,
     ) -> Result<(), String> {
+        // Extract values before moving job
+        let job_type = job.job_type();
+        let worker_url = job.worker_url().to_string();
+        // A claimed submission holds its entry only as long as it lives:
+        // ended or dropped before a slot is held, the claim goes with it.
+        let mut claim = claimed.then_some(Claim {
+            status_map: &self.status_map,
+            url: &worker_url,
+            job_type,
+            held: false,
+        });
         // Check if context is still alive before accepting jobs
         let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
         };
-
-        // Extract values before moving job
-        let job_type = job.job_type();
-        let worker_url = job.worker_url().to_string();
         let tokenizer_load = match &job {
             Job::AddTokenizer { config } => Some(config.name.clone()),
             _ => None,
@@ -619,6 +622,9 @@ impl JobQueue {
             ));
         };
 
+        if let Some(claim) = claim.as_mut() {
+            claim.held = true;
+        }
         // Record pending status
         Self::write_pending(&self.status_map, &worker_url, job_type, claimed);
         // A tokenizer load counts as in flight for its model from here (the
@@ -2301,6 +2307,81 @@ mod tests {
         assert_eq!(
             (entry.job_type.as_str(), entry.status.as_str()),
             ("AddWorker", "pending")
+        );
+    }
+
+    /// A claimed submission dropped inside its wait for a slot (a cancelled
+    /// request on a full queue) leaves no entry under its URL: the claim an
+    /// update made against a registration in flight and a registration's
+    /// typed claim both go with the dropped caller, and the URL takes the
+    /// next claim.
+    #[tokio::test]
+    async fn a_claimed_submission_dropped_in_its_slot_wait_leaves_no_entry() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        // One slot and no job ever runs: the dispatcher parks the first job on
+        // the concurrency limit of zero, the second fills the slot, and every
+        // later submission waits.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 1,
+                max_concurrent_jobs: 0,
+            },
+            Arc::downgrade(&context),
+        );
+        let update = |url: &str| Job::UpdateWorker {
+            url: url.to_string(),
+            update: Box::new(WorkerUpdateRequest {
+                priority: None,
+                cost: None,
+                labels: None,
+                api_key: None,
+                health: None,
+            }),
+        };
+        queue
+            .submit(update("http://w:8006"))
+            .await
+            .expect("the first job");
+        for _ in 0..1000 {
+            if queue.tx.capacity() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queue.tx.capacity(), 1, "the dispatcher took the first job");
+        queue
+            .submit(update("http://w:8007"))
+            .await
+            .expect("the slot");
+        assert_eq!(queue.tx.capacity(), 0, "the queue is full");
+
+        let url = "http://w:8008";
+        let wait = Duration::from_millis(50);
+        let dropped =
+            tokio::time::timeout(wait, queue.submit_unless_registering(update(url))).await;
+        assert!(dropped.is_err(), "the update's submission waits for a slot");
+        assert!(
+            queue.get_status(url).is_none(),
+            "the update's claim went with its caller"
+        );
+
+        let registration = Job::AddWorker {
+            config: Box::new(WorkerSpec::new(url)),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+        };
+        assert!(
+            queue.claim_if_idle(&registration),
+            "the URL takes the next claim"
+        );
+        let dropped = tokio::time::timeout(wait, queue.submit_claimed(registration)).await;
+        assert!(
+            dropped.is_err(),
+            "the registration's submission waits for a slot"
+        );
+        assert!(
+            queue.get_status(url).is_none(),
+            "the registration's claim went with its caller"
         );
     }
 }
