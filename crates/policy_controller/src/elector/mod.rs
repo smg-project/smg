@@ -408,9 +408,9 @@ impl Elector {
                 return Err(err);
             }
         };
-        self.held = None;
         match written {
             Written::Done => {
+                self.held = None;
                 self.attempted = None;
                 if let Some(observation) = &mut self.observed {
                     observation.record = released;
@@ -418,7 +418,10 @@ impl Elector {
                 Ok(true)
             }
             Written::Moved => {
+                // The record is kept until the re-read settles what moved:
+                // a read error leaves a second call its retry.
                 let stored = self.backend.read()?;
+                self.held = None;
                 match (stored, self.attempted.take()) {
                     // This process's own renewal that landed and reported an
                     // error: the lease to give up is that record.
@@ -1531,6 +1534,79 @@ mod tests {
             b.tick(t0 + S + S / 2).expect("take"),
             Tick::Acquired { term: 2 }
         );
+    }
+
+    /// A backend whose reads fail while `read_fails` is above zero, and whose
+    /// writes land and then report an error while `lost_answers` is above
+    /// zero: one API server through one blip.
+    struct Blips {
+        lease: MemoryLease,
+        read_fails: Arc<AtomicU32>,
+        lost_answers: Arc<AtomicU32>,
+    }
+
+    impl LeaseBackend for Blips {
+        fn read(&mut self) -> Result<Option<LeaseRecord>, ElectError> {
+            if self.read_fails.load(Ordering::Relaxed) > 0 {
+                self.read_fails.fetch_sub(1, Ordering::Relaxed);
+                return Err(ElectError::Io {
+                    place: self.place(),
+                    source: std::io::Error::other("the read was lost"),
+                });
+            }
+            self.lease.read()
+        }
+
+        fn write(
+            &mut self,
+            expected: Option<&LeaseRecord>,
+            record: &LeaseRecord,
+        ) -> Result<Written, ElectError> {
+            let written = self.lease.write(expected, record)?;
+            if self.lost_answers.load(Ordering::Relaxed) > 0 {
+                self.lost_answers.fetch_sub(1, Ordering::Relaxed);
+                return Err(ElectError::Io {
+                    place: self.place(),
+                    source: std::io::Error::other("the answer was lost"),
+                });
+            }
+            Ok(written)
+        }
+
+        fn place(&self) -> String {
+            "blips".to_string()
+        }
+    }
+
+    #[test]
+    fn a_release_whose_re_read_failed_keeps_the_record_for_the_retry() {
+        let lease = MemoryLease::new();
+        let read_fails = Arc::new(AtomicU32::new(0));
+        let lost_answers = Arc::new(AtomicU32::new(0));
+        let backend = Blips {
+            lease: lease.clone(),
+            read_fails: Arc::clone(&read_fails),
+            lost_answers: Arc::clone(&lost_answers),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + S;
+        a.tick(t0).expect("acquire");
+        // A renewal lands and its answer is lost.
+        lost_answers.store(1, Ordering::Relaxed);
+        a.tick(t0 + S).expect_err("the answer was lost");
+        // A planned stop: the release's write is refused over the record
+        // before that renewal, and the re-read that settles what moved fails
+        // too. The record is kept, so a second call retries, finds its own
+        // landed renewal and releases it.
+        read_fails.store(1, Ordering::Relaxed);
+        a.release().expect_err("the read was lost");
+        assert!(a.is_holder(), "kept for the retry");
+        assert_eq!(a.fence().leader_term(t0 + S), None);
+        assert!(a.release().expect("the retry"), "released after all");
+        assert!(!a.is_holder());
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert!(stored.is_released());
+        assert_eq!(stored.term, 1);
     }
 
     /// A backend whose write does not land while `delay` is set: it reports
