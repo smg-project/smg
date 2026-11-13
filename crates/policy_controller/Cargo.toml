@@ -24,6 +24,13 @@ schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The WebAssembly plugin host (`wasm`): the runtime and one kept instance per
+# module per deciding thread. The log lines a plugin writes go through the
+# optional tracing declared with the controller's dependencies below; this
+# feature turns it on too.
+thread_local = { version = "1.1", optional = true }
+wasmtime = { workspace = true, optional = true }
+
 # The Kubernetes Lease elector (design 10), behind the `kubernetes` feature:
 # the gateway's own kube client stack, pinned to the same release. The
 # runtime handle its election thread blocks on is the optional tokio declared
@@ -93,6 +100,10 @@ controller = [
 # The Kubernetes Lease backend of the elector.
 kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 
+default = ["wasm"]
+# The WebAssembly plugin host over the committed `smg:policy` worlds.
+wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing"]
+
 [dev-dependencies]
 criterion = "0.8"
 # The Kubernetes elector's tests run its client against a service in the
@@ -113,6 +124,11 @@ prost-types = { workspace = true }
 wit-parser = { version = "0.258.3", default-features = false, features = ["std"] }
 # The lease-file tests and bench write under a directory of their own.
 tempfile = "3"
+# The plugin host's test guests are WebAssembly text in the test sources,
+# assembled and wrapped into components of the committed world at test time:
+# no binary fixture and no cross target.
+wat = "1"
+wit-component = { version = "0.258.3", default-features = false }
 # The controller's mutual-TLS test mints its authority, server and client
 # certificates when it runs; no certificate file lives in the repository.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
@@ -147,6 +163,11 @@ harness = false
 [[bench]]
 name = "elector"
 harness = false
+
+[[bench]]
+name = "wasm_plugin"
+harness = false
+required-features = ["wasm"]
 
 [[bench]]
 name = "epd"
