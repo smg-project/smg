@@ -380,9 +380,14 @@ impl PolicyRegistry {
     /// registry then resolves a request's routing key from the headers the
     /// document's bindings read a session key from (the gateway's own default
     /// header stays for a document without sessions). A document the engine
-    /// refuses is the caller's error, naming the field.
+    /// refuses is the caller's error, naming the field; so is one with a
+    /// stage that reads an input this host does not feed a document on this
+    /// base (the prefix index, a ring), refused by its profile, stage and
+    /// input instead of applied to score nothing (the decider's
+    /// `fed_as_a_document`).
     pub fn with_policy_spec(mut self, spec: &PolicySpec) -> Result<Self, EngineHostError> {
         let decider = Decider::from_spec(spec)?;
+        decider.fed_as_a_document()?;
         let headers = session_headers_of(spec)?;
         if !headers.is_empty() {
             self.routing_key_headers = Arc::new(headers);
@@ -3785,5 +3790,58 @@ mod tests {
             .expect_err("two lists are refused")
             .to_string();
         assert!(error.contains("x-a and x-b"), "{error}");
+    }
+
+    /// A document is applied only if this host feeds every input its stages
+    /// read on this base. Of the crate's presets, each written as a
+    /// document, two are refused by the profile, the stage and the input:
+    /// `cache_aware`, whose stages read the prefix index (the cache-aware
+    /// policy object holds it under the flags; nothing stands behind a
+    /// document), and `consistent_hashing`, whose ring the regular path does
+    /// not key yet. Every other preset is applied. A hash index is refused
+    /// the same way, by the affinity stage that reads it.
+    #[test]
+    fn a_document_whose_stage_reads_an_unfed_input_is_refused_at_the_apply() {
+        let apply = |spec: &PolicySpec| {
+            PolicyRegistry::with_override(PolicyConfig::Random, RoutingKeyOverrideConfig::default())
+                .with_policy_spec(spec)
+                .map(drop)
+                .map_err(|error| error.to_string())
+        };
+        let refused = |profile: &str, stage: &str, need: &str| {
+            Err(format!(
+                "profile {profile:?}: the {stage} stage reads {need}, which this gateway does \
+                 not feed a document on this base"
+            ))
+        };
+        for name in smg_policy_controller::PRESETS {
+            let document = PolicySpec::preset(name).expect("a preset document");
+            let expected = match name {
+                "cache_aware" => refused(name, "warmup-slice", "KV events into an index"),
+                "consistent_hashing" => refused(name, "consistent-hash", "a consistent-hash ring"),
+                _ => Ok(()),
+            };
+            assert_eq!(apply(&document), expected, "{name}");
+        }
+
+        let mut hashed = PolicySpec::preset("cache_aware").expect("a preset document");
+        hashed.view.boundaries = vec![512, 2048];
+        hashed.index.insert(
+            "*".to_string(),
+            smg_policy_controller::spec::IndexSpec {
+                kind: smg_policy_controller::spec::IndexKind::Hash,
+                ..Default::default()
+            },
+        );
+        hashed
+            .profiles
+            .get_mut("cache_aware")
+            .expect("its profile")
+            .score
+            .remove(0);
+        assert_eq!(
+            apply(&hashed),
+            refused("cache_aware", "prefix-affinity", "KV events into an index")
+        );
     }
 }

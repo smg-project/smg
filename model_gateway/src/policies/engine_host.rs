@@ -110,6 +110,14 @@ pub enum EngineHostError {
     /// header lists; the registry resolves one list per gateway on this base.
     #[error("the document's bindings disagree on their session headers ({0}); one list per gateway on this base")]
     SessionHeaders(String),
+    /// A stage of a document that reads an input this host does not feed a
+    /// document on this base.
+    #[error("profile {profile:?}: the {stage} stage reads {need}, which this gateway does not feed a document on this base")]
+    Unfed {
+        profile: String,
+        stage: &'static str,
+        need: &'static str,
+    },
     #[error(transparent)]
     Spec(#[from] SpecError),
 }
@@ -466,6 +474,56 @@ pub(crate) fn wants_text(needs: Needs) -> bool {
     needs.text || needs.token_hashes || needs.text_hashes
 }
 
+/// What this host feeds the stages of a document on the regular path of
+/// this base: load reports, the session key its headers resolve to and the
+/// two per-worker session counts. Under the flags the cache-aware policy
+/// object holds the prefix index and the placements; nothing stands behind
+/// a document, so the prefix hashes of either kind, the KV events and the
+/// request text the placements read are not fed. Nor is a ring's keyed form
+/// or an encode item's media, which the regular path does not carry.
+const FED_UNDER_A_DOCUMENT: Needs = Needs {
+    text: false,
+    token_hashes: false,
+    text_hashes: false,
+    loads: true,
+    events: false,
+    ring: false,
+    headers: true,
+    media: false,
+    active_sessions: true,
+    session_in_flight: true,
+};
+
+/// The first input in `needs` that `fed` lacks, as a refusal names it.
+fn unfed(needs: Needs, fed: Needs) -> Option<&'static str> {
+    [
+        (needs.events && !fed.events, "KV events into an index"),
+        (
+            needs.token_hashes && !fed.token_hashes,
+            "the request's token hashes",
+        ),
+        (
+            needs.text_hashes && !fed.text_hashes,
+            "the request's text hashes",
+        ),
+        (needs.text && !fed.text, "the request text"),
+        (needs.ring && !fed.ring, "a consistent-hash ring"),
+        (needs.media && !fed.media, "the request's media counts"),
+        (needs.loads && !fed.loads, "load reports"),
+        (needs.headers && !fed.headers, "the view's headers"),
+        (
+            needs.active_sessions && !fed.active_sessions,
+            "the active sessions per worker",
+        ),
+        (
+            needs.session_in_flight && !fed.session_in_flight,
+            "the key's requests in flight per worker",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(lacking, input)| lacking.then_some(input))
+}
+
 thread_local! {
     /// The view of the decision in progress on this thread, reused across
     /// decisions so a decision allocates nothing after the first.
@@ -759,6 +817,28 @@ impl Decider {
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The apply's rule for a document: it is applied only if this host
+    /// feeds every input its stages read on this base
+    /// ([`FED_UNDER_A_DOCUMENT`]). The first stage that reads an input the
+    /// host does not feed, in the engine's order of profiles and the
+    /// profile's of stages, refuses the document by the profile, the stage
+    /// and the input: a stage left unfed scores nothing, and the document
+    /// would decide otherwise than the flags it stands in for.
+    pub(crate) fn fed_as_a_document(&self) -> Result<(), EngineHostError> {
+        for profile in self.engine.profiles() {
+            for weighted in &profile.scorers {
+                if let Some(need) = unfed(weighted.scorer.needs(), FED_UNDER_A_DOCUMENT) {
+                    return Err(EngineHostError::Unfed {
+                        profile: profile.name.clone(),
+                        stage: weighted.scorer.name(),
+                        need,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether the engine binds an encode profile, so the encode items of an
