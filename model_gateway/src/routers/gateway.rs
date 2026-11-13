@@ -2592,6 +2592,17 @@ mod tests {
             None,
             "nothing under the second"
         );
+        let names: Vec<String> = seen
+            .last_headers()
+            .expect("the lineage headers")
+            .keys()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["x-routing-key"],
+            "the writer adds the configured name and no other: the loader vets that name"
+        );
         assert_eq!(
             placed(&seen).as_deref(),
             Some("conv"),

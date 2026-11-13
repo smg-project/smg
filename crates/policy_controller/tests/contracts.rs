@@ -23,9 +23,10 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    Candidate, Constraints, HashKind, Health, Lease, LeaseKind, LoadRow, MediaCounts, Membership,
-    Outcome, OverloadRegime, Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role,
-    Shed, ShedReason, Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    spec::DENIED_HEADERS, Candidate, Constraints, HashKind, Health, Lease, LeaseKind, LoadRow,
+    MediaCounts, Membership, Outcome, OverloadRegime, Pair, Phase, PoolFacts, Queue, ReleaseReason,
+    RequestFacts, Role, Shed, ShedReason, Side, Signal, SignalSource, Target, Trace,
+    TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -37,6 +38,27 @@ const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
 const WIT_PACKAGE: &str = "policy";
 const WIT_VERSION: &str = "1.0.0";
+
+/// The header deny-list of design section 4.6: the names no view may read
+/// and no routing-key override may key on, lowercase, in this order, each
+/// once. A name added or moved here is a contract change.
+const DENIED_HEADER_NAMES: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
+
+#[test]
+fn the_header_deny_list_holds_its_seven_names() {
+    assert_eq!(DENIED_HEADERS, DENIED_HEADER_NAMES, "the deny-list moved");
+    for name in DENIED_HEADERS {
+        assert_eq!(name, name.to_ascii_lowercase(), "{name} is not lowercase");
+    }
+}
 
 /// A record's field names in declaration order. The pattern names every
 /// field without `..`, so the crate's type cannot gain, lose or rename one
