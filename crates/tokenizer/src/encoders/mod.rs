@@ -234,6 +234,14 @@ impl TemplateAnswers<'_> {
             .and_then(|profile| profile.thinking_mode)
             .map(|resolve| resolve(template_kwargs, thinking))
     }
+
+    /// Whether the renderer reads the kwarg `name`: a profile's encoder reads
+    /// the kwargs itself (its tool choice, response format and effort come
+    /// from them), so every name is read under a profile; the Jinja template
+    /// answers for itself otherwise.
+    pub(crate) fn template_reads(&self, name: &str) -> bool {
+        self.profile.is_some() || self.template.reads(name)
+    }
 }
 
 /// Whether a marked render of the V4 family ends in the generation header its

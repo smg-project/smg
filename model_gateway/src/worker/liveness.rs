@@ -621,10 +621,11 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
 
 /// Apply every liveness budget the configuration carries: the stall, wedge
 /// and stale thresholds and the warm-up slice. The one place the budgets
-/// are read from a configuration, for the server's start-up and for a
-/// context built by hand (the test harness); the first call in a process
-/// wins, as for [`configure`].
-pub(crate) fn configure_from(config: &RouterConfig) {
+/// are read from a configuration, for the server's start-up and, as
+/// `worker::configure_liveness`, for a host that builds the context without
+/// the builder (the test harness today); the first call in a process wins,
+/// as for the thresholds' own setter.
+pub fn configure_from(config: &RouterConfig) {
     configure(
         Duration::from_secs(config.worker_stall_secs),
         Duration::from_secs(config.worker_wedge_secs),
@@ -1157,6 +1158,26 @@ mod tests {
 
     fn worker() -> Arc<dyn Worker> {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
+    }
+
+    /// A worker whose prompt was given up on by the silence verdict (a run
+    /// the whole cold-shape grace long, released without an answer) is
+    /// judged by its own rate once it answers: the wait it was given up on
+    /// is no busy time, so the next side reads the threshold, not the cap.
+    #[test]
+    fn a_worker_given_up_on_is_judged_by_its_own_rate_once_it_answers() {
+        let w = worker();
+        let t0 = now_ms().max(1);
+        w.note_prefill_started_at(95, true, t0);
+        w.note_prefill_ended_at(95, true, None, t0 + 120_000);
+        w.note_prefill_started_at(95, true, t0 + 120_000);
+        w.note_prefill_ended_at(95, true, Some(0), t0 + 121_000);
+        assert_eq!(w.prefill_rate_tps(), 95, "the answer's own rate");
+        assert_eq!(
+            prefill_side_bound_with(&w, 95, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE),
+            "a worker that has answered a prompt this long: the threshold"
+        );
     }
 
     /// Progress stamped now, for the tests that need no particular instant.

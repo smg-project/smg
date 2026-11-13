@@ -545,6 +545,14 @@ pub trait Tokenizer: Encoder + Decoder {
         RendererCapabilities::default()
     }
 
+    /// Whether the renderer reads the template kwarg `name`. The gateway hands
+    /// a request's controls to the template as kwargs (`tool_choice`,
+    /// `response_format`) and leaves out one the renderer never reads: it
+    /// could not reach the prompt. `true` where the answer is not known.
+    fn template_reads(&self, _name: &str) -> bool {
+        true
+    }
+
     /// The thinking mode this tokenizer's renderer renders for the template
     /// kwargs and the request-level toggle it is handed
     /// ([`ChatTemplateParams::template_kwargs`] and

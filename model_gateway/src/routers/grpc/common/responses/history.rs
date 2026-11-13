@@ -334,17 +334,19 @@ pub(crate) fn hosted_call_result(
 /// content parts and the phase label it may carry, a reasoning row added
 /// through the conversations API from the bare content it stores, any other
 /// row from the whole item it stores. `None` for a row that has no input form
-/// (a built-in tool call, an older schema), which is left out.
-fn conversation_item_as_input(item: &ConversationItem) -> Option<ResponseInputOutputItem> {
+/// (a built-in tool call, an older schema), which is left out. The row is
+/// consumed: its strings become the item's, with no copy; a row that carries
+/// its id on the row only has that id written into the item.
+fn conversation_item_as_input(item: ConversationItem) -> Option<ResponseInputOutputItem> {
     match item.item_type.as_str() {
         "message" => {
-            let (content, phase) = split_stored_message_content(item.content.clone());
+            let (content, phase) = split_stored_message_content(item.content);
             match serde_json::from_value::<Vec<ResponseContentPart>>(content) {
                 Ok(content) => Some(ResponseInputOutputItem::Message {
-                    id: item.id.0.clone(),
-                    role: item.role.clone().unwrap_or_else(|| "user".to_string()),
+                    id: item.id.0,
+                    role: item.role.unwrap_or_else(|| "user".to_string()),
                     content,
-                    status: item.status.clone(),
+                    status: item.status,
                     phase,
                 }),
                 Err(e) => {
@@ -353,31 +355,36 @@ fn conversation_item_as_input(item: &ConversationItem) -> Option<ResponseInputOu
                 }
             }
         }
-        "reasoning" if item.content.is_array() => {
-            match serde_json::from_value(item.content.clone()) {
-                Ok(content) => Some(ResponseInputOutputItem::new_reasoning(
-                    item.id.0.clone(),
-                    vec![],
-                    content,
-                    item.status.clone(),
-                )),
-                Err(e) => {
-                    warn!(item_id = %item.id.0, error = %e, "Stored reasoning item has no readable content; left out of the history");
-                    None
-                }
+        "reasoning" if item.content.is_array() => match serde_json::from_value(item.content) {
+            Ok(content) => Some(ResponseInputOutputItem::new_reasoning(
+                item.id.0,
+                vec![],
+                content,
+                item.status,
+            )),
+            Err(e) => {
+                warn!(item_id = %item.id.0, error = %e, "Stored reasoning item has no readable content; left out of the history");
+                None
             }
-        }
+        },
         _ => {
             // A whole-item row keeps the item under its own fields; a row
             // added through the conversations API carries its id on the row
             // only, and an item is found by id when referenced.
-            let mut whole = item.content.clone();
+            let mut whole = item.content;
+            let id = item.id.0;
             if let Some(fields) = whole.as_object_mut() {
                 fields
                     .entry("id")
-                    .or_insert_with(|| Value::String(item.id.0.clone()));
+                    .or_insert_with(|| Value::String(id.clone()));
             }
-            stored_item_as_input(&whole)
+            match serde_json::from_value(whole) {
+                Ok(input) => Some(input),
+                Err(e) => {
+                    warn!(item_id = %id, item_type = %item.item_type, error = %e, "Stored item has no readable form; left out of the history");
+                    None
+                }
+            }
         }
     }
 }
@@ -455,10 +462,11 @@ async fn conversation_items(
     // itself (no response id) was answered by nobody and keeps every part,
     // so the conversion refuses it as it would the request's own.
     let items: Vec<ResponseInputOutputItem> = stored
-        .iter()
+        .into_iter()
         .filter_map(|row| {
+            let answered = row.response_id.is_some();
             let item = conversation_item_as_input(row).filter(replays)?;
-            Some(if row.response_id.is_some() {
+            Some(if answered {
                 replayed_parts(item, into)
             } else {
                 item
@@ -1298,7 +1306,7 @@ pub(crate) mod tests {
             tenant: None,
         };
 
-        let message = conversation_item_as_input(&row(
+        let message = conversation_item_as_input(row(
             "message",
             Some("assistant"),
             json!({"content": [{"type": "output_text", "text": "hi", "annotations": []}], "phase": "final_answer"}),
@@ -1310,7 +1318,7 @@ pub(crate) mod tests {
                 if id == "message_1" && role == "assistant"
         ));
 
-        let reasoning = conversation_item_as_input(&row(
+        let reasoning = conversation_item_as_input(row(
             "reasoning",
             None,
             json!([{"type": "reasoning_text", "text": "thinking"}]),
@@ -1323,7 +1331,7 @@ pub(crate) mod tests {
         ));
 
         // a row with no input form is left out, not an error
-        assert!(conversation_item_as_input(&row(
+        assert!(conversation_item_as_input(row(
             "web_search_call",
             None,
             json!({"type": "web_search_call", "status": "completed"})
