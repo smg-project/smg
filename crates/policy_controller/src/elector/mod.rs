@@ -46,10 +46,12 @@
 //! stop. A backend call blocks that thread alone; the shard threads read the
 //! fence's snapshot, never the backend. The identity is
 //! `controller-id@host:port`, dialable without a Service and unique per
-//! instance. A restart under the same identity resumes its own record once
-//! the record stood still for a renew period (the earlier run is gone); a
+//! instance. A restart under the same identity resumes its own record under
+//! its term once the record stood still for its duration, the wait of every
+//! candidate (the earlier run's fence, stalled or gone, is closed by then); a
 //! second instance under a duplicated identity sees the record move under
-//! its name and refuses to take it, so two fences never open under one term.
+//! its name and refuses to take it for as long as it moves, so two fences
+//! never open under one term.
 //! A write that landed but reported an error (a sync that failed after the
 //! rename, an update the server applied before the call timed out) is told
 //! from a stranger's by the record the elector attempted, and is adopted as
@@ -289,7 +291,9 @@ pub struct Elector {
     attempted: Option<LeaseRecord>,
     /// New shapes of the record under this identity that this run did not
     /// write: the first is the earlier run's last write, a second is another
-    /// candidate under a duplicated identity.
+    /// candidate under a duplicated identity. Cleared when the record stands
+    /// still for its duration (this run resumes it), is released, or passes
+    /// to another identity: the refusal lasts as long as the writing does.
     strangers: u32,
 }
 
@@ -382,7 +386,8 @@ impl Elector {
     /// or by an earlier one of this process that landed and reported an
     /// error; `false` when it held nothing, or when another candidate holds
     /// the lease. On an error the elector keeps the record, so a second call
-    /// retries the write; a caller that ticks instead renews.
+    /// retries the write; a caller that ticks instead renews, or answers
+    /// [`Tick::Lost`] when the release landed after all.
     pub fn release(&mut self) -> Result<bool, ElectError> {
         let Some(mine) = self.held.clone() else {
             return Ok(false);
@@ -423,6 +428,7 @@ impl Elector {
         let Some(record) = current else {
             self.observed = None;
             self.attempted = None;
+            self.strangers = 0;
             return;
         };
         if self.observed.as_ref().is_some_and(|o| o.record == *record) {
@@ -432,12 +438,15 @@ impl Elector {
         // own and stays for the adoption; any other supersedes the attempt,
         // and one under this identity was written by another run under this
         // name: the earlier run's last write at the first sight, or a
-        // candidate under a duplicated identity.
+        // candidate under a duplicated identity. A record released or under
+        // another identity ends that count.
         if self.attempted.as_ref() != Some(record) {
             self.attempted = None;
-            if record.holder == self.identity {
-                self.strangers += 1;
-            }
+            self.strangers = if record.holder == self.identity {
+                self.strangers.saturating_add(1)
+            } else {
+                0
+            };
         }
         self.observed = Some(Observation {
             record: record.clone(),
@@ -458,8 +467,10 @@ impl Elector {
         } else {
             match (current, self.attempted.take()) {
                 // The attempt landed after all: the stored record is this
-                // process's own, renewed from here.
-                (Some(stored), Some(attempted)) if stored == attempted => {
+                // process's own, renewed from here. A released one is this
+                // process's own release, landed: the lease is given up, the
+                // fence stays closed, and the next tick is a candidate's.
+                (Some(stored), Some(attempted)) if stored == attempted && !stored.is_released() => {
                     mine = stored;
                     self.held = Some(mine.clone());
                 }
@@ -512,23 +523,27 @@ impl Elector {
                 (record.term, record.acquired_at_micros)
             }
             // A record under this identity that this run did not write: the
-            // earlier run's, resumed under its term once it stood still for
-            // a renew period (the earlier run is gone); one that moves again
-            // is another candidate under a duplicated identity, which would
-            // open a second fence under one term, so it is refused.
+            // earlier run's last write, or another candidate's under a
+            // duplicated identity. Either writer's fence may be open to its
+            // renew deadline, so this run waits for the record's duration of
+            // stillness, as every candidate does, and resumes under the
+            // record's term; a record that moves again under this name has
+            // another writer and is refused for as long as it keeps moving,
+            // since a take would open a second fence under one term.
             Some(record) if record.holder == self.identity => {
-                if self.strangers > 1 {
-                    return Err(ElectError::Identity(
-                        "another candidate writes under this identity",
-                    ));
-                }
                 let since = self.observed.as_ref().map_or(now, |o| o.since);
-                if now.saturating_duration_since(since) < self.settings.renew_period {
+                if now.saturating_duration_since(since) < record.duration() {
+                    if self.strangers > 1 {
+                        return Err(ElectError::Identity(
+                            "another candidate writes under this identity",
+                        ));
+                    }
                     return Ok(Tick::Following {
                         holder: record.holder.clone(),
                         term: record.term,
                     });
                 }
+                self.strangers = 0;
                 (record.term, record.acquired_at_micros)
             }
             Some(record) => {
@@ -843,9 +858,9 @@ mod tests {
             a.observed().expect("the record").acquired_at_micros
         };
         // The process restarts: a fresh elector under the same identity. It
-        // resumes its record once the record stood still for a renew period
-        // from its first sight, which tells the earlier run's last write from
-        // a live writer under the same name.
+        // resumes its record once the record stood still for its duration
+        // from its first sight, the wait of every candidate: a live writer
+        // under the same name would have moved it by then.
         let mut again = candidate(&lease, "a@host:1");
         let first_sight = t0 + S / 10;
         assert_eq!(
@@ -858,18 +873,59 @@ mod tests {
         );
         assert!(matches!(
             again
-                .tick(first_sight + S - Duration::from_micros(1))
+                .tick(first_sight + 3 * S - Duration::from_micros(1))
                 .expect("look"),
             Tick::Following { .. }
         ));
         assert_eq!(
-            again.tick(first_sight + S).expect("resume"),
+            again.tick(first_sight + 3 * S).expect("resume"),
             Tick::Acquired { term: 1 }
         );
         let record = again.observed().expect("the record");
         assert_eq!(record.acquired_at_micros, acquired_at, "the take stands");
         assert!(record.renewed_at_micros > acquired_at);
-        assert_eq!(again.fence().leader_term(first_sight + S), Some(1));
+        assert_eq!(again.fence().leader_term(first_sight + 3 * S), Some(1));
+    }
+
+    #[test]
+    fn a_restart_resumes_only_once_the_stalled_earlier_runs_fence_is_closed() {
+        let lease = MemoryLease::new();
+        let t0 = Instant::now() + S;
+        let mut earlier = candidate(&lease, "a@host:1");
+        earlier.tick(t0).expect("acquire");
+        assert_eq!(
+            earlier.tick(t0 + S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        // The earlier run stalls with its fence open to the renew deadline,
+        // and a new run under the same identity starts at once. A resume
+        // after a renew period of stillness would open a second fence under
+        // the term; the new run waits for the record's duration instead.
+        let mut again = candidate(&lease, "a@host:1");
+        let first_sight = t0 + S + S / 10;
+        assert!(matches!(
+            again.tick(first_sight).expect("look"),
+            Tick::Following { .. }
+        ));
+        let deadline = t0 + S + 2 * S;
+        assert_eq!(earlier.fence().leader_term(deadline), Some(1));
+        assert!(matches!(
+            again.tick(deadline).expect("look"),
+            Tick::Following { .. }
+        ));
+        assert_eq!(again.fence().leader_term(deadline), None);
+        assert!(matches!(
+            again
+                .tick(first_sight + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Following { .. }
+        ));
+        assert_eq!(
+            again.tick(first_sight + 3 * S).expect("resume"),
+            Tick::Acquired { term: 1 }
+        );
+        assert_eq!(earlier.fence().leader_term(first_sight + 3 * S), None);
+        assert_eq!(again.fence().leader_term(first_sight + 3 * S), Some(1));
     }
 
     #[test]
@@ -879,9 +935,9 @@ mod tests {
         let mut twin = candidate(&lease, "a@host:1");
         let t0 = Instant::now() + S;
         assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
-        // The twin sees a live record under its own name: it waits for a
-        // renew period of stillness, and the holder's renewal ends the wait
-        // with a refusal, never a take.
+        // The twin sees a live record under its own name: it waits for the
+        // record's duration of stillness, and the holder's renewal turns the
+        // wait into a refusal, never a take.
         assert!(matches!(
             twin.tick(t0 + S / 2).expect("look"),
             Tick::Following { .. }
@@ -898,10 +954,38 @@ mod tests {
         for i in 2..6u32 {
             let now = t0 + i * S;
             assert_eq!(a.tick(now).expect("renew"), Tick::Renewed { term: 1 });
-            twin.tick(now + S / 2).expect_err("refused for good");
+            twin.tick(now + S / 2)
+                .expect_err("refused while the record moves");
             assert_eq!(a.fence().leader_term(now), Some(1));
             assert_eq!(twin.fence().leader_term(now + S / 2), None);
         }
+        // The holder stalls after its renewal at `last`. Its fence is open to
+        // the renew deadline; the twin keeps its distance for the record's
+        // duration from its first sight of that renewal, then resumes the
+        // term with the earlier fence closed: the refusal was not for life.
+        let last = t0 + 5 * S;
+        let first_sight = last + S / 2;
+        twin.tick(last + 2 * S)
+            .expect_err("the record may still move");
+        assert_eq!(a.fence().leader_term(last + 2 * S), Some(1));
+        assert_eq!(twin.fence().leader_term(last + 2 * S), None);
+        twin.tick(first_sight + 3 * S - Duration::from_micros(1))
+            .expect_err("not yet");
+        assert_eq!(
+            twin.tick(first_sight + 3 * S).expect("resume"),
+            Tick::Acquired { term: 1 }
+        );
+        assert_eq!(a.fence().leader_term(first_sight + 3 * S), None);
+        assert_eq!(twin.fence().leader_term(first_sight + 3 * S), Some(1));
+        // The stalled holder wakes to a record that moved under it.
+        assert_eq!(
+            a.tick(first_sight + 4 * S).expect("look"),
+            Tick::Lost {
+                term: 1,
+                holder: "a@host:1".to_string()
+            }
+        );
+        assert_eq!(a.fence().leader_term(first_sight + 4 * S), None);
     }
 
     #[test]
@@ -1348,6 +1432,51 @@ mod tests {
         assert!(a.release().expect("the retry"), "released after all");
         assert!(!a.is_holder());
         assert_eq!(a.fence().leader_term(t0), None);
+    }
+
+    #[test]
+    fn a_release_that_landed_but_errored_is_not_renewed_by_the_next_tick() {
+        let lease = MemoryLease::new();
+        let fails = Arc::new(AtomicU32::new(0));
+        let backend = LandsThenErrors {
+            lease: lease.clone(),
+            fails: Arc::clone(&fails),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + S;
+        a.tick(t0).expect("acquire");
+        fails.store(1, Ordering::Relaxed);
+        a.release().expect_err("the answer was lost");
+        // The caller ticks instead of retrying: the released record is this
+        // run's own release, not a lease to renew. The fence stays closed
+        // under the old term while the candidates take the free lease.
+        assert_eq!(
+            a.tick(t0 + S).expect("look"),
+            Tick::Lost {
+                term: 1,
+                holder: String::new()
+            }
+        );
+        assert!(!a.is_holder());
+        assert_eq!(a.fence().leader_term(t0 + S), None);
+        assert!(
+            lease
+                .clone()
+                .read()
+                .expect("read")
+                .expect("the record")
+                .is_released(),
+            "still released"
+        );
+        let mut b = candidate(&lease, "b@host:2");
+        assert_eq!(
+            b.tick(t0 + S + S / 2).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+        assert!(matches!(
+            a.tick(t0 + 2 * S).expect("look"),
+            Tick::Following { term: 2, .. }
+        ));
     }
 
     #[test]
