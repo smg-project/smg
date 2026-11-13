@@ -57,6 +57,24 @@ use crate::common::FIELD_PARAM;
 #[cfg(feature = "axum")]
 pub struct ValidatedJson<T>(pub T);
 
+/// A body a route reads as a JSON value and checks itself (the Conversations
+/// routes): it rides the validated extractor for the envelope its refusals
+/// take, with nothing to validate or normalize before the handler sees it.
+#[cfg(feature = "axum")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ValueBody(pub Value);
+
+#[cfg(feature = "axum")]
+impl Validate for ValueBody {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "axum")]
+impl Normalizable for ValueBody {}
+
 /// The `error.code` of a body this extractor refused, carried as a response
 /// extension: the gateway's HTTP metrics read it when a response did not come
 /// from the gateway's own error builder, so the `error_code` label records the

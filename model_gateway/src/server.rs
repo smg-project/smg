@@ -37,14 +37,13 @@ use openai_protocol::{
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-    validated::{ValidatedJson, ValidatedPath, ValidatedQuery},
+    validated::{ValidatedJson, ValidatedPath, ValidatedQuery, ValueBody},
     worker::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerListFormat, WorkerSpec,
         WorkerUpdateRequest,
     },
 };
 use serde::Deserialize;
-use serde_json::Value;
 use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
@@ -632,7 +631,7 @@ async fn v1_responses_list_input_items(
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Json(body): Json<Value>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::create_conversation(&state.context.conversation_storage, tenant.as_deref(), body)
@@ -657,7 +656,7 @@ async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedPath(conversation_id): ValidatedPath<String>,
-    Json(body): Json<Value>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::update_conversation(
@@ -717,7 +716,7 @@ async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedPath(conversation_id): ValidatedPath<String>,
-    Json(body): Json<Value>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::create_conversation_items(
@@ -3403,6 +3402,7 @@ mod tests {
 
     use axum::response::sse::{Event, Sse};
     use axum_server::accept::Accept;
+    use serde_json::Value;
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;

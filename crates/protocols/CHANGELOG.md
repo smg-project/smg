@@ -6,6 +6,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
+  transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
+  handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or
+  one under another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
+  `invalid_json` or `json_parse_error`) as the typed routes do. The gateway's Conversations routes
+  read it.
 - `ValidatedQuery<T>` and `ValidatedPath<T>`, behind the `axum` feature: a route's query string
   and path segments read as the typed routes' body extractor reads a body. A query value the type
   does not take, one that does not parse or a required one that is missing, and a path segment
