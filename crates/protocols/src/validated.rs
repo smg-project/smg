@@ -24,7 +24,11 @@ use axum::{
         },
         FromRequest, FromRequestParts, Path, Query, Request,
     },
-    http::{header::CONTENT_TYPE, request::Parts, StatusCode},
+    http::{
+        header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE},
+        request::Parts,
+        HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -471,6 +475,45 @@ fn is_mime_parameter(part: &str) -> bool {
     is_token(name) && (is_token(value) || quoted)
 }
 
+/// The `Content-Encoding` of a request whose body a JSON extractor cannot
+/// read: any but `identity`, in whichever field of a repeated header or
+/// position of a comma-separated list it stands (a list is read coding by
+/// coding, as a combined field is one; the first coding the gateway does
+/// not decode is the one named). The gateway decodes no content encoding,
+/// so a compressed body would be parsed as JSON and refused as one; the
+/// header is answered first, as 415, by both JSON extractors.
+#[cfg(feature = "axum")]
+pub fn undecodable_content_encoding(req: &Request) -> Option<String> {
+    req.headers()
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .flat_map(|value| {
+            String::from_utf8_lossy(value.as_bytes())
+                .split(',')
+                .map(|coding| coding.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .find(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+}
+
+/// The message of the 415 a JSON body under an encoding the gateway does
+/// not decode is answered with.
+#[cfg(feature = "axum")]
+pub fn content_encoding_message(encoding: &str) -> String {
+    format!("Content-Encoding `{encoding}` is not decoded: send the JSON body unencoded")
+}
+
+/// The 415 with its `Accept-Encoding: identity`, the header by which a
+/// client that compresses its requests tells an encoding refusal from a
+/// media-type one (RFC 9110, sections 12.5.3 and 15.5.16).
+#[cfg(feature = "axum")]
+pub fn with_accept_encoding_identity(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    response
+}
+
 /// The gateway's answer to a body axum's extractor refused.
 #[cfg(feature = "axum")]
 fn json_rejection(err: JsonRejection) -> Response {
@@ -516,6 +559,14 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(encoding) = undecodable_content_encoding(&req) {
+            return Err(with_accept_encoding_identity(rejection(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "json_parse_error",
+                None,
+                content_encoding_message(&encoding),
+            )));
+        }
         // A body under the plain `application/json` content type is read and
         // parsed once, directly; axum's extractor parses it a second time only
         // when that fails, so that the rejection names the path of the failing
@@ -870,6 +921,77 @@ mod tests {
             .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.to_string().contains("syntax"), "{body}");
+    }
+
+    /// A body under a `Content-Encoding` the gateway does not decode is a
+    /// 415 in the envelope (`json_parse_error`, the header in the message,
+    /// `Accept-Encoding: identity` on the answer) before the body is read, in
+    /// whichever field of a repeated header or position of a comma-separated
+    /// list the encoding stands (the first undecoded coding is the one named);
+    /// `identity`, the one encoding that is none, alone or repeated in a list,
+    /// is read as the plain body it is.
+    #[tokio::test]
+    async fn a_content_encoding_the_gateway_does_not_decode_is_a_415_before_the_body_is_read() {
+        for (fields, accepted, named) in [
+            (&["gzip"][..], false, "gzip"),
+            (&["br, gzip"][..], false, "br"),
+            (&["identity", "gzip"][..], false, "gzip"),
+            (&["identity, gzip"][..], false, "gzip"),
+            (&["identity"][..], true, ""),
+            (&["identity, identity"][..], true, ""),
+            (&["Identity , identity"][..], true, ""),
+        ] {
+            let encoding = fields.join(" + ");
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json");
+            for field in fields {
+                request = request.header("content-encoding", *field);
+            }
+            let request = request
+                .body(Body::from(r#"{"value":0.5,"name":"x"}"#))
+                .unwrap_or_default();
+            let result = ValidatedJson::<BodyRequest>::from_request(request, &()).await;
+            if accepted {
+                assert!(result.is_ok(), "{encoding}: read as the plain body it is");
+                continue;
+            }
+            let response = result.err().expect("refused");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{encoding}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(ACCEPT_ENCODING)
+                    .map(HeaderValue::as_bytes),
+                Some(&b"identity"[..]),
+                "{encoding}: the 415 names the one encoding it takes"
+            );
+            assert_eq!(
+                response.extensions().get::<RejectionCode>(),
+                Some(&RejectionCode("json_parse_error".to_string())),
+                "{encoding}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            assert_eq!(
+                body["error"]["code"], "json_parse_error",
+                "{encoding}: {body}"
+            );
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(named),
+                "{encoding}: {body}"
+            );
+        }
     }
 
     /// A rejection carries its code as the `RejectionCode` extension (the

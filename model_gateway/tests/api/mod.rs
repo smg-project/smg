@@ -1,6 +1,7 @@
 //! API endpoint integration tests
 
 mod api_endpoints_test;
+mod content_encoding_test;
 mod messages_api_test;
 mod messages_streaming_test;
 mod messages_test;
