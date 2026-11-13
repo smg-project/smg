@@ -1528,14 +1528,16 @@ pub(crate) fn select_pair(
 
 /// The policy engine for a pair placement, or `None` when the legacy path
 /// decides: hosted under `--policy-engine engine`, and not placing a request
-/// the sticky routing-key override keys on either side
-/// ([`PolicyRegistry::pair_engine_for`]).
+/// the sticky routing-key override keys on either side or a key-native side
+/// pins by the key placement derives, a configured routing-key header
+/// included ([`PolicyRegistry::pair_engine_for`]).
 pub(crate) fn pair_decider<'a>(
     policies: &'a PolicyRegistry,
     inputs: &PlacementInputs<'_>,
 ) -> Option<&'a Arc<Decider>> {
     policies.pair_engine_for(&SelectWorkerInfo {
         headers: inputs.headers,
+        routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         ..SelectWorkerInfo::default()
     })
@@ -2391,6 +2393,38 @@ mod tests {
             ..PlacementInputs::default()
         };
         assert!(pair_decider(&policies, &keyed).is_none());
+    }
+
+    /// A manual side pins the key placement derives from a configured
+    /// routing-key header, override off: that keyed request stays on the
+    /// legacy pair path, the unkeyed one takes the engine, and sides that
+    /// pin nothing take it keyed or not.
+    #[test]
+    fn a_keyed_pair_with_a_manual_side_keeps_the_legacy_path_by_a_configured_header() {
+        let configured = || RoutingKeyOverrideConfig {
+            enabled: false,
+            headers: vec!["x-session-id".into()],
+            ..Default::default()
+        };
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 3600,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let round_robin = PolicyConfig::RoundRobin;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "conv-7".parse().unwrap());
+        let keyed = PlacementInputs {
+            headers: Some(&headers),
+            ..PlacementInputs::default()
+        };
+        let pinning = PolicyRegistry::with_override(manual.clone(), configured())
+            .with_policy_engine(PolicyEngineMode::Engine, &manual, &round_robin);
+        assert!(pair_decider(&pinning, &PlacementInputs::default()).is_some());
+        assert!(pair_decider(&pinning, &keyed).is_none());
+        let plain = PolicyRegistry::with_override(round_robin.clone(), configured())
+            .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
+        assert!(pair_decider(&plain, &keyed).is_some());
     }
 
     /// The engine's proposal of one pair, decided with an open window and
