@@ -2491,15 +2491,22 @@ impl NativeEncoder {
         None
     }
 
-    /// Whether the stages, run over a window of text around `p` that starts
-    /// and ends at whitespace, cut cleanly at `p`: at each stage in turn, no
-    /// match may span `p`; a match that starts at `p` settles it (the deeper
-    /// stages see that match from `p` on either way), a gap around `p` hands
-    /// the question to the next stage, and a gap at the last stage would be
-    /// split, so that is no cut. The window starts and ends where the whole
-    /// text's match loop begins a piece too ([`Self::window_start`],
-    /// [`Self::window_end`]), so that its pieces up to `p` are the text's; a
-    /// candidate without such a start or end is no cut.
+    /// Whether the stages, run over a window of text around `p`, cut cleanly
+    /// at `p`. The window starts where the whole text's match loop begins a
+    /// piece and ends just after such a space ([`Self::window_start`],
+    /// [`Self::window_end`]), so that its pieces around `p` are the text's; a
+    /// candidate without such a start or end is no cut. Over the window the
+    /// stages run as the walk runs them over a piece ([`Self::pieces`]), each
+    /// over the piece of the stage before it, never over the whole window
+    /// (two isolated stages, `aa` then a space with 999 of the space-or-a
+    /// class, over a run of ` a` with `aa` inside it: the second stage's match
+    /// begins where `aa` ends, while a run from the window's start would end
+    /// one match on the candidate and begin the next there). A piece that
+    /// holds `p` inside it would be split, so that is no cut; and the text
+    /// before `p` on its own, as the pool's unit reads it, must cut into the
+    /// same pieces as it does inside the window (a lookahead at `p` reads the
+    /// unit's end where the text reads on: ` a{1000}(?!\s)` holds at the one
+    /// and fails at the other), else that is no cut either.
     fn piece_starts_at(&self, text: &str, p: usize) -> bool {
         let Some(start) = self.window_start(text, p) else {
             return false;
@@ -2509,20 +2516,25 @@ impl NativeEncoder {
         };
         let window = &text[start..end];
         let at = p - start;
-        for stage in &self.stages {
-            for (piece_start, piece_end) in stage.pattern.find_iter(window) {
-                if piece_start == at {
-                    return true;
-                }
-                if piece_start < at && at < piece_end {
-                    return false;
-                }
-                if piece_start > at {
-                    break;
-                }
-            }
+        let mut whole = Vec::new();
+        self.piece_spans(window, &mut whole);
+        if whole.iter().any(|&(from, to)| from < at && at < to) {
+            return false;
         }
-        false
+        let mut left = Vec::new();
+        self.piece_spans(&window[..at], &mut left);
+        left.iter()
+            .eq(whole.iter().take_while(|&&(_, to)| to <= at))
+    }
+
+    /// The final pieces of `text` under the stages, as the walk cuts them
+    /// ([`Self::pieces`]), as spans of byte offsets into `text`.
+    fn piece_spans(&self, text: &str, out: &mut Vec<(usize, usize)>) {
+        let base = text.as_ptr() as usize;
+        self.pieces(0, text, &mut |piece| {
+            let from = piece.as_ptr() as usize - base;
+            out.push((from, from + piece.len()));
+        });
     }
 
     /// Where the cut check's window for a candidate at `p` starts: the first
