@@ -4717,6 +4717,85 @@ fn function_tool_parameters_must_be_an_object() {
     );
 }
 
+/// The public API's function-tool keys are checked for shape as the custom
+/// tool's typed fields are: `async` and `defer_loading` a boolean,
+/// `allowed_callers` an array of strings, `output_schema` an object, each also
+/// `null`, on a function tool alone or in a namespace.
+#[test]
+fn function_tool_keys_must_have_the_spec_shapes() {
+    use serde_json::Value;
+    let tool = |key: &str, value: &Value| {
+        let mut tool = json!({"type": "function", "name": "f", "parameters": {}});
+        tool[key] = value.clone();
+        tool
+    };
+    for (key, value, expected) in [
+        (
+            "async",
+            json!("yes"),
+            "expected a boolean, but got a string",
+        ),
+        (
+            "defer_loading",
+            json!(1),
+            "expected a boolean, but got a number",
+        ),
+        (
+            "allowed_callers",
+            json!("direct"),
+            "expected an array of strings, but got a string",
+        ),
+        (
+            "allowed_callers",
+            json!(["direct", 1]),
+            "expected an array of strings, but got a number",
+        ),
+        (
+            "output_schema",
+            json!("object"),
+            "expected an object, but got a string",
+        ),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [tool(key, &value)]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(
+            code.contains("invalid_type")
+                && code.contains(&format!("tools[0].{key}"))
+                && code.contains(expected),
+            "{key}={value}: {code}"
+        );
+
+        let namespaced = plain_request(json!({
+            "model": "m", "input": "hi",
+            "tools": [{"type": "namespace", "name": "ns", "description": "d",
+                       "tools": [tool(key, &value)]}]
+        }))
+        .unwrap();
+        let code = validation_code(&namespaced);
+        assert!(
+            code.contains(&format!("tools[0].tools[0].{key}")),
+            "{key}={value}: {code}"
+        );
+    }
+    for (key, value) in [
+        ("async", json!(false)),
+        ("defer_loading", Value::Null),
+        ("allowed_callers", json!(["programmatic"])),
+        ("allowed_callers", Value::Null),
+        ("output_schema", json!({"type": "object"})),
+        ("output_schema", Value::Null),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [tool(key, &value)]
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok(), "{key}={value}");
+    }
+}
+
 /// One of OpenAI's own models: the public API's structured-output rules apply.
 const OPENAI_MODEL: &str = "gpt-4.1";
 /// A self-hosted model: those rules are the engine's business, not the gateway's.

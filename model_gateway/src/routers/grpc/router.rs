@@ -23,9 +23,11 @@ use uuid::Uuid;
 use super::{
     common::{
         responses::{
-            background, handlers::cancel_response_impl, streaming::build_sse_response_from_stream,
-            utils::validate_worker_availability, BackgroundResponses, BackgroundStream,
-            ResponsesContext,
+            background,
+            handlers::cancel_response_impl,
+            streaming::build_sse_response_from_stream,
+            utils::{refuse_tools_without_a_direct_caller, validate_worker_availability},
+            BackgroundResponses, BackgroundStream, ResponsesContext,
         },
         stages::{
             context_length_exceeded, helpers::resolve_request_id_stamp, smallest_context_length,
@@ -472,6 +474,11 @@ impl GrpcRouter {
         // 0. Fast worker validation (fail-fast before expensive operations)
         if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
         {
+            return error_response;
+        }
+        // A tool only code may call has no caller on this router, which runs
+        // no programmatic tool calls.
+        if let Some(error_response) = refuse_tools_without_a_direct_caller(body.tools.as_deref()) {
             return error_response;
         }
 

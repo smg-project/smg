@@ -404,7 +404,7 @@ pub enum ResponseTool {
 
     /// User-defined custom tool with optional grammar-constrained input.
     ///
-    /// Spec: `{ name, type: "custom", defer_loading?, description?, format? }`.
+    /// Spec: `{ name, type: "custom", allowed_callers?, async?, defer_loading?, description?, format? }`.
     /// `format` constrains the model's free-form `input` payload — `Text` is
     /// unconstrained, `Grammar` enforces a Lark or regex production at decode
     /// time. The model returns a `custom_tool_call` output item carrying the
@@ -539,6 +539,19 @@ impl FunctionTool {
     pub const TOOL_KEYS: &'static [&'static str] =
         &["async", "defer_loading", "output_schema", "allowed_callers"];
 
+    /// Every key a function tool takes, as its refusal of another key lists
+    /// them: the function object's own, then [`Self::TOOL_KEYS`].
+    const FIELDS: &'static [&'static str] = &[
+        "name",
+        "description",
+        "parameters",
+        "strict",
+        "async",
+        "defer_loading",
+        "output_schema",
+        "allowed_callers",
+    ];
+
     /// The function object a chat template is handed: the tool's function
     /// without [`Self::TOOL_KEYS`], which describe the call, not the function.
     pub fn chat_function(&self) -> Function {
@@ -547,6 +560,16 @@ impl FunctionTool {
             .extra
             .retain(|key, _| !Self::TOOL_KEYS.contains(&key.as_str()));
         function
+    }
+
+    /// Whether the model may call the tool itself: `allowed_callers` is absent,
+    /// `null` or names `direct`. A tool only code may call (`["programmatic"]`)
+    /// needs a router that runs programmatic tool calls.
+    pub fn allows_direct_calls(&self) -> bool {
+        match self.function.extra.get("allowed_callers") {
+            Some(Value::Array(callers)) => callers.iter().any(|caller| caller == "direct"),
+            _ => true,
+        }
     }
 }
 
@@ -558,23 +581,13 @@ impl FunctionTool {
 /// public API's own tool keys ([`FunctionTool::TOOL_KEYS`]) stay in `extra`.
 impl<'de> Deserialize<'de> for FunctionTool {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        const FIELDS: &[&str] = &[
-            "name",
-            "description",
-            "parameters",
-            "strict",
-            "async",
-            "defer_loading",
-            "output_schema",
-            "allowed_callers",
-        ];
         let function = Function::deserialize(deserializer)?;
         if let Some(key) = function
             .extra
             .keys()
             .find(|key| !FunctionTool::TOOL_KEYS.contains(&key.as_str()))
         {
-            return Err(serde::de::Error::unknown_field(key, FIELDS));
+            return Err(serde::de::Error::unknown_field(key, FunctionTool::FIELDS));
         }
         Ok(Self { function })
     }
@@ -705,7 +718,7 @@ pub enum FileSearchRanker {
 
 /// User-defined custom tool definition.
 ///
-/// Spec: `{ name, type: "custom", defer_loading?, description?, format? }`.
+/// Spec: `{ name, type: "custom", allowed_callers?, async?, defer_loading?, description?, format? }`.
 /// The discriminator (`type: "custom"`) is enforced by the parent
 /// [`ResponseTool`] enum; this struct only carries the payload fields so the
 /// `flatten`-style wire shape survives a round-trip.
@@ -731,6 +744,16 @@ pub struct CustomTool {
     /// The contexts the tool may be invoked from (`CallableToolAllowedCaller`:
     /// `direct`, `programmatic`), forwarded as given.
     pub allowed_callers: Option<Vec<String>>,
+}
+
+impl CustomTool {
+    /// Whether the model may call the tool itself: `allowed_callers` is absent
+    /// or names `direct` (see [`FunctionTool::allows_direct_calls`]).
+    pub fn allows_direct_calls(&self) -> bool {
+        self.allowed_callers
+            .as_ref()
+            .is_none_or(|callers| callers.iter().any(|caller| caller == "direct"))
+    }
 }
 
 /// Input-format constraint applied to a [`CustomTool`].
@@ -3990,6 +4013,41 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
     Ok(())
 }
 
+/// The public API's function-tool keys ([`FunctionTool::TOOL_KEYS`]) are kept
+/// untyped in the function's `extra`, so their shapes are checked here, as the
+/// custom tool's typed fields check theirs: `async` and `defer_loading` a
+/// boolean, `allowed_callers` an array of strings, `output_schema` an object,
+/// each of them also `null`.
+fn validate_function_tool_keys(function: &Function, at: &str) -> Result<(), ValidationError> {
+    for key in FunctionTool::TOOL_KEYS {
+        let Some(value) = function.extra.get(*key) else {
+            continue;
+        };
+        let (expected, got) = match *key {
+            "async" | "defer_loading" if !(value.is_boolean() || value.is_null()) => {
+                ("a boolean", json_type_name(value))
+            }
+            "allowed_callers" => match value {
+                Value::Null => continue,
+                Value::Array(callers) => match callers.iter().find(|caller| !caller.is_string()) {
+                    Some(caller) => ("an array of strings", json_type_name(caller)),
+                    None => continue,
+                },
+                _ => ("an array of strings", json_type_name(value)),
+            },
+            "output_schema" if !(value.is_object() || value.is_null()) => {
+                ("an object", json_type_name(value))
+            }
+            _ => continue,
+        };
+        return Err(invalid(
+            "invalid_type",
+            format!("Invalid type for '{at}.{key}': expected {expected}, but got {got} instead."),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates ResponseTool structure based on tool type
 fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError> {
     // MCP server_label must be present and unique (case-insensitive).
@@ -4010,6 +4068,17 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                             json_type_name(function.parameters_schema())
                         ),
                     ));
+                }
+                validate_function_tool_keys(function, &format!("tools[{idx}]"))?;
+            }
+            ResponseTool::Namespace(namespace) => {
+                for (member_idx, member) in namespace.tools.iter().enumerate() {
+                    if let NamespaceTool::Function(function_tool) = member {
+                        validate_function_tool_keys(
+                            &function_tool.function,
+                            &format!("tools[{idx}].tools[{member_idx}]"),
+                        )?;
+                    }
                 }
             }
             // The hosted local_shell tool is not served by the gateway, and the
@@ -4582,6 +4651,13 @@ impl ResponseReasoningContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A function tool's refusal of an unknown key lists the public API's tool
+    /// keys among those it takes.
+    #[test]
+    fn a_function_tools_fields_end_with_its_tool_keys() {
+        assert!(FunctionTool::FIELDS.ends_with(FunctionTool::TOOL_KEYS));
+    }
 
     /// The three sampling knobs the request keeps as plain values read as set
     /// only off their serde defaults: absent is unset, a value is set, and a
