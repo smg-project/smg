@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use serde_with::skip_serializing_none;
 use validator::{Validate, ValidationError};
 
@@ -71,6 +71,13 @@ pub struct InteractionsRequest {
 
     /// Link to prior interaction for stateful conversations
     pub previous_interaction_id: Option<String>,
+
+    /// The request's other fields (`continuation_token`, `safety_settings`,
+    /// `service_tier`, `webhook_config`, `environment`, `labels`,
+    /// `cached_content`, and any the API adds), forwarded to the upstream as
+    /// written, as the Messages request's `other` is.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 impl Default for InteractionsRequest {
@@ -90,6 +97,7 @@ impl Default for InteractionsRequest {
             stream: false,
             background: false,
             store: true,
+            other: Map::new(),
         }
     }
 }
@@ -1235,6 +1243,32 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The request's fields the gateway does not model are written back for
+    /// the upstream as the client sent them: the continuation token of a
+    /// `store: false` client's next hop, the safety settings, the service
+    /// tier and the rest.
+    #[test]
+    fn a_request_keeps_the_fields_the_gateway_does_not_model() {
+        let fields = serde_json::json!({
+            "continuation_token": "tok_1",
+            "safety_settings": [{"type": "harassment", "threshold": "block_none"}],
+            "service_tier": "flex",
+            "webhook_config": {"uris": ["https://example.com/hook"]},
+            "environment": "remote",
+            "labels": {"team": "a"},
+            "cached_content": "cachedContents/1"
+        });
+        let mut body = serde_json::json!({"model": "m", "input": "hi", "store": false});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let request: InteractionsRequest = serde_json::from_value(body).unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        for (key, value) in fields.as_object().unwrap() {
+            assert_eq!(&written[key], value, "{key}");
+        }
+    }
 
     fn refusal(result: Result<(), ValidationError>) -> (String, String) {
         let err = result.expect_err("a refusal");

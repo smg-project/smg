@@ -88,3 +88,52 @@ fn transform_payload(payload: &mut Value, ctx: &RequestContext) {
         obj.insert("store".to_string(), Value::Bool(false));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use openai_protocol::interactions::InteractionsRequest;
+    use serde_json::json;
+
+    use super::request_building;
+    use crate::{
+        gemini::context::{RequestContext, SharedComponents},
+        tenant::{TenantKey, TenantRequestMeta},
+        test_support::{http_client, StubWorkers},
+    };
+
+    /// The upstream payload carries the request's fields the gateway does not
+    /// model as the client wrote them, and the gateway's own overrides still
+    /// apply: the model the route names, and `store: false` for a model
+    /// request.
+    #[tokio::test]
+    async fn the_payload_keeps_the_fields_the_gateway_does_not_model() {
+        let request: InteractionsRequest = serde_json::from_value(json!({
+            "model": "m", "input": "hi", "store": false,
+            "continuation_token": "tok_1",
+            "safety_settings": [{"type": "harassment", "threshold": "block_none"}],
+            "service_tier": "flex"
+        }))
+        .expect("a request");
+        let components = SharedComponents {
+            client: http_client(),
+            workers: Arc::new(StubWorkers::default()),
+            request_timeout: Duration::from_secs(5),
+        };
+        let mut ctx = RequestContext::new(
+            Arc::new(request),
+            None,
+            Some("gemini-routed".to_string()),
+            TenantRequestMeta::new(TenantKey::new("t")),
+            Arc::new(components),
+        );
+        assert!(request_building(&mut ctx).await.is_ok());
+        let payload = ctx.processing.payload.expect("a payload");
+        assert_eq!(payload["continuation_token"], "tok_1");
+        assert_eq!(payload["safety_settings"][0]["threshold"], "block_none");
+        assert_eq!(payload["service_tier"], "flex");
+        assert_eq!(payload["model"], "gemini-routed");
+        assert_eq!(payload["store"], false);
+    }
+}
