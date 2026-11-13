@@ -11,7 +11,7 @@ use serde_json::Value;
 use validator::Validate;
 
 use super::{
-    common::{routing_text_of_input, GenerationRequest, UsageInfo},
+    common::{routing_text_of_input, GenerationRequest, StringOrArray, UsageInfo},
     embedding::validate_input,
     validated::Normalizable,
 };
@@ -44,11 +44,13 @@ pub struct ClassifyRequest {
     /// Optional user identifier
     pub user: Option<String>,
 
-    /// Engine extension: request id for tracking
-    pub rid: Option<String>,
+    /// Engine extension: request id for tracking, one, or one per input, as
+    /// SGLang's `rid` takes it
+    pub rid: Option<StringOrArray>,
 
-    /// Engine extension: request priority
-    pub priority: Option<i32>,
+    /// Engine extension: request priority, any 64-bit integer, as SGLang's
+    /// `priority` takes it
+    pub priority: Option<i64>,
 
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
     #[serde(flatten)]
@@ -59,7 +61,8 @@ impl Normalizable for ClassifyRequest {}
 
 impl GenerationRequest for ClassifyRequest {
     fn rid(&self) -> Option<&str> {
-        self.rid.as_deref()
+        // A batch's first id, as a rerank request's
+        self.rid.as_ref().and_then(StringOrArray::first)
     }
 
     fn is_stream(&self) -> bool {

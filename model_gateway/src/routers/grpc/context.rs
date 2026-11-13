@@ -176,7 +176,11 @@ impl RequestType {
             Self::Generate(r) => r.rid.as_deref(),
             Self::Completion(r) => r.rid.as_deref(),
             Self::Embedding(r) => r.rid.as_deref(),
-            Self::Classify(r) => r.rid.as_deref(),
+            // a batch's first id, as the classify request routes by it
+            Self::Classify(r) => r
+                .rid
+                .as_ref()
+                .and_then(openai_protocol::common::StringOrArray::first),
             Self::Messages(r) => r.rid.as_deref(),
             Self::Responses(_) | Self::Decisions(_) | Self::Transcription { .. } => None,
         }

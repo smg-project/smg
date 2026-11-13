@@ -2,6 +2,7 @@
 //! serialization round trips, validation rules and provider profiles.
 
 mod chat;
+mod classify;
 mod completion;
 mod decisions;
 mod deepseek_profile;

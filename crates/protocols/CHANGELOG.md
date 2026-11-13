@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A classify request's `rid` may be a list, one per input, and its `priority` any 64-bit
+  integer, as SGLang's `/v1/classify` takes them: a list of ids and a priority past `i32` were
+  refused as `invalid_type` and `invalid_value`. A batch routes by its first id, as a rerank request
+  does. Breaking: `ClassifyRequest.rid` is an `Option<StringOrArray>` and `priority` an
+  `Option<i64>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
