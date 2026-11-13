@@ -823,14 +823,17 @@ async fn relay_upstream_stream(
                         continue;
                     }
 
-                    // Process through handler
-                    let action = handler.process_event(event_name, data.as_ref());
+                    // Parse the payload once: the handler's gate and record, the skip and
+                    // in_progress checks below and the forward all read this value.
+                    let parsed = serde_json::from_str::<Value>(data.as_ref()).ok();
+                    let action = match parsed.as_ref() {
+                        Some(value) => handler.process_parsed(event_name, value),
+                        // An unparsable payload: the handler's own path logs and forwards it.
+                        None => handler.process_event(event_name, data.as_ref()),
+                    };
 
                     match action {
                         StreamAction::Forward => {
-                            // Parse data once and reuse for skip check, forwarding, and in_progress check
-                            let parsed = serde_json::from_str::<Value>(data.as_ref()).ok();
-
                             // Skip response.created and response.in_progress on subsequent iterations
                             let should_skip = if flags.first_iteration {
                                 false
@@ -935,7 +938,7 @@ async fn relay_upstream_stream(
                                         raw_block: &raw_block,
                                         event_name,
                                         data: data.as_ref(),
-                                        pre_parsed: None,
+                                        pre_parsed: parsed,
                                     },
                                     handler,
                                     tx,
