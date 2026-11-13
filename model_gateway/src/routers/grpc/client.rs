@@ -1227,6 +1227,26 @@ mod tests {
         assert!(!silent.contains_key("constrained_decoding_start"));
     }
 
+    /// vLLM discovery preserves an explicit policy and leaves old engines silent.
+    #[test]
+    fn vllm_server_info_discovers_decoding_policy() {
+        for policy in ["", "requested", "always"] {
+            let labels = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+                constrained_decoding: policy.to_string(),
+                ..Default::default()
+            }))
+            .to_labels();
+            assert_eq!(
+                labels.get("constrained_decoding").map(String::as_str),
+                if policy.is_empty() {
+                    None
+                } else {
+                    Some(policy)
+                }
+            );
+        }
+    }
+
     /// The vocabulary of structural-tag nodes a worker's grammar compiler
     /// takes becomes the `structural_tag_vocabulary` label on every runtime
     /// whose servicer reports it: a field of the vLLM and TensorRT-LLM server

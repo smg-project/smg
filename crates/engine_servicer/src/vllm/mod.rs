@@ -175,6 +175,8 @@ pub struct VllmModelInfo {
     /// parser to see the thought's end, `first_token` when the grammar runs
     /// from the first generated token; empty when the config does not say.
     pub constrained_decoding_start: String,
+    /// Gateway policy declared by the launcher: requested, always, or unset.
+    pub constrained_decoding: String,
     /// The vocabulary of structural-tag nodes the engine's grammar compiler
     /// takes, as the launcher read it off the xgrammar installed beside the
     /// engine (`structural_tag_vocabulary` label): `older` for one that

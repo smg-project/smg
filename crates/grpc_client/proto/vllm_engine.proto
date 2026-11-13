@@ -535,6 +535,11 @@ message GetServerInfoResponse {
   // E/P must agree on the connector and advertise complementary roles.
   string ec_connector = 29;
   string ec_role = 30;
+
+  // The engine's requested gateway policy: "requested" or "always".
+  // Empty leaves the gateway default unchanged. Flattened into the
+  // constrained_decoding worker label; explicit worker configuration wins.
+  string constrained_decoding = 31;
 }
 
 // =====================
