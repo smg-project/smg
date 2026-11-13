@@ -1256,7 +1256,8 @@ async fn submit_removal_job(
     // Guard the failed worker by its own id. The url is a DP base, so the
     // removal step matches the whole rank group; a bare revision would take
     // out every sibling that happens to sit at the same revision.
-    let expected_revisions = HashMap::from([(worker_id.as_str().to_string(), expected_revision)]);
+    let expected_revisions =
+        HashMap::from([(worker_id.as_str().to_string(), Some(expected_revision))]);
     if let Err(e) = job_queue
         .submit(Job::RemoveWorker {
             url: url.clone(),

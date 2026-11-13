@@ -26,8 +26,12 @@ pub struct WorkerRemovalRequest {
     /// silently leave the rest registered against a Pod that is already gone.
     ///
     /// A worker missing from the map is a different incarnation than the one
-    /// observed, so it is left alone. `None` removes every match unguarded.
-    pub expected_revisions: Option<HashMap<String, u64>>,
+    /// observed, so it is left alone. An id mapped to `None` is removed at
+    /// whatever revision it holds: a `DELETE` names the id, and a worker
+    /// rebuilt under it since (a `PATCH`, a `PUT`, a label refresh) is the
+    /// one the `DELETE` named. `None` for the map removes every match
+    /// unguarded.
+    pub expected_revisions: Option<HashMap<String, Option<u64>>>,
 }
 
 /// Step to find workers to remove based on URL.
@@ -56,12 +60,15 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             // was registered after the snapshot; a revision that moved was
             // replaced since. Either way that worker is skipped and the next
             // reconcile pass re-evaluates it, while its siblings still drain.
+            // An id pinned at no revision is removed as it stands.
             workers_to_remove.retain(|worker| {
                 app_context
                     .worker_registry
                     .get_id_by_url(worker.url())
                     .and_then(|id| expected_revisions.get(id.as_str()).copied())
-                    .is_some_and(|expected| expected == worker.revision())
+                    .is_some_and(|expected| {
+                        expected.is_none_or(|revision| revision == worker.revision())
+                    })
             });
             if workers_to_remove.is_empty() {
                 debug!(

@@ -870,17 +870,21 @@ impl WorkerService {
             }
         }
 
-        // The removal is pinned to what this DELETE saw, each worker under
-        // the URL at its id and revision, as the removal step's guard reads
-        // them: a worker a PUT replaces between the DELETE's answer and the
-        // removal's run is the PUT's and stays.
+        // The removal is pinned to the workers this DELETE saw by id and to
+        // no revision, as the removal step's guard reads it: a worker
+        // rebuilt under its id before the removal runs (a PATCH or a PUT
+        // answered earlier and still in flight, a label refresh) is the one
+        // this DELETE named and goes; a worker registered under a fresh id
+        // since is not and stays. A revision pin held the removal behind
+        // the job that moves the revision and then skipped the worker,
+        // every time.
         let entries = find_workers_by_url(&self.worker_registry, &url)
             .into_iter()
             .filter_map(|worker| {
                 let id = self.worker_registry.get_id_by_url(worker.url())?;
-                Some((id.as_str().to_string(), worker.revision()))
+                Some((id.as_str().to_string(), None))
             })
-            .collect::<HashMap<String, u64>>();
+            .collect::<HashMap<String, Option<u64>>>();
         let job = Job::RemoveWorker {
             url: url.clone(),
             expected_revisions: Some(entries),
@@ -894,8 +898,9 @@ impl WorkerService {
         // A repeated DELETE's removal finds nothing left then; one behind a
         // guarded cleanup that skipped a worker replaced since the cleanup's
         // snapshot removes that worker, where a DELETE answered by the
-        // cleanup alone removed nothing. The queue keeps one job per URL,
-        // the latest; this is its only caller.
+        // cleanup alone removed nothing. The queue keeps one job per URL; a
+        // label refresh is kept the same way (`submit_label_refresh`), and
+        // a kept removal outranks it: the worker it would refresh is leaving.
         job_queue
             .submit_or_defer(job)
             .await
@@ -1383,7 +1388,7 @@ mod tests {
         // saw, holds the URL.
         let cleanup = Job::RemoveWorker {
             url: url.to_string(),
-            expected_revisions: Some(HashMap::from([(id.as_str().to_string(), 1)])),
+            expected_revisions: Some(HashMap::from([(id.as_str().to_string(), Some(1))])),
         };
         assert!(queue.claim_if_idle(&cleanup), "the cleanup holds the URL");
         let deleted = service
