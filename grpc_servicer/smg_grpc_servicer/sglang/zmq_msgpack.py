@@ -237,10 +237,19 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
         kv_used_tokens: int = 0,
         kv_total_tokens: int = 0,
         hidden_rows: list[list[list[float]] | None] | None = None,
+        stats_rows: list[tuple[int, int]] | None = None,
     ) -> BatchTokenIDSlimOutput:
-        if out.output_ids is None:
-            raise ValueError("BatchTokenIDOutput.output_ids is required on the slim wire")
         count = len(out.rids or [])
+        if hasattr(out, "output_ids"):
+            if out.output_ids is None:
+                raise ValueError("BatchTokenIDOutput.output_ids is required on the slim wire")
+            output_ids = [list(ids) for ids in out.output_ids]
+        else:
+            # Native flat rows carry the same incremental tokens. The SMG slim
+            # wire stays unchanged for both engine layouts.
+            from sglang.srt.managers.io_struct import row_output_ids
+
+            output_ids = [list(row_output_ids(out, index)) for index in range(count)]
 
         def column(values, default):
             values = list(values or [])
@@ -264,13 +273,13 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
 
         return cls(
             rids=list(out.rids or []),
-            output_ids=[list(ids) for ids in out.output_ids],
+            output_ids=output_ids,
             finished_reasons=[str((r or {}).get("type") or "") for r in reasons],
             finished_messages=[(r or {}).get("message") for r in reasons],
             finished_matched=[matched(r) for r in reasons],
-            prompt_tokens=column(out.prompt_tokens, 0),
+            prompt_tokens=_token_count_column(out, "prompt_tokens", count, stats_rows),
             completion_tokens=column(out.completion_tokens, 0),
-            cached_tokens=column(out.cached_tokens, 0),
+            cached_tokens=_token_count_column(out, "cached_tokens", count, stats_rows),
             output_token_logprobs_val=[
                 list(v or []) for v in column(out.output_token_logprobs_val, None)
             ],
@@ -322,6 +331,44 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
             # wire carries what is new. None per request without rows.
             output_hidden_states=column(hidden_rows, None),
         )
+
+
+def _token_count_column(output, name, count, rows=None):
+    """Preserve legacy columns; expand the newer sparse stats into the same slim wire."""
+    values = getattr(output, name, None)
+    if values is not None:
+        return list(values) + [0] * max(0, count - len(values))
+    if rows is not None:
+        index = 0 if name == "prompt_tokens" else 1
+        return [row[index] for row in rows]
+    stats = getattr(output, "request_stats", None) or []
+    return [int(getattr(stats[i], name, 0) or 0) if i < len(stats) else 0 for i in range(count)]
+
+
+class RequestStatsRows:
+    """Retain sparse native stats only for live requests, freeing them on output or abort."""
+
+    def __init__(self):
+        self.rows = {}
+
+    def column(self, output):
+        """Rehydrate per-step counts without changing an engine that supplies full columns."""
+        if getattr(output, "prompt_tokens", None) is not None:
+            return None
+        stats = getattr(output, "request_stats", None) or []
+        finished = getattr(output, "finished_reasons", None) or []
+        rows = []
+        for index, rid in enumerate(output.rids or []):
+            if index < len(stats) and stats[index] is not None:
+                self.rows[rid] = (stats[index].prompt_tokens, stats[index].cached_tokens)
+            rows.append(self.rows.get(rid, (0, 0)))
+            if index < len(finished) and finished[index]:
+                self.forget(rid)
+        return rows
+
+    def forget(self, rid):
+        """A terminal abort follows the same cleanup path as a completed native row."""
+        self.rows.pop(rid, None)
 
 
 class HiddenStateRows:
@@ -435,8 +482,8 @@ class BatchEmbeddingSlimOutput(msgspec.Struct, tag=True, array_like=True):
         return cls(
             rids=list(out.rids or []),
             embeddings=embeddings,
-            prompt_tokens=column(out.prompt_tokens, 0),
-            cached_tokens=column(out.cached_tokens, 0),
+            prompt_tokens=_token_count_column(out, "prompt_tokens", count),
+            cached_tokens=_token_count_column(out, "cached_tokens", count),
             finished_reasons=reasons,
             finished_messages=messages,
             finished_status=statuses,
@@ -753,6 +800,7 @@ class MsgpackSendSocket:
         # The elements of each request's cumulative hidden-state list already
         # consumed (the wire carries each output's new rows).
         self.hidden_rows = HiddenStateRows()
+        self.stats_rows = RequestStatsRows()
 
     def attach(
         self,
@@ -856,6 +904,7 @@ class MsgpackSendSocket:
                     output,
                     engine_index=self.engine_index,
                     hidden_rows=self.hidden_rows.column(output),
+                    stats_rows=self.stats_rows.column(output),
                     **self._load_tail(),
                 )
             )
@@ -924,6 +973,7 @@ class MsgpackSendSocket:
         )
         self.traces.finish(rid)
         self.hidden_rows.forget(rid)
+        self.stats_rows.forget(rid)
 
     def send_health_signal(self) -> None:
         """The scheduler's bare health signal as an output with nothing in
@@ -1231,10 +1281,19 @@ def request_layouts() -> dict[str, list[str]]:
         TokenizedEmbeddingReqInput,
         TokenizedGenerateReqInput,
     )
-    from sglang.srt.managers.schedule_batch import (
-        MultimodalDataItem,
-        MultimodalProcessorOutput,
-    )
+
+    try:
+        from sglang.srt.managers.schedule_batch import (
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
+    except ImportError:
+        # Current native schedulers no longer re-export these classes. Read the
+        # same native declarations at their defining module; the wire is unchanged.
+        from sglang.srt.managers.req_types import (
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     return {

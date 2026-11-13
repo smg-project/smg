@@ -45,6 +45,9 @@ sha2 = "0.11"
 zip = "9.0"
 tempfile = "3.27"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 tonic-prost-build = "0.14.6"
 

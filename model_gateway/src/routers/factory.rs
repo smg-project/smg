@@ -59,6 +59,11 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        if let Some(path) = &ctx.router_config.sglang_managed_epd {
+            return Ok(Box::new(
+                super::grpc::sglang_epd::router::ManagedRouter::new(ctx, path).await?,
+            ));
+        }
         match ctx.router_config.connection_mode {
             ConnectionMode::Grpc | ConnectionMode::Zmq => {
                 // Register the per-role policies each disaggregation mode needs,

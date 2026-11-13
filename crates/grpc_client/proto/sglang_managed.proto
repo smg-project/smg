@@ -1,0 +1,241 @@
+syntax = "proto3";
+
+package smg.sglang.managed.v1;
+
+import "sglang_scheduler.proto";
+
+// Separate services: an old scheduler must never accept a managed operation.
+service ManagedSglang {
+  rpc GetCapabilities(CapabilityQuery) returns (Capabilities);
+  rpc GeneratePrefill(PrefillStart) returns (stream ControlEvent);
+  rpc GenerateDecode(stream DecodeCommand) returns (stream ControlEvent);
+  rpc Terminate(Termination) returns (TerminationReceipt);
+}
+
+service ManagedEncoder {
+  rpc GetCapabilities(CapabilityQuery) returns (Capabilities);
+  rpc Encode(EncodeRequest) returns (stream ControlEvent);
+  rpc Cancel(Termination) returns (TerminationReceipt);
+  rpc GetOperation(OperationRef) returns (OperationStatus);
+  rpc WatchLoad(Instance) returns (stream LoadSnapshot);
+}
+
+message CapabilityQuery {}
+
+message Capabilities {
+  uint32 version = 1;
+  Instance instance = 2;
+  string role = 3;
+  string model_revision = 4;
+  string processor_contract = 5;
+  string layout_contract = 6;
+  string embedding_dtype = 7;
+  string kv_backend = 8;
+  string embedding_backend = 9;
+  string topology_contract = 10;
+  string bootstrap_host = 11;
+  uint32 bootstrap_port = 12;
+  string receive_endpoint = 13;
+  uint64 capacity = 14;
+  uint64 wall_time_unix_ms = 15;
+  uint32 tp_size = 16;
+  bool ready = 17;
+}
+
+message Identity {
+  string logical_request_id = 1;
+  string attempt_id = 2;
+  uint32 branch_id = 3;
+}
+
+message Instance {
+  string worker_id = 1;
+  string generation = 2;
+}
+
+message OperationRef {
+  Identity identity = 1;
+  Instance target = 2;
+  string operation_id = 3;
+  bytes request_digest = 4;
+  bytes plan_digest = 5;
+}
+
+message Budget {
+  uint64 original_expiry_unix_ms = 1;
+  uint64 remaining_timeout_ms = 2;
+  uint64 estimated_work = 3;
+  uint64 context_bytes = 4;
+}
+
+message Bootstrap {
+  string host = 1;
+  uint32 port = 2;
+  int64 room = 3;
+}
+
+message InputBinding {
+  OperationRef decode = 1;
+  Instance prefill = 2;
+  string prefill_rid = 3;
+  Bootstrap bootstrap = 4;
+  string layout_contract = 5;
+  string processor_contract = 6;
+  string model_revision = 7;
+  repeated string media_routing_labels = 8;
+}
+
+// Deliberately no arbitrary map, raw bytes, media references or tensor handles.
+// The only bytes below are a fixed-size native identity and integrity digest.
+message IntegerArray {
+  repeated uint32 shape = 1;
+  repeated sint64 values = 2;
+}
+
+message Offset {
+  uint32 start = 1;
+  uint32 end = 2;
+}
+
+message ImageMetadata {
+  uint32 occurrence = 1;
+  bytes full_identity = 2;
+  repeated sint64 pad_values = 3;
+  optional string processor_fingerprint = 4;
+  repeated Offset offsets = 5;
+  uint32 native_format = 6;
+  repeated uint32 grid_thw = 7;
+  optional string routing_label = 8;
+  uint64 native_hash = 9;
+}
+
+message PreparedDecodeInput {
+  uint32 version = 1;
+  InputBinding binding = 2;
+  repeated uint32 unpadded_ids = 3;
+  repeated sint64 padded_ids = 4;
+  repeated ImageMetadata images = 5;
+  IntegerArray mrope_positions = 6;
+  IntegerArray mrope_delta = 7;
+  IntegerArray token_types = 8;
+  uint32 image_token_id = 9;
+  uint32 image_start_id = 10;
+  uint32 image_end_id = 11;
+  bytes integrity_digest = 12;
+}
+
+message DecodeStart {
+  uint32 version = 1;
+  InputBinding binding = 2;
+  Budget budget = 3;
+  // Contains generation options and, for inline text only, complete tokens.
+  // All multimodal fields, session and n > 1 are refused by this service.
+  .sglang.grpc.scheduler.GenerateRequest generation = 4;
+  bool deferred_from_prefill = 5;
+}
+
+message DecodeCommand {
+  oneof command {
+    DecodeStart start = 1;
+    PreparedDecodeInput bind_prepared_input = 2;
+    string cancel = 3;
+  }
+}
+
+message EncodePart {
+  string native_part_rid = 1;
+  uint32 part_idx = 2;
+  repeated uint32 ordered_item_ids = 3;
+}
+
+message ExternalEncodePlan {
+  string receiver_rid = 1;
+  repeated string encoder_receive_endpoints = 2;
+  repeated uint32 image_counts = 3;
+  repeated EncodePart parts = 4;
+}
+
+message PrefillStart {
+  uint32 version = 1;
+  OperationRef operation = 2;
+  Budget budget = 3;
+  InputBinding binding = 4;
+  .sglang.grpc.scheduler.GenerateRequest generation = 5;
+  ExternalEncodePlan encode_plan = 6;
+}
+
+message EncodeRequest {
+  uint32 version = 1;
+  OperationRef operation = 2;
+  Budget budget = 3;
+  InputBinding receiver_binding = 4;
+  ExternalEncodePlan plan = 5;
+  repeated string image_references = 6;
+  string transfer_backend = 7;
+  string tenant_id = 8;
+}
+
+enum Stage {
+  STAGE_UNSPECIFIED = 0;
+  ACCEPTED = 1;
+  PREPROCESSED = 2;
+  ENCODED = 3;
+  DELIVERED = 4;
+  INPUT_BOUND = 5;
+  NATIVE_SUBMITTED = 6;
+  CANCEL_REQUESTED = 7;
+  QUIESCED = 8;
+}
+
+message Failure {
+  string code = 1;
+  string message = 2;
+}
+
+message ControlEvent {
+  OperationRef operation = 1;
+  uint64 event_seq = 2;
+  uint64 admission_seq = 3;
+  optional uint32 part_idx = 4;
+  oneof event {
+    Stage stage = 5;
+    PreparedDecodeInput media_prepared = 6;
+    .sglang.grpc.scheduler.GenerateResponse generation = 7;
+    Failure failed = 8;
+  }
+}
+
+message Termination {
+  OperationRef operation = 1;
+  uint64 original_expiry_unix_ms = 2;
+  string native_rid = 3;
+  string reason = 4;
+}
+
+message TerminationReceipt {
+  // Cancellation recorded, not a claim about CUDA/RDMA completion.
+  bool recorded = 1;
+  bool quiesced = 2;
+}
+
+message OperationStatus {
+  OperationRef operation = 1;
+  uint64 admission_seq = 2;
+  Stage stage = 3;
+  bool terminal = 4;
+  bool quiesced = 5;
+}
+
+message LoadSnapshot {
+  Instance instance = 1;
+  uint64 snapshot_seq = 2;
+  uint64 covered_admission_seq = 3;
+  uint64 capacity = 4;
+  uint64 active = 5;
+  uint64 cpu_work = 6;
+  uint64 gpu_work = 7;
+  uint64 artifact_bytes = 8;
+  uint64 staging_bytes = 9;
+  uint64 send_bytes = 10;
+  uint64 draining_work = 11;
+}

@@ -1,4 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=proto/sglang_managed.proto");
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .extern_path(".sglang.grpc.scheduler", "crate::sglang_proto")
+        .extern_path(".smg.grpc.common", "crate::common_proto")
+        .compile_protos(&["proto/sglang_managed.proto"], &["proto"])?;
     // Rebuild triggers
     println!("cargo:rerun-if-changed=proto/common.proto");
     println!("cargo:rerun-if-changed=proto/sglang_scheduler.proto");

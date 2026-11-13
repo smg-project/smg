@@ -71,6 +71,9 @@ impl ParserChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
     pub mode: RoutingMode,
+    /// Explicit managed SGLang EPD deployment configuration; absent preserves legacy routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sglang_managed_epd: Option<String>,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
     /// Explicit runtime for the startup workers (`--worker-urls`), set from
@@ -2207,6 +2210,7 @@ impl Default for RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            sglang_managed_epd: None,
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),

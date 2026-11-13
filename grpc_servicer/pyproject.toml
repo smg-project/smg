@@ -75,6 +75,7 @@ tokenspeed = ["pyzmq>=25.0.0", "msgspec>=0.18.0"]
 # smg_grpc_servicer/sglang/zmq_plugin.py).
 [project.entry-points."sglang.srt.plugins"]
 smg-zmq = "smg_grpc_servicer.sglang.zmq_plugin:register"
+smg-managed-epd = "smg_grpc_servicer.sglang.managed.plugin:register"
 # SGLang's launchers load this before they parse the command line; it adds
 # `--servicer-impl` to SGLang's server parser (see smg_grpc_servicer/sglang/plugin.py).
 smg-servicer = "smg_grpc_servicer.sglang.plugin:register"

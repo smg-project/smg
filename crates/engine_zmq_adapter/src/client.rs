@@ -30,7 +30,10 @@ use engine_zmq_client::{
 use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
-use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
+use smg_grpc_client::{
+    sglang_managed::proto as managed, sglang_proto, tokenspeed_proto, trtllm_proto,
+    vllm_proto as vllm,
+};
 use tokio::time::Instant;
 
 #[cfg(unix)]
@@ -40,8 +43,9 @@ use crate::{
     pin_yield::PinYieldNote,
     sglang::{
         aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
-        encode_media_refs, fan_out_sglang_requests, translate_embed_request_sglang,
-        translate_request_sglang, RankPlacement, SglangGenerateStream, SglangProfileStart,
+        encode_media_refs, fan_out_sglang_requests, room_residue_rank,
+        translate_embed_request_sglang, translate_request_sglang, RankPlacement,
+        SglangGenerateStream, SglangProfileStart,
     },
     sglang_encode::{EncodeDispatchRequest, EncodeNotice, SglangEncodeDispatcher},
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
@@ -347,6 +351,216 @@ pub struct ZmqEngineClient {
 }
 
 impl ZmqEngineClient {
+    /// Submit one managed SGLang request through a fenced native plugin. This path
+    /// never calls the legacy media dispatcher, v1 identity handler or fan-out.
+    pub async fn generate_sglang_managed(
+        &self,
+        mut req: sglang_proto::GenerateRequest,
+        binding: &managed::InputBinding,
+        external: Option<&managed::ExternalEncodePlan>,
+        manifest: Option<&managed::PreparedDecodeInput>,
+    ) -> Result<SglangGenerateStream, tonic::Status> {
+        use prost::Message;
+        use smg_grpc_client::sglang_managed::{
+            validate_binding, validate_external_plan, validate_manifest, Limits,
+        };
+        validate_binding(binding)?;
+        let client = self.sglang_client("managed Generate")?;
+        let role = if external.is_some() {
+            "prefill"
+        } else {
+            "decode"
+        };
+        let target = if role == "prefill" {
+            binding.prefill.as_ref()
+        } else {
+            binding.decode.as_ref().and_then(|op| op.target.as_ref())
+        }
+        .ok_or_else(|| tonic::Status::invalid_argument("missing managed target"))?;
+        if client.engines().iter().any(|engine| {
+            engine
+                .ready_response
+                .sglang_managed
+                .as_ref()
+                .is_none_or(|cap| {
+                    cap.version != 1
+                        || cap.worker_id != target.worker_id
+                        || cap.generation != target.generation
+                        || cap.role != role
+                        || cap.layout != binding.layout_contract
+                })
+        }) {
+            return Err(tonic::Status::failed_precondition(
+                "native scheduler lacks matching managed plugin capability",
+            ));
+        }
+        if req.mm_inputs.is_some()
+            || req.media_identity.is_some()
+            || !req.extra_mm_inputs.is_empty()
+            || !req.input_embeds.is_empty()
+            || req.sampling_params.as_ref().is_some_and(|p| p.n > 1)
+            || (external.is_some() && manifest.is_some())
+        {
+            return Err(tonic::Status::invalid_argument(
+                "managed native Generate refuses legacy media and n > 1",
+            ));
+        }
+        if let Some(input) = manifest {
+            validate_manifest(input, binding, Limits::default())?;
+            req.tokenized
+                .as_mut()
+                .ok_or_else(|| tonic::Status::invalid_argument("missing managed tokenized input"))?
+                .input_ids
+                .clone_from(&input.unpadded_ids);
+        }
+        let original_text = req.tokenized.as_ref().map(|t| t.original_text.clone());
+        let pin = req.data_parallel_rank;
+        let placement = if role == "prefill" {
+            RankPlacement::RoomResidue
+        } else {
+            RankPlacement::Pin
+        };
+        let mut native = translate_request_sglang(
+            req,
+            self.prompt_bound()?,
+            client.engines().len(),
+            placement,
+            &self.meta.pin_yield,
+        )
+        .map_err(tonic::Status::invalid_argument)?;
+        let bootstrap = binding
+            .bootstrap
+            .as_ref()
+            .ok_or_else(|| tonic::Status::invalid_argument("missing managed bootstrap"))?;
+        native.bootstrap_host = Some(bootstrap.host.clone());
+        native.bootstrap_port =
+            Some(i32::try_from(bootstrap.port).map_err(|_| {
+                tonic::Status::invalid_argument("managed bootstrap port out of range")
+            })?);
+        native.bootstrap_room = Some(bootstrap.room);
+        if role == "prefill" {
+            // Managed rooms are signed 64-bit, unlike the legacy proto's int32 room.
+            // Select the rank from the authoritative binding after translation.
+            native.routed_dp_rank = room_residue_rank(
+                bootstrap.room,
+                pin,
+                client.engines().len(),
+                &native.rid,
+                &self.meta.pin_yield,
+            );
+        } else if native.rid
+            != binding
+                .decode
+                .as_ref()
+                .map(|op| op.operation_id.as_str())
+                .unwrap_or_default()
+        {
+            return Err(tonic::Status::invalid_argument("managed D rid mismatch"));
+        }
+        if let Some(plan) = external {
+            let images = plan.image_counts.iter().map(|n| *n as usize).sum();
+            validate_external_plan(plan, images)?;
+            if native.rid != binding.prefill_rid || plan.receiver_rid != native.rid {
+                return Err(tonic::Status::invalid_argument("managed P rid mismatch"));
+            }
+            if images > 0 {
+                native.input_text = original_text.filter(|text| !text.is_empty());
+                if native.input_text.is_none() {
+                    return Err(tonic::Status::invalid_argument(
+                        "managed P requires the rendered prompt",
+                    ));
+                }
+                native.need_wait_for_mm_inputs = Some(true);
+                native.num_items_assigned = Some(BTreeMap::from([(1, plan.image_counts.clone())]));
+                native.encoder_urls = Some(plan.encoder_receive_endpoints.clone());
+            }
+        }
+        let hex = |bytes: Vec<u8>| -> String {
+            const DIGITS: &[u8] = b"0123456789abcdef";
+            bytes
+                .into_iter()
+                .flat_map(|v| {
+                    [
+                        char::from(DIGITS[(v >> 4) as usize]),
+                        char::from(DIGITS[(v & 15) as usize]),
+                    ]
+                })
+                .collect()
+        };
+        let mut envelope = vec![
+            (OpaqueValue::from("role"), OpaqueValue::from(role)),
+            (
+                OpaqueValue::from("binding"),
+                OpaqueValue::from(hex(binding.encode_to_vec())),
+            ),
+            (
+                OpaqueValue::from("text_only"),
+                OpaqueValue::from(external.is_some_and(|plan| plan.parts.is_empty())),
+            ),
+        ];
+        if let Some(manifest) = manifest {
+            envelope.push((
+                OpaqueValue::from("manifest"),
+                OpaqueValue::from(hex(manifest.encode_to_vec())),
+            ));
+        }
+        let mut custom = match native.sampling_params.custom_params.take() {
+            None => Vec::new(),
+            Some(OpaqueValue::Map(fields)) => fields,
+            _ => {
+                return Err(tonic::Status::invalid_argument(
+                    "custom parameters must be a map",
+                ))
+            }
+        };
+        if custom
+            .iter()
+            .any(|(key, _)| key.as_str() == Some("__smg_managed_epd_v1"))
+        {
+            return Err(tonic::Status::invalid_argument(
+                "client supplied a private managed envelope",
+            ));
+        }
+        custom.push((
+            OpaqueValue::from("__smg_managed_epd_v1"),
+            OpaqueValue::Map(envelope),
+        ));
+        native.sampling_params.custom_params = Some(OpaqueValue::Map(custom));
+        let stream = client
+            .submit(SglangRequest::Generate(native))
+            .await
+            .map_err(zmq_status)?;
+        Ok(SglangGenerateStream::new(stream, 0))
+    }
+
+    /// Managed cancellation keeps the output registration until the engine's terminal
+    /// response. Unlike legacy abort, sending alone is not considered resource release.
+    pub async fn abort_sglang_managed(&self, rank: u32, rid: &str) -> Result<(), tonic::Status> {
+        use engine_zmq_client::{
+            codec::encode_msgpack, protocol::sglang::request::SglangRequestType,
+        };
+        let client = self.sglang_client("managed Abort")?;
+        let engine = client
+            .engines()
+            .iter()
+            .find(|e| {
+                e.engine_id.engine_index() == Some(rank)
+                    || (rank == 0
+                        && client.engines().len() == 1
+                        && e.engine_id.engine_index().is_none())
+            })
+            .ok_or_else(|| tonic::Status::failed_precondition("managed native rank disappeared"))?;
+        let payload = encode_msgpack(&vec![rid]).map_err(zmq_status)?;
+        client
+            .send_typed(
+                &engine.engine_id,
+                SglangRequestType::Abort.to_frame(),
+                payload,
+                Vec::new(),
+            )
+            .await
+            .map_err(zmq_status)
+    }
     /// Bind the frontend sockets and complete the handshake with the engine(s),
     /// which must already be running and dialing `handshake_address`.
     ///

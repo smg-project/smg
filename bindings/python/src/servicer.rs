@@ -528,6 +528,108 @@ struct SmgSglangMediaProcessor {
     admission: Arc<tokio::sync::Semaphore>,
 }
 
+/// E-local Rust preprocessing for the managed native encoder bridge.
+/// Serialized CPU tensors never pass through the gateway or the D control service.
+#[pyclass(name = "ManagedEncoderProcessor")]
+pub struct PyManagedEncoderProcessor {
+    pipeline: WorkerMediaPipeline,
+    runtime: tokio::runtime::Runtime,
+    admission: tokio::sync::Semaphore,
+    max_artifact_bytes: usize,
+}
+
+#[pymethods]
+impl PyManagedEncoderProcessor {
+    /// Load the shared Rust processor once, without changing legacy model support defaults.
+    #[new]
+    fn new(
+        py: Python<'_>,
+        options: Bound<'_, PyDict>,
+        tokenizer_dir: String,
+        max_artifact_bytes: usize,
+    ) -> PyResult<Self> {
+        let native = native_media_options(&options, "managed-encoder")?;
+        if max_artifact_bytes == 0
+            || native.max_inflight == 0
+            || native.max_inflight > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(PyValueError::new_err(
+                "managed encoder requires finite nonzero limits",
+            ));
+        }
+        py.detach(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let pipeline = runtime
+                .block_on(async {
+                    let tokenizer =
+                        llm_tokenizer::factory::create_tokenizer_async(&tokenizer_dir).await?;
+                    let mut settings = native.settings;
+                    settings.tokenizer_dir = Some(tokenizer_dir);
+                    WorkerMediaPipeline::new_sglang(settings, tokenizer).await
+                })
+                .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+            if !matches!(pipeline.spec_name(), "qwen_vl" | "qwen3_vl") {
+                return Err(PyValueError::new_err(
+                    "managed encoder has no artifact adapter for this model",
+                ));
+            }
+            Ok(Self {
+                pipeline,
+                runtime,
+                admission: tokio::sync::Semaphore::new(native.max_inflight),
+                max_artifact_bytes,
+            })
+        })
+    }
+
+    /// Run from an E-owned blocking task; its slot remains held until CPU work actually exits.
+    fn prepare<'py>(
+        &self,
+        py: Python<'py>,
+        image_urls: Vec<String>,
+        image_token_id: u32,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        if image_urls.is_empty() || image_urls.len() > 32 {
+            return Err(PyValueError::new_err(
+                "managed image count must be in 1..=32",
+            ));
+        }
+        let bytes = py.detach(|| {
+            let _permit = self.admission.try_acquire().map_err(|_| {
+                PyRuntimeError::new_err("managed CPU preprocessing capacity exhausted")
+            })?;
+            let tokens = vec![image_token_id; image_urls.len()];
+            let items: Vec<_> = image_urls
+                .into_iter()
+                .map(|url| WorkerMediaItem {
+                    modality: Modality::Image,
+                    url,
+                })
+                .collect();
+            let (_, inputs, extras) = self
+                .runtime
+                .block_on(self.pipeline.process_sglang(tokens, &items))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let artifact = smg_grpc_client::sglang_proto::GenerateRequest {
+                mm_inputs: Some(Box::new(inputs)),
+                extra_mm_inputs: extras,
+                ..Default::default()
+            };
+            if artifact.encoded_len() > self.max_artifact_bytes {
+                return Err(PyValueError::new_err(
+                    "managed CPU artifact exceeds byte budget",
+                ));
+            }
+            Ok(artifact.encode_to_vec())
+        })?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+}
+
 impl SglangMediaProcessor for SmgSglangMediaProcessor {
     fn identity_key(&self) -> Option<&str> {
         self.pipeline.sglang_identity_key()
@@ -1719,6 +1821,7 @@ impl PySglangGrpcServer {
         kv_events_topic = String::new(),
         encode_dispatcher = None,
         smg_media_processor = None,
+        sglang_managed_epd = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
@@ -1762,6 +1865,7 @@ impl PySglangGrpcServer {
         kv_events_topic: String,
         encode_dispatcher: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
+        sglang_managed_epd: Option<String>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
@@ -1836,6 +1940,13 @@ impl PySglangGrpcServer {
             media_processor: None,
         };
         let inner = py.detach(|| -> PyResult<SglangServicerServer> {
+            if let Some(json) = sglang_managed_epd {
+                if native.is_some() {
+                    return Err(PyValueError::new_err("managed P/D cannot use legacy media preprocessing"));
+                }
+                let managed = serde_json::from_str(&json).map_err(|e| PyValueError::new_err(format!("invalid managed configuration: {e}")))?;
+                return SglangServicerServer::start_managed(config, managed).map_err(to_py_err);
+            }
             if let Some(native) = native {
                 if !matches!(
                     native.settings.encoder_dtype.as_str(),
