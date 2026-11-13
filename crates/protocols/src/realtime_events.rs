@@ -803,6 +803,12 @@ impl<'de> Deserialize<'de> for SessionConfig {
                 other,
                 &["realtime", "transcription"],
             )),
+            // A `type` that is there but no string is the wrong type, not a
+            // missing field.
+            None if session.get("type").is_some() => Err(D::Error::invalid_type(
+                serde::de::Unexpected::Other("a non-string `type`"),
+                &"`realtime` or `transcription`",
+            )),
             None => Err(D::Error::missing_field("type")),
         }
     }
@@ -969,6 +975,19 @@ mod tests {
         .expect_err("a session type no API names")
         .to_string();
         assert!(bogus.contains("a_session_of_no_api"), "{bogus}");
+
+        for (session, expected) in [
+            (json!({"type": null}), "a non-string `type`"),
+            (json!({"type": 5}), "a non-string `type`"),
+            (json!({"model": "gpt-realtime"}), "missing field `type`"),
+        ] {
+            let refused = serde_json::from_value::<ClientEvent>(
+                json!({"type": "session.update", "session": session}),
+            )
+            .expect_err("a session without a string type")
+            .to_string();
+            assert!(refused.contains(expected), "{refused}");
+        }
     }
 
     /// A transcription event keeps its detected languages, an empty list
