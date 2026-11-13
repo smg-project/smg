@@ -7,11 +7,14 @@
 
 use std::sync::Arc;
 
-use smg_grpc_client::{common_proto, vllm_proto as proto, TraceInjector, VllmEngineClient};
+use smg_grpc_client::{
+    common_proto, sglang_proto, vllm_proto as proto, SglangSchedulerClient, TraceInjector,
+    VllmEngineClient,
+};
 use tonic::metadata::{MetadataMap, MetadataValue};
 
 mod common;
-use common::{generate_request, spawn_mock, MockState, TRACE_HEADER};
+use common::{generate_request, spawn_mock, spawn_sglang_mock, MockState, TRACE_HEADER};
 
 /// A W3C trace context (the specification's own example), the value the
 /// gateway's injector writes under the same header from the active span.
@@ -56,6 +59,23 @@ async fn generate_framed_carries_the_trace_context() {
     let (client, state) = traced_client().await.unwrap();
     let _stream = client
         .generate_framed(generate_request("traced-framed"))
+        .await
+        .unwrap();
+    assert_eq!(state.traced(), carried("Generate"));
+}
+
+#[tokio::test]
+async fn the_sglang_framed_generate_carries_the_trace_context() {
+    let (endpoint, state) = spawn_sglang_mock().await.unwrap();
+    let client =
+        SglangSchedulerClient::connect_with_trace_injector(&endpoint, Arc::new(ProbeInjector))
+            .await
+            .unwrap();
+    let _stream = client
+        .generate_framed(sglang_proto::GenerateRequest {
+            request_id: "traced-sglang".to_string(),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(state.traced(), carried("Generate"));

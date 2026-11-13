@@ -393,7 +393,7 @@ impl GrpcClient {
     ) -> Result<ProtoStream, tonic::Status> {
         match (self, req) {
             (Self::Sglang(client), ProtoGenerateRequest::Sglang(boxed_req)) => {
-                let stream = client.generate(*boxed_req).await?;
+                let stream = client.generate_framed(*boxed_req).await?;
                 Ok(ProtoStream::Sglang(stream))
             }
             (Self::Vllm(client), ProtoGenerateRequest::Vllm(boxed_req)) => {
