@@ -1321,9 +1321,11 @@ mod tests {
                 registry_reads_over_the_flags(card, url, parser, flags, registry)
             };
 
+        // The worker is named through the mask: a credential in its address
+        // is in no message (the helper masks, so no caller can forget).
         let first = said(
             &known,
-            "grpc://a:1",
+            "grpc://user:secret@a:1",
             ParserChoice::Symphony,
             &flags,
             &registry,
@@ -1333,7 +1335,8 @@ mod tests {
             first.contains("'Qwen/Qwen3-8B'")
                 && first.contains("'qwen3'")
                 && first.contains("the table 'mistral_v13'")
-                && first.contains("grpc://a:1"),
+                && first.contains("***@a:1")
+                && !first.contains("secret"),
             "{first}"
         );
         registry
@@ -2548,27 +2551,37 @@ mod tests {
         )
         .is_ok());
 
+        // The refusal names the worker through the mask: a credential in its
+        // address is in no refusal (the helper masks, so no caller can forget).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
         let err = validate_parser_overrides(
             &card,
-            "http://w:1",
+            "http://user:secret@w:1",
             ParserChoice::Legacy,
             Some(&tool_factory),
             None,
         )
         .expect_err("unknown tool parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
+        assert!(
+            err.contains("http://***@w:1") && !err.contains("secret"),
+            "{err}"
+        );
 
         let card = ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser");
         let err = validate_parser_overrides(
             &card,
-            "http://w:1",
+            "http://user:secret@w:1",
             ParserChoice::Legacy,
             None,
             Some(&reasoning_factory),
         )
         .expect_err("unknown reasoning parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
+        assert!(
+            err.contains("http://***@w:1") && !err.contains("secret"),
+            "{err}"
+        );
 
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
