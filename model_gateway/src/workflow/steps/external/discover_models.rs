@@ -13,6 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     routers::provider_support,
+    server::http_client_builder,
     worker::endpoint::Endpoint,
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
@@ -23,7 +24,7 @@ use crate::{
     reason = "Lazy static initialization — reqwest::Client::build() only fails on TLS backend misconfiguration which is unrecoverable"
 )]
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    crate::server::http_client_builder()
+    http_client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to create HTTP client")
