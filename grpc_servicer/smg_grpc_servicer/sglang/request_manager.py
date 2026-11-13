@@ -1102,7 +1102,15 @@ class GrpcRequestManager:
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         # Embedding outputs are terminal: no request counts survive this batch.
-        prompts, _ = SchedulerOutputAdapter().read_usage(batch_out)
+        try:
+            prompts, _ = SchedulerOutputAdapter().read_usage(batch_out)
+        except Exception as exc:
+            # Embeddings are terminal, so no scheduler abort is needed.
+            logger.exception("Failed to normalize scheduler embedding output")
+            reason = {"type": "abort", "message": str(exc), "status_code": 500}
+            for rid in batch_out.rids:
+                await self._handle_abort_req(AbortReq(rid=rid, finished_reason=reason))
+            return
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:
                 continue

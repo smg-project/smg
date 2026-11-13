@@ -503,3 +503,44 @@ def test_invalid_batch_finishes_consumers_and_aborts_decode(manager, layout, dis
             await asyncio.gather(*tasks, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("layout", ["sparse", "unknown"])
+def test_invalid_embedding_usage_finishes_consumers(manager, layout):
+    """Rejected terminal embeddings wake siblings without aborting the scheduler."""
+
+    async def scenario():
+        futures, states = [], []
+        for rid in ("e-invalid", "e-sibling", "e-unaffected"):
+            futures.append(await manager.embedding_request(SimpleNamespace(), rid))
+            states.append(manager.rid_to_state[rid])
+        manager.rid_to_state["e-finished"] = SimpleNamespace(finished=True)
+        batch = SimpleNamespace(
+            rids=["e-invalid", "e-sibling", "e-late", "e-finished"],
+            finished_reasons=[{"type": "stop"}] * 4,
+        )
+        if layout == "sparse":
+            batch.request_stats = [SimpleNamespace(prompt_tokens=12, cached_tokens=3), object()]
+        sent = list(manager.sent)
+        try:
+            await manager._handle_embedding_output(batch)
+            results = await asyncio.wait_for(asyncio.gather(*futures[:2]), timeout=1)
+            for state, result in zip(states[:2], results):
+                assert state.finished and state.event.is_set()
+                assert result["finished"] and result["error"]
+                assert result["meta_info"]["finish_reason"]["status_code"] == 500
+                assert state.time_stats.root_span.ended == 1
+            assert "e-invalid" not in manager.rid_to_state
+            assert "e-sibling" not in manager.rid_to_state
+            assert not futures[2].done() and not states[2].finished
+            assert not manager.output_adapter._counts
+            await manager._handle_embedding_output(batch)
+            assert manager.sent == sent
+            assert all(state.time_stats.root_span.ended == 1 for state in states[:2])
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            await asyncio.gather(*futures, return_exceptions=True)
+
+    asyncio.run(scenario())
