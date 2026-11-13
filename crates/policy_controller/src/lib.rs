@@ -41,6 +41,12 @@
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
 //!   [`elector::Fence`] a shard thread reads before every decision it sends.
 //!
+//! - Behind the `controller` feature, the standalone controller
+//!   (`controller`): the listeners with their credentialed scopes, the
+//!   health service on each, the admin endpoints, readiness and the drain,
+//!   and the binary of the package's name over them. The scopes' calls, the
+//!   ingestion drivers and the election arrive in the step's later PRs.
+//!
 //! What this step does not hold: the plugin hosts, the operator calls, the
 //! ingestion drivers and the gRPC API; they arrive in later
 //! steps and build on these types. The
@@ -48,6 +54,8 @@
 //! report's sample instant); the wire carries durations only.
 
 pub mod builtins;
+#[cfg(feature = "controller")]
+pub mod controller;
 pub mod decision;
 pub mod elector;
 pub mod framework;
