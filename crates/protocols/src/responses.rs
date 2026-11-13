@@ -2811,8 +2811,8 @@ pub enum ServiceTier {
     Flex,
     Scale,
     Priority,
-    /// Fast mode, which `priority` also selects. A request sent with `fast`
-    /// is answered with `priority`.
+    /// Fast mode, which `priority` also selects. The OpenAI API answers a
+    /// `fast` request with `priority`; the gRPC routers echo `fast`.
     Fast,
     /// The access-controlled Ultrafast Processing tier. A Response served on
     /// it reports `ultrafast`.
