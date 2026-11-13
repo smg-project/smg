@@ -12,13 +12,14 @@
 //! resource version on the API server. Everything else is the elector's and
 //! the same over every backend:
 //!
-//! - **Acquire.** A candidate takes a lease that is absent, released, its own
-//!   (the same identity after a restart), or that stood unchanged for the
-//!   record's duration *by this candidate's own clock*: it times the record
-//!   from the instant it first saw it in its present shape, never from the
-//!   wall timestamp the record carries, so no second clock enters the
-//!   decision. The take writes the next term: terms only grow, one per change
-//!   of holder.
+//! - **Acquire.** A candidate takes a lease that is absent or released at
+//!   once, and one that stood unchanged for the record's duration *by this
+//!   candidate's own clock*, its own identity's record after a restart
+//!   included: it times the record from the instant it first saw it in its
+//!   present shape, never from the wall timestamp the record carries, so no
+//!   second clock enters the decision. A take writes the next term (terms
+//!   only grow, one per change of holder); a resume of its own identity's
+//!   record keeps the record's term.
 //! - **Renew.** The holder rewrites the record every renew period with a
 //!   later wall timestamp under its own term; a record that moved under it (a
 //!   candidate took the expired lease) refuses the renewal and the holder has
@@ -286,8 +287,9 @@ pub struct Elector {
     held: Option<LeaseRecord>,
     /// The record of the last write that reported an error: it may have
     /// landed (a sync that failed after the rename, an update that timed out
-    /// after the server applied it), and a stored record equal to it is this
-    /// process's own.
+    /// after the server applied it), now or later, and a stored record equal
+    /// to it is this process's own. Kept until a write of this process lands
+    /// with its answer or another record supersedes it.
     attempted: Option<LeaseRecord>,
     /// New shapes of the record under this identity that this run did not
     /// write: the first is the earlier run's last write, a second is another
@@ -407,20 +409,32 @@ impl Elector {
             }
         };
         self.held = None;
-        self.attempted = None;
         match written {
             Written::Done => {
+                self.attempted = None;
                 if let Some(observation) = &mut self.observed {
                     observation.record = released;
                 }
                 Ok(true)
             }
-            // Another candidate's write, or this process's own release that
-            // landed and reported an error: released under this term.
-            Written::Moved => Ok(self
-                .backend
-                .read()?
-                .is_some_and(|stored| stored.is_released() && stored.term == mine.term)),
+            Written::Moved => {
+                let stored = self.backend.read()?;
+                match (stored, self.attempted.take()) {
+                    // This process's own renewal that landed and reported an
+                    // error: the lease to give up is that record.
+                    (Some(stored), Some(attempted))
+                        if stored == attempted && !stored.is_released() =>
+                    {
+                        self.held = Some(stored);
+                        self.release()
+                    }
+                    // Another candidate's write, or this process's own
+                    // release that landed and reported an error: released
+                    // under this term.
+                    (stored, _) => Ok(stored
+                        .is_some_and(|stored| stored.is_released() && stored.term == mine.term)),
+                }
+            }
         }
     }
 
@@ -460,11 +474,11 @@ impl Elector {
         mut mine: LeaseRecord,
         now: Instant,
     ) -> Result<Tick, ElectError> {
-        if current.as_ref() == Some(&mine) {
-            // An attempt that reported an error never landed: the record is
-            // still the one before it.
-            self.attempted = None;
-        } else {
+        // An attempt that reported an error and has not landed may still
+        // land late (a server applies a timed-out update after this tick's
+        // read), so it is kept until a write of this process lands with its
+        // answer.
+        if current.as_ref() != Some(&mine) {
             match (current, self.attempted.take()) {
                 // The attempt landed after all: the stored record is this
                 // process's own, renewed from here. A released one is this
@@ -490,6 +504,7 @@ impl Elector {
         };
         match written {
             Written::Done => {
+                self.attempted = None;
                 self.fence.set(renewed.term, Some(now));
                 self.observed = Some(Observation {
                     record: renewed.clone(),
@@ -500,7 +515,18 @@ impl Elector {
             }
             Written::Moved => {
                 let current = self.backend.read()?;
-                Ok(self.lose(mine.term, current))
+                match (current, self.attempted.take()) {
+                    // This process's own earlier attempt landed between this
+                    // tick's read and its write: the record is its own,
+                    // renewed over in one more round.
+                    (Some(stored), Some(attempted))
+                        if stored == attempted && !stored.is_released() =>
+                    {
+                        self.held = Some(stored.clone());
+                        self.renew(Some(stored.clone()), stored, now)
+                    }
+                    (current, _) => Ok(self.lose(mine.term, current)),
+                }
             }
         }
     }
@@ -655,7 +681,7 @@ impl LeaseBackend for MemoryLease {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicU32, Ordering},
+        sync::atomic::{AtomicBool, AtomicU32, Ordering},
         thread,
         time::Duration,
     };
@@ -1476,6 +1502,115 @@ mod tests {
         assert!(matches!(
             a.tick(t0 + 2 * S).expect("look"),
             Tick::Following { term: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn a_release_after_a_renewal_that_landed_but_errored_gives_up_the_landed_record() {
+        let lease = MemoryLease::new();
+        let fails = Arc::new(AtomicU32::new(0));
+        let backend = LandsThenErrors {
+            lease: lease.clone(),
+            fails: Arc::clone(&fails),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + S;
+        a.tick(t0).expect("acquire");
+        fails.store(1, Ordering::Relaxed);
+        a.tick(t0 + S).expect_err("the answer was lost");
+        // A planned stop: the release goes over the renewal that landed, not
+        // over the record before it, and the lease is free at once.
+        assert!(a.release().expect("release"), "released");
+        assert!(!a.is_holder());
+        assert_eq!(a.fence().leader_term(t0 + S), None);
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert!(stored.is_released());
+        assert_eq!(stored.term, 1);
+        let mut b = candidate(&lease, "b@host:2");
+        assert_eq!(
+            b.tick(t0 + S + S / 2).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+    }
+
+    /// A backend whose write does not land while `delay` is set: it reports
+    /// an error and lands at the backend's next write, before that write is
+    /// judged, as a server applies a timed-out update late.
+    struct LandsLate {
+        lease: MemoryLease,
+        delay: Arc<AtomicBool>,
+        pending: Option<(Option<LeaseRecord>, LeaseRecord)>,
+    }
+
+    impl LeaseBackend for LandsLate {
+        fn read(&mut self) -> Result<Option<LeaseRecord>, ElectError> {
+            self.lease.read()
+        }
+
+        fn write(
+            &mut self,
+            expected: Option<&LeaseRecord>,
+            record: &LeaseRecord,
+        ) -> Result<Written, ElectError> {
+            if let Some((expected, record)) = self.pending.take() {
+                self.lease.write(expected.as_ref(), &record)?;
+            }
+            if self.delay.swap(false, Ordering::Relaxed) {
+                self.pending = Some((expected.cloned(), record.clone()));
+                return Err(ElectError::Io {
+                    place: self.place(),
+                    source: std::io::Error::other("the answer was lost"),
+                });
+            }
+            self.lease.write(expected, record)
+        }
+
+        fn place(&self) -> String {
+            "lands-late".to_string()
+        }
+    }
+
+    #[test]
+    fn a_renewal_that_landed_late_is_renewed_over_not_lost() {
+        let lease = MemoryLease::new();
+        let delay = Arc::new(AtomicBool::new(false));
+        let backend = LandsLate {
+            lease: lease.clone(),
+            delay: Arc::clone(&delay),
+            pending: None,
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        delay.store(true, Ordering::Relaxed);
+        a.tick(t0 + S).expect_err("the answer was lost");
+        assert!(a.is_holder());
+        // The next tick reads the record before the lost renewal lands and
+        // writes after it did: the record under its write is this run's
+        // own, and the renewal goes over it within the tick.
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert!(a.is_holder());
+        assert_eq!(a.fence().leader_term(t0 + 2 * S), Some(1));
+        assert_eq!(
+            lease
+                .clone()
+                .read()
+                .expect("read")
+                .expect("the record")
+                .holder,
+            "a@host:1"
+        );
+        assert_eq!(
+            a.tick(t0 + 3 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        let mut b = candidate(&lease, "b@host:2");
+        assert!(matches!(
+            b.tick(t0 + 3 * S).expect("follow"),
+            Tick::Following { term: 1, .. }
         ));
     }
 
