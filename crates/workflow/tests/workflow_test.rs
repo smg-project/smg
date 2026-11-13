@@ -14,10 +14,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 use wfaas::{
-    BackoffStrategy, FailureAction, LoggingSubscriber, RetryPolicy, StateStore, StepDefinition,
-    StepExecutor, StepId, StepResult, StepStatus, ValidationError, WorkflowContext, WorkflowData,
-    WorkflowDefinition, WorkflowEngine, WorkflowError, WorkflowInstanceId, WorkflowResult,
-    WorkflowState, WorkflowStatus,
+    BackoffStrategy, FailureAction, InMemoryStore, LoggingSubscriber, RetryPolicy, StateStore,
+    StepDefinition, StepExecutor, StepId, StepResult, StepStatus, ValidationError, WorkflowContext,
+    WorkflowData, WorkflowDefinition, WorkflowEngine, WorkflowError, WorkflowInstanceId,
+    WorkflowResult, WorkflowState, WorkflowStatus,
 };
 
 /// Test workflow data type for integration tests.
@@ -1802,5 +1802,144 @@ async fn a_step_that_skips_in_its_attempt_reads_skipped() {
     assert_eq!(
         state.step_states[&StepId::new("next_step")].status,
         StepStatus::Succeeded
+    );
+}
+
+/// A store that writes the workflow's cancel right after the step's cancel
+/// read. The engine reads the cancel once in its scheduler before it
+/// dispatches the step and once in the step's attempt loop before the first
+/// attempt; the cancel lands between that second read and the attempt's
+/// start.
+#[derive(Clone)]
+struct CancelAfterTheStepsRead {
+    inner: InMemoryStore<TestWorkflowData>,
+    reads: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StateStore<TestWorkflowData> for CancelAfterTheStepsRead {
+    async fn save(&self, state: WorkflowState<TestWorkflowData>) -> WorkflowResult<()> {
+        self.inner.save(state).await
+    }
+
+    async fn load(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowState<TestWorkflowData>> {
+        self.inner.load(instance_id).await
+    }
+
+    async fn update<F>(&self, instance_id: WorkflowInstanceId, f: F) -> WorkflowResult<()>
+    where
+        F: FnOnce(&mut WorkflowState<TestWorkflowData>) + Send,
+    {
+        self.inner.update(instance_id, f).await
+    }
+
+    async fn delete(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()> {
+        self.inner.delete(instance_id).await
+    }
+
+    async fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<TestWorkflowData>>> {
+        self.inner.list_active().await
+    }
+
+    async fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<TestWorkflowData>>> {
+        self.inner.list_all().await
+    }
+
+    async fn is_cancelled(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<bool> {
+        let read = self.inner.is_cancelled(instance_id).await?;
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.inner
+                .update(instance_id, |state| {
+                    state.status = WorkflowStatus::Cancelled;
+                })
+                .await?;
+        }
+        Ok(read)
+    }
+
+    async fn cleanup_old_workflows(&self, ttl: Duration) -> usize {
+        self.inner.cleanup_old_workflows(ttl).await
+    }
+
+    async fn get_context(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowContext<TestWorkflowData>> {
+        self.inner.get_context(instance_id).await
+    }
+
+    async fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool {
+        self.inner.cleanup_if_terminal(instance_id).await
+    }
+}
+
+/// A step that records that it ran.
+struct RanStep {
+    ran: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for RanStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        Ok(StepResult::Success)
+    }
+}
+
+/// A cancel that lands between a step's cancel read and its first attempt's
+/// start: the attempt's start reads the cancel inside its own store update
+/// and the step never runs. Before this, the step past its read ran on under
+/// the cancelled workflow, and a waiter whose snapshot fell in that window
+/// read the step pending and the workflow over.
+#[tokio::test]
+async fn a_step_whose_cancel_lands_after_its_read_does_not_start() {
+    let store = CancelAfterTheStepsRead {
+        inner: InMemoryStore::new(),
+        reads: Arc::new(AtomicU32::new(0)),
+    };
+    let engine: WorkflowEngine<TestWorkflowData, CancelAfterTheStepsRead> =
+        WorkflowEngine::with_store(store.clone());
+    let ran = Arc::new(AtomicU32::new(0));
+    let workflow = WorkflowDefinition::new("cancel_after_read_workflow", "Cancel After Read")
+        .add_step(StepDefinition::new(
+            "only_step",
+            "Step whose cancel lands after its read",
+            Arc::new(RanStep {
+                ran: Arc::clone(&ran),
+            }),
+        ));
+    let workflow_id = workflow.id.clone();
+    engine
+        .register_workflow(workflow)
+        .map_err(|error| error.to_string())
+        .unwrap();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+    let state = engine
+        .wait_for_terminal_state(instance_id, "cancel after read", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(
+        store.reads.load(Ordering::SeqCst) >= 2,
+        "the step read the cancel before its attempt"
+    );
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "the step's executor never ran"
+    );
+    assert_ne!(
+        state.step_states[&StepId::new("only_step")].status,
+        StepStatus::Succeeded,
+        "the step did not run on under the cancelled workflow"
     );
 }
