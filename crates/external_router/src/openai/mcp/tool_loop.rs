@@ -533,8 +533,12 @@ pub(crate) fn build_resume_payload(
         .as_object_mut()
         .ok_or_else(|| "payload not an object".to_string())?;
 
-    let mut input_array = match obj.get("input") {
-        Some(Value::Array(items)) => items.clone(),
+    // The copy of the payload above owns an input of its own: taken out in
+    // place (a removal would move the last key into its slot under the
+    // crate's ordered maps), its items are moved into the resumed list, not
+    // copied a second time; the insert below fills the slot again.
+    let mut input_array = match obj.get_mut("input").map(Value::take) {
+        Some(Value::Array(items)) => items,
         Some(Value::String(text)) => vec![json!({
             "type": "message",
             "role": "user",
@@ -1616,6 +1620,7 @@ mod tests {
     use crate::{
         openai::mcp::test_support,
         openai_bridge::{FormatRegistry, ResponseFormat},
+        test_support::counting_alloc,
     };
 
     fn test_tool(name: &str) -> Tool {
@@ -2300,6 +2305,24 @@ mod tests {
         assert_eq!(payload["tool_choice"], json!("auto"));
     }
 
+    /// The resumed payload keeps the base payload's keys where they were:
+    /// `input` is taken out in place and filled again, not removed and
+    /// appended (the crate's maps keep insertion order on the wire); the
+    /// loop's own `store` follows them.
+    #[test]
+    fn resume_payload_keeps_the_base_keys_in_place() {
+        let base = json!({"model": "test-model", "input": "hi", "stream": false, "metadata": {}});
+        let resumed = super::build_resume_payload(&base, &[], &json!([]), false).unwrap();
+        let keys: Vec<&str> = resumed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["model", "input", "stream", "metadata", "store"]);
+        assert_eq!(resumed["input"][0]["content"][0]["text"], "hi");
+    }
+
     #[test]
     fn resume_payload_forces_auto_tool_choice() {
         let base = json!({
@@ -2589,4 +2612,49 @@ mod tests {
             series[0]
         );
     }
+
+    /// The resume payload of a request of ten input items and four history
+    /// items: its allocation calls are pinned. The payload is copied once (the
+    /// loop keeps the one it started from); the input items of that copy are
+    /// moved into the resumed list, where a second copy of them was made
+    /// before. The count is printed for the Numbers table.
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the count a pin reads is printed for the Numbers table"
+    )]
+    fn a_resume_payload_moves_the_copied_input_items() {
+        let items: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text",
+                    "text": format!("turn {i}: a sentence long enough to live on the heap")}]})
+            })
+            .collect();
+        let base = json!({"model": "m", "input": items, "tools": [], "stream": false});
+        let history: Vec<serde_json::Value> = (0..4)
+            .map(|i| json!({"type": "function_call_output", "call_id": format!("call_{i}"), "output": format!("result {i}")}))
+            .collect();
+        let tools =
+            json!([{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]);
+
+        let before = counting_alloc::calls();
+        let resumed =
+            super::build_resume_payload(&base, &history, &tools, false).expect("a resume payload");
+        let calls = counting_alloc::calls() - before;
+
+        eprintln!(
+            "a resume payload of 10 input items and 4 history items: {calls} allocation calls"
+        );
+        assert_eq!(resumed["input"].as_array().map(Vec::len), Some(14));
+        assert_eq!(resumed["input"][0], base["input"][0]);
+        assert_eq!(resumed["input"][13], history[3]);
+        assert_eq!(resumed["tool_choice"], json!("auto"));
+        assert_eq!(
+            calls, PINNED_RESUME_CALLS,
+            "the resume payload's allocation calls changed"
+        );
+    }
+
+    /// Allocation calls of the resume payload above, today.
+    const PINNED_RESUME_CALLS: usize = 199;
 }

@@ -69,10 +69,12 @@ impl SseKeepAlive {
 
     /// Gives an SSE `response` whose length is not known up front (a
     /// complete SSE answer has nothing to wait for, and a body sent under a
-    /// `Content-Length` header must not grow past it: the relays copy an
-    /// upstream's header onto a streamed body) its keep-alive, handed to the
-    /// edge's body wrapper; `messages` selects the Messages API's ping over
-    /// the comment. Anything else is returned as it came.
+    /// `Content-Length` header must not grow past it: the relay drops an
+    /// upstream's header from a streamed SSE body, so the header that remains
+    /// is a non-SSE upstream body the PD router relabels as SSE) its
+    /// keep-alive, handed to the edge's body wrapper; `messages` selects the
+    /// Messages API's ping over the comment. Anything else is returned as it
+    /// came.
     pub(crate) fn apply(self, mut response: Response, messages: bool) -> Response {
         let Some(interval) = self.interval else {
             return response;
@@ -465,8 +467,10 @@ mod tests {
         assert_eq!(next_within(&mut body, 10 * SECS).await, Read::Silence);
     }
 
-    /// A streamed body under an upstream's `Content-Length` (the relays copy
-    /// the header) is left alone: a keep-alive would push it past the length.
+    /// A streamed body under an upstream's `Content-Length` (a non-SSE
+    /// upstream body relabelled as SSE keeps the header; the relay drops it
+    /// from a streamed SSE body) is left alone: a keep-alive would push it
+    /// past the length.
     #[tokio::test(start_paused = true)]
     async fn an_sse_answer_under_a_content_length_header_passes_untouched() {
         let declared = || {

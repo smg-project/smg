@@ -71,6 +71,13 @@ impl MemoryStore {
         Self::default()
     }
 
+    /// How many entries the health tables hold, over every gateway.
+    #[cfg(test)]
+    pub(super) fn health_entries(&self) -> usize {
+        let health = self.health.lock();
+        health.vetoes.len() + health.ok_at.len()
+    }
+
     /// How many resyncs were recorded for `reason`.
     pub fn resyncs(&self, reason: ResyncReason) -> u64 {
         self.kv
@@ -198,10 +205,15 @@ impl WorkersStore for MemoryStore {
                     probes: Probes::default(),
                 },
             );
-            return workers.record(MembershipChange::Replaced {
+            let change = workers.record(MembershipChange::Replaced {
                 old: old_id,
                 new: new_id,
             });
+            // The old incarnation's health leaves with its row, as on a
+            // removal and under the same lock: a veto or a completed dispatch
+            // keyed by the old id would outlive it for good.
+            self.health.lock().forget(old_id);
+            return change;
         }
         let id = identity(&facts.key, facts.incarnation);
         workers.by_key.insert(facts.key.clone(), id);
@@ -242,7 +254,14 @@ impl WorkersStore for MemoryStore {
         workers.guarded(id, revision)?;
         let row = workers.rows.remove(&id)?;
         workers.by_key.remove(&row.row.facts.key);
-        Some(workers.record(MembershipChange::Removed { id }))
+        let change = workers.record(MembershipChange::Removed { id });
+        // The health tables forget the worker with its row, under the workers
+        // lock: a veto or a completed dispatch keyed by an id that is gone
+        // would stay for good, the next incarnation having a new id, and the
+        // writers take the same lock first, so one racing the removal finds
+        // the row gone or writes before the tables are cleared.
+        self.health.lock().forget(id);
+        Some(change)
     }
 
     fn set_status(
@@ -309,6 +328,14 @@ struct HealthTables {
     /// The latest completed dispatch of class `Ok` on a worker by each
     /// gateway: the precedence rule is per gateway.
     ok_at: FxHashMap<(GatewayId, WorkerId), Instant>,
+}
+
+impl HealthTables {
+    /// Drop every gateway's entries on the worker.
+    fn forget(&mut self, id: WorkerId) {
+        self.vetoes.retain(|(_, worker), _| *worker != id);
+        self.ok_at.retain(|(_, worker), _| *worker != id);
+    }
 }
 
 /// The status machine of one probe over the row's counters: the registry's
@@ -388,13 +415,20 @@ impl HealthSink for MemoryStore {
     }
 
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
-        let mut health = self.health.lock();
         match until {
             Some(until) => {
-                health.vetoes.insert((gateway, id), until);
+                // Under the workers lock, taken before the health lock as
+                // every writer takes it: a veto landing after the worker's
+                // removal (a breaker opening on a torn-down worker's
+                // failures) would re-create its entry for good.
+                let workers = self.workers.lock();
+                if !workers.rows.contains_key(&id) {
+                    return;
+                }
+                self.health.lock().vetoes.insert((gateway, id), until);
             }
             None => {
-                health.vetoes.remove(&(gateway, id));
+                self.health.lock().vetoes.remove(&(gateway, id));
             }
         }
     }
@@ -409,6 +443,14 @@ impl HealthSink for MemoryStore {
 
     fn completed(&self, gateway: GatewayId, id: WorkerId, class: TransportClass, at: Instant) {
         if class != TransportClass::Ok {
+            return;
+        }
+        // Under the workers lock, taken before the health lock: a dispatch
+        // completing after its worker's removal (the usual order, a gateway's
+        // in-flight work ends after the row is gone) would re-create the
+        // entry for good.
+        let workers = self.workers.lock();
+        if !workers.rows.contains_key(&id) {
             return;
         }
         let mut health = self.health.lock();

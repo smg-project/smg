@@ -566,7 +566,7 @@ async fn frames_until_the_deltas_then_the_rest(
 }
 
 /// The room one event may add past the bound: a chat chunk event of a
-/// one-character delta is under 200 bytes.
+/// delta of up to three characters is under 200 bytes.
 const ONE_EVENT_ROOM: usize = 512;
 
 /// A burst of ready engine messages behind the first token leaves in frames
@@ -580,7 +580,7 @@ const ONE_EVENT_ROOM: usize = 512;
 async fn a_burst_past_the_flush_bound_leaves_in_bounded_frames_on_the_chat_stream() {
     const BURST: usize = 200;
     let (gate, gated) = oneshot::channel();
-    let burst: Vec<_> = (0..BURST).map(|_| chunk(0, "a")).collect();
+    let burst: Vec<_> = (0..BURST).map(|i| chunk(0, &i.to_string())).collect();
     let (stream, server) = staged_stream(
         vec![(None, burst), (Some(gated), vec![complete(0, "stop")])],
         "0",
@@ -621,7 +621,8 @@ async fn a_burst_past_the_flush_bound_leaves_in_bounded_frames_on_the_chat_strea
         .iter()
         .flat_map(|frame| contents_of(frame))
         .collect();
-    assert_eq!(deltas, vec!["a"; BURST], "the burst's deltas in order");
+    let expected: Vec<String> = (0..BURST).map(|i| i.to_string()).collect();
+    assert_eq!(deltas, expected, "the burst's deltas in order");
     let sizes: Vec<usize> = burst_frames.iter().map(Bytes::len).collect();
     let largest = sizes.iter().copied().max().expect("a frame");
     assert!(

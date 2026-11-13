@@ -279,6 +279,9 @@ impl ZmqGenerateStream {
 pub(crate) struct StreamState {
     pub(crate) output_ids: Vec<u32>,
     pub(crate) completion_tokens: u32,
+    /// The prompt count the usage reports: the request's own where the
+    /// wire's module seeds it with the ids it sent, the engine's once an
+    /// output reports one.
     pub(crate) prompt_tokens: u32,
     pub(crate) cached_tokens: u32,
     /// Cumulative sampled-token logprobs across ticks. The proto contract is
@@ -499,6 +502,107 @@ pub(crate) fn map_slim_output(
     }
     let mut response = state.emit_tick(index, output.output_ids, chunk_logprobs, finish, pending);
     state.attach_input_logprobs(pending, input_logprobs_emitted, &mut response);
+    response
+}
+
+/// How a choice ends from the frontend's side, written once for the four
+/// wires: the engine's own terminal `Complete` when it is parked, the `abort`
+/// terminal the Python servicer yields after an `Abort` RPC, and the `stop`
+/// terminal of a string stop the frontend matched. The adapter's generate
+/// streams implement it through the state they accumulate.
+pub trait FrontendFinish {
+    /// Whether the engine already finished this choice and its terminal
+    /// `Complete` is parked behind the chunk just yielded (the finish tick
+    /// carried new tokens). A frontend that matched a stop on that chunk must
+    /// not synthesize its own `Complete`: the accumulated state has already
+    /// been drained into the parked one.
+    fn has_parked_complete(&self) -> bool;
+
+    /// End this choice as aborted: the engine's own parked `Complete` when it
+    /// already finished, else the terminal `Complete` the Python servicer
+    /// yields after an `Abort` RPC (`finish_reason = "abort"`). The
+    /// engine-side request is aborted when the stream is dropped, so the
+    /// caller drops it next.
+    fn complete_aborted(&mut self) -> vllm::GenerateResponse;
+
+    /// End this choice now on a frontend-matched string stop: the terminal
+    /// `Complete` built from the accumulated state, exactly as if the engine
+    /// had reported `stop` with that string. The engine-side request is
+    /// aborted when the stream is dropped, so the caller drops it next.
+    fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse;
+}
+
+/// What a wire's stream lends a frontend finish: its accumulated state, the
+/// choice index, the parked terminal and whether the prompt logprobs went out.
+/// Nameable in [`finish::Parts`]'s signature, built by the adapter's streams
+/// alone: its fields are the crate's.
+pub struct FinishParts<'a> {
+    pub(crate) state: &'a mut StreamState,
+    pub(crate) index: u32,
+    pub(crate) pending: &'a mut Option<vllm::GenerateResponse>,
+    pub(crate) input_logprobs_emitted: &'a mut bool,
+}
+
+/// The stream fields a frontend finish reads and writes. A wire implements
+/// [`finish::Parts`] and takes [`FrontendFinish`] from the blanket impl; the
+/// trait lives in a module of its own, reachable through that impl's bound and
+/// nameable nowhere outside the crate.
+pub(crate) mod finish {
+    use smg_grpc_client::vllm_proto as vllm;
+
+    use super::FinishParts;
+
+    /// The parts of a wire's stream a frontend finish borrows.
+    pub trait Parts {
+        /// The engine's terminal `Complete`, parked for the next poll.
+        fn parked(&self) -> Option<&vllm::GenerateResponse>;
+        /// The fields a frontend finish writes, borrowed together.
+        fn finish_parts(&mut self) -> FinishParts<'_>;
+    }
+}
+
+impl<T: finish::Parts> FrontendFinish for T {
+    fn has_parked_complete(&self) -> bool {
+        self.parked().is_some()
+    }
+
+    fn complete_aborted(&mut self) -> vllm::GenerateResponse {
+        if let Some(parked) = self.finish_parts().pending.take() {
+            return parked;
+        }
+        complete_with_finish(self.finish_parts(), "abort".to_string(), None)
+    }
+
+    fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
+        complete_with_finish(
+            self.finish_parts(),
+            "stop".to_string(),
+            Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
+                matched,
+            )),
+        )
+    }
+}
+
+/// The terminal `Complete` of a frontend finish, built from the accumulated
+/// state. No new tokens, so `emit_tick` yields the `Complete` directly and
+/// parks nothing; the prompt logprobs ride it when they have not gone out yet.
+fn complete_with_finish(
+    parts: FinishParts<'_>,
+    finish_reason: String,
+    matched: Option<vllm::generate_complete::MatchedStop>,
+) -> vllm::GenerateResponse {
+    let mut parked_nothing = None;
+    let mut response = parts.state.emit_tick(
+        parts.index,
+        Vec::new(),
+        None,
+        Some((finish_reason, matched)),
+        &mut parked_nothing,
+    );
+    parts
+        .state
+        .attach_input_logprobs(parts.pending, parts.input_logprobs_emitted, &mut response);
     response
 }
 
@@ -1055,5 +1159,97 @@ mod tests {
         assert!(stream.next().await.is_none(), "an ended stream stays ended");
         drop(stream);
         expect_nothing(&mut input, Duration::from_millis(300)).await;
+    }
+
+    /// A stream as a frontend finish borrows it: the parts alone.
+    struct Finished {
+        state: StreamState,
+        pending: Option<vllm::GenerateResponse>,
+        input_logprobs_emitted: bool,
+    }
+
+    impl finish::Parts for Finished {
+        fn parked(&self) -> Option<&vllm::GenerateResponse> {
+            self.pending.as_ref()
+        }
+
+        fn finish_parts(&mut self) -> FinishParts<'_> {
+            FinishParts {
+                state: &mut self.state,
+                index: 3,
+                pending: &mut self.pending,
+                input_logprobs_emitted: &mut self.input_logprobs_emitted,
+            }
+        }
+    }
+
+    fn finished(output_ids: Vec<u32>) -> Finished {
+        Finished {
+            state: StreamState {
+                output_ids,
+                ..Default::default()
+            },
+            pending: None,
+            input_logprobs_emitted: false,
+        }
+    }
+
+    fn complete_of(response: vllm::GenerateResponse) -> vllm::GenerateComplete {
+        match response.response {
+            Some(vllm::generate_response::Response::Complete(complete)) => complete,
+            other => panic!("a frontend finish yields a Complete, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frontend_finish_yields_the_parked_complete_on_an_abort_after_the_engines_finish() {
+        let mut stream = finished(vec![1, 2]);
+        stream.pending = Some(complete());
+        assert!(stream.has_parked_complete());
+        assert_eq!(
+            complete_of(stream.complete_aborted()),
+            vllm::GenerateComplete::default()
+        );
+        assert!(
+            !stream.has_parked_complete(),
+            "the parked terminal is taken once"
+        );
+    }
+
+    #[test]
+    fn frontend_finish_aborts_the_output_so_far_before_the_engines_finish() {
+        let mut stream = finished(vec![1, 2]);
+        assert!(!stream.has_parked_complete());
+        let terminal = complete_of(stream.complete_aborted());
+        assert_eq!(terminal.finish_reason, "abort");
+        assert_eq!(terminal.output_ids, vec![1, 2]);
+        assert!(terminal.matched_stop.is_none());
+        assert_eq!(terminal.index, 3);
+    }
+
+    #[test]
+    fn frontend_finish_ends_a_matched_stop_as_stop_with_the_string() {
+        let mut stream = finished(vec![7]);
+        let terminal = complete_of(stream.complete_with_matched_stop("END".to_string()));
+        assert_eq!(terminal.finish_reason, "stop");
+        assert_eq!(
+            terminal.matched_stop,
+            Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
+                "END".to_string()
+            ))
+        );
+        assert_eq!(terminal.output_ids, vec![7]);
+    }
+
+    #[test]
+    fn frontend_finish_carries_the_prompt_logprobs_not_yet_emitted() {
+        let mut stream = finished(Vec::new());
+        stream.state.prompt_logprobs = vec![vllm::InputTokenLogProb::default()];
+        stream.state.prompt_token_ids = vec![11];
+        let terminal = complete_of(stream.complete_aborted());
+        assert_eq!(
+            terminal.input_logprobs.map(|logprobs| logprobs.token_ids),
+            Some(vec![11])
+        );
     }
 }

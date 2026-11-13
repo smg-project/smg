@@ -364,6 +364,33 @@ pub enum ProtoResponseVariant {
     None,
 }
 
+/// The wire dispatch of a counter every wire carries under one field name,
+/// written once per form. A wire added to the wrappers is one arm in each
+/// form, two in all, where every reader spelled its own before. The compiler
+/// still refuses a reader that lacks a wire; the macro only moves where the
+/// arms are written. The second form names the wire without the field and
+/// what it reads instead.
+macro_rules! wire_field {
+    ($on:expr, $c:ident => $read:expr) => {
+        match $on {
+            Self::Sglang($c) => $read,
+            Self::Vllm($c) => $read,
+            Self::Trtllm($c) => $read,
+            Self::Mlx($c) => $read,
+            Self::TokenSpeed($c) => $read,
+        }
+    };
+    ($on:expr, $c:ident => $read:expr, Mlx => $none:expr) => {
+        match $on {
+            Self::Sglang($c) => $read,
+            Self::Vllm($c) => $read,
+            Self::Trtllm($c) => $read,
+            Self::TokenSpeed($c) => $read,
+            Self::Mlx(_) => $none,
+        }
+    };
+}
+
 /// The accessors every engine-response wrapper answers with the same five-arm
 /// match, written once and invoked inside each wrapper's `impl` (as the engine
 /// clients invoke `impl_engine_client_basics`): the engine predicates, the chunk
@@ -419,36 +446,18 @@ macro_rules! engine_response_basics {
 
         /// Get prompt tokens
         pub fn prompt_tokens(&self) -> u32 {
-            match self {
-                Self::Sglang(c) => c.prompt_tokens,
-                Self::Vllm(c) => c.prompt_tokens,
-                Self::Trtllm(c) => c.prompt_tokens,
-                Self::Mlx(c) => c.prompt_tokens,
-                Self::TokenSpeed(c) => c.prompt_tokens,
-            }
+            wire_field!(self, c => c.prompt_tokens)
         }
 
         /// Get completion tokens (the running count on a chunk, the total on a
         /// `Complete`)
         pub fn completion_tokens(&self) -> u32 {
-            match self {
-                Self::Sglang(c) => c.completion_tokens,
-                Self::Vllm(c) => c.completion_tokens,
-                Self::Trtllm(c) => c.completion_tokens,
-                Self::Mlx(c) => c.completion_tokens,
-                Self::TokenSpeed(c) => c.completion_tokens,
-            }
+            wire_field!(self, c => c.completion_tokens)
         }
 
         /// Get cached tokens
         pub fn cached_tokens(&self) -> u32 {
-            match self {
-                Self::Sglang(c) => c.cached_tokens,
-                Self::Vllm(c) => c.cached_tokens,
-                Self::Trtllm(c) => c.cached_tokens,
-                Self::Mlx(c) => c.cached_tokens,
-                Self::TokenSpeed(c) => c.cached_tokens,
-            }
+            wire_field!(self, c => c.cached_tokens)
         }
 
         /// Get reasoning tokens.
@@ -534,14 +543,13 @@ impl ProtoGenerateStreamChunk {
     }
 
     /// The output's logprobs, read in place on the message; `None` when the
-    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
             Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
-            Self::Trtllm(c) => {
-                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
-            }
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
             Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
@@ -716,24 +724,12 @@ impl ProtoGenerateComplete {
 
     /// Get accepted speculative draft tokens.
     pub fn spec_accepted_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.spec_accepted_tokens,
-            Self::Vllm(c) => c.spec_accepted_tokens,
-            Self::Trtllm(c) => c.spec_accepted_tokens,
-            Self::TokenSpeed(c) => c.spec_accepted_tokens,
-            Self::Mlx(_) => 0,
-        }
+        wire_field!(self, c => c.spec_accepted_tokens, Mlx => 0)
     }
 
     /// Get proposed speculative draft tokens.
     pub fn spec_draft_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.spec_draft_tokens,
-            Self::Vllm(c) => c.spec_draft_tokens,
-            Self::Trtllm(c) => c.spec_draft_tokens,
-            Self::TokenSpeed(c) => c.spec_draft_tokens,
-            Self::Mlx(_) => 0,
-        }
+        wire_field!(self, c => c.spec_draft_tokens, Mlx => 0)
     }
 
     /// Get input/prompt logprobs (SGLang, vLLM, and TensorRT-LLM)
@@ -777,14 +773,13 @@ impl ProtoGenerateComplete {
     }
 
     /// The output's logprobs, read in place on the message; `None` when the
-    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
             Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
-            Self::Trtllm(c) => {
-                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
-            }
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
             Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
@@ -3306,5 +3301,160 @@ mod watched_tests {
         );
         assert!(matches!(stream.next().await, Some(Ok(_))));
         assert!(stream.next().await.is_none(), "the end is the end");
+    }
+}
+
+#[cfg(test)]
+mod output_logprob_tests {
+    use super::{trtllm, ProtoGenerateComplete, ProtoGenerateStreamChunk};
+
+    fn one_record() -> Vec<trtllm::TokenLogprob> {
+        vec![trtllm::TokenLogprob {
+            token_id: 7,
+            logprob: -0.5,
+            top_logprobs: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn a_trtllm_chunk_reads_an_empty_logprob_list_as_none() {
+        // The TRT-LLM wire says "no logprobs" with an empty list where the
+        // other wires leave the field absent; one record is one position.
+        let none = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
+    }
+
+    #[test]
+    fn a_trtllm_complete_reads_an_empty_logprob_list_as_none() {
+        let none = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod wire_field_tests {
+    use super::*;
+
+    /// Every wire's counters come from its own fields: the five-wire form on the
+    /// chunk and complete wrappers, and the complete wrapper's speculative pair,
+    /// zero on the wire that has none.
+    #[test]
+    fn counters_read_each_wires_own_fields() {
+        let chunks = [
+            ProtoGenerateStreamChunk::Sglang(sglang::GenerateStreamChunk {
+                prompt_tokens: 11,
+                completion_tokens: 12,
+                cached_tokens: 13,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+                prompt_tokens: 21,
+                completion_tokens: 22,
+                cached_tokens: 23,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk {
+                prompt_tokens: 31,
+                completion_tokens: 32,
+                cached_tokens: 33,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Mlx(mlx::GenerateStreamChunk {
+                prompt_tokens: 41,
+                completion_tokens: 42,
+                cached_tokens: 43,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+                prompt_tokens: 51,
+                completion_tokens: 52,
+                cached_tokens: 53,
+                ..Default::default()
+            }),
+        ];
+        for (n, chunk) in (1u32..).zip(chunks.iter()) {
+            let base = 10 * n;
+            assert_eq!(
+                (
+                    chunk.prompt_tokens(),
+                    chunk.completion_tokens(),
+                    chunk.cached_tokens()
+                ),
+                (base + 1, base + 2, base + 3)
+            );
+        }
+        let completes = [
+            ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                prompt_tokens: 11,
+                completion_tokens: 12,
+                cached_tokens: 13,
+                spec_accepted_tokens: 14,
+                spec_draft_tokens: 15,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::Vllm(Box::new(vllm::GenerateComplete {
+                prompt_tokens: 21,
+                completion_tokens: 22,
+                cached_tokens: 23,
+                spec_accepted_tokens: 24,
+                spec_draft_tokens: 25,
+                ..Default::default()
+            })),
+            ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete {
+                prompt_tokens: 31,
+                completion_tokens: 32,
+                cached_tokens: 33,
+                spec_accepted_tokens: 34,
+                spec_draft_tokens: 35,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::Mlx(mlx::GenerateComplete {
+                prompt_tokens: 41,
+                completion_tokens: 42,
+                cached_tokens: 43,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+                prompt_tokens: 51,
+                completion_tokens: 52,
+                cached_tokens: 53,
+                spec_accepted_tokens: 54,
+                spec_draft_tokens: 55,
+                ..Default::default()
+            }),
+        ];
+        for (n, complete) in (1u32..).zip(completes.iter()) {
+            let base = 10 * n;
+            assert_eq!(
+                (
+                    complete.prompt_tokens(),
+                    complete.completion_tokens(),
+                    complete.cached_tokens()
+                ),
+                (base + 1, base + 2, base + 3)
+            );
+            let speculative = if matches!(complete, ProtoGenerateComplete::Mlx(_)) {
+                (0, 0)
+            } else {
+                (base + 4, base + 5)
+            };
+            assert_eq!(
+                (
+                    complete.spec_accepted_tokens(),
+                    complete.spec_draft_tokens()
+                ),
+                speculative
+            );
+        }
     }
 }

@@ -35,9 +35,15 @@ serde_yaml = { workspace = true }
 prost-build = { version = "0.14.4", default-features = false }
 prost-types = { workspace = true }
 wit-parser = { version = "0.258.3", default-features = false, features = ["std"] }
+# The lease-file tests and bench write under a directory of their own.
+tempfile = "3"
 
 [[bench]]
 name = "decision"
+harness = false
+
+[[bench]]
+name = "elector"
 harness = false
 
 [[bench]]
@@ -46,6 +52,10 @@ harness = false
 
 [[bench]]
 name = "contention"
+harness = false
+
+[[bench]]
+name = "store"
 harness = false
 
 [lints]

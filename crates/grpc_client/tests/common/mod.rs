@@ -34,6 +34,11 @@ pub struct MockState {
     /// The calls served that the client injects the trace context into,
     /// each with the `TRACE_HEADER` value it carried, in arrival order.
     traced: Mutex<Vec<(&'static str, Option<String>)>>,
+    /// The last generate request the mock decoded, whole.
+    generated: Mutex<Option<proto::GenerateRequest>>,
+    /// The status every generate call fails with before its stream opens,
+    /// when set.
+    generate_status: Mutex<Option<tonic::Code>>,
 }
 
 impl MockState {
@@ -56,6 +61,23 @@ impl MockState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// The last generate request the mock decoded.
+    pub fn last_generated(&self) -> Option<proto::GenerateRequest> {
+        self.generated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every generate call from now on fails with `code` before its
+    /// stream opens.
+    pub fn fail_generate_with(&self, code: tonic::Code) {
+        *self
+            .generate_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code);
     }
 
     /// Records `call` with the trace header `request` carried, if any.
@@ -106,6 +128,19 @@ impl proto::vllm_engine_server::VllmEngine for MockEngine {
         request: Request<proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         self.state.record_trace("Generate", &request);
+        if let Some(code) = *self
+            .state
+            .generate_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(Status::new(code, "scripted"));
+        }
+        *self
+            .state
+            .generated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.into_inner());
         let (tx, rx) = mpsc::channel(4);
         *self.state.lock_tx() = Some(tx);
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -195,8 +230,27 @@ impl proto::vllm_engine_server::VllmEngine for MockEngine {
 
 pub async fn spawn_mock(
 ) -> Result<(String, Arc<MockState>), Box<dyn std::error::Error + Send + Sync>> {
+    serve(None).await
+}
+
+/// The mock with its decoder's message limit raised to `max_message_bytes`
+/// (tonic's default is 4 MiB; the engine servicers raise theirs for the
+/// image tensors a request carries).
+pub async fn spawn_mock_decoding_up_to(
+    max_message_bytes: usize,
+) -> Result<(String, Arc<MockState>), Box<dyn std::error::Error + Send + Sync>> {
+    serve(Some(max_message_bytes)).await
+}
+
+async fn serve(
+    max_message_bytes: Option<usize>,
+) -> Result<(String, Arc<MockState>), Box<dyn std::error::Error + Send + Sync>> {
     let mock = MockEngine::default();
     let state = Arc::clone(&mock.state);
+    let mut service = proto::vllm_engine_server::VllmEngineServer::new(mock);
+    if let Some(bytes) = max_message_bytes {
+        service = service.max_decoding_message_size(bytes);
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     #[expect(
@@ -205,7 +259,7 @@ pub async fn spawn_mock(
     )]
     tokio::spawn(
         Server::builder()
-            .add_service(proto::vllm_engine_server::VllmEngineServer::new(mock))
+            .add_service(service)
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     Ok((format!("http://{addr}"), state))

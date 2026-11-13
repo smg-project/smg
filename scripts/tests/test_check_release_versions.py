@@ -1088,6 +1088,11 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
     os.symlink("real2", root / "hop2")
     os.symlink("../hop2", root / "pkg" / "through")  # a link to a link to a directory ...
     os.symlink("../real3/f", root / "real2" / "inner")  # ... that holds a link
+    put(
+        root, "shared/pyproject.toml", '[project]\nname = "shared"\nversion = "9.9.9"\n'
+    )  # same name, content
+    put(root, "real/x ", "sp\n")  # a target with whitespace at its end, read as written
+    os.symlink("../real/x ", root / "pkg" / "sp")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "chore: initial")
     git(root, "tag", "v1.0.0")
@@ -1105,6 +1110,7 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
         "real/y",
         "real/z",
         "shared",
+        "real/x ",
         "hop2",
         "real2",
         "real/x",
@@ -1181,5 +1187,29 @@ def test_what_a_components_symlinks_point_at_is_its_content(mod, tmp_path):
         root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
     )
     assert "  ! pkg (pkg/) — 3 file(s) changed but version not bumped (v0.1.0) [minor]" in (
+        stream.getvalue()
+    )
+
+    # a manifest of the version file's name in the linked directory is content, not the version file
+    put(root, "shared/pyproject.toml", '[project]\nname = "shared"\nversion = "9.9.10"\n')
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "fix(shared): the manifest")
+    stream = io.StringIO()
+    mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    assert "  ! pkg (pkg/) — 4 file(s) changed but version not bumped (v0.1.0) [minor]" in (
+        stream.getvalue()
+    )
+
+    # a target with whitespace at its end is the file of that name, not its trimmed neighbour
+    put(root, "real/x ", "sp2\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "fix(real): the spaced file")
+    stream = io.StringIO()
+    mod.run(
+        root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=packages, mirrors=()
+    )
+    assert "  ! pkg (pkg/) — 5 file(s) changed but version not bumped (v0.1.0) [minor]" in (
         stream.getvalue()
     )

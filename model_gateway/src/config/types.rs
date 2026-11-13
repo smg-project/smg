@@ -591,7 +591,9 @@ pub struct RouterConfig {
     /// Bounds of the memory history backend (`history_backend = "memory"`):
     /// the most stored responses and conversation items it keeps and how long
     /// it keeps a record; unset = the defaults (10,000 responses, 100,000
-    /// items, one day).
+    /// items, one day). The Messages route's thread store, in memory under
+    /// every backend, keeps at most `max_responses` turns for the same
+    /// retention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)

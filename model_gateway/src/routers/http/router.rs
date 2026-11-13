@@ -47,7 +47,13 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
+    middleware::{
+        body_timeout::{
+            request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
+        },
+        scheduler::PreemptionGuard,
+        TenantRequestMeta,
+    },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
@@ -109,11 +115,11 @@ use crate::{
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
 const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-/// Error codes for streamed-body aborts the client caused. They carry no
-/// worker verdict: recording a circuit-breaker sample for them would let slow
-/// or oversized uploaders open a healthy worker's breaker.
-const STREAMED_BODY_STALLED: &str = "request_body_stalled";
-const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
+/// Error code of a streamed body that broke off before it was forwarded.
+/// With the middleware's `REQUEST_BODY_STALLED` and `REQUEST_BODY_TOO_LARGE`
+/// it names an abort the client caused; the three carry no worker verdict:
+/// recording a circuit-breaker sample for one would let slow or oversized
+/// uploaders open a healthy worker's breaker.
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 
 /// How a worker response body is relayed to the client. Re-chunking exists
@@ -260,7 +266,7 @@ impl Router {
             Ok(worker) => {
                 let mut request_builder = worker
                     .http_client()
-                    .get(format!("{}/{endpoint}", worker.url()));
+                    .get(format!("{}/{endpoint}", worker.base_url()));
                 // A public route outside the auth middleware: the allow-listed
                 // caller headers go as they are and nothing is added (a
                 // configured worker key here would authenticate an anonymous
@@ -345,6 +351,7 @@ impl Router {
                 cache_namespace,
                 candidate_filter,
                 tried,
+                sequence: None,
             },
         )
     }
@@ -1220,6 +1227,12 @@ impl Router {
         model_id: &str,
         routing: &RoutingDerivatives,
     ) -> Result<Arc<dyn Worker>, Response> {
+        // The request's sequence before the pool read: see
+        // `PlacementInputs::sequence`.
+        let sequence = self
+            .policy_registry
+            .decider()
+            .map(|decider| decider.begin());
         let all_workers = self
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
@@ -1254,6 +1267,7 @@ impl Router {
                 cache_namespace: routing.cache_namespace,
                 candidate_filter: None,
                 tried: &[],
+                sequence,
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
@@ -1350,9 +1364,12 @@ impl Router {
     }
 
     /// Buffer a worker response body, capped at `limit` bytes; a larger body
-    /// is a misbehaving worker and yields a 502 before memory balloons. The
-    /// request's own timeout running out mid-body ends the request as it does
-    /// before the head (see [`convert_reqwest_error`]).
+    /// is a misbehaving worker and yields a 502 before memory balloons, and so
+    /// does a body the worker's connection cuts short (a close before the
+    /// announced length, a reset mid-body): the worker's transport failing
+    /// under the call, answered under its own code, never a fault of the
+    /// gateway's. The request's own timeout running out mid-body ends the
+    /// request as it does before the head (see [`convert_reqwest_error`]).
     async fn read_worker_body_capped<S>(mut stream: S, limit: usize) -> Result<Bytes, Response>
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
@@ -1368,7 +1385,7 @@ impl Router {
                     )));
                 }
                 Err(e) => {
-                    return Err(error::internal_error(
+                    return Err(error::bad_gateway(
                         "read_response_body_failed",
                         format!("Failed to get response body: {}", cause(&e)),
                     ));
@@ -1574,13 +1591,7 @@ impl Router {
                     timeout_secs,
                     "Streamed request body stalled waiting on the client; aborting dispatch"
                 );
-                return error::create_error(
-                    StatusCode::REQUEST_TIMEOUT,
-                    STREAMED_BODY_STALLED,
-                    format!(
-                        "No request body bytes arrived from the client for {timeout_secs} seconds"
-                    ),
-                );
+                return request_body_stalled_response(timeout_secs);
             }
         };
 
@@ -1593,7 +1604,7 @@ impl Router {
                 );
                 return error::create_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    STREAMED_BODY_TOO_LARGE,
+                    REQUEST_BODY_TOO_LARGE,
                     format!("Request body exceeded {} bytes", self.max_payload_size),
                 );
             }
@@ -2327,7 +2338,7 @@ impl Router {
         // status and code.
         let client_body_fault = matches!(
             error_code,
-            STREAMED_BODY_STALLED | STREAMED_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
+            REQUEST_BODY_STALLED | REQUEST_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
         );
         if !client_body_fault {
             // A streamed head's success was recorded before its relay task
@@ -2892,14 +2903,17 @@ mod tests {
         middleware::ReportedRefusal,
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         policies::as_cache_aware,
-        routers::common::{
-            body_policy::{
-                REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
-                REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
-                REASON_WASM_REQUEST_HOOK,
+        routers::{
+            common::{
+                body_policy::{
+                    REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
+                    REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                    REASON_WASM_REQUEST_HOOK,
+                },
+                request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+                test_support::fast_retry_config,
             },
-            request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
-            test_support::fast_retry_config,
+            http::test_support,
         },
         service_discovery::testing::create_test_app_context,
         worker::{
@@ -3090,6 +3104,50 @@ mod tests {
             texts.iter().all(|text| !text.contains("s3cret")),
             "{texts:?}"
         );
+    }
+
+    /// One of the public GET pass-throughs, on a worker registered with a
+    /// trailing slash: the stub is asked for `/get_server_info`, not
+    /// `//get_server_info`.
+    #[tokio::test]
+    async fn a_get_pass_through_joins_to_a_slashed_registration_with_one_slash() {
+        use std::sync::Mutex;
+
+        use axum::http::Uri;
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |uri: Uri| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.lock().unwrap().push(uri.path().to_owned());
+                ([(CONTENT_TYPE, "application/json")], "{}").into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let slashed = BasicWorkerBuilder::new(format!("http://{addr}/"))
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![slashed]);
+
+        let response = router
+            .proxy_get_request(
+                Request::builder().body(Body::empty()).unwrap(),
+                "get_server_info",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["/get_server_info"]);
     }
 
     /// smg-lab #288: the `model` label of the request families is bounded by
@@ -3786,9 +3844,9 @@ mod tests {
 
     /// The buffered transcription answer's outcome names the reason from
     /// what the client sees: a body the gateway could not read whole (cut
-    /// under the read) is the gateway's own 500 under its code, counted as
-    /// the worker's connection failing (`transport_disconnect`), not as the
-    /// worker-style reason of a 500; a body that arrives whole is the
+    /// under the read) is a bad gateway under the gateway's own code, counted
+    /// as the worker's connection failing (`transport_disconnect`), not as
+    /// the worker-style reason of a 502; a body that arrives whole is the
     /// worker's answer, recorded by its status.
     #[tokio::test]
     async fn a_buffered_transcription_read_failure_names_the_gateways_reason() {
@@ -3808,7 +3866,7 @@ mod tests {
         let answer =
             buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
                 .await;
-        assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&answer),
             "read_response_body_failed"
@@ -3878,8 +3936,12 @@ mod tests {
         );
     }
 
+    /// A body the engine's stream ends with an error is the worker's
+    /// transport failing under the call: a bad gateway under the read's code,
+    /// the class the over-limit body takes and the one the metrics file the
+    /// code under (`transport_disconnect`), never a 500 of the gateway's own.
     #[tokio::test]
-    async fn read_worker_body_capped_maps_read_failure_to_500() {
+    async fn read_worker_body_capped_maps_a_read_failure_to_a_bad_gateway() {
         let url = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
 
         let response = Router::read_worker_body_capped(
@@ -3889,7 +3951,57 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "read_response_body_failed"
+        );
+    }
+
+    /// Loopback engine stub whose every answer is a 200 head announcing a
+    /// 1000-byte body, twelve bytes of it, and then the closed connection: an
+    /// engine that goes away mid-answer, as the client reads it ("end of file
+    /// before message length reached").
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn spawn_close_after_headers_stub() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 1000\r\n\r\n{\"partial\":",
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An engine that closes the connection after its head and a few bytes
+    /// of the body it announced is answered the same way: a bad gateway
+    /// under the read's code, with the client's reason in the message.
+    #[tokio::test]
+    async fn a_worker_that_closes_mid_body_is_a_bad_gateway() {
+        let url = spawn_close_after_headers_stub().await;
+
+        let response = Router::read_worker_body_capped(
+            worker_body(&crate::server::http_client(), &url).await,
+            1 << 20,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"
@@ -5312,6 +5424,7 @@ mod tests {
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
         let err = crate::server::http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -5338,7 +5451,10 @@ mod tests {
         // A reserved port nobody listens at: the connect is refused.
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let err = crate::server::http_client()
+        let err = crate::server::http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(format!("http://{addr}/generate"))
             .send()
             .await
@@ -6807,64 +6923,6 @@ mod tests {
         }
     }
 
-    /// Whether `bytes` hold a whole HTTP/1 request: the head and as many
-    /// body bytes as its `Content-Length` declares.
-    fn request_complete(bytes: &[u8]) -> bool {
-        let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
-            return false;
-        };
-        let head = String::from_utf8_lossy(&bytes[..head_end]);
-        let length = head
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.trim()
-                    .eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())?
-            })
-            .unwrap_or(0);
-        bytes.len() >= head_end + 4 + length
-    }
-
-    /// A worker that answers one request with a sized SSE head (the
-    /// `Content-Length` of the whole `body`) and closes the connection after
-    /// the first `sent` bytes of it: an upstream that knew its length and
-    /// went away mid-body.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test stub server lives for the duration of the test process"
-    )]
-    async fn spawn_sized_sse_worker_cut_after(body: &'static str, sent: usize) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            // The whole request first, so the close is a clean end of the
-            // answer and never a reset of unread request bytes.
-            let mut request = Vec::new();
-            let mut buf = [0u8; 4096];
-            while !request_complete(&request) {
-                match sock.read(&mut buf).await {
-                    Ok(n) if n > 0 => request.extend_from_slice(&buf[..n]),
-                    _ => return,
-                }
-            }
-            let head = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
-                body.len()
-            );
-            let _ = sock.write_all(head.as_bytes()).await;
-            let _ = sock.write_all(&body.as_bytes()[..sent]).await;
-            let _ = sock.flush().await;
-            // The socket drops here, short of the declared length.
-        });
-        format!("http://{addr}")
-    }
-
     /// The plain path ends a cut stream with its error event too, so a sized
     /// upstream answer that is cut reaches the client without the upstream's
     /// `Content-Length`: the frames that arrived, the typed error event and
@@ -6875,7 +6933,7 @@ mod tests {
                             data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
                             data: [DONE]\n\n";
         let first = BODY.find("\n\n").unwrap() + 2;
-        let url = spawn_sized_sse_worker_cut_after(BODY, first).await;
+        let url = test_support::spawn_sized_sse_worker_cut_after(BODY, first).await;
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
 
         let response = router

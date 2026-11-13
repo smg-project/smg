@@ -510,9 +510,10 @@ struct FrameHeader {
 /// marker, its payload and the offset of what follows the segment. Fill bytes,
 /// stray bytes before a marker and a stuffed zero (`FF 00`; defects both
 /// decoders warn of and read past, one byte at a time) and the standalone
-/// markers (the restart markers, SOI and TEM) are stepped over. The walk ends at the end of the image, at a segment cut short, and
-/// at the scan header unless that is the segment wanted, since no marker walk
-/// crosses the entropy-coded data behind it.
+/// markers (the restart markers, SOI and TEM) are stepped over. The walk ends
+/// at the end of the image, at a segment cut short, and at the scan header
+/// unless that is the segment wanted, since no marker walk crosses the
+/// entropy-coded data behind it.
 fn segment(bytes: &[u8], wanted: impl Fn(u8) -> bool) -> Option<(u8, &[u8], usize)> {
     if !is_jpeg(bytes) {
         return None;
@@ -565,8 +566,10 @@ fn is_frame_header(marker: u8) -> bool {
 /// libjpeg-turbo 2.x refuses a frame whose components are sampled unlike each
 /// other (a CMYK file with subsampled inks and a full-resolution black) with
 /// "Could not determine subsampling type", though its decoder takes such a
-/// frame, so this reader stands in for the call. `None` when the scan or the
-/// end of the image comes before a frame header, or a segment is cut short.
+/// frame, so this reader supplies the component count the call did not, for
+/// a frame whose dimensions agree with the call's (`fallback_frame`). `None`
+/// when the scan or the end of the image comes before a frame header, or a
+/// segment is cut short.
 fn frame_header(bytes: &[u8]) -> Option<FrameHeader> {
     let (_, payload, _) = segment(bytes, is_frame_header)?;
     let (&[_precision, h0, h1, w0, w1, components], _) = payload.split_first_chunk::<6>()?;
@@ -806,8 +809,9 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
     // - `bytes` is a live `&[u8]`; its ptr/len describe a valid immutable region
     //   for the duration of the calls (libjpeg-turbo only reads it).
     // - `buf` is an owned `Vec<u8>` whose length is exactly `w*h*channels`
-    //   (overflow-checked) from the frame's dimensions (the header call's, or
-    //   the frame header's when that call refuses the sampling; the decoder
+    //   (overflow-checked) from the dimensions the header call read (when it
+    //   refuses only the sampling, the frame header adds the component count
+    //   and must name the same dimensions, `fallback_frame`; the decoder
     //   never writes past the size it is given), with `channels` the
     //   pixel size of the format requested (3 for `TJPF_RGB`, 4 for
     //   `TJPF_CMYK`); a pooled buffer has a larger capacity, the length is
@@ -1113,19 +1117,48 @@ mod tests {
         }
     }
 
-    /// A 16x8 four-component baseline JPEG whose first component is sampled
-    /// 2x2 and the other three 1x1: the shape a CMYK file written with chroma
-    /// subsampling takes, which libjpeg-turbo 2.x's header call cannot name.
-    /// One MCU with every coefficient zero, so every sample decodes to 128.
+    /// A 16x8 baseline JPEG of one MCU with every coefficient zero, so every
+    /// sample decodes to 128, its components sampled as `sampling` says (one
+    /// packed byte per component, the horizontal factor in the high nibble).
     /// Built here rather than stored: a byte table would be test data.
-    fn unequal_sampling_cmyk_jpeg() -> Vec<u8> {
+    ///
+    /// The scan holds one block per sampling unit, which is the scan's count
+    /// only when the components share one interleaved MCU (two or more of
+    /// them) at least 16 columns wide (a horizontal factor of 2 or more
+    /// somewhere). 4:4:4 takes two MCUs, so half the blocks go unwritten:
+    /// libjpeg warns of the premature end, fills them with zeros and keeps
+    /// the frame, grey like the written half, so no pixel check would tell.
+    /// A single component's scan is not interleaved and takes the frame's
+    /// two blocks whatever its factors: one short at 1x1, exact at 2x1, two
+    /// over at 2x2. The builder refuses such lists.
+    fn unequal_sampling_jpeg(sampling: &[u8]) -> Vec<u8> {
+        assert!(
+            sampling.len() >= 2 && sampling.iter().any(|&factors| factors >> 4 >= 2),
+            "one MCU of 16x8 takes two or more components, one with a horizontal \
+             factor of 2 or more: not {sampling:02X?}"
+        );
+        let count = sampling.len();
         let mut jpeg = vec![0xFF, 0xD8];
         // DQT: one table of ones.
         jpeg.extend([0xFF, 0xDB, 0x00, 0x43, 0x00]);
         jpeg.extend([1u8; 64]);
-        // SOF0: 8 bits, 8 rows, 16 columns, four components (2x2, 1x1, 1x1, 1x1).
-        jpeg.extend([0xFF, 0xC0, 0x00, 0x14, 0x08, 0x00, 0x08, 0x00, 0x10, 0x04]);
-        jpeg.extend([1, 0x22, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0]);
+        // SOF0: 8 bits, 8 rows, 16 columns, the components with their
+        // sampling, all on quantization table 0.
+        jpeg.extend([
+            0xFF,
+            0xC0,
+            0x00,
+            8 + 3 * count as u8,
+            0x08,
+            0x00,
+            0x08,
+            0x00,
+            0x10,
+        ]);
+        jpeg.push(count as u8);
+        for (id, &factors) in (1..).zip(sampling) {
+            jpeg.extend([id, factors, 0]);
+        }
         // DHT: a DC table and an AC table with one code each, for symbol 0 (a
         // zero difference; the end of a block).
         for class in [0x00, 0x10] {
@@ -1133,14 +1166,51 @@ mod tests {
             jpeg.extend([0u8; 15]);
             jpeg.push(0x00);
         }
-        // SOS: the four components on tables 0 and 0, the whole spectrum.
-        jpeg.extend([
-            0xFF, 0xDA, 0x00, 0x0E, 0x04, 1, 0, 2, 0, 3, 0, 4, 0, 0, 0x3F, 0,
-        ]);
-        // Seven blocks (four of the first component, one of each other), each
-        // a zero difference and an end of block: fourteen zero bits, padded.
-        jpeg.extend([0x00, 0x03, 0xFF, 0xD9]);
+        // SOS: every component on tables 0 and 0, the whole spectrum.
+        jpeg.extend([0xFF, 0xDA, 0x00, 6 + 2 * count as u8, count as u8]);
+        for id in 1..=count as u8 {
+            jpeg.extend([id, 0]);
+        }
+        jpeg.extend([0, 0x3F, 0]);
+        // One block per sampling unit of each component, each a zero
+        // difference and an end of block: two zero bits a block, padded
+        // with ones to the byte.
+        let blocks: usize = sampling
+            .iter()
+            .map(|&factors| usize::from(factors >> 4) * usize::from(factors & 0x0F))
+            .sum();
+        let bits = 2 * blocks;
+        let mut scan = vec![0u8; bits.div_ceil(8)];
+        let padding = scan.len() * 8 - bits;
+        if let Some(last) = scan.last_mut() {
+            *last = (1u8 << padding) - 1;
+        }
+        jpeg.extend(scan);
+        jpeg.extend([0xFF, 0xD9]);
         jpeg
+    }
+
+    /// The four-component file: its first component sampled 2x2 and the other
+    /// three 1x1, the shape a CMYK file written with chroma subsampling takes,
+    /// which libjpeg-turbo 2.x's header call cannot name.
+    fn unequal_sampling_cmyk_jpeg() -> Vec<u8> {
+        unequal_sampling_jpeg(&[0x22, 0x11, 0x11, 0x11])
+    }
+
+    /// A list the builder cannot write is refused rather than written short:
+    /// three components sampled 1x1 each take two MCUs across the 16 columns.
+    #[test]
+    #[should_panic(expected = "one MCU of 16x8 takes two or more components")]
+    fn the_builder_refuses_a_list_whose_mcu_is_narrower_than_the_frame() {
+        unequal_sampling_jpeg(&[0x11, 0x11, 0x11]);
+    }
+
+    /// A single component's scan is not interleaved: its block count is the
+    /// component's own, not one MCU's.
+    #[test]
+    #[should_panic(expected = "one MCU of 16x8 takes two or more components")]
+    fn the_builder_refuses_a_single_component() {
+        unequal_sampling_jpeg(&[0x22]);
     }
 
     /// The reader finds the frame header behind the tables, in a file written
@@ -1307,17 +1377,44 @@ mod tests {
         assert_eq!(fallback_frame(16, 8, None), None);
     }
 
+    /// The three-component half of the fallback's key: a file whose second
+    /// component is sampled 2x1 and the others 1x1, a pattern the header call
+    /// names no subsampling for, decodes through the library as YCbCr to grey
+    /// 128 on every pixel (the decoder takes any whole-number sampling ratio).
+    #[test]
+    fn a_three_component_jpeg_with_unequal_sampling_decodes_through_turbojpeg() {
+        if !crate::test_support::turbojpeg_or_skip("the three-component test") {
+            return;
+        }
+        let jpeg = unequal_sampling_jpeg(&[0x11, 0x21, 0x11]);
+        assert_eq!(
+            frame_header(&jpeg),
+            Some(FrameHeader {
+                width: 16,
+                height: 8,
+                components: 3
+            }),
+            "the frame header reads the three-component frame"
+        );
+        let image = decode_jpeg_rgb(&jpeg)
+            .expect("decoded through libjpeg-turbo, the header call notwithstanding");
+        let rgb = image.to_rgb8();
+        assert_eq!((rgb.width(), rgb.height()), (16, 8));
+        assert!(
+            rgb.pixels().all(|pixel| pixel.0 == [128, 128, 128]),
+            "every sample is 128: grey"
+        );
+    }
+
     /// A header the library cannot read leaves the dimensions unset, and the
     /// decode answers `None` without taking a buffer: the hand-built file with
     /// its precision set to 9 bits (no build reads it: 2.x wants its compiled
     /// 8, 3.x takes 8, 12 and 16) and its frame grown to 1024x1024, which the
     /// frame header alone would read and serve from the 4 MiB class.
     #[test]
-    #[expect(clippy::print_stderr)]
     fn a_header_the_library_cannot_read_takes_no_buffer() {
         use crate::buffer_pool::{self, BufferPool};
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the unreadable-header test");
+        if !crate::test_support::turbojpeg_or_skip("the unreadable-header test") {
             return;
         }
         let mut jpeg = unequal_sampling_cmyk_jpeg();
@@ -1752,11 +1849,9 @@ mod tests {
     /// answers `None` with no buffer taken, where the frame header alone
     /// would serve the 4 MiB class.
     #[test]
-    #[expect(clippy::print_stderr)]
     fn a_two_component_frame_takes_no_buffer() {
         use crate::buffer_pool::{self, BufferPool};
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the two-component test");
+        if !crate::test_support::turbojpeg_or_skip("the two-component test") {
             return;
         }
         let jpeg = two_component_jpeg();

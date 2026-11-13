@@ -5,6 +5,7 @@ use std::{
 
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
+use smg_policy_controller::spec::DENIED_HEADERS;
 use tokio::sync::Semaphore;
 
 use super::*;
@@ -548,6 +549,7 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_routing_key_headers(config)?;
         Self::validate_policy_engine(config)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
@@ -556,7 +558,6 @@ impl ConfigValidator {
         Self::validate_log_dir(config)?;
         Self::validate_access_log_fields(config)?;
         Self::validate_storage_context_headers(config)?;
-        Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_memory_history(config)?;
@@ -774,6 +775,13 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// `routing_key_override.headers` names routing keys, never credentials:
+    /// a thread turn's client lineage goes out under the first configured
+    /// name, and the provider paths forward a request's `Authorization` over
+    /// the worker's own key, so a credential name there sends a lineage as a
+    /// credential and the upstream refuses the turn. The names on the policy
+    /// contracts' header deny-list are refused at load by name, under both
+    /// policy engines, ahead of the engine build.
     fn validate_routing_key_headers(config: &RouterConfig) -> ConfigResult<()> {
         for name in &config.routing_key_override.headers {
             HeaderName::try_from(name.as_str()).map_err(|e| ConfigError::ValidationFailed {
@@ -781,6 +789,16 @@ impl ConfigValidator {
                     "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
                 ),
             })?;
+            if DENIED_HEADERS
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(name))
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "routing_key_override.headers contains the credential header name '{name}': a routing key is never a credential"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -976,6 +994,14 @@ impl ConfigValidator {
             return Err(ConfigError::invalid_value(
                 "oracle.pool_timeout_secs",
                 oracle.pool_timeout_secs,
+                "Must be > 0",
+            ));
+        }
+
+        if oracle.op_timeout_secs == 0 {
+            return Err(ConfigError::invalid_value(
+                "oracle.op_timeout_secs",
+                oracle.op_timeout_secs,
                 "Must be > 0",
             ));
         }
@@ -3717,7 +3743,13 @@ mod tests {
         assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
         assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
         assert!(!warning.contains("secret"), "{warning}");
-        for url in ["http://user:secret@worker:8000", "grpc://worker:50051"] {
+        // An `@` inside a query or fragment is no userinfo: no warning.
+        for url in [
+            "http://user:secret@worker:8000",
+            "grpc://worker:50051",
+            "grpc://worker:50051?token=a@b",
+            "grpc://worker:50051#a@b",
+        ] {
             assert_eq!(unused_credentials_warning(url), None, "{url}");
         }
 
@@ -3805,8 +3837,8 @@ mod tests {
 
     /// Under `engine` the sticky override's headers are the default
     /// binding's sessions rule: a name repeated in another case is one
-    /// header, as under legacy; a header on the engine's deny-list refuses
-    /// the start by name, where the legacy path takes it.
+    /// header, as under legacy; a header on the deny-list is refused at load
+    /// by name under both engines, before the engine build reads it.
     #[test]
     fn the_engine_switch_takes_a_repeated_routing_header_and_refuses_a_denied_one() {
         let mut config = regular_mode_config();
@@ -3815,16 +3847,46 @@ mod tests {
         config.routing_key_override.headers =
             vec!["X-Routing-Key".to_string(), "x-routing-key".to_string()];
         assert!(ConfigValidator::validate(&config).is_ok());
-        config.routing_key_override.headers = vec!["x-api-key".to_string()];
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref reason, .. })
-                if field == "policy_engine"
-                    && reason.contains("x-api-key")
-                    && reason.contains("deny-list")
-        ));
-        config.policy_engine = PolicyEngineMode::Legacy;
+        for engine in [PolicyEngineMode::Engine, PolicyEngineMode::Legacy] {
+            config.policy_engine = engine;
+            config.routing_key_override.headers = vec!["x-api-key".to_string()];
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::ValidationFailed { ref reason })
+                        if reason.contains("routing_key_override.headers")
+                            && reason.contains("x-api-key")
+                ),
+                "{engine:?}"
+            );
+        }
+    }
+
+    /// A routing-key header is never a credential: every name on the shared
+    /// header deny-list is refused at load by name, in any letter case and in
+    /// any position of the list, where a plain name beside it is taken.
+    #[test]
+    fn routing_key_headers_refuse_credential_names() {
+        let mut config = regular_mode_config();
+        config.routing_key_override.enabled = true;
+        config.routing_key_override.headers = vec!["x-routing-key".to_string()];
         assert!(ConfigValidator::validate(&config).is_ok());
+        for denied in DENIED_HEADERS {
+            for name in [denied.to_string(), denied.to_ascii_uppercase()] {
+                config.routing_key_override.headers =
+                    vec!["x-routing-key".to_string(), name.clone()];
+                assert!(
+                    matches!(
+                        ConfigValidator::validate(&config),
+                        Err(ConfigError::ValidationFailed { ref reason })
+                            if reason.contains("routing_key_override.headers")
+                                && reason.contains(&name)
+                                && reason.contains("credential")
+                    ),
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]

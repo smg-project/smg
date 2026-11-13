@@ -41,7 +41,7 @@ use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use super::streaming::build_sse_response_from_stream;
 use crate::{
-    middleware::{edge_body::BodyDuties, metrics::BodyFailure},
+    middleware::edge_body::BodyFailure,
     routers::common::sse::{SseReceiver, SseSender},
     worker::GuardedStream,
 };
@@ -90,7 +90,7 @@ pub(crate) struct DrivenBody {
     reading: Option<Reading>,
     rx: SseReceiver,
     /// The reading's word when it ended failed, for the edge's count of the
-    /// response (shared with the response's duties).
+    /// response (the response's cell, shared with the edge).
     failure: BodyFailure,
     /// The body handed its first frame out.
     first_frame_out: bool,
@@ -211,7 +211,7 @@ impl Drop for DrivenBody {
 /// they ride in the body's own stream ([`GuardedStream`]) and are dropped
 /// with it, with no wrapper over the body (a wrapper is a boxed
 /// `poll_frame` more on every frame out). The reading's word on how it
-/// ended goes to the edge with the body's duties, so a stream that told the
+/// ended goes to the edge in the response's cell, so a stream that told the
 /// client of a failure counts as one.
 pub(crate) fn build_sse_response_driven<G>(reading: Reading, rx: SseReceiver, guards: G) -> Response
 where
@@ -237,7 +237,7 @@ where
     let body = DrivenBody::new(reading, rx);
     let failure = body.failure().clone();
     let mut response = respond(GuardedStream::new(body, guards));
-    BodyDuties::hand(&mut response, |duties| duties.failure = Some(failure));
+    failure.carry(&mut response);
     response
 }
 
@@ -257,6 +257,7 @@ mod tests {
     use tokio::sync::{oneshot, Notify};
 
     use super::*;
+    use crate::middleware::edge_body::BodyDuties;
 
     fn frame(text: &str) -> Bytes {
         Bytes::copy_from_slice(text.as_bytes())
@@ -293,7 +294,7 @@ mod tests {
     }
 
     /// The response over a driven body hands the reading's word to the edge
-    /// with the body's duties, told as the reading ends.
+    /// in the response's cell, told as the reading ends.
     #[tokio::test]
     async fn the_driven_response_hands_the_failure_to_the_edge() {
         let (tx, rx) = driven_channel();
@@ -303,7 +304,7 @@ mod tests {
         };
         let mut response = build_sse_response_driven(Box::pin(reading), rx, ());
         let mut duties = BodyDuties::take(&mut response);
-        let failure = duties.failure.take().expect("the failure handed over");
+        let failure = duties.take_failure().expect("the failure handed over");
         assert!(!failure.told(), "nothing told before the body is read");
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await

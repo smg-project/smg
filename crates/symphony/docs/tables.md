@@ -359,6 +359,10 @@ What this table says beyond the DSML one:
   the empty one, both dropped; later in the content both are text. With `thinking_mode` set,
   the generation prompt ends with `<mm:think>` (`enabled`) or `</mm:think>` (`disabled`) after
   the turn opener `]~b]ai\n`, and the replay puts the output inside the thought or in content.
+- **MiniMax-M3.1-Flash reads with the table.** The same tokenizer, special tokens, think tags,
+  separator and XML call tree. Its template writes an effort tag in the system block and has
+  no `thinking_mode` branch, so its generation prompt adds nothing and the output starts in
+  `start`, as in the primary's adaptive default.
 - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
   has it; the recorded outputs close the thought first.
 - **A forced call admits the thought first, and the separator.** The structural tag for a forced
@@ -844,6 +848,20 @@ What the table leaves out, for want of fixtures: the template picks the thought'
 the calls as JSON objects or with a typed tag per argument (`tool_call_format`); the recorded sets
 hold the default thought and the default calls, read here. A thought under one of the other tags is
 content until a set shows it.
+
+## Hy V3 (`hy_v3`)
+
+The template decides the thought by `reasoning_effort`, and the table reads the decision from the
+prompt: `no_think` (the default, and any value the template does not know) writes `<think></think>`
+after the turn opener, so the output starts in content; `low` and `high` write `<think>` alone, so it
+starts inside the thought. `enable_thinking` moves nothing. The recorded sets hold the default alone
+(bellwether refused every thought-bearing probe at record time), so the thought's shapes rest on the
+table's rows, which are Hy4's under the plain markers.
+
+What the table leaves out, for want of fixtures: the template can spell every marker with a suffix of
+its own (`<think:…>`, `<tool_sep:…>`; Hy4's `:opensource` is that spelling), and its search mode renders
+tool outputs under other markers; the recorded sets hold the plain spelling, read here. A turn under a
+suffixed spelling is content until a set shows it.
 
 ## Muse Spark (`muse_spark`)
 

@@ -14,14 +14,17 @@
 //! the host (`routers::common::placement::select_from`) and the encode items
 //! of an encode-prefill-decode request through [`Decider::decide_encode_items`]
 //! (the gRPC worker-selection stage); the pair and admission paths follow in
-//! later steps. A removed worker's rows leave the
-//! engine's accounting with it ([`Decider::on_worker_removed`], from the
-//! policy registry's removal path), and its session pins go with them: a key
-//! whose owner was removed keeps its failover as the owner, a key with no pin
-//! left is placed afresh. A worker re-registered at the same address is a new
-//! id to the engine, so its old keys do not come back to it (the legacy maps
-//! pin by URL and give them back). The rest of the membership feed (added,
-//! replaced, resized, snapshot) follows in a later step.
+//! later steps. A removed or replaced worker's rows leave the engine's
+//! accounting with it ([`Decider::on_worker_removed`] and
+//! [`Decider::on_worker_replaced`], from the workflow's removal, registration
+//! and property-update steps), and its session pins go with them: a key whose
+//! owner was removed keeps its failover as the owner, a key with no pin left
+//! is placed afresh. A worker re-registered at the same address is a new id
+//! to the engine, so its old keys do not come back to it (the legacy maps pin
+//! by URL and give them back). Mesh imports, which the registry rebuilds and
+//! removes without a workflow, do not reach these hooks yet; they and the
+//! rest of the membership feed (added, resized, snapshot) follow in a later
+//! step.
 //!
 //! A session (the routing-key header, else the rid-derived key) is a
 //! binding's `sessions` rule in the engine: the `manual` policy pins every
@@ -357,7 +360,60 @@ struct View {
     candidates: Vec<Candidate>,
     decodes: Vec<Candidate>,
     tried: Vec<WorkerId>,
+    /// The partner lists a pair decision has emitted rows for, by address,
+    /// in pair-class order (the class is the index plus one).
+    lists: Vec<usize>,
+    /// One list's open partners under the lifted decode veto, read once
+    /// each for the bar.
+    open_partners: Vec<OpenPartner>,
     scratch: Scratch,
+}
+
+/// The decode side of a pair decision as the host hands it to
+/// [`Decider::decide_pair`]: each open prefill's partner list, shared between
+/// the prefills of one pairing descriptor, so the decision keys one pair
+/// class per list by `Arc` identity; the live filter over a list's workers,
+/// which reads the decode alone and never the prefill; and whether the
+/// decode pool is over the overload thresholds on every worker with its veto
+/// lifted, in which case a list's rows are its least-loaded open partners
+/// alone (`LoadBar`).
+#[derive(Clone, Copy)]
+pub struct PairPartners<'a, 'p> {
+    pub list: &'a dyn Fn(usize) -> &'p Arc<[Arc<dyn Worker>]>,
+    pub open: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    pub lift_decode: bool,
+}
+
+/// An open partner of a lifted list: its position in the list, whether its
+/// window has a free room, and the host's in-flight count on it.
+struct OpenPartner {
+    at: u32,
+    room: bool,
+    load: usize,
+}
+
+/// The bar a lifted list's rows meet, as the legacy path pairs a decode pool
+/// all over the thresholds by load: among the open partners with a free room
+/// when any has one (every open partner otherwise), the least-loaded alone.
+struct LoadBar {
+    needs_room: bool,
+    load: usize,
+}
+
+impl LoadBar {
+    /// The bar over `open`; `None` when the list leaves no partner open.
+    fn over(open: &[OpenPartner]) -> Option<Self> {
+        let needs_room = open.iter().any(|p| p.room);
+        open.iter()
+            .filter(|p| p.room || !needs_room)
+            .map(|p| p.load)
+            .min()
+            .map(|load| Self { needs_room, load })
+    }
+
+    fn admits(&self, partner: &OpenPartner) -> bool {
+        (partner.room || !self.needs_room) && partner.load == self.load
+    }
 }
 
 /// What a decision reads from the request as the host holds it.
@@ -380,6 +436,12 @@ pub struct HostRequest<'a> {
     /// The prefill capacity window as the host reads it, when the decision
     /// is a prefill side's; every candidate has capacity otherwise.
     pub has_capacity: Option<CapacityCheck<'a>>,
+    /// The request's lease sequence when the router drew it before it
+    /// captured its candidates ([`Decider::begin`]): the decision and the
+    /// one re-decision over the same candidates run under it, so a handle
+    /// retired after the draw is booked by neither commit. `None` numbers
+    /// the lease when its view is built.
+    pub sequence: Option<LeaseId>,
 }
 
 /// What the encode items of one request share, as the host holds it: the
@@ -431,6 +493,13 @@ pub struct Decider {
     /// The engine binds an encode profile: the `epd` plan decides the encode
     /// items of an encode-prefill-decode request.
     encode: bool,
+    /// The token-work a pair's request of unknown size is booked at on the
+    /// prefill side: the prefill profile's mean, as the prefill policy
+    /// prices it.
+    mean_prefill_prompt_tokens: u32,
+    /// The same on the decode side: the decode profile's mean, as the
+    /// decode policy prices it.
+    mean_decode_prompt_tokens: u32,
 }
 
 impl std::fmt::Debug for Decider {
@@ -546,6 +615,8 @@ impl Decider {
             seq: AtomicU64::new(1),
             mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
             encode: spec.bindings.iter().any(|b| b.plan == Some(PlanName::Epd)),
+            mean_prefill_prompt_tokens: spec.profiles.get("prefill").map_or(0, mean_prefill_of),
+            mean_decode_prompt_tokens: spec.profiles.get("decode").map_or(0, mean_prefill_of),
         })
     }
 
@@ -583,16 +654,28 @@ impl Decider {
     }
 
     /// Record `id`'s retirement at the next lease to be issued. A lease is
-    /// numbered before its view is built, so every decision that began
-    /// before this call carries a lower sequence.
+    /// numbered at the router's capture (`begin`) or before its view is
+    /// built, so every decision that began before this call carries a lower
+    /// sequence.
     fn retire(&self, id: WorkerId) {
         self.retired
             .lock()
             .retire(id, self.seq.load(Ordering::Relaxed));
     }
 
-    /// Decisions taken so far, each `decide` or `decide_pair` call one; for
-    /// tests and dumps.
+    /// Draw a request's lease sequence before its candidates are captured.
+    /// A router that reads the pool after this call books nothing on a
+    /// handle retired from then on, however the retirement interleaves with
+    /// its capture and its decision: [`HostRequest::sequence`] carries the
+    /// draw into [`Decider::decide`], and the one re-decision over the same
+    /// candidates reuses it. A request without one is numbered when its
+    /// view is built.
+    pub fn begin(&self) -> LeaseId {
+        LeaseId(self.seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Lease sequences drawn so far: each `begin`, and each `decide` or
+    /// `decide_pair` call without a drawn one; for tests and dumps.
     pub fn decisions(&self) -> u64 {
         self.seq.load(Ordering::Relaxed).saturating_sub(1)
     }
@@ -603,9 +686,23 @@ impl Decider {
     /// `mean_prefill_tokens`, as the legacy policy prices it; nothing under a
     /// policy that does not price tokens).
     pub fn prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
-        tokens.map_or(self.mean_prompt_tokens, |tokens| {
-            u32::try_from(tokens.len()).unwrap_or(u32::MAX)
-        })
+        counted_or(tokens, self.mean_prompt_tokens)
+    }
+
+    /// [`Self::prompt_tokens`] for a pair's prefill side: a request of
+    /// unknown size is booked at the prefill profile's mean, the prefill
+    /// policy's own estimate; the pair's lease carries it.
+    pub fn prefill_prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
+        counted_or(tokens, self.mean_prefill_prompt_tokens)
+    }
+
+    /// [`Self::prompt_tokens`] for a pair's decode side: a request of
+    /// unknown size is booked on the decode at the decode profile's mean,
+    /// the decode policy's own estimate ([`Self::commit_pair`]), so a
+    /// load-pricing decode behind a load-blind prefill is credited its own
+    /// work and never zero.
+    pub fn decode_prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
+        counted_or(tokens, self.mean_decode_prompt_tokens)
     }
 
     /// Hand the engine the worker monitor's load feed.
@@ -734,9 +831,10 @@ impl Decider {
         excluded: &[WorkerId],
     ) -> (Decision, Lease) {
         let now = Instant::now();
-        // Numbered before the view is built: a retirement that lands during
-        // the decision outdates this lease (see `Retired`).
-        let id = LeaseId(self.seq.fetch_add(1, Ordering::Relaxed));
+        // Under the sequence the router drew at its capture, or one drawn
+        // here before the view is built: a retirement that lands after the
+        // draw outdates this lease (see `Retired`).
+        let id = request.sequence.unwrap_or_else(|| self.begin());
         let snapshot = self.snapshot();
         let session_key = request.session_key.map_or(Identity::NONE, |key| {
             Identity::scoped(key, session_scope(request.model, request.phase))
@@ -876,24 +974,27 @@ impl Decider {
 
     /// Decide a prefill and decode pair: the prefill profile over `prefills`
     /// (with `has_capacity` as the admission window reads it now), the
-    /// decode profile over the partners of the chosen prefill. `partners(i)`
-    /// lists the open partners of `prefills[i]`; the decode rows of each
-    /// prefill form its pair class. The request's tried URLs and `excluded`
-    /// reach both sides. The returned workers are the decode rows in
-    /// position order, for the target's decode side.
+    /// decode profile over the partners of the chosen prefill. The decode
+    /// rows are built once per distinct partner list ([`PairPartners`]):
+    /// prefills sharing a list share its pair class, so a homogeneous fleet
+    /// costs P + D rows and never P x D. Under the decode pool's lifted veto
+    /// a list's rows are its least-loaded open partners alone, the ones with
+    /// a free room first (`LoadBar`). The request's tried URLs and
+    /// `excluded` reach both sides. The returned workers are the decode rows
+    /// in position order, for the target's decode side.
     pub fn decide_pair(
         &self,
         request: &HostRequest<'_>,
         prefills: &[Arc<dyn Worker>],
         has_capacity: CapacityCheck<'_>,
-        partners: &dyn Fn(usize) -> Vec<Arc<dyn Worker>>,
-        lift_decode: bool,
+        partners: PairPartners<'_, '_>,
         excluded: &[WorkerId],
     ) -> (Decision, Lease, Vec<Arc<dyn Worker>>) {
         let now = Instant::now();
-        // Numbered before the view is built: a retirement that lands during
-        // the decision outdates this lease (see `Retired`).
-        let id = LeaseId(self.seq.fetch_add(1, Ordering::Relaxed));
+        // Under the sequence the router drew at its capture, or one drawn
+        // here before the view is built: a retirement that lands after the
+        // draw outdates this lease (see `Retired`).
+        let id = request.sequence.unwrap_or_else(|| self.begin());
         let snapshot = self.snapshot();
         let session_key = request.session_key.map_or(Identity::NONE, Identity::plain);
         let build = ViewBuild {
@@ -908,28 +1009,66 @@ impl Decider {
                 candidates,
                 decodes,
                 tried,
+                lists,
+                open_partners,
                 scratch,
             } = &mut *view;
             candidates.clear();
             decodes.clear();
             tried.clear();
+            lists.clear();
             for (i, prefill) in prefills.iter().enumerate() {
-                let class = i as u32 + 1;
+                // One pair class per distinct list, keyed by the list's
+                // address: the index holds every list for the whole
+                // decision, and the open filter reads the decode alone, so
+                // prefills sharing a list share its rows.
+                let list = (partners.list)(i);
+                let key = Arc::as_ptr(list).cast::<()>().addr();
+                let class = match lists.iter().position(|&seen| seen == key) {
+                    Some(seen) => seen as u32 + 1,
+                    None => {
+                        lists.push(key);
+                        let class = lists.len() as u32;
+                        let mut emit = |decode: &Arc<dyn Worker>| {
+                            let position = decode_workers.len() as u32;
+                            let row = self.candidate(&build, position, decode, true, class);
+                            if request.tried.iter().any(|url| url == decode.base_url()) {
+                                tried.push(row.id);
+                            }
+                            decodes.push(row);
+                            decode_workers.push(Arc::clone(decode));
+                        };
+                        if partners.lift_decode {
+                            open_partners.clear();
+                            open_partners.extend(
+                                list.iter()
+                                    .enumerate()
+                                    .filter(|(_, d)| (partners.open)(d))
+                                    .map(|(at, d)| OpenPartner {
+                                        at: at as u32,
+                                        room: pd_admission::has_free_room(d.as_ref()),
+                                        load: d.load(),
+                                    }),
+                            );
+                            if let Some(bar) = LoadBar::over(open_partners) {
+                                for kept in open_partners.iter().filter(|p| bar.admits(p)) {
+                                    emit(&list[kept.at as usize]);
+                                }
+                            }
+                        } else {
+                            for decode in list.iter().filter(|d| (partners.open)(d)) {
+                                emit(decode);
+                            }
+                        }
+                        class
+                    }
+                };
                 let candidate =
                     self.candidate(&build, i as u32, prefill, has_capacity(prefill), class);
                 if request.tried.iter().any(|url| url == prefill.base_url()) {
                     tried.push(candidate.id);
                 }
                 candidates.push(candidate);
-                for decode in partners(i) {
-                    let position = decode_workers.len() as u32;
-                    let row = self.candidate(&build, position, &decode, true, class);
-                    if request.tried.iter().any(|url| url == decode.base_url()) {
-                        tried.push(row.id);
-                    }
-                    decodes.push(row);
-                    decode_workers.push(decode);
-                }
             }
             let now_micros = self.micros_since_origin(now);
             let facts = RequestFacts {
@@ -955,7 +1094,7 @@ impl Decider {
             };
             let decode_cx = Constraints {
                 excluded,
-                overload_lifted: lift_decode,
+                overload_lifted: partners.lift_decode,
                 ..Constraints::default()
             };
             self.engine.decide_pair(
@@ -980,13 +1119,38 @@ impl Decider {
     /// The commit: walk the ordered targets, take the first one `accept`
     /// re-validates under the host's lock, and feed the engine's accounting
     /// for the target taken, on `side` and, for a pair, on the decode side
-    /// too. `None` when every target missed; the caller re-decides once with
-    /// the misses excluded, then falls back.
+    /// too with the lease's tokens. `None` when every target missed; the
+    /// caller re-decides once with the misses excluded, then falls back.
     pub fn commit(
         &self,
         lease: &Lease,
         decision: &Decision,
         side: Side,
+        accept: impl FnMut(&Target) -> bool,
+    ) -> Option<Target> {
+        self.commit_booking(lease, decision, side, None, accept)
+    }
+
+    /// [`Self::commit`] of a pair decision ([`Self::decide_pair`]): the
+    /// prefill side is booked with the lease's tokens, the decode side with
+    /// `decode_tokens`, each side's own estimate of a request of unknown
+    /// size ([`Self::decode_prompt_tokens`]).
+    pub fn commit_pair(
+        &self,
+        lease: &Lease,
+        decode_tokens: u32,
+        decision: &Decision,
+        accept: impl FnMut(&Target) -> bool,
+    ) -> Option<Target> {
+        self.commit_booking(lease, decision, Side::Prefill, Some(decode_tokens), accept)
+    }
+
+    fn commit_booking(
+        &self,
+        lease: &Lease,
+        decision: &Decision,
+        side: Side,
+        decode_tokens: Option<u32>,
         mut accept: impl FnMut(&Target) -> bool,
     ) -> Option<Target> {
         let pick = decision.pick()?;
@@ -1024,6 +1188,7 @@ impl Decider {
                     if book_decode {
                         let decode = Lease {
                             side: Side::Decode,
+                            tokens: decode_tokens.unwrap_or(booked.tokens),
                             ..booked
                         };
                         self.engine
@@ -1173,6 +1338,13 @@ fn narrow(count: i64) -> u32 {
 }
 
 /// A ratio as the row's permille field.
+/// A prompt's token count when the host has the tokens, else `mean`.
+fn counted_or(tokens: Option<&[u32]>, mean: u32) -> u32 {
+    tokens.map_or(mean, |tokens| {
+        u32::try_from(tokens.len()).unwrap_or(u32::MAX)
+    })
+}
+
 fn permille(ratio: f64) -> u16 {
     (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
@@ -1190,7 +1362,7 @@ mod tests {
         policies::{test_support, PolicyFactory},
         worker::{
             load_state::{one_rank_load, LoadSnapshot},
-            test_support::worker_of,
+            test_support::{no_health_check, worker_of},
             BasicWorkerBuilder, Worker,
         },
     };
@@ -2020,7 +2192,13 @@ mod tests {
             worker_of("http://d0:8000", WorkerType::Decode),
             worker_of("http://d1:8000", WorkerType::Decode),
         ];
-        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { decodes.to_vec() };
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.to_vec());
+        let list = |_: usize| &all;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
         let tried = [decodes[0].base_url().to_string()];
         let after_d0 = HostRequest {
             phase: Phase::Prefill,
@@ -2038,7 +2216,7 @@ mod tests {
         };
         for _ in 0..20 {
             let (decision, _, _) =
-                decider.decide_pair(&after_d0, &prefills, &|_| true, &partners, false, &[]);
+                decider.decide_pair(&after_d0, &prefills, &|_| true, partners, &[]);
             assert_eq!(
                 decode_of(&decision),
                 Some(1),
@@ -2052,7 +2230,7 @@ mod tests {
         };
         for _ in 0..20 {
             let (decision, _, _) =
-                decider.decide_pair(&fresh, &prefills, &|_| true, &partners, false, &excluded);
+                decider.decide_pair(&fresh, &prefills, &|_| true, partners, &excluded);
             assert_eq!(
                 decode_of(&decision),
                 Some(1),
@@ -2074,11 +2252,15 @@ mod tests {
             worker_of("http://d2:8000", WorkerType::Decode),
         ];
         // p0 partners with d0 alone; p1 with d1 and d2.
-        let partners = |i: usize| -> Vec<Arc<dyn Worker>> {
-            match i {
-                0 => vec![decodes[0].clone()],
-                _ => vec![decodes[1].clone(), decodes[2].clone()],
-            }
+        let lists: [Arc<[Arc<dyn Worker>]>; 2] = [
+            Arc::from(vec![decodes[0].clone()]),
+            Arc::from(vec![decodes[1].clone(), decodes[2].clone()]),
+        ];
+        let list = |i: usize| &lists[i.min(1)];
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
         };
         let request = HostRequest {
             phase: Phase::Prefill,
@@ -2086,14 +2268,14 @@ mod tests {
         };
         for _ in 0..4 {
             let (decision, lease, rows) =
-                decider.decide_pair(&request, &prefills, &|_| true, &partners, false, &[]);
+                decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
             let target = decider
                 .commit(&lease, &decision, Side::Prefill, |_| true)
                 .expect("a pair");
             let pair = target.pair.expect("the decode side");
             let decode = &rows[pair.decode_position as usize];
             assert!(
-                partners(target.position as usize)
+                list(target.position as usize)
                     .iter()
                     .any(|w| w.url() == decode.url()),
                 "the decode is a partner of the chosen prefill"
@@ -2123,14 +2305,19 @@ mod tests {
             (decodes[1].url().to_string(), idle()),
         ]));
         decider.set_load_receiver(Some(rx));
-        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { decodes.to_vec() };
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.to_vec());
+        let list = |_: usize| &all;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
         let request = HostRequest {
             phase: Phase::Prefill,
             prompt_tokens: 512,
             ..request()
         };
-        let (first, lease, _) =
-            decider.decide_pair(&request, &prefills, &|_| true, &partners, false, &[]);
+        let (first, lease, _) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
         let taken = decider
             .commit(&lease, &first, Side::Prefill, |_| true)
             .expect("a pair");
@@ -2139,8 +2326,7 @@ mod tests {
         // picker draws the tie from the seed, so one or three decisions
         // could agree by chance.
         for _ in 0..20 {
-            let (next, _, _) =
-                decider.decide_pair(&request, &prefills, &|_| true, &partners, false, &[]);
+            let (next, _, _) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
             let pair = next
                 .pick()
                 .expect("a pair")
@@ -2155,6 +2341,193 @@ mod tests {
         }
     }
 
+    /// Prefills sharing one partner list (one pairing descriptor, as the
+    /// pair index shares them) share one pair class and one set of decode
+    /// rows: P + D rows, never P x D, and every prefill still pairs within
+    /// the list.
+    #[test]
+    fn prefills_sharing_a_partner_list_share_one_pair_class_and_its_decode_rows() {
+        let decider = decider(&PolicyConfig::RoundRobin);
+        let prefills: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| worker_of(&format!("http://p{i}:8000"), WorkerType::Prefill))
+            .collect();
+        let decodes: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| worker_of(&format!("http://d{i}:8000"), WorkerType::Decode))
+            .collect();
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.clone());
+        let list = |_: usize| &all;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            ..request()
+        };
+        let mut prefills_seen = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let (decision, _, rows) =
+                decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+            assert_eq!(
+                rows.len(),
+                decodes.len(),
+                "one row per decode of the shared list, not per (prefill, decode)"
+            );
+            let target = decision
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .copied()
+                .expect("a target");
+            let pair = target.pair.expect("the decode side");
+            assert!(
+                (pair.decode_position as usize) < rows.len(),
+                "the decode side indexes the shared rows: {target:?}"
+            );
+            prefills_seen.insert(target.position);
+        }
+        assert_eq!(
+            prefills_seen.len(),
+            3,
+            "every prefill pairs: {prefills_seen:?}"
+        );
+    }
+
+    /// A load-blind prefill beside a load-pricing decode, no token count:
+    /// the lease carries the prefill's estimate (nothing) and the decode
+    /// side is booked at the decode profile's own mean, so the booked
+    /// decode carries the credit and the next pairs take the other decode.
+    #[test]
+    fn a_mixed_pair_books_the_decode_side_at_the_decode_profiles_mean() {
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = Decider::from_configs(
+            &PolicyConfig::RoundRobin,
+            &PolicyConfig::RoundRobin,
+            &least_load,
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("carried policies");
+        assert_eq!(
+            decider.prefill_prompt_tokens(None),
+            0,
+            "round robin prices no tokens"
+        );
+        assert_eq!(decider.decode_prompt_tokens(None), 100);
+        assert_eq!(decider.decode_prompt_tokens(Some(&[1, 2, 3])), 3);
+        let prefills = vec![worker_of("http://p0:8000", WorkerType::Prefill)];
+        let decodes = [
+            worker_of("http://d0:8000", WorkerType::Decode),
+            worker_of("http://d1:8000", WorkerType::Decode),
+        ];
+        let idle = || one_rank_load(0, 0.1, 2000.0);
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (prefills[0].url().to_string(), idle()),
+            (decodes[0].url().to_string(), idle()),
+            (decodes[1].url().to_string(), idle()),
+        ]));
+        decider.set_load_receiver(Some(rx));
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.to_vec());
+        let list = |_: usize| &all;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            prompt_tokens: decider.prefill_prompt_tokens(None),
+            ..request()
+        };
+        let (first, lease, _) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+        let taken = decider
+            .commit_pair(&lease, decider.decode_prompt_tokens(None), &first, |_| true)
+            .expect("a pair");
+        let booked = taken.pair.expect("the decode side").decode_position;
+        // Twenty decisions: booked at the prefill's estimate of nothing the
+        // two decodes would tie and the picker would draw the tie from the
+        // seed.
+        for _ in 0..20 {
+            let (next, _, _) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+            let pair = next
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .and_then(|t| t.pair);
+            assert_eq!(
+                pair.map(|p| p.decode_position),
+                Some(1 - booked),
+                "the decode side carries its own credit: {next:?}"
+            );
+        }
+    }
+
+    /// Under the decode pool's lifted veto a list's rows are its least-loaded
+    /// open partners alone, the ones with a free room first: the pair goes
+    /// by load, as the legacy path pairs such a pool, whatever the decode
+    /// picker.
+    #[test]
+    fn a_lifted_decode_list_pairs_its_least_loaded_open_partners_alone() {
+        let decider = decider(&PolicyConfig::RoundRobin);
+        let prefills = vec![worker_of("http://p0:8000", WorkerType::Prefill)];
+        let gated = {
+            let mut labels = HashMap::new();
+            labels.insert("max_running_requests".to_string(), "1".to_string());
+            Arc::new(
+                BasicWorkerBuilder::new("http://d3:8000")
+                    .worker_type(WorkerType::Decode)
+                    .labels(labels)
+                    .health_config(no_health_check())
+                    .build(),
+            ) as Arc<dyn Worker>
+        };
+        let decodes: Vec<Arc<dyn Worker>> = vec![
+            worker_of("http://d0:8000", WorkerType::Decode),
+            worker_of("http://d1:8000", WorkerType::Decode),
+            worker_of("http://d2:8000", WorkerType::Decode),
+            gated,
+        ];
+        decodes[0].increment_load();
+        decodes[0].increment_load();
+        decodes[1].increment_load();
+        let all: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.clone());
+        let list = |_: usize| &all;
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            ..request()
+        };
+        let rows_of = |open: &dyn Fn(&Arc<dyn Worker>) -> bool, lift_decode: bool| {
+            let partners = PairPartners {
+                list: &list,
+                open,
+                lift_decode,
+            };
+            let (_, _, rows) = decider.decide_pair(&request, &prefills, &|_| true, partners, &[]);
+            rows.iter().map(|w| w.url().to_string()).collect::<Vec<_>>()
+        };
+        let d = |i: usize| decodes[i].url().to_string();
+        // No lift: every open partner is a row, in list order.
+        assert_eq!(rows_of(&|_| true, false), [d(0), d(1), d(2), d(3)]);
+        // The lift: the least-loaded open partners alone.
+        assert_eq!(rows_of(&|_| true, true), [d(2), d(3)]);
+        // A partner the filter closes is out before the bar is read.
+        assert_eq!(rows_of(&|w| w.url() != decodes[2].url(), true), [d(3)]);
+        // A partner with a free room comes before a less loaded one whose
+        // window is full; with no room anywhere the bar reads load alone.
+        assert!(decodes[3].try_admit_pd(1, 1), "d3's one room is taken");
+        assert_eq!(rows_of(&|_| true, true), [d(2)]);
+        let d0_or_d3 =
+            |w: &Arc<dyn Worker>| w.url() == decodes[0].url() || w.url() == decodes[3].url();
+        assert_eq!(rows_of(&d0_or_d3, true), [d(0)]);
+        assert_eq!(rows_of(&|w| w.url() == decodes[3].url(), true), [d(3)]);
+    }
+
     #[test]
     fn a_prefill_without_capacity_is_passed_over() {
         let decider = decider(&PolicyConfig::RoundRobin);
@@ -2162,8 +2535,14 @@ mod tests {
             worker_of("http://p0:8000", WorkerType::Prefill),
             worker_of("http://p1:8000", WorkerType::Prefill),
         ];
-        let decode = worker_of("http://d0:8000", WorkerType::Decode);
-        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { vec![decode.clone()] };
+        let decode: Arc<[Arc<dyn Worker>]> =
+            Arc::from(vec![worker_of("http://d0:8000", WorkerType::Decode)]);
+        let list = |_: usize| &decode;
+        let partners = PairPartners {
+            list: &list,
+            open: &|_| true,
+            lift_decode: false,
+        };
         let full = prefills[0].url().to_string();
         let has_capacity = |w: &Arc<dyn Worker>| w.url() != full;
         let request = HostRequest {
@@ -2172,7 +2551,7 @@ mod tests {
         };
         for _ in 0..3 {
             let (decision, _, _) =
-                decider.decide_pair(&request, &prefills, &has_capacity, &partners, false, &[]);
+                decider.decide_pair(&request, &prefills, &has_capacity, partners, &[]);
             let first = decision.pick().expect("a pair").targets.first().copied();
             assert_eq!(first.map(|t| t.position), Some(1));
         }
@@ -2453,6 +2832,180 @@ mod tests {
             "the retired handle reads idle: a lease numbered before the view booked nothing"
         );
     }
+    /// A retirement that lands between a router's capture of its candidates
+    /// and its decision outdates the lease when the router drew the request's
+    /// sequence first: the captured slice still holds the retired handle, the
+    /// decision and the one re-decision over that slice run under the drawn
+    /// sequence, and neither commit books on it.
+    #[test]
+    fn a_commit_under_a_sequence_drawn_before_the_retirement_books_nothing() {
+        let config = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = decider(&config);
+        let (workers, _reports) = fed_pair(&decider);
+        let leader = || {
+            let (decision, _) = decider.decide(&request(), &workers, &[]);
+            decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .iter()
+                .next()
+                .map(|t| t.position)
+        };
+        // The router's order: the sequence, then the candidate slice (both
+        // handles), then the first worker's retirement lands, then the
+        // decision over the stale slice.
+        let sequence = decider.begin();
+        let captured = workers.clone();
+        decider.on_worker_removed(workers[0].as_ref());
+        let under_sequence = HostRequest {
+            prompt_tokens: decider.prompt_tokens(None),
+            sequence: Some(sequence),
+            ..request()
+        };
+        let (decision, lease) = decider.decide(&under_sequence, &captured, &[]);
+        assert_eq!(
+            lease.id, sequence,
+            "the decision runs under the drawn sequence"
+        );
+        decider
+            .commit(&lease, &decision, Side::Single, |t| t.position == 0)
+            .expect("the dispatch itself proceeds");
+        // The one re-decision over the same slice, the live worker excluded
+        // as a commit miss would exclude it, keeps the sequence.
+        let live = worker_id(workers[1].as_ref());
+        let (again, lease) = decider.decide(&under_sequence, &captured, &[live]);
+        assert_eq!(
+            lease.id, sequence,
+            "the re-decision keeps the drawn sequence"
+        );
+        decider
+            .commit(&lease, &again, Side::Single, |t| t.position == 0)
+            .expect("the re-decision's dispatch proceeds too");
+        // One small booking on the other worker: the retired handle, idle,
+        // still leads; either stale booking at the mean size would have lost it.
+        let small = HostRequest {
+            prompt_tokens: 1,
+            ..request()
+        };
+        let (decision, lease) = decider.decide(&small, &workers, &[]);
+        decider
+            .commit(&lease, &decision, Side::Single, |t| t.position == 1)
+            .expect("the other worker is booked");
+        assert_eq!(
+            leader(),
+            Some(0),
+            "the retired handle reads idle: no commit under the drawn sequence booked on it"
+        );
+    }
+
+    /// The pair path under a sequence drawn before the capture: the router
+    /// draws, captures the prefills and the partners, a decode's retirement
+    /// lands, then the pair decision over the stale partners runs under the
+    /// drawn sequence and its commit books nothing on the retired decode. A
+    /// pair request without a drawn sequence is numbered afresh.
+    #[test]
+    fn a_pair_commit_under_a_sequence_drawn_before_the_retirement_books_nothing() {
+        let decider = decider(&PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        });
+        let prefills = vec![worker_of("http://p0:8000", WorkerType::Prefill)];
+        let decodes = [
+            worker_of("http://d0:8000", WorkerType::Decode),
+            worker_of("http://d1:8000", WorkerType::Decode),
+        ];
+        let idle = || one_rank_load(0, 0.1, 2000.0);
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (prefills[0].url().to_string(), idle()),
+            (decodes[0].url().to_string(), idle()),
+            (decodes[1].url().to_string(), idle()),
+        ]));
+        decider.set_load_receiver(Some(rx));
+        let decode_list: Arc<[Arc<dyn Worker>]> = Arc::from(decodes.to_vec());
+        let list = |_: usize| &decode_list;
+        let open = |_: &Arc<dyn Worker>| true;
+        let partners = || PairPartners {
+            list: &list,
+            open: &open,
+            lift_decode: false,
+        };
+        let pair_request = |prompt_tokens| HostRequest {
+            phase: Phase::Prefill,
+            prompt_tokens,
+            ..request()
+        };
+        let leading_decode = || {
+            let (decision, _, _) =
+                decider.decide_pair(&pair_request(512), &prefills, &|_| true, partners(), &[]);
+            decision
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .and_then(|t| t.pair)
+                .map(|p| p.decode_position)
+        };
+        // One small booking on the second decode first, so the first one
+        // leads strictly and the pair below takes it.
+        let (decision, lease, _) =
+            decider.decide_pair(&pair_request(1), &prefills, &|_| true, partners(), &[]);
+        decider
+            .commit(&lease, &decision, Side::Prefill, |t| {
+                t.pair.is_some_and(|p| p.decode_position == 1)
+            })
+            .expect("the second decode is booked");
+        assert_eq!(
+            leading_decode(),
+            Some(0),
+            "the first decode leads while idle"
+        );
+        // The router's order: the sequence, then the captures (the partners
+        // still list the first decode), then its retirement lands, then the
+        // decision over the stale partners.
+        let sequence = decider.begin();
+        decider.on_worker_removed(decodes[0].as_ref());
+        let under_sequence = HostRequest {
+            sequence: Some(sequence),
+            ..pair_request(512)
+        };
+        let (decision, lease, _) =
+            decider.decide_pair(&under_sequence, &prefills, &|_| true, partners(), &[]);
+        assert_eq!(
+            lease.id, sequence,
+            "the pair decision runs under the drawn sequence"
+        );
+        let taken = decider
+            .commit(&lease, &decision, Side::Prefill, |_| true)
+            .expect("the dispatch itself proceeds");
+        assert_eq!(
+            taken.pair.map(|p| p.decode_position),
+            Some(0),
+            "the pair took the retired decode from the stale partners"
+        );
+        // The retired decode still leads: the request's booking would have
+        // lost it to the one-token booking on the other decode.
+        assert_eq!(
+            leading_decode(),
+            Some(0),
+            "the retired decode reads idle: no commit under the drawn sequence booked on it"
+        );
+        // A pair request with no drawn sequence is numbered afresh.
+        let (_, fresh, _) =
+            decider.decide_pair(&pair_request(512), &prefills, &|_| true, partners(), &[]);
+        assert!(
+            fresh.id.0 > sequence.0,
+            "a pair request without a drawn sequence draws a new one: {:?} after {:?}",
+            fresh.id,
+            sequence
+        );
+    }
+
     /// A retirement that lands while a commit runs, after its check and
     /// before its booking, waits for the booking: the check and the booking
     /// hold the retirement record's lock together, so the row the booking
@@ -3107,5 +3660,31 @@ mod tests {
         let (id, key) = worker_identity(worker);
         assert_eq!(id, worker_id(worker), "the id under the store's rule");
         assert_eq!(key, fingerprint(worker.url().as_bytes()) as u32);
+    }
+
+    /// A pair's request of unknown size is booked at the prefill profile's
+    /// mean (the prefill policy's own estimate), whatever the default profile
+    /// prices; a counted prompt is booked as counted.
+    #[test]
+    fn a_pairs_unknown_prompt_size_is_booked_at_the_prefill_profiles_mean() {
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let decider = Decider::from_configs(
+            &PolicyConfig::RoundRobin,
+            &least_load,
+            &least_load,
+            &RoutingKeyOverrideConfig::default(),
+        )
+        .expect("carried policies");
+        assert_eq!(
+            decider.prompt_tokens(None),
+            0,
+            "round robin prices no tokens"
+        );
+        assert_eq!(decider.prefill_prompt_tokens(None), 100);
+        assert_eq!(decider.prefill_prompt_tokens(Some(&[1, 2, 3])), 3);
     }
 }

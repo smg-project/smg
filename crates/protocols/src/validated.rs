@@ -18,10 +18,17 @@ use std::borrow::Cow;
 use axum::{
     body::Bytes,
     extract::{
-        rejection::{BytesRejection, FailedToBufferBody, JsonRejection},
-        FromRequest, Request,
+        path::ErrorKind,
+        rejection::{
+            BytesRejection, FailedToBufferBody, JsonRejection, PathRejection, QueryRejection,
+        },
+        FromRequest, FromRequestParts, Path, Query, Request,
     },
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE},
+        request::Parts,
+        HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -53,6 +60,24 @@ use crate::common::FIELD_PARAM;
 /// ```
 #[cfg(feature = "axum")]
 pub struct ValidatedJson<T>(pub T);
+
+/// A body a route reads as a JSON value and checks itself (the Conversations
+/// routes): it rides the validated extractor for the envelope its refusals
+/// take, with nothing to validate or normalize before the handler sees it.
+#[cfg(feature = "axum")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ValueBody(pub Value);
+
+#[cfg(feature = "axum")]
+impl Validate for ValueBody {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "axum")]
+impl Normalizable for ValueBody {}
 
 /// The `error.code` of a body this extractor refused, carried as a response
 /// extension: the gateway's HTTP metrics read it when a response did not come
@@ -450,6 +475,45 @@ fn is_mime_parameter(part: &str) -> bool {
     is_token(name) && (is_token(value) || quoted)
 }
 
+/// The `Content-Encoding` of a request whose body a JSON extractor cannot
+/// read: any but `identity`, in whichever field of a repeated header or
+/// position of a comma-separated list it stands (a list is read coding by
+/// coding, as a combined field is one; the first coding the gateway does
+/// not decode is the one named). The gateway decodes no content encoding,
+/// so a compressed body would be parsed as JSON and refused as one; the
+/// header is answered first, as 415, by both JSON extractors.
+#[cfg(feature = "axum")]
+pub fn undecodable_content_encoding(req: &Request) -> Option<String> {
+    req.headers()
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .flat_map(|value| {
+            String::from_utf8_lossy(value.as_bytes())
+                .split(',')
+                .map(|coding| coding.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .find(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+}
+
+/// The message of the 415 a JSON body under an encoding the gateway does
+/// not decode is answered with.
+#[cfg(feature = "axum")]
+pub fn content_encoding_message(encoding: &str) -> String {
+    format!("Content-Encoding `{encoding}` is not decoded: send the JSON body unencoded")
+}
+
+/// The 415 with its `Accept-Encoding: identity`, the header by which a
+/// client that compresses its requests tells an encoding refusal from a
+/// media-type one (RFC 9110, sections 12.5.3 and 15.5.16).
+#[cfg(feature = "axum")]
+pub fn with_accept_encoding_identity(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    response
+}
+
 /// The gateway's answer to a body axum's extractor refused.
 #[cfg(feature = "axum")]
 fn json_rejection(err: JsonRejection) -> Response {
@@ -495,6 +559,14 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(encoding) = undecodable_content_encoding(&req) {
+            return Err(with_accept_encoding_identity(rejection(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "json_parse_error",
+                None,
+                content_encoding_message(&encoding),
+            )));
+        }
         // A body under the plain `application/json` content type is read and
         // parsed once, directly; axum's extractor parses it a second time only
         // when that fails, so that the rejection names the path of the failing
@@ -549,6 +621,98 @@ impl<T> std::ops::Deref for ValidatedJson<T> {
 impl<T> std::ops::DerefMut for ValidatedJson<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// A query string a route reads as `T` (the Conversations list route, the
+/// realtime routes): a value the type does not take is refused in the
+/// envelope, with the code the body extractor gives the same serde reason
+/// (`unknown_parameter`, `invalid_type`, ...) and `invalid_value` for a
+/// value that does not parse, where the framework answers text/plain.
+#[cfg(feature = "axum")]
+pub struct ValidatedQuery<T>(pub T);
+
+#[cfg(feature = "axum")]
+impl<S, T> FromRequestParts<S> for ValidatedQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(err) => Err(query_rejection(&err)),
+        }
+    }
+}
+
+/// A path segment a route reads as `T` (`/v1/models/{*id}`, the
+/// Conversations and Responses ids): a segment that is not UTF-8 or does not
+/// parse as the type is refused in the envelope as `invalid_value`, `param`
+/// the segment's name, where the framework answers text/plain. A rejection
+/// the route itself causes (no such parameter, a shape the extractor cannot
+/// fill) keeps the framework's answer: a 500 of the route's making, never a
+/// client's.
+#[cfg(feature = "axum")]
+pub struct ValidatedPath<T>(pub T);
+
+#[cfg(feature = "axum")]
+impl<S, T> FromRequestParts<S> for ValidatedPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<T>::from_request_parts(parts, state).await {
+            Ok(Path(value)) => Ok(Self(value)),
+            Err(err) => Err(path_rejection(err)),
+        }
+    }
+}
+
+/// The framework's prefix on a query string the type did not take.
+#[cfg(feature = "axum")]
+const QUERY_PREFIX: &str = "Failed to deserialize query string: ";
+
+#[cfg(feature = "axum")]
+fn query_rejection(err: &QueryRejection) -> Response {
+    let message = err.body_text();
+    let reason = message.strip_prefix(QUERY_PREFIX).unwrap_or(&message);
+    // The body extractor's code for the same serde reason; its fallback
+    // names JSON parsing, which a query string never had: a value that does
+    // not parse is `invalid_value`.
+    let code = match deserialize_code(reason) {
+        "json_parse_error" => "invalid_value",
+        code => code,
+    };
+    let param = param_from_deserialize_message(reason);
+    rejection(StatusCode::BAD_REQUEST, code, param, message)
+}
+
+#[cfg(feature = "axum")]
+fn path_rejection(err: PathRejection) -> Response {
+    match err {
+        PathRejection::FailedToDeserializePathParams(failed)
+            if failed.status() == StatusCode::BAD_REQUEST =>
+        {
+            let param = match failed.kind() {
+                ErrorKind::InvalidUtf8InPathParam { key }
+                | ErrorKind::ParseErrorAtKey { key, .. }
+                | ErrorKind::DeserializeError { key, .. } => Some(key.clone()),
+                _ => None,
+            };
+            rejection(
+                StatusCode::BAD_REQUEST,
+                "invalid_value",
+                param,
+                failed.body_text(),
+            )
+        }
+        other => other.into_response(),
     }
 }
 
@@ -757,6 +921,77 @@ mod tests {
             .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.to_string().contains("syntax"), "{body}");
+    }
+
+    /// A body under a `Content-Encoding` the gateway does not decode is a
+    /// 415 in the envelope (`json_parse_error`, the header in the message,
+    /// `Accept-Encoding: identity` on the answer) before the body is read, in
+    /// whichever field of a repeated header or position of a comma-separated
+    /// list the encoding stands (the first undecoded coding is the one named);
+    /// `identity`, the one encoding that is none, alone or repeated in a list,
+    /// is read as the plain body it is.
+    #[tokio::test]
+    async fn a_content_encoding_the_gateway_does_not_decode_is_a_415_before_the_body_is_read() {
+        for (fields, accepted, named) in [
+            (&["gzip"][..], false, "gzip"),
+            (&["br, gzip"][..], false, "br"),
+            (&["identity", "gzip"][..], false, "gzip"),
+            (&["identity, gzip"][..], false, "gzip"),
+            (&["identity"][..], true, ""),
+            (&["identity, identity"][..], true, ""),
+            (&["Identity , identity"][..], true, ""),
+        ] {
+            let encoding = fields.join(" + ");
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json");
+            for field in fields {
+                request = request.header("content-encoding", *field);
+            }
+            let request = request
+                .body(Body::from(r#"{"value":0.5,"name":"x"}"#))
+                .unwrap_or_default();
+            let result = ValidatedJson::<BodyRequest>::from_request(request, &()).await;
+            if accepted {
+                assert!(result.is_ok(), "{encoding}: read as the plain body it is");
+                continue;
+            }
+            let response = result.err().expect("refused");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{encoding}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(ACCEPT_ENCODING)
+                    .map(HeaderValue::as_bytes),
+                Some(&b"identity"[..]),
+                "{encoding}: the 415 names the one encoding it takes"
+            );
+            assert_eq!(
+                response.extensions().get::<RejectionCode>(),
+                Some(&RejectionCode("json_parse_error".to_string())),
+                "{encoding}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            assert_eq!(
+                body["error"]["code"], "json_parse_error",
+                "{encoding}: {body}"
+            );
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(named),
+                "{encoding}: {body}"
+            );
+        }
     }
 
     /// A rejection carries its code as the `RejectionCode` extension (the
@@ -1556,6 +1791,220 @@ mod tests {
         }
     }
 
+    /// Omitted, null and true all keep Flash's sampling defaults and explicit values.
+    #[tokio::test]
+    async fn glm_flash_sampling_defaults_and_explicit_values() {
+        for do_sample in [None, Some(Value::Null), Some(json!(true))] {
+            let mut body = json!({
+                "model": "zai-org/GLM-5.3-Flash",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(do_sample) = do_sample {
+                body["do_sample"] = do_sample;
+            }
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(1.0), Some(0.95), None)
+            );
+
+            body["temperature"] = json!(0.7);
+            body["top_p"] = json!(0.8);
+            body["top_k"] = json!(20);
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.7), Some(0.8), Some(20))
+            );
+
+            body["top_p"] = json!(0);
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.7), Some(1.0), Some(1))
+            );
+        }
+    }
+
+    /// A registered Flash alias takes the same greedy override and validation as its model.
+    #[tokio::test]
+    async fn glm_flash_sampling_validates_effective_values_for_the_model_and_its_alias() {
+        use crate::profile::ProviderProfile;
+
+        const ALIAS: &str = "flash-sampling-chat-alias";
+        const CHECKPOINT: &str = "flash-sampling-chat-checkpoint";
+        ProviderProfile::register_model_aliases([
+            (ALIAS, "zai-org/GLM-5.3-Flash"),
+            ("glm-5.3-flash-sampling-checkpoint-alias", CHECKPOINT),
+        ]);
+        for model in [
+            "zai-org/GLM-5.3-Flash",
+            "GLM5.3-FLASH-FP8",
+            ALIAS,
+            CHECKPOINT,
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "do_sample": false, "temperature": 99, "top_p": -1, "top_k": 0
+            });
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.0), Some(1.0), Some(1))
+            );
+
+            body["top_k"] = json!(20);
+            body["top_p"] = json!(0.9);
+            body["do_sample"] = json!(true);
+            body["temperature"] = json!(1.01);
+            let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["param"], "temperature");
+
+            body["temperature"] = json!(-0.01);
+            assert!(chat_request(&body.to_string()).await.is_err());
+            for temperature in [0.0, 1.0] {
+                body["temperature"] = json!(temperature);
+                assert!(chat_request(&body.to_string()).await.is_ok());
+            }
+            for invalid in [json!(0), json!("false"), json!([]), json!({})] {
+                body["do_sample"] = invalid;
+                let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(error["error"]["param"], "do_sample");
+            }
+        }
+    }
+
+    /// Flash-specific sampling rules leave neighboring models and their extensions alone.
+    #[tokio::test]
+    async fn glm_flash_sampling_rules_do_not_reach_other_models() {
+        for model in [
+            "glm-5.3-air",
+            "glm-5.3-flashlight",
+            "glm53flash2",
+            "local-model",
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "do_sample": false, "temperature": 1.5, "top_p": 0.7, "top_k": 20
+            });
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(1.5), Some(0.7), Some(20))
+            );
+            assert_eq!(req.other["do_sample"], false);
+            body["do_sample"] = json!("false");
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(req.other["do_sample"], "false");
+            body["top_p"] = json!(0);
+            let (status, _) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// The Chat Completions extractor applies the Flash budget to model names
+    /// and registered aliases, preserving both wire fields and their precedence.
+    #[tokio::test]
+    async fn glm53_flash_chat_output_budget() {
+        use serde_json::json;
+
+        use crate::profile::ProviderProfile;
+
+        const ALIAS: &str = "opaque-glm-flash-budget-test";
+        ProviderProfile::register_model_aliases([(ALIAS, "zai-org/GLM-5.3-Flash")]);
+
+        for (model, flash) in [
+            ("glm-5.3-flash", true),
+            ("zai-org/GLM-5.3-Flash-FP8", true),
+            ("glm53flash", false),
+            (ALIAS, true),
+            ("glm-5.3", false),
+            ("glm-5.2", false),
+            ("glm-5.3-flashlight", false),
+            ("glm-5.3-flash2", false),
+            ("local-model", false),
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let request = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(request.output_token_cap(), None, "{model}");
+            if !flash {
+                body["max_completion_tokens"] = json!(163_840);
+                let request = chat_request(&body.to_string()).await.unwrap();
+                assert_eq!(request.output_token_cap(), Some(163_840), "{model}");
+                continue;
+            }
+
+            body["max_tokens"] = Value::Null;
+            body["max_completion_tokens"] = Value::Null;
+            assert_eq!(
+                chat_request(&body.to_string())
+                    .await
+                    .unwrap()
+                    .output_token_cap(),
+                None
+            );
+
+            let mut minimum_only = body.clone();
+            minimum_only["min_tokens"] = json!(65_537);
+            assert!(chat_request(&minimum_only.to_string()).await.is_ok());
+
+            for fields in [
+                json!({"max_tokens": 1}),
+                json!({"max_tokens": 131_072}),
+                json!({"max_completion_tokens": 1}),
+                json!({"max_completion_tokens": 131_072}),
+                json!({"max_tokens": 131_072, "max_completion_tokens": 1}),
+                json!({"max_tokens": 1, "max_completion_tokens": 131_072}),
+            ] {
+                let mut input = body.clone();
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                let request = chat_request(&input.to_string()).await.unwrap();
+                assert_eq!(
+                    request.output_token_cap().map(u64::from),
+                    fields["max_completion_tokens"]
+                        .as_u64()
+                        .or_else(|| fields["max_tokens"].as_u64()),
+                    "{input}"
+                );
+                let serialized = serde_json::to_value(request).unwrap();
+                assert_eq!(serialized["max_tokens"], fields["max_tokens"], "{input}");
+                assert_eq!(
+                    serialized["max_completion_tokens"], fields["max_completion_tokens"],
+                    "{input}"
+                );
+            }
+
+            for (value, code) in [
+                (0, "integer_below_min_value"),
+                (131_073, "max_tokens_out_of_range"),
+            ] {
+                for (field, other) in [
+                    ("max_tokens", "max_completion_tokens"),
+                    ("max_completion_tokens", "max_tokens"),
+                ] {
+                    for other_value in [Value::Null, json!(1)] {
+                        body[field] = json!(value);
+                        body[other] = other_value;
+                        let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+                        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                        assert_eq!(error["error"]["code"], code, "{body}: {error}");
+                        assert_eq!(error["error"]["param"], field, "{body}: {error}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Both keys with the same text make a request, as before the alias. Both
     /// keys with different text are refused as a value, and the param names
     /// the message.
@@ -1582,5 +2031,82 @@ mod tests {
                 .is_some_and(|m| m.contains("`reasoning_content` and `reasoning` disagree")),
             "{json}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "axum"))]
+mod query_tests {
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct Page {
+        limit: Option<usize>,
+    }
+
+    /// The limit the extractor read from `uri`, or the status and the body of
+    /// its refusal.
+    async fn extract(uri: &str) -> Result<Option<usize>, (StatusCode, Value)> {
+        let request = Request::builder().uri(uri).body(()).unwrap_or_default();
+        let (mut parts, ()) = request.into_parts();
+        match ValidatedQuery::<Page>::from_request_parts(&mut parts, &()).await {
+            Ok(ValidatedQuery(page)) => Ok(page.limit),
+            Err(response) => {
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                Err((status, serde_json::from_slice(&bytes).unwrap_or_default()))
+            }
+        }
+    }
+
+    /// A query string the type takes reaches the handler; a value the type
+    /// does not take is a 400 in the envelope, `invalid_value`, with the
+    /// framework's message.
+    #[tokio::test]
+    async fn a_query_string_the_type_does_not_take_is_refused_in_the_envelope() {
+        assert_eq!(extract("/list?limit=5").await, Ok(Some(5)));
+        assert_eq!(extract("/list").await, Ok(None));
+        let (status, body) = extract("/list?limit=-1").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(body["error"]["code"], "invalid_value", "{body}");
+        assert_eq!(body["error"]["param"], "limit", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with(QUERY_PREFIX),
+            "{body}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "axum"))]
+mod path_tests {
+    use super::*;
+
+    /// A path parameter the route did not declare is a rejection of the
+    /// route's own making: the framework's answer (a 500, text/plain)
+    /// reaches the client as it is, not as a 400 in the envelope.
+    #[tokio::test]
+    async fn a_rejection_of_the_routes_own_making_keeps_the_frameworks_answer() {
+        let request = Request::builder()
+            .uri("/items/7")
+            .body(())
+            .unwrap_or_default();
+        let (mut parts, ()) = request.into_parts();
+        let Err(response) = ValidatedPath::<u32>::from_request_parts(&mut parts, &()).await else {
+            panic!("a request no route matched carries no path parameters");
+        };
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
     }
 }

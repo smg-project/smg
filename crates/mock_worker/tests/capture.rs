@@ -215,8 +215,32 @@ async fn unset_optionals_are_null_and_set_values_come_back_as_sent() {
     set.logprob_start_len = Some(0);
     set.top_logprobs_num = 5;
     set.token_ids_logprob = vec![7, 8];
-    set.mm_inputs = Some(ts::MultimodalInputs::default());
-    set.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo::default());
+    // One well-formed media item with its encode room: the wire refuses an
+    // empty items list and a bootstrap info that leaves an item without a room.
+    set.mm_inputs = Some(ts::MultimodalInputs {
+        items: vec![ts::MultimodalItem {
+            modality: smg_grpc_client::common_proto::Modality::Image as i32,
+            content_hash: vec![1; 8],
+            encoder_input: Some(ts::TensorData {
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+                payload: Some(ts::tensor_data::Payload::Inline(vec![0; 16].into())),
+            }),
+            placeholders: vec![ts::PlaceholderRange {
+                offset: 0,
+                length: 1,
+            }],
+            ..Default::default()
+        }],
+    });
+    set.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo {
+        items: vec![ts::EncodeItemBootstrapInfo {
+            item_index: 0,
+            bootstrap_host: "127.0.0.1".to_string(),
+            bootstrap_port: 8999,
+            bootstrap_room: 11,
+        }],
+    });
     set.kv_bootstrap_info = Some(ts::KvBootstrapInfo::default());
     set.data_parallel_rank = Some(0);
     generate(&client, set).await;

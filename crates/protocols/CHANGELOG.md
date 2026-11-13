@@ -6,6 +6,21 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
+  transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
+  handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or
+  one under another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
+  `invalid_json` or `json_parse_error`) as the typed routes do. The gateway's Conversations routes
+  read it.
+- `ValidatedQuery<T>` and `ValidatedPath<T>`, behind the `axum` feature: a route's query string
+  and path segments read as the typed routes' body extractor reads a body. A query value the type
+  does not take, one that does not parse or a required one that is missing, and a path segment
+  that is not UTF-8 or does not parse as its type answer the gateway's JSON error envelope
+  (`400`, `error.code` `unknown_parameter`, `invalid_type`, `invalid_value` or
+  `missing_required_parameter`, `error.param` the parameter's or the segment's name) where the
+  framework answers text/plain; a rejection of the route's own making (a path parameter the
+  route does not declare, a shape the extractor cannot fill) keeps the framework's answer. The
+  gateway's model, Responses id, realtime and Conversations list and id routes read them.
 - `ChatCompletionRequest::dynamic_tools_for`, `declares_tools_for`, `effective_tool_list_for`,
   `shared_tool_list_for` and `callable_tools_for`: the tool-set readers under a provider profile
   the caller derived already, beside `template_thinking_for`. The readers without the suffix
@@ -14,6 +29,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- `ValidatedJson` refuses a body under a `Content-Encoding` the gateway does not decode (any but
+  `identity`, in whichever field of a repeated header or position of a comma-separated list it
+  stands) before it reads the body, as a `415` in the gateway's JSON error envelope (`error.code`
+  `json_parse_error`, the encoding named in the message) with `Accept-Encoding: identity`; it
+  parsed the compressed bytes as JSON and
+  refused them as a `400` with a syntax error. `undecodable_content_encoding`,
+  `content_encoding_message` and `with_accept_encoding_identity`, behind the `axum` feature, are
+  the header's reading, the message and the answer's header, shared with the gateway's
+  control-plane JSON extractor, which answers the same.
 - Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
   `ResponseFormat::StructuralTag` carries `Box<serde_json::Map<String, Value>>`. A format had
   grown from 104 to 128 bytes when the schema kept its description and the structural tag
@@ -61,6 +85,34 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
+  `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
+  "input_image" in a function output for text-only backends: only text parts are carried as a tool
+  result`, where every such part answered the one fixed message `Multimodal function output is not
+  supported by this text-only backend`. The gateway's `400 unsupported_content_part` for a function
+  output now names the part, as the same route's refusal of a message part does; the code and the
+  status are unchanged.
+  The message reaches a client on both routes that read it: the chat-family Responses conversion
+  (`400 unsupported_content_part`) and the Harmony builder's tool message
+  (`400 harmony_build_failed`).
+- Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
+  (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
+  Messages request), as the vendor's contract for the family reads it: the request answers as one
+  with `thinking.type: disabled` does, no reasoning and `reasoning_tokens` 0. The profile had read
+  every effort value as thinking on, so a `none` was rendered into the template's effort tag and
+  the model reasoned anyway. `minimal` keeps thinking on under the profile, as the contract's
+  lowest level. An explicit `thinking.type` wins over the effort as before. Adds the profile's
+  second reading of the field, `ProviderProfile::template_reasoning_effort`, with
+  `ChatCompletionRequest::template_reasoning_effort_for`,
+  `CreateMessageRequest::template_reasoning_effort_for` and
+  `CountMessageTokensRequest::template_reasoning_effort_for`: the `reasoning_effort` a prompt is
+  rendered with, as the profile hands it to the template given the thinking preference the prompt
+  renders with. Every other profile hands the value over as sent; MiniMax hands over the levels
+  the contract names (`low`, `medium`, `high`, `xhigh`, `max`), `minimal` as `low`, and nothing
+  for any other value or while thinking is off, whether the typed toggle, the effort or, where the
+  template reads that key, its own `thinking_mode` switch sent in `chat_template_kwargs` says so
+  (the gateway applies the switch under the template's detected thinking key, as it does for the
+  mode itself; `ProviderProfile::thinking_from_template_kwargs` is the reading).
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
@@ -68,6 +120,25 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
+- `EmbeddingRequest`, `ClassifyRequest`, `TokenizeRequest`, `DetokenizeRequest` and
+  `V1RerankReqInput` implement `Validate` and `Normalizable`, so the gateway reads
+  `/v1/embeddings`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize` and `/v1/rerank` through its
+  validated extractor: a body that does not parse, a body of the wrong type and a failed rule
+  answer the gateway's JSON error envelope (`400`, with `error.code` and `error.param`) where
+  axum's own text/plain `422`, `415` and `400` answered before. `V1RerankReqInput` refuses an
+  empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
+  its `top_n` keeps reading `0` as all documents. `TokenizeRequest` and `DetokenizeRequest`
+  declare no rule; the rules `EmbeddingRequest` and `ClassifyRequest` declare follow.
+- `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
+  an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
+  member of another kind than the first is refused by its index), and `EmbeddingRequest` the
+  API's bound on `dimensions` (at least one), so the gateway refuses the shapes the API refuses
+  in its error envelope with the field in `error.param` (`empty_array`, `empty_input`,
+  `invalid_type`, `integer_below_min_value`) before a worker sees them, on the gRPC path and the
+  HTTP relay alike. `validate_input` is the classify route's rule and the base of the embeddings
+  route's (`validate_embedding_input`), which also takes the serving engine's array of objects, a
+  structured member each, forwarded with no field of them read. The rule reads shape only: a
+  batch's length, the `encoding_format` and the objects' fields are the serving engine's to bound.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses

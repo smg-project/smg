@@ -266,3 +266,71 @@ async fn test_v1_messages_refuses_a_nucleus_of_nothing_and_a_top_k_of_zero_befor
 
     ctx.shutdown().await;
 }
+
+/// A `tool_use` block whose `input` is not an object is refused with a 400
+/// in the Messages error envelope naming the block, before anything is
+/// routed; the same history with an object `input` is served.
+#[tokio::test]
+async fn test_v1_messages_refuses_a_tool_use_input_that_is_not_an_object_before_routing() {
+    let ctx = AppTestContext::new(vec![MockWorkerConfig {
+        port: 18307,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    }])
+    .await;
+
+    let app = ctx.create_app();
+
+    for (input, expected) in [
+        (json!("Paris"), StatusCode::BAD_REQUEST),
+        (json!({"city": "Paris"}), StatusCode::OK),
+    ] {
+        let payload = json!({
+            "model": "mock-model",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01A", "name": "get_weather", "input": input}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01A", "content": "sunny"}
+                ]}
+            ],
+            "tools": [{
+                "name": "get_weather",
+                "description": "weather",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), expected, "{input}");
+        if expected == StatusCode::BAD_REQUEST {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body_json["type"], "error", "{body_json}");
+            assert_eq!(
+                body_json["error"]["type"], "invalid_request_error",
+                "{body_json}"
+            );
+            let text = body_json["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                text.contains("messages.1.content.0.tool_use.input"),
+                "{text}"
+            );
+        }
+    }
+
+    ctx.shutdown().await;
+}

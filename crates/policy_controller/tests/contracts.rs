@@ -23,9 +23,10 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    Candidate, Constraints, HashKind, Health, Lease, LeaseKind, LoadRow, MediaCounts, Membership,
-    Outcome, OverloadRegime, Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role,
-    Shed, ShedReason, Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    spec::DENIED_HEADERS, Candidate, Constraints, HashKind, Health, Lease, LeaseKind, LoadRow,
+    MediaCounts, Membership, Outcome, OverloadRegime, Pair, Phase, PoolFacts, Queue, ReleaseReason,
+    RequestFacts, Role, Shed, ShedReason, Side, Signal, SignalSource, Target, Trace,
+    TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -37,6 +38,27 @@ const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
 const WIT_PACKAGE: &str = "policy";
 const WIT_VERSION: &str = "1.0.0";
+
+/// The header deny-list of design section 4.6: the names no view may read
+/// and no routing-key override may key on, lowercase, in this order, each
+/// once. A name added or moved here is a contract change.
+const DENIED_HEADER_NAMES: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
+
+#[test]
+fn the_header_deny_list_holds_its_seven_names() {
+    assert_eq!(DENIED_HEADERS, DENIED_HEADER_NAMES, "the deny-list moved");
+    for name in DENIED_HEADERS {
+        assert_eq!(name, name.to_ascii_lowercase(), "{name} is not lowercase");
+    }
+}
 
 /// A record's field names in declaration order. The pattern names every
 /// field without `..`, so the crate's type cannot gain, lose or rename one
@@ -426,6 +448,8 @@ fn enum_mirrors() -> Vec<(
                     LateDecision,
                     ClientGone,
                     CommitFailed,
+                    Expired,
+                    WorkerRemoved,
                 }
             ),
         ),
@@ -1570,6 +1594,58 @@ fn the_versioned_names_a_plugin_author_builds_against_are_pinned() {
     );
 }
 
+/// The resume fields a watcher hands back: `WorkerEvent.seq` is the
+/// replication log position and `term` the term it was written under,
+/// `WatchWorkersRequest` carries both back, and `SnapshotRequired` names the
+/// oldest position the log still holds.
+type ResumeField = (&'static str, i32, Type);
+
+const RESUME_FIELDS: &[(&str, &[ResumeField])] = &[
+    (
+        "WatchWorkersRequest",
+        &[
+            ("models", 1, Type::String),
+            ("resume_seq", 2, Type::Uint64),
+            ("with_needs", 3, Type::Bool),
+            ("resume_term", 4, Type::Uint64),
+        ],
+    ),
+    (
+        "WorkerEvent",
+        &[
+            ("seq", 1, Type::Uint64),
+            ("membership_epoch", 2, Type::Uint64),
+            ("term", 11, Type::Uint64),
+        ],
+    ),
+    ("SnapshotRequired", &[("oldest_seq", 1, Type::Uint64)]),
+];
+
+#[test]
+fn the_watch_workers_resume_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in RESUME_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a resume field moved");
+    }
+}
+
 /// The packed request block's layout as the world's comment states it: a
 /// 72-byte header, the model bytes, zero bytes to the next multiple of 8,
 /// then the u64 sections. The arithmetic is mirrored here so the alignment
@@ -1605,5 +1681,188 @@ fn the_packed_request_block_keeps_its_u64_sections_aligned() {
             wit.contains(sentence),
             "the world states the alignment rule: {sentence:?}"
         );
+    }
+}
+
+/// The lease-id layout's bounds as `LeaseOrigin` states them: terms below
+/// 2^31 fit the 31 id bits, the per-term counter starts at 1 and never wraps
+/// into the term bits, so a controller-minted id is never 0 and never repeats
+/// across terms. The sentences are pinned beside the layout they bound.
+#[test]
+fn the_lease_id_layout_states_its_bounds() {
+    let proto = std::fs::read_to_string(contracts_dir().join(PLUGIN_PROTO))
+        .expect("the plugin protocol reads");
+    for sentence in [
+        "terms\n// stay below 2^31",
+        "the counter starts at 1",
+        "bumps its term before it mints again",
+        "never 0 and\n// never repeats across terms",
+    ] {
+        assert!(
+            proto.contains(sentence),
+            "LeaseOrigin states the id bounds: {sentence:?}"
+        );
+    }
+}
+
+/// The hello version fields: `PluginHello` offers a range on a Decide stream
+/// and one version (`protocol_min` = `protocol_max`) on an Observe stream;
+/// `PluginHelloAck.protocol` is the version a Decide stream settled, the one
+/// every Observe hello of that instance then names.
+type HelloField = (&'static str, i32, Type);
+
+const HELLO_FIELDS: &[(&str, &[HelloField])] = &[
+    (
+        "PluginHello",
+        &[
+            ("protocol_min", 1, Type::Uint32),
+            ("protocol_max", 2, Type::Uint32),
+        ],
+    ),
+    ("PluginHelloAck", &[("protocol", 1, Type::Uint32)]),
+];
+
+#[test]
+fn the_hello_version_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in HELLO_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "{message_name}: a hello version field moved"
+        );
+    }
+}
+
+/// The decline a plugin answers a stage with: `stage` is Stage bits, `reason`
+/// the enum, `detail` free text; a frame declining a stage and filling that
+/// stage's answer field is invalid.
+type DeclineField = (&'static str, i32, Type);
+
+const DECLINE_FIELDS: &[(&str, &[DeclineField])] = &[(
+    "Decline",
+    &[
+        ("stage", 1, Type::Uint32),
+        ("reason", 2, Type::Enum),
+        ("detail", 3, Type::String),
+    ],
+)];
+
+#[test]
+fn the_decline_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECLINE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a decline field moved");
+    }
+}
+
+/// Every lease end names exactly one lifecycle event: a completion, or a
+/// release with its reason. An end with no event is the leak a stateful plugin
+/// cannot see, so a `LeaseEnd` cause without a row here fails the test.
+const LEASE_END_EVENTS: &[(&str, &str)] = &[
+    ("CAUSE_COMPLETED", "completed"),
+    ("CAUSE_RELEASED", "released(reason)"),
+    ("CAUSE_EXPIRED", "released(REASON_EXPIRED)"),
+    ("CAUSE_WORKER_REMOVED", "released(REASON_WORKER_REMOVED)"),
+];
+
+#[test]
+fn every_lease_end_cause_names_one_lifecycle_event() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let causes: Vec<String> = enum_values(controller, "LeaseEnd.Cause")
+        .expect("LeaseEnd.Cause is an enum")
+        .into_iter()
+        .filter(|(_, number)| *number != 0)
+        .map(|(name, _)| name)
+        .collect();
+    let mapped: Vec<String> = LEASE_END_EVENTS
+        .iter()
+        .map(|(cause, _)| (*cause).to_owned())
+        .collect();
+    assert_eq!(causes, mapped, "a LeaseEnd cause has no lifecycle event");
+    let reasons: Vec<String> = enum_values(plugin, "Released.Reason")
+        .expect("Released.Reason is an enum")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for (cause, event) in LEASE_END_EVENTS {
+        if let Some(reason) = event
+            .strip_prefix("released(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .filter(|reason| reason.starts_with("REASON_"))
+        {
+            assert!(
+                reasons.iter().any(|r| r == reason),
+                "{cause}: {reason} is not a Released.Reason"
+            );
+        }
+    }
+}
+
+/// The decide frame's budget beside the request's: `PluginDecide.budget_micros`
+/// is the plugin's own deadline, clamped to at most `request.budget_micros`.
+type DecideField = (&'static str, i32, Type);
+
+const DECIDE_FIELDS: &[(&str, &[DecideField])] = &[
+    (
+        "PluginDecide",
+        &[
+            ("stages", 5, Type::Uint32),
+            ("budget_micros", 7, Type::Uint32),
+        ],
+    ),
+    ("RequestFacts", &[("budget_micros", 14, Type::Uint32)]),
+];
+
+#[test]
+fn the_decide_budget_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECIDE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a budget field moved");
     }
 }

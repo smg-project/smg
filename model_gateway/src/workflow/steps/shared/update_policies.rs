@@ -23,9 +23,12 @@ use crate::{
 /// monitor wants loads at all (always by default; see
 /// `WorkerMonitor::loads_wanted`). Only gRPC workers stream. A registration
 /// and an update that rebuilt the worker both come through here, so the two
-/// cannot choose differently. The monitor reads the registry under its slot
-/// lock before it stops or starts anything, so a worker removed or replaced
-/// again while the add waited for an old task to end gets no stream.
+/// cannot choose differently. A worker that streams nothing tells the
+/// monitor as well: it ends the stream a former object has under the URL,
+/// which nothing else on the replace path stops. The monitor reads the
+/// registry under its slot lock before it stops or starts anything, so a
+/// worker removed or replaced again while the add waited for an old task to
+/// end gets no stream.
 pub(crate) async fn start_kv_stream(
     app_context: &AppContext,
     worker: &Arc<dyn Worker>,
@@ -46,8 +49,9 @@ pub(crate) async fn start_kv_stream(
             .is_some_and(|loads| loads.loads_wanted(std::slice::from_ref(worker)))
             .then_some(SubscriptionKind::Loads)
     };
-    if let Some(kind) = kind {
-        monitor.on_worker_added(worker, kind).await;
+    match kind {
+        Some(kind) => monitor.on_worker_added(worker, kind).await,
+        None => monitor.on_worker_added_without_stream(worker).await,
     }
 }
 

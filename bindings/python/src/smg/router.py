@@ -219,8 +219,9 @@ def build_control_plane_auth_config(
             "control-plane JWT authentication would otherwise be silently disabled"
         )
 
-    # Check if any auth is configured
-    has_api_keys = bool(api_keys)
+    # Check if any auth is configured; a control-plane key file counts, since
+    # the binding reads it into this config's keys.
+    has_api_keys = bool(api_keys) or args_dict.get("control_plane_api_keys_file") is not None
     has_jwt = jwt_issuer is not None and jwt_audience is not None
 
     if not has_api_keys and not has_jwt:
@@ -546,6 +547,7 @@ class Router:
                 pool_min=args_dict.get("oracle_pool_min", 1),
                 pool_max=args_dict.get("oracle_pool_max", 16),
                 pool_timeout_secs=args_dict.get("oracle_pool_timeout_secs", 30),
+                op_timeout_secs=args_dict.get("oracle_op_timeout_secs", 5),
             )
         args_dict["oracle_config"] = oracle_config
         args_dict["history_backend"] = history_backend
@@ -596,6 +598,7 @@ class Router:
             "oracle_pool_min",
             "oracle_pool_max",
             "oracle_pool_timeout_secs",
+            "oracle_op_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
             "postgres_op_timeout_secs",

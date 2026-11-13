@@ -4411,6 +4411,7 @@ dependencies = [
  "bytes",
  "clap",
  "engine-servicer",
+ "engine-zmq-adapter",
  "engine-zmq-client",
  "futures",
  "llm-tokenizer",
@@ -7872,10 +7873,10 @@ dependencies = [
  "serde_json",
  "smg",
  "smg-grpc-client",
+ "smg-symphony",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
- "tool-parser",
  "tracing",
  "uuid",
 ]
@@ -7884,9 +7885,11 @@ dependencies = [
 name = "smg-grpc-client"
 version = "1.17.0"
 dependencies = [
+ "bytes",
  "futures",
  "h2",
  "http-body",
+ "http-body-util",
  "openai-protocol",
  "prost",
  "prost-types",
@@ -7986,6 +7989,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.21",
  "wit-parser",
 ]

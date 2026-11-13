@@ -134,10 +134,11 @@ pub struct Endpoint {
     userinfo: Option<String>,
     host: Host,
     port: Option<u16>,
-    /// Path prefix, when the address carries one. `validate_worker_url`
-    /// accepts `http://proxy:8080/sglang`, and `endpoint_url` appends the
-    /// route to it, so the prefix is part of which backend this names.
-    /// Stored with its leading `/` and without a trailing one.
+    /// What follows the authority, when the address carries anything: a
+    /// path prefix (`validate_worker_url` accepts `http://proxy:8080/sglang`,
+    /// and `endpoint_url` appends the route to it, so the prefix is part of
+    /// which backend this names), with any query or fragment as written.
+    /// Stored from its leading `/`, `?` or `#` and without a trailing slash.
     path: Option<String>,
 }
 
@@ -252,7 +253,8 @@ impl Endpoint {
         self.port
     }
 
-    /// Path prefix, if the address carries one.
+    /// What follows the authority (a path prefix, query or fragment), if the
+    /// address carries anything.
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref()
     }
@@ -435,10 +437,14 @@ fn split_rank(input: &str) -> (&str, Option<usize>) {
     }
 }
 
-/// Split an authority from its path prefix.
+/// Split an authority from what follows it: a path prefix, or a query or
+/// fragment written without one.
 ///
-/// The search starts after a bracketed IPv6 host so the brackets' own colons
-/// and the authority are never mistaken for a path.
+/// The authority ends at the first `/`, `?` or `#`, as a URL's does, so an
+/// `@` inside a query or fragment (`host:port?token=a@b`) is never read as
+/// the userinfo delimiter further down. The search starts after a bracketed
+/// IPv6 host so the brackets' own colons and the authority are never
+/// mistaken for a path.
 fn split_path(rest: &str) -> (&str, Option<String>) {
     // Only a bracketed host has brackets to skip. Searching for `]`
     // unconditionally let one inside a path hide the `/` that preceded it.
@@ -447,7 +453,7 @@ fn split_path(rest: &str) -> (&str, Option<String>) {
     } else {
         0
     };
-    let Some(offset) = rest[after_brackets..].find('/') else {
+    let Some(offset) = rest[after_brackets..].find(['/', '?', '#']) else {
         return (rest, None);
     };
     let at = after_brackets + offset;
@@ -644,6 +650,62 @@ mod tests {
         assert_eq!(endpoint.key().as_str(), "user@worker:3000");
         // A prefix of the address is not the same backend.
         assert_ne!(key_of("http://user"), key_of("http://user@worker:3000"));
+    }
+
+    /// The authority ends at the first `/`, `?` or `#`, so an `@` inside a
+    /// query or fragment written without a path is part of it, not the
+    /// userinfo delimiter. Before, `grpc://host:9000?token=a@b` parsed as the
+    /// userinfo `host:9000?token=a` on the host `b`: a spurious "carries
+    /// userinfo" warning, a masked form naming the wrong host and a key that
+    /// was not the backend's. The same tail without an `@` parses the same
+    /// way; before, the port parser read `9000?token=x` and refused it, while
+    /// `validate_worker_url` accepted the URL, so such a worker registered but
+    /// could not be found again by its address.
+    #[test]
+    fn an_at_sign_inside_a_query_or_fragment_is_not_userinfo() {
+        for (spelling, key, masked) in [
+            (
+                "grpc://host:9000?token=a@b",
+                "host:9000?token=a@b",
+                "grpc://host:9000",
+            ),
+            (
+                "grpc://host:9000?token=x",
+                "host:9000?token=x",
+                "grpc://host:9000",
+            ),
+            ("http://host:9000#a@b", "host:9000#a@b", "http://host:9000"),
+            (
+                "http://[fd00::1]:9000?token=a@b",
+                "[fd00::1]:9000?token=a@b",
+                "http://[fd00::1]:9000",
+            ),
+        ] {
+            let endpoint = Endpoint::parse(spelling).expect(spelling);
+            assert!(!endpoint.has_credentials(), "{spelling}");
+            assert_eq!(endpoint.port(), Some(9000), "{spelling}");
+            assert_eq!(endpoint.key().as_str(), key, "{spelling}");
+            assert_eq!(endpoint.redacted(), masked, "{spelling}");
+            assert_eq!(Endpoint::redacted_url(spelling), masked, "{spelling}");
+            assert_eq!(endpoint.render(), spelling, "{spelling}");
+        }
+        // Userinfo is still read, at the authority's own last `@`: a
+        // username, a `user:p@ss` pair, and either beside a query.
+        for (spelling, key) in [
+            ("http://user@host:9000", "user@host:9000"),
+            ("http://user:p@ss@host:9000", "user:p@ss@host:9000"),
+            ("http://user@host:9000?x@y", "user@host:9000?x@y"),
+        ] {
+            let endpoint = Endpoint::parse(spelling).expect(spelling);
+            assert!(endpoint.has_credentials(), "{spelling}");
+            assert_eq!(endpoint.key().as_str(), key, "{spelling}");
+            assert_eq!(endpoint.redacted(), "http://***@host:9000", "{spelling}");
+        }
+        // A rank after a query is still the rank.
+        let (endpoint, rank) = Endpoint::parse_with_rank("grpc://host:9000?x@y@2").unwrap();
+        assert_eq!(rank, Some(2));
+        assert!(!endpoint.has_credentials());
+        assert_eq!(endpoint.key().as_str(), "host:9000?x@y");
     }
 
     #[test]

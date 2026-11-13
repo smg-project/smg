@@ -9,7 +9,6 @@ use std::{
 
 use futures::StreamExt as _;
 use mock_worker::{
-    admin,
     config::{Config, Role, SchedulerWire},
     drain,
     grpc::serve_with_listener,
@@ -285,25 +284,11 @@ async fn start_realistic_prefill() -> (TokenSpeedSchedulerClient, reqwest::Clien
 }
 
 /// The admin API beside the worker on gRPC `port`: an HTTP client and the
-/// worker's fault route, up.
+/// worker's fault route, on a port the server held before it was read.
 async fn fault_route(port: u16) -> (reqwest::Client, String) {
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(Config::default()),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+    let admin_port = common::start_admin(Config::default()).await;
     let http = common::http_client();
     let fault = format!("http://127.0.0.1:{admin_port}/admin/fault/grpc:{port}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while http.get(&fault).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     (http, fault)
 }
 
@@ -663,22 +648,8 @@ async fn start_realistic_http_prefill() -> (reqwest::Client, String, String) {
         ..Config::default()
     })
     .await;
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(Config::default()),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+    let admin_port = common::start_admin(Config::default()).await;
     let fault = format!("http://127.0.0.1:{admin_port}/admin/fault/{name}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while client.get(&fault).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     (client, base, fault)
 }
 
@@ -1289,6 +1260,23 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
     }
     assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
 
+    // An item without its feature: the encode worker runs the tower on it
+    // and has no room to fall back on, so the request is refused and not
+    // counted.
+    let mut featureless = tokenspeed_encode_request("ts-e3", 1, &[43]);
+    featureless.mm_inputs.as_mut().expect("the items").items[0].encoder_input = None;
+    let refused = encoder
+        .encode(featureless)
+        .await
+        .expect_err("an item without its feature");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("media item 0")
+            && refused.message().contains("no encoder input"),
+        "{refused:?}"
+    );
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
     // A `Generate` went to the wrong pool: this worker takes `Encode`.
     let wrong_pool = scheduler
         .generate(request("ts-g1", &[1, 2, 3], false))
@@ -1312,6 +1300,110 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
         server_arg(&info, "disaggregation_bootstrap_port").is_some(),
         "{info:?}"
     );
+}
+
+/// The encoder servicer reads its feature through the generic tensor reader,
+/// not the scheduler's feature path: an SHM handle in a dtype the scheduler
+/// refuses for its feature is accepted here, with the byte length the
+/// generic reader checks.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_reads_an_shm_feature_as_the_encoder_servicer_does() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let before = encodes_served(&http, &fault, &name).await;
+    let mut shm = tokenspeed_encode_request("ts-shm", 1, &[45]);
+    shm.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float64".to_string(),
+        payload: Some(ts::tensor_data::Payload::Shm(
+            smg_grpc_client::common_proto::ShmHandle {
+                name: "smg-mm-enc".to_string(),
+                nbytes: 32,
+                ..Default::default()
+            },
+        )),
+    });
+    let answer = encoder
+        .encode(shm)
+        .await
+        .expect("a float64 SHM feature on the encoder")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    let mut short = tokenspeed_encode_request("ts-shm-short", 1, &[46]);
+    short.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float64".to_string(),
+        payload: Some(ts::tensor_data::Payload::Shm(
+            smg_grpc_client::common_proto::ShmHandle {
+                name: "smg-mm-enc".to_string(),
+                nbytes: 16,
+                ..Default::default()
+            },
+        )),
+    });
+    let refused = encoder
+        .encode(short)
+        .await
+        .expect_err("a byte length short of the shape");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(refused.message().contains("byte length 16"), "{refused:?}");
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+}
+
+/// Both servicers pull a remote handle for the item's feature alone: the
+/// encoder accepts a remote feature as the scheduler does, and a remote side
+/// tensor is refused, as the generic reader's `tensor_payload_bytes` refuses
+/// it on either.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_pulls_a_remote_feature_and_refuses_a_remote_side_tensor() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let before = encodes_served(&http, &fault, &name).await;
+    let remote = |nbytes: u64| {
+        Some(ts::tensor_data::Payload::Remote(
+            smg_grpc_client::common_proto::RemoteTensorHandle {
+                transport: "nixl".to_string(),
+                nbytes,
+                ..Default::default()
+            },
+        ))
+    };
+    let mut feature = tokenspeed_encode_request("ts-remote", 1, &[47]);
+    feature.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float16".to_string(),
+        payload: remote(8),
+    });
+    let answer = encoder
+        .encode(feature)
+        .await
+        .expect("a remote feature on the encoder")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+
+    let mut side = tokenspeed_encode_request("ts-remote-side", 1, &[48]);
+    side.mm_inputs.as_mut().expect("the items").items[0]
+        .model_specific_tensors
+        .insert(
+            "image_grid_thw".to_string(),
+            ts::TensorData {
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+                payload: remote(24),
+            },
+        );
+    let refused = encoder
+        .encode(side)
+        .await
+        .expect_err("a remote side tensor the servicer refuses");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("image_grid_thw")
+            && refused.message().contains("remote payload"),
+        "{refused:?}"
+    );
+    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
 }
 
 /// The engine's encoder takes exactly one media item under one room per
@@ -1440,6 +1532,21 @@ async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
             "rooms {rooms:?}: {refused:?}"
         );
     }
+
+    // Rooms with no media at all: the first entry's index is out of range
+    // (item 0 of 0), refused as a room off the end is.
+    let mut no_media = with_media("ts-p4", Some(vec![room(0, 11)]));
+    no_media.mm_inputs = None;
+    let refused = client
+        .generate(no_media)
+        .await
+        .err()
+        .expect("a refused handoff, not a stream");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().ends_with("names item 0 of 0"),
+        "{refused:?}"
+    );
 
     // No rooms at all: a request without an encoder, served as before.
     let frames = generate(&client, with_media("ts-p3", None)).await;

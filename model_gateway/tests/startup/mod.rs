@@ -13,4 +13,5 @@ mod priority_scheduler_config_startup_test;
 mod rdma_listen_ip_startup_test;
 mod secrets_auto_reload_startup_test;
 mod secrets_reload_startup_test;
+mod tls_connection_limit_startup_test;
 mod tokenizer_paths_startup_test;

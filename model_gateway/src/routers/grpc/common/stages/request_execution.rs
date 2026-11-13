@@ -26,7 +26,9 @@ use crate::{
     },
     routers::{
         common::{
-            attempt_ledger::{mark_failed_side, mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{
+                is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+            },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
             retry::mark_non_retryable,
@@ -1053,10 +1055,17 @@ async fn execute_parallel_pd(
     // The prefill side's silence is bounded from its dispatch: a call that
     // returns no stream, or a stream with nothing on it, within the bound
     // fails the attempt instead of holding the request (and the decode room
-    // the admission gate claimed for it) until its own timeout.
+    // the admission gate claimed for it) until its own timeout. A side whose
+    // embeddings come from an encode worker has the encoder's forward and
+    // the transfer in front of its first response as well.
     let prefill_worker = workers.prefill_worker();
-    let bound = prefill_worker
-        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
+    let bound = prefill_worker.and_then(|worker| {
+        if prefill_request.awaits_encode() {
+            PrefillBound::behind_encode(worker, sides.prompt_tokens, prefill_start)
+        } else {
+            PrefillBound::at(worker, sides.prompt_tokens, prefill_start)
+        }
+    });
     // Each side owns its client handle (a cheap channel clone, the same one
     // batched dispatch takes per sub-request) so the side still in flight when
     // its partner fails can be moved off the request path.
@@ -1507,12 +1516,43 @@ fn pd_side_error(
     }
     UpstreamClass::account_dispatch_failure(side.name(), connection, error);
     account_pd_side_failure(side.name(), error);
-    start_failure_response(
+    let worker = match side {
+        PdSide::Prefill => workers.prefill_worker(),
+        PdSide::Decode => workers.decode_worker(),
+    };
+    pd_start_failure_response(side, worker, error, "execute_parallel_pd")
+}
+
+/// The client answer for a disaggregated side that failed to start, under the
+/// side's start code (see [`start_failure_response`]). A status the side's
+/// worker answered for the payload itself (its own `INTERNAL`, definitive for
+/// the retry layer) names that worker as the failed side, so the retry window
+/// closes on it alone and the answer stands when no other worker of its kind
+/// is available (see `attempt_ledger::FailedSide`): one side's own 500 is not
+/// its partner's, and a free worker of the side's kind still takes the
+/// request. Left unnamed, the definitive answer closed the window on both
+/// workers of the pair while a worker of the other kind still counted as an
+/// alternative, so the retry found no pair to admit and the client read a
+/// `no_available_workers` refusal in place of the worker's own answer. Any
+/// other status names no side and is replayed as before.
+pub(crate) fn pd_start_failure_response(
+    side: PdSide,
+    worker: Option<&Arc<dyn Worker>>,
+    error: &tonic::Status,
+    function: &'static str,
+) -> Response {
+    let mut response = start_failure_response(
         error,
-        "execute_parallel_pd",
+        function,
         side.description(SidePhase::Start),
         side.code(SidePhase::Start),
-    )
+    );
+    if is_definitive_failure(&response) {
+        if let Some(worker) = worker {
+            mark_failed_side(&mut response, worker.as_ref());
+        }
+    }
+    response
 }
 
 /// Why a PD side still dispatching is retired off the request path (see
@@ -1605,7 +1645,7 @@ pub(crate) fn retire_pd_side(
         match result {
             Ok(stream) => {
                 debug!(
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     "Aborting the room of an abandoned PD side"
@@ -1620,7 +1660,7 @@ pub(crate) fn retire_pd_side(
                 UpstreamClass::account_dispatch_failure(side.name(), connection, &error);
                 error!(
                     function = "retire_pd_side",
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     error = %error,
@@ -1629,7 +1669,7 @@ pub(crate) fn retire_pd_side(
             }
             Err(error) => {
                 debug!(
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     error = %error,
@@ -1675,12 +1715,36 @@ impl PrefillBound {
         prompt_tokens: u64,
         dispatched: Instant,
     ) -> Option<Self> {
+        let bound = liveness::prefill_side_bound(worker, prompt_tokens)?;
+        Self::on(worker, prompt_tokens, bound, dispatched)
+    }
+
+    /// [`Self::at`] for a side whose embeddings come from an encode worker:
+    /// a worker that has answered nothing gets what is left of the
+    /// cold-shape grace, its first prompt being the encoder's first as well
+    /// (see [`liveness::prefill_side_bound_behind_encode`]). A stalled
+    /// decode partner is read once the side's bound has passed, as under
+    /// the cold-shape grace: at the grace while it is in force.
+    pub(crate) fn behind_encode(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        dispatched: Instant,
+    ) -> Option<Self> {
+        let bound = liveness::prefill_side_bound_behind_encode(worker, prompt_tokens)?;
+        Self::on(worker, prompt_tokens, bound, dispatched)
+    }
+
+    /// A bound of `bound` from `dispatched` on a side of `prompt_tokens` to
+    /// `worker`, a stalled decode partner judged by a decode side's bound
+    /// for the same prompt.
+    fn on(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        bound: Duration,
+        dispatched: Instant,
+    ) -> Option<Self> {
         let partner_bound = liveness::decode_side_bound(worker, prompt_tokens)?;
-        Self::of(
-            liveness::prefill_side_bound(worker, prompt_tokens)?,
-            dispatched,
-        )
-        .map(|bound| Self {
+        Self::of(bound, dispatched).map(|bound| Self {
             partner_bound,
             ..bound
         })
@@ -2104,8 +2168,8 @@ pub(crate) mod tests {
     use crate::{
         routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
         worker::{
-            BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
-            WorkerType,
+            test_support::no_health_check, BasicWorkerBuilder, CircuitBreakerConfig,
+            ConnectionMode, RuntimeType, Worker, WorkerType,
         },
     };
 
@@ -2444,6 +2508,105 @@ pub(crate) mod tests {
         }
     }
 
+    /// A side's own `INTERNAL` before its first byte is the worker's
+    /// definitive answer for the payload, and names the side's worker as the
+    /// failed side: the retry window closes on that worker alone, its partner
+    /// stays selectable, the request moves to another worker of the side's
+    /// kind when one is available, and the answer stands when none is. A
+    /// status that is not the worker's own answer names no side and is
+    /// replayed as before.
+    #[test]
+    fn a_sides_own_500_before_its_first_byte_closes_the_window_on_its_worker_alone() {
+        use crate::routers::common::attempt_ledger::is_definitive_failure;
+
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let code = |response: &Response| {
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        // The sole prefill worker's own 500: its answer stands.
+        let ledger = AttemptLedger::default();
+        let mut answered = pd_side_error(
+            PdSide::Prefill,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::internal("engine died"),
+            &workers,
+        );
+        assert_eq!(answered.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            code(&answered).as_deref(),
+            Some("prefill_worker_failed_to_start")
+        );
+        assert!(is_definitive_failure(&answered));
+        assert!(
+            answered.extensions().get::<FailedSide>().is_some(),
+            "the side's worker is named"
+        );
+        ledger.settle(&mut answered, workers.workers(), [&prefill, &decode]);
+        assert!(
+            !ledger.admits(prefill.as_ref()),
+            "the prefill worker that answered is out"
+        );
+        assert!(ledger.admits(decode.as_ref()), "its decode partner is not");
+        assert!(
+            !is_retryable_response(&answered),
+            "no other prefill worker: the worker's own answer is the client's"
+        );
+
+        // One decode worker's own 500 with another decode worker available
+        // (ready, as the pool holds one: the ledger's alternative must be
+        // available): the request moves there, with the same prefill.
+        let other_decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-2:30000")
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let ledger = AttemptLedger::default();
+        let mut answered = pd_side_error(
+            PdSide::Decode,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::internal("engine died"),
+            &workers,
+        );
+        assert_eq!(
+            code(&answered).as_deref(),
+            Some("decode_worker_failed_to_start")
+        );
+        ledger.settle(
+            &mut answered,
+            workers.workers(),
+            [&prefill, &decode, &other_decode],
+        );
+        assert!(!ledger.admits(decode.as_ref()));
+        assert!(ledger.admits(prefill.as_ref()));
+        assert!(ledger.admits(other_decode.as_ref()));
+        assert!(
+            is_retryable_response(&answered),
+            "the other decode worker takes the request"
+        );
+
+        // A status that is not the worker's own answer names no side.
+        let refused = pd_side_error(
+            PdSide::Decode,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::unavailable("the engine is busy"),
+            &workers,
+        );
+        assert_eq!(refused.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_definitive_failure(&refused));
+        assert!(refused.extensions().get::<FailedSide>().is_none());
+        assert!(is_retryable_response(&refused));
+    }
+
     #[test]
     fn a_spent_sidecar_budget_is_not_retried_but_a_fast_sidecar_failure_is() {
         use crate::routers::common::retry::is_retryable_response;
@@ -2752,6 +2915,139 @@ pub(crate) mod tests {
         assert!(
             is_retryable_response(&response),
             "another prefill worker may take the request"
+        );
+    }
+
+    /// The first media prompt of a fresh deployment (95 tokens) dispatched to
+    /// a prefill worker that has answered nothing, with the encoder's first
+    /// forward in front of its answer: the side as `dispatch_prefill_within`
+    /// drives it under `bound`, answering as `side` does (the stubs answer
+    /// with a failure of their own, which passes through as a late side's
+    /// does, or never).
+    async fn first_media_prompt(
+        prefill: &Arc<dyn Worker>,
+        bound: PrefillBound,
+        side: SideDispatch,
+    ) -> StreamResult {
+        dispatch_prefill_within(
+            Some(bound),
+            side,
+            Some(Arc::clone(prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-first-image".to_string(),
+            95,
+        )
+        .await
+    }
+
+    /// The first media request of a fresh encode-prefill-decode deployment:
+    /// the prefill side's first response waits on the encoder's first
+    /// forward and the transfer before the prefill worker's own, and its
+    /// worker has answered nothing. A plain side's bound (a request that
+    /// carries no encode rooms) gives it up at the threshold while the
+    /// encoder still runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_under_a_plain_bound_is_given_up_on_while_the_encoder_runs() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let plain = PrefillBound::at(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            plain.bound,
+            Duration::from_secs(3),
+            "a plain side on a worker that has answered nothing: the threshold"
+        );
+        let answer = answers_after(Duration::from_millis(3_500));
+        let status = failure(first_media_prompt(&prefill, plain, answer).await);
+        assert!(
+            is_prefill_silence(&status),
+            "given up on at the threshold while the encoder runs: {status:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_millis(3_500),
+            "at the threshold, before the answer: {elapsed:?}"
+        );
+    }
+
+    /// The same first media request behind an encode worker: the side's
+    /// bound is the cold-shape grace, so the answer that comes at 3.5 s
+    /// passes through, and a stalled decode partner is still judged by a
+    /// decode side's bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_behind_an_encode_worker_waits_out_the_encoders_first_forward()
+    {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let encoder_forward = Duration::from_millis(3_500);
+        let started = tokio::time::Instant::now();
+        let behind =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            behind.bound,
+            Duration::from_secs(120),
+            "behind an encode worker: the cold-shape grace"
+        );
+        assert_eq!(
+            behind.partner_bound,
+            Duration::from_secs(3),
+            "the partner's own bound is unchanged; it is read once the side's bound has passed, as under the cold-shape grace"
+        );
+        let answer = answers_after(encoder_forward);
+        let status = failure(first_media_prompt(&prefill, behind, answer).await);
+        assert!(
+            !is_prefill_silence(&status),
+            "the side's answer passed through: {status:?}"
+        );
+        assert_eq!(status.message(), "late side");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= encoder_forward && elapsed < Duration::from_secs(4),
+            "the answer's own time, not a verdict: {elapsed:?}"
+        );
+    }
+
+    /// A first media request behind an encode worker whose prefill side
+    /// never answers is still given up on, at the grace and not later, with
+    /// the verdict naming the window it was judged against.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_behind_an_encode_worker_that_never_answers_is_given_up_on_at_the_grace(
+    ) {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let behind =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        let status = failure(first_media_prompt(&prefill, behind, never_answers()).await);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            status
+                .message()
+                .contains("never answered (a 120.0s window)"),
+            "the verdict names the grace it was judged against: {status:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(120) && elapsed < Duration::from_secs(121),
+            "given up on at the grace, not later: {elapsed:?}"
+        );
+        // The grace is spent: a run released without an answer leaves its
+        // silence on the worker's book, and the next side reads the
+        // threshold. The side given up on above still holds its prompt (its
+        // stream never ends here; the late failure would release it), so the
+        // test releases it, then banks a run the grace long, stamped forward
+        // (the gateway clock is young in a test).
+        prefill.note_prefill_ended(95, true, None);
+        let t0 = liveness::now_ms().max(1);
+        prefill.note_prefill_started_at(95, true, t0);
+        prefill.note_prefill_ended_at(95, true, None, t0 + 120_000);
+        let spent =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            spent.bound,
+            Duration::from_secs(3),
+            "the grace spent: the threshold until the worker answers"
         );
     }
 

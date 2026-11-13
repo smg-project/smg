@@ -43,6 +43,75 @@ fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
     assert!(!state.raw_tool_call_arguments());
 }
 
+/// A state reads the names its templates read: a bare name anywhere in an
+/// expression of the default template, or of an alternate a request may
+/// render through. The gateway hands a request control to the template
+/// under its name only when the template reads it.
+#[test]
+fn a_state_reads_the_names_its_templates_read() {
+    let reading = "{% macro format(f) %}{{ f | tojson }}{% endmacro %}{% for m in messages %}\
+                   {{ m.content }}{% endfor %}{% if response_format is defined %}\
+                   {{ format(response_format) }}{% endif %}";
+    let state = ChatTemplateState::new(Some(reading.to_string())).unwrap();
+    assert!(state.reads("response_format"));
+    assert!(state.reads("messages"));
+    assert!(!state.reads("tool_choice"));
+
+    let plain = "{% for m in messages %}{{ m.content }}{% endfor %}";
+    let state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    assert!(!state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // An alternate's reads count: the `tool_use` template a request with
+    // tools renders through.
+    let state = ChatTemplateState::from_config(ConfigChatTemplates {
+        default: Some(plain.to_string()),
+        tool_use: Some(format!("{plain}{{{{ tool_choice }}}}")),
+    })
+    .unwrap();
+    assert!(state.reads("tool_choice"));
+    assert!(!state.reads("response_format"));
+
+    // A name read only as a call block's parameter default counts: the
+    // block's parameters are expressions of the template, as a macro's.
+    let call_block = "{% macro wrap() %}{{ caller() }}{% endmacro %}{% for m in messages %}\
+                      {{ m.content }}{% endfor %}{% call(fmt=response_format) wrap() %}\
+                      {{ fmt | tojson }}{% endcall %}";
+    let state = ChatTemplateState::new(Some(call_block.to_string())).unwrap();
+    assert!(state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // The processor alternate's reads count too: a checkpoint's processor
+    // template, which a request without tools renders through.
+    let state = ChatTemplateState::from_checkpoint(
+        ConfigChatTemplates {
+            default: Some(plain.to_string()),
+            tool_use: None,
+        },
+        Some(format!("processor:{plain}{{{{ response_format }}}}")),
+    )
+    .unwrap();
+    assert!(format!("{state:?}").contains("has_processor: true"));
+    assert!(state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // A replacement template answers for itself.
+    let mut state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    state.set(reading.to_string()).unwrap();
+    assert!(state.reads("response_format"));
+
+    // No template: nothing to leave a name out of.
+    assert!(ChatTemplateState::empty().reads("response_format"));
+    assert!(ChatTemplateState::new(None).unwrap().reads("tool_choice"));
+
+    // A template the detector could not parse leaves the names unknown,
+    // and an unknown set reads every name rather than none.
+    assert!(detect_all("{% if %}").names_read.is_none());
+    let mut state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    state.names_read = None;
+    assert!(state.reads("response_format"));
+}
+
 /// A template that writes a history call by string concatenation, as the
 /// DeepSeek V3 line's templates do.
 const CONCATENATING_CALLS: &str =
@@ -1480,6 +1549,68 @@ fn clear_thinking_is_not_a_thinking_switch() {
             "{template}"
         );
     }
+}
+
+/// The word `thinking` in what a template prints is not a switch: the
+/// MiniMax M3.1 template's system prose ("When thinking is enabled, wrap your
+/// reasoning in ...") stands in a string literal, and the template branches
+/// on no thinking variable, where the M3 template branched on
+/// `thinking_mode`. A comment or the raw text outside the blocks is not a
+/// switch either; the same words as code are.
+#[test]
+fn thinking_in_prose_or_a_comment_is_not_a_thinking_switch() {
+    let m31_shape = "{{- 'You have a thinking capability that allows you to reason step by step \
+                     before responding. When thinking is enabled, wrap your reasoning in ' ~ \
+                     think_begin_token ~ ' and ' ~ think_end_token }}\
+                     {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                     {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    for template in [
+        m31_shape,
+        "{{ \"When thinking is enabled, think.\" }}{% for m in messages %}{{ m.content }}{% endfor %}",
+        "{% set note = 'if thinking == true' %}{{ note }}",
+        "{# if thinking is defined #}{{ messages | length }}",
+        "When thinking is enabled, think.{% for m in messages %}{{ m.content }}{% endfor %}",
+        // A raw block prints its text as it is, switch-looking words included.
+        "{% raw %}{% if thinking %}on{% endif %}{% endraw %}{{ messages | length }}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::None, None),
+            "{template}"
+        );
+    }
+    let state = ChatTemplateState::new(Some(m31_shape.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+    assert_eq!(state.thinking_key_name(), None);
+    assert!(!state.prefill_opens_think_block());
+
+    // The same words as code are the switch, after a literal and after a
+    // literal with an escaped quote in it.
+    for template in [
+        "{% if thinking is defined and thinking %}<think>{% endif %}",
+        "{{ 'When thinking is enabled' }}{% if thinking %}<think>{% endif %}",
+        "{{ 'it\\'s thinking' }}{% if thinking == true %}<think>{% endif %}",
+        "{{ \"a 'quoted' word\" }}{% set thinking = thinking %}",
+        // A nested dict literal's `}}` does not end the block before the switch.
+        "{{ {'a': {'b': '<think>'}}['a']['b'] if thinking else '' }}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
+            "{template}"
+        );
+    }
+    // The M3 shape keeps its tri-state switch.
+    assert_eq!(
+        detect_thinking_toggle(
+            "{{- 'When thinking is enabled, wrap your reasoning.' }}\
+             {%- if thinking_mode is defined and thinking_mode == \"enabled\" -%}<think>{%- endif -%}"
+        ),
+        (
+            ThinkingToggle::DefaultOff,
+            Some(ThinkingKeyName::ThinkingMode)
+        )
+    );
 }
 
 #[test]

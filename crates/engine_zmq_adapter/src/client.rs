@@ -863,10 +863,11 @@ impl ZmqEngineClient {
             let top_logprobs = ranked_candidate_count(sampling.and_then(|sp| sp.logprobs));
             let prompt_top_logprobs =
                 ranked_candidate_count(sampling.and_then(|sp| sp.prompt_logprobs));
-            let first_prompt_token = request
-                .prompt_token_ids
-                .as_ref()
-                .and_then(|ids| ids.first().copied());
+            let prompt_token_ids = request.prompt_token_ids.as_deref().unwrap_or_default();
+            let first_prompt_token = prompt_token_ids.first().copied();
+            // The usage's prompt count until the engine's prefill stats
+            // report their own.
+            let prompt_tokens = u32::try_from(prompt_token_ids.len()).unwrap_or(u32::MAX);
             // Sub-streams submitted before a mid-loop failure are dropped with
             // the error, which auto-aborts their engine-side requests.
             let stream = client
@@ -879,6 +880,7 @@ impl ZmqEngineClient {
                 top_logprobs,
                 prompt_top_logprobs,
                 first_prompt_token,
+                prompt_tokens,
             ));
         }
         Ok(streams)
@@ -2280,9 +2282,12 @@ mod tests {
     /// probe named is free only until a neighbour takes it. The worker's
     /// connect is raced against the engine's dial: a bind that finds the port
     /// taken ends that attempt at once, its engine dial abandoned with it,
-    /// and the next attempt starts on a fresh probe.
+    /// and the next attempt starts on a fresh probe. The panic after the last
+    /// attempt carries the last bind error and the address it failed on, the
+    /// bind's own words rather than the neighbour sentence alone.
     async fn connect_tcp_worker(mut probe: impl FnMut() -> u16) -> (ZmqEngineClient, MockEngine) {
         const ATTEMPTS: usize = 8;
+        let mut last_bind_error = String::new();
         for _ in 0..ATTEMPTS {
             let base_url = format!("tcp://127.0.0.1:{}", probe());
             let mut worker = std::pin::pin!(connect_with_eos(
@@ -2304,7 +2309,10 @@ mod tests {
                 engine = &mut engine => First::Engine(engine),
             };
             match first {
-                First::Worker(Err(error)) if error.contains("Address already in use") => continue,
+                First::Worker(Err(error)) if error.contains("Address already in use") => {
+                    last_bind_error = format!("{base_url}: {error}");
+                    continue;
+                }
                 First::Worker(worker) => {
                     let client = worker.expect("the tcp worker connects");
                     let engine = engine.await.expect("mock engine connected");
@@ -2317,7 +2325,37 @@ mod tests {
                 }
             }
         }
-        panic!("{ATTEMPTS} probed ports were taken before the worker could bind them");
+        panic!(
+            "{ATTEMPTS} probed ports were taken before the worker could bind them; \
+             the last bind: {last_bind_error}"
+        );
+    }
+
+    /// A port held through every attempt exhausts them, and the panic names
+    /// the address the last bind failed on with the bind's own error, not
+    /// the neighbours alone.
+    #[tokio::test]
+    async fn a_port_held_through_every_attempt_puts_the_bind_error_in_the_panic() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = holder.local_addr().unwrap().port();
+        let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            connect_tcp_worker(|| held),
+        ))
+        .await
+        else {
+            panic!("the worker bound the held port");
+        };
+        let message = *panic
+            .downcast::<String>()
+            .expect("the retry's panic is a formatted message");
+        assert!(
+            message.contains(&format!("the last bind: tcp://127.0.0.1:{held}")),
+            "the panic names the address: {message}"
+        );
+        assert!(
+            message.contains("Address already in use"),
+            "the panic carries the bind's own error: {message}"
+        );
     }
 
     /// A probed port a neighbour took before the worker bound it is probed

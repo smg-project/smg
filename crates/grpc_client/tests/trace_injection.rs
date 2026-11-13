@@ -17,7 +17,8 @@ use common::{generate_request, spawn_mock, MockState, TRACE_HEADER};
 /// gateway's injector writes under the same header from the active span.
 const TRACE_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 
-/// Writes the one header the gateway's injector writes.
+/// Writes `traceparent`, the header the gateway's injector carries the span
+/// in (it writes `tracestate` beside it, which these tests do not read).
 struct ProbeInjector;
 
 impl TraceInjector for ProbeInjector {
@@ -47,6 +48,16 @@ fn carried(call: &'static str) -> Vec<(&'static str, Option<String>)> {
 async fn generate_carries_the_trace_context() {
     let (client, state) = traced_client().await.unwrap();
     let _stream = client.generate(generate_request("traced-1")).await.unwrap();
+    assert_eq!(state.traced(), carried("Generate"));
+}
+
+#[tokio::test]
+async fn generate_framed_carries_the_trace_context() {
+    let (client, state) = traced_client().await.unwrap();
+    let _stream = client
+        .generate_framed(generate_request("traced-framed"))
+        .await
+        .unwrap();
     assert_eq!(state.traced(), carried("Generate"));
 }
 

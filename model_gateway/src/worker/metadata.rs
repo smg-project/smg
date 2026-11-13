@@ -126,12 +126,17 @@ impl WorkerMetadata {
         self.spec.bootstrap_port
     }
 
-    /// Get the base URL without any DP rank suffix.
+    /// The base URL without any DP rank suffix and, for an `http://` or
+    /// `https://` base, without a trailing slash: every route joins to it with
+    /// one slash, however the URL was registered. A socket address stays as
+    /// given. The worker's `url()` keeps the registered form, the registry's key.
     pub fn base_url(&self) -> &str {
-        self.spec
-            .dp_base_url
-            .as_deref()
-            .unwrap_or(self.spec.url.as_str())
+        join_base(
+            self.spec
+                .dp_base_url
+                .as_deref()
+                .unwrap_or(self.spec.url.as_str()),
+        )
     }
 
     /// Compose an endpoint URL for a specific route.
@@ -270,5 +275,19 @@ impl WorkerMetadata {
     /// Check if this worker is in wildcard mode (accepts any model).
     pub fn is_wildcard(&self) -> bool {
         self.spec.models.is_wildcard()
+    }
+}
+
+/// The form of a URL a route is joined to: an `http://` or `https://` base
+/// without its trailing slash, so both joins in use, `{base}/{route}` and
+/// `{base}{route}`, read one slash whether the URL was registered as
+/// `http://h:8000` or `http://h:8000/`. Any other address (`ipc://`, `tcp://`,
+/// `grpc://`) is not a base routes join to and stays as given: the ZMQ
+/// adapter hashes the exact path for its handshake port and socket files.
+pub(crate) fn join_base(url: &str) -> &str {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        url.trim_end_matches('/')
+    } else {
+        url
     }
 }

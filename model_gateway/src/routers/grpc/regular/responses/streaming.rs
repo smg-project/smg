@@ -3,7 +3,9 @@
 //! This module handles streaming request execution:
 //! - `execute_tool_loop_streaming` - MCP tool loop with streaming
 //! - `convert_chat_stream_to_responses_stream` - Non-MCP streaming conversion
-//! - Streaming accumulators for response building
+//!
+//! A stream's final object (the terminal event's and the stored one) is the
+//! event emitter's: the items its events announced, under the ids they carry.
 
 use std::{
     borrow::Cow,
@@ -26,10 +28,7 @@ use openai_protocol::{
         ChatCompletionStreamResponse,
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
-    responses::{
-        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage,
-    },
+    responses::{ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesUsage},
 };
 use serde_json::{json, Value};
 use smg_data_connector::{
@@ -67,10 +66,6 @@ use crate::{
                     streaming::{
                         attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
                     },
-                    utils::{
-                        custom_tool_input, custom_tool_names, cut_call, function_call_status,
-                        generation_failure_error, resolve_function_identity, response_status,
-                    },
                     BackgroundStream, ResponsesContext,
                 },
                 stages::{iteration_charge, RateLimitCell},
@@ -97,7 +92,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     ctx: &ResponsesContext,
     chat_request: Arc<ChatCompletionRequest>,
     params: ResponsesCallContext,
-    original_request: &ResponsesRequest,
+    original_request: &Arc<ResponsesRequest>,
     background: Option<BackgroundStream>,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
@@ -139,8 +134,9 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     // Create channel for transformed SSE events
     let (tx, rx) = sse_channel();
 
-    // Spawn background task to transform stream
-    let original_request_clone = original_request.clone();
+    // Spawn background task to transform stream; it takes a share of the
+    // request (a count), not a copy of it.
+    let original_request_clone = Arc::clone(original_request);
     let response_storage = ctx.response_storage.clone();
     let conversation_storage = ctx.conversation_storage.clone();
     let conversation_item_storage = ctx.conversation_item_storage.clone();
@@ -310,7 +306,7 @@ enum BodyRead {
 /// client left only when the body next yields, and the engine request behind
 /// the body would run on as long. Here every read races the body against the
 /// client's leaving, looked at first so a busy body cannot outrun it; on
-/// [`BodyRead::ClientLeft`] the caller returns, the body is dropped with it,
+/// [`BodyRead::ClientLeft`] the caller ends its read and drops the body,
 /// and the chat layer ends the engine request the way it does for its own
 /// clients. A background response's `tx` is the sender of its relay, which
 /// closes with the work and not with the client: its reads are the body's
@@ -323,6 +319,64 @@ async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
     }
 }
 
+/// The record of a stored foreground stream whose client left mid-stream, as
+/// the `response.created` it announced promised: the items streamed so far
+/// (the open ones closed, in progress), status `cancelled` when no finish had
+/// been read (a finish the stream had read stands, with its own statuses), the
+/// status the background cancel path writes for a response stopped before its end; the
+/// GET and a `previous_response_id` chain answer from it. The emitter is
+/// abandoned first: its item events are built into the object and sent to
+/// nobody. An unstored stream records nothing, as before; a background one
+/// never meets the departure (its relay outlives the client). The chat body
+/// has gone with the frame loop, which ended the generation on the engine.
+/// The answer is the departure, as before.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the record takes the storage handles of the transform it ends"
+)]
+async fn record_departure(
+    mut event_emitter: ResponseStreamEventEmitter,
+    usage: Option<ResponsesUsage>,
+    original_request: &ResponsesRequest,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
+    request_context: Option<StorageRequestContext>,
+    tx: &SseSender,
+) -> Result<(), String> {
+    if stored_foreground(original_request) {
+        event_emitter.abandon();
+        // A finish the stream had already read stands (a `length` finish
+        // keeps its `incomplete_details`); only a generation cut before its
+        // finish is recorded as cancelled.
+        if event_emitter.finish_reason().is_none() {
+            event_emitter.set_finish_reason(Some("cancelled"));
+        }
+        event_emitter.close_items(tx).await?;
+        let mut final_response = event_emitter.finalize(None);
+        final_response.usage = usage;
+        if let Err(e) = persist_response_if_needed(
+            conversation_storage,
+            conversation_item_storage,
+            response_storage,
+            &final_response,
+            original_request,
+            tenant,
+            request_context,
+        )
+        .await
+        {
+            debug!(
+                response_id = %final_response.id,
+                error = %e.message,
+                "The record of a stream its client left could not be written"
+            );
+        }
+    }
+    Err("Client disconnected".to_string())
+}
+
 /// Process chat SSE stream and transform to responses format
 #[expect(
     clippy::too_many_arguments,
@@ -330,7 +384,7 @@ async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
 )]
 async fn process_and_transform_sse_stream(
     body: Body,
-    original_request: ResponsesRequest,
+    original_request: Arc<ResponsesRequest>,
     response_id: Option<String>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
@@ -339,22 +393,21 @@ async fn process_and_transform_sse_stream(
     request_context: Option<StorageRequestContext>,
     tx: SseSender,
 ) -> Result<(), String> {
-    // Create accumulator for final response
-    let mut accumulator = StreamingResponseAccumulator::new(&original_request);
+    // The usage of the last chunk that carried one, for the final object.
+    let mut usage: Option<Usage> = None;
 
     // Create event emitter for OpenAI-compatible streaming; a background
     // response streams under the id its queued record was stored under.
     let response_id = response_id.unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
-    let mut event_emitter = ResponseStreamEventEmitter::new(response_id.clone(), model, created_at);
-    event_emitter.set_original_request(original_request.clone());
+    let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+    event_emitter.set_original_request(ResponsesRequest::clone(&original_request));
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
-    let event = event_emitter.emit_created();
     event_emitter
-        .send_event(&event, &tx)
+        .send_created(&tx)
         .await
         .map_err(|_| "Failed to send response.created event".to_string())?;
 
@@ -366,9 +419,8 @@ async fn process_and_transform_sse_stream(
             .map_err(|_| "Failed to send response.queued event".to_string())?;
     }
 
-    let event = event_emitter.emit_in_progress();
     event_emitter
-        .send_event(&event, &tx)
+        .send_in_progress(&tx)
         .await
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
@@ -376,6 +428,9 @@ async fn process_and_transform_sse_stream(
     let mut stream = body.into_data_stream();
 
     let mut terminal_error = None;
+    // The client left: met by the body read, by an event it no longer takes,
+    // or by the emitter's send. The loop ends there.
+    let mut client_left = false;
     // Process the stream frame by frame; a frame holds one or more SSE events.
     'frames: loop {
         let chunk = match next_frame(&mut stream, &tx).await {
@@ -385,10 +440,10 @@ async fn process_and_transform_sse_stream(
                 break;
             }
             BodyRead::End => break,
-            // The chat body goes with this return, which ends the generation
-            // on the engine; the stream ends as it does when the client's
-            // leaving is met at the next frame, and nothing of it is stored.
-            BodyRead::ClientLeft => return Err("Client disconnected".to_string()),
+            BodyRead::ClientLeft => {
+                client_left = true;
+                break;
+            }
         };
 
         let frame = frame_text(&chunk);
@@ -396,8 +451,16 @@ async fn process_and_transform_sse_stream(
             match event {
                 ChatSseEvent::Done => break 'frames,
                 ChatSseEvent::Chunk(chat_chunk) => {
-                    accumulator.process_chunk(&chat_chunk);
-                    event_emitter.process_chunk(&chat_chunk, &tx).await?;
+                    if let Some(chunk_usage) = &chat_chunk.usage {
+                        usage = Some(chunk_usage.clone());
+                    }
+                    if let Err(error) = event_emitter.process_chunk(&chat_chunk, &tx).await {
+                        if tx.is_closed() {
+                            client_left = true;
+                            break 'frames;
+                        }
+                        return Err(error);
+                    }
                 }
                 ChatSseEvent::UpstreamError(error) => {
                     terminal_error = Some(error);
@@ -411,23 +474,49 @@ async fn process_and_transform_sse_stream(
                         .await
                         .is_err()
                     {
-                        return Err("Client disconnected".to_string());
+                        client_left = true;
+                        break 'frames;
                     }
                 }
             }
         }
     }
 
-    // Use the same complete usage representation for the terminal event and storage.
+    // The chat body goes here, which ends the generation on the engine (on
+    // the client's leaving as the early return did; on every other end the
+    // body is spent). A stored foreground stream its client left is still
+    // recorded, under the id it announced; the answer is the departure.
+    drop(stream);
+    if client_left {
+        return record_departure(
+            event_emitter,
+            usage
+                .as_ref()
+                .map(|usage| ResponsesUsage::Modern(ResponseUsage::from(usage))),
+            &original_request,
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            tenant.as_deref(),
+            request_context,
+            &tx,
+        )
+        .await;
+    }
+
+    // The final object is the emitter's own: the items its events announced,
+    // under the ids they carry, so the stored object and the stream agree. A
+    // stream cut short before its finish closes its open items first (a
+    // generation that failed leaves them in progress), the record follows,
+    // then the terminal event.
     if terminal_error.is_some() {
-        accumulator.finish_reason = Some("failed".into());
+        event_emitter.set_finish_reason(Some("failed"));
     }
-    let mut final_response = accumulator.finalize();
-    // Persist under the public Responses ID, not the upstream Chat ID.
-    final_response.id = response_id;
-    if let Some(error) = terminal_error.as_ref() {
-        final_response.error = Some(error.clone());
-    }
+    event_emitter.close_items(&tx).await?;
+    let final_response = match terminal_error.as_ref() {
+        Some(error) => event_emitter.finalize_failed(usage, error.clone()),
+        None => event_emitter.finalize(usage),
+    };
     let usage_json = final_response.usage.as_ref().map(|usage| json!(usage));
     let persist = persist_response_if_needed(
         conversation_storage,
@@ -463,226 +552,6 @@ async fn process_and_transform_sse_stream(
     Ok(())
 }
 
-/// Response accumulator for streaming responses (non-MCP path)
-struct StreamingResponseAccumulator {
-    // Response metadata
-    response_id: String,
-    model: String,
-    created_at: i64,
-
-    // Accumulated content
-    content_buffer: String,
-    reasoning_buffer: String,
-    tool_calls: Vec<ResponseOutputItem>,
-
-    // Completion state
-    finish_reason: Option<String>,
-    usage: Option<Usage>,
-
-    // Original request for final response construction
-    original_request: ResponsesRequest,
-}
-
-impl StreamingResponseAccumulator {
-    fn new(original_request: &ResponsesRequest) -> Self {
-        Self {
-            response_id: String::new(),
-            model: String::new(),
-            created_at: 0,
-            content_buffer: String::new(),
-            reasoning_buffer: String::new(),
-            tool_calls: Vec::new(),
-            finish_reason: None,
-            usage: None,
-            original_request: original_request.clone(),
-        }
-    }
-
-    fn process_chunk(&mut self, chunk: &ChatCompletionStreamResponse) {
-        // Initialize metadata on first chunk
-        if self.response_id.is_empty() {
-            self.response_id.clone_from(&chunk.id);
-            self.model.clone_from(&chunk.model);
-            self.created_at = chunk.created as i64;
-        }
-
-        // Process first choice (responses API doesn't support n>1)
-        if let Some(choice) = chunk.choices.first() {
-            // Accumulate content
-            if let Some(content) = &choice.delta.content {
-                self.content_buffer.push_str(content);
-            }
-
-            // Accumulate reasoning
-            if let Some(reasoning) = &choice.delta.reasoning_content {
-                self.reasoning_buffer.push_str(reasoning);
-            }
-
-            // Process tool call deltas
-            if let Some(tool_call_deltas) = &choice.delta.tool_calls {
-                for delta in tool_call_deltas {
-                    // Use index directly (it's a u32, not Option<u32>)
-                    let index = delta.index as usize;
-
-                    // Ensure we have enough tool calls
-                    while self.tool_calls.len() <= index {
-                        self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
-                            id: None,
-                            call_id: String::new(),
-                            name: String::new(),
-                            namespace: None,
-                            arguments: String::new(),
-                            output: None,
-                            status: "in_progress".to_string(),
-                        });
-                    }
-
-                    // Update the tool call at this index
-                    if let ResponseOutputItem::FunctionToolCall {
-                        id,
-                        call_id,
-                        name,
-                        arguments,
-                        ..
-                    } = &mut self.tool_calls[index]
-                    {
-                        if let Some(delta_id) = &delta.id {
-                            id.get_or_insert_with(String::new).push_str(delta_id);
-                            call_id.push_str(delta_id);
-                        }
-                        if let Some(function) = &delta.function {
-                            if let Some(delta_name) = &function.name {
-                                name.push_str(delta_name);
-                            }
-                            if let Some(delta_args) = &function.arguments {
-                                arguments.push_str(delta_args);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Update finish reason
-            if let Some(reason) = &choice.finish_reason {
-                self.finish_reason = Some(reason.clone());
-            }
-        }
-
-        // Update usage
-        if let Some(usage) = &chunk.usage {
-            self.usage = Some(usage.clone());
-        }
-    }
-
-    fn finalize(self) -> ResponsesResponse {
-        let mut output: Vec<ResponseOutputItem> = Vec::new();
-
-        // Add message content if present
-        if !self.content_buffer.is_empty() {
-            output.push(ResponseOutputItem::Message {
-                id: format!("msg_{}", self.response_id),
-                role: "assistant".to_string(),
-                content: vec![ResponseContentPart::OutputText {
-                    text: self.content_buffer,
-                    annotations: vec![],
-                    logprobs: None,
-                }],
-                status: if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
-                    "in_progress"
-                } else {
-                    "completed"
-                }
-                .to_string(),
-                phase: None,
-            });
-        }
-
-        // Add reasoning if present
-        if !self.reasoning_buffer.is_empty() {
-            output.push(ResponseOutputItem::new_reasoning(
-                format!("reasoning_{}", self.response_id),
-                vec![],
-                vec![ResponseReasoningContent::ReasoningText {
-                    text: self.reasoning_buffer,
-                }],
-                Some("completed".to_string()),
-            ));
-        }
-
-        // The cut-call read comes first, on the calls' function-shaped
-        // arguments: a custom tool's item carries no status.
-        let finish_reason = self.finish_reason.as_deref();
-        let cut = cut_call(
-            finish_reason,
-            self.tool_calls.iter().filter_map(|item| match item {
-                ResponseOutputItem::FunctionToolCall { arguments, .. } => Some(arguments.as_str()),
-                _ => None,
-            }),
-        );
-
-        // Add tool calls: a call to a custom tool maps back to its
-        // `custom_tool_call` item, as the non-streaming conversion maps it; a
-        // function call takes the status its arguments and the finish say.
-        let tools = self.original_request.tools.as_deref();
-        let custom_names = custom_tool_names(tools);
-        output.extend(self.tool_calls.into_iter().map(|item| match item {
-            ResponseOutputItem::FunctionToolCall {
-                id,
-                call_id,
-                name,
-                arguments,
-                output,
-                ..
-            } => {
-                let custom = custom_names.contains(&name);
-                let (name, namespace) = resolve_function_identity(tools, &name);
-                if custom {
-                    ResponseOutputItem::CustomToolCall {
-                        call_id,
-                        input: custom_tool_input(&arguments),
-                        name,
-                        id,
-                        namespace,
-                    }
-                } else {
-                    let status = function_call_status(finish_reason, &arguments).to_string();
-                    ResponseOutputItem::FunctionToolCall {
-                        id,
-                        call_id,
-                        name,
-                        namespace,
-                        arguments,
-                        output,
-                        status,
-                    }
-                }
-            }
-            other => other,
-        }));
-
-        // The stored object's status is the terminal event's: a `length`
-        // finish is the token limit, a cut call leaves it incomplete as well.
-        let (status, incomplete_details) = response_status(finish_reason, cut);
-
-        // Convert usage
-        let usage = self.usage.as_ref().map(conversions::responses_usage);
-
-        let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
-            .copy_from_request(&self.original_request)
-            .created_at(self.created_at)
-            .status(status)
-            .output(output)
-            .maybe_usage(usage);
-        if let Some(details) = incomplete_details {
-            builder = builder.incomplete_details(details);
-        }
-        if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
-            builder = builder.error(error);
-        }
-        builder.build()
-    }
-}
-
 // ============================================================================
 // MCP Streaming Path
 // ============================================================================
@@ -695,7 +564,7 @@ impl StreamingResponseAccumulator {
 pub(super) async fn execute_tool_loop_streaming(
     ctx: &ResponsesContext,
     current_request: ResponsesRequest,
-    original_request: &ResponsesRequest,
+    original_request: &Arc<ResponsesRequest>,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
     background: Option<BackgroundStream>,
@@ -704,9 +573,9 @@ pub(super) async fn execute_tool_loop_streaming(
     let (tx, rx) = sse_channel();
     let (startup_tx, startup_rx) = stream_startup_channel();
 
-    // Clone data for background task
+    // Clone data for background task; the request is shared by count, not copied.
     let ctx_clone = ctx.clone();
-    let original_request_clone = original_request.clone();
+    let original_request_clone = Arc::clone(original_request);
     // A background stream's events go through a relay, so the work and its
     // terminal record outlive a client that leaves.
     let tx = match &background {
@@ -879,15 +748,22 @@ async fn stream_mcp_call(
         Some(tool_output.server_label.as_str()),
         Some(&response_format),
     );
-
-    if success {
-        let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
-        emitter.send_event(&event, tx).await?;
-    } else {
-        let err_text = tool_output
+    // The call executed: its item is stored and marked complete, and its
+    // metrics and place in the loop's history recorded, before the sends
+    // that follow, so a client who left during the call changes neither the
+    // record nor the counts; `output_item.done` is still sent after the
+    // completion event, in order.
+    emitter.store_output_item_data(output_index, item_done.clone());
+    emitter.complete_output_item(output_index);
+    let failure = (!success).then(|| {
+        tool_output
             .error_message
             .clone()
-            .unwrap_or_else(|| output_str.clone());
+            .unwrap_or_else(|| output_str.clone())
+    });
+    record_mcp_call(state, site.model, tool_output, output_str, output_item);
+
+    if let Some(err_text) = failure {
         warn!("Tool execution returned error: {}", err_text);
 
         // `response.mcp_call.failed` is the only `*.failed` event
@@ -902,14 +778,40 @@ async fn stream_mcp_call(
             let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
             emitter.send_event(&event, tx).await?;
         }
+    } else {
+        let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
+        emitter.send_event(&event, tx).await?;
     }
 
     let event = emitter.emit_output_item_done(output_index, &item_done);
     emitter.send_event(&event, tx).await?;
-    emitter.complete_output_item(output_index);
-
-    record_mcp_call(state, site.model, tool_output, output_str, output_item);
     Ok(())
+}
+
+/// How the tool loop's turns ended: done (the terminal event follows), failed
+/// with the terminal error object, or left by the client (the departure is
+/// recorded, no event follows).
+enum Turns {
+    Done,
+    Failed(Value),
+    /// The client left: at the loop's own sends between generations (the
+    /// tool list, a call's events, the reasoning item), or inside one.
+    ClientLeft {
+        between: bool,
+    },
+}
+
+impl Turns {
+    /// A failure met at the loop's own sends while the client is gone is the
+    /// client's leaving; any other one answers as before (the loop's error,
+    /// nothing recorded).
+    fn left_or(tx: &SseSender, message: String) -> Result<Self, String> {
+        if tx.is_closed() {
+            Ok(Self::ClientLeft { between: true })
+        } else {
+            Err(message)
+        }
+    }
 }
 
 /// Internal streaming tool loop implementation
@@ -948,14 +850,12 @@ async fn execute_tool_loop_streaming_internal(
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
-    let event = emitter.emit_created();
-    emitter.send_event(&event, &tx).await?;
+    emitter.send_created(&tx).await?;
     if original_request.background.unwrap_or(false) {
         let event = emitter.emit_queued();
         emitter.send_event(&event, &tx).await?;
     }
-    let event = emitter.emit_in_progress();
-    emitter.send_event(&event, &tx).await?;
+    emitter.send_in_progress(&tx).await?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&session);
@@ -967,7 +867,7 @@ async fn execute_tool_loop_streaming_internal(
     // Flag to track if mcp_list_tools has been emitted
     let mut mcp_list_tools_emitted = false;
 
-    let terminal_error = loop {
+    let turns = 'turns: loop {
         trace!("Streaming MCP tool loop iteration {}", state.iteration);
 
         // Emit mcp_list_tools as first output item (only once, on first iteration)
@@ -975,9 +875,12 @@ async fn execute_tool_loop_streaming_internal(
             for binding in session.mcp_servers() {
                 let tools_for_server = session.list_tools_for_server(&binding.server_key);
 
-                emitter
+                if let Err(message) = emitter
                     .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, &tx)
-                    .await?;
+                    .await
+                {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
             mcp_list_tools_emitted = true;
         }
@@ -1036,6 +939,10 @@ async fn execute_tool_loop_streaming_internal(
             ));
         }
 
+        // A fresh generation: no finish until its terminal chunk names one, so
+        // the finish of an earlier turn of the request never reads for this
+        // one (as the Harmony loop does).
+        emitter.set_finish_reason(None);
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
@@ -1045,7 +952,15 @@ async fn execute_tool_loop_streaming_internal(
             .await
             {
                 Ok(response) => response,
-                Err(error) => break Some(error),
+                // The client's leaving is read at the next frame (or at
+                // the send the emitter could not make): a departure, not a
+                // failure of the stream; the error it came with stays in the
+                // log for a reader of the cancelled record.
+                Err(error) if tx.is_closed() => {
+                    debug!(%error, "The chat stream's error met after the client left");
+                    break Turns::ClientLeft { between: false };
+                }
+                Err(error) => break Turns::Failed(error),
             };
         state.record_usage(accumulated_response.usage.as_ref());
         // Truncated or failed generation cannot request MCP execution.
@@ -1055,14 +970,14 @@ async fn execute_tool_loop_streaming_internal(
             .and_then(|choice| choice.finish_reason.as_deref())
             .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"))
         {
-            break None;
+            break Turns::Done;
         }
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
         // Neither can a server call the generation did not finish.
         if has_unfinished_mcp_call(&tool_calls, &session) {
-            break None;
+            break Turns::Done;
         }
 
         if !tool_calls.is_empty() {
@@ -1077,13 +992,17 @@ async fn execute_tool_loop_streaming_internal(
                 model: &current_request.model,
             };
             for tool_call in mcp_tool_calls {
-                stream_mcp_call(&site, &mut state, &mut emitter, &tx, tool_call).await?;
+                if let Err(message) =
+                    stream_mcp_call(&site, &mut state, &mut emitter, &tx, tool_call).await
+                {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
 
             if let Some(limit) = tool_call_limit {
                 break match limit {
-                    McpToolCallLimit::User => None,
-                    McpToolCallLimit::Safety => Some(json!({
+                    McpToolCallLimit::User => Turns::Done,
+                    McpToolCallLimit::Safety => Turns::Failed(json!({
                         "code": "max_tool_calls_exceeded",
                         "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
                     })),
@@ -1093,7 +1012,7 @@ async fn execute_tool_loop_streaming_internal(
             // process_chunk already emitted these function-call items.
             // Return them to the client without duplicating their events.
             if !function_tool_calls.is_empty() {
-                break None;
+                break Turns::Done;
             }
 
             // Build next request with conversation history
@@ -1114,16 +1033,46 @@ async fn execute_tool_loop_streaming_internal(
         // Emit reasoning item if present
         if let Some(reasoning) = reasoning_content {
             if !reasoning.is_empty() {
-                emitter.emit_reasoning_item(&tx, Some(reasoning)).await?;
+                if let Err(message) = emitter.emit_reasoning_item(&tx, Some(reasoning)).await {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
         }
 
         // Text message events already emitted naturally by process_chunk during stream processing
         // (OpenAI router approach - text only appears on final iteration when no tool calls)
 
-        break None;
+        break Turns::Done;
     };
 
+    let terminal_error = match turns {
+        Turns::Done => None,
+        Turns::Failed(error) => Some(error),
+        // A stored foreground stream its client left is recorded as the
+        // regular stream records it: cancelled, the open items in progress,
+        // under the id it announced; the answer is the departure.
+        Turns::ClientLeft { between } => {
+            // Only a finish that ended the loop's last generation stands. A
+            // departure between generations, or in a generation that ended
+            // with tool calls, cut the response short: cancelled.
+            if between || emitter.finish_reason() == Some("tool_calls") {
+                emitter.set_finish_reason(None);
+            }
+            let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+            return record_departure(
+                emitter,
+                state.usage.clone().map(ResponsesUsage::Modern),
+                original_request,
+                ctx.response_storage.clone(),
+                ctx.conversation_storage.clone(),
+                ctx.conversation_item_storage.clone(),
+                tenant.as_deref(),
+                ctx.request_context.clone(),
+                &tx,
+            )
+            .await;
+        }
+    };
     let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
     // The final object, read before the terminal event drains the emitter's
     // items; a background response needs its terminal record under the id
@@ -1373,17 +1322,6 @@ mod tests {
         assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
     };
 
-    #[test]
-    fn streaming_accumulator_serializes_responses_api_usage() {
-        let request = ResponsesRequest::default();
-        let mut accumulator = StreamingResponseAccumulator::new(&request);
-        accumulator.usage = Some(responses_api_test_usage());
-
-        let wire = serde_json::to_value(accumulator.finalize())
-            .expect("streaming response should serialize");
-        assert_responses_api_usage(&wire);
-    }
-
     /// Runs chat SSE frames through the Responses transform as an unstored
     /// request over empty memory storages (no tenant, no request context) and
     /// hands back the client's receiver once the transform has returned.
@@ -1396,10 +1334,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(false),
                 ..Default::default()
-            },
+            }),
             None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1453,206 +1391,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn streaming_accumulator_populates_call_id_from_tool_delta_id() {
-        let request = ResponsesRequest::default();
-        let mut accumulator = StreamingResponseAccumulator::new(&request);
-        let chunk = ChatCompletionStreamResponse::builder("chatcmpl_test", "test-model")
-            .add_choice_tool_name(0, "call_streamed", "lookup")
-            .build();
-
-        accumulator.process_chunk(&chunk);
-
-        assert_eq!(accumulator.tool_calls.len(), 1);
-        match &accumulator.tool_calls[0] {
-            ResponseOutputItem::FunctionToolCall {
-                id, call_id, name, ..
-            } => {
-                assert_eq!(id.as_deref(), Some("call_streamed"));
-                assert_eq!(call_id, "call_streamed");
-                assert_eq!(name, "lookup");
-            }
-            other => panic!("expected function tool call, got {other:?}"),
-        }
-    }
-    #[test]
-    fn namespace_streaming_accumulator_resolves_fragmented_name() {
-        let request: ResponsesRequest = namespace_test_request();
-        let mut accumulator = StreamingResponseAccumulator::new(&request);
-        accumulator.process_chunk(
-            &ChatCompletionStreamResponse::builder("chat_test", "test-model")
-                .add_choice_tool_name(0, "call_test", "weather.")
-                .build(),
-        );
-        let chunk = serde_json::from_value(serde_json::json!({
-            "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-            "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]
-        })).unwrap();
-        accumulator.process_chunk(&chunk);
-        let wire = serde_json::to_value(accumulator.finalize()).unwrap();
-        assert_eq!(wire["output"][0]["name"], "lookup");
-        assert_eq!(wire["output"][0]["namespace"], "weather");
-        assert_eq!(wire["output"][0]["arguments"], "{}");
-    }
-    #[test]
-    fn stored_streamed_tool_calls_have_terminal_status() {
-        for (finish_reason, expected_status) in
-            [("tool_calls", "completed"), ("length", "incomplete")]
-        {
-            let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
-            let chunk = serde_json::from_value(serde_json::json!({
-                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{"tool_calls":[
-                    {"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}}
-                ]},"finish_reason":finish_reason}]
-            })).unwrap();
-            accumulator.process_chunk(&chunk);
-            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
-            assert_eq!(wire["status"], expected_status);
-            assert_eq!(wire["output"][0]["status"], "completed");
-            assert_eq!(wire["output"][0]["call_id"], "call_weather");
-            assert_eq!(wire["output"][0]["arguments"], "{}");
-            if finish_reason == "length" {
-                assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
-            }
-        }
-    }
-
-    #[test]
-    fn failed_generation_does_not_complete_stored_partial_messages_or_tool_calls() {
-        for finish_reason in ["failed", "error"] {
-            let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
-            let partial = serde_json::from_value(serde_json::json!({
-                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{"content":"Partial reply","tool_calls":[
-                    {"index":0,"id":"call_weather","type":"function","function":{
-                        "name":"weather","arguments":"{\"city\":"
-                    }}
-                ]},"finish_reason":null}]
-            }))
-            .unwrap();
-            accumulator.process_chunk(&partial);
-            let failure = serde_json::from_value(serde_json::json!({
-                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]
-            }))
-            .unwrap();
-            accumulator.process_chunk(&failure);
-            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
-            assert_eq!(wire["status"], "failed", "{finish_reason}");
-            assert_eq!(wire["output"].as_array().unwrap().len(), 2);
-            assert_eq!(wire["output"][0]["type"], "message");
-            assert_eq!(
-                wire["output"][0]["status"], "in_progress",
-                "{finish_reason}"
-            );
-            assert_eq!(wire["output"][0]["content"][0]["text"], "Partial reply");
-            let item = &wire["output"][1];
-            assert_eq!(item["status"], "in_progress", "{finish_reason}");
-            assert_eq!(item["call_id"], "call_weather");
-            assert_eq!(item["arguments"], "{\"city\":");
-        }
-    }
-
-    #[test]
-    fn length_truncated_stored_tool_call_preserves_earlier_completed_calls() {
-        let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
-        let partial = serde_json::from_value(serde_json::json!({
-            "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-            "choices":[{"index":0,"delta":{"tool_calls":[
-                {"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}},
-                {"index":1,"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
-            ]},"finish_reason":null}]
-        })).unwrap();
-        accumulator.process_chunk(&partial);
-        let limit = serde_json::from_value(serde_json::json!({
-            "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-            "choices":[{"index":0,"delta":{},"finish_reason":"length"}]
-        }))
-        .unwrap();
-        accumulator.process_chunk(&limit);
-        let wire = serde_json::to_value(accumulator.finalize()).unwrap();
-        assert_eq!(wire["status"], "incomplete");
-        assert_eq!(wire["incomplete_details"]["reason"], "max_output_tokens");
-        assert_eq!(wire["output"].as_array().unwrap().len(), 2);
-        assert_eq!(wire["output"][0]["status"], "completed");
-        assert_eq!(wire["output"][0]["arguments"], "{}");
-        assert_eq!(wire["output"][1]["status"], "incomplete");
-        assert_eq!(wire["output"][1]["call_id"], "call_time");
-        assert_eq!(wire["output"][1]["arguments"], "{\"tz\":");
-    }
-
-    #[test]
-    fn a_stored_streamed_turn_whose_call_was_cut_reads_incomplete() {
-        for finish_reason in [
-            serde_json::json!("abort"),
-            serde_json::json!("stop"),
-            serde_json::json!(null),
-        ] {
-            let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
-            let partial = serde_json::from_value(serde_json::json!({
-                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{"tool_calls":[
-                    {"index":0,"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
-                ]},"finish_reason":null}]
-            }))
-            .unwrap();
-            accumulator.process_chunk(&partial);
-            let end = serde_json::from_value(serde_json::json!({
-                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]
-            }))
-            .unwrap();
-            accumulator.process_chunk(&end);
-            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
-            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
-            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
-            assert_eq!(wire["output"][0]["status"], "incomplete", "{finish_reason}");
-            assert_eq!(
-                wire["output"][0]["arguments"], "{\"tz\":",
-                "{finish_reason}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_stored_streamed_turn_whose_custom_call_was_cut_reads_incomplete_and_keeps_its_item() {
-        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
-            "model": "test-model", "input": "hi",
-            "tools": [{"type": "custom", "name": "emit_command"}]
-        }))
-        .unwrap();
-        for finish_reason in [
-            serde_json::json!("abort"),
-            serde_json::json!("stop"),
-            serde_json::json!(null),
-        ] {
-            let mut accumulator = StreamingResponseAccumulator::new(&request);
-            let partial = serde_json::from_value(serde_json::json!({
-                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{"tool_calls":[
-                    {"index":0,"id":"call_c","type":"function","function":{"name":"emit_command","arguments":"{\"input\": \"pw"}}
-                ]},"finish_reason":null}]
-            }))
-            .unwrap();
-            accumulator.process_chunk(&partial);
-            let end = serde_json::from_value(serde_json::json!({
-                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]
-            }))
-            .unwrap();
-            accumulator.process_chunk(&end);
-            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
-            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
-            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
-            assert_eq!(
-                wire["output"][0]["type"], "custom_tool_call",
-                "{finish_reason}"
-            );
-            assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
-        }
-    }
-
     #[tokio::test]
     async fn upstream_error_closes_reasoning_and_emits_failed_response() {
         let reasoning = json!({"id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
@@ -1690,63 +1428,333 @@ mod tests {
         assert!(!events.iter().any(|e| e["type"] == "response.completed"));
     }
 
+    /// The `data:` payloads the client read, in order, once the transform has
+    /// dropped its sender.
+    async fn drained_events(rx: &mut mpsc::Receiver<Result<Bytes, std::io::Error>>) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            events.extend(
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|data| serde_json::from_str::<Value>(data).unwrap()),
+            );
+        }
+        events
+    }
+
+    /// Runs chat SSE frames through the Responses transform as a STORED
+    /// request over memory storages (no tenant, no request context) and hands
+    /// back the events the client read and the object the store holds under
+    /// the id `response.created` announced.
+    async fn transformed_and_stored(
+        frames: Vec<String>,
+        request: ResponsesRequest,
+    ) -> (Vec<Value>, Value) {
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            Arc::new(ResponsesRequest {
+                store: Some(true),
+                ..request
+            }),
+            None,
+            storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        let events = drained_events(&mut rx).await;
+        let id = events[0]["response"]["id"]
+            .as_str()
+            .expect("response.created names the id");
+        let stored = storage
+            .get_response(&smg_data_connector::ResponseId::from(id))
+            .await
+            .unwrap()
+            .expect("a stored request's record")
+            .raw_response;
+        (events, stored)
+    }
+
+    /// The item ids of a response object's output, in order.
+    fn output_ids(response: &Value) -> Vec<String> {
+        response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_stored_streamed_object_serializes_responses_api_usage() {
+        let chunk = ChatCompletionStreamResponse::builder("chat_test", "test-model")
+            .usage(responses_api_test_usage())
+            .build();
+        let frames = vec![
+            format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()),
+            "data: [DONE]\n\n".into(),
+        ];
+        let (events, stored) = transformed_and_stored(frames, ResponsesRequest::default()).await;
+        assert_responses_api_usage(&stored);
+        // A turn without items: the terminal event and the stored object both
+        // read `output: []`; no message is invented for it.
+        let terminal = events.last().expect("a terminal event");
+        assert_eq!(terminal["response"]["output"], json!([]), "{terminal}");
+        assert_eq!(terminal["response"]["output"], stored["output"]);
+    }
+
+    /// The stored object of a stream is the one its events announced: the
+    /// items in their streamed order, each under the id its
+    /// `response.output_item.added` carried (the reasoning item `rs_`, the
+    /// message `msg_`, the function call `fc_`), a function call's own id
+    /// beside the `call_id` the client echoes, and the terminal event names
+    /// the same items.
+    #[tokio::test]
+    async fn the_stored_streamed_object_carries_the_items_the_events_announced() {
+        let frames = vec![
+            chat_event(json!({"reasoning_content":"think"}), None),
+            chat_event(json!({"content":"Hello"}), None),
+            chat_event(
+                json!({"tool_calls":[{"index":0,"id":"call_streamed","type":"function",
+                    "function":{"name":"lookup","arguments":"{}"}}]}),
+                None,
+            ),
+            chat_event(json!({}), Some("tool_calls")),
+            "data: [DONE]\n\n".into(),
+        ];
+        let (events, stored) = transformed_and_stored(frames, ResponsesRequest::default()).await;
+        let output = stored["output"].as_array().unwrap();
+        let kinds: Vec<&str> = output
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["reasoning", "message", "function_call"], "{stored}");
+        for (item, prefix) in output.iter().zip(["rs_", "msg_", "fc_"]) {
+            let id = item["id"].as_str().unwrap();
+            assert!(id.starts_with(prefix), "{item}");
+            for event_type in ["response.output_item.added", "response.output_item.done"] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| e["type"] == event_type && e["item"]["id"] == id)
+                        .count(),
+                    1,
+                    "{event_type} of {id}"
+                );
+            }
+        }
+        let call = &output[2];
+        assert_eq!(call["call_id"], "call_streamed");
+        assert_ne!(call["id"], call["call_id"], "{call}");
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+        assert_eq!(output_ids(&terminal["response"]), output_ids(&stored));
+    }
+
+    #[tokio::test]
+    async fn namespace_stored_streamed_call_keeps_its_structured_identity() {
+        let first = ChatCompletionStreamResponse::builder("chat_test", "test-model")
+            .add_choice_tool_name(0, "call_test", "weather.lookup")
+            .build();
+        let frames = vec![
+            format!("data: {}\n\n", serde_json::to_string(&first).unwrap()),
+            chat_event(
+                json!({"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}),
+                Some("tool_calls"),
+            ),
+            "data: [DONE]\n\n".into(),
+        ];
+        let (_, stored) = transformed_and_stored(frames, namespace_test_request()).await;
+        assert_eq!(stored["output"][0]["name"], "lookup");
+        assert_eq!(stored["output"][0]["namespace"], "weather");
+        assert_eq!(stored["output"][0]["arguments"], "{}");
+        assert_eq!(stored["output"][0]["call_id"], "call_test");
+    }
+
+    #[tokio::test]
+    async fn stored_streamed_tool_calls_have_terminal_status() {
+        for (finish_reason, expected_status) in
+            [("tool_calls", "completed"), ("length", "incomplete")]
+        {
+            let frames = vec![
+                chat_event(
+                    json!({"tool_calls":[{"index":0,"id":"call_weather","type":"function",
+                        "function":{"name":"weather","arguments":"{}"}}]}),
+                    Some(finish_reason),
+                ),
+                "data: [DONE]\n\n".into(),
+            ];
+            let (_, stored) = transformed_and_stored(frames, ResponsesRequest::default()).await;
+            assert_eq!(stored["status"], expected_status);
+            assert_eq!(stored["output"][0]["status"], "completed");
+            assert_eq!(stored["output"][0]["call_id"], "call_weather");
+            assert_eq!(stored["output"][0]["arguments"], "{}");
+            if finish_reason == "length" {
+                assert_eq!(stored["incomplete_details"]["reason"], "max_output_tokens");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_generation_does_not_complete_stored_partial_messages_or_tool_calls() {
+        for finish_reason in ["failed", "error"] {
+            let frames = vec![
+                chat_event(
+                    json!({"content":"Partial reply","tool_calls":[{"index":0,"id":"call_weather",
+                        "type":"function","function":{"name":"weather","arguments":"{\"city\":"}}]}),
+                    None,
+                ),
+                chat_event(json!({}), Some(finish_reason)),
+                "data: [DONE]\n\n".into(),
+            ];
+            let (_, stored) = transformed_and_stored(frames, ResponsesRequest::default()).await;
+            assert_eq!(stored["status"], "failed", "{finish_reason}");
+            assert_eq!(stored["output"].as_array().unwrap().len(), 2);
+            assert_eq!(stored["output"][0]["type"], "message");
+            assert_eq!(
+                stored["output"][0]["status"], "in_progress",
+                "{finish_reason}"
+            );
+            assert_eq!(stored["output"][0]["content"][0]["text"], "Partial reply");
+            let item = &stored["output"][1];
+            assert_eq!(item["status"], "in_progress", "{finish_reason}");
+            assert_eq!(item["call_id"], "call_weather");
+            assert_eq!(item["arguments"], "{\"city\":");
+        }
+    }
+
+    #[tokio::test]
+    async fn length_truncated_stored_tool_call_preserves_earlier_completed_calls() {
+        let frames = vec![
+            chat_event(
+                json!({"tool_calls":[
+                    {"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{}"}},
+                    {"index":1,"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
+                ]}),
+                None,
+            ),
+            chat_event(json!({}), Some("length")),
+            "data: [DONE]\n\n".into(),
+        ];
+        let (_, stored) = transformed_and_stored(frames, ResponsesRequest::default()).await;
+        assert_eq!(stored["status"], "incomplete");
+        assert_eq!(stored["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(stored["output"].as_array().unwrap().len(), 2);
+        assert_eq!(stored["output"][0]["status"], "completed");
+        assert_eq!(stored["output"][0]["arguments"], "{}");
+        assert_eq!(stored["output"][1]["status"], "incomplete");
+        assert_eq!(stored["output"][1]["call_id"], "call_time");
+        assert_eq!(stored["output"][1]["arguments"], "{\"tz\":");
+    }
+
+    /// A call cut before its arguments were whole reads `incomplete` in the
+    /// stored object whatever ended the stream: an abort, a stop, or a body
+    /// that ended with no finish at all (the item is closed when the stream
+    /// ends, so the record keeps it).
+    #[tokio::test]
+    async fn a_stored_streamed_turn_whose_call_was_cut_reads_incomplete() {
+        for finish_reason in [Some("abort"), Some("stop"), None] {
+            let frames = vec![
+                chat_event(
+                    json!({"tool_calls":[{"index":0,"id":"call_time","type":"function",
+                        "function":{"name":"time","arguments":"{\"tz\":"}}]}),
+                    None,
+                ),
+                chat_event(json!({}), finish_reason),
+                "data: [DONE]\n\n".into(),
+            ];
+            let (_, stored) = transformed_and_stored(frames, ResponsesRequest::default()).await;
+            assert_eq!(stored["status"], "incomplete", "{finish_reason:?}");
+            assert!(stored["incomplete_details"].is_null(), "{finish_reason:?}");
+            assert_eq!(
+                stored["output"][0]["status"], "incomplete",
+                "{finish_reason:?}"
+            );
+            assert_eq!(
+                stored["output"][0]["arguments"], "{\"tz\":",
+                "{finish_reason:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stored_streamed_turn_whose_custom_call_was_cut_reads_incomplete_and_keeps_its_item()
+    {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model", "input": "hi",
+            "tools": [{"type": "custom", "name": "emit_command"}]
+        }))
+        .unwrap();
+        for finish_reason in [Some("abort"), Some("stop"), None] {
+            let frames = vec![
+                chat_event(
+                    json!({"tool_calls":[{"index":0,"id":"call_c","type":"function",
+                        "function":{"name":"emit_command","arguments":"{\"input\": \"pw"}}]}),
+                    None,
+                ),
+                chat_event(json!({}), finish_reason),
+                "data: [DONE]\n\n".into(),
+            ];
+            let (_, stored) = transformed_and_stored(frames, request.clone()).await;
+            assert_eq!(stored["status"], "incomplete", "{finish_reason:?}");
+            assert!(stored["incomplete_details"].is_null(), "{finish_reason:?}");
+            assert_eq!(
+                stored["output"][0]["type"], "custom_tool_call",
+                "{finish_reason:?}"
+            );
+            assert_eq!(
+                stored["output"][0]["call_id"], "call_c",
+                "{finish_reason:?}"
+            );
+        }
+    }
+
+    /// A stream that fails after a message and a call were partly streamed
+    /// closes both (in progress) before `response.failed`, and the stored
+    /// object carries the same items under the same ids with the same error,
+    /// whether the failure is the generation's finish or an upstream error
+    /// event before any finish.
     #[tokio::test]
     async fn failed_terminal_retains_and_closes_partial_message_and_function() {
         for finish in [None, Some("failed"), Some("error")] {
-            let request = ResponsesRequest::default();
-            let mut accumulator = StreamingResponseAccumulator::new(&request);
-            let mut emitter =
-                ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
-            let (tx, mut rx) = mpsc::channel(64);
-            let partial: ChatCompletionStreamResponse = serde_json::from_value(json!({
-                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                "choices":[{"index":0,"delta":{"content":"Partial answer", "tool_calls":[{
-                    "index":0,"id":"call_test","type":"function","function":{"name":"lookup","arguments":"{\"city\":"}
-                }]},"finish_reason":null}]
-            })).unwrap();
-            accumulator.process_chunk(&partial);
-            emitter.process_chunk(&partial, &tx).await.unwrap();
-            if let Some(finish) = finish {
-                let last = serde_json::from_value(json!({
-                    "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
-                    "choices":[{"index":0,"delta":{},"finish_reason":finish}]
-                })).unwrap();
-                accumulator.process_chunk(&last);
-                emitter.process_chunk(&last, &tx).await.unwrap();
+            let mut frames = vec![chat_event(
+                json!({"content":"Partial answer","tool_calls":[{"index":0,"id":"call_test",
+                    "type":"function","function":{"name":"lookup","arguments":"{\"city\":"}}]}),
+                None,
+            )];
+            match finish {
+                Some(finish) => frames.push(chat_event(json!({}), Some(finish))),
+                None => frames.push(
+                    "data: {\"error\":{\"code\":\"internal_error\",\"message\":\"engine stopped\"}}\n\n"
+                        .into(),
+                ),
             }
-            let error = json!({"code":"internal_error","message":"engine stopped"});
-            emitter
-                .emit_terminal(None, finish.is_none().then_some(&error), &tx)
-                .await
-                .unwrap();
-            drop(tx);
-            let mut events: Vec<Value> = Vec::new();
-            while let Some(Ok(bytes)) = rx.recv().await {
-                let text = std::str::from_utf8(&bytes).unwrap();
-                events.push(
-                    serde_json::from_str(
-                        text.lines()
-                            .find_map(|line| line.strip_prefix("data: "))
-                            .unwrap(),
-                    )
-                    .unwrap(),
-                );
-            }
+            frames.push("data: [DONE]\n\n".into());
+            let (events, stored) =
+                transformed_and_stored(frames, ResponsesRequest::default()).await;
             let terminal = events.last().unwrap();
-            assert_eq!(terminal["type"], "response.failed");
+            assert_eq!(terminal["type"], "response.failed", "{finish:?}");
             assert_eq!(terminal["response"]["output"].as_array().unwrap().len(), 2);
-            accumulator.finish_reason = Some("failed".into());
-            let stored = serde_json::to_value(accumulator.finalize()).unwrap();
+            assert_eq!(stored["status"], "failed", "{finish:?}");
+            assert_eq!(stored["error"], terminal["response"]["error"], "{finish:?}");
             if finish.is_some() {
-                assert_eq!(terminal["response"]["error"]["code"], "server_error");
                 assert_eq!(stored["error"]["code"], "server_error");
                 assert!(stored["error"]["message"]
                     .as_str()
                     .is_some_and(|s| !s.is_empty()));
-                let saved = serde_json::to_value(emitter.finalize(None)).unwrap();
-                assert_eq!(saved["error"], stored["error"]);
             } else {
-                assert_eq!(terminal["response"]["error"], error);
+                assert_eq!(stored["error"]["code"], "internal_error");
+                assert_eq!(stored["error"]["message"], "engine stopped");
             }
             for kind in ["message", "function_call"] {
                 let output = terminal["response"]["output"]
@@ -1762,9 +1770,10 @@ mod tests {
                     .find(|item| item["type"] == kind)
                     .unwrap();
                 assert_eq!(output["status"], "in_progress", "{output}");
-                assert_eq!(output["status"], saved["status"]);
-                assert_eq!(output["arguments"], saved["arguments"]);
-                assert_eq!(output["content"][0]["text"], saved["content"][0]["text"]);
+                assert_eq!(saved["id"], output["id"]);
+                assert_eq!(saved["status"], output["status"]);
+                assert_eq!(saved["arguments"], output["arguments"]);
+                assert_eq!(saved["content"][0]["text"], output["content"][0]["text"]);
                 for event_type in ["response.output_item.added", "response.output_item.done"] {
                     assert_eq!(
                         events
@@ -1917,6 +1926,291 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection reset"));
+    }
+
+    /// A stored foreground stream whose client leaves mid-stream keeps the
+    /// promise `response.created` made: its record is written with the items
+    /// streamed so far (closed in progress) and status `cancelled`, while the
+    /// chat body is dropped with the read, as before; an unstored one records
+    /// nothing. The transform answers the departure either way.
+    #[tokio::test]
+    async fn a_stored_stream_whose_client_leaves_is_recorded_as_cancelled() {
+        for store in [true, false] {
+            let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let body = Body::from_stream(ReceiverStream::new(body_rx));
+            let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+            let (tx, mut rx) = mpsc::channel(64);
+            let transform = process_and_transform_sse_stream(
+                body,
+                Arc::new(ResponsesRequest {
+                    store: Some(store),
+                    ..Default::default()
+                }),
+                None,
+                storage.clone(),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                None,
+                tx,
+            );
+            let client = async move {
+                body_tx
+                    .send(Ok(Bytes::from(chat_event(
+                        json!({"content":"Hello"}),
+                        None,
+                    ))))
+                    .await
+                    .unwrap();
+                // The client reads up to the text it was streamed, then leaves.
+                let mut id = None;
+                'read: while let Some(Ok(bytes)) = rx.recv().await {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                        let event: Value = serde_json::from_str(data).unwrap();
+                        if event["type"] == "response.created" {
+                            id = event["response"]["id"].as_str().map(str::to_string);
+                        }
+                        if event["type"] == "response.output_text.delta" {
+                            break 'read;
+                        }
+                    }
+                }
+                drop(rx);
+                (id.expect("response.created names the id"), body_tx)
+            };
+            // The joined futures are large; boxed, they stay off the test's stack.
+            let (outcome, (id, body_tx)) = Box::pin(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                async { tokio::join!(transform, client) },
+            ))
+            .await
+            .expect("the body never ends; the client's leaving ends the read");
+            assert_eq!(outcome.unwrap_err(), "Client disconnected");
+            assert!(
+                body_tx.is_closed(),
+                "the chat body is dropped with the read"
+            );
+            let record = storage
+                .get_response(&smg_data_connector::ResponseId::from(id.as_str()))
+                .await
+                .unwrap();
+            if !store {
+                assert!(record.is_none(), "an unstored response records nothing");
+                continue;
+            }
+            let stored = record.expect("the stored stream's record").raw_response;
+            assert_eq!(stored["status"], "cancelled", "{stored}");
+            assert!(stored["error"].is_null(), "{stored}");
+            assert!(stored["incomplete_details"].is_null(), "{stored}");
+            assert_eq!(stored["output"][0]["type"], "message", "{stored}");
+            assert_eq!(stored["output"][0]["status"], "in_progress", "{stored}");
+            assert_eq!(stored["output"][0]["content"][0]["text"], "Hello");
+            assert!(
+                stored["output"][0]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("msg_")),
+                "{stored}"
+            );
+        }
+    }
+
+    /// Reads the client's SSE frames up to the first event of `event_type`
+    /// and returns the id `response.created` announced.
+    async fn read_until<E>(rx: &mut mpsc::Receiver<Result<Bytes, E>>, event_type: &str) -> String {
+        let mut id = None;
+        'read: while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                let event: Value = serde_json::from_str(data).unwrap();
+                if event["type"] == "response.created" {
+                    id = event["response"]["id"].as_str().map(str::to_string);
+                }
+                if event["type"] == event_type {
+                    break 'read;
+                }
+            }
+        }
+        id.expect("response.created names the id")
+    }
+
+    /// The stored object of the response `id`.
+    async fn stored_record(storage: &smg_data_connector::MemoryResponseStorage, id: &str) -> Value {
+        storage
+            .get_response(&smg_data_connector::ResponseId::from(id))
+            .await
+            .unwrap()
+            .expect("the stored stream's record")
+            .raw_response
+    }
+
+    /// The client leaves while the message's closing events are being sent
+    /// (an SSE channel of one slot: the client reads up to the text delta and
+    /// leaves, so the first closing event's send meets the dead client). The
+    /// item was stored before that send, and the finish had been read: the
+    /// record keeps the message, completed, under the stream's own finish.
+    #[tokio::test]
+    async fn a_client_that_leaves_during_the_closing_events_keeps_the_streamed_message() {
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        let transform = process_and_transform_sse_stream(
+            body,
+            Arc::new(ResponsesRequest {
+                store: Some(true),
+                ..Default::default()
+            }),
+            None,
+            storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        );
+        let client = async move {
+            for frame in [
+                chat_event(json!({"content":"Hello"}), None),
+                chat_event(json!({}), Some("stop")),
+            ] {
+                body_tx.send(Ok(Bytes::from(frame))).await.unwrap();
+            }
+            let id = read_until(&mut rx, "response.output_text.delta").await;
+            drop(rx);
+            (id, body_tx)
+        };
+        let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(transform, client) },
+        ))
+        .await
+        .expect("the client's leaving ends the read");
+        assert_eq!(outcome.unwrap_err(), "Client disconnected");
+        let stored = stored_record(&storage, &id).await;
+        assert_eq!(stored["status"], "completed", "{stored}");
+        assert_eq!(stored["output"][0]["type"], "message", "{stored}");
+        assert_eq!(stored["output"][0]["status"], "completed", "{stored}");
+        assert_eq!(
+            stored["output"][0]["content"][0]["text"], "Hello",
+            "{stored}"
+        );
+    }
+
+    /// A finish the stream had already read stands when the client leaves
+    /// before the body ends: a `length` finish is recorded `incomplete` with
+    /// its `incomplete_details`, not `cancelled`, and the message it closed
+    /// keeps its text.
+    #[tokio::test]
+    async fn a_client_that_leaves_after_the_finish_keeps_the_finish() {
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(64);
+        let transform = process_and_transform_sse_stream(
+            body,
+            Arc::new(ResponsesRequest {
+                store: Some(true),
+                ..Default::default()
+            }),
+            None,
+            storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        );
+        let client = async move {
+            for frame in [
+                chat_event(json!({"content":"Hello"}), None),
+                chat_event(json!({}), Some("length")),
+            ] {
+                body_tx.send(Ok(Bytes::from(frame))).await.unwrap();
+            }
+            // The message closed under the finish; the client leaves before
+            // the body ends (no usage chunk, no `[DONE]` yet).
+            let id = read_until(&mut rx, "response.output_item.done").await;
+            drop(rx);
+            (id, body_tx)
+        };
+        let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(transform, client) },
+        ))
+        .await
+        .expect("the client's leaving ends the read");
+        assert_eq!(outcome.unwrap_err(), "Client disconnected");
+        let stored = stored_record(&storage, &id).await;
+        assert_eq!(stored["status"], "incomplete", "{stored}");
+        assert_eq!(
+            stored["incomplete_details"]["reason"], "max_output_tokens",
+            "{stored}"
+        );
+        assert_eq!(
+            stored["output"][0]["content"][0]["text"], "Hello",
+            "{stored}"
+        );
+        assert_ne!(stored["output"][0]["status"], "in_progress", "{stored}");
+    }
+
+    /// Under `cancelled` every item still open when the client left reads
+    /// `in_progress`: a reasoning item, a function call with partial
+    /// arguments, as the message does.
+    #[tokio::test]
+    async fn a_cancelled_record_closes_the_open_reasoning_and_call_items_in_progress() {
+        for (delta, leave_at, item_type) in [
+            (
+                json!({"reasoning_content":"think"}),
+                "response.reasoning_text.delta",
+                "reasoning",
+            ),
+            (
+                json!({"tool_calls":[{"index":0,"id":"call_open","type":"function",
+                    "function":{"name":"lookup","arguments":"{\"q\":"}}]}),
+                "response.function_call_arguments.delta",
+                "function_call",
+            ),
+        ] {
+            let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let body = Body::from_stream(ReceiverStream::new(body_rx));
+            let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+            let (tx, mut rx) = mpsc::channel(64);
+            let transform = process_and_transform_sse_stream(
+                body,
+                Arc::new(ResponsesRequest {
+                    store: Some(true),
+                    ..Default::default()
+                }),
+                None,
+                storage.clone(),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                None,
+                tx,
+            );
+            let client = async move {
+                body_tx
+                    .send(Ok(Bytes::from(chat_event(delta, None))))
+                    .await
+                    .unwrap();
+                let id = read_until(&mut rx, leave_at).await;
+                drop(rx);
+                (id, body_tx)
+            };
+            let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                async { tokio::join!(transform, client) },
+            ))
+            .await
+            .expect("the client's leaving ends the read");
+            assert_eq!(outcome.unwrap_err(), "Client disconnected");
+            let stored = stored_record(&storage, &id).await;
+            assert_eq!(stored["status"], "cancelled", "{item_type}: {stored}");
+            assert_eq!(stored["output"][0]["type"], item_type, "{stored}");
+            assert_eq!(stored["output"][0]["status"], "in_progress", "{stored}");
+        }
     }
 
     /// The reader parked on a chat body that stalled (nothing more on it)
@@ -2126,10 +2420,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             response_storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2175,7 +2469,10 @@ mod tests {
             .unwrap()
             .expect("the failed response is stored");
         assert_eq!(stored.raw_response["status"], "failed");
-        assert_eq!(stored.raw_response["error"]["code"], "stream_error");
+        assert_eq!(
+            stored.raw_response["error"], terminal["response"]["error"],
+            "the record carries the error the client saw"
+        );
     }
 
     #[test]

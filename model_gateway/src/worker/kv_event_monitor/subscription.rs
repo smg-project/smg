@@ -893,6 +893,35 @@ mod tests {
         assert_eq!(learned(&sizes), Some(128));
     }
 
+    /// The reconnect delay a failing stream waits doubles from the initial
+    /// delay to the cap, stays at the cap once there, and a reset returns
+    /// it to the initial delay.
+    #[test]
+    fn the_reconnect_backoff_doubles_to_its_cap_and_a_reset_starts_over() {
+        let mut backoff = Backoff::new();
+        assert_eq!(backoff.delay_ms(), INITIAL_RECONNECT_DELAY_MS);
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            backoff.grow();
+            delays.push(backoff.delay_ms());
+        }
+        assert_eq!(
+            delays,
+            [200, 400, 800, 1_600, 3_200, 5_000, 5_000, 5_000],
+            "doubled from 100 ms up to the 5 s cap, then held there"
+        );
+        assert_eq!(
+            backoff.delay(),
+            Duration::from_millis(MAX_RECONNECT_DELAY_MS)
+        );
+        backoff.reset();
+        assert_eq!(
+            backoff.delay_ms(),
+            INITIAL_RECONNECT_DELAY_MS,
+            "a reset returns the initial delay"
+        );
+    }
+
     /// What the test scheduler's `SubscribeKvEvents` does.
     enum Subscribe {
         /// Accepts the call and never answers it, as an engine still
@@ -1668,7 +1697,12 @@ mod tests {
     /// not a working one: the delay before the next attempt doubles from
     /// attempt to attempt instead of restarting at the initial delay on
     /// every connect, the worker's own answer to the subscribe call does
-    /// not end the wait early, and the failure is counted by its code.
+    /// not end the wait early, and the failure is counted by its code. The
+    /// doubling is read from the delays the subscription schedules (its
+    /// retry lines), not from the wall-clock gaps between the connects,
+    /// which a loaded host stretches unevenly; each gap is held to the delay
+    /// slept before it, a floor load can only raise.
+    #[traced_test]
     #[test]
     fn a_stream_that_fails_on_its_first_message_backs_off_and_is_counted() {
         use metrics_exporter_prometheus::PrometheusBuilder;
@@ -1705,15 +1739,49 @@ mod tests {
             "{} subscribe calls in 1.9 s",
             calls.len()
         );
+        // The delay scheduled after each failed stream doubles up to the cap,
+        // and each was slept: the gap before a connect is at least the delay
+        // the retry line before it scheduled. A loaded host only stretches a
+        // gap, and a connect it pushes past the window takes its delay with
+        // it, so the floor reads the retry lines rather than a fixed value.
         let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
-        assert!(
-            gaps.windows(2).all(|pair| pair[1] > pair[0]),
-            "the gaps do not grow: {gaps:?}"
-        );
-        assert!(
-            gaps.last().unwrap() >= &Duration::from_millis(600),
-            "{gaps:?}"
-        );
+        logs_assert(|lines: &[&str]| {
+            let delays = lines
+                .iter()
+                .filter(|line| line.contains("KV event stream error, reconnecting"))
+                .map(|line| {
+                    line.split("delay_ms=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                        .ok_or_else(|| format!("no delay_ms on the retry line: {line}"))
+                })
+                .collect::<Result<Vec<u64>, String>>()?;
+            if delays.len() < 3 {
+                return Err(format!(
+                    "{} retry lines, three or more expected",
+                    delays.len()
+                ));
+            }
+            if delays[0] != INITIAL_RECONNECT_DELAY_MS
+                || !delays
+                    .windows(2)
+                    .all(|pair| pair[1] == (pair[0] * 2).min(MAX_RECONNECT_DELAY_MS))
+            {
+                return Err(format!("the scheduled delays do not double: {delays:?}"));
+            }
+            if let Some((gap, delay)) = gaps
+                .iter()
+                .zip(&delays)
+                .find(|(gap, delay)| **gap < Duration::from_millis(**delay))
+            {
+                return Err(format!(
+                    "a connect came {gap:?} after the one before it, under the {delay} ms \
+                     its retry line scheduled: gaps {gaps:?}, delays {delays:?}"
+                ));
+            }
+            Ok(())
+        });
 
         let rendered = handle.render();
         let line = rendered

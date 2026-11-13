@@ -1,11 +1,13 @@
 //! A sentencepiece-style vocabulary with byte fallback on the native encode
 //! path (Gemma, Llama 2 and their kin). Such a vocabulary has no `ByteLevel`
 //! stage: the spaces of the text become the word marker U+2581 (a `Replace`
-//! normalizer, or the `Metaspace` pre-tokenizer of the Llama class, which
-//! also prepends the marker by its scheme), the text between two added
-//! tokens is one word of the model, and the model's `merge_word` makes a
-//! symbol of each character the vocabulary has and of each byte (`<0xHH>`)
-//! of one it has not, then merges. This module gives that word pieces: a cut
+//! normalizer, alone or after a `Prepend` normalizer that puts the marker
+//! before every text between added tokens, or the `Metaspace`
+//! pre-tokenizer of the Llama class, which also prepends the marker by its
+//! scheme), the text between two added tokens is one word of the model,
+//! and the model's `merge_word` makes a symbol of each character the
+//! vocabulary has and of each byte (`<0xHH>`) of one it has not, then
+//! merges. This module gives that word pieces: a cut
 //! between two adjacent bytes that no vocabulary token holds adjacent can
 //! never be crossed by a merge (a merge's product is a vocabulary token, and
 //! it would hold the pair), so the pieces merge on their own to the ids of
@@ -45,7 +47,8 @@ const BRIDGE_WORDS: usize = 256 * 256 / 64;
 pub(super) const MERGE_SCRATCH_SYMBOLS: usize = 4_096;
 
 /// Where the word marker is prepended: the `Metaspace` prepend scheme
-/// (`Never` for a `Replace` normalizer too, which prepends nothing).
+/// (`Never` for a `Replace` normalizer too, which prepends nothing), or
+/// the `Prepend` normalizer (`Every`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Marker {
     Never,
@@ -54,6 +57,11 @@ pub(super) enum Marker {
     First,
     /// Before every text between added tokens.
     Always,
+    /// Before every text between added tokens, one that starts with a space
+    /// or the marker too: the `Prepend` normalizer, which prepends to the
+    /// whole normalized text where `Metaspace` prepends only to one that
+    /// does not start with the marker.
+    Every,
 }
 
 /// The symbols a piece of a byte-fallback vocabulary starts from, where its
@@ -78,10 +86,13 @@ pub(super) struct CharSymbols {
 impl CharSymbols {
     /// The tables of `model`'s vocabulary (a BPE with byte fallback), or why
     /// the vocabulary declines: `ignore_merges` (it looks the whole text up,
-    /// which pieces cannot), a byte token missing or merges the table cannot
-    /// stand in for (the table's own declines, with the `<0xHH>` spelling of
-    /// the byte tokens), a token that spells a byte token inside it (a merge
-    /// could then cross a cut).
+    /// which pieces cannot), merges the table cannot stand in for (the
+    /// table's own declines, with the `<0xHH>` spelling of the byte tokens),
+    /// a byte token missing for a byte the fallback could reach (one beyond
+    /// ASCII, which may lie inside any character that is no token, or an
+    /// ASCII one whose character is no token; an ASCII character that is a
+    /// token never falls back, so its byte's token is not needed), a token
+    /// that spells a byte token inside it (a merge could then cross a cut).
     ///
     /// `read` is what the file's one-pass read saw of the model: the merge
     /// table takes the merges from it, and the entries are read by id when
@@ -111,6 +122,17 @@ impl CharSymbols {
         };
         for (id, token) in entries_of(bpe, read) {
             symbols.read_token(token.as_ref(), id)?;
+        }
+        // A byte without a token: the fallback spells the bytes of a
+        // character that is no token, so an ASCII byte whose character is
+        // one is never reached (a character beyond ASCII holds no ASCII
+        // byte); any other missing byte could be, and declines.
+        for byte in 0..=255u8 {
+            if symbols.merges.lacks_a_token_for_byte(byte)
+                && !(byte.is_ascii() && symbols.ascii[usize::from(byte)] != NO_ID)
+            {
+                return Err(Declined::from(format!("byte {byte:#04x} has no token")));
+            }
         }
         symbols.bridge_raw_text();
         Ok(symbols)
@@ -188,15 +210,29 @@ impl CharSymbols {
         self.merges.merges()
     }
 
+    /// Bytes the vocabulary has no token for (none the fallback reaches,
+    /// see [`Self::from_model`]), for the load log.
+    pub(super) fn bytes_without_a_token(&self) -> usize {
+        self.merges.missing_bytes()
+    }
+
     /// Whether the word marker goes before a text: one that starts a text
-    /// between added tokens (`starts_text`), under the `Always` scheme; the
-    /// one at the start of the input (`at_input_start`), under `First`.
+    /// between added tokens (`starts_text`), under the `Always` scheme and
+    /// the `Prepend` normalizer (`Every`); the one at the start of the
+    /// input (`at_input_start`), under `First`.
     pub(super) fn prepends(&self, starts_text: bool, at_input_start: bool) -> bool {
         match self.marker {
             Marker::Never => false,
-            Marker::Always => starts_text,
+            Marker::Always | Marker::Every => starts_text,
             Marker::First => at_input_start,
         }
+    }
+
+    /// Whether the marker goes before a text that already starts with a
+    /// space or the marker (the `Prepend` normalizer puts it there;
+    /// `Metaspace` does not).
+    pub(super) fn prepends_to_a_marked_text(&self) -> bool {
+        self.marker == Marker::Every
     }
 
     /// Whether no cut goes between the raw bytes `prev` and `cur` (see the
@@ -269,6 +305,13 @@ impl CharSymbols {
             }
             let mut utf8 = [0u8; 4];
             for &byte in c.encode_utf8(&mut utf8).as_bytes() {
+                // The construction declines a missing byte the fallback
+                // could reach (see `from_model`): one spelled here has a
+                // token.
+                debug_assert!(
+                    !self.merges.lacks_a_token_for_byte(byte),
+                    "a byte without a token reached the fallback: {byte:#04x} in {c:?}"
+                );
                 symbols.push(self.merges.byte_id(byte));
             }
         }

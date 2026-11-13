@@ -4891,10 +4891,13 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// engine that decodes with PIL bit for bit; the pure-Rust decoder differs by
 /// a few levels, which the vision encoder amplifies), everything else and any
 /// turbojpeg failure through the `image` crate; then the long-side cap. A
-/// JPEG that ends where the reference loader refuses it (its entropy-coded
-/// data runs out, a progressive file misses its end marker, or a second
-/// scan header or a table follows a single-scan frame's scan) is refused
-/// before either decoder sees it (`jpeg_turbo::end_is_served`).
+/// frame the library decoded cleanly is served as it is. A JPEG the library
+/// decoded with a warning, or that the fallback path would read, is refused
+/// when its data ends in a form the end-marker walk refuses (its
+/// entropy-coded data runs out, a progressive file misses its end marker,
+/// or a second scan header or a table follows a single-scan frame's scan):
+/// the warned frame is not kept, and the `image` crate's decoder never sees
+/// the file (`jpeg_turbo::end_is_served`).
 ///
 /// CMYK and YCCK JPEGs follow the same rule: with libjpeg-turbo they are
 /// decompressed as CMYK and converted with PIL's arithmetic

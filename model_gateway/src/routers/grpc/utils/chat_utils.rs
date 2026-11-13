@@ -15,7 +15,9 @@ use axum::{
 use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, ThinkingKeyName,
+    },
     traits::{Encoding, PromptEncoding, Tokenizer},
     StopRules, StopSequenceConfig, StopSequenceDecoder,
 };
@@ -678,7 +680,7 @@ pub(crate) fn process_content_format(
 }
 
 pub(super) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
-const TOOL_CHOICE_KEY: &str = "tool_choice";
+pub(super) const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
 
 /// The template kwarg both prompt paths tell the tool choice through: the
@@ -698,18 +700,49 @@ pub(crate) fn insert_tool_choice_kwarg(
 /// owns interpretation (level→value mapping, `tool_choice`/`response_format`
 /// rendering, defaulting, and validation); an explicit `chat_template_kwargs`
 /// entry wins, except for `reasoning_effort`: the request-level effort
-/// (`thinking.effort`, else the top-level field) is written over an entry,
-/// as the engine's own server renders it.
-fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+/// (`thinking.effort`, else the top-level field) owns the key, as the
+/// engine's own server renders it, written over an entry as the request's
+/// provider profile hands it to the template
+/// (`ProviderProfile::template_reasoning_effort`, given the thinking
+/// preference the prompt renders with: the template's own `thinking_mode`
+/// switch among the kwargs where the template reads that key, `thinking_key`
+/// being the tokenizer's detected thinking key as the backed plan gates its
+/// mode kwargs, else the typed toggle or the profile's reading of the effort),
+/// and the entry removed when the profile hands the template none. A control
+/// the renderer never reads (`reads`: the tokenizer's
+/// [`Tokenizer::template_reads`]) is left out: it could not reach the prompt,
+/// and a `response_format` carries a schema the copy into the kwarg walks
+/// node by node.
+fn build_chat_template_kwargs(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    thinking_key: Option<ThinkingKeyName>,
+    reads: impl Fn(&str) -> bool,
+) -> HashMap<String, Value> {
     let request_kwargs = request
         .chat_template_kwargs
         .as_ref()
         .map_or(0, HashMap::len);
-    let reasoning_effort = request.effective_reasoning_effort();
+    let explicit = matches!(thinking_key, Some(ThinkingKeyName::ThinkingMode))
+        .then(|| provider.thinking_from_template_kwargs(request.chat_template_kwargs.as_ref()))
+        .flatten();
+    let reasoning_effort = provider.template_reasoning_effort(
+        request.effective_reasoning_effort(),
+        explicit.or_else(|| request.template_thinking_for(provider)),
+    );
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .filter(|_| reads(TOOL_CHOICE_KEY));
+    let response_format = request
+        .response_format
+        .as_ref()
+        .filter(|_| reads(RESPONSE_FORMAT_KEY));
     // A plain request (no tool choice, no response format, no kwargs, no
-    // effort) renders with no kwargs at all: its map stays unallocated.
-    let mut combined = if request.tool_choice.is_some()
-        || request.response_format.is_some()
+    // effort), or one whose controls the template never reads, renders with
+    // no kwargs at all: its map stays unallocated.
+    let mut combined = if tool_choice.is_some()
+        || response_format.is_some()
         || request_kwargs > 0
         || reasoning_effort.is_some()
     {
@@ -717,10 +750,10 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     } else {
         HashMap::new()
     };
-    if let Some(tool_choice) = &request.tool_choice {
+    if let Some(tool_choice) = tool_choice {
         insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
-    if let Some(response_format) = &request.response_format {
+    if let Some(response_format) = response_format {
         if let Ok(value) = serde_json::to_value(response_format) {
             combined.insert(RESPONSE_FORMAT_KEY.to_string(), value);
         }
@@ -728,11 +761,18 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     if let Some(template_kwargs) = &request.chat_template_kwargs {
         combined.extend(template_kwargs.clone());
     }
-    if let Some(reasoning_effort) = reasoning_effort {
-        combined.insert(
-            REASONING_EFFORT_KEY.to_string(),
-            Value::String(reasoning_effort.to_string()),
-        );
+    if request.effective_reasoning_effort().is_some() {
+        match reasoning_effort {
+            Some(reasoning_effort) => {
+                combined.insert(
+                    REASONING_EFFORT_KEY.to_string(),
+                    Value::String(reasoning_effort.to_string()),
+                );
+            }
+            None => {
+                combined.remove(REASONING_EFFORT_KEY);
+            }
+        }
     }
     combined
 }
@@ -748,9 +788,25 @@ fn resolve_template_thinking(
     request.template_thinking_for(provider)
 }
 
-/// gRPC backends require content parts the gateway knows how to render, and
-/// a refusal part only where the contract defines it: on an assistant turn.
+/// Validate content sent to a model template, using the tool declarations
+/// that the template will receive.
+pub(crate) fn validate_chat_template_content_parts(
+    request: &ChatCompletionRequest,
+) -> Result<(), String> {
+    validate_chat_parts(&request.messages, Some(request))
+}
+
+/// Validate gRPC chat content outside the regular template preparation path.
 pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
+    validate_chat_parts(messages, None)
+}
+
+/// Reject unsupported parts and permit a homogeneous list of declared Flash
+/// tool references only in a tool message sent to the model template.
+fn validate_chat_parts(
+    messages: &[ChatMessage],
+    template_request: Option<&ChatCompletionRequest>,
+) -> Result<(), String> {
     for message in messages {
         let content = match message {
             ChatMessage::System { content, .. }
@@ -770,6 +826,18 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
                             .get("type")
                             .and_then(Value::as_str)
                             .unwrap_or("<missing>");
+                        if let Some(request) = template_request.filter(|request| {
+                            type_name == "tool_reference"
+                                && matches!(message, ChatMessage::Tool { .. })
+                                && ProviderProfile::for_model(&request.model)
+                                    .supports_chat_tool_references(&request.model)
+                        }) {
+                            validate_tool_references(
+                                parts,
+                                request.tools.as_deref().unwrap_or_default(),
+                            )?;
+                            break;
+                        }
                         return Err(format!(
                             "Unsupported chat content part type {type_name:?} for gRPC backends"
                         ));
@@ -784,6 +852,33 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
                     _ => {}
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The template selects the reference path by the first block and emits only
+/// matching tools. Refuse mixed lists and unknown names before they can lose
+/// content in that rendering.
+fn validate_tool_references(parts: &[ContentPart], tools: &[Tool]) -> Result<(), String> {
+    for part in parts {
+        let fields = match part {
+            ContentPart::Unknown(fields)
+                if fields.get("type").and_then(Value::as_str) == Some("tool_reference") =>
+            {
+                fields
+            }
+            _ => return Err("tool_reference content must contain only tool references".into()),
+        };
+        let name = fields.get("name").and_then(Value::as_str);
+        if !name.is_some_and(|name| {
+            tools
+                .iter()
+                .any(|tool| tool.tool_type == "function" && tool.function.name == name)
+        }) {
+            return Err(
+                "tool_reference.name must name a function available to the template".into(),
+            );
         }
     }
     Ok(())
@@ -1143,7 +1238,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
         // tool set and shared by every request that carries the same tools.
         let prepared_tools = request.tools.as_deref().map(prepare_tools).transpose()?;
 
-        let combined_template_kwargs = build_chat_template_kwargs(request);
+        let combined_template_kwargs =
+            build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name(), |name| {
+                tokenizer.template_reads(name)
+            });
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
             None

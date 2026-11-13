@@ -7,12 +7,13 @@
 //! `None` means the registry does not know the model, and the caller reads its output another
 //! way; the gateway keeps its older parsers for such a model.
 //!
-//! The groups are bellwether's: the checkpoints that share a tokenizer and a template, recorded
-//! once by the group's primary. Every group whose table is on main is here, its primary and its
-//! other checkpoints under the primary's organisation, spelled in `groups.json` beside this
-//! module (one group per line; the crate's build script writes the file as the `GROUPS`
-//! constant); `tests/readme.rs` writes the README's models table from the same groups and checks
-//! that the two agree.
+//! The groups are bellwether's: the checkpoints that share a tokenizer and the wire the table
+//! reads (a template too, except for a checkpoint `docs/tables.md` notes as differing only
+//! outside the wire), recorded once by the group's primary. Every group whose table is on main is
+//! here, its primary and its other checkpoints under the primary's organisation, spelled in
+//! `groups.json` beside this module (one group per line; the crate's build script writes the file
+//! as the `GROUPS` constant); `tests/readme.rs` writes the README's models table from the same
+//! groups and checks that the two agree.
 //!
 //! A lookup matches the repository name, the text after the last path separator (either slash),
 //! exactly and without regard to case, under any organisation or path: `Qwen/Qwen3-8B`,
@@ -29,9 +30,9 @@ use std::{
 
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
-    gemma4, glm, glm4, hy4, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling,
-    llama4, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral, mistral_v13, muse_spark,
-    olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    gemma4, glm, glm4, hy4, hy_v3, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5,
+    ling, llama4, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral, mistral_v13,
+    muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -85,6 +86,8 @@ tables! {
     SeedOss => "seed_oss", seed_oss;
     /// [`hy4()`].
     Hy4 => "hy4", hy4;
+    /// [`hy_v3()`].
+    HyV3 => "hy_v3", hy_v3;
     /// [`ling()`].
     Ling => "ling", ling;
     /// [`iquest()`].
@@ -224,7 +227,7 @@ struct Group {
     /// own: the prompt's replay starts at its last occurrence.
     opener: Option<&'static str>,
     /// What the group's own template writes after the thought's close before the first call,
-    /// when it is not the table's own (the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one
+    /// when it is not the table's own (the NVIDIA Nemotron 3 and 3.5 groups and Step 3.5 Flash write one
     /// newline where the Qwen 3.5 template writes two): the group's tags write it in the table's place
     /// ([`Format::with_thought_after`]).
     after: Option<&'static str>,
@@ -552,6 +555,30 @@ mod tests {
         }
     }
 
+    /// A checkpoint published under another name or organisation than its group's primary reads
+    /// with the group's table once the group lists it under `also`: names whose template renders
+    /// the same text as the primary's and whose tokenizer files are the primary's or a re-save of
+    /// them.
+    #[test]
+    fn a_checkpoint_a_group_lists_under_also_resolves_to_the_groups_table() {
+        for (model, table) in [
+            ("moonshotai/Kimi-K3.1-Pro", Table::KimiK3),
+            ("nvidia/Kimi-K3.1-Pro-NVFP4", Table::KimiK3),
+            ("kimi-k3.1-pro", Table::KimiK3),
+            ("nvidia/DeepSeek-V4.1-Flash-NVFP4", Table::DeepSeekV4_1),
+            ("nvidia/DeepSeek-V4.1-Flash-1017-NVFP4", Table::DeepSeekV4_1),
+            ("microsoft/UserRepGen-4B", Table::Qwen3Tagged),
+            ("nvidia/Qwen3.8-Flash-Next-FP4-Local", Table::Qwen3Tagged),
+            ("microsoft/AesCode-8B", Table::Qwen3),
+            ("microsoft/AesCode-32B", Table::Qwen3),
+            ("internlm/Visual-ERM", Table::Qwen3),
+            ("tencent/WeVisOne-VL-2B", Table::Qwen3),
+        ] {
+            assert_eq!(table_for(model), Some(table), "{model}");
+            assert!(for_model(model).is_some(), "{model}");
+        }
+    }
+
     #[test]
     fn a_model_the_registry_does_not_know_resolves_to_none() {
         for model in [
@@ -628,6 +655,27 @@ mod tests {
             granite.turn_opener(),
             Some("<|start_of_role|>assistant<|end_of_role|>")
         );
+    }
+
+    /// MiniMax-M3.1-Flash is a checkpoint of the MiniMax-M3 group (the
+    /// MiniMax M3 section of `docs/tables.md`: the same tokenizer and wire,
+    /// a template that differs only outside the wire), so the `minimax_m3`
+    /// table reads it by its repository name as it reads the primary's; the
+    /// near-miss `MiniMax-M3.1` stays unknown.
+    #[test]
+    fn the_minimax_m3_1_flash_checkpoint_reads_with_the_m3_table() {
+        let primary = for_model("MiniMaxAI/MiniMax-M3").expect("MiniMax-M3");
+        for model in [
+            "MiniMax-M3.1-Flash",
+            "MiniMaxAI/MiniMax-M3.1-Flash",
+            "minimaxai/minimax-m3.1-flash",
+        ] {
+            let flash = for_model(model).expect(model);
+            assert_eq!(flash.name(), "minimax_m3", "{model}");
+            assert_eq!(flash.name(), primary.name(), "{model}");
+            assert_eq!(flash.turn_opener(), primary.turn_opener(), "{model}");
+        }
+        assert!(for_model("MiniMax-M3.1").is_none());
     }
 
     #[test]

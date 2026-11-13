@@ -197,6 +197,17 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen3-vl-2b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-4b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-8b-instruct", GenerationPrompt::Plain),
+    // The AesCode pair are Qwen3-VL-8B-Instruct checkpoints by their `also` names; bellwether records
+    // them as members of the Visual-ERM group, whose sets replay through that table.
+    ("aescode-8b", GenerationPrompt::Plain),
+    ("aescode-32b", GenerationPrompt::Plain),
+    // Visual-ERM is that group's bellwether primary (the AesCode pair carries its files): its sets replay
+    // under their own slug too.
+    ("visual-erm", GenerationPrompt::Plain),
+    // WeVisOne-VL-4B and -2B write the Qwen3-VL template over a tokenizer of their own (one group, the
+    // 4B its primary): JSON calls, no thought; bellwether records each checkpoint's own sets.
+    ("wevisone-vl-4b", GenerationPrompt::Plain),
+    ("wevisone-vl-2b", GenerationPrompt::Plain),
     ("qwen3-vl-30b-a3b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-32b-instruct", GenerationPrompt::Plain),
     ("qwen3-vl-235b-a22b-instruct", GenerationPrompt::Plain),
@@ -251,6 +262,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen3.5-2b", GenerationPrompt::OpensTheThoughtWhenAsked),
     ("qwen3.5-4b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-9b", GenerationPrompt::OpensTheThought),
+    // UserRepGen-4B is a member of the Qwen3.5-9B group: its group's sets replay through the table
+    // its `also` name resolves to.
+    ("userrepgen-4b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-27b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-122b-a10b", GenerationPrompt::OpensTheThought),
@@ -377,6 +391,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Keyed arguments, each family under its own markers; the prompt opens the thought, Hy4's
     // whatever the request says.
     ("hy4-preview", GenerationPrompt::AlwaysOpensTheThought),
+    // Hy V3 (Hy-Memory) writes Hy4's grammar under the plain markers, with K2-Horizon's newlines
+    // and `<tool_sep>` after the name; its prompt closes the thought unless the request's
+    // `reasoning_effort` asks for one.
+    (
+        "hy-memory-30b-a3b",
+        GenerationPrompt::OpensTheThoughtByEffort,
+    ),
     ("ling-3.0-flash", GenerationPrompt::OpensTheThought),
     // GLM writes Ling's syntax with nothing between the tags; its prompt opens the thought
     // whatever the request says (the template has no thinking switch).
@@ -402,6 +423,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
     ("lfm2.5-1.2b-instruct", GenerationPrompt::ModelDecides),
+    // LFM2.5-24B-A2B's template opens the thought in the prompt whatever the request says (`<think>`
+    // after the assistant header, no newline, in both thinking settings of its render set).
+    ("lfm2.5-24b-a2b", GenerationPrompt::AlwaysOpensTheThought),
     // Llama 4's list stands bare in the turn after the content, every value between double
     // quotes; the template has no thought and ends the generation prompt with the opener and two
     // newlines, which the shared tail does not write and the replay does not need.
@@ -439,6 +463,12 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
     // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
     ("gemma-4-e4b-it", GenerationPrompt::ModelDecides),
+    // Nemotron 3.5 Bolt-E4B writes a Nemotron-modified Gemma 4 template: the prompt is the turn's opener
+    // alone, and a request that turns thinking on puts `<|think|>` in a system turn instead.
+    (
+        "nvidia-nemotron-3.5-bolt-e4b-bf16",
+        GenerationPrompt::ModelDecides,
+    ),
     // Qwen3's JSON calls under other templates (bellwether main 5bcd7b0b0): each as its own
     // template writes the thought.
     ("agentcpm-explore", GenerationPrompt::ModelWritesTheThought),
@@ -505,6 +535,29 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16",
         GenerationPrompt::OpensTheThought,
     ),
+    // The Nemotron 3.5 Super-VL and Bolt-74B, Dory and NLD-Uni templates write the Lightning prompt
+    // (`<think>\n` opened, `<think></think>` when the request turns thinking off) with their own
+    // additions elsewhere in the turn (a media macro, an effort or budget suffix on the user turn).
+    (
+        "nvidia-nemotron-3.5-super-vl-120b-a12b-bf16",
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3.5-bolt-74b-a9b-bf16",
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-labs-dory1.0-4b-bf16",
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("nld-uni", GenerationPrompt::OpensTheThought),
+    // The LFM3 line (LFM3-1.7B, LFM3-VL-2B, d1-2B) writes Qwen 3.5's tagged calls under ChatML and opens
+    // the thought in the prompt (`<think>`, no newline), closed at once (`<think></think>`) when the
+    // request turns thinking off; LFM3-Omni-2B's template opens it only when the request asks.
+    ("lfm3-1.7b", GenerationPrompt::OpensTheThought),
+    ("lfm3-vl-2b", GenerationPrompt::OpensTheThought),
+    ("d1-2b", GenerationPrompt::OpensTheThought),
+    ("lfm3-omni-2b", GenerationPrompt::OpensTheThoughtWhenAsked),
     // GLM 4.5's keyed spelling (a newline after the name, each key and each value); the model
     // writes its own `<think>`, closed in the prompt when thinking is off.
     ("glm-4.5v", GenerationPrompt::ModelWritesTheThought),
@@ -540,6 +593,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("ministral-3-8b-instruct-2512-bf16", GenerationPrompt::Plain),
     ("mistral-medium-3.5-128b", GenerationPrompt::ModelDecides),
     ("mistral-small-4-119b-2603", GenerationPrompt::ModelDecides),
+    // Mistral Large 4's template ends at `[/INST]` whatever the request says (reasoning_effort rides in
+    // its `[MODEL_SETTINGS]` block); the model writes `[THINK]` itself or not.
+    ("mistral-large-4-1t-a52b", GenerationPrompt::ModelDecides),
     // Llama Nemotron: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`. The Super
     // template has a thought the model writes itself (`/no_think` in the system prompt closes it
     // in the prompt; the request's switch changes nothing); the Nano and DLER templates have none.
@@ -726,11 +782,13 @@ impl Recorded for Table {
             | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, the DSML tables, Kimi K2, LFM2.5,
+            // tagged ones' (no call comes of the fence); IQuest, Hy V3 (whose `<tool_call>` opens a
+            // call inside its block alone), the DSML tables, Kimi K2, LFM2.5,
             // MiniMax M2, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
             // `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
+            | Self::HyV3
             | Self::DeepSeekV3_2
             | Self::DeepSeekV3
             | Self::DeepSeekV3_1
@@ -772,6 +830,7 @@ impl Recorded for Table {
                 | Self::Qwen3TaggedDirect
                 | Self::SeedOss
                 | Self::Hy4
+                | Self::HyV3
                 | Self::Ling
                 | Self::IQuest
                 | Self::Glm
@@ -824,6 +883,11 @@ enum GenerationPrompt {
     /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
     /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
     OpensTheThoughtWhenAsked,
+    /// Hy V3 (Hy-Memory): `<think>` (the thought opened, no newline) when the request's
+    /// `reasoning_effort` is `low` or `high`, so the output starts inside the thought; otherwise
+    /// (`no_think`, the template's default) `<think></think>`, and the output starts in content.
+    /// `enable_thinking` moves nothing in this template.
+    OpensTheThoughtByEffort,
     /// Qwen3: nothing, and the model writes its own `<think>`; thinking off closes it in the
     /// prompt as above.
     ModelWritesTheThought,
@@ -879,6 +943,10 @@ impl GenerationPrompt {
             }
             (Self::OpensTheThoughtOrClosesIt, _) => opened,
             (Self::OpensTheThoughtOrTheAnswer, false) => opened,
+            (Self::OpensTheThoughtByEffort, _) if request.effort_asks_for_a_thought() => {
+                open.to_string()
+            }
+            (Self::OpensTheThoughtByEffort, _) => format!("{open}{close}"),
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
             (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
@@ -892,7 +960,10 @@ impl GenerationPrompt {
     fn writes_no_thought_unasked(self) -> bool {
         matches!(
             self,
-            Self::Plain | Self::OpensTheThoughtWhenAsked | Self::MarkerAlone
+            Self::Plain
+                | Self::OpensTheThoughtWhenAsked
+                | Self::OpensTheThoughtByEffort
+                | Self::MarkerAlone
         )
     }
 }
@@ -976,9 +1047,11 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
 /// where it is not its table's, measured against the rendered prompts (bellwether's
 /// `render/common.jsonl`, `tools-call-arguments-object`): the NVIDIA Nemotron 3 groups and Step
 /// 3.5 Flash write `</think>\n<tool_call>` where the Qwen 3.5 template behind their table writes
-/// two newlines.
+/// two newlines; the Nemotron 3.5 Super-VL and Bolt-74B, Dory and NLD-Uni templates write the same one
+/// newline, and the LFM3 and d1 templates write the call right after the close.
 /// The registry's groups carry it as the group's `after`; the test after the next reads the
-/// rendered prompts themselves where the tree holds them.
+/// rendered prompts themselves where the tree holds them (the recorded thinking-on call where the
+/// rendered call turn carries no thought, as d1-2B's does not).
 const MEASURED_AFTER: &[(&str, &str)] = &[
     ("cosmos3-edge", "\n"),
     ("cosmos3-edge-policy-droid", "\n"),
@@ -990,7 +1063,15 @@ const MEASURED_AFTER: &[(&str, &str)] = &[
     ("nvidia-nemotron-3.5-lightning-30b-a3b-bf16", "\n"),
     ("nvidia-nemotron-labs-3-elastic-30b-a3b-bf16", "\n"),
     ("nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16", "\n"),
+    ("nvidia-nemotron-3.5-super-vl-120b-a12b-bf16", "\n"),
+    ("nvidia-nemotron-3.5-bolt-74b-a9b-bf16", "\n"),
+    ("nvidia-nemotron-labs-dory1.0-4b-bf16", "\n"),
+    ("nld-uni", "\n"),
     ("step-3.5-flash", "\n"),
+    ("lfm3-1.7b", ""),
+    ("lfm3-vl-2b", ""),
+    ("lfm3-omni-2b", ""),
+    ("d1-2b", ""),
 ];
 
 #[test]
@@ -1026,13 +1107,16 @@ fn every_measured_opener_and_text_after_the_close_is_the_registrys() {
 
 /// The text after the thought's close before a call, read from each recorded model's rendered
 /// `tools-call-arguments-object` (`render/common.jsonl`, the reference's `text`: the assistant
-/// turn that made the call),
+/// turn that made the call), or from its recorded `call-single-thinking-on` (`parse/common.jsonl`,
+/// the reference's `text`: the same oracle's rendering of the assistant turn that made the call)
+/// where the rendered call turn carries no thought,
 /// is the registry's for it: the table's layout, or the group's own `after`. Skipped where the
 /// tree is not given; a model the tree has not recorded, a table without a thought layout or a
 /// close, dots3, whose template writes the call's own lead before every block, and a turn whose
 /// template wrote text of the message there, are not read; a tree under which nothing is read
 /// fails, and so does a measured group ([`MEASURED_AFTER`]) the tree records but this test cannot
-/// read.
+/// read. Muse Spark's text after the close is the next message's opener, read as the rest's
+/// prefix; every other table's is the layout whitespace before the call's first tag.
 #[test]
 #[expect(
     clippy::print_stderr,
@@ -1068,30 +1152,72 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         if format.name() == "dots3" {
             continue;
         }
-        let Some(sets) = sets_of(&root, slug, "render").unwrap_or_else(|e| panic!("{e}")) else {
+        let (render, parse) = (
+            sets_of(&root, slug, "render").unwrap_or_else(|e| panic!("{e}")),
+            sets_of(&root, slug, "parse").unwrap_or_else(|e| panic!("{e}")),
+        );
+        if render.is_none() && parse.is_none() {
             continue;
-        };
-        let Ok(text) = fs::read_to_string(sets.dir.join("common.jsonl")) else {
-            continue;
-        };
-        let Some(rendered) = text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find(|case| {
-                case["id"]
-                    .as_str()
-                    .is_some_and(|id| id.ends_with("/render/tools-call-arguments-object"))
+        }
+        // The rendered call turn, else the recorded thinking-on call: a template that writes no
+        // thought into the history's call turn shows its text after the close there alone.
+        let sources = [
+            (
+                "the rendered call turn",
+                render,
+                "/render/tools-call-arguments-object",
+            ),
+            (
+                "the recorded thinking-on call",
+                parse,
+                "/parse/call-single-thinking-on",
+            ),
+        ];
+        let texts: Vec<(&str, String)> = sources
+            .into_iter()
+            .filter_map(|(source, sets, suffix)| Some((source, sets?, suffix)))
+            .filter_map(|(source, sets, suffix)| {
+                let text = fs::read_to_string(sets.dir.join("common.jsonl")).ok()?;
+                text.lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|case| case["id"].as_str().is_some_and(|id| id.ends_with(suffix)))
+                    .and_then(|case| case["reference"]["text"].as_str().map(str::to_string))
+                    .map(|text| (source, text))
             })
-            .and_then(|case| case["reference"]["text"].as_str().map(str::to_string))
-        else {
-            unread("no rendered tools-call-arguments-object with a reference text".to_string());
+            .collect();
+        if texts.is_empty() {
+            unread(
+                "no rendered tools-call-arguments-object nor recorded call-single-thinking-on \
+                 with a reference text"
+                    .to_string(),
+            );
             continue;
-        };
-        let Some(at) = rendered.find(close) else {
-            unread(format!("no {close:?} in the rendered call turn"));
+        }
+        let Some((source, rendered, at)) = texts
+            .iter()
+            .find_map(|(source, text)| text.find(close).map(|at| (*source, text, at)))
+        else {
+            unread(format!(
+                "no {close:?} in the rendered call turn or the recorded thinking-on call"
+            ));
             continue;
         };
         let rest = &rendered[at + close.len()..];
+        let after = &*thought.after;
+        // A table whose text after the close is the next message's opener (Muse Spark's
+        // `<|start|>assistant`) is read as the rest's prefix; every other table's is the layout
+        // whitespace before the call's first tag.
+        if after.starts_with('<') {
+            if !rest.starts_with(after) {
+                wrong.push(format!(
+                    "{slug} ({}): the template writes {:?} after {close:?} before the call in {source}, the registry {after:?}",
+                    format.name(),
+                    rest.get(..after.len()).unwrap_or(rest)
+                ));
+            }
+            read.push(*slug);
+            continue;
+        }
         let between = &rest[..rest.find('<').unwrap_or(rest.len())];
         // A turn whose template wrote text of the message between the close and the call (a
         // `None` for a content the request left out) says nothing about the layout.
@@ -1101,23 +1227,22 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
             ));
             continue;
         }
-        if between != &*thought.after {
+        if between != after {
             wrong.push(format!(
-                "{slug} ({}): the template writes {between:?} after {close:?} before the call, the registry {:?}",
-                format.name(),
-                &*thought.after
+                "{slug} ({}): the template writes {between:?} after {close:?} before the call in {source}, the registry {after:?}",
+                format.name()
             ));
         }
         read.push(*slug);
     }
     eprintln!(
-        "{} recorded models' rendered call turns read: {}",
+        "{} recorded models' text after the close read: {}",
         read.len(),
         read.join(", ")
     );
     assert!(
         !read.is_empty(),
-        "no rendered call turn read under {}: is it the fixtures/ directory?",
+        "no text after the close read under {}: is it the fixtures/ directory?",
         root.display()
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -1439,6 +1564,11 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     ("kimi-k2-thinking", "parse/reasoning-with-marker-text"),
     ("kimi-k2.5", "parse/reasoning-with-marker-text"),
     ("kimi-k2.6", "parse/reasoning-with-marker-text"),
+    // bellwether's reference refused every case but the thought-bearing ones for these templates:
+    // each slug's common set records the thinking-on call and the four reasoning cases, five of the
+    // sixteen, and no fence probe.
+    ("d1-2b", "parse/content-with-marker-in-code-fence"),
+    ("lfm2.5-24b-a2b", "parse/content-with-marker-in-code-fence"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
@@ -1555,6 +1685,17 @@ impl Request {
             == Some(false)
     }
 
+    /// Whether the request's `reasoning_effort`, the switch Hy V3's template reads, asks for a
+    /// thought: `low` or `high`; `no_think`, the default, and anything else leave it closed.
+    fn effort_asks_for_a_thought(&self) -> bool {
+        matches!(
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.reasoning_effort.as_deref()),
+            Some("low" | "high")
+        )
+    }
+
     fn enable_thinking(&self) -> Option<bool> {
         self.chat_template_kwargs
             .as_ref()
@@ -1566,6 +1707,7 @@ impl Request {
 struct ChatTemplateKwargs {
     enable_thinking: Option<bool>,
     thinking: Option<bool>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]

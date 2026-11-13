@@ -122,7 +122,7 @@ async fn visible_previous_chain(
                 metrics_labels::ERROR_VALIDATION,
                 metrics_labels::REASON_INVALID_REQUEST,
             );
-            Err(error::bad_request(
+            Err(error::not_found(
                 "previous_response_not_found",
                 format!("Previous response with id '{prev_id_str}' not found."),
             ))

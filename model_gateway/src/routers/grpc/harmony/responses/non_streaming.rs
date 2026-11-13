@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session,
+        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session, owned_request,
         strip_image_generation_from_request_tools, McpCallTracking,
     },
     execution::{execute_mcp_tools, ToolResult},
@@ -33,7 +33,9 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, load_history,
-                persist_response_if_needed, tool_call_limit,
+                persist_response_if_needed,
+                streaming::OutputItemKind,
+                tool_call_limit,
                 utils::{
                     function_call_status, generation_failure_error, resolve_function_identity,
                     response_status,
@@ -150,6 +152,10 @@ async fn execute_with_mcp_loop(
         &ctx.mcp_format_registry,
     );
 
+    // Shared with each iteration's pipeline context by reference count; the
+    // loop takes it back (`owned_request`) when it appends the tool outputs.
+    let mut current_request = Arc::new(current_request);
+
     loop {
         iteration_count += 1;
 
@@ -233,7 +239,7 @@ async fn execute_with_mcp_loop(
 
                     // Build response with incomplete status - no tools executed due to limit
                     // Use original_tools for response (hide internal MCP tools)
-                    let mut response_request = current_request.clone();
+                    let mut response_request = owned_request(current_request);
                     response_request.tools.clone_from(&original_tools);
                     let mut response = build_tool_response(
                         vec![],         // No MCP tools executed
@@ -307,7 +313,7 @@ async fn execute_with_mcp_loop(
                     // 2. MCP tools as completed (with output) - these were executed
                     // 3. Function tools as completed (without output) - need caller execution
                     // Use original_tools for response (hide internal MCP tools)
-                    let mut response_request = current_request.clone();
+                    let mut response_request = owned_request(current_request);
                     response_request.tools.clone_from(&original_tools);
                     let mut response = build_tool_response(
                         mcp_tool_calls,
@@ -338,13 +344,13 @@ async fn execute_with_mcp_loop(
                 debug!("Only MCP tools - continuing loop with results");
 
                 // Build next request with appended history
-                current_request = build_next_request_with_tools(
-                    current_request,
+                current_request = Arc::new(build_next_request_with_tools(
+                    owned_request(current_request),
                     mcp_tool_calls,
                     mcp_results,
                     analysis,
                     partial_text,
-                );
+                ));
 
                 // Continue loop - next iteration will select workers and execute
             }
@@ -388,7 +394,9 @@ async fn execute_without_mcp_loop(
 ) -> Result<ResponsesResponse, Response> {
     debug!("Executing Harmony Responses without MCP loop");
 
-    // Execute pipeline once
+    // Execute pipeline once; the response built from a tool call below reads
+    // the same request, so it is shared, not copied.
+    let current_request = Arc::new(current_request);
     let iteration_result = ctx
         .pipeline
         .execute_harmony_responses(&current_request, ctx, Some(tenant_request_meta))
@@ -418,7 +426,7 @@ async fn execute_without_mcp_loop(
                 partial_text,
                 usage,
                 request_id,
-                Arc::new(current_request),
+                current_request,
             ))
         }
         ResponsesIterationResult::Completed { response, usage: _ } => {
@@ -449,7 +457,7 @@ fn build_tool_response(
     // Add reasoning output item if analysis exists
     if let Some(analysis_text) = analysis {
         output.push(ResponseOutputItem::new_reasoning(
-            format!("reasoning_{request_id}"),
+            OutputItemKind::Reasoning.new_id(),
             vec![],
             vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,
@@ -461,7 +469,7 @@ fn build_tool_response(
     // Add message output item if partial text exists
     if !partial_text.is_empty() {
         output.push(ResponseOutputItem::Message {
-            id: format!("msg_{request_id}"),
+            id: OutputItemKind::Message.new_id(),
             role: "assistant".to_string(),
             content: vec![ResponseContentPart::OutputText {
                 text: partial_text,
@@ -481,7 +489,7 @@ fn build_tool_response(
         let (name, namespace) =
             resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id.clone()),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id: tool_call.id.clone(),
             name,
             namespace,
@@ -508,7 +516,7 @@ fn build_tool_response(
         let status = function_call_status(finish_reason, &arguments);
         cut_call |= status == "incomplete";
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id,
             name,
             namespace,

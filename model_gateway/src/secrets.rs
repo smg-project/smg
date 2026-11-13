@@ -140,8 +140,9 @@ pub struct BadFile(pub ConfigError);
 
 /// The reason of a refusal, for the file's own refusal to carry in front of
 /// its field and path: a parser's refusal names its entry's field with the
-/// value redacted, a rule its reason.
-fn entry_refusal(error: ConfigError) -> String {
+/// value redacted, a rule its reason. A language binding that reads a key
+/// file refuses a bad entry the same way.
+pub fn entry_refusal(error: ConfigError) -> String {
     match error {
         ConfigError::InvalidValue { reason, .. } | ConfigError::ValidationFailed { reason } => {
             reason
@@ -392,27 +393,37 @@ impl SecretReloader {
 /// One reload off the runtime's threads (the files are small, but a mount
 /// can stall), its outcome logged under `trigger` (`route` or `watch`): the
 /// files read and whether each set changed, or the file that stopped it with
-/// every key in force standing. `None` when the reload's task did not
-/// complete, which is logged as an error.
+/// every key in force standing. The task that reloads writes that line,
+/// under the caller's span: a caller that leaves mid-reload (the route's
+/// client gone) drops this future, not the task, and the keys put in force
+/// are still said so. `None` when the reload's task did not complete, which
+/// is logged as an error.
 pub async fn reload_logged(
     reloader: Arc<SecretReloader>,
     trigger: &'static str,
 ) -> Option<Result<ReloadReport, BadFile>> {
-    match task::spawn_blocking(move || reloader.reload()).await {
-        Ok(Ok(report)) => {
-            info!(
-                trigger,
-                files = report.files.len(),
-                serving_changed = report.serving_changed,
-                control_plane_changed = report.control_plane_changed,
-                "the keys were reloaded from their files"
-            );
-            Some(Ok(report))
-        }
-        Ok(Err(BadFile(error))) => {
-            warn!(trigger, %error, "the keys were not reloaded; the keys in force stand");
-            Some(Err(BadFile(error)))
-        }
+    let span = tracing::Span::current();
+    let reloaded = task::spawn_blocking(move || {
+        span.in_scope(|| {
+            let outcome = reloader.reload();
+            match &outcome {
+                Ok(report) => info!(
+                    trigger,
+                    files = report.files.len(),
+                    serving_changed = report.serving_changed,
+                    control_plane_changed = report.control_plane_changed,
+                    "the keys were reloaded from their files"
+                ),
+                Err(BadFile(error)) => {
+                    warn!(trigger, %error, "the keys were not reloaded; the keys in force stand");
+                }
+            }
+            outcome
+        })
+    })
+    .await;
+    match reloaded {
+        Ok(outcome) => Some(outcome),
         Err(error) => {
             error!(trigger, %error, "the keys' reload did not complete");
             None
@@ -457,16 +468,45 @@ pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::
     Ok(handle)
 }
 
-/// The start's refusal for a key directory that cannot be watched. The watch
-/// crate's own error names no path for the likely causes, the inotify
-/// limits, so this one names the flag and the directory.
+/// The start's refusal for a key directory that cannot be watched: the flag,
+/// the directory as an absolute path, the cause, and the inotify limit behind
+/// the cause when one is known. The watch crate reports the watch limit as
+/// its own kind (its reading of `ENOSPC` from `add_watch`, the directory
+/// attached) and the instance limit as the `EMFILE` that refused the inotify
+/// handle (nothing attached); neither names the flag or the limit to raise.
 fn watch_refused(dir: &Path, error: notify::Error) -> notify::Error {
+    let limit = inotify_limit(&error.kind);
     // The kind alone: a path the error carries is the directory itself.
     let cause = notify::Error::new(error.kind);
+    let shown = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     notify::Error::generic(&format!(
-        "--secrets-auto-reload: cannot watch {}: {cause}",
-        dir.display()
+        "--secrets-auto-reload: cannot watch {}: {cause}{limit}",
+        shown.display()
     ))
+}
+
+/// The limit to raise for an error kind an inotify limit surfaces as, or
+/// nothing: the watch limit is the crate's own kind; the instance limit is
+/// `EMFILE` ("too many open files"), which a process at its open-file limit
+/// gets as well, so both are named. The errno is Linux's, and only Linux has
+/// an inotify limit to raise: another target carries no hint.
+fn inotify_limit(kind: &notify::ErrorKind) -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        const EMFILE: i32 = 24;
+        match kind {
+            notify::ErrorKind::MaxFilesWatch => " (raise fs.inotify.max_user_watches)",
+            notify::ErrorKind::Io(error) if error.raw_os_error() == Some(EMFILE) => {
+                " (raise fs.inotify.max_user_instances, or the process's open-file limit)"
+            }
+            _ => "",
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = kind;
+        ""
+    }
 }
 
 /// One watched directory of key files; `watch` is `None` while the directory
@@ -519,7 +559,10 @@ async fn watch_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc as std_mpsc;
+
     use smg_auth::{ApiKeyEntry, Role};
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -578,6 +621,71 @@ mod tests {
 
         let again = reloader.reload().expect("reloaded");
         assert!(!again.serving_changed, "the same file changes nothing");
+    }
+
+    /// A caller that leaves while the keys are reloaded: the future is
+    /// dropped at its await of the blocking task, the task puts the files'
+    /// keys in force all the same, and the reload's log line is written under
+    /// the caller's span. The runtime's one blocking thread is held until the
+    /// drop, so the first poll is pending by construction, and the line is
+    /// awaited before the keys are read.
+    #[traced_test]
+    #[test]
+    fn a_reload_whose_caller_leaves_still_logs_its_outcome() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("a directory");
+            let tenants = write(dir.path(), "tenants", "acme:t-one\n");
+            let entries = [TenantApiKeyEntry {
+                tenant_id: "acme".into(),
+                key: "t-one".into(),
+            }];
+            let serving = AuthConfig::with_tenant_keys(Some("flag-key".into()), &entries);
+            let reloader = Arc::new(
+                SecretReloader::new(
+                    SecretFiles {
+                        tenant_api_keys: Some(tenants),
+                        ..SecretFiles::default()
+                    },
+                    &sources(SecretSource::Flag, Some(SecretSource::File)),
+                    Some("flag-key"),
+                    &entries,
+                    KeySets::serving_alone(serving.clone()),
+                )
+                .expect("a file source"),
+            );
+            write(dir.path(), "tenants", "acme:t-two\n");
+
+            let (release, held) = std_mpsc::channel::<()>();
+            let _hold = task::spawn_blocking(move || held.recv());
+            let mut reload = Box::pin(reload_logged(Arc::clone(&reloader), "route"));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(reload.as_mut(), &mut cx).is_pending(),
+                "the reload yields at its await of the queued blocking task"
+            );
+            drop(reload);
+            release.send(()).expect("the hold waits for its release");
+
+            let logged = time::timeout(Duration::from_secs(10), async {
+                while !logs_contain("the keys were reloaded from their files") {
+                    time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(
+                logged.is_ok(),
+                "the reload task logs its outcome without its caller"
+            );
+            assert!(
+                serving.contains_token("t-two"),
+                "the rotated key is in force"
+            );
+        });
     }
 
     #[test]
@@ -1096,6 +1204,42 @@ mod tests {
         assert!(text.ends_with("not a directory"), "{text}");
     }
 
+    /// The refusal names the directory as an absolute path and, for the two
+    /// kinds the inotify limits surface as, the limit to raise: `EMFILE` names
+    /// the instance limit and the open-file limit, the crate's watch-limit
+    /// kind the watch limit. Any other cause, `ENOSPC` as an io error among
+    /// them (the crate never passes it through), carries no hint.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_watch_refusal_names_the_absolute_directory_and_the_inotify_limit() {
+        let instances = notify::Error::io(std::io::Error::from_raw_os_error(24));
+        let text = watch_refused(Path::new("keys"), instances).to_string();
+        let absolute = std::path::absolute("keys").expect("an absolute path");
+        let prefix = format!(
+            "--secrets-auto-reload: cannot watch {}: ",
+            absolute.display()
+        );
+        assert!(text.starts_with(&prefix), "{text}");
+        assert!(
+            text.ends_with(
+                "(raise fs.inotify.max_user_instances, or the process's open-file limit)"
+            ),
+            "{text}"
+        );
+        let watches = notify::Error::new(notify::ErrorKind::MaxFilesWatch);
+        let text = watch_refused(Path::new("."), watches).to_string();
+        assert!(
+            text.ends_with("(raise fs.inotify.max_user_watches)"),
+            "{text}"
+        );
+        assert!(!text.contains("cannot watch .:"), "{text}");
+        for other in [20, 28] {
+            let other = notify::Error::io(std::io::Error::from_raw_os_error(other));
+            let text = watch_refused(Path::new("keys"), other).to_string();
+            assert!(!text.contains("fs.inotify"), "{text}");
+        }
+    }
+
     /// The admin routes' fallback, in force when no control-plane keys are
     /// configured, follows the shared key through a reload of its file: the
     /// retired key is out there too.
@@ -1208,6 +1352,78 @@ mod tests {
         );
         assert_eq!(files.count(), 2);
         assert!(SecretFiles::default().names().next().is_none());
+    }
+
+    /// Every key's file has its own name in the record, the tenant file's
+    /// between the shared key's and the control plane's: one name per
+    /// setting, in the order the reload reads the files.
+    #[test]
+    fn every_watched_file_is_named_once_in_the_reload_order() {
+        let files = SecretFiles {
+            api_key: Some(PathBuf::from("/keys/api-key")),
+            tenant_api_keys: Some(PathBuf::from("/keys/tenants")),
+            control_plane_api_keys: Some(PathBuf::from("/keys/control-plane")),
+        };
+        assert_eq!(
+            files.names().collect::<Vec<_>>(),
+            [
+                "api-key-file",
+                "tenant-api-keys-file",
+                "control-plane-api-keys-file"
+            ],
+            "one name per file, in the reload's order"
+        );
+        assert_eq!(files.count(), 3);
+        let tenants_alone = SecretFiles {
+            tenant_api_keys: Some(PathBuf::from("/keys/tenants")),
+            ..SecretFiles::default()
+        };
+        assert_eq!(
+            tenants_alone.names().collect::<Vec<_>>(),
+            ["tenant-api-keys-file"],
+            "the tenant file's own name"
+        );
+    }
+
+    /// The record's order is the reload's: a reloader over all three files
+    /// reports them in the order the record names them.
+    #[test]
+    fn a_reload_of_every_file_reports_them_in_the_reload_order() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let key = write(dir.path(), "key", "k-one\n");
+        let tenants = write(dir.path(), "tenants", "acme:t-one\n");
+        let cp = write(dir.path(), "cp", "ops:Ops:admin:cp-one\n");
+        let start = [TenantApiKeyEntry {
+            tenant_id: "acme".into(),
+            key: "t-one".into(),
+        }];
+        let set = ApiKeySet::new(vec![ApiKeyEntry::new("ops", "Ops", "cp-one", Role::Admin)]);
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                api_key: Some(key),
+                tenant_api_keys: Some(tenants),
+                control_plane_api_keys: Some(cp),
+            },
+            &sources(SecretSource::File, Some(SecretSource::File)),
+            Some("k-one"),
+            &start,
+            KeySets {
+                control_plane: Some(set),
+                ..KeySets::serving_alone(AuthConfig::with_tenant_keys(Some("k-one".into()), &start))
+            },
+        )
+        .expect("file sources");
+        let report = reloader.reload().expect("reloaded");
+        assert_eq!(
+            report
+                .files
+                .iter()
+                .map(|file| file.setting)
+                .collect::<Vec<_>>(),
+            reloader.files().names().collect::<Vec<_>>(),
+            "the reload reports the files in the order the record names them"
+        );
+        assert_eq!(report.files.len(), 3, "every file read");
     }
 
     #[test]

@@ -646,6 +646,23 @@ pub(super) fn push_tools_and_response_format(
     }
 }
 
+/// A system message: its content (the families' `system_msg_template` is
+/// "{content}"), then the tools and the response format it carries;
+/// `render_tools` is the dialect's tools template.
+pub(super) fn render_system_message(
+    prompt: &mut String,
+    turn: &Turn<'_>,
+    render_tools: fn(&[Value]) -> String,
+) {
+    prompt.push_str(turn.content);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
+}
+
 /// The renderer-level pin the three renderers share: a history tool call
 /// whose `arguments` are already an object (the gateway parses the OpenAI
 /// string before a renderer runs) renders one DSML parameter per key through
