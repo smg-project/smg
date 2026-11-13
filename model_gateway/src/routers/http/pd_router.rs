@@ -586,10 +586,10 @@ impl PDRouter {
         body.insert(Self::BOOTSTRAP_ROOM_KEY, fields.room);
     }
 
-    fn inject_dp_rank(
-        body: &mut RawBody<'_>,
+    fn inject_dp_rank<'a>(
+        body: &mut RawBody<'a>,
         rank: isize,
-        rank_key: &str,
+        rank_key: &'a str,
     ) -> serde_json::Result<()> {
         body.insert(rank_key, to_raw_value(&rank)?);
         Ok(())
@@ -2927,30 +2927,36 @@ impl RouterTrait for PDRouter {
         // The request is never borrowed here: a borrowed local keeps its slot
         // in the task across the awaits that follow, a second copy of the
         // request per count. It is moved out for its routing text, moved back,
-        // and serialized once a worker is selected and admitted.
-        let (request_text, body) =
-            Self::count_tokens_routing_text(body, self.policies_need_request_text());
-        let Some(worker) = placement::select_single(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            RoutingPool::HttpPrefill,
-            None,
-            PlacementInputs {
-                text: request_text.as_deref(),
-                tokens: None,
-                headers,
-                rid_key: None,
-                cache_namespace: None,
-                candidate_filter: None,
-                tried: &[],
-                sequence: None,
-            },
-        ) else {
-            return error::service_unavailable(
-                "no_prefill_servers",
-                "No available prefill servers to count tokens",
-            );
+        // and serialized once a worker is selected and admitted. The routing
+        // text, when a policy reads any, is owned by the selection's block and
+        // dropped at its end, before the first await: neither its slot nor
+        // its buffer rides in the task across the round trip.
+        let (worker, body) = {
+            let (request_text, body) =
+                Self::count_tokens_routing_text(body, self.policies_need_request_text());
+            let Some(worker) = placement::select_single(
+                &self.worker_registry,
+                &self.policy_registry,
+                model_id,
+                RoutingPool::HttpPrefill,
+                None,
+                PlacementInputs {
+                    text: request_text.as_deref(),
+                    tokens: None,
+                    headers,
+                    rid_key: None,
+                    cache_namespace: None,
+                    candidate_filter: None,
+                    tried: &[],
+                    sequence: None,
+                },
+            ) else {
+                return error::service_unavailable(
+                    "no_prefill_servers",
+                    "No available prefill servers to count tokens",
+                );
+            };
+            (worker, body)
         };
 
         if let Some(response) = overload::shed_if_worker_overloaded(

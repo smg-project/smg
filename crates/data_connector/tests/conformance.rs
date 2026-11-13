@@ -580,6 +580,7 @@ async fn oracle_store() -> Option<StorageBundle> {
         pool_min: OracleConfig::default_pool_min(),
         pool_max: 4,
         pool_timeout_secs: OracleConfig::default_pool_timeout_secs(),
+        op_timeout_secs: OracleConfig::default_op_timeout_secs(),
         schema: Some(SchemaConfig {
             auto_migrate: true,
             ..Default::default()

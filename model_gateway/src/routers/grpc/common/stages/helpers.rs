@@ -1063,7 +1063,7 @@ pub(crate) fn finish_generate_request(
             ));
         }
         let refs =
-            assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            assemble_media_refs(&plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
         proto_request
             .set_media_refs(refs)
             .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
