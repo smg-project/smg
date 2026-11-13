@@ -93,8 +93,10 @@ impl PipelineStage for EmbeddingPreparationStage {
     }
 }
 
-/// The client-visible code of an input of a shape the contract has no form
-/// for (an object, a mixed array, a negative id).
+/// The client-visible code of an input of a shape this route has no form
+/// for: an array of structured members (the fifth shape the public validator
+/// admits, for the engine's own server), or, when a request reaches the stage
+/// unvalidated, an object, a mixed array or a negative id.
 pub(crate) const INVALID_INPUT_CODE: &str = "invalid_input";
 /// The client-visible code of an input with nothing to embed: an empty text
 /// or id list, or a batch with an empty member.
@@ -109,6 +111,17 @@ pub(crate) const INVALID_INPUT_TOKEN_CODE: &str = "invalid_input_token";
 /// and an empty member of a batch are refused by name, before a tokenizer or
 /// a worker is spoken to.
 fn embedding_inputs(input: &Value) -> Result<CompletionPrompt, Response> {
+    // The public validator admits a fifth shape on the embeddings route, an
+    // array of structured members for the engine's own server; the tokenized
+    // wire has no form for it, so it is refused by name, not as a malformed
+    // request.
+    if matches!(input, Value::Array(members) if members.first().is_some_and(Value::is_object)) {
+        return Err(error::bad_request(
+            INVALID_INPUT_CODE,
+            "input as an array of objects (structured members) is not served by the gRPC router; \
+             send a string, an array of strings, an array of token ids or an array of token-id arrays",
+        ));
+    }
     let prompt = CompletionPrompt::deserialize(input).map_err(|e| {
         error::bad_request(
             INVALID_INPUT_CODE,
@@ -245,6 +258,7 @@ mod tests {
             CompletionPrompt::TokenIdBatches(vec![vec![1, 2], vec![3]])
         );
         for (shape, code) in [
+            (json!([{"text": "a"}]), INVALID_INPUT_CODE),
             (json!({"text": "hello"}), INVALID_INPUT_CODE),
             (json!(["hello", 1]), INVALID_INPUT_CODE),
             (json!([-1, 2]), INVALID_INPUT_CODE),
