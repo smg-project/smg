@@ -257,7 +257,7 @@ async fn refresh_worker_models(
     worker: &Arc<dyn Worker>,
     auth_header: Option<&HeaderValue>,
 ) -> bool {
-    let url = format!("{}/v1/models", worker.url());
+    let url = worker.endpoint_url("/v1/models");
     let mut backend_req = worker.http_client().get(&url);
 
     // Use caller's auth if provided, otherwise fall back to worker's configured API key.
@@ -473,5 +473,48 @@ mod tests {
             error::extract_error_code_from_response(&refused),
             "worker_overload_protection_shed"
         );
+    }
+
+    /// One of the five production joins, on a worker registered with a
+    /// trailing slash: the model refresh asks the engine for `/v1/models`,
+    /// not `//v1/models`, and the registered form stays the registry's key.
+    #[tokio::test]
+    async fn the_model_refresh_joins_to_a_slashed_registration_with_one_slash() {
+        use std::sync::Mutex;
+
+        use axum::{
+            http::{header::CONTENT_TYPE, Uri},
+            Router,
+        };
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let app = Router::new().fallback(move |uri: Uri| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.lock().unwrap().push(uri.path().to_owned());
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    r#"{"object":"list","data":[{"id":"m1","object":"model"}]}"#,
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let slashed = worker(&format!("http://{addr}/"), false);
+        assert!(
+            refresh_worker_models(&slashed, None).await,
+            "the refresh reads the stub's one model"
+        );
+        assert_eq!(seen.lock().unwrap().as_slice(), ["/v1/models"]);
+        assert_eq!(slashed.url(), format!("http://{addr}/"));
     }
 }

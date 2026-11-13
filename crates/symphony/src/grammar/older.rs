@@ -281,6 +281,8 @@ fn unlimited(grammar: &Grammar) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use openai_protocol::common::{Function, Tool};
     use serde_json::{json, Value};
 
@@ -349,7 +351,8 @@ mod tests {
     /// the gateway asks for, the answer grammars, and the whole-turn grammars.
     fn every_registry_grammar() -> Vec<(String, Grammar)> {
         let tools = tools();
-        let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+        let schema =
+            Arc::new(json!({"type": "object", "properties": {"answer": {"type": "string"}}}));
         let mut all = Vec::new();
         for table in Table::ALL {
             let format = table.format();
@@ -659,7 +662,7 @@ mod tests {
                 Grammar::Sequence(vec![
                     Grammar::Token("<|x|>".to_string()),
                     Grammar::JsonSchema {
-                        schema: json!({"type": "object"}),
+                        schema: Arc::new(json!({"type": "object"})),
                         style: None,
                         excludes: vec!["</t>".to_string()],
                         whitespace: crate::Whitespace::Free,

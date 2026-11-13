@@ -184,7 +184,14 @@ pub async fn serve_with_listener_until(
         // detection asks each wire's health check in turn and takes the
         // first that answers, so another wire's scheduler here would name the
         // worker's runtime for it.
-        let mut builder = Server::builder();
+        // A receiver's windows set the sender's pace. The gateway's media
+        // requests carry inline tensors of tens of megabytes; on hyper's
+        // server defaults each one stalls on window updates frame by frame.
+        // The windows and frames follow the engine servicer's.
+        let mut builder = Server::builder()
+            .initial_stream_window_size(Some(16 * 1024 * 1024))
+            .initial_connection_window_size(Some(64 * 1024 * 1024))
+            .max_frame_size(Some(1024 * 1024));
         let routes = match wire {
             // An encode worker on this wire mounts the engine's encoder service
             // beside the scheduler's, as the servicer does: the gateway's encode

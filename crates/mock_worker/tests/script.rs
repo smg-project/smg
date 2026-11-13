@@ -21,7 +21,6 @@ use engine_zmq_client::{
 };
 use futures::StreamExt;
 use mock_worker::{
-    admin,
     config::{Config, ReplayConfig},
     grpc, http, script, zmq,
 };
@@ -313,23 +312,9 @@ async fn grpc_fails_a_text_answer_it_cannot_encode_instead_of_answering_canned()
 #[tokio::test]
 async fn the_admin_api_enqueues_answers_in_order_reads_the_counts_and_clears() {
     let (client, worker) = start_grpc(config(None)).await;
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(config(None)),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+    let admin_port = common::start_admin(config(None)).await;
     let http = common::http_client();
     let url = |worker: &str| format!("http://127.0.0.1:{admin_port}/admin/script/{worker}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while http.get(url(&worker)).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 
     // Two in order for this worker, one keyed for every worker. (The shared
     // queue, `all`, is not fed here: the tests of this binary run together

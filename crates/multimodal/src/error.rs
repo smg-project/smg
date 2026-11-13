@@ -118,6 +118,14 @@ pub enum MediaConnectorError {
         limit: usize,
         knob: &'static str,
     },
+    /// The pixel tensors the request's images would put on the wire are
+    /// longer than one gRPC message carries (its four-byte length prefix): a
+    /// size refusal, the request's own ([`MediaFault::Client`],
+    /// [`MediaErrorCode::TooLarge`]), answered by fewer or smaller images.
+    #[error(
+        "the request's images would be {bytes} bytes of pixel tensors on the wire, over the {limit}-byte message cap; send fewer or smaller images"
+    )]
+    PixelsOverWireCap { bytes: usize, limit: usize },
     /// The list of a video's picks would be longer than the decoder's
     /// process can be given in one argument: a size refusal, the request's
     /// own ([`MediaFault::Client`], [`MediaErrorCode::TooLarge`]), answered
@@ -267,6 +275,7 @@ impl MediaConnectorError {
             Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
+            | Self::PixelsOverWireCap { .. }
             | Self::FrameListTooLong { .. }
             | Self::Image(image::ImageError::Limits(_)) => MediaErrorCode::TooLarge,
             Self::InvalidImageLongSideCap { .. }
@@ -327,6 +336,7 @@ impl MediaConnectorError {
             | Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
+            | Self::PixelsOverWireCap { .. }
             | Self::FrameListTooLong { .. }
             | Self::Image(_)
             | Self::AudioDecode(_)

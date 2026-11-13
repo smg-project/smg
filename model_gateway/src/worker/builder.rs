@@ -876,4 +876,55 @@ mod tests {
         // bootstrap_host should be "prefill1", not "3"
         assert_eq!(worker.metadata().spec.bootstrap_host, "prefill1");
     }
+
+    /// A URL registered with a trailing slash keeps it as the registry's key
+    /// (`url()`), and every join reads one slash: the base URL carries none,
+    /// for the worker and for a data-parallel rank of it.
+    #[test]
+    fn a_trailing_slash_on_the_registered_url_is_not_in_the_join_base() {
+        let worker = BasicWorkerBuilder::new("http://h:8000/").build();
+        assert_eq!(worker.url(), "http://h:8000/");
+        assert_eq!(worker.base_url(), "http://h:8000");
+        assert_eq!(
+            worker.endpoint_url("/get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+        assert_eq!(
+            format!("{}/{}", worker.base_url(), "get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+
+        let rank = BasicWorkerBuilder::new("http://h:8000/")
+            .dp_config(3, 8)
+            .build();
+        assert_eq!(rank.base_url(), "http://h:8000");
+        assert_eq!(
+            rank.endpoint_url("/get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+    }
+
+    /// A socket address is not a base routes join to: the ZMQ adapter hashes
+    /// the exact path for its handshake port and socket files, so a trailing
+    /// slash on an `ipc://` or `tcp://` registration stays in `base_url()`,
+    /// for the worker and for a data-parallel rank of it.
+    #[test]
+    fn a_trailing_slash_on_a_socket_address_stays_in_the_base() {
+        let ipc = BasicWorkerBuilder::new("ipc:///tmp/engine/")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(ipc.url(), "ipc:///tmp/engine/");
+        assert_eq!(ipc.base_url(), "ipc:///tmp/engine/");
+
+        let rank = BasicWorkerBuilder::new("ipc:///tmp/engine/")
+            .connection_mode(ConnectionMode::Zmq)
+            .dp_config(3, 8)
+            .build();
+        assert_eq!(rank.base_url(), "ipc:///tmp/engine/");
+
+        let tcp = BasicWorkerBuilder::new("tcp://127.0.0.1:5555/")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(tcp.base_url(), "tcp://127.0.0.1:5555/");
+    }
 }

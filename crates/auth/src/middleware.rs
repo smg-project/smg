@@ -12,7 +12,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument::WithSubscriber, warn, Dispatch, Instrument};
 
 use crate::{
     audit::{AuditContext, AuditLogger, AuditResource},
@@ -301,10 +301,14 @@ impl Attempt {
 
     /// Admit `principal`, whichever credential proved it: the role check (a
     /// 403 for a method the role may not use, or for a read kept to the
-    /// `admin` role), the admission line, the
-    /// extension the handlers read, the request itself and, for a request
-    /// that is not a read, the outcome line with the status the handler
-    /// answered and the resource it named.
+    /// `admin` role), the admission line, the extension the handlers read,
+    /// the request itself and, for a request that is not a read, the outcome
+    /// line with the status the handler answered and the resource it named.
+    ///
+    /// A recorded mutation and its outcome line run as one spawned task, so a
+    /// client that leaves before the answer drops the wait and not the
+    /// record. A task that ends without an answer is recorded and answered
+    /// as a 500.
     async fn admit(
         &self,
         audit_logger: &AuditLogger,
@@ -327,20 +331,102 @@ impl Attempt {
         let outcome = (audit_logger.is_enabled() && !is_read(&self.method))
             .then(|| (principal.id.clone(), principal.role));
         request.extensions_mut().insert(principal);
-        let response = next.run(request).await;
-        if let Some((principal_id, role)) = outcome {
-            let ctx = AuditContext::new(
-                &principal_id,
-                kind,
-                role,
-                &self.method,
-                &self.path,
-                self.request_id.as_deref(),
-            );
-            let resource = response.extensions().get::<AuditResource>();
-            audit_logger.log_outcome(&ctx, response.status(), resource.map(|r| r.0.as_str()));
+        let Some((principal_id, role)) = outcome else {
+            return next.run(request).await;
+        };
+        let record = OutcomeRecord::new(OutcomeFacts {
+            principal_id,
+            kind,
+            role,
+            method: self.method.clone(),
+            path: self.path.clone(),
+            request_id: self.request_id.clone(),
+            audit_logger: audit_logger.clone(),
+        });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the task is the admitted request's own work and ends with the handler's answer; a runtime shutdown drops it as it drops the request"
+        )]
+        let mutation = tokio::spawn(
+            async move {
+                let response = next.run(request).await;
+                let resource = response.extensions().get::<AuditResource>();
+                record.answered(response.status(), resource.map(|r| r.0.as_str()));
+                response
+            }
+            .instrument(tracing::Span::current())
+            .with_subscriber(tracing::dispatcher::get_default(Dispatch::clone)),
+        );
+        match mutation.await {
+            Ok(response) => response,
+            Err(error) => {
+                error!(
+                    "{} {} ended without an answer: {}",
+                    self.method, self.path, error
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         }
-        response
+    }
+}
+
+/// What the outcome line of a recorded mutation says besides the status and
+/// the resource.
+struct OutcomeFacts {
+    principal_id: String,
+    kind: &'static str,
+    role: Role,
+    method: String,
+    path: String,
+    request_id: Option<String>,
+    audit_logger: AuditLogger,
+}
+
+impl OutcomeFacts {
+    fn write(&self, status: StatusCode, resource: Option<&str>) {
+        let ctx = AuditContext::new(
+            &self.principal_id,
+            self.kind,
+            self.role,
+            &self.method,
+            &self.path,
+            self.request_id.as_deref(),
+        );
+        self.audit_logger.log_outcome(&ctx, status, resource);
+    }
+}
+
+/// The outcome line the task that runs a recorded mutation owes: written with
+/// the handler's answer, or at 500 with no resource when the handler
+/// panicked (the record is dropped on the unwind, whichever frame drops it).
+/// A record the runtime drops with the mutation in flight writes nothing: no
+/// client was answered a 500 and the handler's blocking work may still
+/// complete, so the admission line stands alone. The task owns it, so a
+/// client that leaves cannot skip it.
+struct OutcomeRecord {
+    facts: OutcomeFacts,
+    written: bool,
+}
+
+impl OutcomeRecord {
+    fn new(facts: OutcomeFacts) -> Self {
+        Self {
+            facts,
+            written: false,
+        }
+    }
+
+    fn answered(mut self, status: StatusCode, resource: Option<&str>) {
+        self.written = true;
+        self.facts.write(status, resource);
+    }
+}
+
+impl Drop for OutcomeRecord {
+    fn drop(&mut self) {
+        if !self.written && std::thread::panicking() {
+            self.facts.write(StatusCode::INTERNAL_SERVER_ERROR, None);
+        }
     }
 }
 
@@ -746,6 +832,9 @@ mod tests {
         async fn list() -> Response {
             StatusCode::OK.into_response()
         }
+        async fn give_up() -> Response {
+            panic!("the handler gave up")
+        }
         let state = ControlPlaneAuthState::new(
             ControlPlaneAuthConfig {
                 jwt: None,
@@ -760,13 +849,13 @@ mod tests {
         let app = Router::new()
             .route("/workers", post(register).get(list))
             .route("/refused", post(refuse))
+            .route("/broken", post(give_up))
             .layer(from_fn_with_state(state, control_plane_auth_middleware));
-        let path = if method == "REFUSED" {
-            "/refused"
-        } else {
-            "/workers"
+        let (path, method) = match method {
+            "REFUSED" => ("/refused", "POST"),
+            "BROKEN" => ("/broken", "POST"),
+            _ => ("/workers", method),
         };
-        let method = if method == "REFUSED" { "POST" } else { method };
         let mut request = Request::builder()
             .method(method)
             .uri(path)
@@ -863,6 +952,217 @@ mod tests {
             Some("control_plane_audit"),
             "{events:?}"
         );
+    }
+
+    /// The audit lines of a mutation whose client leaves after the first
+    /// poll: `handler` waits at a gate, the middleware's future is polled
+    /// once and dropped, the gate opens, and the lines are read once the
+    /// task has written its outcome (or after a thousand yields).
+    async fn lines_after_the_client_left(
+        handler: axum::routing::MethodRouter<Arc<tokio::sync::Notify>>,
+    ) -> Vec<Vec<(String, String)>> {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        use axum::{middleware::from_fn_with_state, Router};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{audit::tests::FieldCapture, config::ApiKeyEntry};
+
+        let gate = Arc::new(Notify::new());
+        let state = ControlPlaneAuthState::new(
+            ControlPlaneAuthConfig {
+                jwt: None,
+                api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                audit_enabled: true,
+            },
+            None,
+        );
+        let app = Router::new()
+            .route("/workers", handler)
+            .layer(from_fn_with_state(state, control_plane_auth_middleware))
+            .with_state(Arc::clone(&gate));
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/workers")
+            .header(header::AUTHORIZATION, "Bearer admin-key")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(RequestId("req-7".to_string()));
+        let capture = Arc::new(FieldCapture::default());
+
+        let mut call = Box::pin(app.oneshot(request).with_subscriber(capture.clone()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            call.as_mut().poll(&mut cx).is_pending(),
+            "the handler waits at its gate"
+        );
+        drop(call);
+        gate.notify_one();
+        for _ in 0..1_000 {
+            if capture.events.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let events = capture.events.lock().unwrap().clone();
+        events
+    }
+
+    /// The client of a mutation leaves after the first poll: the handler's
+    /// gate opens, and the outcome line still reaches the audit log under the
+    /// request's subscriber.
+    #[tokio::test]
+    async fn a_mutation_whose_client_leaves_still_writes_its_outcome_line() {
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        use crate::audit::tests::field;
+
+        async fn register(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            AuditResource::name(StatusCode::ACCEPTED.into_response(), "worker-1")
+        }
+        let events = lines_after_the_client_left(post(register)).await;
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the admission line, then the outcome line: {events:?}"
+        );
+        let outcome = &events[1];
+        assert_eq!(
+            field(outcome, "message"),
+            Some("control_plane_mutation"),
+            "{outcome:?}"
+        );
+        assert_eq!(field(outcome, "status"), Some("202"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("success"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), Some("worker-1"), "{outcome:?}");
+        assert_eq!(field(outcome, "request_id"), Some("req-7"), "{outcome:?}");
+    }
+
+    /// The client leaves, then the handler panics: the task's record still
+    /// writes the outcome line, at 500 with no resource.
+    #[tokio::test]
+    async fn a_handler_that_panics_after_the_client_left_still_writes_its_outcome_line() {
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        use crate::audit::tests::field;
+
+        async fn give_up(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            panic!("the handler gave up after the client left")
+        }
+        let events = lines_after_the_client_left(post(give_up)).await;
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the admission line, then the outcome line: {events:?}"
+        );
+        let outcome = &events[1];
+        assert_eq!(field(outcome, "status"), Some("500"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), None, "{outcome:?}");
+    }
+
+    /// The runtime drops the task of a mutation in flight (the process stops
+    /// with the handler at work, no panic): the record writes no outcome
+    /// line. No client was answered a 500, so the audit trail keeps the
+    /// admission line alone.
+    #[test]
+    fn a_task_the_runtime_drops_writes_no_outcome_line() {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{
+            audit::tests::{field, FieldCapture},
+            config::ApiKeyEntry,
+        };
+
+        async fn wait_at_the_gate(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            StatusCode::ACCEPTED.into_response()
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let capture = Arc::new(FieldCapture::default());
+        let gate = Arc::new(Notify::new());
+        runtime.block_on(async {
+            let state = ControlPlaneAuthState::new(
+                ControlPlaneAuthConfig {
+                    jwt: None,
+                    api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                    audit_enabled: true,
+                },
+                None,
+            );
+            let app = Router::new()
+                .route("/workers", post(wait_at_the_gate))
+                .layer(from_fn_with_state(state, control_plane_auth_middleware))
+                .with_state(Arc::clone(&gate));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/workers")
+                .header(header::AUTHORIZATION, "Bearer admin-key")
+                .body(Body::empty())
+                .unwrap();
+            let mut call = Box::pin(app.oneshot(request).with_subscriber(capture.clone()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                call.as_mut().poll(&mut cx).is_pending(),
+                "the handler waits at its gate"
+            );
+            // The client leaves; the task runs on to its gate.
+            drop(call);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        });
+        // The runtime goes with the task at its gate: the task's future is
+        // dropped on this thread, under the capture, with no panic.
+        tracing::subscriber::with_default(capture.clone(), || drop(runtime));
+
+        let events = capture.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "the admission line alone: {events:?}");
+        assert_eq!(
+            field(&events[0], "message"),
+            Some("control_plane_audit"),
+            "{events:?}"
+        );
+    }
+
+    /// A handler that ends without an answer: the request answers 500 and
+    /// the outcome line says so, with no resource.
+    #[tokio::test]
+    async fn a_handler_that_ends_without_an_answer_is_recorded_as_a_500() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "BROKEN", "admin-key").await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let outcome = &events[1];
+        assert_eq!(field(outcome, "status"), Some("500"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), None, "{outcome:?}");
     }
 
     /// A read the gateway named admin-only: the `user` role is refused by
