@@ -110,6 +110,8 @@ pub enum StatusDetailsReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseStatusError {
     pub code: Option<String>,
+    /// The error's message, as the public API writes it
+    pub message: Option<String>,
     #[serde(rename = "type")]
     pub r#type: Option<String>,
 }

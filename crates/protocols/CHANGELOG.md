@@ -85,6 +85,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- Realtime events read and write as the public API does. A `session.update`, `session.created`
+  or `session.updated` event reads its session into the variant its `type` names, where every
+  one the API writes failed with "missing field `type`", and is written with that `type` once,
+  where it was written twice. A transcription's `completed` event keeps its detected `languages`
+  (an empty list means none was detected), a transcription segment its `start` and `end` at the
+  precision written, and a failed response's error its `message`. Breaking:
+  `ServerEvent::InputAudioTranscriptionCompleted` gains `languages`, the segment's `start` and
+  `end` are `f64`, and `ResponseStatusError` gains `message`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
