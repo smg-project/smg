@@ -767,6 +767,39 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
     }
 }
 
+impl SglangSchedulerClient {
+    /// `generate` with the request's large inline tensors as body frames of
+    /// their own (the crate's private `framed` module): no encode buffer of
+    /// the message's size, the same message on the wire. A plain fn like
+    /// `generate`, for the same reason: the request becomes its frames before
+    /// the future exists, so the boxed future holds the frame list and the
+    /// request id, not the request; the trace context is injected at the
+    /// first poll, as there.
+    pub fn generate_framed(
+        &self,
+        req: proto::GenerateRequest,
+    ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
+        let request_id = req.request_id.clone();
+        let frames = crate::framed::sglang_frames(req);
+        async move {
+            let frames = frames?;
+            let mut carrier = Request::new(());
+            if let Err(e) = self.trace_injector.inject(carrier.metadata_mut()) {
+                warn!("Failed to inject trace context: {}", e);
+            }
+            let (metadata, _extensions, ()) = carrier.into_parts();
+            let stream = crate::framed::call_with_frames::<proto::GenerateResponse>(
+                self.channel(),
+                "/sglang.grpc.scheduler.SglangScheduler/Generate",
+                metadata.into_headers(),
+                frames,
+            )
+            .await?;
+            Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
