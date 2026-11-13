@@ -13,6 +13,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
+use smg_policy_controller::spec::PolicySpec;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
@@ -256,6 +257,23 @@ fn has_https_worker(config: &RouterConfig) -> bool {
                 || decode_urls.iter().any(|url| https(url))
         }
     }
+}
+
+/// The `--policy-spec` document at `path`: JSON by its `.json` extension,
+/// YAML otherwise (a JSON document is YAML too). The reader's error names
+/// the path and the position; the engine's, the field it refused.
+fn read_policy_spec(path: &std::path::Path) -> Result<PolicySpec, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("--policy-spec {}: cannot be read: {error}", path.display()))?;
+    let json = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    if json {
+        serde_json::from_str(&text).map_err(|error| error.to_string())
+    } else {
+        serde_yaml::from_str(&text).map_err(|error| error.to_string())
+    }
+    .map_err(|error| format!("--policy-spec {}: {error}", path.display()))
 }
 
 impl AppContextBuilder {
@@ -631,7 +649,7 @@ impl AppContextBuilder {
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
             .with_worker_registry()
-            .with_policy_registry(&router_config)
+            .with_policy_registry(&router_config)?
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -806,17 +824,26 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create policy registry
-    fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(
-            PolicyRegistry::with_override(
-                config.policy.clone(),
-                config.routing_key_override.clone(),
-            )
-            .with_pd_pairing_mode(config.pd_pairing_mode)
-            .with_policy_engine_for(config.policy_engine, &config.mode, &config.policy),
-        ));
-        self
+    /// Create policy registry: the engine behind `--policy-engine engine`
+    /// from the flags, or, when `--policy-spec` names a document, the
+    /// document's engine, read and applied here so a document the engine
+    /// refuses stops the start naming the field it refused.
+    fn with_policy_registry(mut self, config: &RouterConfig) -> Result<Self, String> {
+        let registry = PolicyRegistry::with_override(
+            config.policy.clone(),
+            config.routing_key_override.clone(),
+        )
+        .with_pd_pairing_mode(config.pd_pairing_mode);
+        let registry = match &config.policy_spec {
+            Some(path) => registry
+                .with_policy_spec(&read_policy_spec(path)?)
+                .map_err(|error| format!("--policy-spec {}: {error}", path.display()))?,
+            None => {
+                registry.with_policy_engine_for(config.policy_engine, &config.mode, &config.policy)
+            }
+        };
+        self.policy_registry = Some(Arc::new(registry));
+        Ok(self)
     }
 
     /// Create all storage backends using the factory function
@@ -1012,7 +1039,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::PolicyConfig,
+        config::types::{PolicyConfig, PolicyEngineMode},
         worker::{
             test_support::{select_worker, worker_of},
             BasicWorkerBuilder, ConnectionMode, PrefillAdmissionAttempt, SubscriptionKind, Worker,
@@ -1205,6 +1232,7 @@ mod tests {
         let config = config_with_policy(policy);
         AppContextBuilder::new()
             .with_policy_registry(&config)
+            .expect("the policy registry")
             .with_kv_event_monitor()
             .kv_event_monitor
             .is_some()
@@ -1241,6 +1269,7 @@ mod tests {
             .expect("client builds")
             .with_worker_registry()
             .with_policy_registry(&config)
+            .expect("the policy registry")
             .with_worker_monitor(&config)
             .expect("worker monitor builds");
 
@@ -1278,6 +1307,7 @@ mod tests {
         let config = config_with_policy(PolicyConfig::Random);
         let builder = AppContextBuilder::new()
             .with_policy_registry(&config)
+            .expect("the policy registry")
             .with_kv_event_monitor();
         assert!(builder.kv_event_monitor.is_some());
         let registry = builder
@@ -1538,6 +1568,7 @@ policy:
         let builder = AppContextBuilder::new()
             .with_worker_registry()
             .with_policy_registry(&config)
+            .expect("the policy registry")
             .with_kv_event_monitor();
         let monitor = builder
             .kv_event_monitor
@@ -1575,6 +1606,54 @@ policy:
             .await;
         assert!(logs_contain("Starting KV event subscription"));
         monitor.stop().await;
+    }
+
+    /// `--policy-spec` is read and applied at start: a preset's document,
+    /// YAML or JSON, hosts the document's engine; a missing file and a
+    /// document the engine refuses name the path and what was refused.
+    #[test]
+    fn a_policy_spec_file_is_applied_at_start_and_a_refused_one_names_its_field() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let spec = PolicySpec::preset("round_robin").expect("a preset document");
+        let yaml = dir.path().join("spec.yaml");
+        std::fs::write(&yaml, serde_yaml::to_string(&spec).expect("yaml")).expect("written");
+        let json = dir.path().join("spec.json");
+        std::fs::write(&json, serde_json::to_string(&spec).expect("json")).expect("written");
+        let under = |path: &std::path::Path| {
+            RouterConfig::builder()
+                .policy_engine(PolicyEngineMode::Engine)
+                .maybe_policy_spec(Some(path.to_path_buf()))
+                .build_unchecked()
+        };
+        for path in [&yaml, &json] {
+            let built = AppContextBuilder::new()
+                .with_policy_registry(&under(path))
+                .expect("the document's engine");
+            let registry = built.policy_registry.expect("a registry");
+            assert!(registry.decider().is_some(), "{}", path.display());
+        }
+
+        let missing = dir.path().join("absent.yaml");
+        let error = AppContextBuilder::new()
+            .with_policy_registry(&under(&missing))
+            .map(drop)
+            .expect_err("a missing file is refused");
+        assert!(
+            error.contains(&missing.display().to_string()) && error.contains("cannot be read"),
+            "{error}"
+        );
+
+        let refused = dir.path().join("refused.yaml");
+        std::fs::write(
+            &refused,
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: []\n    score: [nope]\n    pick: best\n",
+        )
+        .expect("written");
+        let error = AppContextBuilder::new()
+            .with_policy_registry(&under(&refused))
+            .map(drop)
+            .expect_err("an unknown scorer is refused");
+        assert!(error.contains("unknown scorer \"nope\""), "{error}");
     }
 }
 

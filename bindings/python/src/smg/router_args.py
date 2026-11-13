@@ -543,6 +543,9 @@ class RouterArgs:
     # Which implementation decides worker selection: legacy (the policies over
     # worker handles) or engine (the policy engine over its bounded view)
     policy_engine: str = "legacy"
+    # The policy specification the engine applies at start: the path of a YAML
+    # or JSON document of smg.policy/v1; needs policy_engine="engine"
+    policy_spec: str | None = None
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
     # operation included)
@@ -963,7 +966,19 @@ class RouterArgs:
                 " worker handles, or engine, the policy engine over its bounded view. Under"
                 " engine the policy must be one the engine carries: random, round_robin,"
                 " passthrough, power_of_two (expected_wait, requests, least_requests),"
-                " least_load or manual"
+                " least_load, manual and cache_aware in its default form"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-spec",
+            type=str,
+            metavar="PATH",
+            default=RouterArgs.policy_spec,
+            help=(
+                "The policy specification the engine applies at start: a YAML or JSON"
+                " document of smg.policy/v1. Needs --policy-engine engine; a document the"
+                " engine refuses stops the start naming the field it refused. Absent, the"
+                " routing flags decide as before"
             ),
         )
         routing_group.add_argument(

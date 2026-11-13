@@ -657,6 +657,9 @@ struct Router {
     pd_disaggregation: bool,
     pd_pairing_mode: String,
     policy_engine: String,
+    /// The policy specification the engine applies at start: the path of a YAML or JSON
+    /// document of `smg.policy/v1`; needs `policy_engine="engine"`.
+    policy_spec: Option<String>,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
     prefill_expected_workers: Option<usize>,
@@ -1533,6 +1536,7 @@ impl Router {
             .engine_metrics(self.engine_metrics)
             .pd_pairing_mode(pd_pairing_mode)
             .policy_engine(policy_engine)
+            .maybe_policy_spec(self.policy_spec.as_deref())
             .runtime_worker_threads(self.runtime_worker_threads)
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
@@ -1723,6 +1727,7 @@ impl Router {
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
         policy_engine = String::from("legacy"),
+        policy_spec = None,
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
         prefill_expected_workers = None,
@@ -1950,6 +1955,7 @@ impl Router {
         pd_disaggregation: bool,
         pd_pairing_mode: String,
         policy_engine: String,
+        policy_spec: Option<String>,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
         prefill_expected_workers: Option<usize>,
@@ -2228,6 +2234,7 @@ impl Router {
             pd_disaggregation,
             pd_pairing_mode,
             policy_engine,
+            policy_spec,
             postgres_config,
             power_of_two_load_metric,
             prefill_expected_workers,

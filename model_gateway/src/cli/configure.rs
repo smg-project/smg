@@ -15,9 +15,10 @@ use smg::{
         ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
         HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
         MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
-        PolicyEngineMode, PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig,
-        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
-        TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+        PolicyEngineMode, PolicyMode, PolicySpecSource, PostgresConfig, ReadinessRoleConfig,
+        RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+        SchemaConfig, SlurmDiscoveryConfig, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh::discovery::MeshDiscoveryConfig,
     observability::metrics::PrometheusConfig,
@@ -1312,6 +1313,11 @@ impl CliArgs {
                 PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
             )
             .policy_engine(PolicyEngineMode::parse(&self.routing.policy_engine).unwrap_or_default())
+            .maybe_policy_spec(self.routing.policy_spec.as_ref())
+            .policy_mode(PolicyMode::parse(&self.routing.policy_mode).unwrap_or_default())
+            .policy_spec_source(
+                PolicySpecSource::parse(&self.routing.policy_spec_source).unwrap_or_default(),
+            )
             .grouped_dp_sticky(self.routing.grouped_dp_sticky)
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing.routing_key_override,

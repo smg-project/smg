@@ -35,6 +35,8 @@ def cli_source() -> str:
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
     "--grouped-dp-sticky": "the launcher and the binding's Router take it in a follow-up change",
+    "--policy-mode": "one value in this release (embedded); the launcher pins no mode until a second exists",
+    "--policy-spec-source": "one value in this release (file); the launcher pins no source until a second exists",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.
@@ -595,3 +597,21 @@ def test_a_selector_entry_is_refused_with_the_cli_text(rust):
     refusal = f"Invalid value for field 'decode_selector': tier - {reason}"
     with pytest.raises(ValueError, match=re.escape(refusal)):
         RouterArgs._parse_selector(["app=engine tier"], "decode_selector")
+
+
+def test_the_policy_engine_help_lists_the_same_policies_on_both_sides(launcher):
+    """``--policy-engine``'s help lists the policies the engine carries. The CLI's
+    list is pinned to the validator's constant by a CLI test; the launcher's is
+    pinned to the CLI's here, so neither drifts from the refusal at start."""
+    if not MAIN_RS.exists():
+        pytest.skip("the Rust CLI's source is not in this checkout")
+    source = cli_source()
+    before = source[: source.index("policy_engine: String,")]
+    doc = re.search(r"((?:[ \t]*///[^\n]*\n)+)[ \t]*#\[arg\([^()]*\)\]\s*\Z", before)
+    assert doc, "the CLI's --policy-engine field moved"
+    cli_help = " ".join(line.strip().lstrip("/").strip() for line in doc.group(1).splitlines())
+    carried = re.compile(r"one the engine carries: (.+?)\.?$")
+    cli_list = carried.search(cli_help)
+    launcher_list = carried.search(launcher["--policy-engine"].help)
+    assert cli_list and launcher_list, (cli_help, launcher["--policy-engine"].help)
+    assert cli_list.group(1) == launcher_list.group(1), (cli_list.group(1), launcher_list.group(1))

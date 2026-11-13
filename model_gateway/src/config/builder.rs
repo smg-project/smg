@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
@@ -8,8 +8,9 @@ use super::{
     AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
     GroupedDpSticky, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
     MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
-    PolicyEngineMode, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-    RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    PolicyEngineMode, PolicyMode, PolicySpecSource, PostgresConfig, RedisConfig, RetryConfig,
+    RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig,
+    TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -738,6 +739,23 @@ impl RouterConfigBuilder {
 
     pub fn policy_engine(mut self, mode: PolicyEngineMode) -> Self {
         self.config.policy_engine = mode;
+        self
+    }
+
+    /// The policy specification the engine applies at start, when one is
+    /// named.
+    pub fn maybe_policy_spec(mut self, path: Option<impl Into<PathBuf>>) -> Self {
+        self.config.policy_spec = path.map(Into::into);
+        self
+    }
+
+    pub fn policy_mode(mut self, mode: PolicyMode) -> Self {
+        self.config.policy_mode = mode;
+        self
+    }
+
+    pub fn policy_spec_source(mut self, source: PolicySpecSource) -> Self {
+        self.config.policy_spec_source = source;
         self
     }
 

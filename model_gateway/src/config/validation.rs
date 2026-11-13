@@ -489,6 +489,13 @@ pub fn available_cpus() -> usize {
 
 /// Configuration validator
 pub(crate) struct ConfigValidator;
+/// The policies the engine carries in this build, as `--policy-engine`'s
+/// refusal at start and its help name them: one text, so the two cannot
+/// drift.
+pub const POLICIES_THE_ENGINE_CARRIES: &str = "random, round_robin, passthrough, power_of_two \
+    (expected_wait, requests, least_requests), least_load, manual and cache_aware in its default \
+    form";
+
 impl ConfigValidator {
     /// Under `--policy-engine engine` every policy that decides (the default,
     /// the two pair sides and, under encode-prefill-decode, the encode side)
@@ -496,7 +503,22 @@ impl ConfigValidator {
     /// itself accepts the configuration: the decider is built once here, so
     /// a tunable the engine refuses fails the start instead of falling back
     /// to the legacy path.
+    ///
+    /// A `--policy-spec` document needs the engine and stands in for the
+    /// flags' policies, so none of them is checked under it: the document is
+    /// read and validated where it is applied, at start.
     fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(path) = &config.policy_spec {
+            if config.policy_engine != PolicyEngineMode::Engine {
+                return Err(ConfigError::invalid_value(
+                    "policy_spec",
+                    path.display().to_string(),
+                    "--policy-spec needs --policy-engine engine: the legacy policies read no \
+                     specification",
+                ));
+            }
+            return Ok(());
+        }
         if config.policy_engine != PolicyEngineMode::Engine {
             return Ok(());
         }
@@ -509,9 +531,7 @@ impl ConfigValidator {
                     policy.name(),
                     format!(
                         "the policy engine does not carry the stages of {} in this build; it \
-                         carries random, round_robin, passthrough, power_of_two (expected_wait, \
-                         requests, least_requests), least_load, manual and cache_aware in its \
-                         default form",
+                         carries {POLICIES_THE_ENGINE_CARRIES}",
                         unsupported_form(policy)
                     ),
                 ));
@@ -2830,6 +2850,37 @@ mod tests {
             ..epd(None)
         };
         assert!(ConfigValidator::validate(&legacy).is_ok());
+    }
+
+    /// `--policy-spec` is the engine's: under the legacy default it is
+    /// refused by name, and under the engine it stands in for the flags'
+    /// policies, so a policy the engine does not carry passes beside it.
+    #[test]
+    fn a_policy_spec_needs_the_engine_and_stands_in_for_the_flags_policies() {
+        let config = RouterConfig {
+            policy_spec: Some(std::path::PathBuf::from("/etc/smg/policy/spec.yaml")),
+            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
+            ..Default::default()
+        };
+        let error = ConfigValidator::validate(&config).expect_err("refused under the legacy path");
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidValue { ref field, ref value, .. }
+                    if field == "policy_spec" && value == "/etc/smg/policy/spec.yaml"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("--policy-engine engine"),
+            "{error}"
+        );
+
+        let engine = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            ..config
+        };
+        assert!(ConfigValidator::validate(&engine).is_ok());
     }
 
     /// Under `engine` a policy, or a form of one, the engine does not carry

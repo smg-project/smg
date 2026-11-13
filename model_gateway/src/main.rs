@@ -610,7 +610,8 @@ struct RoutingArgs {
     /// policies over worker handles, or `engine`, the policy engine over its
     /// bounded view. Under `engine` the policy must be one the engine
     /// carries: random, round_robin, passthrough, power_of_two (expected_wait,
-    /// requests, least_requests) or least_load
+    /// requests, least_requests), least_load, manual and cache_aware in its
+    /// default form
     #[arg(
         long,
         value_parser = ["legacy", "engine"],
@@ -618,6 +619,34 @@ struct RoutingArgs {
         help_heading = "Routing Policy"
     )]
     policy_engine: String,
+
+    /// The policy specification the engine applies at start: a YAML or JSON
+    /// document of `smg.policy/v1`, the schema the policy crate publishes.
+    /// Needs `--policy-engine engine`; a document the engine refuses stops
+    /// the start naming the field it refused. Absent, the routing flags
+    /// decide as before
+    #[arg(long, value_name = "PATH", help_heading = "Routing Policy")]
+    policy_spec: Option<PathBuf>,
+
+    /// Where the policy engine runs: `embedded`, in the gateway's own
+    /// process, the one mode of this release
+    #[arg(
+        long,
+        value_parser = ["embedded"],
+        default_value = "embedded",
+        help_heading = "Routing Policy"
+    )]
+    policy_mode: String,
+
+    /// Where the policy specification comes from: `file`, the path
+    /// `--policy-spec` names, the one source of this release
+    #[arg(
+        long,
+        value_parser = ["file"],
+        default_value = "file",
+        help_heading = "Routing Policy"
+    )]
+    policy_spec_source: String,
 
     /// Ordered header names checked for the routing key; the first header
     /// present with a valid value wins. Header keys get the same
@@ -2017,8 +2046,8 @@ mod tests {
         config::{
             CacheIndexKind, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
             FileDiscoveryConfig, ManualAssignmentMode, ParserChoice, PolicyConfig,
-            PolicyEngineMode, SlurmDiscoveryConfig, UnhealthyRemovalScope,
-            DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+            PolicyEngineMode, PolicyMode, PolicySpecSource, SlurmDiscoveryConfig,
+            UnhealthyRemovalScope, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
         },
         server::posture::SecretSource,
         service_discovery::RuntimeDiscoveryConfig,
@@ -4159,6 +4188,47 @@ mod tests {
         );
     }
 
+    /// `--policy-spec`, `--policy-mode` and `--policy-spec-source` flow into
+    /// `ServerConfig.router_config`; without them the configuration names no
+    /// document and this release's one mode and source.
+    #[test]
+    fn the_policy_spec_flags_flow_into_both_configs_and_default_to_none_embedded_file() {
+        let cli = cli_args_from(&[]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.policy_spec, None);
+        assert_eq!(router_config.policy_mode, PolicyMode::Embedded);
+        assert_eq!(router_config.policy_spec_source, PolicySpecSource::File);
+
+        let cli = cli_args_from(&[
+            "--policy-engine",
+            "engine",
+            "--policy-spec",
+            "/etc/smg/policy/spec.yaml",
+            "--policy-mode",
+            "embedded",
+            "--policy-spec-source",
+            "file",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.policy_spec.as_deref(),
+            Some(Path::new("/etc/smg/policy/spec.yaml"))
+        );
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.policy_spec.as_deref(),
+            Some(Path::new("/etc/smg/policy/spec.yaml"))
+        );
+        assert_eq!(
+            server_config.router_config.policy_mode,
+            PolicyMode::Embedded
+        );
+        assert_eq!(
+            server_config.router_config.policy_spec_source,
+            PolicySpecSource::File
+        );
+    }
+
     /// Both thresholds are `>=` comparisons, so the excluded ends of their
     /// ranges would veto every worker unconditionally. Reject them at parse
     /// time rather than letting a typo shed all traffic.
@@ -4622,6 +4692,20 @@ mod tests {
         .unwrap()
         .validate()
         .unwrap();
+    }
+
+    /// The `--policy-engine` help names the policies the engine carries as
+    /// the validator's refusal names them, from the one constant.
+    #[test]
+    fn the_policy_engine_help_names_the_policies_the_validator_names() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let carried = format!(
+            "one the engine carries: {}",
+            smg::config::POLICIES_THE_ENGINE_CARRIES
+        );
+        assert!(help.contains(&carried), "{help}");
     }
 
     /// The flag's help states the ceiling the validator refuses above and

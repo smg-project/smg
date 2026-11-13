@@ -109,6 +109,19 @@ pub struct RouterConfig {
     /// bounded view. The switch of the migration and its rollback.
     #[serde(default)]
     pub policy_engine: PolicyEngineMode,
+    /// The policy specification the engine applies at start
+    /// (`--policy-spec`): a YAML or JSON document of `smg.policy/v1`, read
+    /// once, its engine hosted in place of the one the flags describe. Needs
+    /// `--policy-engine engine`; absent, the flags decide as before.
+    #[serde(default)]
+    pub policy_spec: Option<PathBuf>,
+    /// Where the policy engine runs (`--policy-mode`); see [`PolicyMode`].
+    #[serde(default)]
+    pub policy_mode: PolicyMode,
+    /// Where the policy specification comes from (`--policy-spec-source`);
+    /// see [`PolicySpecSource`].
+    #[serde(default)]
+    pub policy_spec_source: PolicySpecSource,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -1246,6 +1259,46 @@ impl PolicyEngineMode {
     }
 }
 
+/// Where the policy engine runs (`--policy-mode`): `embedded`, in the
+/// gateway's own process, is the one mode of this release; the standalone
+/// controller's modes join it with the controller.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyMode {
+    #[default]
+    Embedded,
+}
+
+impl PolicyMode {
+    /// Parse the CLI spelling (`embedded`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "embedded" => Some(Self::Embedded),
+            _ => None,
+        }
+    }
+}
+
+/// Where the policy specification comes from (`--policy-spec-source`):
+/// `file`, the path `--policy-spec` names, is the one source of this
+/// release; the API and resource sources join it with the controller.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicySpecSource {
+    #[default]
+    File,
+}
+
+impl PolicySpecSource {
+    /// Parse the CLI spelling (`file`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+}
+
 /// How strictly PD placement pairs a prefill with a decode on their KV
 /// transfer protocol (#2483). A descriptor component an engine does not report
 /// is "unknown".
@@ -2264,6 +2317,9 @@ impl Default for RouterConfig {
             grouped_dp_sticky: GroupedDpSticky::default(),
             pd_pairing_mode: PdPairingMode::default(),
             policy_engine: PolicyEngineMode::default(),
+            policy_spec: None,
+            policy_mode: PolicyMode::default(),
+            policy_spec_source: PolicySpecSource::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             pd_readiness: None,
@@ -2483,6 +2539,24 @@ mod tests {
         let parsed: RouterConfig =
             serde_json::from_value(serde_json::to_value(RouterConfig::default()).unwrap()).unwrap();
         assert_eq!(parsed.policy_engine, PolicyEngineMode::Legacy);
+    }
+
+    /// `--policy-mode` and `--policy-spec-source` each parse their one
+    /// spelling of this release, any case, and default to it; `policy_spec`
+    /// defaults to none.
+    #[test]
+    fn policy_mode_and_spec_source_parse_their_one_spelling_and_default_to_it() {
+        assert_eq!(PolicyMode::parse(" Embedded "), Some(PolicyMode::Embedded));
+        assert_eq!(PolicyMode::parse("elected"), None);
+        assert_eq!(
+            PolicySpecSource::parse("FILE"),
+            Some(PolicySpecSource::File)
+        );
+        assert_eq!(PolicySpecSource::parse("api"), None);
+        let config = RouterConfig::default();
+        assert_eq!(config.policy_mode, PolicyMode::Embedded);
+        assert_eq!(config.policy_spec_source, PolicySpecSource::File);
+        assert_eq!(config.policy_spec, None);
     }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is
