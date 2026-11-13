@@ -1656,8 +1656,6 @@ mod tests {
         );
     }
 
-    /// A content-source document joins its text blocks; one holding anything
-    /// else is refused naming the block.
     /// A content source given as a string renders as the document's text, as
     /// a text source does.
     #[test]
@@ -1682,6 +1680,8 @@ mod tests {
         );
     }
 
+    /// A content-source document joins its text blocks; one holding anything
+    /// else is refused naming the block.
     #[test]
     fn content_document_joins_its_text_blocks() {
         let text = |t: &str| {

@@ -2204,12 +2204,43 @@ impl ListModelsResponse {
 // ============================================================================
 
 /// The request's container (beta), in either form the public API takes: the
-/// id of a container to reuse, or its configuration
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// id of a container to reuse, or its configuration. It is read by hand, as
+/// [`StringOrBlocks`] is, so a malformed container is refused with the error
+/// of the form it took, not an untagged enum's "did not match any variant".
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum MessagesContainer {
     Id(String),
     Config(ContainerConfig),
+}
+
+impl<'de> Deserialize<'de> for MessagesContainer {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContainerVisitor;
+
+        impl<'de> Visitor<'de> for ContainerVisitor {
+            type Value = MessagesContainer;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a container id or a container configuration")
+            }
+
+            fn visit_str<E: de::Error>(self, id: &str) -> Result<Self::Value, E> {
+                Ok(MessagesContainer::Id(id.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, id: String) -> Result<Self::Value, E> {
+                Ok(MessagesContainer::Id(id))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                ContainerConfig::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(MessagesContainer::Config)
+            }
+        }
+
+        deserializer.deserialize_any(ContainerVisitor)
+    }
 }
 
 /// Container configuration for code execution (beta)
@@ -3706,6 +3737,28 @@ mod tests {
             .unwrap();
             let written = serde_json::to_value(&request).unwrap();
             assert_eq!(written["container"], container);
+        }
+
+        // a malformed container is refused with the error of the form it took
+        for (container, expected) in [
+            (
+                json!(5),
+                "invalid type: integer `5`, expected a container id",
+            ),
+            (
+                json!({"id": 5}),
+                "invalid type: integer `5`, expected a string",
+            ),
+        ] {
+            let refused = serde_json::from_value::<CreateMessageRequest>(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Run the script again."}],
+                "container": container
+            }))
+            .expect_err("a malformed container")
+            .to_string();
+            assert!(refused.contains(expected), "{refused}");
         }
     }
 
