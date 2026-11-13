@@ -14,7 +14,7 @@
 //! absent key is a no-op, iteration yields every entry once. A differential test against a hash
 //! map model under random operations keeps the backshift right.
 
-use crate::{block::SequenceHash, chain_index::BlockRef};
+use crate::{block::SequenceHash, chain_index::BlockRef, prefetch::prefetch_read};
 
 /// Smallest table a non-empty map allocates.
 const MIN_SLOTS: usize = 16;
@@ -225,8 +225,8 @@ impl ChainBlockMap {
     fn touch(&self, key: u64) {
         if !self.slots.is_empty() {
             let home = self.home(key);
-            crate::prefetch::prefetch_read(&self.tags[home]);
-            crate::prefetch::prefetch_read(&self.slots[home]);
+            prefetch_read(&self.tags[home]);
+            prefetch_read(&self.slots[home]);
         }
     }
 
