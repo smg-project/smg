@@ -327,6 +327,9 @@ enum BlockAccumulator {
         id: String,
         name: String,
         input_json: String,
+        /// The caller the block's start named, so the next round's history
+        /// keeps it as the non-streamed loop's does
+        caller: ToolUseCaller,
     },
     Thinking {
         thinking: String,
@@ -413,6 +416,7 @@ impl BlockAccumulator {
                 id,
                 name,
                 input_json,
+                caller,
             } => {
                 let input: Value = serde_json::from_str(input_json).unwrap_or_else(|e| {
                     warn!(
@@ -427,14 +431,15 @@ impl BlockAccumulator {
                     name: name.clone(),
                     input: input.clone(),
                     cache_control: None,
-                    caller: None,
+                    // a call the model made keeps its caller implicit
+                    caller: (*caller != ToolUseCaller::Direct).then(|| caller.clone()),
                 };
                 (
                     ContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input,
-                        caller: ToolUseCaller::Direct,
+                        caller: caller.clone(),
                     },
                     Some(tool_use),
                 )
@@ -648,6 +653,7 @@ where
             id,
             name,
             input_json: String::new(),
+            caller: tool_use_caller(content_block),
         };
         Ok(())
     }
@@ -729,6 +735,16 @@ fn resolve_event(frame: SseFrame<'_>) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
     Some((event_type, frame.data))
 }
 
+/// The caller a streamed `tool_use` block's start names, as the public API
+/// reports it; a block without one is a call the model made.
+fn tool_use_caller(content_block: &Value) -> ToolUseCaller {
+    content_block
+        .get("caller")
+        .filter(|caller| !caller.is_null())
+        .and_then(|caller| serde_json::from_value(caller.clone()).ok())
+        .unwrap_or_default()
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -737,6 +753,44 @@ fn resolve_event(frame: SseFrame<'_>) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
 mod tests {
     use super::*;
     use crate::error::HEADER_X_SMG_ERROR_CODE;
+
+    /// A streamed MCP `tool_use` keeps the caller its start names, so the
+    /// next round's history writes it as the non-streamed loop's does; a call
+    /// the model made writes none.
+    #[test]
+    fn a_streamed_tool_use_keeps_its_caller() {
+        let code_execution = ToolUseCaller::CodeExecution20250825 {
+            tool_id: "srvtoolu_1".to_string(),
+        };
+        let start = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "search",
+            "input": {},
+            "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}
+        });
+        assert_eq!(tool_use_caller(&start), code_execution);
+
+        let block = BlockAccumulator::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "search".to_string(),
+            input_json: "{}".to_string(),
+            caller: tool_use_caller(&start),
+        };
+        let (content, tool_use) = block.finalize();
+        assert!(
+            matches!(&content, ContentBlock::ToolUse { caller, .. } if *caller == code_execution),
+            "{content:?}"
+        );
+        assert_eq!(tool_use.and_then(|t| t.caller), Some(code_execution));
+
+        for direct in [
+            serde_json::json!({"type": "tool_use", "id": "toolu_2", "name": "search"}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_3", "name": "search", "caller": null}),
+        ] {
+            assert_eq!(tool_use_caller(&direct), ToolUseCaller::Direct, "{direct}");
+        }
+    }
 
     #[test]
     fn build_sse_response_drops_smg_owned_error_code() {

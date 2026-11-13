@@ -1502,8 +1502,9 @@ pub enum ContentBlock {
     },
 }
 
-/// The caller of a `tool_use` block, as the public API reports it: the model
-/// itself (`{"type": "direct"}`) or a server tool that issued the call.
+/// The caller of a `tool_use`, `server_tool_use` or `web_search_tool_result`
+/// block, as the public API reports it: the model itself
+/// (`{"type": "direct"}`) or a server tool that issued the call.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolUseCaller {
@@ -1514,8 +1515,8 @@ pub enum ToolUseCaller {
     #[serde(rename = "code_execution_20250825")]
     CodeExecution20250825 { tool_id: String },
     /// A caller kind this build does not know, kept as the upstream sent it:
-    /// a `tool_use` block of an upstream answer must parse whatever caller the
-    /// public API adds later, and leave with the same object.
+    /// a block of an upstream answer must parse whatever caller the public API
+    /// adds later, and leave with the same object.
     #[serde(untagged)]
     Other(Value),
 }
