@@ -1418,6 +1418,14 @@ fn a_stage_after_the_byte_level_reads_the_image() {
     ]))));
     let native = seeded(&tokenizer);
     assert_eq!(native.mapped_from, Some(0));
+    // The ids alone would not tell a skipped anchored stage from a run one
+    // (the pool's merges join no two of the digits `2` to `8`), so the
+    // pieces are compared too, as the reference cuts them, in the image's
+    // alphabet (a cut inside a three-byte character is no `str`).
+    let from = native.mapped_from.expect("the map");
+    let table = bytes_char();
+    let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+    let mut image = String::new();
     for text in [
         "12345\u{4E32}678901",
         "1234567\u{B2}890",
@@ -1425,6 +1433,28 @@ fn a_stage_after_the_byte_level_reads_the_image() {
         "1234567",
         "12 345\n6789",
     ] {
+        let mut split = PreTokenizedString::from(text);
+        pre_tokenizer
+            .pre_tokenize(&mut split)
+            .expect("the reference");
+        let theirs: Vec<String> = split
+            .get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .map(|(piece, _, _)| piece.to_owned())
+            .collect();
+        let mut ours = Vec::new();
+        native.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+            ours.push(
+                raw.iter()
+                    .map(|&b| table[usize::from(b)])
+                    .collect::<String>(),
+            );
+        });
+        assert!(theirs.len() >= 2, "{text:?} is cut");
+        assert_eq!(
+            ours, theirs,
+            "anchored digit stages: the pieces of {text:?}"
+        );
         let reference = tokenizer.encode(text, false).expect("encode");
         for parallel in [false, true] {
             assert_eq!(
