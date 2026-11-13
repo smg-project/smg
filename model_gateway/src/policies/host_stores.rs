@@ -1168,7 +1168,10 @@ mod tests {
     use crate::{
         config::PolicyConfig,
         policies::PolicyRegistry,
-        worker::test_support::{no_health_check, ready_worker, worker_of},
+        worker::{
+            test_support::{no_health_check, ready_worker, worker_of},
+            SubscriptionKind,
+        },
     };
 
     fn facts(key: &str) -> WorkerFacts {
@@ -1965,7 +1968,7 @@ mod tests {
             "no index for the model yet"
         );
         kv_monitor
-            .on_worker_added(&worker, crate::worker::SubscriptionKind::Events)
+            .on_worker_added(&worker, SubscriptionKind::Events)
             .await;
         let index = kv_monitor.get_indexer("m").expect("the model's index");
         assert_eq!(
@@ -2030,7 +2033,7 @@ mod tests {
         let host = HostStores::new(Arc::clone(&registry), None, Some(&kv_monitor));
         let id = worker_id(worker.as_ref());
         kv_monitor
-            .on_worker_added(&worker, crate::worker::SubscriptionKind::Events)
+            .on_worker_added(&worker, SubscriptionKind::Events)
             .await;
         let index = kv_monitor.get_indexer("m").expect("the model's index");
         let facts = |sequence: u64| BatchFacts {
@@ -2098,7 +2101,7 @@ mod tests {
         let host = HostStores::new(Arc::clone(&registry), None, Some(&kv_monitor));
         let id = worker_id(worker.as_ref());
         kv_monitor
-            .on_worker_added(&worker, crate::worker::SubscriptionKind::Events)
+            .on_worker_added(&worker, SubscriptionKind::Events)
             .await;
         let index = kv_monitor.get_indexer("m").expect("the model's index");
         host.removed(id);
@@ -2209,7 +2212,7 @@ mod tests {
             );
             registry.register(Arc::clone(&worker)).expect("registered");
             kv_monitor
-                .on_worker_added(&worker, crate::worker::SubscriptionKind::Events)
+                .on_worker_added(&worker, SubscriptionKind::Events)
                 .await;
             ids.push(worker_id(worker.as_ref()));
         }
@@ -2280,7 +2283,7 @@ mod tests {
         let host = HostStores::new(Arc::clone(&registry), None, Some(&kv_monitor));
         let id = worker_id(worker.as_ref());
         kv_monitor
-            .on_worker_added(&worker, crate::worker::SubscriptionKind::Events)
+            .on_worker_added(&worker, SubscriptionKind::Events)
             .await;
         let index = kv_monitor.get_indexer("m").expect("the model's index");
         let feed = host.feed_of(id).expect("the feed of a live worker");
