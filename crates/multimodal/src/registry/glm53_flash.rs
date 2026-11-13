@@ -677,4 +677,23 @@ mod tests {
             .filter(|(key, _)| *key != "pixel_values")
             .all(|(_, layout)| *layout == FieldLayout::Batched));
     }
+
+    /// The entry has no per-modality override, so a video batch takes the
+    /// legacy map through `from_legacy_fields` too: its pixels are sliced by
+    /// `patches_per_image`, the count the video processor writes beside
+    /// `patches_per_video`. A tidy of either side that forgets the pair fails
+    /// every clip at assembly; this pin and the processor's read it first.
+    #[test]
+    fn a_video_batch_is_sliced_by_the_image_patch_count() {
+        let layouts = Glm53FlashSpec.encoder_field_layouts_for(Modality::Video);
+        assert_eq!(
+            layouts.encoder_input,
+            FieldLayout::flat("patches_per_image")
+        );
+        assert_eq!(
+            layouts.model_specific.get("patches_per_image"),
+            Some(&FieldLayout::Batched)
+        );
+        assert!(!layouts.model_specific.contains_key("pixel_values"));
+    }
 }

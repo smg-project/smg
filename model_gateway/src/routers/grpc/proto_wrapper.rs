@@ -364,10 +364,12 @@ pub enum ProtoResponseVariant {
     None,
 }
 
-/// The wire dispatch of a counter every wire carries under one field name:
-/// the five-arm match written once, so a wire added to the wrappers is one
-/// arm here and a reader cannot forget one. The second form names the wire
-/// without the field and what it reads instead.
+/// The wire dispatch of a counter every wire carries under one field name,
+/// written once per form. A wire added to the wrappers is one arm in each
+/// form, two in all, where every reader spelled its own before. The compiler
+/// still refuses a reader that lacks a wire; the macro only moves where the
+/// arms are written. The second form names the wire without the field and
+/// what it reads instead.
 macro_rules! wire_field {
     ($on:expr, $c:ident => $read:expr) => {
         match $on {
@@ -2946,6 +2948,52 @@ mod tests {
         // Engines without the proto field ignore the pin
         let mut mlx_req = ProtoGenerateRequest::Mlx(Box::default());
         mlx_req.set_data_parallel_rank(1);
+    }
+
+    /// A PD room moves into a rank's residue class and keeps its other bits,
+    /// within `[0, i64::MAX)` from every room; a request without a room, or a
+    /// rank outside the ranks, is left as it was.
+    #[test]
+    fn a_kv_bootstrap_room_moves_into_its_ranks_residue_class() {
+        let room_of = |request: &ProtoGenerateRequest| match request {
+            ProtoGenerateRequest::TokenSpeed(req) => req
+                .kv_bootstrap_info
+                .as_ref()
+                .map(|info| info.bootstrap_room),
+            _ => None,
+        };
+        for room in [0, 41, 1 << 40, i64::MAX - 3, i64::MAX - 1, -5] {
+            for (rank, ranks) in [(0, 1), (3, 4), (1, 2), (6, 8)] {
+                let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
+                request.set_kv_bootstrap_info("prefill".to_string(), 8998, room);
+                assert!(request.set_kv_bootstrap_room_residue(rank, ranks));
+                let moved = room_of(&request).unwrap();
+                assert!(
+                    (0..i64::MAX).contains(&moved),
+                    "{room} as {rank} of {ranks}"
+                );
+                assert_eq!(
+                    moved % ranks as i64,
+                    rank as i64,
+                    "{room} as {rank} of {ranks}"
+                );
+                if (0..i64::MAX - ranks as i64).contains(&room) {
+                    assert_eq!(moved / ranks as i64, room / ranks as i64, "other bits kept");
+                }
+            }
+        }
+
+        let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
+        request.set_kv_bootstrap_info("prefill".to_string(), 8998, 41);
+        for (rank, ranks) in [(4, 4), (0, 0), (0, i64::MAX as usize), (1, usize::MAX)] {
+            assert!(!request.set_kv_bootstrap_room_residue(rank, ranks));
+            assert_eq!(room_of(&request), Some(41));
+        }
+        let mut roomless = ProtoGenerateRequest::TokenSpeed(Box::default());
+        assert!(!roomless.set_kv_bootstrap_room_residue(1, 4));
+        assert_eq!(room_of(&roomless), None);
+        let mut sglang = ProtoGenerateRequest::Sglang(Box::default());
+        assert!(!sglang.set_kv_bootstrap_room_residue(1, 4));
     }
 
     fn vllm_mm_data(modality: common::Modality) -> VllmMultimodalData {

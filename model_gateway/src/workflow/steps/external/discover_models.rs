@@ -347,7 +347,9 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
                 message: format!(
                     "every model discovered from {} needs the {} router, which this build does \
                      not carry; rebuild with the `{}` Cargo feature",
-                    config.url, missing.label, missing.feature
+                    Endpoint::redacted_str(&config.url),
+                    missing.label,
+                    missing.feature
                 ),
             });
         }

@@ -1,5 +1,7 @@
 //! Streaming response accumulator for persisting responses.
 
+use std::borrow::Cow;
+
 use openai_protocol::event_types::{OutputItemEvent, ResponseEvent};
 use serde_json::Value;
 use tracing::warn;
@@ -36,6 +38,24 @@ impl StreamingResponseAccumulator {
             return;
         }
         self.process_block(block);
+    }
+
+    /// Feed the accumulator one event already split into its name and data
+    /// payload; the payload is parsed here.
+    pub fn ingest_event(&mut self, event_name: Option<&str>, data: &str) {
+        if data.trim().is_empty() {
+            return;
+        }
+        match serde_json::from_str::<Value>(data) {
+            Ok(parsed) => self.record_event(event_name, Cow::Owned(parsed)),
+            Err(err) => warn!("Failed to parse streaming event JSON: {}", err),
+        }
+    }
+
+    /// Feed the accumulator one event whose data payload the caller has
+    /// parsed already, so a relayed event is parsed once.
+    pub fn ingest_parsed(&mut self, event_name: Option<&str>, parsed: &Value) {
+        self.record_event(event_name, Cow::Borrowed(parsed));
     }
 
     /// Consume the accumulator and produce the best-effort final response value.
@@ -87,22 +107,13 @@ impl StreamingResponseAccumulator {
         }
 
         let (event_name, data) = parse_sse_block(trimmed);
-        if data.is_empty() {
-            return;
-        }
-
-        self.handle_event(event_name, &data);
+        self.ingest_event(event_name, &data);
     }
 
-    fn handle_event(&mut self, event_name: Option<&str>, data_payload: &str) {
-        let parsed: Value = match serde_json::from_str(data_payload) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!("Failed to parse streaming event JSON: {}", err);
-                return;
-            }
-        };
-
+    /// Record what the final response needs from one parsed event; the
+    /// error event's payload is kept whole, so a borrowed one is copied there
+    /// and nowhere else.
+    fn record_event(&mut self, event_name: Option<&str>, parsed: Cow<'_, Value>) {
         match get_event_type(event_name, &parsed) {
             ResponseEvent::CREATED if self.initial_response.is_none() => {
                 if let Some(response) = parsed.get("response") {
@@ -122,7 +133,7 @@ impl StreamingResponseAccumulator {
                 }
             }
             "response.error" => {
-                self.encountered_error = Some(parsed);
+                self.encountered_error = Some(parsed.into_owned());
             }
             _ => {}
         }

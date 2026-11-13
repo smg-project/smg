@@ -304,7 +304,8 @@ pub struct Candidate {
     /// Host-supplied admission bit: the decode's running window has a room
     /// nobody waiting at its gate is in line for.
     pub has_room: bool,
-    /// Milliseconds since the worker was admitted to the pool.
+    /// Milliseconds since the worker was admitted to the pool, saturating at
+    /// `u32::MAX` as `report_age_ms` does; never wrapping.
     pub admitted_age_ms: u32,
     /// Blocks the index learned about the worker since admission.
     pub indexed_growth: u32,
@@ -333,10 +334,13 @@ pub struct Candidate {
     /// index owns first: by the birthday bound, n(n - 1) / 2 over 2^32, about
     /// one chance in 8,600 over a pool of a thousand and one in 870,000 over
     /// a hundred; the 64-bit form waits for the candidate's byte budget.
-    /// Zero when the host carries none. Last in the record (the wire numbers
-    /// its fields in the record's order; this one came after the contract's
-    /// first cut).
+    /// Zero when the host carries none. After the contract's first cut (the
+    /// wire numbers its fields in the record's order).
     pub key: u32,
+    /// Blocks the index holds for the worker: what a warm-up stage reads
+    /// thinness from, against the fleet's level. Last in the record, after
+    /// `key`, for the same reason.
+    pub indexed_blocks: u32,
 }
 
 /// Media on the request: counts and bytes, for workers that take media.
@@ -383,7 +387,8 @@ pub struct RequestFacts<'a> {
     pub attempt: u8,
     /// Candidates earlier attempts of this request already tried.
     pub tried: &'a [WorkerId],
-    /// Time left for the decision, relative to the host's receipt.
+    /// Time left for the whole decision, relative to the host's receipt; a
+    /// plugin's own share of it rides its frame, clamped to at most this.
     pub budget_micros: u32,
     /// Allow-listed headers only.
     pub headers: &'a [Header<'a>],
@@ -391,6 +396,11 @@ pub struct RequestFacts<'a> {
     /// The per-decision seed, recorded in the trace: the only randomness a
     /// stage gets.
     pub seed: u64,
+    /// The size in tokens of one of the request's blocks as the host
+    /// counted them: an index's learned block size on an event-fed request,
+    /// the configured one on a tree-fed request; `0` reads the view's. Last
+    /// on the wire (the numbering follows the record's order).
+    pub block_size: u32,
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
