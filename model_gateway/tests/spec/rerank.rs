@@ -15,6 +15,7 @@ fn test_rerank_request_serialization() {
         model: "test-model".to_string(),
         top_k: Some(5),
         return_documents: true,
+        instruct: None,
         rid: Some(StringOrArray::String("req-123".to_string())),
         user: Some("user-456".to_string()),
     };
@@ -63,6 +64,7 @@ fn test_rerank_request_validation_success() {
         model: "test-model".to_string(),
         top_k: Some(2),
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -78,6 +80,7 @@ fn test_rerank_request_validation_empty_query() {
         model: "test-model".to_string(),
         top_k: None,
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -94,6 +97,7 @@ fn test_rerank_request_validation_whitespace_query() {
         model: "test-model".to_string(),
         top_k: None,
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -110,6 +114,7 @@ fn test_rerank_request_validation_empty_documents() {
         model: "test-model".to_string(),
         top_k: None,
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -126,6 +131,7 @@ fn test_rerank_request_validation_top_k_zero() {
         model: "test-model".to_string(),
         top_k: Some(0),
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -142,6 +148,7 @@ fn test_rerank_request_validation_top_k_greater_than_docs() {
         model: "test-model".to_string(),
         top_k: Some(5),
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -158,6 +165,7 @@ fn test_rerank_request_effective_top_k() {
         model: "test-model".to_string(),
         top_k: Some(2),
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -173,6 +181,7 @@ fn test_rerank_request_effective_top_k_none() {
         model: "test-model".to_string(),
         top_k: None,
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -362,6 +371,7 @@ fn test_v1_rerank_req_input_serialization() {
         model: Some("test-model".to_string()),
         top_n: Some(1),
         return_documents: false,
+        instruct: None,
         rid: Some(StringOrArray::String("req-123".to_string())),
         user: Some("user-456".to_string()),
     };
@@ -499,6 +509,7 @@ fn test_rerank_request_generation_request_trait() {
         model: "test-model".to_string(),
         top_k: None,
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -517,6 +528,7 @@ fn test_rerank_request_very_long_query() {
         model: "test-model".to_string(),
         top_k: None,
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -533,6 +545,7 @@ fn test_rerank_request_many_documents() {
         model: "test-model".to_string(),
         top_k: Some(100),
         return_documents: true,
+        instruct: None,
         rid: None,
         user: None,
     };
@@ -552,6 +565,7 @@ fn test_rerank_request_special_characters() {
         model: "test-model".to_string(),
         top_k: None,
         return_documents: true,
+        instruct: None,
         rid: Some(StringOrArray::String("req-🚀-123".to_string())),
         user: Some("user-🎉-456".to_string()),
     };
@@ -567,6 +581,7 @@ fn test_rerank_request_rid_array() {
         model: "test-model".to_string(),
         top_k: None,
         return_documents: true,
+        instruct: None,
         rid: Some(StringOrArray::Array(vec![
             "req1".to_string(),
             "req2".to_string(),
@@ -624,6 +639,7 @@ fn test_full_rerank_workflow() {
         model: "rerank-model".to_string(),
         top_k: Some(2),
         return_documents: true,
+        instruct: None,
         rid: Some(StringOrArray::String("req-123".to_string())),
         user: Some("user-456".to_string()),
     };

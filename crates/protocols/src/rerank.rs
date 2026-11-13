@@ -42,14 +42,21 @@ pub struct RerankRequest {
     #[serde(skip_serializing_if = "super::common::is_unknown_model")]
     pub model: String,
 
-    /// Maximum number of documents to return (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Maximum number of documents to return (optional). `top_n`, SGLang's
+    /// spelling, is read as well, as `/v1/rerank` reads `top_k`.
+    #[serde(alias = "top_n", skip_serializing_if = "Option::is_none")]
     #[validate(range(min = 1))]
     pub top_k: Option<usize>,
 
     /// Whether to return documents in addition to scores
     #[serde(default = "default_true")]
     pub return_documents: bool,
+
+    /// The instruction a reranker that takes one (Qwen3's) scores the
+    /// documents under, as SGLang's rerank takes it; absent, the model's
+    /// template applies its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruct: Option<String>,
 
     // Engine-specific extensions
     /// Request ID for tracking; absent from the body when unset, so the
@@ -356,6 +363,10 @@ pub struct V1RerankReqInput {
     #[serde(default = "default_true")]
     pub return_documents: bool,
 
+    /// The instruction the reranker scores under, as on the native route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruct: Option<String>,
+
     /// Request ID for tracking, as on the native route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rid: Option<StringOrArray>,
@@ -378,6 +389,7 @@ impl From<V1RerankReqInput> for RerankRequest {
                 .unwrap_or_else(super::common::default_unknown_model),
             top_k: v1.top_n.filter(|n| *n > 0),
             return_documents: v1.return_documents,
+            instruct: v1.instruct,
             rid: v1.rid,
             user: v1.user,
         }
@@ -408,5 +420,58 @@ mod tests {
             serde_json::to_value(&with_rid).expect("a body")["rid"],
             "r-1"
         );
+    }
+
+    /// SGLang's rerank takes an `instruct` and spells the limit `top_n`: the
+    /// native route reads `top_n` as its `top_k`, and both routes keep the
+    /// instruction, `/v1/rerank`'s through its conversion. A `top_n` of 0 on
+    /// the native route is refused, as SGLang refuses it; a request without
+    /// an instruction writes none.
+    #[test]
+    fn a_rerank_request_keeps_instruct_and_reads_top_n() {
+        let native: RerankRequest = serde_json::from_value(json!({
+            "model": "m",
+            "query": "q",
+            "documents": ["d1", "d2"],
+            "top_n": 1,
+            "instruct": "Given a legal question, judge the passage"
+        }))
+        .expect("a native request");
+        assert_eq!(native.top_k, Some(1));
+        assert!(native.validate().is_ok(), "a top_n of 1 passes");
+        let written = serde_json::to_value(&native).expect("serialize");
+        assert_eq!(
+            written["instruct"],
+            "Given a legal question, judge the passage"
+        );
+        assert_eq!(written["top_k"], 1);
+
+        let v1: V1RerankReqInput = serde_json::from_value(json!({
+            "query": "q",
+            "documents": ["d"],
+            "instruct": "Judge the passage"
+        }))
+        .expect("a v1 request");
+        assert_eq!(
+            RerankRequest::from(v1).instruct.as_deref(),
+            Some("Judge the passage")
+        );
+
+        let zero: RerankRequest = serde_json::from_value(json!({
+            "model": "m",
+            "query": "q",
+            "documents": ["d"],
+            "top_n": 0
+        }))
+        .expect("a native request");
+        assert!(zero.validate().is_err(), "a top_n of 0 is refused");
+
+        let plain: RerankRequest =
+            serde_json::from_value(json!({"model": "m", "query": "q", "documents": ["d"]}))
+                .expect("a native request");
+        assert!(serde_json::to_value(&plain)
+            .expect("serialize")
+            .get("instruct")
+            .is_none());
     }
 }

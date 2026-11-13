@@ -94,6 +94,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A rerank request keeps SGLang's `instruct`, and the native `/rerank` route reads SGLang's
+  `top_n` as its `top_k`, as `/v1/rerank` reads `top_k`. Neither request type had `instruct`, so
+  the Qwen3 rerankers scored under their template's default instruction, and a `/rerank` client's
+  `top_n` was ignored, answering every document. `RerankRequest` and `V1RerankReqInput` gain
+  `instruct`, carried by the conversion and skipped when absent; a `top_n` of 0 on `/rerank` is
+  refused by `top_k`'s bound, as SGLang refuses it. Breaking: both request types gain `instruct`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

@@ -3652,6 +3652,7 @@ mod tests {
             model: "test-model".to_string(),
             top_k: Some(1),
             return_documents: false,
+            instruct: None,
             rid: None,
             user: None,
         }

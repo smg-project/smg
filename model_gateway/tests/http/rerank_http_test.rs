@@ -192,6 +192,62 @@ async fn v1_rerank_routes_by_the_body_model_and_applies_top_n() {
     );
 }
 
+/// SGLang's rerank spells the limit `top_n` and takes an `instruct`: the
+/// native route applies a `top_n` as its own `top_k`, and both routes carry
+/// the instruction to the worker.
+#[tokio::test]
+async fn rerank_applies_top_n_and_both_routes_forward_instruct() {
+    let upstream = upstream(results_object()).await;
+    let app = app_for(&upstream).await;
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/rerank",
+            json!({
+                "model": MODEL,
+                "query": "what is rust",
+                "documents": ["a kind of oxide", "a systems language"],
+                "top_n": 1,
+                "instruct": "Given a programming question, judge the passage"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_of(response).await;
+    assert_eq!(
+        body["results"],
+        json!([{"score": 0.93, "index": 1}]),
+        "top_n truncates the worker's ranked list on the native route"
+    );
+
+    let response = app
+        .oneshot(request(
+            "/v1/rerank",
+            json!({
+                "model": MODEL,
+                "query": "what is rust",
+                "documents": ["a kind of oxide", "a systems language"],
+                "instruct": "Given a chemistry question, judge the passage"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = upstream.state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].1["instruct"], "Given a programming question, judge the passage",
+        "the native route forwards the instruction"
+    );
+    assert_eq!(
+        requests[1].1["instruct"], "Given a chemistry question, judge the passage",
+        "/v1/rerank forwards the instruction"
+    );
+}
+
 #[tokio::test]
 async fn v1_rerank_for_a_model_no_worker_serves_is_refused_before_dispatch() {
     let upstream = upstream(results_object()).await;
