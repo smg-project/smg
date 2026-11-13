@@ -131,9 +131,10 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrap_port: Option<i32>,
 
-    /// For disaggregated inference
+    /// For disaggregated inference: the room id, drawn from `[0, 2^63 - 1]`,
+    /// as SGLang's PD contract types it (int64)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bootstrap_room: Option<i32>,
+    pub bootstrap_room: Option<i64>,
 
     /// For disaggregated inference
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -528,6 +529,25 @@ mod tests {
         };
         assert_eq!(with_n(0).choices(), 1);
         assert_eq!(with_n(4).choices(), 4);
+    }
+
+    /// A room id is drawn from `[0, 2^63 - 1]`, as SGLang's PD contract
+    /// types it: a client that pre-assigns its bootstrap fields sends one past
+    /// `i32`, and it is read and written back as sent.
+    #[test]
+    fn a_generate_request_takes_a_63_bit_bootstrap_room() {
+        let body = serde_json::json!({
+            "model": "m",
+            "text": "hi",
+            "bootstrap_host": "10.0.0.1",
+            "bootstrap_port": 8998,
+            "bootstrap_room": 4_611_686_018_427_387_904_i64
+        });
+        let request: GenerateRequest =
+            serde_json::from_value(body.clone()).expect("a pre-assigned room");
+        assert_eq!(request.bootstrap_room, Some(4_611_686_018_427_387_904));
+        let written = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(written["bootstrap_room"], body["bootstrap_room"]);
     }
 
     /// The rules of `sampling_params` run on the request as the chat route's

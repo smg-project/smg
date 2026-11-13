@@ -85,6 +85,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `/generate` request's `bootstrap_room` takes a 63-bit room id, as SGLang's PD contract types
+  it (int64): rooms are drawn from `[0, 2^63 - 1]`, so nearly every real one was refused as past
+  `i32`. Breaking: `GenerateRequest.bootstrap_room` is an `Option<i64>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
