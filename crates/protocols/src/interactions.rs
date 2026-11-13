@@ -518,13 +518,19 @@ pub struct AllowedTools {
     pub tools: Option<Vec<String>>,
 }
 
+/// A tool choice mode. The SDK keeps the set open, so a mode this build does
+/// not name is kept as written (`Other`), as the tools' other open sets are.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ToolChoiceType {
     Auto,
     Any,
     None,
     Validated,
+    /// A mode this build does not name, kept as the client wrote it
+    #[serde(untagged)]
+    Other(String),
 }
 
 // ============================================================================
@@ -1298,6 +1304,28 @@ mod tests {
         assert!(request.validate().is_ok(), "{:?}", request.validate());
         let written = crate::common::to_value_exact(&request).unwrap();
         assert_eq!(written["tools"], tools);
+
+        let open_mode: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Find a cafe near the office.",
+            "store": false,
+            "tools": [{
+                "type": "mcp_server",
+                "name": "maps",
+                "allowed_tools": [{"mode": "a_mode_of_no_api", "tools": ["find_place"]}]
+            }],
+            "generation_config": {"tool_choice": "a_mode_of_no_api"}
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&open_mode).unwrap();
+        assert_eq!(
+            written["tools"][0]["allowed_tools"][0]["mode"],
+            "a_mode_of_no_api"
+        );
+        assert_eq!(
+            written["generation_config"]["tool_choice"],
+            "a_mode_of_no_api"
+        );
     }
 
     fn refusal(result: Result<(), ValidationError>) -> (String, String) {
