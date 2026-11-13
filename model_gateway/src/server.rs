@@ -37,14 +37,13 @@ use openai_protocol::{
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-    validated::{ValidatedJson, ValidatedPath, ValidatedQuery},
+    validated::{ValidatedJson, ValidatedPath, ValidatedQuery, ValueBody},
     worker::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerListFormat, WorkerSpec,
         WorkerUpdateRequest,
     },
 };
 use serde::Deserialize;
-use serde_json::Value;
 use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
@@ -304,7 +303,7 @@ async fn v1_rerank(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<V1RerankReqInput>,
+    ValidatedJson(body): ValidatedJson<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
     let model = rerank_body.model.clone();
@@ -391,7 +390,7 @@ async fn v1_embeddings(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<EmbeddingRequest>,
+    ValidatedJson(body): ValidatedJson<EmbeddingRequest>,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -541,7 +540,7 @@ async fn v1_classify(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<ClassifyRequest>,
+    ValidatedJson(body): ValidatedJson<ClassifyRequest>,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -632,7 +631,7 @@ async fn v1_responses_list_input_items(
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Json(body): Json<Value>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::create_conversation(&state.context.conversation_storage, tenant.as_deref(), body)
@@ -657,7 +656,7 @@ async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedPath(conversation_id): ValidatedPath<String>,
-    Json(body): Json<Value>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::update_conversation(
@@ -717,7 +716,7 @@ async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedPath(conversation_id): ValidatedPath<String>,
-    Json(body): Json<Value>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::create_conversation_items(
@@ -1068,14 +1067,14 @@ async fn replace_worker(
 
 async fn v1_tokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<TokenizeRequest>,
+    ValidatedJson(request): ValidatedJson<TokenizeRequest>,
 ) -> Response {
     tokenize::tokenize(&state.context, request).await
 }
 
 async fn v1_detokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<DetokenizeRequest>,
+    ValidatedJson(request): ValidatedJson<DetokenizeRequest>,
 ) -> Response {
     tokenize::detokenize(&state.context, request).await
 }
@@ -3403,6 +3402,7 @@ mod tests {
 
     use axum::response::sse::{Event, Sse};
     use axum_server::accept::Accept;
+    use serde_json::Value;
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;

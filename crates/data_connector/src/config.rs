@@ -92,6 +92,12 @@ pub struct OracleConfig {
 }
 
 impl OracleConfig {
+    /// The pool's wait for a connection, and the bound on the start-up
+    /// connection; `None` when `pool_timeout_secs` is 0 (no wait bound).
+    pub fn pool_timeout(&self) -> Option<Duration> {
+        (self.pool_timeout_secs > 0).then(|| Duration::from_secs(self.pool_timeout_secs))
+    }
+
     pub fn default_pool_min() -> usize {
         default_pool_min()
     }
@@ -134,10 +140,11 @@ impl std::fmt::Debug for OracleConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostgresConfig {
-    // Database connection URL,
-    // postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
+    /// Database connection URL,
+    /// `postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]`.
     pub db_url: String,
-    // Database pool max size
+    /// Most connections in the pool; 16 unless set. Must be > 0.
+    #[serde(default = "PostgresConfig::default_pool_max")]
     pub pool_max: usize,
     /// Bound, in seconds, on one call to the store: waiting for a pooled
     /// connection, connecting, and the operation itself. A call that exceeds
@@ -212,10 +219,9 @@ impl PostgresConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RedisConfig {
-    // Redis connection URL
-    // redis://[:password@]host[:port][/db]
+    /// Redis connection URL, `redis://[:password@]host[:port][/db]`.
     pub url: String,
-    // Connection pool max size
+    /// Most connections in the pool; 16 unless set. Must be > 0.
     #[serde(default = "default_redis_pool_max")]
     pub pool_max: usize,
     /// Bound, in seconds, on one call to the store: waiting for a pooled
@@ -228,7 +234,8 @@ pub struct RedisConfig {
     /// Optional schema customization (key prefix, field names, extra fields).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaConfig>,
-    // Data retention in days. If None, data persists indefinitely.
+    /// Data retention in days, at least 1; 30 unless set. `None` keeps every
+    /// record for good.
     #[serde(default = "default_redis_retention_days")]
     pub retention_days: Option<u64>,
 }
@@ -543,6 +550,29 @@ mod tests {
             err.contains("greater than 0"),
             "unexpected error message: {err}"
         );
+    }
+
+    // ── pool_max ────────────────────────────────────────────────────────
+
+    /// A configuration that leaves `pool_max` out parses to the crate's
+    /// default for either store, as one without `op_timeout_secs` does: the
+    /// CLI passes the field, a file or a binding built by hand need not.
+    #[test]
+    fn pool_max_defaults_to_sixteen_when_left_out() {
+        let pg: PostgresConfig =
+            serde_json::from_value(serde_json::json!({"db_url": "postgres://u:p@h/d"}))
+                .expect("a Postgres config without pool_max");
+        assert_eq!(pg.pool_max, PostgresConfig::default_pool_max());
+        assert_eq!(pg.pool_max, 16);
+        let redis: RedisConfig = serde_json::from_value(serde_json::json!({"url": "redis://h"}))
+            .expect("a Redis config without pool_max");
+        assert_eq!(redis.pool_max, 16);
+
+        let pg: PostgresConfig = serde_json::from_value(
+            serde_json::json!({"db_url": "postgres://u:p@h/d", "pool_max": 4}),
+        )
+        .expect("a Postgres config with pool_max");
+        assert_eq!(pg.pool_max, 4, "a set value is kept");
     }
 
     // ── op_timeout_secs ─────────────────────────────────────────────────

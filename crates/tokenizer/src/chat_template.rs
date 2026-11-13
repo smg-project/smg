@@ -1217,27 +1217,21 @@ impl<'a> PythonJsonFormatter<'a> {
         }
     }
 
-    /// One more array item or object key: with an indent, a line break after
-    /// the item separator (none before the first item) and the indentation;
-    /// without one, the item separator before every item but the first.
-    /// Python's `json.dumps` begins the two the same way.
+    /// One more array item or object key: the item separator before every
+    /// item but the first, then, with an indent, a line break and the
+    /// indentation. Python's `json.dumps` begins the two the same way.
     fn begin_item<W>(&self, writer: &mut W, first: bool) -> io::Result<()>
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent {
-            if first {
-                writer.write_all(b"\n")?;
-            } else {
-                writer.write_all(&self.separators.item)?;
-                writer.write_all(b"\n")?;
-            }
-            write_indent(writer, self.current_indent, indent)
-        } else if first {
-            Ok(())
-        } else {
-            writer.write_all(&self.separators.item)
+        if !first {
+            writer.write_all(&self.separators.item)?;
         }
+        if let Some(indent) = self.indent {
+            writer.write_all(b"\n")?;
+            write_indent(writer, self.current_indent, indent)?;
+        }
+        Ok(())
     }
 }
 

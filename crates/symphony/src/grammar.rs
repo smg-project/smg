@@ -13,7 +13,7 @@
 //! [`Format::grammar`] derives the tree from the table's rows and the request's tools, one spelling
 //! per call syntax. Notes on how, and on what it leaves open: `docs/grammar.md`.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use openai_protocol::common::Tool;
 use serde::{ser::SerializeMap, Serialize, Serializer};
@@ -53,9 +53,11 @@ pub enum Grammar {
     /// (`glm_xml` writes it as `<arg_key>`/`<arg_value>` pairs). Its strings and keys hold none of
     /// `excludes`, a list xgrammar enforces from 0.2.8 on and an older xgrammar ignores; an empty
     /// list is not written. Its `whitespace` between tokens is free, as JSON has it, or bounded to
-    /// runs of so many characters ([`Whitespace`]); only a bound is written.
+    /// runs of so many characters ([`Whitespace`]); only a bound is written. The schema is shared,
+    /// not copied: an answer's tag keeps one for every worker start and retry, and each node it
+    /// builds reads the tag's.
     JsonSchema {
-        schema: Value,
+        schema: Arc<Value>,
         style: Option<String>,
         excludes: Vec<String>,
         whitespace: Whitespace,
@@ -305,7 +307,7 @@ impl Serialize for Grammar {
                 whitespace,
             } => {
                 map.serialize_entry("type", "json_schema")?;
-                map.serialize_entry("json_schema", schema)?;
+                map.serialize_entry("json_schema", schema.as_ref())?;
                 if let Some(style) = style {
                     map.serialize_entry("style", style)?;
                 }
@@ -682,6 +684,16 @@ impl Count<'_> {
     }
 }
 
+/// One of the words.
+fn words(words: &[&str]) -> Grammar {
+    Grammar::Or(
+        words
+            .iter()
+            .map(|word| Grammar::ConstString(word.to_string()))
+            .collect(),
+    )
+}
+
 /// `item` once or more, `separator` before every repeat: the one shape of a separated list, for
 /// the calls of a block and the members of a value alike.
 fn repeated(item: Grammar, separator: &str) -> Grammar {
@@ -928,7 +940,7 @@ impl Format {
     /// opened, with the way into the answer owed after it, and leaves the way in optional without
     /// the thought unless the engine starts the grammar at the first token
     /// (`Self::thought_message`).
-    pub fn answer_grammar(&self, schema: &Value, reasoning_open: bool) -> Option<Grammar> {
+    pub fn answer_grammar(&self, schema: &Arc<Value>, reasoning_open: bool) -> Option<Grammar> {
         self.answer_grammar_for(schema, reasoning_open, GrammarStart::Unknown)
     }
 
@@ -938,15 +950,16 @@ impl Format {
     /// thought, closed, before the schema (`Self::led`); one that does not say gets the schema
     /// alone as well, its own constraint applied where it starts, and engines of either kind
     /// ([`GrammarStart::Either`]) keep the prefix a forced call takes, loosely, since no one tag
-    /// fits both.
+    /// fits both. The node shares `schema` with its keeper instead of copying it: a tag that keeps
+    /// the schema builds its grammar at every worker start and retry at no copy.
     pub fn answer_grammar_for(
         &self,
-        schema: &Value,
+        schema: &Arc<Value>,
         reasoning_open: bool,
         start: GrammarStart,
     ) -> Option<Grammar> {
         let answer = Grammar::JsonSchema {
-            schema: schema.clone(),
+            schema: Arc::clone(schema),
             style: None,
             excludes: Vec::new(),
             whitespace: self.answer_whitespace(),
@@ -2796,7 +2809,7 @@ mod tests {
         // The engines' rule: an unbounded content (a repetition, free text, tags) behind an empty
         // end is refused; a bounded one (a JSON value, the v13 table's tags) may end with nothing.
         let object = Grammar::JsonSchema {
-            schema: value!({"type": "object"}),
+            schema: Arc::new(value!({"type": "object"})),
             style: None,
             excludes: Vec::new(),
             whitespace: Whitespace::Free,
@@ -3302,11 +3315,45 @@ mod tests {
         value!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]})
     }
 
+    /// [`answer_schema`] as a tag keeps it.
+    fn shared_schema() -> Arc<Value> {
+        Arc::new(answer_schema())
+    }
+
     /// The JSON answer's tag for `format`, as a payload.
     fn answer(format: &Format, reasoning_open: bool) -> Option<Value> {
         format
-            .answer_grammar(&answer_schema(), reasoning_open)
+            .answer_grammar(&shared_schema(), reasoning_open)
             .map(|grammar| grammar.payload())
+    }
+
+    /// The answer's node holds the schema its keeper gave it, not a copy: a tag builds its grammar
+    /// at every worker start and retry.
+    #[test]
+    fn an_answer_grammar_shares_the_schema_it_is_given() {
+        fn holds(grammar: &Grammar, schema: &Arc<Value>) -> bool {
+            match grammar {
+                Grammar::JsonSchema { schema: held, .. } => Arc::ptr_eq(held, schema),
+                Grammar::Sequence(parts) | Grammar::Or(parts) => {
+                    parts.iter().any(|part| holds(part, schema))
+                }
+                Grammar::Optional(content) | Grammar::Star(content) | Grammar::Plus(content) => {
+                    holds(content, schema)
+                }
+                Grammar::Tag(tag) => holds(&tag.content, schema),
+                Grammar::TriggeredTags { tags, .. } | Grammar::TagsWithSeparator { tags, .. } => {
+                    tags.iter().any(|tag| holds(&tag.content, schema))
+                }
+                _ => false,
+            }
+        }
+        let schema = shared_schema();
+        for format in [formats::qwen3(CallSyntax::Json), formats::deepseek_v4_1()] {
+            let grammar = format
+                .answer_grammar(&schema, false)
+                .expect("an answer tag");
+            assert!(holds(&grammar, &schema), "{}", format.name());
+        }
     }
 
     #[test]
@@ -3358,7 +3405,7 @@ mod tests {
             assert_eq!(
                 answer(&format, true),
                 format
-                    .answer_grammar_for(&answer_schema(), true, GrammarStart::AfterReasoning)
+                    .answer_grammar_for(&shared_schema(), true, GrammarStart::AfterReasoning)
                     .map(|grammar| grammar.payload()),
                 "{}: as after the gate",
                 format.name()
@@ -3411,7 +3458,7 @@ mod tests {
                 .payload();
             assert_eq!(
                 format
-                    .answer_grammar_for(&answer_schema(), true, GrammarStart::Either)
+                    .answer_grammar_for(&shared_schema(), true, GrammarStart::Either)
                     .map(|grammar| grammar.payload()),
                 Some(value!({"format": {"type": "sequence", "elements": [
                     call["format"]["elements"][0].clone(),
@@ -3452,7 +3499,7 @@ mod tests {
                     GrammarStart::FirstToken,
                 ] {
                     let Some(grammar) =
-                        format.answer_grammar_for(&answer_schema(), reasoning_open, start)
+                        format.answer_grammar_for(&shared_schema(), reasoning_open, start)
                     else {
                         continue;
                     };
@@ -3529,7 +3576,7 @@ mod tests {
         // after the thought, optional on its own.
         let answer_for = |start| {
             formats::inkling()
-                .answer_grammar_for(&answer_schema(), false, start)
+                .answer_grammar_for(&shared_schema(), false, start)
                 .expect("an answer")
                 .payload()
         };
@@ -3707,7 +3754,7 @@ mod tests {
         let schema = value!({"type": "json_schema", "json_schema": answer_schema()});
         let answer_for = |start| {
             format
-                .answer_grammar_for(&answer_schema(), reasoning_open, start)
+                .answer_grammar_for(&shared_schema(), reasoning_open, start)
                 .expect("an answer")
                 .payload()
         };
@@ -3786,13 +3833,13 @@ mod tests {
         assert!(kimi.reasoning_open(prompt));
         let close = "<|close|>think<|sep|>";
         let unknown = kimi
-            .answer_grammar_for(&answer_schema(), true, GrammarStart::Unknown)
+            .answer_grammar_for(&shared_schema(), true, GrammarStart::Unknown)
             .expect("an answer")
             .payload();
         let begin = unknown["format"]["begin"].as_str().expect("a tag");
         assert!(begin.starts_with(close), "{begin}");
         let gated = kimi
-            .answer_grammar_for(&answer_schema(), true, GrammarStart::AfterReasoning)
+            .answer_grammar_for(&shared_schema(), true, GrammarStart::AfterReasoning)
             .expect("an answer")
             .payload();
         let gated_begin = gated["format"]["begin"].as_str().expect("a tag");
@@ -3804,7 +3851,7 @@ mod tests {
         // does after the gate, the close consumed, so the model thinks before it answers and is
         // not made to spell the close.
         let first = kimi
-            .answer_grammar_for(&answer_schema(), true, GrammarStart::FirstToken)
+            .answer_grammar_for(&shared_schema(), true, GrammarStart::FirstToken)
             .expect("an answer")
             .payload();
         assert_eq!(first["format"]["type"], "sequence", "{first}");
@@ -3850,8 +3897,8 @@ mod tests {
             GrammarStart::FirstToken,
         ] {
             assert_eq!(
-                closed.answer_grammar_for(&answer_schema(), false, start),
-                closed.answer_grammar(&answer_schema(), false),
+                closed.answer_grammar_for(&shared_schema(), false, start),
+                closed.answer_grammar(&shared_schema(), false),
                 "{start:?}"
             );
         }
@@ -4153,7 +4200,7 @@ mod tests {
             GrammarStart::FirstToken,
         ] {
             let answer = format
-                .answer_grammar_for(&answer_schema(), false, start)
+                .answer_grammar_for(&shared_schema(), false, start)
                 .expect("an answer")
                 .payload();
             assert_eq!(
@@ -4905,7 +4952,7 @@ mod tests {
         // words out (written only when there are words to leave out), JSON whose whitespace is
         // bounded (written only when it is), and an EBNF grammar.
         let excluding = |excludes: &[&str]| Grammar::JsonSchema {
-            schema: value!({"type": "string"}),
+            schema: Arc::new(value!({"type": "string"})),
             style: None,
             excludes: excludes.iter().map(|word| word.to_string()).collect(),
             whitespace: Whitespace::Free,
@@ -4918,7 +4965,7 @@ mod tests {
             }),
             excluding(&[]),
             Grammar::JsonSchema {
-                schema: value!({"type": "object"}),
+                schema: Arc::new(value!({"type": "object"})),
                 style: None,
                 excludes: Vec::new(),
                 whitespace: Whitespace::Bounded(16),
@@ -4961,20 +5008,21 @@ mod tests {
         // open, for a schema and for `json_object`'s bare object alike, and nowhere else: the
         // calls' values are the schema's, and a table that does not bound keeps the node as it was.
         let lfm = formats::lfm2_5();
-        let schema = value!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let schema =
+            Arc::new(value!({"type": "object", "properties": {"city": {"type": "string"}}}));
         for reasoning_open in [false, true] {
             for start in [
                 GrammarStart::Unknown,
                 GrammarStart::AfterReasoning,
                 GrammarStart::FirstToken,
             ] {
-                for schema in [&schema, &value!({"type": "object"})] {
+                for schema in [&schema, &Arc::new(value!({"type": "object"}))] {
                     let answer = lfm
                         .answer_grammar_for(schema, reasoning_open, start)
                         .expect("an answer")
                         .payload();
                     let node = json_schema_node(&answer["format"]).expect("the schema node");
-                    assert_eq!(node["json_schema"], *schema, "{answer}");
+                    assert_eq!(node["json_schema"], **schema, "{answer}");
                     assert_eq!(
                         node["max_whitespace_cnt"], 32,
                         "reasoning_open={reasoning_open} {start:?}: {answer}"
@@ -5042,7 +5090,7 @@ mod tests {
             },
             Grammar::Tag(tag(Bound::Text("<|e|>".to_string()))),
             Grammar::JsonSchema {
-                schema: value!({"z": [1, 2.5, null], "a": {"b": "\t"}}),
+                schema: Arc::new(value!({"z": [1, 2.5, null], "a": {"b": "\t"}})),
                 style: Some("glm_xml".to_string()),
                 excludes: vec!["<|e|>".to_string()],
                 whitespace: Whitespace::Bounded(8),

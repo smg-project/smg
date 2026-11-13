@@ -304,7 +304,8 @@ pub struct Candidate {
     /// Host-supplied admission bit: the decode's running window has a room
     /// nobody waiting at its gate is in line for.
     pub has_room: bool,
-    /// Milliseconds since the worker was admitted to the pool.
+    /// Milliseconds since the worker was admitted to the pool, saturating at
+    /// `u32::MAX` as `report_age_ms` does; never wrapping.
     pub admitted_age_ms: u32,
     /// Blocks the index learned about the worker since admission.
     pub indexed_growth: u32,
@@ -383,7 +384,8 @@ pub struct RequestFacts<'a> {
     pub attempt: u8,
     /// Candidates earlier attempts of this request already tried.
     pub tried: &'a [WorkerId],
-    /// Time left for the decision, relative to the host's receipt.
+    /// Time left for the whole decision, relative to the host's receipt; a
+    /// plugin's own share of it rides its frame, clamped to at most this.
     pub budget_micros: u32,
     /// Allow-listed headers only.
     pub headers: &'a [Header<'a>],

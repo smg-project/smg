@@ -2,6 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use tokio::sync::oneshot;
 use tracing::info;
 use url::Url;
 
@@ -49,17 +50,60 @@ pub struct StorageFactoryConfig<'a> {
 
 /// Why the start-up contact with a store failed. The contact, one connection
 /// and one round trip, is bounded by the backend's store-call bound
-/// (`op_timeout_secs`): the client library and the pool bound their own steps
-/// at twice that, so a store that accepts the connection and never answers is
-/// the contact's own verdict, with the bound in the text, for either backend;
-/// a store that refuses the connection is a verdict at once. The gateway does
-/// not start with a history backend it cannot reach.
+/// (`op_timeout_secs`) on Postgres and Redis, where the client library and
+/// the pool bound their own steps at twice that, and by the pool's wait
+/// (`pool_timeout_secs`) on Oracle, whose driver connects synchronously on a
+/// blocking thread; so a store that accepts the connection and never answers
+/// is the contact's own verdict, with the bound in the text, for every
+/// backend; a store that refuses the connection is a verdict at once. The
+/// gateway does not start with a history backend it cannot reach.
 #[derive(Debug)]
 pub(crate) enum StoreContactError {
     /// The connection or the round trip failed: refused, reset, rejected.
     Failed(String),
     /// Nothing came back within the bound.
     NoAnswer,
+}
+
+/// The start-up contact of a store whose driver connects synchronously:
+/// `connect` runs on a thread of its own, outside the runtime's blocking
+/// pool, and its answer is awaited under `bound` (`None`: no bound, as a
+/// pool with no wait bound). Nothing back within the bound is `NoAnswer`; a
+/// `connect` that failed, or whose thread ended without an answer (the
+/// helper runs the connect and the bootstrap, so the text names neither), is
+/// `Failed` with the cause. The bound ends the wait, not the thread: it
+/// returns when the driver does, and the process's exit ends it. It is not
+/// a `spawn_blocking` task because the runtime's drop waits for those: a
+/// start-up that gave up on the connect must still hand its error to the
+/// operator and exit.
+pub(crate) async fn contact_blocking<T: Send + 'static>(
+    bound: Option<Duration>,
+    connect: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, StoreContactError> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("history-store-start-up".to_string())
+        .spawn(move || {
+            // The receiver is gone when the bound fired first: nothing to do.
+            let _ = tx.send(connect());
+        })
+        .map_err(|e| {
+            StoreContactError::Failed(format!("the start-up thread could not start: {e}"))
+        })?;
+    let answer = match bound {
+        Some(bound) => match tokio::time::timeout(bound, rx).await {
+            Ok(answer) => answer,
+            Err(_elapsed) => return Err(StoreContactError::NoAnswer),
+        },
+        None => rx.await,
+    };
+    match answer {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(cause)) => Err(StoreContactError::Failed(cause)),
+        Err(_gone) => Err(StoreContactError::Failed(
+            "the start-up thread ended without an answer".to_string(),
+        )),
+    }
 }
 
 /// The start-up error for a store contact that failed: the backend, the store
@@ -151,7 +195,7 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
                 oracle_cfg.pool_min, oracle_cfg.pool_max
             );
 
-            let storages = create_oracle_storage(oracle_cfg)?;
+            let storages = create_oracle_storage(oracle_cfg).await?;
 
             info!("Data connector initialized successfully: Oracle ATP");
             storages
@@ -251,17 +295,45 @@ fn bounded(bundle: StorageBundle, bound: CallBound) -> StorageBundle {
 }
 
 /// Create Oracle storage backends with a single shared connection pool.
-fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, String> {
+async fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, String> {
     use crate::oracle::OracleStore;
 
-    let store = OracleStore::new(
-        oracle_cfg,
-        &[
-            OracleConversationStorage::init_schema,
-            OracleConversationItemStorage::init_schema,
-            OracleResponseStorage::init_schema,
-        ],
-    )?;
+    let store = OracleStore::new(oracle_cfg)?;
+    // The start-up connection under the pool's wait, as the Postgres and
+    // Redis contacts run under their call bound; a pool wait of 0 is no bound
+    // (then nothing can fail to answer in time, and the text's 0 s is unused).
+    let bound = oracle_cfg.pool_timeout();
+    let conn = store.contact(bound).await.map_err(|err| {
+        contact_error(
+            "Oracle",
+            &oracle_cfg.connect_descriptor,
+            bound.unwrap_or_default(),
+            err,
+        )
+    })?;
+    // The tables, the schema version and the indexes, on that connection and
+    // on the same kind of thread, so no round trip of the start-up runs on a
+    // runtime worker; unbounded, as before: a migration takes what it takes,
+    // and a store that stops answering after the login holds the start-up
+    // here (named in the change, not changed).
+    let bootstrap_store = store.clone();
+    contact_blocking(None, move || {
+        bootstrap_store.bootstrap(
+            &conn,
+            &[
+                OracleConversationStorage::init_schema,
+                OracleConversationItemStorage::init_schema,
+                OracleResponseStorage::init_schema,
+            ],
+        )?;
+        drop(conn);
+        Ok(())
+    })
+    .await
+    .map_err(|err| match err {
+        StoreContactError::Failed(cause) => cause,
+        StoreContactError::NoAnswer => "the start-up bootstrap gave no answer".to_string(),
+    })?;
 
     Ok(StorageBundle {
         response_storage: Arc::new(OracleResponseStorage::new(store.clone())),
@@ -459,6 +531,129 @@ mod tests {
         assert!(
             started.elapsed() >= BOUND,
             "the verdict waited for the bound"
+        );
+    }
+
+    /// A start-up connect that never returns (a store that accepts and never
+    /// answers behind a driver that connects synchronously) is a verdict at
+    /// the bound; a connect that fails is a verdict at once; no bound is no
+    /// bound. The bound ends the wait, not the connect's thread, which runs
+    /// on, outside the runtime.
+    #[tokio::test]
+    async fn a_blocking_start_up_connect_that_never_returns_is_refused_at_the_bound() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let flag = returned.clone();
+        let started = Instant::now();
+        let verdict = contact_blocking(Some(Duration::from_secs(1)), move || {
+            std::thread::sleep(Duration::from_secs(3));
+            flag.store(true, Ordering::SeqCst);
+            Ok::<(), String>(())
+        })
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(verdict, Err(StoreContactError::NoAnswer)),
+            "{verdict:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(3),
+            "verdict after {elapsed:?}; the bound is 1 s"
+        );
+        assert!(
+            !returned.load(Ordering::SeqCst),
+            "the connect's thread is still running when the verdict is given"
+        );
+
+        let failed = contact_blocking(Some(Duration::from_secs(1)), || {
+            Err::<(), String>("refused".into())
+        })
+        .await;
+        assert!(
+            matches!(failed, Err(StoreContactError::Failed(ref cause)) if cause == "refused"),
+            "{failed:?}"
+        );
+        let unbounded = contact_blocking(None, || Ok::<u8, String>(7)).await;
+        assert!(matches!(unbounded, Ok(7)), "{unbounded:?}");
+    }
+
+    /// The connect the bound gave up on runs on a thread of its own, not in
+    /// the runtime's blocking pool: a runtime that shuts down after the
+    /// verdict does not wait for it, so the start-up error reaches the
+    /// operator and the process exits. A connect in the blocking pool holds
+    /// the runtime's drop for as long as the driver blocks, which is what this
+    /// test refuses: the runtime of its own, the verdict at the bound, then
+    /// the drop, all within a few seconds while the connect sleeps on.
+    #[test]
+    fn a_start_up_connect_the_bound_gave_up_on_does_not_hold_the_runtime_s_shutdown() {
+        use std::sync::mpsc;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a runtime of the test's own");
+            let verdict = runtime.block_on(contact_blocking(Some(Duration::from_secs(1)), || {
+                std::thread::sleep(Duration::from_secs(30));
+                Ok::<(), String>(())
+            }));
+            assert!(
+                matches!(verdict, Err(StoreContactError::NoAnswer)),
+                "{verdict:?}"
+            );
+            drop(runtime);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the runtime shut down while the connect's thread still ran");
+    }
+
+    /// The Oracle start-up against a store that accepts and never answers
+    /// gives a verdict within the pool wait: the bound's own where the driver
+    /// connects, a refusal at once where it cannot (its client library absent
+    /// on the test host); never a start that does not end.
+    #[tokio::test]
+    async fn an_oracle_store_that_accepts_and_never_answers_is_refused_within_the_start_up_bound() {
+        let (_hole, port) = black_hole();
+        let oracle = OracleConfig {
+            wallet_path: None,
+            connect_descriptor: format!("127.0.0.1:{port}/svc"),
+            external_auth: false,
+            username: "u".to_string(),
+            password: "s3cr3t".to_string(),
+            pool_min: 1,
+            pool_max: 1,
+            pool_timeout_secs: BOUND_SECS,
+            schema: None,
+        };
+        let verdict = tokio::time::timeout(
+            HANG_GUARD,
+            create_storage(StorageFactoryConfig {
+                backend: &HistoryBackend::Oracle,
+                oracle: Some(&oracle),
+                postgres: None,
+                redis: None,
+                memory: None,
+                hook: None,
+            }),
+        )
+        .await
+        .expect("the start-up gives a verdict within its bound");
+        let err = verdict
+            .err()
+            .expect("a store that never answers is refused at start-up");
+        assert!(
+            err.contains("Oracle history backend")
+                && (err.contains("did not answer within the start-up bound of 2 s")
+                    || err.contains("is unreachable at start-up")),
+            "{err}"
+        );
+        assert!(
+            !err.contains("s3cr3t"),
+            "the password is not in the text: {err}"
         );
     }
 

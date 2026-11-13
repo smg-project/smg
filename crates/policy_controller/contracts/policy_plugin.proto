@@ -10,7 +10,8 @@
 // decodes as unset: a Decision with no outcome is a deadline miss, a
 // PluginDecision answering none of its asked stages a decline. On the decide,
 // session, plugin and lifecycle wires no absolute instant crosses: budgets,
-// ages and vetoes are durations relative to the frame's receipt.
+// ages and vetoes are durations relative to the frame's receipt; a duration
+// or age past its field's width saturates at the maximum, never wraps.
 // Widths: a `uint32` marked `u8` or `u16` holds a value of that width in the
 // record, and a reader refuses a larger one. A worker id is the 64-bit hash
 // of (registration key, incarnation), never a URL.
@@ -216,7 +217,7 @@ message Candidate {
   // Host-supplied admission bit: the decode's running window has a room
   // nobody waiting at its gate is in line for.
   bool has_room = 17;
-  uint32 admitted_age_ms = 18;  // since admission to the pool
+  uint32 admitted_age_ms = 18;  // since admission to the pool, saturating
   // Blocks the index learned about the worker since admission.
   uint32 indexed_growth = 19;
   // One-based position into `view.zones`; 0 when unzoned.
@@ -258,7 +259,9 @@ message RequestFacts {
   Phase phase = 11;
   uint32 attempt = 12;  // u8; 0 for the first attempt
   repeated fixed64 tried = 13 [packed = true];
-  // Time left for the decision, relative to the frame's receipt.
+  // Time left for the whole decision, relative to the frame's receipt (on a
+  // PluginDecide, rebased to that frame's receipt when the controller
+  // forwards it).
   uint32 budget_micros = 14;
   repeated Header headers = 15;  // allow-listed only
   MediaCounts media = 16;
@@ -478,7 +481,7 @@ message Completed {
   uint32 ttft_micros = 6;
   uint32 tokens_in = 7;
   uint32 tokens_out = 8;
-  uint32 duration_micros = 9;
+  uint32 duration_micros = 9;  // saturating
 }
 
 message Released {
@@ -496,6 +499,10 @@ message Released {
     REASON_CLIENT_GONE = 3;
     // The commit refused every target (a removed worker, a lost room).
     REASON_COMMIT_FAILED = 4;
+    // The stream rule's grace passed without a Completed.
+    REASON_EXPIRED = 5;
+    // An immediate deregistration released the worker's leases.
+    REASON_WORKER_REMOVED = 6;
   }
   Reason reason = 3;
   // Unspecified releases every side; a pair's leases share an id, so name it.
@@ -562,7 +569,20 @@ message LifecycleEvent {
 // with a server-name pin; both streams authenticate once at open; the
 // controller is the client.
 //
-// The first frame on a Decide stream.
+// The first frame on a Decide stream and on an Observe stream. On Decide the
+// range is negotiated: the plugin answers the version it chose in
+// PluginHelloAck.protocol, fixed for that stream. One plugin (the gRPC server
+// behind its address, however many processes answer there) speaks one
+// version while any of its Decide streams (one per controller shard) stays
+// open: the first stream to settle fixes it, later Decide hellos name only
+// that version (protocol_min = protocol_max), and once the last stream closes
+// the next stream to settle fixes it anew. An ack that races the first one
+// and names another version is cancelled by the controller, its error
+// naming both. On Observe nothing answers before the Ack, so the hello
+// names the plugin's version, protocol_min = protocol_max. A plugin that
+// does not speak the one version offered ends the stream, as the server,
+// with FAILED_PRECONDITION, its message naming the offered and the spoken
+// versions.
 message PluginHello {
   uint32 protocol_min = 1;
   uint32 protocol_max = 2;
@@ -613,10 +633,16 @@ message PluginDecide {
   PoolFacts pool = 4;
   uint32 stages = 5;
   repeated float scores_in = 6 [packed = true];
+  // The plugin's own deadline for this frame, relative to its receipt (the
+  // budget REASON_BUDGET declines are measured against). The controller
+  // clamps it to at most `request.budget_micros`, so a plugin may rely on
+  // this field never exceeding the request's.
   uint32 budget_micros = 7;
 }
 
 message Decline {
+  // The declined stages as Stage bits (one decline per PluginDecision names
+  // every stage the plugin steps aside from); never one Stage value.
   uint32 stage = 1;
   enum Reason {
     REASON_UNSPECIFIED = 0;
@@ -634,7 +660,10 @@ message Decline {
 // the breaker counts it), a `decline` the stage's fallback alone. Each asked
 // stage answers with its own field: `survivors` present and empty sheds,
 // never a fallback; `pick` unset after a PICK ask declines; a stage asked
-// for and left unanswered is declined.
+// for and left unanswered is declined. A frame that declines a stage in
+// `decline.stage` and fills that stage's answer field is invalid: refused
+// as malformed like any other invalid frame (the decision falls back, the
+// breaker counts it), never read one way or the other.
 message PluginDecision {
   fixed64 decision_id = 1;
   Survivors survivors = 2;
@@ -662,8 +691,10 @@ message PluginRequest {
   }
 }
 
-// The hello first, as on Decide (a plugin that refuses its version ends the
-// stream with FAILED_PRECONDITION), then the events; one Ack at the end.
+// The hello first, naming the plugin's version (PluginHello; a plugin that
+// does not speak it ends the stream with
+// FAILED_PRECONDITION naming both versions), then the events; one Ack at the
+// end.
 message ObserveRequest {
   oneof request {
     PluginHello hello = 1;
@@ -689,6 +720,7 @@ service PolicyPlugin {
   // One bidirectional stream per controller shard, pipelined, ordered per
   // decision id: view and stage set in; mask, scores and pick out.
   rpc Decide(stream PluginRequest) returns (stream PluginResponse);
-  // A client stream answered once: the lifecycle of the ids the plugin saw.
+  // A client stream answered once: the LifecycleEvent states, opened for a
+  // plugin once one of its Decide streams settled and for no other.
   rpc Observe(stream ObserveRequest) returns (Ack);
 }

@@ -36,15 +36,20 @@
 //!   [`store::MemoryStore`] behind them and the contract tests over it. A
 //!   gateway in the embedded mode implements the same traits over its own
 //!   structures; nothing decides through them yet.
+//! - 10, the election ([`elector`]): one [`elector::Elector`] over a
+//!   [`elector::LeaseBackend`] (the lease file and the in-process record
+//!   here, the Kubernetes `Lease` next), terms that only grow, and the
+//!   [`elector::Fence`] a shard thread reads before every decision it sends.
 //!
 //! What this step does not hold: the plugin hosts, the operator calls, the
-//! ingestion drivers, the gRPC API and the election; they arrive in later
+//! ingestion drivers and the gRPC API; they arrive in later
 //! steps and build on these types. The
 //! in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 
 pub mod builtins;
 pub mod decision;
+pub mod elector;
 pub mod framework;
 pub mod lease;
 pub mod ring;

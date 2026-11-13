@@ -39,7 +39,7 @@ interface types {
   /// The transport outcome of a dispatch, beside its status.
   enum transport-class { ok, client-error, server-error, connect-failed, timeout, cancelled }
   /// Why a lease was released before its completion.
-  enum release-reason { abandoned, late-decision, client-gone, commit-failed }
+  enum release-reason { abandoned, late-decision, client-gone, commit-failed, expired, worker-removed }
 
   /// A tenant or a session key under the plugin's exposure: `hash` unless the
   /// spec says `plain`, `none` when withheld.
@@ -66,7 +66,8 @@ interface types {
   /// into the spec's declared lists (0 is unzoned, unspecified or none;
   /// `zone-capacity.zone` is never 0); `labels` are bits over the declared
   /// label list (at most 64; validation refuses a longer list). `load` is
-  /// absent when the host has no report.
+  /// absent when the host has no report; `admitted-age-ms` saturates at the
+  /// u32 maximum, never wraps.
   record candidate {
     id: u64,
     role: role,
@@ -166,7 +167,8 @@ interface types {
   /// the decision on its clock: a load credit dates from the dispatch.
   record dispatched { lease: lease, target: target, side: side, since-decision-micros: u32 }
 
-  /// What a completed dispatch reported.
+  /// What a completed dispatch reported; `duration-micros` saturates at the
+  /// u32 maximum, never wraps.
   record completed {
     lease: lease,
     side: side,

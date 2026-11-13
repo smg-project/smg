@@ -225,7 +225,7 @@ struct Group {
     /// own: the prompt's replay starts at its last occurrence.
     opener: Option<&'static str>,
     /// What the group's own template writes after the thought's close before the first call,
-    /// when it is not the table's own (the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one
+    /// when it is not the table's own (the NVIDIA Nemotron 3 and 3.5 groups and Step 3.5 Flash write one
     /// newline where the Qwen 3.5 template writes two): the group's tags write it in the table's place
     /// ([`Format::with_thought_after`]).
     after: Option<&'static str>,
@@ -570,6 +570,7 @@ mod tests {
             ("microsoft/AesCode-8B", Table::Qwen3),
             ("microsoft/AesCode-32B", Table::Qwen3),
             ("internlm/Visual-ERM", Table::Qwen3),
+            ("tencent/WeVisOne-VL-2B", Table::Qwen3),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");

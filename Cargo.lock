@@ -7873,10 +7873,10 @@ dependencies = [
  "serde_json",
  "smg",
  "smg-grpc-client",
+ "smg-symphony",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
- "tool-parser",
  "tracing",
  "uuid",
 ]
@@ -7987,6 +7987,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.21",
  "wit-parser",
 ]

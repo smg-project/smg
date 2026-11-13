@@ -503,6 +503,7 @@ mod tests {
         Stage {
             pattern: Pattern::parse(pattern).expect("parses"),
             pieces,
+            digits: false,
         }
     }
 

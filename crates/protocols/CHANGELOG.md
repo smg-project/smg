@@ -6,6 +6,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
+  transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
+  handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or
+  one under another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
+  `invalid_json` or `json_parse_error`) as the typed routes do. The gateway's Conversations routes
+  read it.
 - `ValidatedQuery<T>` and `ValidatedPath<T>`, behind the `axum` feature: a route's query string
   and path segments read as the typed routes' body extractor reads a body. A query value the type
   does not take, one that does not parse or a required one that is missing, and a path segment
@@ -23,6 +29,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- `ValidatedJson` refuses a body under a `Content-Encoding` the gateway does not decode (any but
+  `identity`, in whichever field of a repeated header or position of a comma-separated list it
+  stands) before it reads the body, as a `415` in the gateway's JSON error envelope (`error.code`
+  `json_parse_error`, the encoding named in the message) with `Accept-Encoding: identity`; it
+  parsed the compressed bytes as JSON and
+  refused them as a `400` with a syntax error. `undecodable_content_encoding`,
+  `content_encoding_message` and `with_accept_encoding_identity`, behind the `axum` feature, are
+  the header's reading, the message and the answer's header, shared with the gateway's
+  control-plane JSON extractor, which answers the same.
 - Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
   `ResponseFormat::StructuralTag` carries `Box<serde_json::Map<String, Value>>`. A format had
   grown from 104 to 128 bytes when the schema kept its description and the structural tag
@@ -95,6 +110,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
+- `EmbeddingRequest`, `ClassifyRequest`, `TokenizeRequest`, `DetokenizeRequest` and
+  `V1RerankReqInput` implement `Validate` and `Normalizable`, so the gateway reads
+  `/v1/embeddings`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize` and `/v1/rerank` through its
+  validated extractor: a body that does not parse, a body of the wrong type and a failed rule
+  answer the gateway's JSON error envelope (`400`, with `error.code` and `error.param`) where
+  axum's own text/plain `422`, `415` and `400` answered before. `V1RerankReqInput` refuses an
+  empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
+  its `top_n` keeps reading `0` as all documents. The four other types declare no rule.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses

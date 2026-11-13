@@ -364,10 +364,12 @@ pub enum ProtoResponseVariant {
     None,
 }
 
-/// The wire dispatch of a counter every wire carries under one field name:
-/// the five-arm match written once, so a wire added to the wrappers is one
-/// arm here and a reader cannot forget one. The second form names the wire
-/// without the field and what it reads instead.
+/// The wire dispatch of a counter every wire carries under one field name,
+/// written once per form. A wire added to the wrappers is one arm in each
+/// form, two in all, where every reader spelled its own before. The compiler
+/// still refuses a reader that lacks a wire; the macro only moves where the
+/// arms are written. The second form names the wire without the field and
+/// what it reads instead.
 macro_rules! wire_field {
     ($on:expr, $c:ident => $read:expr) => {
         match $on {

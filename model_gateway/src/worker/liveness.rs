@@ -237,6 +237,48 @@ fn prefill_side_bound_with(
     side_bound_with(worker, prompt_tokens, wedge, 2)
 }
 
+/// [`prefill_side_bound`] for a side whose prompt's embeddings come from an
+/// encode worker (an encode-prefill-decode dispatch on the rendezvous
+/// handoff): its first response waits on the encode worker's forward and
+/// the embedding transfer before the prefill worker's own forward, work the
+/// worker's books never see (the encode call is acknowledged once the
+/// request is on the encoder's wire; the embeddings travel worker to
+/// worker). A worker that has answered nothing takes the cold-shape grace
+/// here, where [`prefill_side_bound`] judges it at the threshold: its first
+/// prompt is the encoder's first as well, and an encoder meeting its first
+/// shape builds its kernels in the same silence the grace exists for (a
+/// fresh three-role deployment answered its first image and its first video
+/// request with the silence verdict at the 3 s threshold, and both in about
+/// a second once warm). The grace is what is left of it against the time
+/// the worker's prompts have gone unanswered
+/// ([`Worker::prefill_unanswered_total`]), as a side on a cold shape gets
+/// what is left of the grace since its dispatch
+/// ([`prefill_side_reprieve`]): the sides of a cold burst share one deadline
+/// about the grace after the run began, and a worker given up on without an
+/// answer is back at the threshold until it answers, so a real freeze met
+/// there costs the grace once. A worker that has answered is judged as a
+/// plain side is, the cold-shape grace for a longer prompt included.
+pub(crate) fn prefill_side_bound_behind_encode(
+    worker: &Arc<dyn Worker>,
+    prompt_tokens: u64,
+) -> Option<Duration> {
+    let (_, wedge, _) = thresholds();
+    prefill_side_bound_behind_encode_with(worker, prompt_tokens, wedge)
+}
+
+/// [`prefill_side_bound_behind_encode`] at the given wedge threshold.
+fn prefill_side_bound_behind_encode_with(
+    worker: &Arc<dyn Worker>,
+    prompt_tokens: u64,
+    wedge: Duration,
+) -> Option<Duration> {
+    let grace = match worker.prefill_answered_ago() {
+        None => COLD_SHAPE_GRACE.saturating_sub(worker.prefill_unanswered_total()),
+        Some(_) => cold_shape_grace(worker, prompt_tokens),
+    };
+    side_bound_given(worker, prompt_tokens, wedge, 2, grace)
+}
+
 /// A side's bound at the given wedge threshold: the threshold, `times` the
 /// time a prompt of `prompt_tokens` takes behind what `worker` is already
 /// prefilling, or the cold-shape grace, whichever is longest, capped.
@@ -247,9 +289,26 @@ fn side_bound_with(
     wedge: Duration,
     times: u32,
 ) -> Option<Duration> {
+    side_bound_given(
+        worker,
+        prompt_tokens,
+        wedge,
+        times,
+        cold_shape_grace(worker, prompt_tokens),
+    )
+}
+
+/// [`side_bound_with`] at the given cold-shape `grace`.
+fn side_bound_given(
+    worker: &Arc<dyn Worker>,
+    prompt_tokens: u64,
+    wedge: Duration,
+    times: u32,
+    grace: Duration,
+) -> Option<Duration> {
     (!wedge.is_zero()).then(|| {
         let eta = worker.prefill_eta(prompt_tokens).saturating_mul(times);
-        bound_over(wedge, eta.max(cold_shape_grace(worker, prompt_tokens)))
+        bound_over(wedge, eta.max(grace))
     })
 }
 
@@ -2853,6 +2912,84 @@ mod tests {
         );
         on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+    }
+
+    /// The prefill side of a request whose embeddings come from an encode
+    /// worker has the encoder's forward and the transfer in front of its
+    /// first response, work the worker's books never see; on a worker that
+    /// has answered nothing its prompt is the encoder's first shape as well
+    /// (the first image prompt of a fresh deployment, 95 tokens), so the
+    /// side gets the grace a plain side is refused, once: a worker that has
+    /// answered is judged as a plain side is, the cold-shape grace for a
+    /// longer prompt (the first video prompt, 1,162 tokens) included.
+    #[test]
+    fn a_prefill_side_behind_an_encode_worker_gets_the_grace_until_its_worker_has_answered() {
+        let w = worker();
+        assert_eq!(
+            prefill_side_bound_with(&w, 95, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE),
+            "a plain side on a worker that has answered nothing: the threshold"
+        );
+        assert_eq!(
+            prefill_side_bound_behind_encode_with(&w, 95, DEFAULT_WEDGE),
+            Some(COLD_SHAPE_GRACE),
+            "behind an encode worker: the grace"
+        );
+        assert_eq!(
+            prefill_side_bound_behind_encode_with(&w, 95, Duration::from_secs(600)),
+            Some(Duration::from_secs(600)),
+            "a longer configured threshold stands"
+        );
+        assert_eq!(
+            prefill_side_bound_behind_encode_with(&w, 95, Duration::ZERO),
+            None,
+            "a zero threshold turns the bound off"
+        );
+        // Spent against the worker's unanswered time, what its runs released
+        // without an answer banked (stamped forward, the gateway clock being
+        // young in a test, and untimed, so the rate window stays out of it):
+        // a run that went 100 s unanswered leaves 20 s of the grace to the
+        // next side; 20 s more leave none, until the worker answers.
+        let t0 = now_ms().max(1);
+        w.note_prefill_started_at(95, false, t0);
+        w.note_prefill_ended_at(95, false, None, t0 + 100_000);
+        assert_eq!(
+            prefill_side_bound_behind_encode_with(&w, 95, DEFAULT_WEDGE),
+            Some(Duration::from_secs(20)),
+            "what is left of the grace after a run that went 100 s unanswered"
+        );
+        w.note_prefill_started_at(95, false, t0 + 100_000);
+        w.note_prefill_ended_at(95, false, None, t0 + 120_000);
+        assert_eq!(
+            prefill_side_bound_behind_encode_with(&w, 95, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE),
+            "given up on without an answer for the whole grace: the threshold until the worker answers"
+        );
+        w.note_prefill_started(95, true);
+        w.note_prefill_ended(95, true, Some(0));
+        assert_eq!(
+            prefill_side_bound_behind_encode_with(&w, 95, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE),
+            "the worker has answered: the threshold, as a plain side"
+        );
+        assert_eq!(
+            prefill_side_bound_behind_encode_with(&w, 1_162, DEFAULT_WEDGE),
+            Some(COLD_SHAPE_GRACE),
+            "a prompt longer than any answered: the cold-shape grace"
+        );
+        for prompt_tokens in [95, 1_162, 32_768, 100_000_000] {
+            assert_eq!(
+                prefill_side_bound_behind_encode_with(&w, prompt_tokens, DEFAULT_WEDGE),
+                prefill_side_bound_with(&w, prompt_tokens, DEFAULT_WEDGE),
+                "a worker that has answered is judged as a plain side is ({prompt_tokens} tokens)"
+            );
+        }
+        w.note_prefill_started(8 * 32_768, true);
+        assert_eq!(
+            prefill_side_bound_behind_encode_with(&w, 32_768, DEFAULT_WEDGE),
+            prefill_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            "behind a backlog too"
+        );
     }
 
     /// A frozen engine vetoed on a shape it has shown, and a longer prompt

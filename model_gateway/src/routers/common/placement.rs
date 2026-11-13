@@ -19,10 +19,13 @@ use axum::{
     response::Response,
 };
 use rand::RngExt;
-use smg_policy_controller::{Decision, LeaseId, Phase, Side, Target, WorkerId, MAX_TARGETS};
+use smg_policy_controller::{
+    Decision, Lease, LeaseId, Phase, Shed, ShedReason, Side, Target, WorkerId, MAX_TARGETS,
+};
 use tracing::{debug, warn};
 
 use crate::{
+    config::types::PdPairingMode,
     middleware::ReportedRefusal,
     observability::{
         cache_trace,
@@ -30,8 +33,10 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        as_consistent_hashing, engine_host::HostRequest, policy_filters_unavailable_workers,
-        CacheNamespace, Decider, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        as_consistent_hashing,
+        engine_host::{HostRequest, PairPartners},
+        policy_filters_unavailable_workers, CacheNamespace, Decider, LoadBalancingPolicy,
+        PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
@@ -939,12 +944,12 @@ fn relaxed_pair(
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
-    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
     inputs: &PlacementInputs<'_>,
     failed_pool: &[Arc<dyn Worker>],
 ) -> Option<Result<Pair, Box<PairFailure>>> {
     let shedding = registry.overload_shed_enabled();
-    if !overload::all_vetoed(failed_pool) || (shedding && overload::all_overloaded(failed_pool)) {
+    if !steerable(shedding, failed_pool) {
         return None;
     }
     let eligible = |w: &Arc<dyn Worker>| {
@@ -998,7 +1003,7 @@ fn relaxed_pair(
             BRANCH_ALL_STALLED_FALLBACK,
         ),
     };
-    if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&prefill)) {
+    if !has_capacity(&prefill) {
         return Some(Err(Box::new(PairFailure {
             role: WorkerRole::Prefill,
             verdict: PlacementFailure::PrefillAtCapacity,
@@ -1021,6 +1026,292 @@ fn relaxed_pair(
         prefill,
         decode,
         runtime,
+    }))
+}
+
+/// Whether a pool with nothing open is the steering default's to pair
+/// ([`relaxed_pair`]): vetoed on every worker, and not all-overloaded under
+/// `--worker-overload-shed` (`shedding`), where the caller sheds instead.
+fn steerable(shedding: bool, pool: &[Arc<dyn Worker>]) -> bool {
+    overload::all_vetoed(pool) && !(shedding && overload::all_overloaded(pool))
+}
+
+/// Whether a worker is open: available, or vetoed by the overload thresholds
+/// alone while its pool's veto is lifted.
+fn open_under(worker: &Arc<dyn Worker>, lift: bool) -> bool {
+    worker.is_available() || (lift && overload::vetoed_by_overload_alone(worker.as_ref()))
+}
+
+/// The decode side's live checks, which the engine's commit repeats on the
+/// partner a decision chose: open under the decode pool's lift, and on the
+/// pair's runtime where one is pinned.
+fn partner_live(decode: &Arc<dyn Worker>, lift_decode: bool, runtime: Option<RuntimeType>) -> bool {
+    open_under(decode, lift_decode)
+        && runtime.is_none_or(|r| decode.metadata().spec.runtime_type == r)
+}
+
+/// The live predicates of one pair placement: what the request may use (the
+/// retained plan's wire, its own candidate filter) and what counts as open
+/// on each side (available, or vetoed by the overload thresholds alone where
+/// the pool's veto is lifted). Settled once by [`pair_prelude`], read by the
+/// legacy selection and by the engine's decision alike.
+#[derive(Clone, Copy)]
+struct PairLive<'a> {
+    wire: Option<WireConstraint>,
+    candidate_filter: Option<CandidateFilter<'a>>,
+    /// The prefill pool is over the thresholds on every worker the request
+    /// may use, and steered by load unless its policy places over the veto.
+    prefill_over: bool,
+    /// The prefill policy places over the lifted veto
+    /// ([`LoadBalancingPolicy::balances_load_against_affinity`]).
+    lift_prefill: bool,
+    /// The decode pool is over the thresholds on every worker the request
+    /// may use: its veto is lifted and the pick pairs by load.
+    lift_decode: bool,
+}
+
+impl PairLive<'_> {
+    fn admitted(&self, worker: &Arc<dyn Worker>) -> bool {
+        WireConstraint::admits(self.wire, worker.as_ref())
+            && self
+                .candidate_filter
+                .is_none_or(|accepts| accepts(worker.as_ref()))
+    }
+
+    fn eligible(&self, worker: &Arc<dyn Worker>, lift: bool) -> bool {
+        self.admitted(worker) && open_under(worker, lift)
+    }
+
+    fn prefill_eligible(&self, worker: &Arc<dyn Worker>) -> bool {
+        self.eligible(worker, self.lift_prefill)
+    }
+
+    /// Whether a decode partner is open for the pair: eligible under the
+    /// decode pool's lift, and on the pair's runtime where one is pinned.
+    fn partner_open(&self, decode: &Arc<dyn Worker>, runtime: Option<RuntimeType>) -> bool {
+        self.admitted(decode) && partner_live(decode, self.lift_decode, runtime)
+    }
+}
+
+/// What the prelude of a pair placement settles from membership and
+/// availability alone, before any policy runs.
+enum PairPrelude<'a> {
+    /// A verdict from membership: a role with no worker, or the pairing
+    /// refusal.
+    Failed(Box<PairFailure>),
+    /// No prefill is open with an open partner: the role names the pool that
+    /// left nothing open, for the steering default or the role's verdict.
+    AllVetoed(WorkerRole),
+    /// The open prefills (positions into `pairs.prefill`), each with an open
+    /// partner on the pair's runtime, for the policies.
+    Open {
+        live: PairLive<'a>,
+        open: Vec<usize>,
+        pair_runtime: Option<RuntimeType>,
+    },
+}
+
+/// The prelude of [`select_pair`], shared with the engine seam: the live
+/// predicates, the roles' membership verdicts, and the open prefills on the
+/// pair's runtime. See [`select_pair`] for the rules.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the prelude reads every routing input of the pair placement"
+)]
+fn pair_prelude<'a>(
+    registry: &WorkerRegistry,
+    prefill_policy: &dyn LoadBalancingPolicy,
+    pairing_mode: PdPairingMode,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    homogeneous_runtime: bool,
+    inputs: &PlacementInputs<'a>,
+) -> PairPrelude<'a> {
+    let admitted = |w: &Arc<dyn Worker>| {
+        WireConstraint::admits(wire, w.as_ref())
+            && inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(w.as_ref()))
+    };
+    // The overload thresholds steer a pool only while one of the workers the
+    // request may use in it is under them. A pool whose every such worker
+    // is over them (and some otherwise routable) has nowhere to be steered:
+    // the default steers it by load, as it steers a single-worker placement,
+    // and a decode pool over them pairs by load with the prefill its own
+    // policy picked rather than re-pick a prefill its pool never vetoed.
+    // Under `--worker-overload-shed` such a pool is shed instead.
+    let shedding = registry.overload_shed_enabled();
+    let vetoed_alone = |pool: &[Arc<dyn Worker>]| {
+        pool.iter()
+            .any(|w| admitted(w) && overload::vetoed_by_overload_alone(w.as_ref()))
+    };
+    let lifted = |pool: &[Arc<dyn Worker>]| {
+        !shedding && !pool.iter().any(|w| admitted(w) && w.is_available()) && vetoed_alone(pool)
+    };
+    let live = PairLive {
+        wire,
+        candidate_filter: inputs.candidate_filter,
+        prefill_over: lifted(&pairs.prefill),
+        // The veto does not steer a prefill pool whose policy weighs load
+        // against cache affinity itself (`SelectWorkerInfo::overload_lifted`):
+        // under sustained load the prefill workers take turns crossing the
+        // thresholds, and every crossing would send the sessions whose prefixes
+        // that worker holds to another one, discarding their cache and pushing
+        // that worker over in turn; a least-loaded pick over a pool all over
+        // them discards the same. The policy's own gate moves a request off a
+        // holder loaded well past the pool
+        // (`LoadBalancingPolicy::balances_load_against_affinity`). A policy
+        // without that affinity (load-blind, or one that hashes only over
+        // workers under the thresholds) keeps the veto and the default.
+        lift_prefill: !shedding
+            && prefill_policy.balances_load_against_affinity()
+            && vetoed_alone(&pairs.prefill),
+        lift_decode: lifted(&pairs.decode_pool),
+    };
+    let fail = |role: WorkerRole, verdict: PlacementFailure| {
+        PairPrelude::Failed(Box::new(PairFailure { role, verdict }))
+    };
+
+    // A role with no worker at all names itself before pairing is judged.
+    if pairs.prefill_pool.is_empty() {
+        debug!("No prefill workers");
+        return fail(WorkerRole::Prefill, PlacementFailure::NoCandidates);
+    }
+    if pairs.decode_pool.is_empty() {
+        debug!("No decode workers");
+        return fail(WorkerRole::Decode, PlacementFailure::NoCandidates);
+    }
+    if let Some(refusal) = &pairs.refusal {
+        warn!(
+            model_id,
+            mode = pairing_mode.as_str(),
+            mismatches = ?refusal.mismatches,
+            prefill = ?refusal.prefill,
+            decode = ?refusal.decode,
+            "No prefill/decode pair shares a KV transfer protocol"
+        );
+        return fail(
+            WorkerRole::Decode,
+            PlacementFailure::NoCompatiblePair {
+                prefill: refusal.prefill.clone(),
+                decode: refusal.decode.clone(),
+                mismatches: refusal.mismatches.clone(),
+            },
+        );
+    }
+
+    // Live state: a prefill is open when it is available and so is one of
+    // its partners, so the policy's pick can always be paired. Where the
+    // wire's rendezvous is runtime-specific, both pools must also share a
+    // runtime: that of the first prefill worker open under its own runtime,
+    // so a prefill whose partners are all down never shuts out a healthy
+    // pair on another runtime. The index keeps runtimes apart already
+    // unless pairing is off or a runtime is unknown.
+    let can_pair_on = |i: usize, runtime: Option<RuntimeType>| {
+        pairs.partners[i]
+            .iter()
+            .any(|d| live.partner_open(d, runtime))
+    };
+    if !pairs.prefill.iter().any(|p| live.prefill_eligible(p)) {
+        return PairPrelude::AllVetoed(WorkerRole::Prefill);
+    }
+    let pair_runtime = homogeneous_runtime
+        .then(|| {
+            pairs.prefill.iter().enumerate().find_map(|(i, p)| {
+                let runtime = p.metadata().spec.runtime_type;
+                (live.prefill_eligible(p) && can_pair_on(i, Some(runtime))).then_some(runtime)
+            })
+        })
+        .flatten();
+    // One pass: the open prefills on the pair's runtime, counting the
+    // pairable ones the narrowing excluded so the exclusion leaves a trace.
+    let mut excluded = 0usize;
+    let open: Vec<usize> = (0..pairs.prefill.len())
+        .filter(|&i| {
+            let p = &pairs.prefill[i];
+            if !live.prefill_eligible(p) {
+                return false;
+            }
+            let own = p.metadata().spec.runtime_type;
+            if pair_runtime.is_some_and(|runtime| own != runtime) {
+                if can_pair_on(i, Some(own)) {
+                    excluded += 1;
+                }
+                return false;
+            }
+            can_pair_on(i, pair_runtime)
+        })
+        .collect();
+    if excluded > 0 {
+        warn!(
+            model_id,
+            ?pair_runtime,
+            excluded,
+            "Mixed runtime types in PD workers; pairable prefill workers on another runtime were excluded"
+        );
+    }
+    if open.is_empty() {
+        // A lifted prefill pool with every worker vetoed had no prefill free
+        // of the vetoes: the default is judged over it, as it was before the
+        // lift. Otherwise the decode pool left the open prefills nothing to
+        // pair with.
+        return PairPrelude::AllVetoed(if live.prefill_over {
+            WorkerRole::Prefill
+        } else {
+            WorkerRole::Decode
+        });
+    }
+    PairPrelude::Open {
+        live,
+        open,
+        pair_runtime,
+    }
+}
+
+/// The workers of the pool `role` names (the pairable prefills, or the decode
+/// pool), as the request may use them ([`admitted_pool`]).
+fn admitted_role_pool(
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    inputs: &PlacementInputs<'_>,
+    role: WorkerRole,
+) -> Vec<Arc<dyn Worker>> {
+    let pool: &[Arc<dyn Worker>] = match role {
+        WorkerRole::Decode => &pairs.decode_pool,
+        WorkerRole::Prefill | WorkerRole::Single => &pairs.prefill,
+    };
+    admitted_pool(pool, wire, inputs)
+}
+
+/// A pair pool with nothing open, named by `role`: the steering default's
+/// pair when the pool is vetoed on every worker the request may use
+/// ([`relaxed_pair`]), else the role's verdict judged from those workers.
+fn settle_vetoed(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
+    inputs: &PlacementInputs<'_>,
+    role: WorkerRole,
+) -> Result<Pair, Box<PairFailure>> {
+    let admitted = admitted_role_pool(pairs, wire, inputs, role);
+    if let Some(pair) = relaxed_pair(
+        registry,
+        model_id,
+        pairs,
+        wire,
+        has_capacity,
+        inputs,
+        &admitted,
+    ) {
+        return pair;
+    }
+    debug!(?role, "No available PD pair");
+    Err(Box::new(PairFailure {
+        role,
+        verdict: failure_from(&admitted, model_id, registry.overload_shed_enabled()),
     }))
 }
 
@@ -1057,178 +1348,42 @@ pub(crate) fn select_pair(
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
-    let admitted = |w: &Arc<dyn Worker>| {
-        WireConstraint::admits(wire, w.as_ref())
-            && inputs
-                .candidate_filter
-                .is_none_or(|accepts| accepts(w.as_ref()))
-    };
-    // The overload thresholds steer a pool only while one of the workers the
-    // request may use in it is under them. A pool whose every such worker
-    // is over them (and some otherwise routable) has nowhere to be steered:
-    // the default steers it by load, as it steers a single-worker placement,
-    // and a decode pool over them pairs by load with the prefill its own
-    // policy picked rather than re-pick a prefill its pool never vetoed.
-    // Under `--worker-overload-shed` such a pool is shed instead.
-    let shedding = registry.overload_shed_enabled();
-    let vetoed_alone = |pool: &[Arc<dyn Worker>]| {
-        pool.iter()
-            .any(|w| admitted(w) && overload::vetoed_by_overload_alone(w.as_ref()))
-    };
-    let lifted = |pool: &[Arc<dyn Worker>]| {
-        !shedding && !pool.iter().any(|w| admitted(w) && w.is_available()) && vetoed_alone(pool)
-    };
     // Independent prefill/decode policies so stateful ones (round robin) do
     // not share a counter; each role tags the sticky key with its own prefix.
     let prefill_policy = policies.get_prefill_policy();
     let decode_policy = policies.get_decode_policy();
-    let prefill_over = lifted(&pairs.prefill);
-    // The veto does not steer a prefill pool whose policy weighs load
-    // against cache affinity itself (`SelectWorkerInfo::overload_lifted`):
-    // under sustained load the prefill workers take turns crossing the
-    // thresholds, and every crossing would send the sessions whose prefixes
-    // that worker holds to another one, discarding their cache and pushing
-    // that worker over in turn; a least-loaded pick over a pool all over
-    // them discards the same. The policy's own gate moves a request off a
-    // holder loaded well past the pool
-    // (`LoadBalancingPolicy::balances_load_against_affinity`). A policy
-    // without that affinity (load-blind, or one that hashes only over
-    // workers under the thresholds) keeps the veto and the default.
-    let lift_prefill = !shedding
-        && prefill_policy.balances_load_against_affinity()
-        && vetoed_alone(&pairs.prefill);
-    let lift_decode = lifted(&pairs.decode_pool);
-    let eligible = |w: &Arc<dyn Worker>, lift: bool| {
-        admitted(w)
-            && (w.is_available() || (lift && overload::vetoed_by_overload_alone(w.as_ref())))
+    let has_capacity =
+        |w: &Arc<dyn Worker>| prefill_capacity.is_none_or(|capacity| capacity.has_capacity(w));
+    let (live, mut open, pair_runtime) = match pair_prelude(
+        registry,
+        prefill_policy.as_ref(),
+        policies.pd_pairing_mode(),
+        model_id,
+        pairs,
+        wire,
+        homogeneous_runtime,
+        &inputs,
+    ) {
+        PairPrelude::Failed(failure) => return Err(failure),
+        PairPrelude::AllVetoed(role) => {
+            return settle_vetoed(
+                registry,
+                model_id,
+                pairs,
+                wire,
+                &has_capacity,
+                &inputs,
+                role,
+            )
+        }
+        PairPrelude::Open {
+            live,
+            open,
+            pair_runtime,
+        } => (live, open, pair_runtime),
     };
-    let prefill_eligible = |w: &Arc<dyn Worker>| eligible(w, lift_prefill);
     let fail =
         |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
-
-    // A role with no worker at all names itself before pairing is judged.
-    if pairs.prefill_pool.is_empty() {
-        debug!("No prefill workers");
-        return Err(fail(WorkerRole::Prefill, PlacementFailure::NoCandidates));
-    }
-    if pairs.decode_pool.is_empty() {
-        debug!("No decode workers");
-        return Err(fail(WorkerRole::Decode, PlacementFailure::NoCandidates));
-    }
-    if let Some(refusal) = &pairs.refusal {
-        warn!(
-            model_id,
-            mode = policies.pd_pairing_mode().as_str(),
-            mismatches = ?refusal.mismatches,
-            prefill = ?refusal.prefill,
-            decode = ?refusal.decode,
-            "No prefill/decode pair shares a KV transfer protocol"
-        );
-        return Err(fail(
-            WorkerRole::Decode,
-            PlacementFailure::NoCompatiblePair {
-                prefill: refusal.prefill.clone(),
-                decode: refusal.decode.clone(),
-                mismatches: refusal.mismatches.clone(),
-            },
-        ));
-    }
-
-    // Live state: a prefill is open when it is available and so is one of
-    // its partners, so the policy's pick can always be paired. Where the
-    // wire's rendezvous is runtime-specific, both pools must also share a
-    // runtime: that of the first prefill worker open under its own runtime,
-    // so a prefill whose partners are all down never shuts out a healthy
-    // pair on another runtime. The index keeps runtimes apart already
-    // unless pairing is off or a runtime is unknown.
-    let partner_open = |d: &Arc<dyn Worker>, runtime: Option<RuntimeType>| {
-        eligible(d, lift_decode) && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
-    };
-    let can_pair_on = |i: usize, runtime: Option<RuntimeType>| {
-        pairs.partners[i].iter().any(|d| partner_open(d, runtime))
-    };
-    if !pairs.prefill.iter().any(&prefill_eligible) {
-        let admitted = admitted_pool(&pairs.prefill, wire, &inputs);
-        if let Some(pair) = relaxed_pair(
-            registry,
-            model_id,
-            pairs,
-            wire,
-            prefill_capacity,
-            &inputs,
-            &admitted,
-        ) {
-            return pair;
-        }
-        debug!("No available prefill workers");
-        return Err(fail(
-            WorkerRole::Prefill,
-            failure_from(&admitted, model_id, registry.overload_shed_enabled()),
-        ));
-    }
-    let pair_runtime = homogeneous_runtime
-        .then(|| {
-            pairs.prefill.iter().enumerate().find_map(|(i, p)| {
-                let runtime = p.metadata().spec.runtime_type;
-                (prefill_eligible(p) && can_pair_on(i, Some(runtime))).then_some(runtime)
-            })
-        })
-        .flatten();
-    // One pass: the open prefills on the pair's runtime, counting the
-    // pairable ones the narrowing excluded so the exclusion leaves a trace.
-    let mut excluded = 0usize;
-    let mut open: Vec<usize> = (0..pairs.prefill.len())
-        .filter(|&i| {
-            let p = &pairs.prefill[i];
-            if !prefill_eligible(p) {
-                return false;
-            }
-            let own = p.metadata().spec.runtime_type;
-            if pair_runtime.is_some_and(|runtime| own != runtime) {
-                if can_pair_on(i, Some(own)) {
-                    excluded += 1;
-                }
-                return false;
-            }
-            can_pair_on(i, pair_runtime)
-        })
-        .collect();
-    if excluded > 0 {
-        warn!(
-            model_id,
-            ?pair_runtime,
-            excluded,
-            "Mixed runtime types in PD workers; pairable prefill workers on another runtime were excluded"
-        );
-    }
-    if open.is_empty() {
-        // A lifted prefill pool with every worker vetoed had no prefill free
-        // of the vetoes: the default is judged over it, as it was before the
-        // lift. Otherwise the decode pool left the open prefills nothing to
-        // pair with.
-        let (role, failed_pool) = if prefill_over {
-            (WorkerRole::Prefill, &pairs.prefill)
-        } else {
-            (WorkerRole::Decode, &pairs.decode_pool)
-        };
-        let admitted = admitted_pool(failed_pool, wire, &inputs);
-        if let Some(pair) = relaxed_pair(
-            registry,
-            model_id,
-            pairs,
-            wire,
-            prefill_capacity,
-            &inputs,
-            &admitted,
-        ) {
-            return pair;
-        }
-        debug!(?pair_runtime, "No available PD pair");
-        return Err(fail(
-            role,
-            failure_from(&admitted, model_id, registry.overload_shed_enabled()),
-        ));
-    }
 
     // Under Prefill admission, workers at their limit leave the candidate set
     // before the policy runs, so a stateful policy never commits a choice
@@ -1261,7 +1416,7 @@ pub(crate) fn select_pair(
         cache_namespace: inputs.cache_namespace,
         hash_ring,
         role: WorkerRole::Prefill,
-        overload_lifted: lift_prefill,
+        overload_lifted: live.lift_prefill,
     };
     // Both pools were filtered for availability above (a pool the overload
     // veto cannot steer counting as available), so a miss here is the
@@ -1277,14 +1432,14 @@ pub(crate) fn select_pair(
     else {
         // A policy that declines a lifted pool all over the thresholds: the
         // least-loaded default steers it, as it steers any other such pool.
-        if lift_prefill {
-            let admitted = admitted_pool(&pairs.prefill, wire, &inputs);
+        if live.lift_prefill {
+            let admitted = admitted_role_pool(pairs, wire, &inputs, WorkerRole::Prefill);
             if let Some(pair) = relaxed_pair(
                 registry,
                 model_id,
                 pairs,
                 wire,
-                prefill_capacity,
+                &has_capacity,
                 &inputs,
                 &admitted,
             ) {
@@ -1304,7 +1459,7 @@ pub(crate) fn select_pair(
     // availability flip between the two reads.
     let mut decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
         .iter()
-        .filter(|d| partner_open(d, pair_runtime))
+        .filter(|d| live.partner_open(d, pair_runtime))
         .cloned()
         .collect();
     if decode.is_empty() {
@@ -1319,7 +1474,7 @@ pub(crate) fn select_pair(
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
     // the veto for its policy.
-    let selected_decode = if lift_decode {
+    let selected_decode = if live.lift_decode {
         overload::least_loaded_uniform(decode.iter(), &mut rand::rng())
             .cloned()
             .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?
@@ -1331,12 +1486,12 @@ pub(crate) fn select_pair(
             None => return Err(declined(WorkerRole::Decode, decode_policy.name())),
         }
     };
-    if prefill_over || lift_decode {
+    if live.prefill_over || live.lift_decode {
         Metrics::record_worker_overload_fallback(STAGE_SELECTION);
         debug!(
             branch = BRANCH_ALL_OVERLOADED_FALLBACK,
-            prefill_pool = prefill_over,
-            decode_pool = lift_decode,
+            prefill_pool = live.prefill_over,
+            decode_pool = live.lift_decode,
             prefill = %selected_prefill.redacted_url(),
             decode = %selected_decode.redacted_url(),
             model_id,
@@ -1350,7 +1505,7 @@ pub(crate) fn select_pair(
         model_id,
         prefill_policy.name(),
     );
-    if !lift_decode {
+    if !live.lift_decode {
         Metrics::record_worker_selection(
             metrics_labels::WORKER_DECODE,
             selected_decode.connection_mode().as_metric_label(),
@@ -1369,6 +1524,376 @@ pub(crate) fn select_pair(
         decode: selected_decode,
         runtime,
     })
+}
+
+/// The policy engine for a pair placement, or `None` when the legacy path
+/// decides: hosted under `--policy-engine engine`, and not placing a request
+/// the sticky routing-key override keys on either side or a key-native side
+/// pins by the key placement derives, a configured routing-key header
+/// included ([`PolicyRegistry::pair_engine_for`]).
+pub(crate) fn pair_decider<'a>(
+    policies: &'a PolicyRegistry,
+    inputs: &PlacementInputs<'_>,
+) -> Option<&'a Arc<Decider>> {
+    policies.pair_engine_for(&SelectWorkerInfo {
+        headers: inputs.headers,
+        routing_key: policies.sticky_header_key(inputs.headers),
+        rid_key: inputs.rid_key,
+        ..SelectWorkerInfo::default()
+    })
+}
+
+/// A pair placement decided through the engine, as [`decide_pair`] hands it
+/// to [`commit_pair`] under the same hold of the admission lock.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the decided side carries the engine's decision by value across the one hop from the decision to the commit; boxing it would cost one allocation per pair placement"
+)]
+pub(crate) enum PairProposal {
+    /// The prelude's own pair (the steering default over an all-vetoed pool):
+    /// the caller re-validates the prefill's window alone.
+    Settled(Pair),
+    /// The engine's decision, committed over its ordered targets.
+    Decided(PairDecision),
+}
+
+/// The engine's pair decision with what its commit indexes and re-validates.
+pub(crate) struct PairDecision {
+    decision: Decision,
+    lease: Lease,
+    /// The decode side's booking of a request of unknown size: the decode
+    /// policy's own estimate, where the lease carries the prefill's.
+    decode_tokens: u32,
+    /// The open prefills the decision's targets index by position.
+    prefills: Vec<Arc<dyn Worker>>,
+    /// The decode rows the targets' pair sides index by position.
+    decodes: Vec<Arc<dyn Worker>>,
+    pair_runtime: Option<RuntimeType>,
+    prefill_over: bool,
+    lift_prefill: bool,
+    lift_decode: bool,
+}
+
+/// [`select_pair`] through the policy engine, the decision half: the prelude
+/// settles what membership and availability settle, then one pair decision
+/// over the open prefills with their capacity bits (`has_capacity`: the
+/// admission window as the lock reads it) and their open partners with
+/// their room bits; `excluded` are the ids a commit of this request just
+/// refused, for the one re-decision. A prefill picker that declines a
+/// lifted pool all over the thresholds is steered by the least-loaded
+/// default, as the legacy path steers it. Runs inside the admission
+/// callback, under the lock, as the legacy selection does: an open pool
+/// with no capacity is the at-capacity verdict before any engine call, so
+/// a newcomer behind the queue builds no view and moves no policy state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the engine seam threads every routing input plus the window"
+)]
+pub(crate) fn decide_pair(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    decider: &Decider,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    homogeneous_runtime: bool,
+    has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
+    inputs: PlacementInputs<'_>,
+    excluded: &[WorkerId],
+) -> Result<PairProposal, Box<PairFailure>> {
+    let prefill_policy = policies.get_prefill_policy();
+    let (live, open, pair_runtime) = match pair_prelude(
+        registry,
+        prefill_policy.as_ref(),
+        policies.pd_pairing_mode(),
+        model_id,
+        pairs,
+        wire,
+        homogeneous_runtime,
+        &inputs,
+    ) {
+        PairPrelude::Failed(failure) => return Err(failure),
+        PairPrelude::AllVetoed(role) => {
+            return settle_vetoed(registry, model_id, pairs, wire, has_capacity, &inputs, role)
+                .map(PairProposal::Settled)
+        }
+        PairPrelude::Open {
+            live,
+            open,
+            pair_runtime,
+        } => (live, open, pair_runtime),
+    };
+    // The at-capacity verdict is the prelude's, before any engine call: no
+    // open prefill under the window means the request waits for a slot (the
+    // FIFO's own answer), with no view built and no policy state moved, which
+    // keeps capacity hidden behind the queue for the policies whose selection
+    // commits routing state.
+    if !open.iter().any(|&i| has_capacity(&pairs.prefill[i])) {
+        return Err(Box::new(PairFailure {
+            role: WorkerRole::Prefill,
+            verdict: PlacementFailure::PrefillAtCapacity,
+        }));
+    }
+    let prefills: Vec<Arc<dyn Worker>> = open
+        .iter()
+        .map(|&i| Arc::clone(&pairs.prefill[i]))
+        .collect();
+    // Each open prefill's partner list as the index shares it between the
+    // prefills of one pairing descriptor, and the live filter over a list,
+    // which reads the decode and the pair's runtime alone: the engine keys
+    // one pair class per list and builds its rows once.
+    let list = |i: usize| &pairs.partners[open[i]];
+    let partner_open = |d: &Arc<dyn Worker>| live.partner_open(d, pair_runtime);
+    let request = HostRequest {
+        model: model_id,
+        prompt_tokens: decider.prefill_prompt_tokens(inputs.tokens),
+        session_key: policies
+            .sticky_header_key(inputs.headers)
+            .or(inputs.rid_key),
+        tried: inputs.tried,
+        overload_lifted: live.lift_prefill,
+        phase: Phase::Prefill,
+        has_capacity: None,
+        sequence: inputs.sequence,
+    };
+    let (decision, lease, decodes) = decider.decide_pair(
+        &request,
+        &prefills,
+        has_capacity,
+        PairPartners {
+            list: &list,
+            open: &partner_open,
+            lift_decode: live.lift_decode,
+        },
+        excluded,
+    );
+    if let Decision::Shed(shed) = &decision {
+        let failure = pair_shed(policies, decider, model_id, shed);
+        if live.lift_prefill
+            && failure.role == WorkerRole::Prefill
+            && matches!(failure.verdict, PlacementFailure::PolicyDeclined(_))
+        {
+            let admitted = admitted_role_pool(pairs, wire, &inputs, WorkerRole::Prefill);
+            if let Some(pair) = relaxed_pair(
+                registry,
+                model_id,
+                pairs,
+                wire,
+                has_capacity,
+                &inputs,
+                &admitted,
+            ) {
+                return pair.map(PairProposal::Settled);
+            }
+        }
+        return Err(failure);
+    }
+    Ok(PairProposal::Decided(PairDecision {
+        decision,
+        lease,
+        decode_tokens: decider.decode_prompt_tokens(inputs.tokens),
+        prefills,
+        decodes,
+        pair_runtime,
+        prefill_over: live.prefill_over,
+        lift_prefill: live.lift_prefill,
+        lift_decode: live.lift_decode,
+    }))
+}
+
+/// The host's verdict for a pair the engine shed: a prefill pool its
+/// capacity filter emptied waits for a slot; a decode side with no open
+/// partner is the decode role's unavailability; a picker's decline names
+/// the policy of the side that declined; anything else is the prefill
+/// role's unavailability.
+fn pair_shed(
+    policies: &PolicyRegistry,
+    decider: &Decider,
+    model_id: &str,
+    shed: &Shed,
+) -> Box<PairFailure> {
+    let (role, verdict) = match shed.emptied_by {
+        "has-capacity" => (WorkerRole::Prefill, PlacementFailure::PrefillAtCapacity),
+        "partnered" | "partners" | "has-room" => {
+            (WorkerRole::Decode, PlacementFailure::Unavailable)
+        }
+        _ if shed.reason == ShedReason::PolicyDeclined => {
+            let decode_side = decider
+                .engine()
+                .profile_for(model_id, Phase::Decode)
+                .is_some_and(|(index, _)| index == shed.trace.profile);
+            if decode_side {
+                (
+                    WorkerRole::Decode,
+                    PlacementFailure::PolicyDeclined(policies.get_decode_policy().name()),
+                )
+            } else {
+                (
+                    WorkerRole::Prefill,
+                    PlacementFailure::PolicyDeclined(policies.get_prefill_policy().name()),
+                )
+            }
+        }
+        _ => (WorkerRole::Prefill, PlacementFailure::Unavailable),
+    };
+    Box::new(PairFailure { role, verdict })
+}
+
+/// [`select_pair`] through the policy engine, the commit half, right after
+/// the decision under the same hold of the admission lock: `has_capacity`
+/// is the window re-read, since a regular or an unbounded dispatch moves a
+/// worker's load outside this lock. The first target whose
+/// prefill has capacity and is still open and whose decode partner is still
+/// open is the pair, booked on both sides, the decode at its own estimate;
+/// when every target misses, the missed ids go to
+/// `missed` for the one re-decision and the request waits for a slot. The
+/// room itself is claimed at dispatch (`pd_admission::admit_decode`), as
+/// under the legacy path.
+pub(crate) fn commit_pair(
+    policies: &PolicyRegistry,
+    decider: &Decider,
+    model_id: &str,
+    proposal: PairProposal,
+    has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
+    missed: &mut Vec<WorkerId>,
+) -> Result<Pair, Box<PairFailure>> {
+    let pd = match proposal {
+        PairProposal::Settled(pair) => return Ok(pair),
+        PairProposal::Decided(pd) => pd,
+    };
+    let fail =
+        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
+    let decode_of = |target: &Target| {
+        target
+            .pair
+            .map(|pair| &pd.decodes[pair.decode_position as usize])
+    };
+    // Both sides are re-read under the lock, as the single seam re-reads
+    // availability: the prefill open under its pool's lift beside its
+    // window, the decode partner live.
+    let accept = |target: &Target| {
+        let prefill = &pd.prefills[target.position as usize];
+        has_capacity(prefill)
+            && open_under(prefill, pd.lift_prefill)
+            && decode_of(target).is_some_and(|d| partner_live(d, pd.lift_decode, pd.pair_runtime))
+    };
+    let Some(target) = decider.commit_pair(&pd.lease, pd.decode_tokens, &pd.decision, accept)
+    else {
+        if let Some(pick) = pd.decision.pick() {
+            for target in pick.targets.iter() {
+                missed.push(target.id);
+                missed.extend(target.pair.map(|pair| pair.decode_id));
+            }
+        }
+        return Err(fail(
+            WorkerRole::Prefill,
+            PlacementFailure::PrefillAtCapacity,
+        ));
+    };
+    let prefill = Arc::clone(&pd.prefills[target.position as usize]);
+    let decode = decode_of(&target)
+        .map(Arc::clone)
+        .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?;
+    if pd.prefill_over || pd.lift_decode {
+        Metrics::record_worker_overload_fallback(STAGE_SELECTION);
+        debug!(
+            branch = BRANCH_ALL_OVERLOADED_FALLBACK,
+            prefill_pool = pd.prefill_over,
+            decode_pool = pd.lift_decode,
+            prefill = %prefill.redacted_url(),
+            decode = %decode.redacted_url(),
+            model_id,
+            "Veto fallback: a pool over the overload thresholds decided with the veto lifted"
+        );
+    }
+    let runtime = prefill.metadata().spec.runtime_type;
+    Metrics::record_worker_selection(
+        metrics_labels::WORKER_PREFILL,
+        prefill.connection_mode().as_metric_label(),
+        model_id,
+        policies.get_prefill_policy().name(),
+    );
+    // A decode paired by load under the lift is the veto fallback's pick,
+    // counted above, not a selection of the decode policy.
+    if !pd.lift_decode {
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            decode.connection_mode().as_metric_label(),
+            model_id,
+            policies.get_decode_policy().name(),
+        );
+    }
+    debug!(
+        prefill = %prefill.redacted_url(),
+        decode = %decode.redacted_url(),
+        "Selected PD pair"
+    );
+    Ok(Pair {
+        prefill,
+        decode,
+        runtime,
+    })
+}
+
+/// [`select_pair`] through the policy engine inside the admission callback,
+/// as the routers run it under `--policy-engine engine`: the decision over
+/// the window as the lock reads it (`has_capacity`: the routers' read of the
+/// admission context, every prefill open with admission off), its commit
+/// under the same hold, and one re-decision with the ids a refused commit
+/// missed before the at-capacity verdict queues the request. The window is
+/// read again at each step, never remembered from the one before.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the engine seam threads every routing input plus the window"
+)]
+pub(crate) fn place_pair_through_engine(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    decider: &Decider,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    homogeneous_runtime: bool,
+    has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
+    inputs: PlacementInputs<'_>,
+) -> Result<Pair, Box<PairFailure>> {
+    let decide = |excluded: &[WorkerId]| {
+        decide_pair(
+            registry,
+            policies,
+            decider,
+            model_id,
+            pairs,
+            wire,
+            homogeneous_runtime,
+            has_capacity,
+            inputs,
+            excluded,
+        )
+    };
+    let mut missed = Vec::new();
+    let refused = match commit_pair(
+        policies,
+        decider,
+        model_id,
+        decide(&[])?,
+        has_capacity,
+        &mut missed,
+    ) {
+        Ok(pair) => return Ok(pair),
+        Err(failure) => failure,
+    };
+    if missed.is_empty() {
+        return Err(refused);
+    }
+    commit_pair(
+        policies,
+        decider,
+        model_id,
+        decide(&missed)?,
+        has_capacity,
+        &mut Vec::new(),
+    )
 }
 
 /// Narrow a decode pick's candidates to the workers whose admission gate
@@ -1413,6 +1938,7 @@ pub(crate) fn retain_decodes_with_a_room(
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::{Cell, RefCell},
         collections::{BTreeMap, HashMap},
         sync::Mutex,
         time::Duration,
@@ -1554,6 +2080,572 @@ mod tests {
                 .expect("worker registers");
         }
         registry
+    }
+
+    /// One pair through the engine seam, its two halves apart: the decision
+    /// with `has_capacity` as one read of the window, the commit with
+    /// `capacity` as a later read of it (the routers take both under one
+    /// hold of the lock), the misses of a refused commit excluded from the
+    /// next decision through `missed`.
+    fn decided_pair(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
+        capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
+        missed: &mut Vec<WorkerId>,
+    ) -> Result<Pair, Box<PairFailure>> {
+        let decider = pair_decider(policies, &PlacementInputs::default())
+            .expect("the engine serves the pair");
+        let pairs = pairs_of(registry, policies);
+        let excluded = std::mem::take(missed);
+        let proposal = decide_pair(
+            registry,
+            policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            has_capacity,
+            PlacementInputs::default(),
+            &excluded,
+        )?;
+        commit_pair(policies, decider, MODEL, proposal, capacity, missed)
+    }
+
+    /// Selections per worker URL over `requests` pairs decided through the
+    /// engine with an open window.
+    fn decided_hits(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        requests: usize,
+    ) -> BTreeMap<String, usize> {
+        let mut hits = BTreeMap::new();
+        let mut missed = Vec::new();
+        for _ in 0..requests {
+            let pair = decided_pair(registry, policies, &|_| true, &|_| true, &mut missed)
+                .expect("a pair is open");
+            *hits.entry(pair.prefill.url().to_string()).or_insert(0) += 1;
+            *hits.entry(pair.decode.url().to_string()).or_insert(0) += 1;
+        }
+        hits
+    }
+
+    /// The two PD cohorts' policies with the engine hosted behind the switch.
+    fn engine_cohort_policies() -> PolicyRegistry {
+        let round_robin = PolicyConfig::RoundRobin;
+        cohort_policies().with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin)
+    }
+
+    /// Under `--policy-engine engine` the pair is decided through the engine:
+    /// round robin on both roles rotates the prefills and, within the chosen
+    /// prefill's partners, the decodes; every pair is one decision.
+    #[test]
+    fn with_the_engine_switch_a_pair_rotates_both_pools() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let picks = decided_hits(&registry, &policies, 8);
+        assert_eq!(picks["grpc://p:1"], 4, "{picks:?}");
+        assert_eq!(picks["grpc://p:2"], 4, "{picks:?}");
+        assert_eq!(picks["grpc://d:1"], 4, "{picks:?}");
+        assert_eq!(picks["grpc://d:2"], 4, "{picks:?}");
+        let decider = policies.decider().expect("hosted");
+        assert_eq!(decider.decisions(), 8, "one decision per pair");
+    }
+
+    /// The at-capacity verdict is the prelude's: with no open prefill under
+    /// the window the engine decides nothing (no view built, no policy state
+    /// moved) and the failure is the one the FIFO queues on; the locked
+    /// placement answers the same.
+    #[test]
+    fn a_pool_with_no_capacity_queues_before_the_engine_decides() {
+        use crate::worker::PrefillCandidateError as _;
+
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let none = |_: &Arc<dyn Worker>| false;
+        let failure = decide_pair(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &none,
+            PlacementInputs::default(),
+            &[],
+        )
+        .err()
+        .expect("no prefill has capacity");
+        assert!(
+            failure.is_at_capacity(),
+            "the verdict is the at-capacity one"
+        );
+        assert_eq!(decider.decisions(), 0, "no decision was made");
+        let mut missed = Vec::new();
+        let placed = decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+            .expect("an open pair with capacity is placed");
+        assert_eq!(placed.prefill.url(), "grpc://p:1");
+        assert_eq!(decider.decisions(), 1);
+    }
+
+    /// Under the switch a decode partner whose window is full is kept out of
+    /// the pair by the engine's room bit, and the rooms stay the host's to
+    /// claim at dispatch (the engine books nothing).
+    #[test]
+    fn with_the_engine_switch_a_full_decode_window_is_kept_out_of_the_pair() {
+        let registry = gated_pd_registry(2);
+        let policies = engine_cohort_policies();
+        let full = registry.get_by_url("grpc://d:1").expect("registered");
+        assert!(full.try_admit_pd(2, 2), "both rooms claimed");
+        let picks = decided_hits(&registry, &policies, 10);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        assert_eq!(picks["grpc://d:2"], 10, "{picks:?}");
+        assert_eq!(picks["grpc://p:1"], 10, "{picks:?}");
+
+        full.release_pd(2);
+        let picks = decided_hits(&registry, &policies, 10);
+        assert_eq!(picks["grpc://d:1"], 5, "{picks:?}");
+        assert_eq!(picks["grpc://d:2"], 5, "{picks:?}");
+    }
+
+    /// The commit re-validates the prefill's window under the lock: a window
+    /// that closed between the decision and the commit refuses every target,
+    /// the request waits for a slot, and the missed pair (its prefill and its
+    /// decode) is recorded for the one re-decision, which the next commit
+    /// clears.
+    #[test]
+    fn the_commit_re_validates_the_window_and_records_the_missed_pair() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let mut missed = Vec::new();
+        let refused = decided_pair(&registry, &policies, &|_| true, &|_| false, &mut missed)
+            .err()
+            .expect("the window closed under the lock");
+        assert_eq!(refused.role, WorkerRole::Prefill);
+        assert!(matches!(
+            refused.verdict,
+            PlacementFailure::PrefillAtCapacity
+        ));
+        assert_eq!(missed.len(), 2, "the prefill and its decode: {missed:?}");
+        assert_eq!(decider.decisions(), 1);
+        let pair = decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+            .expect("the re-decision pairs");
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+        assert_eq!(decider.decisions(), 2, "one re-decision");
+        assert!(missed.is_empty(), "a committed pair leaves no miss behind");
+    }
+
+    /// The seam the routers call, with the window closing between the
+    /// decision and the commit. The prelude reads the window once and the
+    /// engine's view once per prefill, so its fourth read is the first
+    /// commit's, and that read finds the decided prefill's window closed:
+    /// the commit refuses, the miss is recorded, the one re-decision pairs
+    /// the other prefill, and one call places the pair with two decisions.
+    #[test]
+    fn the_seam_re_decides_once_when_the_window_closes_before_the_commit() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let reads = Cell::new(0_u32);
+        let closed: RefCell<Option<String>> = RefCell::new(None);
+        let has_capacity = |worker: &Arc<dyn Worker>| {
+            reads.set(reads.get() + 1);
+            if reads.get() == 4 {
+                *closed.borrow_mut() = Some(worker.url().to_string());
+            }
+            closed.borrow().as_deref() != Some(worker.url())
+        };
+        let pair = place_pair_through_engine(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &has_capacity,
+            PlacementInputs::default(),
+        )
+        .expect("the re-decision pairs the other prefill");
+        let closed = closed
+            .borrow()
+            .clone()
+            .expect("the first commit read the window");
+        assert_ne!(
+            pair.prefill.url(),
+            closed,
+            "the closed prefill is not paired"
+        );
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+        assert_eq!(decider.decisions(), 2, "one re-decision");
+    }
+
+    /// A window that closes between the prelude's read and the engine's:
+    /// the prelude saw a prefill with capacity, the engine's capacity filter
+    /// then empties the pool, and the host's verdict is still the one the
+    /// request waits on (`pair_shed` maps the capacity shed to it).
+    #[test]
+    fn a_capacity_shed_past_the_prelude_is_the_at_capacity_verdict() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let first_read = Cell::new(true);
+        let has_capacity = |_: &Arc<dyn Worker>| first_read.replace(false);
+        let shed = place_pair_through_engine(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &has_capacity,
+            PlacementInputs::default(),
+        )
+        .err()
+        .expect("the engine shed the pool on its capacity filter");
+        assert_eq!(shed.role, WorkerRole::Prefill);
+        assert!(matches!(shed.verdict, PlacementFailure::PrefillAtCapacity));
+        assert_eq!(decider.decisions(), 1, "the engine decided once");
+    }
+
+    /// A prefill pool the window admits nothing of waits for a slot (the
+    /// engine's capacity stage empties it), and a decode pool with nothing
+    /// open is the decode role's unavailability, as the legacy path judges
+    /// both.
+    #[test]
+    fn the_engines_pair_sheds_map_to_the_roles_verdicts() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let mut missed = Vec::new();
+        let at_capacity = decided_pair(&registry, &policies, &|_| false, &|_| true, &mut missed)
+            .err()
+            .expect("no prefill has capacity");
+        assert_eq!(at_capacity.role, WorkerRole::Prefill);
+        assert!(matches!(
+            at_capacity.verdict,
+            PlacementFailure::PrefillAtCapacity
+        ));
+
+        let decode = registry.get_by_url("grpc://d:1").expect("registered");
+        decode.set_status(WorkerStatus::NotReady);
+        let down = decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+            .err()
+            .expect("no partner is open");
+        assert_eq!(down.role, WorkerRole::Decode);
+        assert!(matches!(down.verdict, PlacementFailure::Unavailable));
+        let legacy = pair_from(&registry, &cohort_policies())
+            .err()
+            .expect("legacy agrees");
+        assert_eq!(legacy.role, WorkerRole::Decode);
+        assert!(matches!(legacy.verdict, PlacementFailure::Unavailable));
+    }
+
+    /// A request the sticky routing-key override keys stays on the legacy
+    /// pair path; without a key the engine decides.
+    #[test]
+    fn a_keyed_pair_keeps_the_legacy_path_under_the_sticky_override() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let policies = PolicyRegistry::with_override(
+            round_robin.clone(),
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
+        assert!(pair_decider(&policies, &PlacementInputs::default()).is_some());
+        let keyed = PlacementInputs {
+            rid_key: Some("session-7"),
+            ..PlacementInputs::default()
+        };
+        assert!(pair_decider(&policies, &keyed).is_none());
+    }
+
+    /// A manual side pins the key placement derives from a configured
+    /// routing-key header, override off: that keyed request stays on the
+    /// legacy pair path, the unkeyed one takes the engine, and sides that
+    /// pin nothing take it keyed or not.
+    #[test]
+    fn a_keyed_pair_with_a_manual_side_keeps_the_legacy_path_by_a_configured_header() {
+        let configured = || RoutingKeyOverrideConfig {
+            enabled: false,
+            headers: vec!["x-session-id".into()],
+            ..Default::default()
+        };
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 3600,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let round_robin = PolicyConfig::RoundRobin;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "conv-7".parse().unwrap());
+        let keyed = PlacementInputs {
+            headers: Some(&headers),
+            ..PlacementInputs::default()
+        };
+        let pinning = PolicyRegistry::with_override(manual.clone(), configured())
+            .with_policy_engine(PolicyEngineMode::Engine, &manual, &round_robin);
+        assert!(pair_decider(&pinning, &PlacementInputs::default()).is_some());
+        assert!(pair_decider(&pinning, &keyed).is_none());
+        let plain = PolicyRegistry::with_override(round_robin.clone(), configured())
+            .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
+        assert!(pair_decider(&plain, &keyed).is_some());
+    }
+
+    /// The engine's proposal of one pair, decided with an open window and
+    /// nothing excluded, for a test that reads the decision itself.
+    fn proposed_pair(registry: &WorkerRegistry, policies: &PolicyRegistry) -> PairDecision {
+        let decider = pair_decider(policies, &PlacementInputs::default())
+            .expect("the engine serves the pair");
+        let pairs = pairs_of(registry, policies);
+        let proposal = decide_pair(
+            registry,
+            policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &|_| true,
+            PlacementInputs::default(),
+            &[],
+        )
+        .expect("a pair is open");
+        match proposal {
+            PairProposal::Decided(pd) => pd,
+            PairProposal::Settled(_) => panic!("the engine decides the pair"),
+        }
+    }
+
+    /// The decode of a proposal's first target.
+    fn proposed_decode(pd: &PairDecision) -> Arc<dyn Worker> {
+        let target = pd
+            .decision
+            .pick()
+            .expect("a pair")
+            .targets
+            .first()
+            .copied()
+            .expect("a target");
+        Arc::clone(&pd.decodes[target.pair.expect("the decode side").decode_position as usize])
+    }
+
+    /// Prefills of one pairing descriptor share one partner list, so the
+    /// decision builds one set of decode rows for all of them (P + D rows,
+    /// never P x D) and still rotates both pools in full.
+    #[test]
+    fn with_the_engine_switch_prefills_sharing_a_partner_list_share_one_pair_class() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:3", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let pairs = pairs_of(&registry, &policies);
+        assert!(
+            pairs
+                .partners
+                .iter()
+                .all(|list| Arc::ptr_eq(list, &pairs.partners[0])),
+            "one descriptor, one shared list"
+        );
+        let pd = proposed_pair(&registry, &policies);
+        assert_eq!(pd.prefills.len(), 3);
+        assert_eq!(
+            pd.decodes.len(),
+            2,
+            "one row per decode, not one per (prefill, decode)"
+        );
+        let picks = decided_hits(&registry, &policies, 12);
+        for prefill in ["grpc://p:1", "grpc://p:2", "grpc://p:3"] {
+            assert_eq!(picks[prefill], 4, "{picks:?}");
+        }
+        for decode in ["grpc://d:1", "grpc://d:2"] {
+            assert_eq!(picks[decode], 6, "{picks:?}");
+        }
+    }
+
+    /// The commit re-checks the prefill's availability under the lock as it
+    /// does the decode partner's: a prefill that went unavailable between
+    /// the decision and the commit refuses its targets, the miss is recorded
+    /// for the one re-decision, and the re-decision pairs the other prefill.
+    #[test]
+    fn the_pair_commit_re_checks_the_prefill_as_it_does_the_decode() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pd = proposed_pair(&registry, &policies);
+        let chosen = Arc::clone(
+            &pd.prefills[pd
+                .decision
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .expect("a target")
+                .position as usize],
+        );
+        chosen.set_status(WorkerStatus::NotReady);
+        let mut missed = Vec::new();
+        let refused = commit_pair(
+            &policies,
+            decider,
+            MODEL,
+            PairProposal::Decided(pd),
+            &|_| true,
+            &mut missed,
+        )
+        .err()
+        .expect("the prefill went unavailable under the lock");
+        assert_eq!(refused.role, WorkerRole::Prefill);
+        assert!(matches!(
+            refused.verdict,
+            PlacementFailure::PrefillAtCapacity
+        ));
+        assert_eq!(missed.len(), 2, "the prefill and its decode: {missed:?}");
+        let pair = decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+            .expect("the re-decision pairs the other prefill");
+        assert_ne!(pair.prefill.url(), chosen.url());
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+        assert_eq!(decider.decisions(), 2, "one re-decision");
+    }
+
+    /// A round-robin prefill beside a least-load decode, no token count: the
+    /// decode side is booked at its own policy's mean, so the booked decode
+    /// carries the credit and every next decision takes the other decode
+    /// (booked at the prefill's estimate of nothing, the two would tie).
+    #[test]
+    fn a_mixed_policy_pair_books_the_decode_at_the_decode_policies_estimate() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let round_robin = PolicyConfig::RoundRobin;
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &round_robin,
+            &least_load,
+        );
+        let decider = policies.decider().expect("hosted");
+        let feed = TestFeed::attached_to(policies.get_decode_policy().as_ref());
+        let idle = || one_rank_load(0, 0.1, 2000.0);
+        feed.publish(&HashMap::from([
+            ("grpc://p:1".to_string(), idle()),
+            ("grpc://d:1".to_string(), idle()),
+            ("grpc://d:2".to_string(), idle()),
+        ]));
+        decider.set_load_receiver(Some(feed.receiver()));
+        assert_eq!(
+            decider.prefill_prompt_tokens(None),
+            0,
+            "round robin prices no tokens"
+        );
+        assert_eq!(decider.decode_prompt_tokens(None), 100);
+        let mut missed = Vec::new();
+        let booked = decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+            .expect("a pair is open")
+            .decode;
+        for _ in 0..20 {
+            let next = proposed_decode(&proposed_pair(&registry, &policies));
+            assert_ne!(
+                next.url(),
+                booked.url(),
+                "the booked decode carries its own credit"
+            );
+        }
+    }
+
+    /// Both decode partners over the thresholds with shedding off, one of
+    /// them busier: under the switch every placement takes the least-loaded
+    /// partner, counted as the veto fallback and not as a selection of the
+    /// decode policy, as the legacy path pairs such a pool.
+    #[test]
+    fn with_the_engine_switch_an_all_overloaded_decode_pool_pairs_the_least_loaded_partner() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let busier = registry.get_by_url("grpc://d:1").expect("registered");
+        for _ in 0..3 {
+            busier.increment_load();
+        }
+        for url in ["grpc://d:1", "grpc://d:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut missed = Vec::new();
+        let pair = metrics::with_local_recorder(&recorder, || {
+            decided_pair(&registry, &policies, &|_| true, &|_| true, &mut missed)
+        })
+        .expect("a pair is open");
+        assert_eq!(pair.decode.url(), "grpc://d:2", "the least-loaded partner");
+        let rendered = handle.render();
+        assert_one_overload_fallback(&rendered);
+        assert!(
+            !rendered.lines().any(|line| {
+                line.starts_with("smg_worker_selection_total{")
+                    && line.contains("worker_type=\"decode\"")
+            }),
+            "the fallback's decode is not a selection of the decode policy:\n{rendered}"
+        );
+        let picks = decided_hits(&registry, &policies, 4);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        assert_eq!(picks["grpc://d:2"], 4, "{picks:?}");
     }
 
     /// A decode partner whose window is full, or whose free room a place
@@ -4131,5 +5223,50 @@ mod tests {
             "no fallback outside the host's veto"
         );
         assert_eq!(decider.decisions(), 5, "one re-decision, never a second");
+    }
+
+    /// The commit re-reads the decode partner's liveness as it re-reads the
+    /// prefill's window. With one prefill the window's third read is the
+    /// first commit's; the decided decode goes down at that read, the
+    /// commit misses the pair, and the re-decision finds no open partner
+    /// left: the seam refuses with the decode role's unavailability, as
+    /// `pair_shed` maps a decode side with nothing open. A commit that only
+    /// checks the partner exists places the request on the dead decode.
+    #[test]
+    fn the_commit_refuses_a_decode_partner_that_died_after_the_decision() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = engine_cohort_policies();
+        let decider = policies.decider().expect("hosted");
+        let pairs = pairs_of(&registry, &policies);
+        let decode = registry
+            .get_by_url("grpc://d:1")
+            .expect("the decode registers");
+        let reads = Cell::new(0_u32);
+        let has_capacity = |_: &Arc<dyn Worker>| {
+            reads.set(reads.get() + 1);
+            if reads.get() == 3 {
+                decode.set_status(WorkerStatus::NotReady);
+            }
+            true
+        };
+        let refused = place_pair_through_engine(
+            &registry,
+            &policies,
+            decider,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            &has_capacity,
+            PlacementInputs::default(),
+        )
+        .err()
+        .expect("no live decode is left for the pair");
+        assert!(reads.get() >= 3, "the commit read the window");
+        assert_eq!(refused.role, WorkerRole::Decode);
+        assert!(matches!(refused.verdict, PlacementFailure::Unavailable));
     }
 }
