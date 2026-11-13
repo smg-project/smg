@@ -85,6 +85,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Realtime session or client secret request keeps what the public API takes, so the
+  `/v1/realtime/sessions`, `/client_secrets` and `/transcription_sessions` routes, which write the
+  typed request back for the upstream, forward it: the session's `tools` as a list (an empty one
+  clears them), where any list was refused; a `turn_detection` of `null`, which turns voice
+  activity detection off, where it was dropped and so left server VAD on; and the client secret's
+  `expires_after`, where it was dropped and so every secret lived the default 600 seconds.
+  Breaking: `RealtimeSessionCreateRequest.tools` is a `Vec`, `RealtimeAudioConfigInput.turn_detection`
+  is an `Option<Option<TurnDetection>>`, and `RealtimeClientSecretCreateRequest` gains
+  `expires_after`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
