@@ -693,6 +693,20 @@ fn convert_user_message(
                     InputContentBlock::McpToolUse(_) | InputContentBlock::McpToolResult(_) => {
                         return Err(mcp_block_refusal(block, index, position));
                     }
+                    // A server tool's result or a container upload is the
+                    // public API's own server tools at work, which no engine
+                    // route runs: refused by name, not dropped. The older
+                    // server tool blocks (`server_tool_use`,
+                    // `web_search_tool_result`, `tool_search_tool_result`)
+                    // are still dropped, as before: refusing them would turn
+                    // requests that are answered today into 400s.
+                    InputContentBlock::WebFetchToolResult(_)
+                    | InputContentBlock::CodeExecutionToolResult(_)
+                    | InputContentBlock::BashCodeExecutionToolResult(_)
+                    | InputContentBlock::TextEditorCodeExecutionToolResult(_)
+                    | InputContentBlock::ContainerUpload(_) => {
+                        return Err(server_tool_block_refusal(block, index, position));
+                    }
                     _ => {}
                 }
             }
@@ -813,6 +827,31 @@ fn mcp_block_refusal(block: &InputContentBlock, index: usize, position: usize) -
     )
 }
 
+/// The refusal of a block of the public API's server tools (a web fetch, code
+/// execution, bash or text editor result, a container upload) on an engine
+/// route, naming the block and its place. No engine route runs those tools, so
+/// the prompt cannot carry the block faithfully, and dropping it in silence
+/// would answer a turn whose input it threw away (an upload-only user turn
+/// would leave no user turn at all). The server tool blocks the request read
+/// before these (`server_tool_use`, `web_search_tool_result`,
+/// `tool_search_tool_result`) are still dropped, as they were: refusing them
+/// is a separate choice, which would turn requests answered today into 400s.
+fn server_tool_block_refusal(block: &InputContentBlock, index: usize, position: usize) -> String {
+    let kind = match block {
+        InputContentBlock::WebFetchToolResult(_) => "web_fetch_tool_result",
+        InputContentBlock::CodeExecutionToolResult(_) => "code_execution_tool_result",
+        InputContentBlock::BashCodeExecutionToolResult(_) => "bash_code_execution_tool_result",
+        InputContentBlock::TextEditorCodeExecutionToolResult(_) => {
+            "text_editor_code_execution_tool_result"
+        }
+        _ => "container_upload",
+    };
+    format!(
+        "messages.{index}.content.{position}: block type '{kind}' is not supported on an engine \
+         route, which runs no server tools; send the turn to a provider route or drop the block"
+    )
+}
+
 /// Convert an assistant message content to a single JSON value.
 ///
 /// Extracts text content, tool calls, and reasoning/thinking into the
@@ -847,6 +886,15 @@ fn convert_assistant_message(
             // refused by name, never dropped from the prompt.
             InputContentBlock::McpToolUse(_) | InputContentBlock::McpToolResult(_) => {
                 return Err(mcp_block_refusal(block, index, position));
+            }
+            // A server tool's result, as the user turn's, the older
+            // server tool blocks still dropped.
+            InputContentBlock::WebFetchToolResult(_)
+            | InputContentBlock::CodeExecutionToolResult(_)
+            | InputContentBlock::BashCodeExecutionToolResult(_)
+            | InputContentBlock::TextEditorCodeExecutionToolResult(_)
+            | InputContentBlock::ContainerUpload(_) => {
+                return Err(server_tool_block_refusal(block, index, position));
             }
             _ => {}
         }
@@ -2509,6 +2557,55 @@ mod tests {
         };
         assert_eq!(rendered("none"), "user: Hello thinking=False");
         assert_eq!(rendered("high"), "user: Hello thinking=unset");
+    }
+
+    /// A block of the public API's server tools is refused on the engine
+    /// routes naming the block and its place, a server tool's result in the
+    /// assistant turn and a container upload in the user turn alike: the
+    /// engine runs no server tool, and a silent drop would answer a turn
+    /// whose input it threw away. A token count reads the same conversion.
+    #[test]
+    fn a_server_tool_block_is_refused_naming_the_block() {
+        let convert = |messages: &[InputMessage]| {
+            process_message_content_format(
+                messages,
+                ChatTemplateContentFormat::String,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .unwrap_err()
+        };
+        let assistant: Vec<InputMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "bash_code_execution", "input": {"command": "ls"}},
+                {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1",
+                 "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}},
+                {"type": "text", "text": "done"}
+            ]}
+        ]))
+        .unwrap();
+        let err = convert(&assistant);
+        assert!(
+            err.starts_with(
+                "messages.1.content.1: block type 'bash_code_execution_tool_result' is not supported on an engine route"
+            ),
+            "{err}"
+        );
+        let user: Vec<InputMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "run it"},
+                {"type": "container_upload", "file_id": "file_1"}
+            ]}
+        ]))
+        .unwrap();
+        let err = convert(&user);
+        assert!(
+            err.starts_with(
+                "messages.0.content.1: block type 'container_upload' is not supported on an engine route"
+            ),
+            "{err}"
+        );
     }
 
     /// A replayed MCP exchange (`mcp_tool_use`, `mcp_tool_result`) is refused
