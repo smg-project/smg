@@ -1410,6 +1410,9 @@ impl StreamingProcessor {
         reasoning_parser: &mut Option<Box<dyn ReasoningParser>>,
         thinking_override: bool,
         think_in_prefill: bool,
+        // A structured JSON response: a typed parser keeps its framing
+        // spellings inside JSON strings.
+        json_mode: bool,
         // Resolved once per request by the caller: re-resolving here could
         // disagree with the upfront availability check if the worker registry
         // changed mid-stream, turning the `expect` below into a panic.
@@ -1428,6 +1431,7 @@ impl StreamingProcessor {
                 model,
             )
             .expect("Parser should be available - checked upfront");
+            parser.set_json_mode(json_mode);
             if thinking_override {
                 parser.mark_reasoning_started();
                 if think_in_prefill {
@@ -4247,6 +4251,7 @@ impl<'a> ChatStream<'a> {
                     &mut self.choices[index as usize].reasoning_parser,
                     self.thinking_override,
                     self.think_in_prefill,
+                    self.spec.json_mode,
                     self.reasoning_parser_name.as_deref(),
                     model,
                 );

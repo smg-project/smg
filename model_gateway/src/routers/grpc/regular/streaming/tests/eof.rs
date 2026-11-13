@@ -4153,3 +4153,101 @@ async fn completion_logprobs_go_out_with_the_chunks_that_scored_a_position() {
         "{wire}"
     );
 }
+
+/// A structured JSON response keeps the Inkling framing spellings inside its
+/// strings, streamed (split inside a quoted spelling) and complete, while the
+/// framing outside the strings still separates reasoning from content.
+#[tokio::test]
+async fn chat_json_mode_preserves_literals_in_streaming_and_complete_responses() {
+    let payload = r#"{"value":"α<|content_thinking|>quoted<|end_message|>"}"#;
+    let framed = format!(
+        "<|message_model|><|content_thinking|>check<|end_message|>\
+         <|message_model|><|content_text|>{payload}<|end_message|>"
+    );
+    for response_format in [
+        serde_json::json!({"type": "json_object"}),
+        serde_json::json!({"type": "json_schema", "json_schema": {
+            "name": "answer", "schema": {"type": "object"}
+        }}),
+    ] {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "eof-test", "messages": [], "response_format": response_format,
+            "separate_reasoning": true, "stream": true, "n": 2
+        }))
+        .unwrap();
+        let spec = ChatResponseSpec::from(&request);
+        assert!(spec.json_mode);
+        let resolver = || {
+            utils::ParserResolver::with_flags(
+                Arc::new(WorkerRegistry::new()),
+                None,
+                Some("inkling".to_string()),
+            )
+        };
+        let (stream, server) = scripted_stream(
+            vec![
+                chunk(
+                    0,
+                    "<|message_model|><|content_text|>{\"value\":\"α<|content_thi",
+                ),
+                chunk(1, &framed),
+                chunk(0, "nking|>quoted<|end_message|>\"}<|end_message|>"),
+                complete(1, "stop"),
+                complete(0, "stop"),
+            ],
+            "0",
+        )
+        .await;
+        let (tx, rx) = sse_channel();
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        let result = streaming_processor(resolver())
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                tokenizer.clone(),
+                (None, None, false, false, false),
+                spec.clone(),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "content"), payload);
+        assert_eq!(chat_text(&events, 1, "content"), payload);
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
+        assert_eq!(chat_text(&events, 1, "reasoning_content"), "check");
+
+        let complete = ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
+            output_ids: framed.chars().map(u32::from).collect(),
+            finish_reason: "stop".to_string(),
+            ..Default::default()
+        }));
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let (choice, _) = unary_processor(resolver())
+            .process_single_choice(
+                "test-request",
+                &complete,
+                0,
+                &spec,
+                "eof-test",
+                &tokenizer,
+                &mut decoder,
+                0,
+                true,
+                false,
+                Some("inkling"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(choice.message.content.as_deref(), Some(payload));
+        assert_eq!(choice.message.reasoning_content.as_deref(), Some("check"));
+    }
+}

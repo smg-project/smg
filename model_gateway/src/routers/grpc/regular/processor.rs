@@ -144,6 +144,7 @@ impl ResponseProcessor {
             ReasoningSource {
                 wanted: original_request.separate_reasoning && reasoning_parser_available,
                 in_prefill: original_request.reasoning_in_prefill,
+                json_mode: original_request.json_mode,
                 parser_name: reasoning_parser_name,
                 model,
             },
@@ -547,6 +548,7 @@ impl ResponseProcessor {
         ) else {
             return split;
         };
+        parser.set_json_mode(source.json_mode);
         if source.in_prefill {
             parser.mark_reasoning_started();
         }
@@ -996,6 +998,7 @@ impl ResponseProcessor {
             ReasoningSource {
                 wanted: reasoning_parser_available,
                 in_prefill: messages_request.reasoning_in_prefill,
+                json_mode: false,
                 parser_name: reasoning_parser_name,
                 model,
             },
@@ -1314,10 +1317,13 @@ struct ReasoningSplit {
 /// What the reasoning split reads from the request: whether the request
 /// wants the split at all (its separate-reasoning switch, with a parser
 /// available), whether the rendered prompt ends inside the thinking block,
-/// the parser the request resolved to, and the model.
+/// whether the response is structured JSON (a typed parser then keeps its
+/// framing spellings inside JSON strings), the parser the request resolved
+/// to, and the model.
 struct ReasoningSource<'a> {
     wanted: bool,
     in_prefill: bool,
+    json_mode: bool,
     parser_name: Option<&'a str>,
     model: &'a str,
 }
@@ -1940,6 +1946,7 @@ mod responses_finish_reason_tests {
             ReasoningSource {
                 wanted: true,
                 in_prefill: false,
+                json_mode: false,
                 parser_name: None,
                 model: "no-such-model",
             },
