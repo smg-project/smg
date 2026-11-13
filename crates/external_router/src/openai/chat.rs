@@ -357,7 +357,7 @@ mod tests {
     use axum::body::to_bytes;
 
     use super::*;
-    use crate::test_support::upstream;
+    use crate::{retry::REQUEST_TIMEOUT_CODE, test_support::upstream};
 
     async fn bytes_of(response: Response) -> Vec<u8> {
         to_bytes(response.into_body(), usize::MAX)
@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
             error::extract_error_code_from_response(&response),
-            crate::retry::REQUEST_TIMEOUT_CODE
+            REQUEST_TIMEOUT_CODE
         );
         assert!(!is_retryable_response(&response));
     }
