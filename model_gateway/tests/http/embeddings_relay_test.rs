@@ -104,3 +104,18 @@ async fn the_relay_forwards_the_classify_fields_the_type_does_not_model() {
 
     ctx.shutdown().await;
 }
+
+/// SGLang's `/v1/classify` takes a body without `model`: it is served by
+/// any worker and reaches it without the key, as a model-less `/generate`
+/// does.
+#[tokio::test]
+async fn a_classify_body_without_model_reaches_the_worker_without_it() {
+    let (ctx, app, recorder) = app_with_recorder(18135).await;
+    let sent = json!({"input": "hello"});
+
+    let (status, answer) = post(&app, "/v1/classify", &sent).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(recorder.only_body(), sent);
+
+    ctx.shutdown().await;
+}

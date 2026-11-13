@@ -209,6 +209,42 @@ async fn a_model_alias_tokenizes_and_detokenizes_as_the_model_it_names() {
     assert_eq!(public_envelope(&text)["code"], "model_not_found", "{text}");
 }
 
+/// SGLang's `/tokenize` and `/detokenize` take a body without `model`: the
+/// loaded tokenizer serves it, and the answer is the one a body naming the
+/// loaded model gets.
+#[tokio::test]
+async fn a_tokenize_or_detokenize_body_without_model_is_served_by_the_loaded_tokenizer() {
+    let app = app_with_a_loaded_tokenizer().await;
+    let named = format!(r#"{{"model":"{LOADED}","prompt":"hi"}}"#);
+    let (status, by_model) = send(&app, "POST", "/v1/tokenize", Some(&named)).await;
+    assert_eq!(status, StatusCode::OK, "tokenize by the model: {by_model}");
+    let (status, without) = send(&app, "POST", "/v1/tokenize", Some(r#"{"prompt":"hi"}"#)).await;
+    assert_eq!(
+        (status, without.as_str()),
+        (StatusCode::OK, by_model.as_str()),
+        "tokenize without a model answers as by the loaded model"
+    );
+
+    let named = format!(r#"{{"model":"{LOADED}","tokens":[1,2,3]}}"#);
+    let (status, by_model) = send(&app, "POST", "/v1/detokenize", Some(&named)).await;
+    assert!(
+        !matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND),
+        "detokenize by the model: {status} {by_model}"
+    );
+    let (status_without, without) = send(
+        &app,
+        "POST",
+        "/v1/detokenize",
+        Some(r#"{"tokens":[1,2,3]}"#),
+    )
+    .await;
+    assert_eq!(
+        (status_without, without.as_str()),
+        (status, by_model.as_str()),
+        "detokenize without a model answers as by the loaded model"
+    );
+}
+
 /// An empty or whitespace name is refused before anything is queued: the
 /// empty name is the tokenize route's "any tokenizer" fallback.
 #[tokio::test]

@@ -547,7 +547,10 @@ impl Gateway {
             })
     }
 
-    fn requires_explicit_generate_model(&self, model_id: &str) -> bool {
+    /// Whether a route that may name no model must name one: under IGW
+    /// routing, "any worker" is no answer when the workers serve different
+    /// models.
+    fn requires_explicit_model(&self, model_id: &str) -> bool {
         self.enable_igw && (model_id.trim().is_empty() || model_id == UNKNOWN_MODEL_ID)
     }
 
@@ -770,7 +773,7 @@ impl RouterTrait for Gateway {
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        if self.requires_explicit_generate_model(model_id) {
+        if self.requires_explicit_model(model_id) {
             return route_error::bad_request(
                 "missing_model",
                 "/generate requests must include a model when IGW routing is enabled",
@@ -1008,6 +1011,12 @@ impl RouterTrait for Gateway {
         body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
+        if self.requires_explicit_model(model_id) {
+            return route_error::bad_request(
+                "missing_model",
+                "/v1/classify requests must include a model when IGW routing is enabled",
+            );
+        }
         self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_classify(headers, tenant_meta, body, model_id)
@@ -2361,6 +2370,32 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
+            route_error::extract_error_code_from_response(&response),
+            "missing_model"
+        );
+    }
+
+    /// A classify body without `model` is refused under IGW routing, as a
+    /// `/generate` body is; with one router it is routed.
+    #[tokio::test]
+    async fn igw_classify_rejects_default_unknown_model() {
+        let request: ClassifyRequest =
+            serde_json::from_value(serde_json::json!({ "input": "hello" })).unwrap();
+        assert_eq!(request.model, UNKNOWN_MODEL_ID);
+
+        let response = test_gateway(true)
+            .route_classify(None, &test_tenant_meta(), request.clone(), &request.model)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&response),
+            "missing_model"
+        );
+
+        let response = test_gateway(false)
+            .route_classify(None, &test_tenant_meta(), request.clone(), &request.model)
+            .await;
+        assert_ne!(
             route_error::extract_error_code_from_response(&response),
             "missing_model"
         );

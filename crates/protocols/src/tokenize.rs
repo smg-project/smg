@@ -19,7 +19,12 @@ use super::validated::Normalizable;
 /// envelope on a body that does not parse or does not match the type.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct TokenizeRequest {
-    /// Model name for tokenizer selection
+    /// Model name for tokenizer selection. SGLang's `/tokenize` takes a body
+    /// without one; such a body is served by a loaded tokenizer.
+    #[serde(
+        default = "super::common::default_unknown_model",
+        skip_serializing_if = "super::common::is_unknown_model"
+    )]
     pub model: String,
 
     /// Text(s) to tokenize - can be a single string or array of strings
@@ -67,7 +72,12 @@ pub enum CountResult {
 /// validation rule, as [`TokenizeRequest`] does not.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct DetokenizeRequest {
-    /// Model name for tokenizer selection
+    /// Model name for tokenizer selection; absent, a loaded tokenizer serves
+    /// the body, as for [`TokenizeRequest`].
+    #[serde(
+        default = "super::common::default_unknown_model",
+        skip_serializing_if = "super::common::is_unknown_model"
+    )]
     pub model: String,
 
     /// Token IDs to detokenize - single list or batch (list of lists)
@@ -223,11 +233,13 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
 
+    /// SGLang's `/tokenize` takes a body without `model`: it reads the
+    /// gateway's "any tokenizer" model.
     #[test]
-    fn test_tokenize_request_requires_model() {
+    fn test_tokenize_request_without_model_reads_the_unknown_model() {
         let json = r#"{"prompt": "Hello world"}"#;
-        let result = serde_json::from_str::<TokenizeRequest>(json);
-        assert!(result.is_err(), "Should fail without model field");
+        let req: TokenizeRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, crate::UNKNOWN_MODEL_ID);
     }
 
     #[test]
@@ -238,11 +250,13 @@ mod tests {
         assert!(matches!(req.prompt, StringOrArray::Array(_)));
     }
 
+    /// A detokenize body without `model` reads the "any tokenizer" model, as
+    /// a tokenize body does.
     #[test]
-    fn test_detokenize_request_requires_model() {
+    fn test_detokenize_request_without_model_reads_the_unknown_model() {
         let json = r#"{"tokens": [1, 2, 3]}"#;
-        let result = serde_json::from_str::<DetokenizeRequest>(json);
-        assert!(result.is_err(), "Should fail without model field");
+        let req: DetokenizeRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, crate::UNKNOWN_MODEL_ID);
     }
 
     #[test]

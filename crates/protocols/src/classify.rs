@@ -29,7 +29,13 @@ use super::{
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct ClassifyRequest {
-    /// ID of the model to use
+    /// ID of the model to use. SGLang's `/v1/classify` takes a body without
+    /// one; such a body routes to any worker, as a model-less `/generate`
+    /// does, and is forwarded without it.
+    #[serde(
+        default = "super::common::default_unknown_model",
+        skip_serializing_if = "super::common::is_unknown_model"
+    )]
     pub model: String,
 
     /// Input can be a string, array of strings, or token IDs
@@ -126,5 +132,32 @@ impl ClassifyResponse {
             data,
             usage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SGLang's `/v1/classify` takes a body without `model`: it reads the
+    /// gateway's "any worker" model and is written back without the key, as
+    /// a model-less `/generate` is.
+    #[test]
+    fn a_classify_request_without_model_reads_and_writes_without_it() {
+        let request: ClassifyRequest =
+            serde_json::from_value(serde_json::json!({"input": "hi"})).expect("no model");
+        assert_eq!(request.model, crate::UNKNOWN_MODEL_ID);
+        assert_eq!(
+            serde_json::to_value(&request).expect("serialize"),
+            serde_json::json!({"input": "hi"})
+        );
+
+        let named: ClassifyRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "input": "hi"}))
+                .expect("a model");
+        assert_eq!(
+            serde_json::to_value(&named).expect("serialize"),
+            serde_json::json!({"model": "m", "input": "hi"})
+        );
     }
 }

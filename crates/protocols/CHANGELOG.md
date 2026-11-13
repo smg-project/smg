@@ -94,6 +94,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A classify, tokenize or detokenize request without `model` is accepted, as SGLang's
+  `/v1/classify`, `/tokenize` and `/detokenize` take it; each was refused as
+  `missing_required_parameter`. `ClassifyRequest`, `TokenizeRequest` and `DetokenizeRequest` read
+  an absent `model` as the gateway's "any worker" model and write it back without the key, as
+  `GenerateRequest` does: a model-less classify body is served by any worker, and a model-less
+  tokenize or detokenize body by a loaded tokenizer. Under IGW routing a model-less classify body
+  is refused as `missing_model`, as a model-less `/generate` body is.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
