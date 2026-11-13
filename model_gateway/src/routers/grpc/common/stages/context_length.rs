@@ -306,7 +306,10 @@ mod tests {
     use std::sync::Arc;
 
     use axum::http::StatusCode;
-    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use openai_protocol::{
+        chat::ChatCompletionRequest, model_card::ModelCard, validated::Normalizable,
+        worker::HealthCheckConfig,
+    };
 
     use super::*;
     use crate::{
@@ -474,6 +477,20 @@ mod tests {
                 MODEL,
             ));
         }
+    }
+
+    /// An omitted Flash budget leaves a smaller worker window available.
+    #[test]
+    fn glm53_flash_chat_omitted_budget_preserves_the_worker_window() {
+        let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        request.normalize();
+        assert_eq!(request.output_token_cap(), None);
+        let request = RequestType::Chat(Arc::new(request));
+        assert!(enforce_output_budget(&request, &single(Some(32_768)), MODEL).is_ok());
     }
 
     #[test]
