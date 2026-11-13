@@ -16,6 +16,11 @@ The worker discovery provider (``router.discovery``) renders the launcher's
 discovery flags, which it parses back into the provider it was given; the
 Role and RoleBinding exist only for what reads pods through the Kubernetes
 API, and the combinations the gateway cannot run fail the render.
+
+The routing policy as a specification document (``router.policySpec`` or a
+named ConfigMap) renders the document's ConfigMap, its mount and
+``--policy-spec`` in place of the ten policy values, which are refused
+beside it when set off their defaults.
 The render checks need the ``helm`` binary and are skipped without it.
 """
 
@@ -159,9 +164,9 @@ def render(*settings: str, files: tuple[Path, ...] = ()) -> tuple[str, list[dict
     return completed.stdout, documents
 
 
-def render_error(*settings: str) -> str:
-    """Renders the chart with ``--set`` pairs that must fail: helm's error."""
-    completed = helm_template(settings)
+def render_error(*settings: str, files: tuple[Path, ...] = ()) -> str:
+    """Renders the chart with ``--set`` pairs (and values files) that must fail: helm's error."""
+    completed = helm_template(settings, files)
     assert completed.returncode != 0, "the chart rendered values it should refuse"
     return completed.stderr
 
@@ -1497,3 +1502,320 @@ def test_the_admission_config_example_renders_arguments_the_launcher_parses():
     parsed = parser.parse_args(args)
     assert parsed.tenant_rate_limit_config == "/etc/smg/rate-limit/rate-limit.yaml"
     assert parsed.priority_scheduler_config == "/etc/smg/scheduler/scheduler.yaml"
+
+
+# The routing policy as a specification document (router.policySpec or router.policySpecConfigMap).
+
+POLICY_SPEC_EXAMPLE = CHART / "examples" / "with-policy-spec.yaml"
+POLICY_SCHEMA = CHART / "files" / "policyspec.schema.json"
+# The policy crate's generated artifact, which the chart ships a copy of.
+CRATE_POLICY_SCHEMA = REPO / "crates" / "policy_controller" / "policyspec.schema.json"
+POLICY_SPEC_PATH = "/etc/smg/policy/spec.yaml"
+# The flags of the ten policy values a document replaces.
+POLICY_VALUE_FLAGS = {
+    "--policy",
+    "--prefill-policy",
+    "--decode-policy",
+    "--encode-policy",
+    "--cache-threshold",
+    "--balance-abs-threshold",
+    "--balance-rel-threshold",
+    "--eviction-interval-secs",
+    "--max-tree-size",
+    "--block-size",
+}
+# Each of the ten policy values set off its chart default, with the mode a role policy needs.
+POLICY_VALUES_OFF_DEFAULT = {
+    "router.policy": ("router.policy=least_load",),
+    "router.disaggregation.prefillPolicy": (
+        "router.disaggregation.mode=pd",
+        "router.disaggregation.prefillPolicy=bucket",
+    ),
+    "router.disaggregation.decodePolicy": (
+        "router.disaggregation.mode=pd",
+        "router.disaggregation.decodePolicy=power_of_two",
+    ),
+    "router.disaggregation.encodePolicy": (
+        "router.disaggregation.mode=epd",
+        "router.disaggregation.encodePolicy=round_robin",
+    ),
+    "router.cacheThreshold": ("router.cacheThreshold=0.2",),
+    "router.balanceAbsThreshold": ("router.balanceAbsThreshold=32",),
+    "router.balanceRelThreshold": ("router.balanceRelThreshold=1.1",),
+    "router.evictionIntervalSecs": ("router.evictionIntervalSecs=60",),
+    "router.maxTreeSize": ("router.maxTreeSize=16777216",),
+    "router.blockSize": ("router.blockSize=32",),
+}
+PD_FLEET = (
+    "router.disaggregation.mode=pd",
+    "router.disaggregation.prefill[0].url=http://prefill-0:8000",
+    "router.disaggregation.decode[0].url=http://decode-0:8000",
+)
+PD_ROLE_POLICIES = (
+    *PD_FLEET,
+    "router.disaggregation.prefillPolicy=bucket",
+    "router.disaggregation.decodePolicy=power_of_two",
+)
+EXAMPLES_WITHOUT_THE_DOCUMENT = [example for example in EXAMPLES if example != POLICY_SPEC_EXAMPLE]
+
+
+def policy_spec_document() -> dict:
+    return yaml.safe_load(POLICY_SPEC_EXAMPLE.read_text())["router"]["policySpec"]
+
+
+def config_map(documents: list[dict], name: str) -> dict | None:
+    found = [d for d in documents if d["kind"] == "ConfigMap" and d["metadata"]["name"] == name]
+    return found[0] if found else None
+
+
+def fleet_values(example: Path) -> list[str]:
+    """The example's disaggregated mode and IGW settings, which a document is refused beside."""
+    router = (yaml.safe_load(example.read_text()) or {}).get("router") or {}
+    found = []
+    mode = (router.get("disaggregation") or {}).get("mode")
+    if mode:
+        found.append(f"router.disaggregation.mode={mode}")
+    if router.get("enableIgw"):
+        found.append("router.enableIgw=true")
+    return found
+
+
+@needs_helm
+def test_a_policy_spec_document_renders_its_config_map_mount_and_flag(tmp_path):
+    """The document goes into a chart ConfigMap mounted whole at /etc/smg/policy;
+    the pod passes ``--policy-spec`` once, with the engine that reads it and none
+    of the ten policy flags; a changed document rolls the pods through the
+    checksum, as the gateway reads the file at start."""
+    _, documents = render(files=(POLICY_SPEC_EXAMPLE,))
+    document = policy_spec_document()
+    spec = config_map(documents, "smg-policy-spec")
+    assert spec is not None
+    assert list(spec["data"]) == ["spec.yaml"]
+    assert yaml.safe_load(spec["data"]["spec.yaml"]) == document
+    pod = router_pod(documents)
+    container = pod["spec"]["containers"][0]
+    args = container["args"]
+    assert has_run(args, ["--policy-spec", POLICY_SPEC_PATH])
+    assert args.count("--policy-spec") == 1
+    assert has_run(args, ["--policy-engine", "engine"])
+    assert not POLICY_VALUE_FLAGS & set(args), sorted(POLICY_VALUE_FLAGS & set(args))
+    assert named(pod["spec"]["volumes"], "policy-spec") == {
+        "name": "policy-spec",
+        "configMap": {"name": "smg-policy-spec"},
+    }
+    assert named(container["volumeMounts"], "policy-spec") == {
+        "name": "policy-spec",
+        "mountPath": "/etc/smg/policy",
+        "readOnly": True,
+    }
+    checksum = pod["metadata"]["annotations"]["checksum/policy-spec"]
+    assert re.fullmatch(r"[0-9a-f]{64}", checksum)
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        yaml.safe_dump({"router": {"policySpec": dict(document, generation=2)}}), encoding="utf-8"
+    )
+    _, rolled = render(files=(values,))
+    assert router_pod(rolled)["metadata"]["annotations"]["checksum/policy-spec"] != checksum
+
+
+@needs_helm
+def test_a_named_policy_spec_config_map_is_mounted_and_not_rendered():
+    """``router.policySpecConfigMap`` names a ConfigMap of the operator's: the chart
+    renders none, mounts the named one and passes the flag; no checksum, as the
+    chart does not see the content."""
+    _, documents = render("router.policySpecConfigMap=ops-policy")
+    assert config_map(documents, "smg-policy-spec") is None
+    pod = router_pod(documents)
+    container = pod["spec"]["containers"][0]
+    assert has_run(container["args"], ["--policy-spec", POLICY_SPEC_PATH])
+    assert has_run(container["args"], ["--policy-engine", "engine"])
+    assert not POLICY_VALUE_FLAGS & set(container["args"])
+    assert named(pod["spec"]["volumes"], "policy-spec")["configMap"] == {"name": "ops-policy"}
+    assert named(container["volumeMounts"], "policy-spec")["mountPath"] == "/etc/smg/policy"
+    assert "checksum/policy-spec" not in (pod["metadata"]["annotations"] or {})
+
+
+@needs_helm
+def test_without_a_policy_spec_nothing_names_it():
+    _, documents = render()
+    assert config_map(documents, "smg-policy-spec") is None
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert "--policy-spec" not in args
+    assert "--policy-engine" not in args
+    assert "policy-spec" not in {volume["name"] for volume in pod["spec"]["volumes"]}
+    assert "checksum/policy-spec" not in (pod["metadata"]["annotations"] or {})
+
+
+@needs_helm
+def test_two_policy_spec_sources_are_refused():
+    error = render_error("router.policySpecConfigMap=ops-policy", files=(POLICY_SPEC_EXAMPLE,))
+    assert "router.policySpec and router.policySpecConfigMap" in error
+    assert "set one or the other" in error
+
+
+@needs_helm
+@pytest.mark.parametrize("value", sorted(POLICY_VALUES_OFF_DEFAULT))
+def test_a_policy_value_off_its_default_beside_a_document_is_refused(value):
+    """The gateway refuses a flag that disagrees with the document; the chart refuses
+    the value where it is written and names it. A value equal to its chart default
+    counts as unset, as helm cannot tell the two apart."""
+    error = render_error(*POLICY_VALUES_OFF_DEFAULT[value], files=(POLICY_SPEC_EXAMPLE,))
+    assert f"{value} set beside router.policySpec" in error, error
+
+
+@needs_helm
+def test_two_policy_values_beside_a_document_are_named_together():
+    error = render_error(
+        "router.policy=least_load", "router.blockSize=32", files=(POLICY_SPEC_EXAMPLE,)
+    )
+    assert "router.policy, router.blockSize set beside router.policySpec" in error
+
+
+@needs_helm
+def test_a_policy_value_beside_a_named_config_map_names_that_source():
+    error = render_error("router.policySpecConfigMap=ops-policy", "router.cacheThreshold=0.2")
+    assert "router.cacheThreshold set beside router.policySpecConfigMap" in error
+
+
+@needs_helm
+@pytest.mark.parametrize("value", sorted(POLICY_VALUES_OFF_DEFAULT))
+def test_a_policy_value_off_its_default_under_legacy_policy_flags_off_is_refused(value):
+    """With the flags off the value would never reach the gateway; the chart refuses
+    it where it is written rather than dropping it."""
+    error = render_error(*POLICY_VALUES_OFF_DEFAULT[value], "router.legacyPolicyFlags=false")
+    assert f"{value} set under router.legacyPolicyFlags=false" in error, error
+
+
+@needs_helm
+@pytest.mark.parametrize("mode", ["pd", "epd"])
+def test_a_disaggregated_mode_beside_a_document_is_refused(mode):
+    """The gateway does not read the document for a disaggregated fleet yet and
+    refuses the pair at start; the chart refuses it where the values are written."""
+    error = render_error(f"router.disaggregation.mode={mode}", files=(POLICY_SPEC_EXAMPLE,))
+    assert f"router.disaggregation.mode={mode} set beside router.policySpec" in error, error
+
+
+@needs_helm
+def test_igw_beside_a_document_is_refused():
+    error = render_error("router.enableIgw=true", files=(POLICY_SPEC_EXAMPLE,))
+    assert "router.enableIgw=true set beside router.policySpec" in error, error
+
+
+@needs_helm
+def test_the_chart_defaults_beside_a_document_count_as_unset():
+    """The defaults the refusal compares against are values.yaml's: restated on the
+    command line, as ``--set`` parses them, they render with the document."""
+    values = yaml.safe_load((CHART / "values.yaml").read_text())["router"]
+    keys = (
+        "policy",
+        "cacheThreshold",
+        "balanceAbsThreshold",
+        "balanceRelThreshold",
+        "evictionIntervalSecs",
+        "maxTreeSize",
+        "blockSize",
+    )
+    settings = [f"router.{key}={values[key]}" for key in keys]
+    _, documents = render(*settings, files=(POLICY_SPEC_EXAMPLE,))
+    args = router_container(documents)["args"]
+    assert has_run(args, ["--policy-spec", POLICY_SPEC_PATH])
+    assert not POLICY_VALUE_FLAGS & set(args)
+    # The same under the flags switched off without a document.
+    _, documents = render(*settings, "router.legacyPolicyFlags=false")
+    assert not POLICY_VALUE_FLAGS & set(router_container(documents)["args"])
+
+
+@needs_helm
+def test_legacy_policy_flags_render_the_policy_values_by_default():
+    """Without a document the ten values render as the gateway's flags, as before."""
+    args = router_container(render(*PD_ROLE_POLICIES)[1])["args"]
+    assert POLICY_VALUE_FLAGS - {"--encode-policy"} <= set(args)
+    assert "--pd-disaggregation" in args
+    assert "--policy-spec" not in args
+    parsed = launcher_args(args)
+    assert parsed.policy == "cache_aware"
+    assert parsed.prefill_policy == "bucket"
+
+
+@needs_helm
+def test_legacy_policy_flags_off_renders_none_of_the_policy_values():
+    """``router.legacyPolicyFlags=false`` renders none of the ten, for a gateway image
+    that no longer takes them; the mode flag and the rest stay (a policy value
+    written beside it is refused instead, above)."""
+    args = router_container(render(*PD_FLEET, "router.legacyPolicyFlags=false")[1])["args"]
+    assert not POLICY_VALUE_FLAGS & set(args), sorted(POLICY_VALUE_FLAGS & set(args))
+    assert "--pd-disaggregation" in args
+    assert "--policy-spec" not in args
+    assert launcher_args(args).pd_disaggregation is True
+
+
+@needs_helm
+def test_a_document_renders_no_policy_flag_whatever_legacy_policy_flags_says():
+    _, documents = render("router.legacyPolicyFlags=true", files=(POLICY_SPEC_EXAMPLE,))
+    args = router_container(documents)["args"]
+    assert not POLICY_VALUE_FLAGS & set(args)
+    assert has_run(args, ["--policy-spec", POLICY_SPEC_PATH])
+
+
+@needs_helm
+@pytest.mark.parametrize("way", ["flags", "document"])
+@pytest.mark.parametrize(
+    "example",
+    EXAMPLES_WITHOUT_THE_DOCUMENT,
+    ids=[example.name for example in EXAMPLES_WITHOUT_THE_DOCUMENT],
+)
+def test_every_example_renders_both_ways(example, way, tmp_path):
+    """Each example as it is (the policy values as flags) and with the document
+    overlaid (the flag and no policy value); the launcher parses both. An example
+    with a disaggregated mode or IGW is refused beside the document by name, as
+    the gateway refuses that pair at start."""
+    files = (example,) if way == "flags" else (example, POLICY_SPEC_EXAMPLE)
+    fleet = fleet_values(example)
+    if way == "document" and fleet:
+        error = render_error(files=files)
+        assert f"{', '.join(fleet)} set beside router.policySpec" in error, error
+        return
+    _, documents = render(files=files)
+    args = router_container(documents)["args"]
+    if way == "flags":
+        assert "--policy" in args
+        assert "--policy-spec" not in args
+    else:
+        assert has_run(args, ["--policy-spec", POLICY_SPEC_PATH])
+        assert not POLICY_VALUE_FLAGS & set(args), sorted(POLICY_VALUE_FLAGS & set(args))
+    launcher_args(with_readable_files(args, tmp_path))
+
+
+@needs_chart
+def test_the_chart_ships_the_policy_schema_the_crate_generates():
+    """``files/policyspec.schema.json`` is a copy of the policy crate's generated
+    artifact, which the crate's own test keeps equal to the spec types."""
+    if not CRATE_POLICY_SCHEMA.exists():
+        pytest.skip("the policy crate is not in this checkout")
+    assert POLICY_SCHEMA.read_bytes() == CRATE_POLICY_SCHEMA.read_bytes()
+
+
+@needs_chart
+def test_the_policy_spec_example_fits_the_shipped_schema():
+    """The example's document names only top-level keys the schema has, every
+    required one, and stage names the schema lists: the gateway refuses an
+    unknown name at start."""
+    schema = json.loads(POLICY_SCHEMA.read_text())
+    document = policy_spec_document()
+    unknown = set(document) - set(schema["properties"])
+    assert not unknown, sorted(unknown)
+    assert set(schema["required"]) <= set(document)
+    scorers = next(o["enum"] for o in schema["$defs"]["ScoreSpec"]["anyOf"] if "enum" in o)
+    pickers = next(o["enum"] for o in schema["$defs"]["PickSpec"]["anyOf"] if "enum" in o)
+    for profile in document["profiles"].values():
+        assert set(profile["score"]) <= set(scorers), profile["score"]
+        assert profile["pick"] in pickers, profile["pick"]
+
+
+@needs_chart
+def test_the_values_schema_types_the_three_policy_spec_values():
+    router = json.loads(SCHEMA.read_text())["properties"]["router"]["properties"]
+    assert router["policySpec"]["type"] == "object"
+    assert router["policySpecConfigMap"]["type"] == "string"
+    assert router["legacyPolicyFlags"]["type"] == "boolean"

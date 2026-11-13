@@ -71,6 +71,28 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 `cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.disaggregation.prefillPolicy`), not for `--policy`.
 
+### Policy Specification
+
+`router.policySpec` holds the routing policy as a document of `apiVersion: smg.policy/v1`, in place of `router.policy`, the cache-aware tuning values (`cacheThreshold`, `balanceAbsThreshold`, `balanceRelThreshold`, `evictionIntervalSecs`, `maxTreeSize`, `blockSize`) and the role policies. The chart writes it into a ConfigMap, mounts it whole at `/etc/smg/policy/spec.yaml` and passes `--policy-spec` with `--policy-engine engine`; a changed document rolls the pods. `router.policySpecConfigMap` names an existing ConfigMap holding the document under the key `spec.yaml` instead; an edit of it takes effect on the next rollout restart. [`files/policyspec.schema.json`](files/policyspec.schema.json) describes the document, which the gateway validates at start, refusing a field it does not know by name. [`examples/with-policy-spec.yaml`](examples/with-policy-spec.yaml) writes the chart's default policy as a document from the stages this gateway build carries, each at its default, which equals the chart's tuning default, so no tuning value appears in it. The engine refuses a stage its build lacks by name at start; the policy crate's tests keep the example one it accepts.
+
+| Value | Default | Meaning |
+|-------|---------|---------|
+| `router.policySpec` | `{}` | The document; set, the chart renders `--policy-spec` and none of the policy values |
+| `router.policySpecConfigMap` | `""` | An existing ConfigMap with the document under `spec.yaml`; refused beside `router.policySpec` |
+| `router.legacyPolicyFlags` | `true` | Without a document, whether the policy values render as flags; `false` renders none, for a gateway image that no longer takes them, and a value changed from its default is then refused |
+
+Under a document none of the policy values renders, whatever `legacyPolicyFlags` says. The chart refuses what the gateway would refuse or drop: two documents; a disaggregated mode (`router.disaggregation.mode`) or `router.enableIgw` beside a document, since the gateway does not read the document for those fleets yet; and a policy value changed from its chart default where its flag would not render, beside a document (the gateway refuses a flag that disagrees with it) or under `legacyPolicyFlags: false` (the value would never reach the gateway). A value left at its default counts as unset. A value the render refuses is written in the document instead, at the field below.
+
+| Chart value | Field in the document |
+|-------------|-----------------------|
+| `router.policy` | the profile the binding names (`bindings[].profile`), composed of its stages |
+| `router.disaggregation.prefillPolicy`, `decodePolicy`, `encodePolicy` | the binding's plan profiles (`bindings[].profiles.prefill`, `.decode`, `.encode`) |
+| `router.cacheThreshold` | `prefix-affinity.threshold` in the profile's `score` list |
+| `router.balanceAbsThreshold`, `router.balanceRelThreshold` | `prefix-affinity.spill.abs`, `prefix-affinity.spill.rel` |
+| `router.maxTreeSize` | `index."*".max_size` |
+| `router.evictionIntervalSecs` | `index."*".sweep_s` |
+| `router.blockSize` | `view.block_size` |
+
 ### Disaggregated Serving
 
 `router.disaggregation.mode` selects the gateway's `--pd-disaggregation` (`pd`) or `--epd-disaggregation` (`epd`); empty, the default, is a regular fleet. The role policies `prefillPolicy`, `decodePolicy` and `encodePolicy` are the launcher's `--prefill-policy`, `--decode-policy` and `--encode-policy` choices, which the schema lists (`bucket` is a prefill-side choice). The role workers are either static URLs, `prefill`, `decode` and `encode` lists of `{url, bootstrapPort}` rendered as `--prefill URL [BOOTSTRAP_PORT]`, `--decode URL` and `--encode URL [BOOTSTRAP_PORT]`, or, under Kubernetes discovery, the pods matching `router.discovery.kubernetes.prefillSelector`, `decodeSelector` and `encodeSelector`. A role given without its mode, or the encode role outside `epd`, is refused at render rather than ignored by the gateway at start-up; a typo in a role key is refused by the schema. A prefill-decode fleet found by label:
@@ -402,6 +424,7 @@ Size the budget past the longest load you expect: a startup probe that fails for
 | [`with-slurm-discovery.yaml`](examples/with-slurm-discovery.yaml) | Workers on Slurm job nodes (custom image) |
 | [`with-ingress.yaml`](examples/with-ingress.yaml) | Ingress with TLS |
 | [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard + PrometheusRule |
+| [`with-policy-spec.yaml`](examples/with-policy-spec.yaml) | The routing policy as a specification document |
 
 ## Testing
 

@@ -19,6 +19,18 @@
             "prefix_hash"
           ]
         },
+        "policySpec": {
+          "type": "object",
+          "description": "The routing policy as a specification document (apiVersion smg.policy/v1; files/policyspec.schema.json describes it), written into a ConfigMap mounted at /etc/smg/policy/spec.yaml and passed as --policy-spec with --policy-engine engine. Set, none of the policy values renders, and a disaggregated mode or enableIgw beside it is refused until the gateway reads the document for those fleets. Empty, the default, leaves the policy to router.policy and the tuning values."
+        },
+        "policySpecConfigMap": {
+          "type": "string",
+          "description": "An existing ConfigMap holding the specification document under the key spec.yaml, mounted and passed as --policy-spec in place of router.policySpec; refused beside it."
+        },
+        "legacyPolicyFlags": {
+          "type": "boolean",
+          "description": "Without a specification, whether the policy values render as the gateway's routing flags: true renders them as before, false renders none of them, for a gateway image that no longer takes them, and a policy value changed from its default is then refused at render."
+        },
         "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
         "mmTurbojpeg": {
           "type": "string",

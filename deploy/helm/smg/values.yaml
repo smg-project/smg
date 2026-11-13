@@ -33,6 +33,28 @@ router:
   #    router.disaggregation.prefillPolicy.
   policy: cache_aware
 
+  # -- The routing policy as a specification document, in place of router.policy,
+  #    the cache-aware tuning values (cacheThreshold, balanceAbsThreshold,
+  #    balanceRelThreshold, evictionIntervalSecs, maxTreeSize, blockSize) and the
+  #    role policies. policySpec is the document itself (apiVersion smg.policy/v1;
+  #    files/policyspec.schema.json describes it): the chart writes it into a
+  #    ConfigMap, mounts it at /etc/smg/policy/spec.yaml and passes --policy-spec
+  #    with --policy-engine engine. policySpecConfigMap names an existing ConfigMap
+  #    holding the document under the key spec.yaml instead. With either set, none
+  #    of the policy values renders, and a policy value changed from its default
+  #    beside the document is refused at render, as is a disaggregated mode or
+  #    enableIgw beside it (the gateway does not read the document for those
+  #    fleets yet). See examples/with-policy-spec.yaml.
+  policySpec: {}
+  policySpecConfigMap: ""
+  # -- Whether the policy values render as the gateway's routing flags (--policy,
+  #    --cache-threshold and the rest) when no specification is set: true, the
+  #    default, renders them as before; false renders none of them, for a gateway
+  #    image that no longer takes the flags, and a policy value changed from its
+  #    default is then refused at render (it would never reach the gateway).
+  #    Ignored under a specification.
+  legacyPolicyFlags: true
+
   # -- Disaggregated serving: the roles the gateway's --pd-disaggregation and
   #    --epd-disaggregation take. mode "" (the default) is a regular fleet, "pd"
   #    prefill and decode workers, "epd" encode, prefill and decode workers. The
