@@ -23,7 +23,7 @@ use engine_zmq_client::{
     },
 };
 use futures::Stream;
-use smg_grpc_client::vllm_proto as vllm;
+use smg_grpc_client::{seeded_word, vllm_proto as vllm};
 
 use crate::{
     context_window::admit_prompt,
@@ -461,7 +461,10 @@ impl Stream for VllmGenerateStream {
 ///   make all n samples identical, and deriving distinct per-sample seeds from
 ///   the request seed is the established engine convention (each of the n
 ///   sequences gets its own sampler state for exactly this reason) while
-///   staying deterministic for repeat runs.
+///   staying deterministic for repeat runs. A derived seed that lands on
+///   `-1`, which the engine reads as "no seed", becomes the word's minimum
+///   like any other seed word on this wire (`seeded_word`), so no sub runs
+///   unseeded; the subs stay distinct.
 /// - Usage: every sub reports the full `prompt_tokens` on its `Complete` (the
 ///   subs share one prompt), matching the gRPC engines' n>1 contract — the
 ///   pipeline de-duplicates (max per prompt), so nothing is counted n times.
@@ -471,8 +474,8 @@ pub(crate) fn fan_out_requests(req: vllm::GenerateRequest) -> Vec<vllm::Generate
         sub.request_id = format!("{}-{i}", sub.request_id);
         if let Some(sp) = sub.sampling_params.as_mut() {
             sp.n = 1;
-            // An explicit seed must still yield distinct samples per sub.
-            sp.seed = sp.seed.map(|seed| seed.wrapping_add(i as i32));
+            // An explicit seed must still yield distinct samples per sub, and never -1.
+            sp.seed = sp.seed.map(|seed| seeded_word(seed.wrapping_add(i as i32)));
         }
     })
 }

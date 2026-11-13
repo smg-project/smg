@@ -290,18 +290,21 @@ pub fn non_negative_folded_i32(seed: u64) -> i32 {
 }
 
 /// A seed on a wire whose engine reads `-1` as "no seed": the legacy form ([`legacy_seed_i32`])
-/// with that one value moved to the word's minimum, which the fold also reaches (the one shared
-/// value a 32-bit field costs), so a seeded request never runs unseeded.
+/// with that one value moved by [`seeded_word`], so a seeded request never runs unseeded.
 pub fn seeded_i32(seed: i64) -> i32 {
-    never_minus_one(legacy_seed_i32(seed))
+    seeded_word(legacy_seed_i32(seed))
 }
 
 /// A 64-bit seed on such a wire: the fold ([`seed_folded_i32`]) with `-1` moved the same way.
 pub fn seeded_folded_i32(seed: u64) -> i32 {
-    never_minus_one(seed_folded_i32(seed))
+    seeded_word(seed_folded_i32(seed))
 }
 
-fn never_minus_one(seed: i32) -> i32 {
+/// A seed word for the wire whose engine reads `-1` as "no seed": `-1` alone becomes the word's
+/// minimum, which the fold also reaches (the one shared value a 32-bit field costs); every other
+/// word is itself. Applied wherever such a word is made, the conversions above and a per-choice
+/// seed derived from a request's by an offset.
+pub fn seeded_word(seed: i32) -> i32 {
     if seed == -1 {
         i32::MIN
     } else {
@@ -559,5 +562,10 @@ mod seed_tests {
         for seed in [-1, i64::from(u32::MAX), i64::MIN, i64::MAX] {
             assert_ne!(seeded_i32(seed), -1, "{seed}");
         }
+        // A word derived by an offset (a per-choice seed) goes through the same rule.
+        assert_eq!(seeded_word((-2i32).wrapping_add(1)), i32::MIN);
+        assert_eq!(seeded_word(-2), -2);
+        assert_eq!(seeded_word(i32::MAX.wrapping_add(1)), i32::MIN);
+        assert_eq!(seeded_word(0), 0);
     }
 }
