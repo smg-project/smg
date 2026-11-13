@@ -70,6 +70,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses request with `service_tier: "fast"` or `"ultrafast"`, as the public API offers them
+  (`ServiceTierResponses`), parses and forwards the tier, and a Response served on either parses.
+  The crate refused both as unknown variants. Breaking: `ServiceTier` gains `Fast` and `Ultrafast`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

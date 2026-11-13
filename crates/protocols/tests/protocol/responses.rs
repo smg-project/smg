@@ -350,6 +350,55 @@ fn test_require_approval_object_round_trip() {
     );
 }
 
+/// The public API's service tiers include `fast` and `ultrafast`: a request
+/// asking for either parses and forwards it as sent, and a Response that
+/// reports either parses and writes it back.
+#[test]
+fn a_responses_service_tier_of_fast_or_ultrafast_parses() {
+    let mut response = json!({
+        "id": "resp_tier",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-5.6",
+        "output": [],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": true,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": null,
+        "user": null,
+        "metadata": {}
+    });
+    for tier in ["fast", "ultrafast"] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "service_tier": tier
+        }))
+        .unwrap_or_else(|e| panic!("a request with service_tier {tier}: {e}"));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["service_tier"],
+            tier
+        );
+
+        response["service_tier"] = json!(tier);
+        let parsed: ResponsesResponse = serde_json::from_value(response.clone())
+            .unwrap_or_else(|e| panic!("a Response with service_tier {tier}: {e}"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap()["service_tier"], tier);
+    }
+}
+
 #[test]
 fn test_include_field_web_search_call_variants_round_trip() {
     let fields: Vec<IncludeField> = serde_json::from_value(json!([
