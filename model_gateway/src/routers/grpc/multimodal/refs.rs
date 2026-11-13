@@ -728,7 +728,7 @@ fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
 }
 
 /// Build the wire payload from the plan, in authored (prompt) order.
-pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, MmRefsError> {
+pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, MmRefsError> {
     let mut items = Vec::with_capacity(plan.parts().len());
     for (index, part) in plan.parts().iter().enumerate() {
         let (modality, url, limit) = forwardable_ref(part)?;
@@ -1817,7 +1817,7 @@ mod tests {
 
     #[test]
     fn assemble_keeps_prompt_order_and_maps_modalities() {
-        let refs = assemble_media_refs(plan(vec![
+        let refs = assemble_media_refs(&plan(vec![
             image_url("https://a/1.png"),
             MediaContentPart::VideoUrl {
                 url: "data:video/mp4;base64,AAAA".to_string(),
@@ -1860,7 +1860,7 @@ mod tests {
         );
         placeholders.set_worker_expandable(Modality::Audio, true);
         ensure_worker_expandable(&plan, &placeholders, false).unwrap();
-        let refs = assemble_media_refs(plan).unwrap();
+        let refs = assemble_media_refs(&plan).unwrap();
         assert_eq!(refs.items[0].modality, common::Modality::Audio as i32);
         assert_eq!(refs.items[0].url, "data:audio/wav;base64,AAAA");
         assert_eq!(refs.items[1].modality, common::Modality::Image as i32);
@@ -1868,7 +1868,7 @@ mod tests {
 
     #[test]
     fn assemble_rejects_unsupported_parts_and_oversized_data_urls() {
-        let err = assemble_media_refs(plan(vec![MediaContentPart::AudioData {
+        let err = assemble_media_refs(&plan(vec![MediaContentPart::AudioData {
             data: vec![0; 4],
             mime_type: Some("audio/wav".to_string()),
             uuid: None,
@@ -1880,8 +1880,8 @@ mod tests {
             "data:image/png;base64,{}",
             "A".repeat(media::image_max_input_bytes() * 4 / 3 + 8)
         );
-        let err =
-            assemble_media_refs(plan(vec![image_url(&oversized)])).expect_err("oversized data url");
+        let err = assemble_media_refs(&plan(vec![image_url(&oversized)]))
+            .expect_err("oversized data url");
         assert_eq!(err.code(), "media_ref_too_large");
     }
 

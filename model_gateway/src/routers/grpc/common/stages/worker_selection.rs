@@ -635,7 +635,7 @@ impl WorkerSelectionStage {
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
-                    let refs = multimodal::assemble_media_refs(plan.clone())
+                    let refs = multimodal::assemble_media_refs(plan)
                         .map_err(multimodal::MmRefsError::into_response)?;
                     Ok(refs
                         .items
