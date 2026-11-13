@@ -70,6 +70,13 @@ const EACH_BYTE: u64 = 0x0101_0101_0101_0101;
 pub(super) struct WordScan;
 
 impl WordScan {
+    /// Every ASCII character of any of the four sets (the letters and the
+    /// white space), as a bit per code: a scanner whose runs stop at other
+    /// classes checks those classes against it (see `chain`).
+    pub(super) const MEMBERS: u128 = ascii_range(b'A', b'Z')
+        | ascii_range(b'a', b'z')
+        | ascii_range(b'\t', b'\r')
+        | ascii_range(b' ', b' ');
     /// No word scan: the mark of a role whose members are no scan's set,
     /// which runs byte by byte under any name a caller passes. Not a scan a
     /// caller may name ([`Roles::run_end_as`] refuses it at compile time).
@@ -222,6 +229,16 @@ impl Roles {
         }
     }
 
+    /// The ASCII characters holding any of `bits`, as a bit per code.
+    pub(super) fn ascii_members(&self, bits: Bits) -> u128 {
+        self.bytes
+            .iter()
+            .take(128)
+            .enumerate()
+            .filter(|(_, role_bits)| **role_bits & bits != 0)
+            .fold(0u128, |members, (code, _)| members | (1 << code))
+    }
+
     /// The role bits of the character at `pos`, a character boundary, and
     /// its length in bytes; `None` at the end of the text.
     #[inline(always)]
@@ -278,19 +295,58 @@ impl Roles {
     pub(super) fn run_end_as<const SCAN: u8, const WORDS: bool>(
         &self,
         text: &str,
-        mut pos: usize,
+        pos: usize,
         bit: Bits,
     ) -> usize {
         const {
             assert!(
                 SCAN >= WordScan::LETTERS && SCAN <= WordScan::SPACES,
-                "one of the four word scans; a role with no scan runs through run_end"
+                "one of the four word scans; a role with no scan runs through the byte loop"
             );
         };
         debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
         if !WORDS || self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
             return self.run_end(text, pos, bit);
         }
+        self.words_end::<SCAN>(text, pos, bit, 0)
+    }
+
+    /// [`Self::run_end_as`] for the chain scanner, whose runs also end at a
+    /// character holding one of the `stop` bits (its stage classes): the
+    /// same words, [`Self::run_end_in`] as the byte loop. The caller has read
+    /// that no stop class holds an ASCII member of the set.
+    #[inline(always)]
+    pub(super) fn run_end_as_in<const SCAN: u8>(
+        &self,
+        text: &str,
+        pos: usize,
+        bit: Bits,
+        stop: Bits,
+    ) -> usize {
+        const {
+            assert!(
+                SCAN >= WordScan::LETTERS && SCAN <= WordScan::SPACES,
+                "one of the four word scans; a role with no scan runs through the byte loop"
+            );
+        };
+        debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
+        if self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
+            return self.run_end_in(text, pos, bit, stop);
+        }
+        self.words_end::<SCAN>(text, pos, bit, stop)
+    }
+
+    /// The word scan itself: the first byte through the table, then whole
+    /// words of the set's members, a byte outside the set ending the run when
+    /// it is ASCII; a `stop` bit ends it as the byte loops do.
+    #[inline(always)]
+    fn words_end<const SCAN: u8>(
+        &self,
+        text: &str,
+        mut pos: usize,
+        bit: Bits,
+        stop: Bits,
+    ) -> usize {
         let bytes = text.as_bytes();
         loop {
             let Some(&lead) = bytes.get(pos) else {
@@ -298,13 +354,14 @@ impl Roles {
             };
             if lead >= 0x80 {
                 let (bits, len) = self.beyond(bytes, pos, lead);
-                if bits & bit == 0 {
+                if bits & bit == 0 || bits & stop != 0 {
                     return pos;
                 }
                 pos += len;
                 continue;
             }
-            if self.bytes[usize::from(lead)] & bit == 0 {
+            let bits = self.bytes[usize::from(lead)];
+            if bits & bit == 0 || bits & stop != 0 {
                 return pos;
             }
             pos += 1;
@@ -349,6 +406,20 @@ impl Roles {
                 }
                 pos += len;
             }
+        }
+        pos
+    }
+
+    /// [`Self::run_end`] with `stop` bits: a character holding one of them
+    /// ends the run as the end of the text would (the chain scanner's
+    /// stretches end at the next character of a stage class).
+    #[inline(always)]
+    pub(super) fn run_end_in(&self, text: &str, mut pos: usize, bit: Bits, stop: Bits) -> usize {
+        while let Some((bits, len)) = self.at(text, pos) {
+            if bits & bit == 0 || bits & stop != 0 {
+                break;
+            }
+            pos += len;
         }
         pos
     }

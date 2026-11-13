@@ -153,8 +153,9 @@ const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// is tokenized every time.
 const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
 
-/// Bytes of an input from which the single-stage scanners walk a letter or
-/// white-space run eight bytes at a time (`Roles::run_end_as`): the scanner
+/// Bytes of an input from which the scanners walk a letter or white-space
+/// run eight bytes at a time (`Roles::run_end_as`, and `run_end_as_in` for
+/// the chain scanner's runs, which also end at a stage class): the scanner
 /// loop is compiled with the word scans and without, and the choice is made
 /// once per encode call on the input's length; a shorter input walks every
 /// run byte by byte through the loop as it was before the scans, and no run
@@ -2519,7 +2520,7 @@ impl NativeEncoder {
                 self.pieces_mapping(0, from, text, &mut image, &mut per_piece);
             }
             (Some(chain), _, None) => {
-                chain.pieces(text, &mut |start, end| {
+                chain.pieces(text, words, &mut |start, end| {
                     if let Err(declined) =
                         self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
                     {
