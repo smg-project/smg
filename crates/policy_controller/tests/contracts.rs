@@ -1866,3 +1866,65 @@ fn the_decide_budget_fields_are_pinned() {
         assert_eq!(found, expected, "{message_name}: a budget field moved");
     }
 }
+
+/// The replication rejoin: `ReplicaHello` names its last applied position and
+/// the term it was written under, every batch names the write term of its
+/// events, a snapshot names the write term of the position it is consistent
+/// with. The pin holds names, numbers and types; the mismatch answer is the
+/// conformance suite's to check.
+type ReplicaField = (&'static str, i32, Type);
+
+const REPLICA_FIELDS: &[(&str, &[ReplicaField])] = &[
+    (
+        "ReplicaHello",
+        &[
+            ("replica_id", 1, Type::String),
+            ("last_applied_seq", 2, Type::Uint64),
+            ("term_seen", 3, Type::Uint64),
+            ("max_backlog", 4, Type::Uint32),
+            ("last_applied_term", 5, Type::Uint64),
+        ],
+    ),
+    (
+        "ReplicationBatch",
+        &[
+            ("first_seq", 1, Type::Uint64),
+            ("term", 2, Type::Uint64),
+            ("events", 3, Type::Message),
+            ("resync_required", 4, Type::Bool),
+        ],
+    ),
+    (
+        "Snapshot",
+        &[
+            ("term", 1, Type::Uint64),
+            ("replication_seq", 15, Type::Uint64),
+            ("replication_term", 18, Type::Uint64),
+        ],
+    ),
+];
+
+#[test]
+fn the_replica_rejoin_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in REPLICA_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a rejoin field moved");
+    }
+}
