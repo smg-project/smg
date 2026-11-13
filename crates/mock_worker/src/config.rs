@@ -619,9 +619,9 @@ impl Config {
         }
         if cfg.role.is_some() && cfg.http_count > 0 && (cfg.grpc_count > 0 || cfg.zmq_count > 0) {
             return Err(
-                "--worker-type gives one wire's workers the role: pass --http-count or \
-                 --grpc-count/--zmq-count, not both (worker i of either wire would bind the \
-                 same bootstrap port)"
+                "--worker-type gives the role to the HTTP workers alone or to the gRPC workers \
+                 and ZMQ ranks together: pass --http-count or --grpc-count/--zmq-count, not \
+                 both (an HTTP worker i and a gRPC worker i would bind the same bootstrap port)"
                     .to_string(),
             );
         }
@@ -1338,7 +1338,7 @@ mod tests {
     /// numbered after the gRPC workers (a ZMQ prefill rank needs the base
     /// port); the encode role is the gRPC wire's alone.
     #[test]
-    fn the_prefill_and_decode_roles_are_one_wires_workers() {
+    fn the_prefill_and_decode_roles_are_the_http_side_or_the_grpc_and_zmq_side() {
         let grpc = ["--grpc-base-port", "19000", "--grpc-count", "2"];
         let cfg = parse(&grpc).expect("gRPC flags parse");
         assert_eq!((cfg.role, cfg.bootstrap_base_port), (None, None));
@@ -1399,7 +1399,7 @@ mod tests {
             .contains("HTTP workers have no encode role"));
         assert!(
             parse(&[&grpc[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
-                .expect_err("one wire's workers take the role")
+                .expect_err("the HTTP workers alone or the gRPC workers and ZMQ ranks together take the role")
                 .contains("not both")
         );
         let zmq = [
@@ -1447,7 +1447,7 @@ mod tests {
             .contains("not encode"));
         assert!(
             parse(&[&zmq[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
-                .expect_err("one wire's workers take the role")
+                .expect_err("the HTTP workers alone or the gRPC workers and ZMQ ranks together take the role")
                 .contains("not both")
         );
         assert!(parse(

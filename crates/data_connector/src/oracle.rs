@@ -1,12 +1,21 @@
 //! Oracle storage implementation using OracleStore helper.
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool::managed::{Manager, Metrics, Pool, RecycleError, RecycleResult};
-use oracle::{sql_type::ToSql, Connection, Connector, Row};
+use oracle::{sql_type::ToSql, ConnStatus, Connection, Connector, ErrorKind, Row};
 use serde_json::Value;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use super::core::{
     make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
@@ -22,6 +31,7 @@ use crate::{
     },
     config::OracleConfig,
     context::current_extra_columns,
+    factory::{contact_blocking, StoreContactError},
     oracle_migrations::ORACLE_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
     versioning::{
@@ -47,15 +57,11 @@ pub(crate) struct OracleStore {
 }
 
 impl OracleStore {
-    /// Create a connection pool, with the schema brought to this build's
-    /// shape first.
-    ///
-    /// Accepts a list of schema initializers that run on a single connection
-    /// before the pool is created, ensuring all tables exist. The database's
-    /// recorded schema version is checked against this build's migrations
-    /// before any of them runs, so a database a newer build migrated forward
-    /// is refused untouched (see [`bootstrap_oracle_schema`]).
-    pub fn new(config: &OracleConfig, init_schemas: &[SchemaInitFn]) -> Result<Self, String> {
+    /// The pool, built without a connection: the schema configuration
+    /// validated and the client configured, no round trip. The start-up
+    /// connection is [`Self::contact`]'s, the schema's bootstrap on it
+    /// [`Self::bootstrap`]'s, in that order in the factory.
+    pub fn new(config: &OracleConfig) -> Result<Self, String> {
         // Extract and validate schema config.
         // Oracle folds unquoted identifiers to uppercase, so existing tables
         // and columns are CONVERSATIONS, CONV_ID, etc.  Uppercase all
@@ -68,42 +74,28 @@ impl OracleStore {
         // Configure Oracle client (wallet env vars, etc.)
         configure_oracle_env(config)?;
 
-        // Initialize schemas using a single connection
-        let conn = connect_oracle(
-            config.external_auth,
-            &config.username,
-            &config.password,
-            &config.connect_descriptor,
-        )
-        .map_err(map_oracle_error)?;
-
-        // The recorded schema version against this build's migrations before
-        // any history table is touched; then the tables, the migrations and
-        // the indexes on the columns they added.
-        bootstrap_oracle_schema(
-            &OracleSchemaSetup {
-                conn: &conn,
-                schema: schema.as_ref(),
-                init_schemas,
-            },
-            &ORACLE_HISTORY_MIGRATIONS,
-            schema.version,
-        )?;
-
-        drop(conn);
-
-        // Create connection pool
-        let config_arc = Arc::new(config.clone());
+        // Create connection pool. Each call as a whole is bounded by the
+        // `bounded` wrappers the factory installs. The pool and the driver
+        // bound their own steps (creating a connection, recycling one, each
+        // round trip of a connection) at twice that bound: backstops that
+        // clean up after a call the wrapper has already answered, never the
+        // first to fire.
+        let backstop = config.op_timeout().saturating_mul(2);
         let manager = OracleConnectionManager {
-            params: Arc::new(OracleConnectParams::from_config(&config_arc)),
+            params: Arc::new(OracleConnectParams::from_config(config)),
+            call_timeout: backstop,
+            call_timeout_refused: Arc::new(AtomicBool::new(false)),
+            connects: Arc::new(Semaphore::new(config.pool_max)),
         };
 
         let mut builder = Pool::builder(manager)
             .max_size(config.pool_max)
+            .create_timeout(Some(backstop))
+            .recycle_timeout(Some(backstop))
             .runtime(deadpool::Runtime::Tokio1);
 
-        if config.pool_timeout_secs > 0 {
-            builder = builder.wait_timeout(Some(Duration::from_secs(config.pool_timeout_secs)));
+        if let Some(wait) = config.pool_timeout() {
+            builder = builder.wait_timeout(Some(wait));
         }
 
         let pool = builder
@@ -111,6 +103,52 @@ impl OracleStore {
             .map_err(|e| format!("Failed to build Oracle pool: {e}"))?;
 
         Ok(Self { pool, schema })
+    }
+
+    /// The start-up contact: one connection, made on a blocking thread (the
+    /// driver connects synchronously) and awaited under `bound`, the pool's
+    /// wait, so a store that accepts the connection and never answers is a
+    /// verdict at the bound instead of a start that never ends; a refused or
+    /// failed connection is a verdict at once. The connection is handed to
+    /// [`Self::bootstrap`]. The bound ends the wait, not the driver's thread,
+    /// which returns when the socket does.
+    pub(crate) async fn contact(
+        &self,
+        bound: Option<Duration>,
+    ) -> Result<Connection, StoreContactError> {
+        let params = self.pool.manager().params.clone();
+        contact_blocking(bound, move || {
+            connect_oracle(
+                params.external_auth,
+                &params.username,
+                &params.password,
+                &params.connect_descriptor,
+            )
+            .map_err(map_oracle_error)
+        })
+        .await
+    }
+
+    /// Brings the database to the schema this build expects, on the
+    /// connection the contact made: the recorded schema version against this
+    /// build's migrations before any history table is touched, then the
+    /// tables, the migrations and the indexes on the columns they added; a
+    /// database a newer build migrated forward is refused untouched (see
+    /// [`bootstrap_oracle_schema`]).
+    pub(crate) fn bootstrap(
+        &self,
+        conn: &Connection,
+        init_schemas: &[SchemaInitFn],
+    ) -> Result<(), String> {
+        bootstrap_oracle_schema(
+            &OracleSchemaSetup {
+                conn,
+                schema: self.schema.as_ref(),
+                init_schemas,
+            },
+            &ORACLE_HISTORY_MIGRATIONS,
+            self.schema.version,
+        )
     }
 
     /// Execute function with a connection from the pool
@@ -136,8 +174,8 @@ impl OracleStore {
     }
 }
 
-/// The start-up steps of [`OracleStore::new`] on its connection, in the order
-/// [`bootstrap_oracle_schema`] runs them.
+/// The start-up steps of [`OracleStore::bootstrap`] on the contact's
+/// connection, in the order [`bootstrap_oracle_schema`] runs them.
 struct OracleSchemaSetup<'a> {
     conn: &'a Connection,
     schema: &'a SchemaConfig,
@@ -258,6 +296,18 @@ impl std::fmt::Debug for OracleConnectParams {
 #[derive(Clone)]
 struct OracleConnectionManager {
     params: Arc<OracleConnectParams>,
+    /// The driver's own bound on each round trip of a pooled connection:
+    /// twice the store-call bound, the backstop behind the wrapper's verdict.
+    call_timeout: Duration,
+    /// Set once the driver refused the call timeout (a client library older
+    /// than the one that bounds its calls), so the warning is logged once.
+    call_timeout_refused: Arc<AtomicBool>,
+    /// At most `pool_max` connects at a time. The pool gives its slot back
+    /// when a bound drops the checkout, the connect's thread runs on: the
+    /// permit rides on that thread and returns when the driver does, so a
+    /// store frozen at connect holds at most `pool_max` connect threads and
+    /// the next connect waits here, where a bound can end the wait.
+    connects: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for OracleConnectionManager {
@@ -269,6 +319,36 @@ impl std::fmt::Debug for OracleConnectionManager {
     }
 }
 
+/// Runs a pooled `connect` on a thread of its own that carries the connect
+/// permit, answered through a oneshot. Not a `spawn_blocking` task: the
+/// runtime's drop waits for those without limit, so a connect frozen at the
+/// socket (a descriptor without a connect timeout) would hold the process's
+/// exit after its drain; a thread of its own ends when the driver returns or
+/// the process exits, as the start-up contact's does. The permit returns
+/// when the driver does, so a stalled connect keeps its slot of the limiter
+/// and the next connect waits for a permit, where a bound can end the wait.
+/// The error text names a thread that could not start or ended without an
+/// answer (a panic in `connect`).
+async fn connect_on_own_thread<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    connect: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("history-store-connect".to_string())
+        .spawn(move || {
+            let answer = connect();
+            // The slot of the limiter returns with the driver, before the
+            // answer is handed over.
+            drop(permit);
+            // The receiver is gone when a bound ended the wait: nothing to do.
+            let _ = tx.send(answer);
+        })
+        .map_err(|e| format!("the connect thread could not start: {e}"))?;
+    rx.await
+        .map_err(|_gone| "the connect thread ended without an answer".to_string())
+}
+
 impl Manager for OracleConnectionManager {
     type Type = Connection;
     type Error = oracle::Error;
@@ -277,20 +357,59 @@ impl Manager for OracleConnectionManager {
         &self,
     ) -> impl std::future::Future<Output = Result<Connection, oracle::Error>> + Send {
         let params = self.params.clone();
+        let call_timeout = self.call_timeout;
+        let refused = self.call_timeout_refused.clone();
+        let connects = self.connects.clone();
         async move {
-            let mut conn = connect_oracle(
-                params.external_auth,
-                &params.username,
-                &params.password,
-                &params.connect_descriptor,
-            )?;
-            conn.set_autocommit(true);
-            Ok(conn)
+            // A connect permit first (an async wait a bound can end); it is
+            // dropped by the connect's thread when the driver returns.
+            let permit = connects.acquire_owned().await.map_err(|closed| {
+                oracle::Error::new(
+                    ErrorKind::Other,
+                    format!("the connect limiter is closed: {closed}"),
+                )
+            })?;
+            // The driver connects synchronously: on a thread of its own (see
+            // `connect_on_own_thread`), so the checkout's future yields and the
+            // bound around the call can end the wait; the thread returns when
+            // the driver does and never holds the runtime's drop.
+            connect_on_own_thread(permit, move || {
+                let mut conn = connect_oracle(
+                    params.external_auth,
+                    &params.username,
+                    &params.password,
+                    &params.connect_descriptor,
+                )?;
+                conn.set_autocommit(true);
+                // The driver's own bound on every round trip of this
+                // connection: a statement or a ping the store never answers
+                // ends here, and the thread and the connection come back.
+                if let Err(err) = conn.set_call_timeout(Some(call_timeout)) {
+                    if !refused.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "Oracle client library refused the call timeout of {call_timeout:?} ({err}); \
+                             a round trip the store never answers holds its thread and connection until the socket ends"
+                        );
+                    }
+                }
+                Ok::<Connection, oracle::Error>(conn)
+            })
+            .await
+            .map_err(|text| oracle::Error::new(ErrorKind::Other, text))?
         }
     }
 
     async fn recycle(&self, conn: &mut Connection, _: &Metrics) -> RecycleResult<Self::Error> {
-        conn.ping().map_err(RecycleError::Backend)
+        // The driver's local view of the connection, no round trip: the
+        // Postgres pool's `Fast` recycling, one round trip fewer per call and
+        // nothing synchronous on the runtime thread. A connection the store
+        // dropped without the client noticing fails its next statement, which
+        // the call answers as the store's failure.
+        match conn.status() {
+            Ok(ConnStatus::Normal) => Ok(()),
+            Ok(status) => Err(RecycleError::message(format!("connection {status:?}"))),
+            Err(err) => Err(RecycleError::Backend(err)),
+        }
     }
 }
 
@@ -2083,7 +2202,83 @@ fn create_index_if_missing(
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::mpsc, time::Instant};
+
     use super::*;
+
+    /// A pooled connect a bound gave up on runs on a thread of its own, not
+    /// in the runtime's blocking pool: a runtime that shuts down after the
+    /// verdict does not wait for it, so a drain ends in the process's exit
+    /// while the connect's thread still sleeps.
+    #[test]
+    fn a_pooled_connect_the_bound_gave_up_on_does_not_hold_the_runtime_s_shutdown() {
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a runtime of the test's own");
+            let limiter = Arc::new(Semaphore::new(1));
+            let verdict = runtime.block_on(async move {
+                let permit = limiter.acquire_owned().await.expect("a permit");
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    connect_on_own_thread(permit, || {
+                        std::thread::sleep(Duration::from_secs(30));
+                        7u8
+                    }),
+                )
+                .await
+            });
+            assert!(verdict.is_err(), "the bound gives the verdict: {verdict:?}");
+            let dropping = Instant::now();
+            drop(runtime);
+            let _ = done_tx.send(dropping.elapsed());
+        });
+        let took = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the runtime shut down while the connect's thread still ran");
+        assert!(took < Duration::from_secs(5), "the drop took {took:?}");
+    }
+
+    /// The connect permit rides on the connect's thread, not on the waiting
+    /// future: once a bound has dropped the wait, the limiter stays one permit
+    /// short until the stalled connect's thread returns, so the next connect
+    /// waits for it; then the permit comes back with the thread. (A permit
+    /// held on the async side would come back with the dropped future and
+    /// let the next connect start while the stalled one still ran.)
+    #[tokio::test]
+    async fn a_stalled_connect_keeps_its_permit_after_the_bound_dropped_the_wait() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let permit = limiter.clone().acquire_owned().await.expect("a permit");
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(100),
+            connect_on_own_thread(permit, move || {
+                let _ = release_rx.recv();
+                7u8
+            }),
+        )
+        .await;
+        assert!(
+            gave_up.is_err(),
+            "the bound gives up on the stalled connect: {gave_up:?}"
+        );
+        // The waiting future is gone; the thread runs on and holds the permit.
+        assert!(
+            limiter.try_acquire().is_err(),
+            "the stalled connect's thread holds the only permit after the bound dropped the wait"
+        );
+        release_tx
+            .send(())
+            .expect("the connect's thread waits for the release");
+        // The permit comes back when the thread returns; its answer goes to a
+        // receiver that is gone.
+        let next = tokio::time::timeout(Duration::from_secs(10), limiter.acquire())
+            .await
+            .expect("the permit came back with the thread");
+        assert!(next.is_ok(), "the limiter is open again: {next:?}");
+    }
 
     /// The identifier filter binds the identifier first and the tenant scope
     /// second, and leaves the scope out when the table keeps no tenant.

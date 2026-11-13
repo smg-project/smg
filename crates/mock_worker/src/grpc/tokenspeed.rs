@@ -243,8 +243,8 @@ impl TokenSpeedScheduler for MockScheduler {
 /// engine's prefill waits on that room and fails without it, so a request
 /// whose entries do not cover each of its items once is refused; a request
 /// without entries has no encoder (a prefill alone processes its own media).
-/// An info with entries and no media is refused by the first arm too: with
-/// no item, its first entry names an item outside the covered range.
+/// An info with entries and no media is refused too: with no item, its first
+/// entry's index is out of range (the refusal names that index of 0 items).
 fn check_encode_bootstrap(req: &ts::GenerateRequest) -> Result<(), Status> {
     let Some(info) = &req.encode_bootstrap_info else {
         return Ok(());
@@ -453,7 +453,7 @@ enum EncoderInput<'a> {
     /// The role runs the tower on the item: the feature rides inline unless
     /// one of the request's encode rooms (by item index) hands it over.
     Required { roomed: &'a [u32] },
-    /// The gateway's decode leg is the request's pixel-free clone: no feature
+    /// The gateway's decode side is the request's pixel-free clone: no feature
     /// and no rooms, the item's metadata alone.
     Detached,
 }
@@ -890,7 +890,7 @@ mod tests {
             .expect("the roomed item is accepted without its feature");
     }
 
-    /// The gateway's decode leg is the request's pixel-free clone (every
+    /// The gateway's decode side is the request's pixel-free clone (every
     /// item's encoder input taken out, the encode rooms dropped, the
     /// metadata kept): a decode worker takes it, and a prefill worker
     /// refuses the same form as the engine refuses a tower run on nothing.

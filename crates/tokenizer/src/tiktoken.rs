@@ -33,7 +33,7 @@ use crate::{
     },
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,
-    native::{AddedTokens, NativeEncoder},
+    native::{Added, AddedTokens, NativeEncoder},
     tekken,
     traits::{
         ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
@@ -577,9 +577,9 @@ impl TiktokenTokenizer {
             ChatTemplateState::from_checkpoint(chat_template, processor_template)?;
         let controls = structural_controls
             .then(|| {
-                let spellings: Vec<(String, TokenIdType)> = specials
+                let spellings: Vec<Added> = specials
                     .iter()
-                    .map(|(spelling, &id)| (spelling.clone(), id))
+                    .map(|(spelling, &id)| Added::plain(spelling.clone(), id))
                     .collect();
                 AddedTokens::build(&spellings).unwrap_or_else(|declined| {
                     tracing::debug!(%declined, "no matcher over the special tokens; a control spelling typed into a request is the control");
@@ -1448,6 +1448,10 @@ impl TokenizerTrait for TiktokenTokenizer {
     ) -> Option<bool> {
         self.template_answers()
             .native_thinking_mode(template_kwargs, thinking)
+    }
+
+    fn template_reads(&self, name: &str) -> bool {
+        self.template_answers().template_reads(name)
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {

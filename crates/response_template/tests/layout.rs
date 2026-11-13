@@ -407,7 +407,7 @@ fn every_mode_has_a_tag(format: &Format, layout: Layout) {
                 .unwrap_or_else(|why| panic!("{options:?}: the engines refuse the tag: {why}"));
         }
         let answer = format
-            .answer_grammar(&json!({"type": "object"}), reasoning_open)
+            .answer_grammar(&Arc::new(json!({"type": "object"})), reasoning_open)
             .unwrap_or_else(|| panic!("{reasoning_open}"));
         answer.check().unwrap_or_else(|why| {
             panic!("thought open {reasoning_open}: the engines refuse the answer grammar: {why}")

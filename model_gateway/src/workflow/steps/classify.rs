@@ -96,7 +96,10 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
                 message: format!(
                     "worker {} targets the {} provider, but this build carries no {} router; \
                      rebuild with the `{}` Cargo feature to admit it",
-                    config.url, missing.label, missing.label, missing.feature
+                    Endpoint::redacted_str(&config.url),
+                    missing.label,
+                    missing.label,
+                    missing.feature
                 ),
             });
         }

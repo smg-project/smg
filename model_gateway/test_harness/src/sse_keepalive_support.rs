@@ -105,30 +105,8 @@ impl Arrival {
     }
 }
 
-/// Posts `body` to `path` and reads the response's chunks as they arrive,
-/// until the body ends or `budget` has passed since the response headers.
-pub async fn stream(
-    app: &Router,
-    path: &str,
-    body: serde_json::Value,
-    budget: Duration,
-) -> Vec<Arrival> {
-    stream_to_end(app, path, body, budget).await.0
-}
-
-/// [`stream`], and whether the body closed (EOF) within the budget rather
-/// than the budget running out with the body still open.
-pub async fn stream_to_end(
-    app: &Router,
-    path: &str,
-    body: serde_json::Value,
-    budget: Duration,
-) -> (Vec<Arrival>, bool) {
-    let response = send(app, path, body).await;
-    read(path, response, budget).await
-}
-
-/// [`stream`] with tokio's clock paused from the response headers on, for
+/// `send` then `read` with tokio's clock paused from the response headers
+/// on, for
 /// a test that reads the gateway's timers as exact instants. The request,
 /// its dial and its hops to the engine run on the wall clock: a paused
 /// clock's auto-advance polls I/O once and, with nothing ready, moves on to
@@ -175,7 +153,7 @@ pub struct PausedRead {
     pub resumed_at: Duration,
 }
 
-/// [`stream_to_end`] with tokio's clock paused from the response headers
+/// `send` then `read` with tokio's clock paused from the response headers
 /// through the engine's `silence` (which started at the request, up to the
 /// slack before the arrival clock) and resumed [`RESUME_MARGIN`] before it
 /// ends: the gateway's timers in the silence are read as exact instants
@@ -183,7 +161,7 @@ pub struct PausedRead {
 /// current-thread runtime, as `tokio::time::pause` does.
 #[expect(
     clippy::disallowed_methods,
-    reason = "test helper: the resume task is done or aborted before the read returns"
+    reason = "test helper: the resume task is done or aborted before the helper returns"
 )]
 pub async fn stream_to_end_paused_through(
     app: &Router,
