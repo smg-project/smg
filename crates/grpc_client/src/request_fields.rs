@@ -276,6 +276,19 @@ pub fn legacy_seed_i32(seed: i64) -> i32 {
     i32::try_from(seed).unwrap_or_else(|_| seed_folded_i32(seed_bits(seed)))
 }
 
+/// A seed on a wire whose signed 32-bit field feeds an engine that seeds an unsigned word: the
+/// legacy form ([`legacy_seed_i32`]) with its sign bit cleared, so a seed that fits and is not
+/// negative stays itself and every other seed lands on a non-negative value (31 bits of identity)
+/// where a negative word would be refused by the engine.
+pub fn non_negative_seed_i32(seed: i64) -> i32 {
+    legacy_seed_i32(seed) & i32::MAX
+}
+
+/// A 64-bit seed on such a wire: the fold ([`seed_folded_i32`]) with its sign bit cleared.
+pub fn non_negative_folded_i32(seed: u64) -> i32 {
+    seed_folded_i32(seed) & i32::MAX
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +508,21 @@ mod seed_tests {
         assert_eq!(seed_folded_i32(7), 7);
         assert_eq!(seed_folded_i32(1 << 32), 1);
         assert_eq!(seed_folded_i32(u64::MAX), 0);
+    }
+
+    #[test]
+    fn a_seed_for_an_unsigned_word_behind_a_signed_field_is_never_negative() {
+        assert_eq!(non_negative_seed_i32(7), 7);
+        assert_eq!(non_negative_seed_i32(i64::from(i32::MAX)), i32::MAX);
+        assert_eq!(non_negative_seed_i32(-1), i32::MAX);
+        assert_eq!(non_negative_seed_i32(i64::from(i32::MIN)), 0);
+        assert_eq!(non_negative_seed_i32(1 << 31), 0);
+        assert_eq!(non_negative_seed_i32(i64::MAX), 0);
+        assert_eq!(non_negative_folded_i32(7), 7);
+        assert_eq!(non_negative_folded_i32(1 << 31), 0);
+        assert_eq!(non_negative_folded_i32(u64::MAX), 0);
+        for seed in [-1, i64::MIN, i64::MAX, 1 << 31, 1 << 32] {
+            assert!(non_negative_seed_i32(seed) >= 0, "{seed}");
+        }
     }
 }
