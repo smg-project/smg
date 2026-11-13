@@ -85,6 +85,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages cache breakpoint keeps its `ttl` (`{"type": "ephemeral", "ttl": "1h"}`), and an image
+  block its `transformations`, when the request is written back for an upstream, as the public API
+  takes them. The unit `CacheControl::Ephemeral` dropped the `ttl`, so a 1h breakpoint reached the
+  upstream as the 5m default, and `ImageBlock` dropped `transformations`, so `oversized_image:
+  error` was lost. Breaking: `CacheControl::Ephemeral` is a struct variant with `ttl:
+  Option<String>`, and `ImageBlock` gains `transformations: Option<Value>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

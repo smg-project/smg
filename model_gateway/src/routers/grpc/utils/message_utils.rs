@@ -1222,6 +1222,7 @@ mod tests {
                         data: "AAAA".to_string(),
                     },
                     cache_control: None,
+                    transformations: None,
                 }),
             ]),
         }];
@@ -1534,6 +1535,7 @@ mod tests {
                                 data: "AAAA".to_string(),
                             },
                             cache_control: None,
+                            transformations: None,
                         }),
                     ])),
                     is_error: None,
@@ -1688,6 +1690,7 @@ mod tests {
                         data: "AAAA".to_string(),
                     },
                     cache_control: None,
+                    transformations: None,
                 })],
             },
             None,

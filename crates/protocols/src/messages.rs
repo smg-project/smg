@@ -669,6 +669,11 @@ pub struct ImageBlock {
     /// Cache control for this block
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+
+    /// How the upstream treats the image (`oversized_image`: `downsize` or
+    /// `error`), forwarded as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transformations: Option<Value>,
 }
 
 /// Image source (base64 or URL)
@@ -907,7 +912,12 @@ pub enum WebSearchToolResultErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CacheControl {
-    Ephemeral,
+    Ephemeral {
+        /// How long the breakpoint lives (`5m`, the default, or `1h`),
+        /// forwarded as written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl: Option<String>,
+    },
 }
 
 /// Citations configuration
@@ -3591,6 +3601,36 @@ mod tests {
                 std::mem::discriminant(&other)
             ),
         }
+    }
+
+    /// A cache breakpoint keeps its `ttl`, and an image its `transformations`,
+    /// when the request is written back for an upstream: on a system block, a
+    /// text block, a tool and an image alike. A bare breakpoint still writes
+    /// no `ttl`.
+    #[test]
+    fn a_cache_breakpoints_ttl_and_an_images_transformations_are_kept() {
+        let hour = json!({"type": "ephemeral", "ttl": "1h"});
+        let request = json!({
+            "model": "m", "max_tokens": 8,
+            "system": [{"type": "text", "text": "be brief", "cache_control": hour}],
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}, "cache_control": hour}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "look", "cache_control": hour},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                 "transformations": {"oversized_image": "error"}, "cache_control": {"type": "ephemeral"}}
+            ]}]
+        });
+        let parsed: CreateMessageRequest = serde_json::from_value(request.clone()).unwrap();
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["system"], request["system"]);
+        assert_eq!(written["tools"][0]["cache_control"], hour);
+        assert_eq!(written["messages"], request["messages"]);
+        assert!(
+            written["messages"][0]["content"][1]["cache_control"]
+                .get("ttl")
+                .is_none(),
+            "{written}"
+        );
     }
 
     #[test]

@@ -361,6 +361,7 @@ mod tests {
                 data: data.to_string(),
             },
             cache_control: None,
+            transformations: None,
         };
         let messages = vec![InputMessage {
             role: Role::User,
