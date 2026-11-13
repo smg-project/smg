@@ -400,7 +400,7 @@ mod tests {
         }))
         .expect("a worker's answer");
         let results = answer.into_results();
-        assert_eq!(results[0].score, 0.123_456_789_012_345);
+        assert_eq!(results[0].score, 0.123_456_789_012_345_f64);
         assert_eq!(
             serde_json::to_value(&results[0]).expect("serialize")["score"],
             json!(0.123_456_789_012_345)
