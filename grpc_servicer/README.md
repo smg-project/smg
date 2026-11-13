@@ -1215,7 +1215,7 @@ are supplied, they must match. For example, with `SMG_URL` set to the gateway's 
 
 ```bash
 curl "$SMG_URL/generate" -H 'Content-Type: application/json' \
-    -d '{"text":"Hello","lora_path":"adapter","sampling_params":{"max_new_tokens":16}}'
+    -d '{"model":"BASE_MODEL","text":"Hello","lora_path":"adapter","sampling_params":{"max_new_tokens":16}}'
 ```
 
 The worker resolves adapter names to SGLang's preloaded internal IDs; direct
