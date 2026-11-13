@@ -154,7 +154,7 @@ impl ChatStreamUsage {
     }
 
     /// The usage so far, in the shape of the request's final usage.
-    fn snapshot(&self, unbilled_prompt_tokens: u32) -> Usage {
+    fn snapshot(&self, unbilled_prompt_tokens: u32, image_tokens: Option<u32>) -> Usage {
         // Choices share one prompt/cache but each generates its own output.
         let counts = TokenCounts {
             prompt: self.choices.values().map(|c| c.prompt).max().unwrap_or(0),
@@ -176,6 +176,7 @@ impl ChatStreamUsage {
             self.reasoning_parsed
                 .then(|| self.choices.values().map(|c| c.reasoning_parsed).sum()),
             unbilled_prompt_tokens,
+            image_tokens,
         )
     }
 }
@@ -3458,9 +3459,9 @@ impl<'a> ChatStream<'a> {
 
     /// The usage a chunk carries when the client asked for continuous usage.
     fn usage_snapshot(&self) -> Option<Usage> {
-        self.continuous_usage
-            .as_ref()
-            .map(|tracker| tracker.snapshot(self.spec.unbilled_prompt_tokens))
+        self.continuous_usage.as_ref().map(|tracker| {
+            tracker.snapshot(self.spec.unbilled_prompt_tokens, self.spec.image_tokens)
+        })
     }
 
     /// The stream's first engine output, for the TTFT.
@@ -4257,7 +4258,9 @@ impl<'a> ChatStream<'a> {
                 self.choices[index as usize].parsed_reasoning_tokens += chunk_reasoning_tokens;
                 if let Some(tracker) = &mut self.continuous_usage {
                     tracker.record_reasoning(index, chunk_reasoning_tokens);
-                    usage = Some(tracker.snapshot(self.spec.unbilled_prompt_tokens));
+                    usage = Some(
+                        tracker.snapshot(self.spec.unbilled_prompt_tokens, self.spec.image_tokens),
+                    );
                 }
             }
             if let Some(mut choice) = reasoning_choice {
@@ -4508,6 +4511,7 @@ impl<'a> ChatStream<'a> {
                         .sum()
                 }),
                 self.spec.unbilled_prompt_tokens,
+                self.spec.image_tokens,
             )
         })
     }

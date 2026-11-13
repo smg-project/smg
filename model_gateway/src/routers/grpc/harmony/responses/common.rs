@@ -1,6 +1,6 @@
 //! Shared helpers and state tracking for Harmony Responses
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use openai_protocol::{
     common::ToolCall,
@@ -82,6 +82,13 @@ pub(super) fn open_mcp_session<'a>(
         );
     }
     session
+}
+
+/// The loop's request back as an owned value once an iteration has run with
+/// it: the iteration's context let go of its share when the run returned, so
+/// this is a move; a copy only while something still shares it.
+pub(super) fn owned_request(request: Arc<ResponsesRequest>) -> ResponsesRequest {
+    Arc::try_unwrap(request).unwrap_or_else(|shared| (*shared).clone())
 }
 
 /// Build next request with tool results appended to history

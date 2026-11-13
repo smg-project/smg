@@ -29,6 +29,8 @@ pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, M
 pub struct MlxEngineClient {
     client: proto::mlx_engine_client::MlxEngineClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    /// The client's own channel, the one its generated stub rides.
+    channel: Channel,
 }
 
 crate::impl_abort_for_drop_with_reason!(MlxEngineClient);
