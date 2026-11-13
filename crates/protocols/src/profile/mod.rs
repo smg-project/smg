@@ -179,6 +179,13 @@ impl ProviderProfile {
         registered.unwrap_or_else(|| Self::from_model_segments(model))
     }
 
+    /// Whether a model id selects the GLM-5.3-Flash Chat Completions
+    /// tool-reference syntax. Opaque model names can inherit the Flash contract
+    /// through the registered aliases.
+    pub fn supports_chat_tool_references(self, model: &str) -> bool {
+        self == Self::Zai && zai::is_glm53_flash(model)
+    }
+
     /// The thinking on/off preference the profile reads from a request's
     /// effective `reasoning_effort` (`thinking.effort`, else the top-level
     /// field) when the request states no `thinking.type`. The OpenAI reading
