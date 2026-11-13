@@ -1481,24 +1481,44 @@ impl std::fmt::Debug for PolicyRegistry {
     }
 }
 
-/// The headers a document's bindings read a session key from, in binding
-/// order with each binding's sticky header first and every name once.
+/// The headers a document's bindings read a session key from, in their
+/// declared order (`sessions.headers`, or the sticky header alone when that
+/// list is empty). The registry resolves one list per gateway on this base,
+/// so the bindings that keep sessions must agree on it: a document whose
+/// bindings disagree is refused here, naming both lists, until the key is
+/// resolved per matched binding.
 fn session_headers_of(spec: &PolicySpec) -> Result<Vec<HeaderName>, EngineHostError> {
-    let mut names: Vec<HeaderName> = Vec::new();
+    let mut agreed: Option<Vec<String>> = None;
     for sessions in spec
         .bindings
         .iter()
         .filter_map(|binding| binding.sessions.as_ref())
     {
-        for name in std::iter::once(&sessions.sticky_header).chain(sessions.headers.iter()) {
-            let header = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| EngineHostError::SessionHeader(name.clone()))?;
-            if !names.contains(&header) {
-                names.push(header);
+        let declared = if sessions.headers.is_empty() {
+            vec![sessions.sticky_header.clone()]
+        } else {
+            sessions.headers.clone()
+        };
+        match &agreed {
+            None => agreed = Some(declared),
+            Some(first) if *first == declared => {}
+            Some(first) => {
+                return Err(EngineHostError::SessionHeaders(format!(
+                    "{} and {}",
+                    first.join(","),
+                    declared.join(",")
+                )));
             }
         }
     }
-    Ok(names)
+    agreed
+        .unwrap_or_default()
+        .iter()
+        .map(|name| {
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| EngineHostError::SessionHeader(name.clone()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3719,23 +3739,51 @@ mod tests {
     }
 
     /// Under a document whose binding keeps sessions, the registry resolves
-    /// a request's routing key from the document's session header, not from
-    /// the command line's list.
+    /// a request's routing key from the document's session headers in their
+    /// declared order, not from the command line's list: the first header
+    /// listed wins when several are present.
     #[test]
-    fn with_policy_spec_resolves_the_documents_session_header() {
+    fn with_policy_spec_resolves_the_documents_session_headers_in_their_order() {
         let mut spec = PolicySpec::preset("round_robin").expect("a preset document");
-        spec.view.headers.push("x-session-id".to_string());
-        spec.bindings[0].sessions =
-            Some(serde_json::from_str(r#"{"sticky_header":"x-session-id"}"#).expect("a rule"));
+        spec.view.headers.push("x-primary".to_string());
+        spec.view.headers.push("x-fallback".to_string());
+        spec.bindings[0].sessions = Some(
+            serde_json::from_str(
+                r#"{"sticky_header":"x-fallback","headers":["x-primary","x-fallback"]}"#,
+            )
+            .expect("a sessions rule"),
+        );
         let registry = PolicyRegistry::new(PolicyConfig::Random)
             .with_policy_spec(&spec)
             .expect("the document's engine");
         let mut headers = HeaderMap::new();
-        headers.insert("x-session-id", "k-1".parse().expect("a header value"));
-        assert_eq!(registry.resolve_routing_key(Some(&headers)), Some("k-1"));
+        headers.insert("x-fallback", "k-fallback".parse().expect("a header value"));
+        headers.insert("x-primary", "k-primary".parse().expect("a header value"));
+        assert_eq!(
+            registry.resolve_routing_key(Some(&headers)),
+            Some("k-primary")
+        );
         assert_eq!(
             registry.routing_key_header().map(HeaderName::as_str),
-            Some("x-session-id")
+            Some("x-primary")
         );
+    }
+
+    /// Bindings of one document that read a session key from different
+    /// header lists are refused at the apply, naming both lists: the registry
+    /// resolves one list per gateway on this base.
+    #[test]
+    fn a_document_whose_bindings_disagree_on_session_headers_is_refused() {
+        let mut spec = PolicySpec::preset("round_robin").expect("a preset document");
+        let mut second = spec.bindings[0].clone();
+        spec.bindings[0].sessions =
+            Some(serde_json::from_str(r#"{"sticky_header":"x-a"}"#).expect("a rule"));
+        second.sessions = Some(serde_json::from_str(r#"{"sticky_header":"x-b"}"#).expect("a rule"));
+        spec.bindings.push(second);
+        let error = session_headers_of(&spec)
+            .map(drop)
+            .expect_err("two lists are refused")
+            .to_string();
+        assert!(error.contains("x-a and x-b"), "{error}");
     }
 }

@@ -106,6 +106,10 @@ pub enum EngineHostError {
     /// A session header a document names that the HTTP layer cannot read.
     #[error("the document's session header {0:?} is not an HTTP header name")]
     SessionHeader(String),
+    /// Bindings of one document that read a session key from different
+    /// header lists; the registry resolves one list per gateway on this base.
+    #[error("the document's bindings disagree on their session headers ({0}); one list per gateway on this base")]
+    SessionHeaders(String),
     #[error(transparent)]
     Spec(#[from] SpecError),
 }

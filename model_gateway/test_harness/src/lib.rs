@@ -39,10 +39,9 @@ use openai_protocol::common::{Function, Tool};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
 use smg::{
-    app_context::AppContext,
+    app_context::{policy_registry_for, AppContext},
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
-    app_context::policy_registry_for,
     routers::{gateway::Gateway, RouterFactory, RouterTrait},
     worker::{
         BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,

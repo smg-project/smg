@@ -4708,24 +4708,6 @@ mod tests {
         assert!(help.contains(&carried), "{help}");
     }
 
-    /// `--policy`'s command-line default is the value the document rule
-    /// reads as unset, from the one constant.
-    #[test]
-    fn the_policy_flag_default_is_the_documents_unset_value() {
-        use clap::CommandFactory;
-        let command = Cli::command();
-        let policy = command
-            .get_arguments()
-            .find(|arg| arg.get_id() == "policy")
-            .expect("the --policy flag");
-        let defaults: Vec<&str> = policy
-            .get_default_values()
-            .iter()
-            .filter_map(|value| value.to_str())
-            .collect();
-        assert_eq!(defaults, [smg::config::CLI_DEFAULT_POLICY]);
-    }
-
     /// The flag's help states the ceiling the validator refuses above and
     /// the multiple of the CPUs the start-up warns above, as the constants
     /// hold them.

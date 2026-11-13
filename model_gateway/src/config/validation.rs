@@ -496,46 +496,32 @@ pub const POLICIES_THE_ENGINE_CARRIES: &str = "random, round_robin, passthrough,
     (expected_wait, requests, least_requests), least_load, manual and cache_aware in its default \
     form";
 
-/// The name `--policy` defaults to on the command line (main.rs pins it).
-/// The document rule reads this value as unset: this base keeps no record of
-/// which flags were given, so only a `--policy` off this default is a
-/// disagreement with a document the gateway can see.
-pub const CLI_DEFAULT_POLICY: &str = "cache_aware";
-
 impl ConfigValidator {
     /// The first stage of the document-beside-flags rule. `--policy-spec`
-    /// stands in for the flags that choose and tune a policy, so one set
-    /// beside a document is refused by name, naming the document: `--policy`
-    /// off its command-line default ([`CLI_DEFAULT_POLICY`] reads as unset),
-    /// `--routing-key-override` and `--routing-key-headers` (read with the
-    /// override off too). On this base the pair sides still decide
-    /// through `--prefill-policy` and `--decode-policy` past any engine, so a
-    /// document is refused under the pair modes until the pair decider reads
-    /// it. A later stage reads the given flags themselves and compiles the
-    /// agreeing ones into the document.
+    /// stands in for the flags that choose and tune a policy. The ones whose
+    /// setting the configuration shows are refused by name beside a document,
+    /// naming it: `--routing-key-override` and `--routing-key-headers` off
+    /// their defaults, and the pair modes with `--enable-igw` (on this base
+    /// the pair sides, the IGW routers' included, still decide through the
+    /// flags' policies past any engine, until the pair decider reads the
+    /// document). `--policy` itself is not read under a document: the
+    /// configuration keeps no record of which flags were given, so the
+    /// registry stands over a neutral configuration and the start says so; a
+    /// later stage reads the given flags and refuses a disagreeing one.
     fn validate_policy_spec_conflicts(config: &RouterConfig, path: &Path) -> ConfigResult<()> {
         let document = path.display();
-        if matches!(
+        let paired = matches!(
             config.mode,
             RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
-        ) {
+        );
+        if paired || config.enable_igw {
             return Err(ConfigError::invalid_value(
                 "policy_spec",
                 document.to_string(),
                 "a document decides the regular path on this release: under a prefill-decode or \
-                 encode-prefill-decode deployment the pair sides read --prefill-policy and \
-                 --decode-policy, so --policy-spec is refused there until the pair decider \
-                 reads the document",
-            ));
-        }
-        if config.policy.name() != CLI_DEFAULT_POLICY {
-            return Err(ConfigError::invalid_value(
-                "policy",
-                config.policy.name(),
-                format!(
-                    "--policy-spec {document} stands in for --policy: drop the flag, or write the \
-                     profile under profiles: and bind it in the document"
-                ),
+                 encode-prefill-decode deployment, and under --enable-igw whose routers pair \
+                 too, the pair sides read --prefill-policy and --decode-policy, so --policy-spec \
+                 is refused there until the pair decider reads the document",
             ));
         }
         if config.routing_key_override.enabled {
@@ -2918,10 +2904,10 @@ mod tests {
     }
 
     /// `--policy-spec` is the engine's and stands in for the flags: under the
-    /// legacy default it is refused by name; under the engine the command-line
-    /// default of `--policy` passes as unset, a `--policy` off it,
-    /// `--routing-key-override` and `--routing-key-headers` are refused naming
-    /// the document, and the pair modes refuse a document on this base.
+    /// legacy default it is refused by name; under the engine `--policy` is
+    /// not read (any value passes), `--routing-key-override` and
+    /// `--routing-key-headers` are refused naming the document, and the pair
+    /// modes and `--enable-igw` refuse a document on this base.
     #[test]
     fn a_policy_spec_needs_the_engine_and_refuses_the_flags_it_stands_in_for() {
         let path = "/etc/smg/policy/spec.yaml";
@@ -2948,16 +2934,26 @@ mod tests {
         };
         assert!(
             ConfigValidator::validate(&engine).is_ok(),
-            "the command-line default of --policy passes as unset"
+            "a document beside the default flags passes"
         );
 
-        let off_default = RouterConfig {
+        let another = RouterConfig {
             policy: PolicyConfig::Random,
             ..engine.clone()
         };
-        let (field, value, text) = refusal(&off_default);
-        assert_eq!((field.as_str(), value.as_str()), ("policy", "random"));
-        assert!(text.contains(path) && text.contains("--policy:"), "{text}");
+        assert!(
+            ConfigValidator::validate(&another).is_ok(),
+            "--policy is not read under a document on this base"
+        );
+
+        let mut igw = engine.clone();
+        igw.enable_igw = true;
+        let (field, value, text) = refusal(&igw);
+        assert_eq!((field.as_str(), value.as_str()), ("policy_spec", path));
+        assert!(
+            text.contains("--enable-igw") && text.contains("pair decider"),
+            "{text}"
+        );
 
         let mut sticky = engine.clone();
         sticky.routing_key_override.enabled = true;
