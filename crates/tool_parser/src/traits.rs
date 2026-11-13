@@ -3,7 +3,7 @@ use openai_protocol::common::Tool;
 
 use crate::{
     errors::ParserResult,
-    types::{StreamingParseResult, ToolCall},
+    types::{StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// Core trait for all tool parsers
@@ -41,7 +41,7 @@ pub trait ToolParser: Send + Sync {
 
     /// Get unstreamed tool call arguments
     /// Returns tool call items for arguments that have been parsed but not yet streamed
-    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::types::ToolCallItem>> {
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         None
     }
 
