@@ -103,18 +103,27 @@ impl LeaseBackend for FileLease {
         tmp.sync_all().map_err(|err| self.io(err))?;
         drop(tmp);
         fs::rename(&self.tmp, &self.path).map_err(|err| self.io(err))?;
-        // The rename is durable once the directory is: a crash before this
-        // sync surfaces the old record, never an empty file.
-        if let Some(dir) = self.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-            File::open(dir)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|err| self.io(err))?;
-        }
+        // The record is written once renamed. The directory sync makes the
+        // rename durable across a crash (a crash before it surfaces the old
+        // record, never an empty file); it is best effort, because the write
+        // has landed whatever it answers, and a filesystem that refuses to
+        // sync a directory would otherwise report every landed write as
+        // failed.
+        let _ = File::open(directory_of(&self.path)).and_then(|dir| dir.sync_all());
         Ok(Written::Done)
     }
 
     fn place(&self) -> String {
         self.path.display().to_string()
+    }
+}
+
+/// The directory a lease path lives in: the working directory for a bare
+/// file name.
+fn directory_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
     }
 }
 
@@ -151,6 +160,16 @@ mod tests {
             ElectionSettings::default(),
         )
         .expect("valid settings")
+    }
+
+    #[test]
+    fn a_bare_file_name_lives_in_the_working_directory() {
+        assert_eq!(directory_of(Path::new("policy.lease")), Path::new("."));
+        assert_eq!(
+            directory_of(Path::new("/var/lib/smg/policy.lease")),
+            Path::new("/var/lib/smg")
+        );
+        assert_eq!(directory_of(Path::new("state/lease")), Path::new("state"));
     }
 
     #[test]

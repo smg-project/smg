@@ -46,8 +46,14 @@
 //! stop. A backend call blocks that thread alone; the shard threads read the
 //! fence's snapshot, never the backend. The identity is
 //! `controller-id@host:port`, dialable without a Service and unique per
-//! instance: two instances under one identity would both count the lease as
-//! their own.
+//! instance. A restart under the same identity resumes its own record once
+//! the record stood still for a renew period (the earlier run is gone); a
+//! second instance under a duplicated identity sees the record move under
+//! its name and refuses to take it, so two fences never open under one term.
+//! A write that landed but reported an error (a sync that failed after the
+//! rename, an update the server applied before the call timed out) is told
+//! from a stranger's by the record the elector attempted, and is adopted as
+//! its own.
 
 mod file;
 
@@ -276,6 +282,15 @@ pub struct Elector {
     observed: Option<Observation>,
     /// The record this process wrote last while holding the lease.
     held: Option<LeaseRecord>,
+    /// The record of the last write that reported an error: it may have
+    /// landed (a sync that failed after the rename, an update that timed out
+    /// after the server applied it), and a stored record equal to it is this
+    /// process's own.
+    attempted: Option<LeaseRecord>,
+    /// New shapes of the record under this identity that this run did not
+    /// write: the first is the earlier run's last write, a second is another
+    /// candidate under a duplicated identity.
+    strangers: u32,
 }
 
 impl fmt::Debug for Elector {
@@ -310,6 +325,8 @@ impl Elector {
             fence: Arc::new(Fence::new(settings.renew_deadline)),
             observed: None,
             held: None,
+            attempted: None,
+            strangers: 0,
         })
     }
 
@@ -361,11 +378,11 @@ impl Elector {
 
     /// Give the lease up: the record is rewritten released, so the next
     /// candidate to look takes it at once. The fence closes now and stays
-    /// closed. `true` when this process rewrote the record; `false` when it
-    /// held nothing, or when the lease had moved under it already. On an
-    /// error the record stays held by this identity and the elector keeps
-    /// it, so a second call retries the write; a caller that ticks instead
-    /// renews.
+    /// closed. `true` when the lease is released now, by this call's write
+    /// or by an earlier one of this process that landed and reported an
+    /// error; `false` when it held nothing, or when another candidate holds
+    /// the lease. On an error the elector keeps the record, so a second call
+    /// retries the write; a caller that ticks instead renews.
     pub fn release(&mut self) -> Result<bool, ElectError> {
         let Some(mine) = self.held.clone() else {
             return Ok(false);
@@ -377,43 +394,90 @@ impl Elector {
             renewed_at_micros: next_wall_micros(mine.renewed_at_micros),
             ..mine.clone()
         };
-        let written = self.backend.write(Some(&mine), &released)?;
-        self.held = None;
-        if written == Written::Done {
-            if let Some(observation) = &mut self.observed {
-                observation.record = released;
+        let written = match self.backend.write(Some(&mine), &released) {
+            Ok(written) => written,
+            Err(err) => {
+                self.attempted = Some(released);
+                return Err(err);
             }
+        };
+        self.held = None;
+        self.attempted = None;
+        match written {
+            Written::Done => {
+                if let Some(observation) = &mut self.observed {
+                    observation.record = released;
+                }
+                Ok(true)
+            }
+            // Another candidate's write, or this process's own release that
+            // landed and reported an error: released under this term.
+            Written::Moved => Ok(self
+                .backend
+                .read()?
+                .is_some_and(|stored| stored.is_released() && stored.term == mine.term)),
         }
-        Ok(written == Written::Done)
     }
 
     fn observe(&mut self, current: Option<&LeaseRecord>, now: Instant) {
-        match (current, &mut self.observed) {
-            (Some(record), Some(observation)) if observation.record == *record => {}
-            (Some(record), observation) => {
-                *observation = Some(Observation {
-                    record: record.clone(),
-                    since: now,
-                });
-            }
-            (None, observation) => *observation = None,
+        let Some(record) = current else {
+            self.observed = None;
+            self.attempted = None;
+            return;
+        };
+        if self.observed.as_ref().is_some_and(|o| o.record == *record) {
+            return;
         }
+        // A new shape. The write this run attempted and lost sight of is its
+        // own and stays for the adoption; any other supersedes the attempt,
+        // and one under this identity was written by another run under this
+        // name: the earlier run's last write at the first sight, or a
+        // candidate under a duplicated identity.
+        if self.attempted.as_ref() != Some(record) {
+            self.attempted = None;
+            if record.holder == self.identity {
+                self.strangers += 1;
+            }
+        }
+        self.observed = Some(Observation {
+            record: record.clone(),
+            since: now,
+        });
     }
 
     fn renew(
         &mut self,
         current: Option<LeaseRecord>,
-        mine: LeaseRecord,
+        mut mine: LeaseRecord,
         now: Instant,
     ) -> Result<Tick, ElectError> {
-        if current.as_ref() != Some(&mine) {
-            return Ok(self.lose(mine.term, current));
+        if current.as_ref() == Some(&mine) {
+            // An attempt that reported an error never landed: the record is
+            // still the one before it.
+            self.attempted = None;
+        } else {
+            match (current, self.attempted.take()) {
+                // The attempt landed after all: the stored record is this
+                // process's own, renewed from here.
+                (Some(stored), Some(attempted)) if stored == attempted => {
+                    mine = stored;
+                    self.held = Some(mine.clone());
+                }
+                (current, _) => return Ok(self.lose(mine.term, current)),
+            }
         }
         let renewed = LeaseRecord {
             renewed_at_micros: next_wall_micros(mine.renewed_at_micros),
             ..mine.clone()
         };
-        match self.backend.write(Some(&mine), &renewed)? {
+        let written = match self.backend.write(Some(&mine), &renewed) {
+            Ok(written) => written,
+            Err(err) => {
+                self.attempted = Some(renewed);
+                return Err(err);
+            }
+        };
+        match written {
             Written::Done => {
                 self.fence.set(renewed.term, Some(now));
                 self.observed = Some(Observation {
@@ -443,8 +507,28 @@ impl Elector {
         let (term, acquired_at_micros) = match &current {
             None => (1, 0),
             Some(record) if record.is_released() => (record.term + 1, 0),
-            // The same identity again: its own lease, under its own term.
+            // The write this run attempted landed after all: its own lease.
+            Some(record) if self.attempted.as_ref() == Some(record) => {
+                (record.term, record.acquired_at_micros)
+            }
+            // A record under this identity that this run did not write: the
+            // earlier run's, resumed under its term once it stood still for
+            // a renew period (the earlier run is gone); one that moves again
+            // is another candidate under a duplicated identity, which would
+            // open a second fence under one term, so it is refused.
             Some(record) if record.holder == self.identity => {
+                if self.strangers > 1 {
+                    return Err(ElectError::Identity(
+                        "another candidate writes under this identity",
+                    ));
+                }
+                let since = self.observed.as_ref().map_or(now, |o| o.since);
+                if now.saturating_duration_since(since) < self.settings.renew_period {
+                    return Ok(Tick::Following {
+                        holder: record.holder.clone(),
+                        term: record.term,
+                    });
+                }
                 (record.term, record.acquired_at_micros)
             }
             Some(record) => {
@@ -470,8 +554,16 @@ impl Elector {
             renewed_at_micros: wall,
             duration_ms: whole_millis_up(self.settings.duration),
         };
-        match self.backend.write(current.as_ref(), &record)? {
+        let written = match self.backend.write(current.as_ref(), &record) {
+            Ok(written) => written,
+            Err(err) => {
+                self.attempted = Some(record);
+                return Err(err);
+            }
+        };
+        match written {
             Written::Done => {
+                self.attempted = None;
                 self.fence.set(term, Some(now));
                 self.observed = Some(Observation {
                     record: record.clone(),
@@ -555,6 +647,10 @@ mod tests {
 
     use super::*;
 
+    /// One second. The tests' instants are `Instant::now() + S` and later:
+    /// the elector dates a first sight at the later of the caller's instant
+    /// and its own clock after the read, so synthetic instants stay one
+    /// second ahead of the real clock and are never overtaken by it.
     const S: Duration = Duration::from_secs(1);
 
     fn settings() -> ElectionSettings {
@@ -746,16 +842,66 @@ mod tests {
             a.tick(t0).expect("acquire");
             a.observed().expect("the record").acquired_at_micros
         };
-        // The process restarts: a fresh elector under the same identity.
+        // The process restarts: a fresh elector under the same identity. It
+        // resumes its record once the record stood still for a renew period
+        // from its first sight, which tells the earlier run's last write from
+        // a live writer under the same name.
         let mut again = candidate(&lease, "a@host:1");
+        let first_sight = t0 + S / 10;
         assert_eq!(
-            again.tick(t0 + S / 10).expect("resume"),
+            again.tick(first_sight).expect("look"),
+            Tick::Following {
+                holder: "a@host:1".to_string(),
+                term: 1
+            },
+            "not yet: the earlier run may still be writing"
+        );
+        assert!(matches!(
+            again
+                .tick(first_sight + S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Following { .. }
+        ));
+        assert_eq!(
+            again.tick(first_sight + S).expect("resume"),
             Tick::Acquired { term: 1 }
         );
         let record = again.observed().expect("the record");
         assert_eq!(record.acquired_at_micros, acquired_at, "the take stands");
         assert!(record.renewed_at_micros > acquired_at);
-        assert_eq!(again.fence().leader_term(t0 + S / 10), Some(1));
+        assert_eq!(again.fence().leader_term(first_sight + S), Some(1));
+    }
+
+    #[test]
+    fn two_electors_under_one_identity_never_both_lead() {
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let mut twin = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        // The twin sees a live record under its own name: it waits for a
+        // renew period of stillness, and the holder's renewal ends the wait
+        // with a refusal, never a take.
+        assert!(matches!(
+            twin.tick(t0 + S / 2).expect("look"),
+            Tick::Following { .. }
+        ));
+        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        let err = twin
+            .tick(t0 + S + S / 2)
+            .expect_err("a second writer under this identity");
+        assert_eq!(
+            err.to_string(),
+            "election identity: another candidate writes under this identity"
+        );
+        assert!(!twin.is_holder());
+        for i in 2..6u32 {
+            let now = t0 + i * S;
+            assert_eq!(a.tick(now).expect("renew"), Tick::Renewed { term: 1 });
+            twin.tick(now + S / 2).expect_err("refused for good");
+            assert_eq!(a.fence().leader_term(now), Some(1));
+            assert_eq!(twin.fence().leader_term(now + S / 2), None);
+        }
     }
 
     #[test]
@@ -1092,6 +1238,116 @@ mod tests {
         );
         assert_eq!(whole_millis_up(Duration::from_secs(3)), 3_000);
         assert_eq!(whole_millis_up(Duration::from_millis(1)), 1);
+    }
+
+    /// A backend whose write lands and then reports an error while `fails`
+    /// is above zero: a sync that failed after the rename, an update the
+    /// server applied before the call timed out.
+    struct LandsThenErrors {
+        lease: MemoryLease,
+        fails: Arc<AtomicU32>,
+    }
+
+    impl LeaseBackend for LandsThenErrors {
+        fn read(&mut self) -> Result<Option<LeaseRecord>, ElectError> {
+            self.lease.read()
+        }
+
+        fn write(
+            &mut self,
+            expected: Option<&LeaseRecord>,
+            record: &LeaseRecord,
+        ) -> Result<Written, ElectError> {
+            let written = self.lease.write(expected, record)?;
+            if self.fails.load(Ordering::Relaxed) > 0 {
+                self.fails.fetch_sub(1, Ordering::Relaxed);
+                return Err(ElectError::Io {
+                    place: self.place(),
+                    source: std::io::Error::other("the answer was lost"),
+                });
+            }
+            Ok(written)
+        }
+
+        fn place(&self) -> String {
+            "lands-then-errors".to_string()
+        }
+    }
+
+    #[test]
+    fn a_write_that_landed_but_reported_an_error_is_this_runs_own() {
+        let lease = MemoryLease::new();
+        let fails = Arc::new(AtomicU32::new(1));
+        let backend = LandsThenErrors {
+            lease: lease.clone(),
+            fails: Arc::clone(&fails),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + S;
+        // The take lands and the answer is lost.
+        a.tick(t0).expect_err("the answer was lost");
+        assert!(!a.is_holder());
+        assert_eq!(
+            a.fence().leader_term(t0),
+            None,
+            "no fence on an unanswered take"
+        );
+        assert_eq!(
+            lease
+                .clone()
+                .read()
+                .expect("read")
+                .expect("the record")
+                .holder,
+            "a@host:1"
+        );
+        // The next look finds this run's own write and takes it at once.
+        assert_eq!(a.tick(t0 + S).expect("own"), Tick::Acquired { term: 1 });
+        assert_eq!(a.fence().leader_term(t0 + S), Some(1));
+        // A renewal lands and the answer is lost: the record is still this
+        // run's own, renewed from there, never a loss.
+        fails.store(1, Ordering::Relaxed);
+        a.tick(t0 + 2 * S).expect_err("the answer was lost");
+        assert!(a.is_holder());
+        assert_eq!(
+            a.tick(t0 + 3 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(a.fence().leader_term(t0 + 3 * S), Some(1));
+        // A standby under another name saw a live record throughout.
+        let mut b = candidate(&lease, "b@host:2");
+        assert!(matches!(
+            b.tick(t0 + 3 * S).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_release_that_landed_but_errored_reads_as_released_on_the_retry() {
+        let lease = MemoryLease::new();
+        let fails = Arc::new(AtomicU32::new(0));
+        let backend = LandsThenErrors {
+            lease: lease.clone(),
+            fails: Arc::clone(&fails),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + S;
+        a.tick(t0).expect("acquire");
+        fails.store(1, Ordering::Relaxed);
+        a.release().expect_err("the answer was lost");
+        assert!(a.is_holder(), "kept for the retry");
+        assert!(
+            lease
+                .clone()
+                .read()
+                .expect("read")
+                .expect("the record")
+                .is_released(),
+            "the release landed"
+        );
+        assert!(a.release().expect("the retry"), "released after all");
+        assert!(!a.is_holder());
+        assert_eq!(a.fence().leader_term(t0), None);
     }
 
     #[test]
