@@ -85,6 +85,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A rerank score keeps the worker's double precision, as SGLang writes it: `RerankResult.score`
+  was an `f32`, so a worker's `0.123456789012345` was answered as `0.12345679`. Breaking: `score`
+  is an `f64`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

@@ -141,9 +141,10 @@ impl RerankRequest {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RerankResult {
-    /// Relevance score for the document
+    /// Relevance score for the document, at the double precision SGLang
+    /// writes it in
     #[serde(alias = "relevance_score")]
-    pub score: f32,
+    pub score: f64,
 
     /// The document text (if return_documents was true)
     #[serde(default, alias = "text", deserialize_with = "deserialize_document")]
@@ -389,6 +390,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// SGLang writes a rerank score as a double: the gateway reads it and
+    /// writes it back at the precision it came in.
+    #[test]
+    fn a_rerank_score_keeps_the_workers_double_precision() {
+        let answer: RerankWorkerResponse = serde_json::from_value(json!({
+            "results": [{"index": 0, "relevance_score": 0.123_456_789_012_345}]
+        }))
+        .expect("a worker's answer");
+        let results = answer.into_results();
+        assert_eq!(results[0].score, 0.123_456_789_012_345);
+        assert_eq!(
+            serde_json::to_value(&results[0]).expect("serialize")["score"],
+            json!(0.123_456_789_012_345)
+        );
+    }
 
     /// A request without a `rid` writes no `rid` key, so the proxy's strip
     /// of the engine defaults finds nothing to drop and forwards the
