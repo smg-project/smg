@@ -300,10 +300,11 @@ fn unreplayed_kind(item: &ResponseInputOutputItem) -> Option<&'static str> {
 }
 
 /// What a stored hosted tool call replays as its result: its output when it
-/// has one, else its error's text when it failed (a failed call stores an
-/// empty output and the failure under `error`; replaying it as an empty
-/// result would tell the model the call succeeded and said nothing), else
-/// nothing (a call that has not run).
+/// has one, else its error's text when it failed (a failed call stores a
+/// `null` output, an empty one in a record an older gateway wrote, and the
+/// failure under `error`; replaying it as an empty result would tell the model
+/// the call succeeded and said nothing), else nothing (a call that has not
+/// run).
 pub(crate) fn hosted_call_result(
     output: Option<&str>,
     error: Option<&McpToolCallError>,

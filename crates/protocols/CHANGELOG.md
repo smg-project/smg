@@ -70,6 +70,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A tool call item without output reads and writes `null` where the public API does: an
+  `mcp_call`'s `output` (a failed call), an `image_generation_call`'s `result` (no image) and a
+  `code_interpreter_call`'s `code` and `outputs`. The first two were plain strings: a typed read
+  of `null` failed, as did one of a stored image call (storage removes its `result`), and smg
+  wrote `""` where the public API writes `null`. The last two were left out when absent, though
+  the public API requires both keys. Breaking: `ResponseOutputItem::McpCall.output` and
+  `ResponseOutputItem::ImageGenerationCall.result` are `Option<String>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

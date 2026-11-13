@@ -63,7 +63,7 @@ fn failed_mcp_call(output: &smg_mcp::ToolExecutionOutput) -> ResponseOutputItem 
         arguments: output.arguments_str.clone(),
         error: Some(McpToolCallError::execution(err_msg)),
         name: output.tool_name.clone(),
-        output: String::new(),
+        output: None,
         server_label: output.server_label.clone(),
     }
 }
@@ -178,7 +178,7 @@ impl ResponseTransformer {
             arguments: arguments.to_string(),
             error: None,
             name: tool_name.to_string(),
-            output: Self::flatten_mcp_output(result),
+            output: Some(Self::flatten_mcp_output(result)),
             server_label: server_label.to_string(),
         }
     }
@@ -341,12 +341,11 @@ impl ResponseTransformer {
             background: fields.background,
             output_format: fields.output_format,
             quality: fields.quality,
-            // `result` is non-optional in the spec; fall back to an empty
-            // string when the MCP server returns no image data so the shape
-            // still matches `ResponseOutputItem::ImageGenerationCall`. Router
-            // wiring is responsible for surfacing an error status when
-            // `image_b64` is missing.
-            result: fields.image_b64.unwrap_or_default(),
+            // `null` when the MCP server returned no image data, as the
+            // public API writes a call without an image. Router wiring is
+            // responsible for surfacing an error status when `image_b64` is
+            // missing.
+            result: fields.image_b64,
             revised_prompt: fields.revised_prompt,
             size: fields.size,
             status: ImageGenerationCallStatus::Completed,
@@ -653,14 +652,15 @@ impl ResponseTransformer {
 /// Per OpenAI spec the `result` field is required on the wire when the item
 /// is freshly emitted, but multi-turn replay/storage references the image by
 /// `id` only (see `ResponseInputOutputItem::ImageGenerationCall` where
-/// `result` is `Option<String>`). This helper clears the payload for storage
-/// while preserving `id`, `revised_prompt`, and `status`.
+/// `result` is `Option<String>`). This helper drops the payload for storage
+/// (`result` becomes `None`) while preserving `id`, `revised_prompt`, and
+/// `status`.
 ///
 /// For any non-image item this is a no-op.
 pub fn compact_image_generation_output(item: &mut ResponseOutputItem) {
     if let ResponseOutputItem::ImageGenerationCall { result, .. } = item {
         // Drop the heap buffer; `clear()` would retain (multi-MB) capacity.
-        *result = String::new();
+        *result = None;
     }
 }
 
@@ -729,7 +729,7 @@ mod tests {
         match transformed {
             ResponseOutputItem::McpCall { id, output, .. } => {
                 assert_eq!(id, "mcp_test-1");
-                assert!(output.contains("key"));
+                assert!(output.is_some_and(|output| output.contains("key")));
             }
             _ => panic!("Expected McpCall"),
         }
@@ -752,7 +752,7 @@ mod tests {
 
         match transformed {
             ResponseOutputItem::McpCall { output, .. } => {
-                assert_eq!(output, "hello from mcp");
+                assert_eq!(output.as_deref(), Some("hello from mcp"));
             }
             _ => panic!("Expected McpCall"),
         }
@@ -796,7 +796,7 @@ mod tests {
 
         match transformed {
             ResponseOutputItem::McpCall { output, .. } => {
-                assert_eq!(output, "first block\nsecond block");
+                assert_eq!(output.as_deref(), Some("first block\nsecond block"));
             }
             _ => panic!("Expected McpCall"),
         }
@@ -841,7 +841,7 @@ mod tests {
 
         match transformed {
             ResponseOutputItem::McpCall { output, .. } => {
-                assert_eq!(output, "kept text");
+                assert_eq!(output.as_deref(), Some("kept text"));
             }
             _ => panic!("Expected McpCall"),
         }
@@ -865,7 +865,7 @@ mod tests {
 
         match transformed {
             ResponseOutputItem::McpCall { output, .. } => {
-                assert_eq!(output, "kept text");
+                assert_eq!(output.as_deref(), Some("kept text"));
             }
             _ => panic!("Expected McpCall"),
         }
@@ -891,7 +891,7 @@ mod tests {
 
         match transformed {
             ResponseOutputItem::McpCall { output, .. } => {
-                assert_eq!(output, "tool execution failed");
+                assert_eq!(output.as_deref(), Some("tool execution failed"));
             }
             _ => panic!("Expected McpCall"),
         }
@@ -920,7 +920,7 @@ mod tests {
 
         match transformed {
             ResponseOutputItem::McpCall { output, .. } => {
-                assert_eq!(output, "hello\nimportant");
+                assert_eq!(output.as_deref(), Some("hello\nimportant"));
             }
             _ => panic!("Expected McpCall"),
         }
@@ -1160,7 +1160,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(id, "ig_req-img-1");
-                assert_eq!(result, "BASE64_IMAGE_BYTES");
+                assert_eq!(result.as_deref(), Some("BASE64_IMAGE_BYTES"));
                 assert_eq!(
                     revised_prompt,
                     Some("a serene mountain at sunrise".to_string())
@@ -1192,7 +1192,7 @@ mod tests {
                 revised_prompt,
                 ..
             } => {
-                assert_eq!(result, "PNG_BASE64");
+                assert_eq!(result.as_deref(), Some("PNG_BASE64"));
                 assert!(revised_prompt.is_none());
             }
             _ => panic!("Expected ImageGenerationCall"),
@@ -1228,7 +1228,7 @@ mod tests {
                 revised_prompt,
                 ..
             } => {
-                assert_eq!(result, "EMBEDDED_BYTES");
+                assert_eq!(result.as_deref(), Some("EMBEDDED_BYTES"));
                 assert_eq!(revised_prompt, Some("tweaked prompt".to_string()));
             }
             _ => panic!("Expected ImageGenerationCall"),
@@ -1270,7 +1270,7 @@ mod tests {
                 revised_prompt,
                 ..
             } => {
-                assert_eq!(result, "TOP_LEVEL_BYTES");
+                assert_eq!(result.as_deref(), Some("TOP_LEVEL_BYTES"));
                 assert_eq!(revised_prompt, Some("a happy cat".to_string()));
             }
             _ => panic!("Expected ImageGenerationCall"),
@@ -1300,7 +1300,7 @@ mod tests {
 
         match transformed {
             ResponseOutputItem::ImageGenerationCall { result, .. } => {
-                assert_eq!(result, "ALIAS_BYTES");
+                assert_eq!(result.as_deref(), Some("ALIAS_BYTES"));
             }
             _ => panic!("Expected ImageGenerationCall"),
         }
@@ -1345,7 +1345,7 @@ mod tests {
                 revised_prompt,
                 ..
             } => {
-                assert_eq!(result, "DISTRIBUTED_BYTES");
+                assert_eq!(result.as_deref(), Some("DISTRIBUTED_BYTES"));
                 assert_eq!(revised_prompt, Some("distributed prompt".to_string()));
             }
             _ => panic!("Expected ImageGenerationCall"),
@@ -1355,8 +1355,8 @@ mod tests {
     #[test]
     fn test_image_generation_transform_missing_image_data() {
         // When the MCP server returns neither image nor prompt, the transformer
-        // still produces a well-formed ImageGenerationCall with an empty result.
-        // Per-router wiring owns surfacing an error status.
+        // still produces a well-formed ImageGenerationCall, with a `null`
+        // result. Per-router wiring owns surfacing an error status.
         let result = json!({});
 
         let transformed = ResponseTransformer::transform(
@@ -1377,7 +1377,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(id, "ig_req-img-4");
-                assert!(result.is_empty());
+                assert!(result.is_none());
                 assert!(revised_prompt.is_none());
                 assert_eq!(status, ImageGenerationCallStatus::Completed);
             }
@@ -1428,7 +1428,7 @@ mod tests {
                 assert_eq!(background.as_deref(), Some("opaque"));
                 assert_eq!(output_format.as_deref(), Some("png"));
                 assert_eq!(quality.as_deref(), Some("high"));
-                assert_eq!(result, "BASE64_IMAGE_BYTES");
+                assert_eq!(result.as_deref(), Some("BASE64_IMAGE_BYTES"));
                 assert_eq!(
                     revised_prompt.as_deref(),
                     Some("a serene mountain at sunrise")
@@ -1536,7 +1536,7 @@ mod tests {
             background: None,
             output_format: None,
             quality: None,
-            result: "A_VERY_LONG_BASE64_STRING".to_string(),
+            result: Some("A_VERY_LONG_BASE64_STRING".to_string()),
             revised_prompt: Some("mountain".to_string()),
             size: None,
             status: ImageGenerationCallStatus::Completed,
@@ -1553,7 +1553,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(id, "ig_abc");
-                assert!(result.is_empty());
+                assert!(result.is_none());
                 assert_eq!(revised_prompt, Some("mountain".to_string()));
                 assert_eq!(status, ImageGenerationCallStatus::Completed);
             }
@@ -1614,7 +1614,7 @@ mod tests {
             } => {
                 assert_eq!(status, "failed");
                 assert_eq!(error, Some(McpToolCallError::execution("upstream broke")));
-                assert_eq!(output, "");
+                assert_eq!(output, None);
                 assert_eq!(arguments, "{\"q\":\"v\"}");
                 assert_eq!(name, "brave_web_search");
             }
@@ -1662,6 +1662,40 @@ mod tests {
                 serde_json::json!("completed"),
                 "{fmt:?}"
             );
+        }
+    }
+
+    /// A call that produced no output writes `null` where the public API
+    /// does: a failed `mcp_call`'s `output`, the `result` of an image call
+    /// whose server returned no image, and the `code` and `outputs` of a code
+    /// interpreter call that reported neither.
+    #[test]
+    fn a_call_without_output_writes_null_where_the_public_api_does() {
+        let failed = transform_tool_output(
+            &failed_tool_output("brave_web_search"),
+            ResponseFormat::Passthrough,
+        );
+        let failed = serde_json::to_value(&failed).expect("serialize mcp_call");
+        assert_eq!(failed["output"], serde_json::Value::Null);
+        assert!(failed.as_object().unwrap().contains_key("output"));
+
+        for (format, keys) in [
+            (ResponseFormat::ImageGenerationCall, &["result"][..]),
+            (
+                ResponseFormat::CodeInterpreterCall,
+                &["code", "outputs"][..],
+            ),
+        ] {
+            let item = ResponseTransformer::transform(&json!({}), format, "call_1", "s", "t", "{}");
+            let item = serde_json::to_value(&item).expect("serialize item");
+            let object = item.as_object().unwrap();
+            for key in keys {
+                assert_eq!(
+                    object.get(*key),
+                    Some(&serde_json::Value::Null),
+                    "{format:?} {key}"
+                );
+            }
         }
     }
 
