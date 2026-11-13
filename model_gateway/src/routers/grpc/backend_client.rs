@@ -115,6 +115,18 @@ impl BackendClient {
         })
     }
 
+    /// How many engines a direct-ZMQ connection connected, one per
+    /// data-parallel rank: the ranks a TokenSpeed engine places a
+    /// disaggregated request among, on the rank its bootstrap room's residue
+    /// modulo this count names (a rank pin yields to the room). `None` on a
+    /// gRPC backend.
+    pub fn connected_engines(&self) -> Option<usize> {
+        match self {
+            Self::Grpc(_) => None,
+            Self::Zmq(client) => Some(client.engine_count()),
+        }
+    }
+
     /// The bootstrap rendezvous the engine behind a direct-ZMQ connection
     /// declared at its handshake (`host`, `port`): where a prefill or encode
     /// engine's bootstrap server listens. `None` on a gRPC backend, whose

@@ -201,6 +201,26 @@ fn fan_out_pd_request(
         .collect()
 }
 
+/// The sub-requests [`execute_fanout_pd`] dispatches for an n>1 request: each
+/// gets the PD metadata and a room of its own, moved into `room_residue`'s
+/// class when the request's sticky key pinned its prefill rank (see
+/// [`pin_grouped_dp_prefill_room`]), so every sample runs on the key's
+/// prefill engine.
+fn pd_fanout_requests(
+    request: &ProtoGenerateRequest,
+    n: u32,
+    workers: &WorkerSelection,
+    room_residue: Option<RoomResidue>,
+) -> Vec<ProtoGenerateRequest> {
+    fan_out_pd_request(request, n, |sub| {
+        maybe_inject_pd_metadata(sub, workers);
+        maybe_inject_pd_rendezvous(sub, workers);
+        if let Some(residue) = room_residue {
+            residue.apply(sub);
+        }
+    })
+}
+
 /// Metric connection labels for the PD sides (a side can be gRPC or ZMQ).
 fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     match workers {
@@ -229,7 +249,9 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// over every message on them (see [`RequestDeadline`]); `None` leaves the
 /// attempt unbounded. `grouped_dp_sticky` is `--grouped-dp-sticky`: whether,
 /// and how, a sticky request to a grouped data-parallel worker is pinned to
-/// one of its engines (see [`pin_grouped_dp_rank`]).
+/// one of its engines (see [`pin_grouped_dp_rank`]), and a disaggregated
+/// one's bootstrap room to its grouped prefill rank (see
+/// [`pin_grouped_dp_prefill_room`]).
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
@@ -291,6 +313,19 @@ pub(crate) async fn execute_plan(
         ctx.sticky_key.as_deref(),
         grouped_dp_sticky,
     );
+    // A sticky disaggregated request's room carries its key's prefill rank
+    // on a grouped prefill worker; an n>1 request's samples, which get rooms
+    // of their own at dispatch, take the same residue.
+    let room_residue = pin_grouped_dp_prefill_room(
+        &mut execution_plan,
+        workers,
+        || match &*clients {
+            ClientSelection::Disaggregated { prefill, .. } => prefill.connected_engines(),
+            ClientSelection::Single { .. } => None,
+        },
+        ctx.sticky_key.as_deref(),
+        grouped_dp_sticky,
+    );
     // The Prefill admission slot worker selection took for this attempt. It
     // is released when the Prefill phase ends, not with the load guards.
     let prefill_guard = ctx.pd_prefill_guard.take();
@@ -349,7 +384,16 @@ pub(crate) async fn execute_plan(
             },
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
+                execute_pd_dispatch(
+                    req,
+                    clients,
+                    workers,
+                    model,
+                    prefill_guard,
+                    ledger,
+                    room_residue,
+                )
+                .await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 let push_encode = matches!(encode, Some(EncodeOutputs::Push(_)));
@@ -492,6 +536,10 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
+/// Dispatch one disaggregated request in its runtime's shape.
+/// `room_residue` is the prefill rank the request's sticky key pinned its
+/// room to ([`pin_grouped_dp_prefill_room`]), which the rooms of an n>1
+/// request's samples take too.
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -499,6 +547,7 @@ async fn execute_pd_dispatch(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    room_residue: Option<RoomResidue>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -539,7 +588,16 @@ async fn execute_pd_dispatch(
         }
         PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
             Some(n) => {
-                execute_fanout_pd(proto_request, n, clients, workers, prefill_guard, ledger).await
+                execute_fanout_pd(
+                    proto_request,
+                    n,
+                    clients,
+                    workers,
+                    prefill_guard,
+                    ledger,
+                    room_residue,
+                )
+                .await
             }
             None => {
                 execute_parallel_pd(proto_request, clients, workers, prefill_guard, ledger).await
@@ -596,9 +654,10 @@ fn attribute_pd_sides(result: ExecutionResult, workers: &WorkerSelection) -> Exe
 }
 
 /// Dispatch an n>1 request as `n` concurrent single-sample PD pairs, each
-/// with its own rendezvous room, and merge their sides into one PD result
-/// whose responses carry the sample index. Fail-fast: the first pair that
-/// fails to start fails the request, and dropping the others aborts them.
+/// with its own rendezvous room ([`pd_fanout_requests`]), and merge their
+/// sides into one PD result whose responses carry the sample index.
+/// Fail-fast: the first pair that fails to start fails the request, and
+/// dropping the others aborts them.
 async fn execute_fanout_pd(
     proto_request: ProtoGenerateRequest,
     n: u32,
@@ -606,11 +665,9 @@ async fn execute_fanout_pd(
     workers: &WorkerSelection,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    room_residue: Option<RoomResidue>,
 ) -> Result<ExecutionResult, Response> {
-    let subs = fan_out_pd_request(&proto_request, n, |sub| {
-        maybe_inject_pd_metadata(sub, workers);
-        maybe_inject_pd_rendezvous(sub, workers);
-    });
+    let subs = pd_fanout_requests(&proto_request, n, workers, room_residue);
     debug!(
         request_id = proto_request.request_id(),
         samples = n,
@@ -701,6 +758,7 @@ async fn execute_epd_dispatch(
         // Text-only, or a retry whose first dispatch took the plan.
         None => proto_request.clear_mm_pixel_values(),
     }
+    // An EPD request's room is left as minted: no sticky prefill rank.
     let result = execute_pd_dispatch(
         proto_request,
         clients,
@@ -708,6 +766,7 @@ async fn execute_epd_dispatch(
         model,
         prefill_guard,
         ledger,
+        None,
     )
     .await;
     if result.is_ok() {
@@ -799,7 +858,8 @@ async fn execute_batch_dispatch(
                     ExecutionPlanKind::Single => {
                         execute_single(request, &mut clients, workers, ledger, dispatched_at).await
                     }
-                    // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
+                    // Completion EPD carries no encode jobs; sub-requests dispatch as PD,
+                    // each with the room it was minted (no sticky prefill rank).
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
                         let prefill_guard = require_prefill_guard(prefill_guard)?;
                         execute_pd_dispatch(
@@ -809,6 +869,7 @@ async fn execute_batch_dispatch(
                             model,
                             prefill_guard,
                             ledger,
+                            None,
                         )
                         .await
                     }
@@ -826,11 +887,12 @@ async fn execute_batch_dispatch(
 /// prefix caches. With a sticky key, pin the plan's single generate request
 /// to the key's rank instead, stable per key as dp-aware expansion pins gRPC
 /// and HTTP rank workers: under `sticky`, the key's hash rank. A batch's
-/// prompts, an embedding and a disaggregated request are left as they are.
-/// The ranks are the worker's `dp_size`, or, for a worker given no count
-/// (its engines declare the group at the handshake), the ranks its
-/// connection places a pin on, fixed for the connection's life:
-/// `pinnable_ranks` reads them, when the connection says (see
+/// prompts, an embedding and a disaggregated request (on TokenSpeed, its
+/// bootstrap room carries its prefill rank instead; see
+/// [`pin_grouped_dp_prefill_room`]) are left as they are. The ranks are the worker's `dp_size`, or, for a
+/// worker given no count (its engines declare the group at the handshake),
+/// the ranks its connection places a pin on, fixed for the connection's
+/// life: `pinnable_ranks` reads them, when the connection says (see
 /// [`BackendClient::pinnable_ranks`]), and only for a request that may be
 /// pinned. A key whose rank is not below `pinnable_ranks` (on vLLM, one at
 /// or past the first index the group's engines lack) is left to the
@@ -877,6 +939,99 @@ fn pin_grouped_dp_rank(
              places a pin on; the request keeps the connector's pick"
         );
     }
+}
+
+/// A sticky key's prefill rank as a disaggregated request's bootstrap room
+/// carries it: the room's residue modulo the prefill side's `ranks` engines
+/// is `rank` (see [`pin_grouped_dp_prefill_room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoomResidue {
+    rank: usize,
+    ranks: usize,
+}
+
+impl RoomResidue {
+    /// Move `request`'s bootstrap room into this residue class, its other
+    /// bits kept as minted; false, and nothing changed, for a request
+    /// without a room.
+    fn apply(self, request: &mut ProtoGenerateRequest) -> bool {
+        request.set_kv_bootstrap_room_residue(self.rank, self.ranks)
+    }
+}
+
+/// The disaggregated counterpart of [`pin_grouped_dp_rank`]. A grouped
+/// data-parallel prefill worker (a ZMQ worker several engines dial, no
+/// `dp_rank`) runs a TokenSpeed request on the rank its bootstrap room's
+/// residue names, modulo the engines its connection connected: on the
+/// prefill side a rank pin yields to the room, and the decode side reads the
+/// KV from that rank. The room is minted at random, which scatters one
+/// conversation's turns over the prefill engines' separate prefix caches.
+/// With a sticky key, the room moves into the residue class of the key's
+/// rank under `sticky` instead. This runs on every attempt, over the room
+/// the attempt minted for its own prefill worker. The ranks are
+/// `prefill_engines`, the engines the prefill side's connection connected
+/// (the modulus the engine places by), or, where the connection does not
+/// say, the worker's `dp_size`. The decode side gets the same room and,
+/// unpinned, places the request on its residue modulo its own engines, so a
+/// decode group the size of the prefill group follows the prefill rank.
+///
+/// Returns the residue, for the rooms of an n>1 request's samples (see
+/// [`pd_fanout_requests`]). Nothing is pinned for a dp-aware prefill worker,
+/// whose minted room already carries its rank, or for one with a single
+/// engine. A batched or EPD request, or one on a runtime other than
+/// TokenSpeed, keeps its random room, which is logged once.
+fn pin_grouped_dp_prefill_room(
+    plan: &mut ExecutionPlan,
+    workers: &WorkerSelection,
+    prefill_engines: impl FnOnce() -> Option<usize>,
+    sticky_key: Option<&str>,
+    sticky: GroupedDpSticky,
+) -> Option<RoomResidue> {
+    if sticky == GroupedDpSticky::Off {
+        return None;
+    }
+    let key = sticky_key?;
+    let prefill = workers.prefill_worker()?;
+    if prefill.dp_rank().is_some() {
+        return None;
+    }
+    let ranks = prefill_engines()
+        .or_else(|| prefill.dp_size())
+        .filter(|&ranks| ranks > 1)?;
+    let rank = match sticky {
+        GroupedDpSticky::Off => return None,
+        GroupedDpSticky::Hash => hash_rank(key, ranks),
+    };
+    let residue = RoomResidue { rank, ranks };
+    let unpinned = match plan {
+        ExecutionPlan::PrefillDecode(request) => {
+            if residue.apply(request) {
+                return Some(residue);
+            }
+            "a request on a runtime other than TokenSpeed"
+        }
+        ExecutionPlan::EncodePrefillDecode { .. } => "an EPD request",
+        ExecutionPlan::Batch { .. } => "a batched request",
+        ExecutionPlan::Single(_) => return None,
+    };
+    note_unpinned_prefill_room(prefill.as_ref(), unpinned);
+    None
+}
+
+/// Log, once per gateway process, that `--grouped-dp-sticky` left a sticky
+/// disaggregated request on its random bootstrap room although its prefill
+/// worker has several engines to choose from; `request` says which kind.
+fn note_unpinned_prefill_room(prefill: &dyn Worker, request: &'static str) {
+    static NOTED: OnceLock<()> = OnceLock::new();
+    NOTED.get_or_init(|| {
+        warn!(
+            prefill_worker = %prefill.redacted_url(),
+            request,
+            "--grouped-dp-sticky carries a sticky key's prefill rank only in the bootstrap room \
+             of a single TokenSpeed disaggregated request; this one keeps its random room, so \
+             its prefill rank is not pinned (logged once)"
+        );
+    });
 }
 
 async fn execute_single(
@@ -2234,7 +2389,7 @@ pub(crate) async fn first_prefill_response_within(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
 
@@ -4561,5 +4716,237 @@ pub(crate) mod tests {
                 .all(|request| pinned_rank(request).is_none()),
             "a batch's prompts"
         );
+    }
+
+    /// A TokenSpeed pair on the ZMQ lane: its prefill worker grouped with
+    /// `prefill` engines (`None`: given no count), its decode worker with
+    /// `decode`.
+    fn grouped_pair(prefill: Option<usize>, decode: Option<usize>) -> WorkerSelection {
+        let worker = |url: &str, worker_type, engines: Option<usize>| -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .connection_mode(ConnectionMode::Zmq);
+            if let Some(engines) = engines {
+                builder = builder.zmq_engine_group(engines);
+            }
+            Arc::new(builder.build())
+        };
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("ipc:///tmp/pd-prefill.ipc", WorkerType::Prefill, prefill),
+            decode: worker("ipc:///tmp/pd-decode.ipc", WorkerType::Decode, decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        }
+    }
+
+    /// The PD room a request carries: `None` on one without (not TokenSpeed,
+    /// or not disaggregated).
+    fn room_of(request: &ProtoGenerateRequest) -> Option<i64> {
+        match request {
+            ProtoGenerateRequest::TokenSpeed(request) => request
+                .kv_bootstrap_info
+                .as_ref()
+                .map(|info| info.bootstrap_room),
+            _ => None,
+        }
+    }
+
+    /// One attempt of a single PD request (sticky `key`) to `workers`, its
+    /// room minted as request building and a retry's re-stamp mint it, then
+    /// pinned as `execute_plan` pins it under `sticky`, through a prefill
+    /// connection that connected `engines` (when it says): the residue the
+    /// pin returned, which the room is checked to carry, and the room.
+    fn pd_attempt(
+        sticky: GroupedDpSticky,
+        workers: &WorkerSelection,
+        engines: Option<usize>,
+        key: Option<&str>,
+    ) -> (Option<RoomResidue>, i64) {
+        let mut request = tokenspeed_request(1, None);
+        maybe_inject_pd_rendezvous(&mut request, workers);
+        let mut plan = ExecutionPlan::PrefillDecode(request);
+        let residue = pin_grouped_dp_prefill_room(&mut plan, workers, || engines, key, sticky);
+        let ExecutionPlan::PrefillDecode(request) = &plan else {
+            panic!("the plan stays a PD request");
+        };
+        assert_eq!(pinned_rank(request), None, "no rank pin on the request");
+        let room = room_of(request).expect("a PD request carries a room");
+        assert!(room >= 0);
+        if let Some(RoomResidue { rank, ranks }) = residue {
+            assert_eq!(room % ranks as i64, rank as i64, "{room}");
+        }
+        (residue, room)
+    }
+
+    /// A grouped prefill worker of a PD pair runs a request on the engine
+    /// `room % engines`: with hash placement the room carries the key's hash
+    /// rank on every attempt, a fresh room each time, and with pinning off it
+    /// is left as minted.
+    #[test]
+    fn a_pd_prefill_room_carries_the_sticky_keys_rank() {
+        for size in [2, 4, 8] {
+            let workers = grouped_pair(Some(size), Some(size));
+            let attempt = |sticky, key: &str| pd_attempt(sticky, &workers, Some(size), Some(key));
+            let mut seen = HashSet::new();
+            for i in 0..64 {
+                let key = format!("conv-{i}");
+                let rank = hash_rank(&key, size);
+                let (first, first_room) = attempt(GroupedDpSticky::Hash, &key);
+                let (again, again_room) = attempt(GroupedDpSticky::Hash, &key);
+                assert_eq!(first, Some(RoomResidue { rank, ranks: size }), "{key}");
+                assert_eq!(again, first, "{key}, retried");
+                assert_ne!(first_room, again_room, "each attempt mints a fresh room");
+                seen.insert(rank);
+            }
+            assert_eq!(seen.len(), size, "64 keys reach every engine of {size}");
+            // Unpinned: residues follow the random rooms (all of them seen).
+            let unpinned: HashSet<i64> = (0..256)
+                .map(|_| attempt(GroupedDpSticky::Off, "conv-0"))
+                .map(|(residue, room)| {
+                    assert_eq!(residue, None, "pinning off");
+                    room % size as i64
+                })
+                .collect();
+            assert_eq!(unpinned.len(), size);
+        }
+    }
+
+    /// A prefill worker given no count (no `dp_size`: a gateway whose decode
+    /// engines are TP, where no one `--zmq-engine-count` fits both pools) is
+    /// pinned by the engines its connection connected. That count, the
+    /// modulus the engine places by, also wins over a `dp_size`, which sizes
+    /// the ranks only where the connection does not say; with neither, the
+    /// room stays random.
+    #[test]
+    fn an_unsized_pd_prefill_room_is_pinned_by_its_engine_count() {
+        let unsized_pair = grouped_pair(None, None);
+        let (sized_2, sized_4) = (grouped_pair(Some(2), None), grouped_pair(Some(4), None));
+        for i in 0..64 {
+            let key = format!("conv-{i}");
+            let pin = |workers: &WorkerSelection, engines| {
+                pd_attempt(GroupedDpSticky::Hash, workers, engines, Some(&key)).0
+            };
+            let rank = hash_rank(&key, 4);
+            let expected = Some(RoomResidue { rank, ranks: 4 });
+            assert_eq!(pin(&unsized_pair, Some(4)), expected, "{key}: connected");
+            assert_eq!(pin(&sized_2, Some(4)), expected, "{key}: over dp_size");
+            assert_eq!(pin(&sized_4, None), expected, "{key}: dp_size alone");
+        }
+        let unpinned: HashSet<i64> = (0..256)
+            .map(|_| pd_attempt(GroupedDpSticky::Hash, &unsized_pair, None, Some("conv")))
+            .map(|(residue, room)| {
+                assert_eq!(residue, None, "no size and no count");
+                room % 4
+            })
+            .collect();
+        assert_eq!(unpinned.len(), 4, "the room stays random");
+    }
+
+    /// Each sample of a sticky n>1 PD request is dispatched with a room of
+    /// its own, every one in the residue class of the key's prefill rank, so
+    /// all the samples prefill on the key's engine; unpinned, the samples'
+    /// rooms stay random.
+    #[test]
+    fn every_sample_of_a_sticky_pd_request_carries_the_keys_prefill_rank() {
+        let workers = grouped_pair(Some(4), Some(4));
+        let mut request = tokenspeed_request(8, None);
+        maybe_inject_pd_rendezvous(&mut request, &workers);
+        let mut plan = ExecutionPlan::PrefillDecode(request);
+        let residue = pin_grouped_dp_prefill_room(
+            &mut plan,
+            &workers,
+            || Some(4),
+            Some("conv-7"),
+            GroupedDpSticky::Hash,
+        );
+        let rank = hash_rank("conv-7", 4);
+        assert_eq!(residue, Some(RoomResidue { rank, ranks: 4 }));
+        let ExecutionPlan::PrefillDecode(request) = &plan else {
+            panic!("the plan stays a PD request");
+        };
+
+        let rooms_of = |residue| -> Vec<i64> {
+            pd_fanout_requests(request, 8, &workers, residue)
+                .iter()
+                .map(|sub| room_of(sub).expect("a sample carries a room"))
+                .collect()
+        };
+        let rooms: HashSet<i64> = rooms_of(residue).into_iter().collect();
+        assert_eq!(rooms.len(), 8, "a room per sample");
+        for room in rooms {
+            assert!(room >= 0);
+            assert_eq!(room % 4, rank as i64, "{room}");
+        }
+        let unpinned: HashSet<i64> = (0..32)
+            .flat_map(|_| rooms_of(None))
+            .map(|room| room % 4)
+            .collect();
+        assert_eq!(unpinned.len(), 4, "unpinned samples' rooms stay random");
+    }
+
+    /// Only a single TokenSpeed PD request with a sticky key to a grouped
+    /// prefill worker has its room pinned: a dp-aware prefill worker's room
+    /// carries the worker's own rank already, a prefill worker of one engine
+    /// has none to choose, and a batched, an EPD or another runtime's request
+    /// keeps the room it was minted.
+    #[test]
+    fn only_a_single_tokenspeed_pd_request_to_a_grouped_prefill_worker_is_pinned() {
+        let workers = grouped_pair(Some(4), Some(4));
+        let hashed = |workers: &WorkerSelection, engines, key| {
+            pd_attempt(GroupedDpSticky::Hash, workers, engines, key).0
+        };
+        assert_eq!(hashed(&workers, Some(4), None), None, "no sticky key");
+        let one = grouped_pair(None, None);
+        assert_eq!(hashed(&one, Some(1), Some("conv")), None, "one engine");
+
+        let ranked = |url, worker_type| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .dp_config(3, 4)
+                    .build(),
+            )
+        };
+        let dp_aware = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: ranked("grpc://prefill:30000", WorkerType::Prefill),
+            decode: ranked("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        };
+        let (residue, room) = pd_attempt(GroupedDpSticky::Hash, &dp_aware, None, Some("conv"));
+        assert_eq!((residue, room % 4), (None, 3), "dp-aware: as minted");
+
+        let minted = || {
+            let mut request = tokenspeed_request(1, None);
+            maybe_inject_pd_rendezvous(&mut request, &workers);
+            request
+        };
+        for mut plan in [
+            ExecutionPlan::Batch {
+                kind: ExecutionPlanKind::PrefillDecode,
+                shared_request_id: "batch".to_string(),
+                requests: vec![minted(), minted()],
+            },
+            ExecutionPlan::EncodePrefillDecode { request: minted() },
+            ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default())),
+        ] {
+            let rooms = |plan: &mut ExecutionPlan| -> Vec<Option<i64>> {
+                plan.generate_requests_mut()
+                    .map(|request| room_of(request))
+                    .collect()
+            };
+            let minted_rooms = rooms(&mut plan);
+            let residue = pin_grouped_dp_prefill_room(
+                &mut plan,
+                &workers,
+                || Some(4),
+                Some("conv"),
+                GroupedDpSticky::Hash,
+            );
+            assert_eq!(residue, None, "{minted_rooms:?}");
+            assert_eq!(rooms(&mut plan), minted_rooms, "left as minted");
+        }
     }
 }

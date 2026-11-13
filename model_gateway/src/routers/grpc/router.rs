@@ -144,15 +144,24 @@ impl GrpcRouter {
         // and the streams they open; zero, the default, arms no deadline.
         let request_timeout = Duration::from_secs(ctx.router_config.grpc_request_timeout_secs);
         // `--grouped-dp-sticky`: a sticky request to a grouped data-parallel
-        // worker is pinned to one of its engines at dispatch. Only the
-        // regular mode dispatches to a single worker, so only its router
-        // announces the setting.
+        // worker is pinned to one of its engines at dispatch, and a
+        // disaggregated one to an engine of its grouped prefill worker
+        // through its bootstrap room. EPD requests are not pinned, so only
+        // the regular and PD routers announce the setting.
         let grouped_dp_sticky = ctx.router_config.grouped_dp_sticky;
-        if mode == Mode::Regular && grouped_dp_sticky != GroupedDpSticky::Off {
-            info!(
-                grouped_dp_sticky = grouped_dp_sticky.as_str(),
-                "Sticky keys are pinned to the engines of grouped data-parallel workers"
-            );
+        if grouped_dp_sticky != GroupedDpSticky::Off {
+            match mode {
+                Mode::Regular => info!(
+                    grouped_dp_sticky = grouped_dp_sticky.as_str(),
+                    "Sticky keys are pinned to the engines of grouped data-parallel workers"
+                ),
+                Mode::PrefillDecode => info!(
+                    grouped_dp_sticky = grouped_dp_sticky.as_str(),
+                    "Sticky keys are pinned to the engines of grouped data-parallel prefill \
+                     workers through their bootstrap rooms"
+                ),
+                Mode::EncodePrefillDecode => {}
+            }
         }
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(

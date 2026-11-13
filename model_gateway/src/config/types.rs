@@ -1363,7 +1363,12 @@ impl Default for RoutingKeyOverrideConfig {
 /// prompts and an embedding keep the connection's pick under every mode, and
 /// so does a request whose rank is not among the ranks, counted from 0, that
 /// its connection places a pin on (on vLLM, the engine indices from 0 up to
-/// the first the group lacks).
+/// the first the group lacks). On a disaggregated pair the pin is the
+/// bootstrap room of a single TokenSpeed request: a grouped prefill worker
+/// places the request on the rank its room's residue names, modulo the
+/// engines its connection connected, so the room is moved into the residue
+/// class of the key's rank, and the decode side takes the same room. A
+/// batched or EPD request, or one on another runtime, keeps its random room.
 ///
 /// The flag and the configuration file take one spelling: the flag's values
 /// are this enum's clap [`ValueEnum`] names, and serde writes the same ones.
@@ -1374,9 +1379,10 @@ pub enum GroupedDpSticky {
     /// engine.
     #[default]
     Off,
-    /// Every request of a key to its hash engine, `xxh3(key) % dp_size`: the
-    /// same engine across requests, gateway restarts and replicas, however
-    /// unevenly the keys fall.
+    /// Every request of a key to its hash engine, `xxh3(key) % ranks` (the
+    /// worker's engines; on a disaggregated pair, the engines the prefill
+    /// connection connected): the same engine across requests, gateway
+    /// restarts and replicas, however unevenly the keys fall.
     Hash,
 }
 
