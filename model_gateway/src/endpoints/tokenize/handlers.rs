@@ -6,7 +6,9 @@
 //! resolves it to, as every serving route reads it. The management routes
 //! refuse in the control plane's envelope (`{"error", "code"}`), the shape
 //! the worker routes use; an empty or whitespace name or source is refused
-//! up front, before a load job is queued for it.
+//! up front, before a load job is queued for it. The tokenize and detokenize
+//! routes refuse in the gateway's public envelope, as the model routes do (an
+//! unknown model is a `404 model_not_found`).
 
 use std::sync::Arc;
 
@@ -26,24 +28,13 @@ use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
-    routers::grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
+    routers::{
+        error,
+        grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
+    },
     worker::{admin_json::refusal, WorkerRegistry, UNKNOWN_MODEL_ID},
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
-
-/// Helper to create error responses
-fn error_response(status: StatusCode, message: &str, error_type: &str) -> Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "message": message,
-                "type": error_type
-            }
-        })),
-    )
-        .into_response()
-}
 
 /// Get a tokenizer by model name, with fallback strategies: the name or id as
 /// given, then the model the worker registry resolves an alias to (the
@@ -113,7 +104,7 @@ pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Re
     ) {
         Ok(t) => t,
         Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
+            return error::not_found("model_not_found", e);
         }
     };
 
@@ -133,10 +124,9 @@ pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Re
                 Ok(enc) => enc,
                 Err(e) => {
                     error!("Tokenization failed: {}", e);
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("Tokenization failed: {e}"),
+                    return error::internal_error(
                         "tokenization_error",
+                        format!("Tokenization failed: {e}"),
                     );
                 }
             };
@@ -183,7 +173,7 @@ pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -
     ) {
         Ok(t) => t,
         Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
+            return error::not_found("model_not_found", e);
         }
     };
 
@@ -198,10 +188,9 @@ pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -
             Ok(t) => t,
             Err(e) => {
                 error!("Detokenization failed: {}", e);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Detokenization failed: {e}"),
+                return error::internal_error(
                     "detokenization_error",
+                    format!("Detokenization failed: {e}"),
                 );
             }
         };

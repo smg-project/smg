@@ -1,7 +1,7 @@
 //! Keyed arguments: the events of one call written as its name and then `<arg_key>` and
 //! `<arg_value>` pairs, from its bytes.
 //!
-//! GLM, Hy4, Ling and IQuest write a call as
+//! GLM, Hy4, Hy V3, Ling and IQuest write a call as
 //!
 //! ```text
 //! <tool_call>get_weather
@@ -14,7 +14,8 @@
 //! each with its own spellings of the four tags ([`Tags`]) and its own newlines around them (Ling
 //! writes one after the name, after each `</arg_key>` and before the close, GLM 4.5 and 4.6 one
 //! after the name, after each `</arg_key>` and after each `</arg_value>`, K2-Horizon the same under
-//! `ifm|`-prefixed tags with the block's own around its calls, Hy4 and IQuest none;
+//! `ifm|`-prefixed tags with the block's own around its calls, Hy V3 K2-Horizon's under the plain
+//! tags with `<tool_sep>` after the name ([`Tags::name_end`]), Hy4 and IQuest none;
 //! [`Newlines`]). The engine's table
 //! owns the call markers: it enters this assembler after the opening marker and leaves it at the
 //! closing one, which it hands over as the call's end. Between the two the assembler reads the
@@ -71,6 +72,10 @@ pub struct Tags {
     pub key_close: &'static str,
     pub value_open: &'static str,
     pub value_close: &'static str,
+    /// What the template writes after the call's name, before the newline and the first pair or
+    /// the close: Hy V3's `<tool_sep>`; nothing for the other families. The assembler takes it
+    /// off the name ([`Assembler`]); the grammar spells it after the name.
+    pub name_end: &'static str,
     pub newlines: Newlines,
 }
 
@@ -152,6 +157,7 @@ impl Tags {
         key_close: "</arg_key>",
         value_open: "<arg_value>",
         value_close: "</arg_value>",
+        name_end: "",
         newlines: Newlines::NONE,
     };
 
@@ -173,6 +179,7 @@ impl Tags {
         key_close: "</ifm|arg_key>",
         value_open: "<ifm|arg_value>",
         value_close: "</ifm|arg_value>",
+        name_end: "",
         newlines: Newlines::K2_HORIZON,
     };
 
@@ -182,7 +189,18 @@ impl Tags {
         key_close: "</arg_key:opensource>",
         value_open: "<arg_value:opensource>",
         value_close: "</arg_value:opensource>",
+        name_end: "",
         newlines: Newlines::NONE,
+    };
+
+    /// Hy V3's spelling: the plain tags with K2-Horizon's newlines, and `<tool_sep>` after the
+    /// name (every one of the 18 calls in hy-memory-30b-a3b's recorded parse sets reads
+    /// `<tool_call>NAME<tool_sep>\n`, the one without arguments
+    /// `<tool_call>NAME<tool_sep>\n</tool_call>`).
+    pub const HY_V3: Self = Self {
+        name_end: "<tool_sep>",
+        newlines: Newlines::K2_HORIZON,
+        ..Self::PLAIN
     };
 
     fn text(&self, tag: usize) -> &'static str {
@@ -599,12 +617,24 @@ impl Assembler {
         self.refused |= self.started();
     }
 
-    /// The text so far is the call's name, less the whitespace around it: the call starts, and
-    /// the whitespace after the name is carried into the next source. Text that is no name is
-    /// refused, and no call starts.
+    /// The text so far is the call's name, less the whitespace around it and the text the
+    /// spelling writes after the name ([`Tags::name_end`], Hy V3's `<tool_sep>`): the call
+    /// starts, and the whitespace after the name is carried into the next source. Text that is
+    /// no name is refused, and no call starts.
     fn name_call(&mut self, out: &mut Events) {
-        let name = self.object.carried.trim().to_string();
+        let text = self.object.carried.trim();
+        let name = text
+            .strip_suffix(self.tags.name_end)
+            .unwrap_or(text)
+            .trim_end()
+            .to_string();
         if name.is_empty() {
+            // The spelling's text after the name with no name before it (`<tool_call><tool_sep>`):
+            // no call starts, and the bytes are the nameless call's, refused with what follows
+            // them rather than dropped as the template's spacing.
+            if !text.is_empty() {
+                self.object.refuse(MalformedReason::CallWithoutName, out);
+            }
             self.stage = Stage::Between;
             return;
         }
@@ -967,6 +997,75 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn hy_v3s_separator_ends_the_name_and_is_the_calls_text() {
+        // Hy V3 writes `<tool_sep>` after the name: whole, cut inside the separator, and on a
+        // call without pairs, the name is the text before it and the separator is in the call's
+        // source, not in the name.
+        let text = "f<tool_sep>\n<arg_key>s</arg_key>\n<arg_value>x</arg_value>\n";
+        for pieces in [
+            vec![text],
+            vec![
+                "f<tool_",
+                "sep>\n<arg_key>s</arg_key>\n<arg_value>x</arg_value>\n",
+            ],
+        ] {
+            let events = run_with(Tags::HY_V3, &pieces, false);
+            assert_eq!(starts(&events), 1, "{pieces:?}");
+            assert!(
+                matches!(&events[0], Event::ToolCallStart { name, .. } if name == "f"),
+                "{pieces:?}"
+            );
+            assert_eq!(arguments(&events), r#"{"s": "x"}"#, "{pieces:?}");
+            assert_eq!(bytes(&events), format!("{text}{CLOSE}"), "{pieces:?}");
+            assert!(malformed(&events).is_empty(), "{pieces:?}");
+        }
+        let events = run_with(Tags::HY_V3, &["f<tool_sep>\n"], false);
+        assert_eq!(starts(&events), 1);
+        assert_eq!(arguments(&events), "{}");
+        assert!(malformed(&events).is_empty());
+        // Text after the separator where the first tag should be is no name: refused, as under
+        // every spelling.
+        let events = run_with(
+            Tags::HY_V3,
+            &["f<tool_sep>prose<arg_key>s</arg_key>\n<arg_value>x</arg_value>\n"],
+            false,
+        );
+        assert_eq!(starts(&events), 0);
+        assert!(malformed(&events)
+            .iter()
+            .any(|(_, why)| *why == MalformedReason::TextWhereTheNameShouldBe));
+        // The separator with no name before it: no call starts, and every byte of the block is
+        // refused with the nameless call, the separator among them (not dropped as the
+        // template's spacing).
+        let text = "<tool_sep>\n<arg_key>s</arg_key>\n<arg_value>x</arg_value>\n";
+        let events = run_with(Tags::HY_V3, &[text], false);
+        assert_eq!(starts(&events), 0);
+        assert!(fragments(&events).is_empty());
+        // The separator leaves refused, first of the block's bytes; what the syntax drops as
+        // the template's spacing is whitespace alone.
+        assert_eq!(refused(&events).first().copied(), Some("<tool_sep>\n"));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            Event::Dropped { text, why: DropReason::Wrapper } if !text.text.trim().is_empty()
+        )));
+        assert!(malformed(&events)
+            .iter()
+            .any(|(_, why)| *why == MalformedReason::CallWithoutName));
+        assert!(malformed(&events).iter().all(|(text, _)| text.is_empty()));
+        assert_eq!(bytes(&events), format!("{text}{CLOSE}"));
+        // The separator alone before the close: the separator refused first, then the close on
+        // its own, two nameless calls, every byte in one event, no call started.
+        let text = "<tool_sep>\n";
+        let events = run_with(Tags::HY_V3, &[text], false);
+        assert_eq!(starts(&events), 0);
+        assert_eq!(bytes(&events), format!("{text}{CLOSE}"));
+        assert!(malformed(&events)
+            .iter()
+            .all(|(_, why)| *why == MalformedReason::CallWithoutName));
+        assert_eq!(malformed(&events).len(), 2);
     }
 
     #[test]
