@@ -4702,6 +4702,11 @@ fn a_response_with_null_metadata_or_any_listed_incomplete_reason_parses() {
         assert_eq!(written["incomplete_details"], json!({"reason": reason}));
         assert_eq!(written["metadata"], json!({}));
     }
+
+    // A populated map still reads as sent.
+    response["metadata"] = json!({"k": "v"});
+    let parsed: ResponsesResponse = serde_json::from_value(response).unwrap();
+    assert_eq!(parsed.metadata.get("k"), Some(&json!("v")));
 }
 
 #[test]
