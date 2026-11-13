@@ -82,8 +82,9 @@ pub struct CreateMessageRequest {
     pub top_p: Option<f64>,
 
     // Beta features
-    /// Container configuration for code execution (beta).
-    pub container: Option<ContainerConfig>,
+    /// The container for code execution to reuse (beta): its id, or its
+    /// configuration.
+    pub container: Option<MessagesContainer>,
 
     /// MCP servers to be utilized in this request (beta).
     pub mcp_servers: Option<Vec<McpServerConfig>>,
@@ -706,7 +707,27 @@ pub enum DocumentSource {
     Base64 { media_type: String, data: String },
     Text { data: String },
     Url { url: String },
-    Content { content: Vec<InputContentBlock> },
+    Content { content: DocumentContent },
+}
+
+/// A content source's content, as the public API takes it: a string, or an
+/// array of content blocks
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum DocumentContent {
+    String(String),
+    Blocks(Vec<InputContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for DocumentContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of content blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
 }
 
 /// Tool use block (in assistant messages)
@@ -2182,6 +2203,15 @@ impl ListModelsResponse {
 // Beta Features - Container & MCP Configuration
 // ============================================================================
 
+/// The request's container (beta), in either form the public API takes: the
+/// id of a container to reuse, or its configuration
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum MessagesContainer {
+    Id(String),
+    Config(ContainerConfig),
+}
+
 /// Container configuration for code execution (beta)
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -3638,6 +3668,44 @@ mod tests {
                 assert_eq!(content.tool_references[0].tool_name, "get_weather");
             }
             _ => panic!("Expected ToolSearchToolResult variant"),
+        }
+    }
+
+    /// A document's content source and the request's container take the
+    /// string form the public API allows beside their other form, and each
+    /// form is written back as sent.
+    #[test]
+    fn a_content_source_and_a_container_take_their_string_forms() {
+        for content in [
+            json!("The document's text."),
+            json!([{"type": "text", "text": "The document's text."}]),
+        ] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": [{
+                    "type": "document",
+                    "source": {"type": "content", "content": content}
+                }]}]
+            }))
+            .unwrap();
+            let written = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                written["messages"][0]["content"][0]["source"]["content"],
+                content
+            );
+        }
+
+        for container in [json!("container_011CZ"), json!({"id": "container_011CZ"})] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Run the script again."}],
+                "container": container
+            }))
+            .unwrap();
+            let written = serde_json::to_value(&request).unwrap();
+            assert_eq!(written["container"], container);
         }
     }
 

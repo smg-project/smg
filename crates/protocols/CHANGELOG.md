@@ -70,6 +70,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages document's content source takes its content as a string, and the request's
+  `container` takes the id of a container as a string, as the public API takes both beside their
+  other forms. Each string was refused with the whole request. On the gRPC router a string
+  content source renders as the document's text, as a text source does. Breaking:
+  `DocumentSource::Content` holds the new `DocumentContent`, and `CreateMessageRequest.container`
+  is the new `MessagesContainer`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
