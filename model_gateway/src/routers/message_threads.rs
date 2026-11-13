@@ -2196,40 +2196,56 @@ mod tests {
         }
     }
 
-    /// A stream with data this gateway cannot read (a content block of a
-    /// kind it does not know, a tool call whose input deltas are no JSON
-    /// document) reaches the client as it came and leaves no turn: the
-    /// record is the answer the client read or nothing, so the continue
-    /// from its id is the 404.
+    /// A streamed answer with a block of a kind this gateway does not read
+    /// reaches the client as it came and is stored with the block as the
+    /// upstream sent it, beside the text it reads.
     #[tokio::test]
-    async fn an_unreadable_stream_leaves_no_turn() {
+    async fn a_streamed_block_this_gateway_does_not_read_is_stored_as_sent() {
         let threads = MessageThreads::new();
-        let mut unknown_block = text_events("msg_unknown", "known");
-        unknown_block.splice(
+        let block = json!({
+            "type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1",
+            "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}
+        });
+        let mut events = text_events("msg_unknown", "known");
+        events.splice(
             4..4,
             [
                 (
                     "content_block_start",
-                    json!({"type": "content_block_start", "index": 1, "content_block": {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1", "content": []}}),
+                    json!({"type": "content_block_start", "index": 1, "content_block": block.clone()}),
                 ),
                 (
                     "content_block_stop",
                     json!({"type": "content_block_stop", "index": 1}),
                 ),
-                (
-                    "content_block_start",
-                    json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
-                ),
-                (
-                    "content_block_delta",
-                    json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "after"}}),
-                ),
-                (
-                    "content_block_stop",
-                    json!({"type": "content_block_stop", "index": 2}),
-                ),
             ],
         );
+        let bytes = sse(&events);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        let (_, turns) = threads
+            .turns("msg_unknown", None)
+            .await
+            .ok()
+            .expect("the thread");
+        let stored = &turns[0].raw_response;
+        assert_eq!(stored["content"][0]["text"], "known");
+        assert_eq!(stored["content"][1], block);
+    }
+
+    /// A stream with data this gateway cannot read (a tool call whose input
+    /// deltas are no JSON document) reaches the client as it came and leaves
+    /// no turn: the record is the answer the client read or nothing, so the
+    /// continue from its id is the 404.
+    #[tokio::test]
+    async fn an_unreadable_stream_leaves_no_turn() {
+        let threads = MessageThreads::new();
         let no_json = vec![
             message_start("msg_nojson"),
             (
@@ -2250,25 +2266,27 @@ mod tests {
             ),
             ("message_stop", json!({"type": "message_stop"})),
         ];
-        for (id, events) in [("msg_unknown", unknown_block), ("msg_nojson", no_json)] {
-            let bytes = sse(&events);
-            let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-            let answered = threads
-                .stored(turn.expect("a turn"), streamed(&bytes, &[]))
-                .await;
-            let read = to_bytes(answered.into_body(), usize::MAX)
-                .await
-                .expect("the stream");
-            assert_eq!(read.as_ref(), bytes.as_slice(), "{id}");
-            let kept = threads
-                .store
-                .get_response(&ResponseId::from(id))
-                .await
-                .expect("the store");
-            assert!(kept.is_none(), "{id}: the place is given back");
-            let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
-            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{id}");
-        }
+        let bytes = sse(&no_json);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        let kept = threads
+            .store
+            .get_response(&ResponseId::from("msg_nojson"))
+            .await
+            .expect("the store");
+        assert!(kept.is_none(), "the place is given back");
+        let refused = refusal(
+            threads
+                .resolve(continue_from("msg_nojson", "again"), None)
+                .await,
+        );
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
     /// A stream framed with CRLF blank lines (one of the relay's three

@@ -1474,6 +1474,12 @@ pub enum ContentBlock {
         content: Option<ToolResultContent>,
         is_error: Option<bool>,
     },
+    /// A block this build does not read, kept as the upstream sent it: an
+    /// upstream answer must parse whatever block the public API adds (a web
+    /// fetch or code execution result, a container upload, ...), and leave
+    /// with the same object.
+    #[serde(untagged)]
+    Other(Value),
 }
 
 /// The caller of a `tool_use` block, as the public API reports it: the model
@@ -3610,6 +3616,61 @@ mod tests {
                 "Expected ToolSearch, got {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    /// The blocks of the public API's answers this build does not read: the
+    /// web fetch, code execution, bash and text editor results and a
+    /// container upload, in the SDK's shapes.
+    fn blocks_this_build_does_not_read() -> Vec<Value> {
+        vec![
+            json!({
+                "type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1",
+                "content": {
+                    "type": "web_fetch_result", "url": "https://example.com",
+                    "retrieved_at": "2026-11-13T00:00:00Z",
+                    "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "page"}}
+                }
+            }),
+            json!({
+                "type": "code_execution_tool_result", "tool_use_id": "srvtoolu_2",
+                "content": {"type": "code_execution_result", "stdout": "4\n", "stderr": "", "return_code": 0, "content": []}
+            }),
+            json!({
+                "type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_3",
+                "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}
+            }),
+            json!({
+                "type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_4",
+                "content": {"type": "text_editor_code_execution_view_result", "file_type": "text", "content": "x = 1", "num_lines": 1, "start_line": 1, "total_lines": 1}
+            }),
+            json!({"type": "container_upload", "file_id": "file_1"}),
+        ]
+    }
+
+    /// An answer with a block this build does not read parses, the block kept
+    /// as `ContentBlock::Other` and written back as the upstream sent it,
+    /// beside the blocks it reads; a streamed block reads the same way.
+    #[test]
+    fn an_answer_keeps_a_block_this_build_does_not_read() {
+        for block in blocks_this_build_does_not_read() {
+            let answer = json!({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+                "content": [{"type": "text", "text": "before"}, block.clone()],
+                "stop_reason": "end_turn", "stop_sequence": null, "stop_details": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}, "container": null
+            });
+            let message: Message =
+                serde_json::from_value(answer.clone()).unwrap_or_else(|e| panic!("{block}: {e}"));
+            assert!(matches!(message.content[0], ContentBlock::Text { .. }));
+            assert!(matches!(&message.content[1], ContentBlock::Other(kept) if *kept == block));
+            assert_eq!(serde_json::to_value(&message).unwrap()["content"][1], block);
+
+            let start =
+                json!({"type": "content_block_start", "index": 1, "content_block": block.clone()});
+            let event: MessageStreamEvent =
+                serde_json::from_value(start.clone()).unwrap_or_else(|e| panic!("{block}: {e}"));
+            assert_eq!(serde_json::to_value(&event).unwrap(), start);
         }
     }
 

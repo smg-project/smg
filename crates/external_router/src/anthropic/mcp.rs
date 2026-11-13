@@ -684,6 +684,17 @@ fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentB
             }
             // MCP blocks are handled separately by rebuild_response_with_mcp_blocks
             ContentBlock::McpToolUse { .. } | ContentBlock::McpToolResult { .. } => {}
+            // A block this build does not read goes back in the next round's
+            // history when the request reads it, and is left out otherwise.
+            ContentBlock::Other(block) => {
+                match serde_json::from_value::<InputContentBlock>(block.clone()) {
+                    Ok(block) => blocks.push(block),
+                    Err(error) => warn!(
+                        %error,
+                        "leaving a content block of a kind this build does not read out of the next round's history"
+                    ),
+                }
+            }
         }
     }
     blocks
