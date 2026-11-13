@@ -658,7 +658,7 @@ jobs:
       !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
       && vars.SMG_RUN_AMD_ON_PRS == 'true'
-      && vars.SMG_RUN_AMD_PR_BENCHMARK == 'true'
+      && (vars.SMG_RUN_AMD_PR_BENCHMARK == 'true' || vars.SMG_RUN_AMD_PR_BENCHMARK_NATIVE_V1 == 'true')
       && github.event_name == 'pull_request'
       && needs.build-wheel.result == 'success'
       && needs.detect-changes.result == 'success'

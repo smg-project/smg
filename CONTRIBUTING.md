@@ -185,6 +185,12 @@ runners only has to set the variables it needs (**Settings → Secrets and varia
 | `SMG_AMD_MOONCAKE_IMAGE` | Unset | Shared image for `e2e-2gpu-pd-vllm-mooncake-amd` (`SMG_RUN_AMD_VLLM_PD2_MOONCAKE`) and `e2e-4gpu-pd-vllm-nixl-amd` (`SMG_RUN_AMD_NIXL_PD4`); both skip when this image is unset, even if their opt-in is true. Supply a digest-pinned image with NIXL and HIP Mooncake, qualified separately for each caller. Stock `749f6f3` is rejected; input checks do not prove native transfers, and image approval and each caller's enablement require separate authorization |
 | `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
 | `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep off until the native environment, performance budget and shared-host admission are qualified |
+| `SMG_RUN_AMD_PR_BENCHMARK_NATIVE_V1` | `false` | Opt in to the existing AMD PR benchmark caller with prepared/final native checks; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep the legacy benchmark flag off to avoid selecting older callers |
+
+This opt-in selects the complete original HTTP/gRPC benchmark; the first normal
+CI run must establish its actual native and measurement qualification. It does
+not establish prior qualification or a security boundary. Main integration and
+weekly performance acceptance remain separate.
 
 The six SGLang caller opt-ins above add no variables or new runner labels. All use
 same-source prepared/final cohort verification and the existing original GPTOSS
