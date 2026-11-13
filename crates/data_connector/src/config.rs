@@ -86,12 +86,25 @@ pub struct OracleConfig {
     pub pool_max: usize,
     #[serde(default = "default_pool_timeout_secs")]
     pub pool_timeout_secs: u64,
+    /// Bound, in seconds, on one call to the store: waiting for a pooled
+    /// connection, connecting, and the operation itself. A call that exceeds
+    /// it fails as a timeout, which the API answers as `503
+    /// storage_unavailable`, instead of holding its request for as long as
+    /// the client waits. Must be > 0.
+    #[serde(default = "default_op_timeout_secs")]
+    pub op_timeout_secs: u64,
     /// Optional schema customization (table names, column names, extra columns).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaConfig>,
 }
 
 impl OracleConfig {
+    /// The pool's wait for a connection, and the bound on the start-up
+    /// connection; `None` when `pool_timeout_secs` is 0 (no wait bound).
+    pub fn pool_timeout(&self) -> Option<Duration> {
+        (self.pool_timeout_secs > 0).then(|| Duration::from_secs(self.pool_timeout_secs))
+    }
+
     pub fn default_pool_min() -> usize {
         default_pool_min()
     }
@@ -102,6 +115,30 @@ impl OracleConfig {
 
     pub fn default_pool_timeout_secs() -> u64 {
         default_pool_timeout_secs()
+    }
+
+    pub fn default_op_timeout_secs() -> u64 {
+        default_op_timeout_secs()
+    }
+
+    /// The bound on one call to the store.
+    pub fn op_timeout(&self) -> Duration {
+        Duration::from_secs(self.op_timeout_secs)
+    }
+
+    /// The numeric invariants every entry path must hold (the CLI, the
+    /// Python bindings, a config built by hand), checked by the factory
+    /// before any connection, as for the other remote backends; the pool's
+    /// minimum and the connect descriptor are checked where the config is
+    /// built.
+    pub fn validate_bounds(&self) -> Result<(), String> {
+        if self.pool_max == 0 {
+            return Err("pool_max must be greater than 0".to_string());
+        }
+        if self.op_timeout_secs == 0 {
+            return Err("op_timeout_secs must be greater than 0".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -127,6 +164,7 @@ impl std::fmt::Debug for OracleConfig {
             .field("pool_min", &self.pool_min)
             .field("pool_max", &self.pool_max)
             .field("pool_timeout_secs", &self.pool_timeout_secs)
+            .field("op_timeout_secs", &self.op_timeout_secs)
             .field("schema", &self.schema)
             .finish()
     }
@@ -582,6 +620,10 @@ mod tests {
         let redis: RedisConfig = serde_json::from_value(serde_json::json!({"url": "redis://h"}))
             .expect("a config without the field");
         assert_eq!(redis.op_timeout_secs, 5);
+        let oracle: OracleConfig =
+            serde_json::from_value(oracle_json(None)).expect("a config without the field");
+        assert_eq!(oracle.op_timeout_secs, 5);
+        assert_eq!(oracle.op_timeout(), Duration::from_secs(5));
 
         let pg: PostgresConfig = serde_json::from_value(
             serde_json::json!({"db_url": "postgres://u:p@h/d", "pool_max": 4, "op_timeout_secs": 12}),
@@ -592,6 +634,23 @@ mod tests {
             serde_json::from_value(serde_json::json!({"url": "redis://h", "op_timeout_secs": 3}))
                 .expect("a config with the field");
         assert_eq!(redis.op_timeout(), Duration::from_secs(3));
+        let oracle: OracleConfig =
+            serde_json::from_value(oracle_json(Some(9))).expect("a config with the field");
+        assert_eq!(oracle.op_timeout(), Duration::from_secs(9));
+    }
+
+    /// An Oracle configuration with the connection fields alone, and the
+    /// bound when given: the Oracle key is the same key as the other two.
+    fn oracle_json(op_timeout_secs: Option<u64>) -> serde_json::Value {
+        let mut config = serde_json::json!({
+            "connect_descriptor": "tcps://h:1522/s",
+            "username": "u",
+            "password": "p",
+        });
+        if let Some(secs) = op_timeout_secs {
+            config["op_timeout_secs"] = serde_json::json!(secs);
+        }
+        config
     }
 
     #[test]
@@ -615,6 +674,15 @@ mod tests {
             schema: None,
         };
         let err = redis.validate().expect_err("op_timeout_secs=0 should fail");
+        assert!(
+            err.contains("op_timeout_secs"),
+            "unexpected error message: {err}"
+        );
+        let oracle: OracleConfig =
+            serde_json::from_value(oracle_json(Some(0))).expect("a config with a zero bound");
+        let err = oracle
+            .validate_bounds()
+            .expect_err("op_timeout_secs=0 should fail");
         assert!(
             err.contains("op_timeout_secs"),
             "unexpected error message: {err}"

@@ -81,20 +81,20 @@ impl ClassifyResponseProcessingStage {
     /// Get label for a class index.
     ///
     /// Returns the label from id2label if available, otherwise returns generic "LABEL_N".
-    fn get_label(id2label: &HashMap<u32, String>, class_idx: u32) -> String {
+    fn get_label(id2label: Option<&HashMap<u32, String>>, class_idx: u32) -> String {
         id2label
-            .get(&class_idx)
+            .and_then(|id2label| id2label.get(&class_idx))
             .cloned()
             .unwrap_or_else(|| format!("LABEL_{class_idx}"))
     }
 
-    /// Extract id2label mapping from the selected worker's model card.
-    fn get_id2label_from_context(ctx: &DispatchContext) -> HashMap<u32, String> {
+    /// The id2label mapping of the selected worker's model card, borrowed
+    /// for the lookup; `None` without a worker or a primary card.
+    fn id2label_from_context(ctx: &DispatchContext) -> Option<&HashMap<u32, String>> {
         // Get the selected worker
-        let worker = match ctx.workers.as_ref() {
-            Some(WorkerSelection::Single { worker }) => worker,
-            Some(WorkerSelection::Disaggregated { prefill, .. }) => prefill, // Use prefill worker for model info
-            None => return HashMap::new(),
+        let worker = match ctx.workers.as_ref()? {
+            WorkerSelection::Single { worker } => worker,
+            WorkerSelection::Disaggregated { prefill, .. } => prefill, // Use prefill worker for model info
         };
 
         // Get id2label from the primary model card
@@ -103,8 +103,7 @@ impl ClassifyResponseProcessingStage {
             .spec
             .models
             .primary()
-            .map(|model| model.id2label.clone())
-            .unwrap_or_default()
+            .map(|model| &model.id2label)
     }
 }
 
@@ -169,24 +168,21 @@ impl ProcessStage for ClassifyResponseProcessingStage {
             ));
         }
 
-        // Get id2label from the worker's model card
-        let id2label = Self::get_id2label_from_context(ctx);
-
         // Apply softmax to get probabilities
         let probs = Self::softmax(logits);
 
         // Get predicted class (argmax)
         let predicted_class = Self::argmax(&probs);
 
-        // Get label for predicted class
-        let label = Self::get_label(&id2label, predicted_class);
+        // Get label for predicted class, read from the worker's model card
+        let label = Self::get_label(Self::id2label_from_context(ctx), predicted_class);
 
         // Build classify data
         let classify_data = ClassifyData {
             index: 0,
             label,
-            probs: probs.clone(),
             num_classes: probs.len() as u32,
+            probs,
         };
 
         // Get dispatch metadata
@@ -287,15 +283,15 @@ mod tests {
         id2label.insert(1, "positive".to_string());
 
         assert_eq!(
-            ClassifyResponseProcessingStage::get_label(&id2label, 0),
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 0),
             "negative"
         );
         assert_eq!(
-            ClassifyResponseProcessingStage::get_label(&id2label, 1),
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 1),
             "positive"
         );
         assert_eq!(
-            ClassifyResponseProcessingStage::get_label(&id2label, 2),
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 2),
             "LABEL_2"
         ); // Fallback for unknown
     }
@@ -304,12 +300,17 @@ mod tests {
     fn test_get_label_without_mapping() {
         let id2label = HashMap::new();
         assert_eq!(
-            ClassifyResponseProcessingStage::get_label(&id2label, 0),
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 0),
             "LABEL_0"
         );
         assert_eq!(
-            ClassifyResponseProcessingStage::get_label(&id2label, 5),
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 5),
             "LABEL_5"
+        );
+        // No worker / no primary card
+        assert_eq!(
+            ClassifyResponseProcessingStage::get_label(None, 0),
+            "LABEL_0"
         );
     }
 }

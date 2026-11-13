@@ -34,7 +34,9 @@
 // id is not the subject (the stream closes); PERMISSION_DENIED the scope or
 // role does not cover the RPC; FAILED_PRECONDITION not the leader (a
 // NotLeader in the status details), a floor above the term, a revision or
-// digest guard; INVALID_ARGUMENT a spec or registration rejected (the field
+// digest guard, or a rejoin position not held under its term (a
+// resync_required batch precedes it; the rejoin opens a new Replicate
+// stream); INVALID_ARGUMENT a spec or registration rejected (the field
 // path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
 // relay over its per-subscriber budget or a standby over its backlog (a
 // resync_required batch precedes it); UNAVAILABLE a standby not yet synced;
@@ -54,7 +56,8 @@ service PolicyController {
   rpc Session(stream GatewayFrame) returns (stream ControllerFrame);
   // Gateway scope, one bidirectional stream per gateway runtime thread.
   rpc Decide(stream DecideRequest) returns (stream DecideAnswer);
-  // Gateway scope, server stream: a snapshot then the tail, resumable by seq.
+  // Gateway scope, server stream: a snapshot then the tail, resumable by seq
+  // and term.
   rpc WatchWorkers(WatchWorkersRequest) returns (stream WorkerEvent);
   // Ingestion scope (relays only), client streams answered once at the end.
   rpc PushLoad(stream LoadReport) returns (Ack);
@@ -320,14 +323,28 @@ message WatchWorkersRequest {
   // Empty for every model.
   repeated string models = 1;
   // 0: a snapshot first, then the tail; otherwise the tail after this seq,
-  // exclusive; when the buffer no longer holds seq + 1 the server answers one
-  // SnapshotRequired and ends the stream. membership_epoch moves only on a
-  // membership change and is no resume point.
+  // exclusive: every membership or health event, and with `with_needs` every
+  // generation's needs, at a greater log position (a needs event carries its
+  // generation's position; the gaps are other event kinds). A log that holds
+  // this seq under another term, or no longer holds the position after it,
+  // answers one SnapshotRequired and ends the stream, never a silent skip or
+  // replay (replicas match by position and term: the replication contract's
+  // rejoin check); a synced standby behind it holds the stream and delivers
+  // as it applies.
+  // membership_epoch moves only on a membership change and is no resume point.
   uint64 resume_seq = 2;
   bool with_needs = 3;
+  // The term `resume_seq` was written under, WorkerEvent.term as delivered; 0
+  // with resume_seq 0.
+  uint64 resume_term = 4;
 }
 
 message WorkerEvent {
+  // The replication log position of the event: the leader assigns it, the
+  // batch carries it and a standby adopts it, so every replica numbers the
+  // event alike. Every page of one snapshot carries the position the snapshot
+  // is consistent with, filtered by `models` or not (the position GetSnapshot's
+  // replication_seq names on a complete one); the tail starts after it.
   uint64 seq = 1;
   uint64 membership_epoch = 2;
   oneof event {
@@ -338,13 +355,17 @@ message WorkerEvent {
     StatusChanged status = 7;
     WorkerRow relabelled = 8;
     NeedsSummary needs = 9;
-    // The tail cannot resume after the requested seq: the stream ends and the
-    // watcher reconnects with resume_seq 0.
+    // The tail cannot resume after the requested seq (the position gone, or
+    // held under another term): the stream ends and the watcher reconnects
+    // with resume_seq 0.
     SnapshotRequired snapshot_required = 10;
   }
+  // The term `seq` was written under; a watcher hands both back on resume.
+  uint64 term = 11;
 }
 
-// Paged at 128 rows under one epoch; a watcher switches at `last`.
+// Paged at 128 rows, every page at the snapshot's seq; a watcher switches to
+// the tail at `last` and, cut before it, reconnects with resume_seq 0.
 message WorkerSnapshot {
   repeated WorkerRow workers = 1;
   bool last = 2;
@@ -591,6 +612,8 @@ message SnapshotRequest {
 }
 
 message Snapshot {
+  // The leader's term at the snapshot (the fencing floor), not the write term
+  // of any position: that is `replication_term`.
   uint64 term = 1;
   uint64 generation = 2;
   string controller_id = 3;
@@ -606,8 +629,9 @@ message Snapshot {
   repeated GatewayRow gateways = 13;
   bool truncated = 14;
   // The log position the snapshot is consistent with (a standby rejoins with
-  // `last_applied_seq` here); non-zero only on a complete, unredacted snapshot
-  // of the replication scope, zero on a partial or redacted one.
+  // `last_applied_seq` here and `last_applied_term` = `replication_term`);
+  // non-zero only on a complete, unredacted snapshot of the replication scope,
+  // zero on a partial or redacted one.
   uint64 replication_seq = 15;
   // The interned-id table at that position.
   IdAssignment ids = 16;
@@ -616,6 +640,9 @@ message Snapshot {
   // answers GetPolicySpec alike from either path; present with
   // `replication_seq`.
   repeated GenerationEvent documents = 17;
+  // The term the event at `replication_seq` was written under; present with
+  // it, zero with it.
+  uint64 replication_term = 18;
 }
 
 // The health precedence's inputs.
@@ -888,9 +915,19 @@ message ReplicaFrame {
 message ReplicaHello {
   string replica_id = 1;
   uint64 last_applied_seq = 2;
+  // The highest term seen: the fencing floor, not the term of any position.
   uint64 term_seen = 3;
   // Events the standby can hold unacknowledged; the leader cuts a slower one.
   uint32 max_backlog = 4;
+  // The term the event at `last_applied_seq` was written under. A leader
+  // continues a standby only when its log holds `last_applied_seq` under
+  // `last_applied_term`; on another term, a position past its head, or one
+  // older than it retains, it answers a resync_required batch, never a
+  // continuation: two replicas that agree on a position and its term share
+  // the prefix before it. A standby seeds both from a snapshot's
+  // `replication_seq` and `replication_term`; a non-zero `last_applied_seq`
+  // with a zero term is answered resync_required as well.
+  uint64 last_applied_term = 5;
 }
 
 message ReplicationAck {
@@ -899,9 +936,16 @@ message ReplicationAck {
 
 message ReplicationBatch {
   uint64 first_seq = 1;
+  // The term every event of the batch was written under, never the sender's
+  // current term: a catch-up batch splits at a term boundary, so a standby
+  // records each position under its write term.
   uint64 term = 2;
   repeated ReplicationEvent events = 3;
-  // The standby's backlog was cut: re-sync from GetSnapshot, then rejoin.
+  // The standby's backlog was cut, or its `last_applied_seq` is not held
+  // under `last_applied_term`: re-sync from GetSnapshot (its `replication_seq`
+  // and `replication_term` seed the next hello), then rejoin on a new
+  // Replicate stream. A standby that re-syncs ends its open WatchWorkers
+  // tails with SnapshotRequired: their positions came from the log it dropped.
   bool resync_required = 4;
 }
 

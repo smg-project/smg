@@ -56,6 +56,9 @@ pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
 pub use kv_event_monitor::{KvEventMonitor, SubscriptionKind};
 pub use kv_index_backend::{KvIndex, WorkerBlocks};
+/// The liveness budgets' setter for a host that builds the context without
+/// the builder, the test harness today; the first call in a process wins.
+pub use liveness::configure_from as configure_liveness;
 pub use liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets};
 pub use manager::WorkerManager;
 pub use metadata::DecodingLabels;
