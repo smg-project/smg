@@ -94,6 +94,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `/generate` request's sampling params keep the seven keys of SGLang's sampling params the
+  struct did not type: `structural_tag`, `stop_regex`, `logit_bias`, `beam_width`,
+  `spaces_between_special_tokens`, `stream_interval` and `watermark`. Each was dropped by the
+  routers that parse the body, so a structural tag was decoded unconstrained, with a `200`.
+  `structural_tag` joins the one-constraint rule beside `regex`, `ebnf` and `json_schema`, and a
+  `beam_width` below one is refused, as SGLang refuses both. Breaking: `SamplingParams` gains the
+  seven fields.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

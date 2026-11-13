@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
@@ -46,6 +48,22 @@ pub struct SamplingParams {
     pub sampling_seed: Option<u64>,
     /// Custom parameters for engine-specific sampling behavior.
     pub custom_params: Option<Map<String, Value>>,
+    /// A structural tag, the fourth structured output constraint beside
+    /// `regex`, `ebnf` and `json_schema`, as SGLang's sampling params take it
+    pub structural_tag: Option<String>,
+    /// Stop when the output matches one of these regexes
+    pub stop_regex: Option<StringOrArray>,
+    /// A bias added to a token's logit, keyed by the token id as a string
+    pub logit_bias: Option<HashMap<String, f32>>,
+    /// Beam search with this many beams; `n` then counts the sequences
+    /// returned
+    #[validate(range(min = 1))]
+    pub beam_width: Option<u32>,
+    pub spaces_between_special_tokens: Option<bool>,
+    /// How many tokens each stream chunk carries
+    pub stream_interval: Option<u32>,
+    /// A watermark configuration, kept as written: the engine checks it
+    pub watermark: Option<Value>,
 }
 
 // ============================================================================
@@ -108,6 +126,7 @@ fn validate_sampling_params(params: &SamplingParams) -> Result<(), validator::Va
         ("regex", params.regex.is_some()),
         ("ebnf", params.ebnf.is_some()),
         ("json_schema", params.json_schema.is_some()),
+        ("structural_tag", params.structural_tag.is_some()),
     ]
     .iter()
     .filter(|(_, present)| *present)
@@ -118,7 +137,7 @@ fn validate_sampling_params(params: &SamplingParams) -> Result<(), validator::Va
         return Err(invalid_at(
             set[1],
             "invalid_value",
-            "only one of regex, ebnf, or json_schema can be set",
+            "only one of regex, ebnf, json_schema, or structural_tag can be set",
         ));
     }
 

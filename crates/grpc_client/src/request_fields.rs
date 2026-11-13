@@ -168,15 +168,22 @@ pub fn completion_constraint(
     )
 }
 
-/// A plain generate request's structured constraint, by [`single_constraint`].
+/// A plain generate request's structured constraint, by [`single_constraint`],
+/// or its structural tag, which only the generate request names; more than one
+/// is the refusal.
 pub fn plain_constraint(
     params: &GenerateSamplingParams,
 ) -> Result<Option<(ConstraintKind, String)>, String> {
-    single_constraint(
+    let constraint = single_constraint(
         params.json_schema.as_deref(),
         params.regex.as_deref(),
         params.ebnf.as_deref(),
-    )
+    )?;
+    match (constraint, params.structural_tag.as_deref()) {
+        (Some(_), Some(_)) => Err("Multiple structured constraints are not allowed".to_string()),
+        (None, Some(tag)) => Ok(Some((ConstraintKind::StructuralTag, tag.to_string()))),
+        (constraint, None) => Ok(constraint),
+    }
 }
 
 /// A plain generate request's sampling parameters as every engine client reads
@@ -507,6 +514,26 @@ mod tests {
             assert_eq!(completion_constraint(&completion), read, "{field}");
             assert_eq!(plain_constraint(&plain), read, "{field}");
         }
+    }
+
+    /// A plain generate request's structural tag is its constraint, as the
+    /// engine clients map it; beside another constraint it is the refusal.
+    #[test]
+    fn the_plain_reader_reads_a_structural_tag() {
+        let tag = r#"{"type":"structural_tag","format":{"type":"const_string","value":"ok"}}"#;
+        let plain: GenerateSamplingParams =
+            serde_json::from_value(serde_json::json!({"structural_tag": tag})).unwrap();
+        assert_eq!(
+            plain_constraint(&plain),
+            Ok(Some((ConstraintKind::StructuralTag, tag.to_string())))
+        );
+        let both: GenerateSamplingParams =
+            serde_json::from_value(serde_json::json!({"structural_tag": tag, "regex": "a+"}))
+                .unwrap();
+        assert_eq!(
+            plain_constraint(&both),
+            Err("Multiple structured constraints are not allowed".to_string())
+        );
     }
 }
 
