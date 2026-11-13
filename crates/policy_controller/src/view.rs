@@ -384,7 +384,8 @@ pub struct RequestFacts<'a> {
     pub attempt: u8,
     /// Candidates earlier attempts of this request already tried.
     pub tried: &'a [WorkerId],
-    /// Time left for the decision, relative to the host's receipt.
+    /// Time left for the whole decision, relative to the host's receipt; a
+    /// plugin's own share of it rides its frame, clamped to at most this.
     pub budget_micros: u32,
     /// Allow-listed headers only.
     pub headers: &'a [Header<'a>],

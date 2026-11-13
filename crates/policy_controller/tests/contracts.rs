@@ -1805,3 +1805,42 @@ fn every_lease_end_cause_names_one_lifecycle_event() {
         }
     }
 }
+
+/// The decide frame's budget beside the request's: `PluginDecide.budget_micros`
+/// is the plugin's own deadline, clamped to at most `request.budget_micros`.
+type DecideField = (&'static str, i32, Type);
+
+const DECIDE_FIELDS: &[(&str, &[DecideField])] = &[
+    (
+        "PluginDecide",
+        &[
+            ("stages", 5, Type::Uint32),
+            ("budget_micros", 7, Type::Uint32),
+        ],
+    ),
+    ("RequestFacts", &[("budget_micros", 14, Type::Uint32)]),
+];
+
+#[test]
+fn the_decide_budget_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECIDE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a budget field moved");
+    }
+}
