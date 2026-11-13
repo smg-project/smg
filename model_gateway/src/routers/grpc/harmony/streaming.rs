@@ -1004,8 +1004,11 @@ impl ResponsesDecode {
         };
         let content_index = 0; // Single content part
         if !self.content_part_added {
-            let event = emitter.emit_content_part_added(*output_index, item_id, content_index);
-            emitter.send_event_best_effort(&event, tx).await;
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_content_part_added(*output_index, item_id, content_index, tx)
+                    .await,
+            );
             self.content_part_added = true;
         }
         emitter
@@ -1249,10 +1252,16 @@ impl ResponsesDecode {
             return;
         };
         let content_index = 0;
-        let event = emitter.emit_text_done(*output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
-        let event = emitter.emit_content_part_done(*output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_text_done(*output_index, item_id, content_index, tx)
+                .await,
+        );
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_content_part_done(*output_index, item_id, content_index, tx)
+                .await,
+        );
         let item = json!({
             "id": item_id,
             "type": "message",

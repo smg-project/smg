@@ -404,9 +404,8 @@ async fn process_and_transform_sse_stream(
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
-    let event = event_emitter.emit_created();
     event_emitter
-        .send_event(&event, &tx)
+        .send_created(&tx)
         .await
         .map_err(|_| "Failed to send response.created event".to_string())?;
 
@@ -418,9 +417,8 @@ async fn process_and_transform_sse_stream(
             .map_err(|_| "Failed to send response.queued event".to_string())?;
     }
 
-    let event = event_emitter.emit_in_progress();
     event_emitter
-        .send_event(&event, &tx)
+        .send_in_progress(&tx)
         .await
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
@@ -815,14 +813,12 @@ async fn execute_tool_loop_streaming_internal(
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
-    let event = emitter.emit_created();
-    emitter.send_event(&event, &tx).await?;
+    emitter.send_created(&tx).await?;
     if original_request.background.unwrap_or(false) {
         let event = emitter.emit_queued();
         emitter.send_event(&event, &tx).await?;
     }
-    let event = emitter.emit_in_progress();
-    emitter.send_event(&event, &tx).await?;
+    emitter.send_in_progress(&tx).await?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&session);
