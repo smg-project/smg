@@ -18,7 +18,9 @@ pub const NATIVE_EFFORT_VALUES: &[&str] =
 /// What the renderer answers around a render. It keeps message parts in the
 /// OpenAI wire format and has no thinking switch: effort is a prompt line, not
 /// a toggle, and no prompt ends inside a reasoning block. It continues a final
-/// assistant message itself and parses tool-call argument strings itself.
+/// assistant message itself and parses tool-call argument strings itself. A
+/// JSON response needs its reasoning separated and cannot continue a
+/// partial assistant value.
 pub(crate) const PROFILE: RendererProfile = RendererProfile {
     content_format: Some(ChatTemplateContentFormat::OpenAI),
     thinking_toggle: ThinkingToggle::None,
@@ -29,6 +31,8 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     capabilities: RendererCapabilities {
         native_assistant_continuation: true,
         raw_tool_call_arguments: true,
+        json_requires_separate_reasoning: true,
+        json_requires_empty_assistant_prefix: true,
         ..RendererProfile::NO_CAPABILITIES
     },
     thinking_mode: None,

@@ -136,6 +136,21 @@ fn continuation_is_unclosed_text_and_rejects_other_shapes() {
 }
 
 #[test]
+fn json_response_contract_requires_separation_and_an_empty_prefix() {
+    let (_directory, tokenizer) = tiny_tokenizer(json!({"model_type":"inkling2_mm_model"}), true);
+    let capabilities = tokenizer.unwrap().renderer_capabilities();
+    assert!(capabilities.validate_json_response(true, None).is_ok());
+    assert!(capabilities.validate_json_response(true, Some("")).is_ok());
+    assert!(capabilities.validate_json_response(false, None).is_err());
+    assert!(capabilities
+        .validate_json_response(true, Some("{"))
+        .is_err());
+    assert!(llm_tokenizer::traits::RendererCapabilities::default()
+        .validate_json_response(false, Some("{"))
+        .is_ok());
+}
+
+#[test]
 fn invalid_efforts_and_unsupported_parts_fail() {
     for effort in [
         json!(-0.1),

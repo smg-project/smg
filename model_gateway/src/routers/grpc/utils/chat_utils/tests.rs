@@ -1631,6 +1631,98 @@ fn flat_renderer_joins_the_prefill_and_reports_from_text() {
 
 // --- renderer-capability gates on the render path ------------------------
 
+fn json_renderer() -> llm_tokenizer::MockTokenizer {
+    llm_tokenizer::MockTokenizer::new()
+        .with_renderer_capabilities(RendererCapabilities {
+            native_assistant_continuation: true,
+            json_requires_separate_reasoning: true,
+            json_requires_empty_assistant_prefix: true,
+            ..Default::default()
+        })
+        .with_json_chat_template()
+}
+
+#[test]
+fn json_reasoning_separation_follows_the_renderer_contract() {
+    for format in [
+        json!({"type":"json_object"}),
+        json!({"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}),
+    ] {
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"user","content":"Hi"}],
+            "response_format":format, "separate_reasoning":false
+        }))
+        .unwrap();
+        let render = |request: &ChatCompletionRequest, tokenizer: &dyn Tokenizer| {
+            process_with_derived_profile(request, tokenizer, None, MediaPartOrder::MediaFirst)
+        };
+        assert!(render(&request, &json_renderer())
+            .unwrap_err()
+            .contains("separate_reasoning=true"));
+        assert!(render(&request, &llm_tokenizer::MockTokenizer::new()).is_ok());
+        request.separate_reasoning = true;
+        assert!(render(&request, &json_renderer()).is_ok());
+    }
+}
+
+#[test]
+fn json_continuation_checks_the_effective_flag_and_actual_response_format() {
+    for top_level in [false, true] {
+        for prefix in ["", "{\"answer\":"] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"m", "messages":[{"role":"assistant","content":prefix}],
+                "response_format":{"type":"json_object"},
+                "continue_final_message":top_level,
+                "chat_template_kwargs":{
+                    "continue_final_message":true,
+                    "response_format":{"type":"text"}
+                }
+            }))
+            .unwrap();
+            let result = process_with_derived_profile(
+                &request,
+                &json_renderer(),
+                None,
+                MediaPartOrder::MediaFirst,
+            );
+            if prefix.is_empty() {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().contains("nonempty assistant"));
+            }
+        }
+    }
+}
+
+#[test]
+fn json_contract_does_not_restrict_text_responses_or_closed_history() {
+    for format in [Value::Null, json!({"type":"text"})] {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"assistant","content":"Partial"}],
+            "response_format":format, "continue_final_message":true,
+            "separate_reasoning":false
+        }))
+        .unwrap();
+        assert!(process_with_derived_profile(
+            &request,
+            &json_renderer(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .is_ok());
+    }
+    let mut request = prefill_request();
+    request.continue_final_message = false;
+    request.response_format = Some(ResponseFormat::JsonObject);
+    assert!(process_with_derived_profile(
+        &request,
+        &json_renderer(),
+        None,
+        MediaPartOrder::MediaFirst,
+    )
+    .is_ok());
+}
+
 /// Render `request` through a mock that declares `capabilities` and
 /// hands back the message list it received as JSON, so both gates are
 /// observable without a checkpoint: which messages reach the template,
@@ -1659,6 +1751,8 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
@@ -1666,6 +1760,8 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 
 /// Without the capability the trailing assistant message is popped and its

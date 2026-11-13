@@ -79,7 +79,12 @@ It inserts typed message headers, content headers and turn endings as IDs.
 There is no BOS or assistant generation opener. The final assistant can continue
 only as string text without reasoning or tool calls.
 
-Request rendering follows the pinned HTTP helper, not the standalone renderer's
+JSON response formats require separated reasoning and cannot continue nonempty assistant text.
+The gateway checks these renderer capabilities against the actual response format before rendering.
+An empty assistant prefix is permitted. This validation does not establish constrained-generation correctness.
+Other renderers retain their existing JSON continuation and reasoning behavior.
+
+Request rendering follows the model's reference request format, not the standalone renderer's
 tool-author convention: a tool call carries its name in JSON, without adding a
 tool-name author to the assistant header. Tool results retain an explicit name
 if supplied. A call ID is metadata, not prompt text. Tool schemas use sorted,
@@ -100,10 +105,10 @@ patches with fixed normalization. The tokenizer bundle includes that policy file
 
 `cargo test -p llm-tokenizer --test inkling2_renderer` runs self-contained tests.
 The ignored oracle test additionally requires `INKLING2_MODEL_DIR` and
-`INKLING2_RENDER_FIXTURES` to name local private artifacts. It validates exact text
-and IDs without downloading model files. This does not establish that an
-installed server binary contains this source. Direct typed thinking, tool-error
-and tool-call parts also require support in the gateway's request schema.
+`INKLING2_RENDER_FIXTURES` to name a local checkpoint and a file of reference
+renderings. It validates exact text and IDs without downloading model files.
+Direct typed thinking, tool-error and tool-call parts also require support in the
+gateway's request schema.
 
 ### TiktokenTokenizer (`tiktoken.rs`)
 - Wraps the `tiktoken-rs` `CoreBPE` builders (`cl100k_base`, `p50k_base`, `p50k_edit`, `r50k_base`).
