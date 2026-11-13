@@ -13,7 +13,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
-    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
+    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling,
     MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
     Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, POOL_THREADS_ENV,
 };
@@ -30,16 +30,13 @@ use super::{
     capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
     encoder_budget::ItemOverEncoderBudget,
-    media_verdict, mm_settings,
+    media_client, media_verdict, mm_settings,
     pixel_cache::pixel_cache_with_budget,
     plan::{prepare_placeholder_tokens, validate_rendered_media_anchors, MediaPlan},
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::{
-    routers::grpc::proto_wrapper::vllm_mm_identity,
-    worker::{http_client::build_with, RuntimeType},
-};
+use crate::{routers::grpc::proto_wrapper::vllm_mm_identity, worker::RuntimeType};
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";
@@ -634,14 +631,8 @@ impl WorkerMediaPipeline {
             allow_private_media_hosts = connector_config.allow_private_hosts,
             "media fetch policy for worker-side processing"
         );
-        let connector = build_with(
-            || crate::server::http_client_builder().timeout(Duration::from_secs(30)),
-            false,
-            "media HTTP client",
-            |client| MediaConnector::new(client, connector_config.clone()),
-        )
-        .map_err(anyhow::Error::msg)
-        .context("building the media connector")?;
+        let connector = media_client::media_connector(&connector_config)
+            .context("building the media connector")?;
         let components = MultimodalComponents {
             media_connector: Arc::new(connector),
             model_registry,
