@@ -4,7 +4,10 @@
 //! and processing responses. These functions are composed by the
 //! streaming and non-streaming processors.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::Body,
@@ -12,7 +15,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use openai_protocol::messages::{CreateMessageRequest, Message};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use tracing::{debug, error, info, warn};
 
 use super::utils::should_propagate_header;
@@ -166,10 +170,14 @@ pub(crate) async fn parse_response(
 
 /// Relay a successful non-streaming answer as the provider wrote it, for the
 /// plain path, which reads nothing of it. The body must be a JSON object: one
-/// that is not is the 502 `parse_error`, as when the answer was read typed.
-/// Its usage counts go to the token metrics, and its bytes leave under the
-/// upstream's status and content type, so a key or a block this build does
-/// not model reaches the client as sent.
+/// that is not is the 502 `parse_error`, as when the answer was read typed. A
+/// body that stops coming is sorted as a send that fails (`send_request`): the
+/// request's timeout running out mid-body is the 504 under
+/// `timeout`/`deadline`, any other read failure the 502 under
+/// `backend_error`/`transport_disconnect`. The answer's usage counts go to the
+/// token metrics, and its bytes leave under the upstream's status and content
+/// type, so a key or a block this build does not model reaches the client as
+/// sent.
 pub(crate) async fn relay_response(
     response: reqwest::Response,
     model_id: &str,
@@ -177,20 +185,33 @@ pub(crate) async fn relay_response(
 ) -> Response {
     let status = response.status();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
-    let read = match response.bytes().await {
-        Ok(body) => serde_json::from_slice::<Value>(&body)
-            .map_err(|e| e.to_string())
-            .and_then(|answer| {
-                if answer.is_object() {
-                    Ok((body, answer))
-                } else {
-                    Err("the answer is not a JSON object".to_string())
-                }
-            }),
-        Err(e) => Err(e.to_string()),
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(model = %model_id, error = %e, "Reading the response body failed");
+            if e.is_timeout() {
+                record_failure_metrics(
+                    model_id,
+                    start_time,
+                    metrics_labels::ERROR_TIMEOUT,
+                    metrics_labels::REASON_DEADLINE,
+                );
+                return error::gateway_timeout("timeout", format!("Request timeout: {e}"));
+            }
+            record_failure_metrics(
+                model_id,
+                start_time,
+                metrics_labels::ERROR_BACKEND,
+                metrics_labels::REASON_TRANSPORT_DISCONNECT,
+            );
+            return error::bad_gateway("request_failed", format!("Request failed: {e}"));
+        }
     };
-    let (body, answer) = match read {
-        Ok(read) => read,
+    // The top-level keys alone, each value left as written: a map refuses an
+    // answer that is no JSON object, and the rest of the document is scanned
+    // past, not built.
+    let answer = match serde_json::from_slice::<HashMap<String, &RawValue>>(&body) {
+        Ok(answer) => answer,
         Err(e) => {
             error!(model = %model_id, error = %e, "Failed to parse response");
             record_failure_metrics(
@@ -202,14 +223,32 @@ pub(crate) async fn relay_response(
             return error::bad_gateway("parse_error", "Invalid response from backend");
         }
     };
-    let usage = |key: &str| answer["usage"][key].as_u64().unwrap_or(0);
-    let (input_tokens, output_tokens) = (usage("input_tokens"), usage("output_tokens"));
-    record_success_metrics(model_id, input_tokens, output_tokens, start_time);
+    #[derive(Default, Deserialize)]
+    struct Counts {
+        #[serde(default)]
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: u64,
+    }
+    let counts = answer
+        .get("usage")
+        .and_then(|usage| serde_json::from_str::<Counts>(usage.get()).ok())
+        .unwrap_or_default();
+    let message_id = answer
+        .get("id")
+        .and_then(|id| serde_json::from_str::<String>(id.get()).ok())
+        .unwrap_or_default();
+    record_success_metrics(
+        model_id,
+        counts.input_tokens,
+        counts.output_tokens,
+        start_time,
+    );
     info!(
         model = %model_id,
-        message_id = %answer["id"].as_str().unwrap_or_default(),
-        input_tokens = %input_tokens,
-        output_tokens = %output_tokens,
+        message_id = %message_id,
+        input_tokens = %counts.input_tokens,
+        output_tokens = %counts.output_tokens,
         "Completed non-streaming request"
     );
     let mut relayed = Response::new(Body::from(body));
@@ -560,6 +599,64 @@ mod tests {
     /// A send the request timeout cuts is the caller's 504 and one error
     /// counted against the model under `timeout`/`deadline`, with a duration
     /// sample; the upstream completes the handshake and never answers.
+    /// An upstream that sends its headers and then stalls past the request's
+    /// timeout is the 504 counted under `timeout`/`deadline`, as a send that
+    /// times out is, not a `parse_error`.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test's stalled upstream, aborted before the test ends"
+    )]
+    async fn a_plain_answer_whose_body_stalls_is_a_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let url = format!(
+            "http://{}/v1/messages",
+            listener.local_addr().expect("an address")
+        );
+        let stalled = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("a connection");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"id\":",
+                )
+                .await
+                .expect("the headers");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(socket);
+        });
+        let budget = Duration::from_millis(200);
+        let start = Instant::now();
+
+        let response = send_request(
+            &client_with_timeout(budget),
+            &url,
+            &HeaderMap::new(),
+            &request(),
+            budget,
+            "stalled-upstream",
+            start,
+        )
+        .await
+        .expect("the headers arrive");
+        let relayed = relay_response(response, "stalled-upstream", start).await;
+
+        assert_eq!(relayed.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            counted_failure(&handle, "stalled-upstream"),
+            ("timeout".to_string(), "deadline".to_string(), 1, 1)
+        );
+        stalled.abort();
+    }
+
     #[tokio::test]
     async fn a_send_that_times_out_is_counted_as_a_deadline_against_the_model() {
         let recorder = PrometheusBuilder::new().build_recorder();
