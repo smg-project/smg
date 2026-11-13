@@ -215,7 +215,7 @@ fn test_transform_messages_string_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -253,7 +253,7 @@ fn test_transform_messages_string_format_without_placeholders_omits_media() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.png".to_string(),
+                    url: "https://example.com/image.png".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -278,7 +278,7 @@ fn test_transform_messages_string_format_with_video_placeholder() {
             },
             ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    url: "https://example.com/video.mp4".to_string(),
+                    url: "https://example.com/video.mp4".to_string().into(),
                     fps: None,
                     max_long_side_pixel: None,
                 },
@@ -309,14 +309,14 @@ fn test_transform_messages_string_format_uses_per_modality_placeholders() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
             },
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "audio".to_string(),
+                    url: "audio".to_string().into(),
                 },
             },
         ]),
@@ -356,7 +356,7 @@ fn test_transform_messages_input_audio_uses_audio_placeholder() {
             },
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             },
@@ -388,7 +388,7 @@ fn test_transform_messages_string_format_rejects_missing_modality_placeholder() 
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::AudioUrl {
             audio_url: AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
             },
         }]),
         name: None,
@@ -411,7 +411,7 @@ fn test_transform_messages_openai_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: Some("high".to_string()),
                     max_long_side_pixel: None,
                 },
@@ -474,7 +474,7 @@ fn test_transform_messages_multiple_messages() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -509,7 +509,7 @@ fn test_transform_messages_empty_text_parts() {
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
-                url: "https://example.com/image.jpg".to_string(),
+                url: "https://example.com/image.jpg".to_string().into(),
                 detail: None,
                 max_long_side_pixel: None,
             },
@@ -544,7 +544,7 @@ fn test_transform_messages_mixed_content_types() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: Some("low".to_string()),
                         max_long_side_pixel: None,
                     },
@@ -592,7 +592,7 @@ fn parts_reach_a_parts_template_in_the_requests_order_whatever_the_media_order()
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -619,7 +619,7 @@ fn test_media_hoisted_before_text_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -651,7 +651,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i1".to_string(),
+                    url: "i1".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -661,7 +661,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i2".to_string(),
+                    url: "i2".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -781,7 +781,7 @@ fn test_tml_preserves_authored_multipart_order_openai() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1005,7 +1005,7 @@ fn test_tml_preserves_authored_multipart_order_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1485,7 +1485,7 @@ fn test_render_image_before_question_real_template() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },

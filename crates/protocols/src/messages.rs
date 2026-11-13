@@ -7,6 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     marker::PhantomData,
+    sync::Arc,
 };
 
 use serde::{
@@ -675,8 +676,14 @@ pub struct ImageBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
-    Base64 { media_type: String, data: String },
-    Url { url: String },
+    /// Base64 text with its media type; the text is shared with the readers
+    /// that decode it, never re-encoded into a data URL.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
+    /// A URL or `data:` URL, shared with its readers.
+    Url { url: Arc<String> },
 }
 
 /// Document content block

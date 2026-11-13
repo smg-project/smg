@@ -1231,7 +1231,7 @@ mod tests {
         .unwrap();
         let connector = &components.media_connector;
         for modality in ["image", "audio", "video"] {
-            let source = MediaSource::Url(url.clone());
+            let source = MediaSource::Url(url.to_string().into());
             let fetch = async {
                 match modality {
                     "image" => connector

@@ -35,13 +35,13 @@ impl MediaPlan {
         let mut plan = Self::default();
         for part in parts {
             let modality = match &part {
-                MediaContentPart::ImageUrl { .. } | MediaContentPart::ImageData { .. } => {
-                    Some(Modality::Image)
-                }
+                MediaContentPart::ImageUrl { .. }
+                | MediaContentPart::ImageBase64 { .. }
+                | MediaContentPart::ImageData { .. } => Some(Modality::Image),
                 MediaContentPart::ImageEmbeds { .. } => Some(Modality::ImageEmbeds),
-                MediaContentPart::AudioUrl { .. } | MediaContentPart::AudioData { .. } => {
-                    Some(Modality::Audio)
-                }
+                MediaContentPart::AudioUrl { .. }
+                | MediaContentPart::AudioBase64 { .. }
+                | MediaContentPart::AudioData { .. } => Some(Modality::Audio),
                 MediaContentPart::VideoUrl { .. } | MediaContentPart::VideoData { .. } => {
                     Some(Modality::Video)
                 }
@@ -71,9 +71,11 @@ impl MediaPlan {
         for part in &self.parts {
             let (of, source) = match part {
                 MediaContentPart::ImageUrl { url, .. } => (Modality::Image, url_source(url)),
+                MediaContentPart::ImageBase64 { .. } => (Modality::Image, BASE64_SOURCE),
                 MediaContentPart::ImageData { .. } => (Modality::Image, 2),
                 MediaContentPart::ImageEmbeds { .. } => (Modality::ImageEmbeds, 2),
                 MediaContentPart::AudioUrl { url, .. } => (Modality::Audio, url_source(url)),
+                MediaContentPart::AudioBase64 { .. } => (Modality::Audio, BASE64_SOURCE),
                 MediaContentPart::AudioData { .. } => (Modality::Audio, 2),
                 MediaContentPart::VideoUrl { url, .. } => (Modality::Video, url_source(url)),
                 MediaContentPart::VideoData { .. } => (Modality::Video, 2),
@@ -115,7 +117,11 @@ impl MediaPlan {
                 MediaContentPart::ImageUrl {
                     max_long_side_pixel: None,
                     ..
+                } | MediaContentPart::ImageBase64 {
+                    max_long_side_pixel: None,
+                    ..
                 } | MediaContentPart::AudioUrl { .. }
+                    | MediaContentPart::AudioBase64 { .. }
                     | MediaContentPart::VideoUrl {
                         fps: None,
                         max_long_side_pixel: None,
@@ -417,6 +423,9 @@ fn url_source(url: &str) -> usize {
     usize::from(FetchSourceKind::of_url(url) == FetchSourceKind::DataUrl)
 }
 
+/// The source index of a base64 part: the data URL it stands for.
+const BASE64_SOURCE: usize = 1;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Arc;
@@ -441,7 +450,7 @@ pub(crate) mod tests {
     /// `count` image parts, each at its own URL.
     pub(crate) fn image_urls(count: usize) -> MediaPlan {
         MediaPlan::new((0..count).map(|i| MediaContentPart::ImageUrl {
-            url: format!("https://example.com/{i}.png"),
+            url: format!("https://example.com/{i}.png").into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
@@ -452,13 +461,13 @@ pub(crate) mod tests {
     fn media_urls(modality: Modality, count: usize) -> MediaPlan {
         match modality {
             Modality::Video => MediaPlan::new((0..count).map(|i| MediaContentPart::VideoUrl {
-                url: format!("https://example.com/{i}.mp4"),
+                url: format!("https://example.com/{i}.mp4").into(),
                 uuid: None,
                 fps: None,
                 max_long_side_pixel: None,
             })),
             Modality::Audio => MediaPlan::new((0..count).map(|i| MediaContentPart::AudioUrl {
-                url: format!("https://example.com/{i}.wav"),
+                url: format!("https://example.com/{i}.wav").into(),
                 uuid: None,
             })),
             Modality::Image | Modality::ImageEmbeds => image_urls(count),
@@ -926,17 +935,17 @@ pub(crate) mod tests {
                 text: "ignored".to_string(),
             },
             MediaContentPart::AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
                 uuid: None,
             },
             MediaContentPart::ImageUrl {
-                url: "image".to_string(),
+                url: "image".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
-                url: "audio-2".to_string(),
+                url: "audio-2".to_string().into(),
                 uuid: None,
             },
         ]);
@@ -949,15 +958,15 @@ pub(crate) mod tests {
         assert_eq!(parts.len(), 3);
         assert!(matches!(
             &parts[0],
-            MediaContentPart::AudioUrl { url, .. } if url == "audio"
+            MediaContentPart::AudioUrl { url, .. } if url.as_str() == "audio"
         ));
         assert!(matches!(
             &parts[1],
-            MediaContentPart::ImageUrl { url, .. } if url == "image"
+            MediaContentPart::ImageUrl { url, .. } if url.as_str() == "image"
         ));
         assert!(matches!(
             &parts[2],
-            MediaContentPart::AudioUrl { url, .. } if url == "audio-2"
+            MediaContentPart::AudioUrl { url, .. } if url.as_str() == "audio-2"
         ));
     }
 
@@ -965,13 +974,13 @@ pub(crate) mod tests {
     fn rendered_anchor_validation_is_exact_per_modality() {
         let plan = MediaPlan::new([
             MediaContentPart::ImageUrl {
-                url: "image".to_string(),
+                url: "image".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
                 uuid: None,
             },
         ]);
@@ -1079,19 +1088,19 @@ pub(crate) mod tests {
         ]);
         let plan = MediaPlan::new([
             MediaContentPart::ImageUrl {
-                url: "https://a/1.png".to_string(),
+                url: "https://a/1.png".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
             },
             MediaContentPart::VideoUrl {
-                url: "https://a/v.mp4".to_string(),
+                url: "https://a/v.mp4".to_string().into(),
                 uuid: None,
                 fps: None,
                 max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
-                url: "https://a/a.wav".to_string(),
+                url: "https://a/a.wav".to_string().into(),
                 uuid: None,
             },
         ]);
@@ -1155,7 +1164,7 @@ pub(crate) mod tests {
         let source = dir.path().to_str().unwrap();
         let tokenizer = MockTokenizer::default();
         let plan = MediaPlan::new([MediaContentPart::ImageUrl {
-            url: "https://a/1.png".to_string(),
+            url: "https://a/1.png".to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
