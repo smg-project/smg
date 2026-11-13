@@ -274,12 +274,13 @@ const SEED_THREADS: usize = 4;
 /// Text on each side of a candidate cut that every stage's pattern is run
 /// over to confirm a piece starts there (widened to the spaces around it).
 const CUT_CHECK_WINDOW: usize = 512;
-/// How far before a candidate cut the window's start may be looked for when
-/// a stage can read a space after a non-whitespace character inside one
-/// match (a letter run joined by spaces, a class read before a space), so
-/// that spaces lie inside pieces; a candidate without a start within this
-/// reach is refused. Without such a stage the nearest space back is the
-/// start, however far.
+/// How far before and after a candidate cut the window's start and end may
+/// be looked for when a stage can read a space after a non-whitespace
+/// character inside one match (a letter run joined by spaces, a class read
+/// before a space), so that spaces lie inside pieces; a candidate without a
+/// start or an end within this reach is refused. Without such a stage the
+/// nearest space back is the start and the nearest space on the end,
+/// however far.
 const CUT_CHECK_REACH: usize = 4 * CUT_CHECK_WINDOW;
 /// Candidates one cut search may reject before it gives up: the byte scan for
 /// a candidate is cheap, the window check on each one is not, so a text whose
@@ -2495,18 +2496,17 @@ impl NativeEncoder {
     /// match may span `p`; a match that starts at `p` settles it (the deeper
     /// stages see that match from `p` on either way), a gap around `p` hands
     /// the question to the next stage, and a gap at the last stage would be
-    /// split, so that is no cut. The window starts where the whole text's
-    /// match loop begins a piece too ([`Self::window_start`]), so that its
-    /// pieces up to `p` are the text's; a candidate without such a start is
-    /// no cut.
+    /// split, so that is no cut. The window starts and ends where the whole
+    /// text's match loop begins a piece too ([`Self::window_start`],
+    /// [`Self::window_end`]), so that its pieces up to `p` are the text's; a
+    /// candidate without such a start or end is no cut.
     fn piece_starts_at(&self, text: &str, p: usize) -> bool {
         let Some(start) = self.window_start(text, p) else {
             return false;
         };
-        let mut end = (p + CUT_CHECK_WINDOW).min(text.len());
-        while end < text.len() && !(text.is_char_boundary(end) && text.as_bytes()[end] == b' ') {
-            end += 1;
-        }
+        let Some(end) = self.window_end(text, p) else {
+            return false;
+        };
         let window = &text[start..end];
         let at = p - start;
         for stage in &self.stages {
@@ -2561,18 +2561,8 @@ impl NativeEncoder {
         }
         let floor = p.saturating_sub(CUT_CHECK_REACH);
         while start > 0 {
-            if text.is_char_boundary(start) && bytes[start] == b' ' {
-                let after = text[start + 1..].chars().next();
-                let taken = text[..start].chars().next_back().is_some_and(|before| {
-                    before.is_whitespace()
-                        || self.stages.iter().any(|stage| {
-                            stage.pattern.spans_space_between(before, after)
-                                || stage.pattern.reads_space_after(before)
-                        })
-                });
-                if !taken {
-                    return Some(start);
-                }
+            if self.piece_begins_at_space(text, start) {
+                return Some(start);
             }
             if start <= floor {
                 return None;
@@ -2580,6 +2570,63 @@ impl NativeEncoder {
             start -= 1;
         }
         Some(0)
+    }
+
+    /// Where the cut check's window for a candidate at `p` ends: the first
+    /// space at or after `p + CUT_CHECK_WINDOW` where the whole text's match
+    /// loop begins a piece, by the rule of the start ([`Self::window_start`]),
+    /// or the text's end, so that the window's pieces around `p` are the
+    /// text's. A window ended at a space inside a piece cuts that piece
+    /// short, and an alternative the end no longer holds gives way to a
+    /// shorter one that fits: ` [ a]{1999}| [ a]{999}| a` over a run of
+    /// ` a` ends its shorter alternative on a candidate the text's longer
+    /// one spans, which would approve a cut inside a piece. When no stage
+    /// reads a space inside a match the first space on is the end, as any
+    /// space begins a piece then. Otherwise `None` when no such space lies
+    /// within [`CUT_CHECK_REACH`] of `p` and the text runs on: no cut there
+    /// (under a pattern that reads a space inside a match such a stretch is
+    /// one piece, so no cut is lost).
+    fn window_end(&self, text: &str, p: usize) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let mut end = (p + CUT_CHECK_WINDOW).min(text.len());
+        if !self.space_inside {
+            while end < text.len() && !(text.is_char_boundary(end) && bytes[end] == b' ') {
+                end += 1;
+            }
+            return Some(end);
+        }
+        let ceiling = (p + CUT_CHECK_REACH).min(text.len());
+        while end < text.len() {
+            if self.piece_begins_at_space(text, end) {
+                return Some(end);
+            }
+            if end >= ceiling {
+                return None;
+            }
+            end += 1;
+        }
+        Some(text.len())
+    }
+
+    /// Whether the whole text's match loop begins a piece at `at` under a
+    /// pattern that reads a space inside a match: `at` holds a space that
+    /// no piece before it took, in a whitespace run from a whitespace
+    /// character before it, as the join of a letter run
+    /// ([`Pattern::spans_space_between`]) or read after a character like the
+    /// one before it inside one match ([`Pattern::reads_space_after`]). The
+    /// cut check's window starts and ends at such a space.
+    fn piece_begins_at_space(&self, text: &str, at: usize) -> bool {
+        if !(text.is_char_boundary(at) && text.as_bytes()[at] == b' ') {
+            return false;
+        }
+        let after = text[at + 1..].chars().next();
+        !text[..at].chars().next_back().is_some_and(|before| {
+            before.is_whitespace()
+                || self.stages.iter().any(|stage| {
+                    stage.pattern.spans_space_between(before, after)
+                        || stage.pattern.reads_space_after(before)
+                })
+        })
     }
 
     /// Appends the ids of one unit: an added token's id, or a text's pieces

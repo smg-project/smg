@@ -1722,6 +1722,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
         "a ".repeat(20_000)
     );
     let letter_space = "abc ".repeat(20_000);
+    let long_alternative = format!("{}{}", "z".repeat(31_768), " a".repeat(20_000));
     for (index, pattern) in [
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}",
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\s+",
@@ -1732,6 +1733,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
         r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\p{N}? |\s+",
         r" [ ac]{999}|x? a+|(?:ab*(?: ab*)*)+",
         r"\p{L}+ ?| ?\p{L}+|\s+",
+        r" [ a]{1999}| [ a]{999}| a",
     ]
     .into_iter()
     .enumerate()
@@ -1761,6 +1763,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
             prefix_run.as_str(),
             prefix_opt.as_str(),
             letter_space.as_str(),
+            long_alternative.as_str(),
         ] {
             let whole: Vec<String> = {
                 let mut out = Vec::new();
