@@ -155,7 +155,7 @@ Call `validate()` to check the URL before use.
 | `password` | `String` | -- | Database password (redacted in `Debug` output). |
 | `pool_min` | `usize` | 1 | Minimum pool connections. |
 | `pool_max` | `usize` | 16 | Maximum pool connections. |
-| `pool_timeout_secs` | `u64` | 30 | Connection acquisition timeout in seconds. |
+| `pool_timeout_secs` | `u64` | 30 | Connection acquisition timeout in seconds, and the bound on the start-up connection: a store that accepts the connection and never answers is refused at start-up within it (0 = no bound). |
 | `schema` | `Option<SchemaConfig>` | `None` | Optional schema customization. See [Schema Configuration](#schema-configuration). |
 
 ### Schema Configuration
