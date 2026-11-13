@@ -533,7 +533,10 @@ impl CliArgs {
     }
 
     /// Build Oracle storage settings after validating authentication and pool bounds.
-    fn build_oracle_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<OracleConfig> {
+    pub(crate) fn build_oracle_config(
+        &self,
+        schema: Option<SchemaConfig>,
+    ) -> ConfigResult<OracleConfig> {
         let (wallet_path, connect_descriptor) = match self.resolve_oracle_connect_details()? {
             OracleConnectSource::Dsn { descriptor } => (None, descriptor),
             OracleConnectSource::Wallet { path, alias } => (Some(path), alias),
@@ -591,7 +594,7 @@ impl CliArgs {
             .oracle_pool_timeout_secs
             .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
 
-        Ok(OracleConfig {
+        let ocf = OracleConfig {
             wallet_path,
             connect_descriptor,
             external_auth: self.integrations.oracle_external_auth,
@@ -600,8 +603,15 @@ impl CliArgs {
             pool_min,
             pool_max,
             pool_timeout_secs,
+            op_timeout_secs: self
+                .integrations
+                .oracle_op_timeout_secs
+                .unwrap_or_else(OracleConfig::default_op_timeout_secs),
             schema,
-        })
+        };
+        ocf.validate_bounds()
+            .map_err(|e| ConfigError::ValidationFailed { reason: e })?;
+        Ok(ocf)
     }
 
     /// Build PostgreSQL storage settings, requiring a URL and valid pool bounds.
@@ -1302,6 +1312,7 @@ impl CliArgs {
                 PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
             )
             .policy_engine(PolicyEngineMode::parse(&self.routing.policy_engine).unwrap_or_default())
+            .grouped_dp_sticky(self.routing.grouped_dp_sticky)
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing.routing_key_override,
                 eviction_interval_secs: self.routing.eviction_interval,

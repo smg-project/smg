@@ -879,6 +879,9 @@ impl WorkerMediaPipeline {
             } else {
                 None
             },
+            // In-process: the tensors ride no gRPC message of this worker's
+            // own; the framing of the hop that carries them answers.
+            None,
             super::transparency::runtime_transparency_policy(runtime),
             self.encoder_budget,
         )
@@ -1906,6 +1909,7 @@ mod tests {
                 CONFIG_KEY,
                 &pipeline.model_dir,
                 pipeline.assembly.image_wire_dtype(),
+                None,
                 llm_multimodal::TransparencyPolicy::CompositeOverWhite,
                 None,
             )
