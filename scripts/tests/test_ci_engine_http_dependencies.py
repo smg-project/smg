@@ -657,6 +657,7 @@ def test_real_verifier_reports_changed_sglang_or_torch_before_native_context(
 # setup. Check that the strict cohort verification also runs after that install.
 # These tests inspect Source only: no backend, model or native verifier starts.
 def _nightly_sglang_postinstall_contract(job):
+    import fnmatch
     import shlex
 
     steps = job["steps"]
@@ -665,37 +666,82 @@ def _nightly_sglang_postinstall_contract(job):
         for index, entry in enumerate(steps)
         if "ci_setup_sglang_rocm_image.sh --verify-only" in entry.get("run", "")
     ]
-    assert len(checks) == 1, "expected one post-install SGLang cohort check"
-    index, check = checks[0]
+    assert len(checks) == 2, "expected prepared and final SGLang cohort checks"
+    by_id = {entry.get("id"): (index, entry) for index, entry in checks}
+    assert set(by_id) == {"prepared", "final"}
+    index, check = by_id["prepared"]
+    final_index, final = by_id["final"]
     installs = [
         position
         for position, entry in enumerate(steps)
         if "pip install wheel/*.whl" in entry.get("run", "")
         and "bash scripts/ci_install_e2e_deps.sh" in entry.get("run", "")
     ]
+    genai = [
+        position
+        for position, entry in enumerate(steps)
+        if 'pip" install' in entry.get("run", "") and "genai-bench==" in entry.get("run", "")
+    ]
+    versions = [
+        (position, entry)
+        for position, entry in enumerate(steps)
+        if entry.get("name") == "Record SGLang runtime versions"
+    ]
     benchmarks = [
         position
         for position, entry in enumerate(steps)
         if "pytest e2e_test/benchmarks/test_nightly_perf.py" in entry.get("run", "")
     ]
-    assert len(installs) == len(benchmarks) == 1
-    assert index == installs[0] + 1 and index < benchmarks[0]
-    assert check["if"] == (
-        "steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang'"
-    )
+    assert len(installs) == len(genai) == len(versions) == len(benchmarks) == 1
+    versions_index, version_step = versions[0]
+    assert installs[0] < genai[0] < versions_index < index < benchmarks[0] < final_index
+    selected_sglang = "steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang'"
+    assert check["if"] == version_step["if"] == selected_sglang
     assert check["env"] == {"SMG_SGLANG_ROCM_IMAGE": "${{ matrix.variant.image }}"}
-    assert check["timeout-minutes"] == 2
-    assert check.get("continue-on-error", False) is False
-    commands = [shlex.split(line) for line in check["run"].splitlines() if line.strip()]
-    assert commands == [
-        ["mkdir", "-p", "nightly_gateway_logs"],
-        [
-            "bash",
-            "scripts/ci_setup_sglang_rocm_image.sh",
-            "--verify-only",
-            "nightly_gateway_logs/sglang-native-environment-prepared.json",
-        ],
+    assert job["env"]["SMG_SGLANG_ROCM_IMAGE"] == (
+        "${{ matrix.variant.runtime == 'sglang' && matrix.variant.image || '' }}"
+    )
+    setup = [entry for entry in steps if entry.get("id") == "setup"]
+    assert len(setup) == 1 and "matrix.variant.setup" in setup[0]["run"]
+    assert final["if"] == (
+        "always() && " + selected_sglang + " && steps.setup.outcome == 'success'"
+    )
+    assert (
+        final.get("env", {}).get("SMG_SGLANG_ROCM_IMAGE", "${{ matrix.variant.image }}")
+        == "${{ matrix.variant.image }}"
+    )
+    assert shlex.split(version_step["run"].splitlines()[0]) == [
+        "mkdir",
+        "-p",
+        "nightly_gateway_logs",
     ]
+    assert version_step["run"].splitlines()[1:] == [
+        "python3 -m pip freeze > nightly_gateway_logs/runtime-versions.txt",
+        '"$RUNNER_TEMP/genai-bench/bin/pip" freeze > nightly_gateway_logs/benchmark-versions.txt',
+    ]
+    reports = []
+    for stage, entry in (("prepared", check), ("final", final)):
+        assert entry["timeout-minutes"] == 2
+        assert entry.get("continue-on-error", False) is False
+        report = f"nightly_gateway_logs/sglang-native-environment-{stage}.json"
+        commands = [shlex.split(line) for line in entry["run"].splitlines() if line.strip()]
+        assert commands == [
+            ["mkdir", "-p", "nightly_gateway_logs"],
+            ["bash", "scripts/ci_setup_sglang_rocm_image.sh", "--verify-only", report],
+        ]
+        reports.append(report)
+    upload = [entry for entry in steps if entry.get("name") == "Upload benchmark results"]
+    assert len(upload) == 1 and upload[0]["if"] == "always() && steps.filter.outputs.skip != 'true'"
+    assert steps.index(upload[0]) > final_index
+    patterns = upload[0]["with"]["path"].splitlines()
+    reports += [
+        "nightly_gateway_logs/runtime-versions.txt",
+        "nightly_gateway_logs/benchmark-versions.txt",
+    ]
+    assert all(
+        any(fnmatch.fnmatch(Path(report).parent.as_posix() + "/", pattern) for pattern in patterns)
+        for report in reports
+    ), "native reports and versions must be retained even on failure"
     return index
 
 
@@ -725,6 +771,21 @@ def test_nightly_sglang_postinstall_after_dependencies(job_id):
         "wrong_report",
         "duplicate",
         "unbounded_timeout",
+        "missing_final",
+        "final_not_always",
+        "final_wrong_runtime",
+        "final_unfiltered",
+        "final_wrong_setup",
+        "final_before_benchmark",
+        "final_wrong_report",
+        "final_wrong_image",
+        "final_continue_on_error",
+        "final_suppressed_exit",
+        "final_unbounded_timeout",
+        "missing_versions",
+        "unretained_reports",
+        "upload_not_always",
+        "wrong_setup_image",
     ],
 )
 def test_nightly_sglang_postinstall_rejects_broken_wiring(job_id, mutation):
@@ -736,7 +797,12 @@ def test_nightly_sglang_postinstall_rejects_broken_wiring(job_id, mutation):
     if mutation == "missing":
         job["steps"].pop(index)
     elif mutation == "before_dependencies":
-        job["steps"].insert(index - 1, job["steps"].pop(index))
+        dependency_index = next(
+            i
+            for i, step in enumerate(job["steps"])
+            if "pip install wheel/*.whl" in step.get("run", "")
+        )
+        job["steps"].insert(dependency_index, job["steps"].pop(index))
     elif mutation == "unfiltered":
         check["if"] = "matrix.variant.runtime == 'sglang'"
     elif mutation == "wrong_runtime":
@@ -755,6 +821,48 @@ def test_nightly_sglang_postinstall_rejects_broken_wiring(job_id, mutation):
         job["steps"].insert(index, copy.deepcopy(check))
     elif mutation == "unbounded_timeout":
         check["timeout-minutes"] = 1440
+    elif mutation.startswith("final_") or mutation == "missing_final":
+        final_index = next(i for i, step in enumerate(job["steps"]) if step.get("id") == "final")
+        final = job["steps"][final_index]
+        if mutation == "missing_final":
+            job["steps"].pop(final_index)
+        elif mutation == "final_not_always":
+            final["if"] = final["if"].replace("always() && ", "")
+        elif mutation == "final_wrong_runtime":
+            final["if"] = final["if"].replace("'sglang'", "'vllm'")
+        elif mutation == "final_unfiltered":
+            final["if"] = final["if"].replace("steps.filter.outputs.skip != 'true' && ", "")
+        elif mutation == "final_wrong_setup":
+            final["if"] = final["if"].replace("steps.setup.outcome", "steps.benchmark.outcome")
+        elif mutation == "final_before_benchmark":
+            benchmark_index = next(
+                i
+                for i, step in enumerate(job["steps"])
+                if "pytest e2e_test/benchmarks/test_nightly_perf.py" in step.get("run", "")
+            )
+            job["steps"].insert(benchmark_index, job["steps"].pop(final_index))
+        elif mutation == "final_wrong_report":
+            final["run"] = final["run"].replace("sglang-native-environment-final.json", "lost.json")
+        elif mutation == "final_wrong_image":
+            final["env"] = {"SMG_SGLANG_ROCM_IMAGE": "an-unbound-image"}
+        elif mutation == "final_continue_on_error":
+            final["continue-on-error"] = True
+        elif mutation == "final_suppressed_exit":
+            final["run"] += " || true"
+        elif mutation == "final_unbounded_timeout":
+            final["timeout-minutes"] = 1440
+    elif mutation == "missing_versions":
+        job["steps"] = [
+            s for s in job["steps"] if s.get("name") != "Record SGLang runtime versions"
+        ]
+    elif mutation == "unretained_reports":
+        upload = next(s for s in job["steps"] if s.get("name") == "Upload benchmark results")
+        upload["with"]["path"] = "benchmark_*/"
+    elif mutation == "upload_not_always":
+        upload = next(s for s in job["steps"] if s.get("name") == "Upload benchmark results")
+        upload["if"] = "success()"
+    elif mutation == "wrong_setup_image":
+        job["env"]["SMG_SGLANG_ROCM_IMAGE"] = "an-unbound-image"
     with pytest.raises(AssertionError):
         _nightly_sglang_postinstall_contract(job)
 
