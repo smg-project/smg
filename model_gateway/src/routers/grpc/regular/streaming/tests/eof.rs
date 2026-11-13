@@ -521,6 +521,7 @@ async fn byte_fallback_generate_mid_run_stop_reports_gateway_stop() {
     let wire = serde_json::to_value(&responses[0]).unwrap();
     assert_eq!(wire["text"], "");
     assert_eq!(wire["meta_info"]["finish_reason"]["type"], "stop");
+    assert_eq!(wire["meta_info"]["finish_reason"]["matched"], "tt");
     assert_eq!(wire["meta_info"]["matched_stop"], "tt");
 }
 
@@ -561,6 +562,7 @@ async fn byte_fallback_generate_stop_token_keeps_the_engine_matched_stop() {
     let wire = serde_json::to_value(&responses[0]).unwrap();
     assert_eq!(wire["text"], "tt");
     assert_eq!(wire["meta_info"]["finish_reason"]["type"], "stop");
+    assert_eq!(wire["meta_info"]["finish_reason"]["matched"], 3);
     assert_eq!(wire["meta_info"]["matched_stop"], 3);
 }
 

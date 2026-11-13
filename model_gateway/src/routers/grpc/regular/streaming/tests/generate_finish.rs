@@ -2,7 +2,9 @@
 //! the non-streamed answer (`{"type":"stop"}`, `{"type":"length","length":N}`)
 //! on a plain stream as on one that returns logprobs.
 
-use smg_grpc_client::vllm_engine::proto::generate_response::Response as GenerationEvent;
+use smg_grpc_client::vllm_engine::proto::{
+    self, generate_complete::MatchedStop, generate_response::Response as GenerationEvent,
+};
 
 use super::{
     super::*,
@@ -17,6 +19,12 @@ async fn finish_event(reason: &str, completion_tokens: u32, with_logprobs: bool)
     if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
         complete.completion_tokens = completion_tokens;
     }
+    finish_event_of(terminal, with_logprobs).await
+}
+
+/// The finish event of a one-choice generate stream the engine ends with
+/// `terminal`, as [`finish_event`] drives it.
+async fn finish_event_of(terminal: proto::GenerateResponse, with_logprobs: bool) -> Value {
     let (stream, server) = scripted_stream(vec![chunk(0, "hi"), terminal], "0").await;
     let ctx = GenerateStreamContext {
         request_id: "gen-finish".to_string(),
@@ -57,6 +65,35 @@ async fn a_plain_stream_writes_the_typed_finish_reason_of_the_logprobs_stream() 
             assert_eq!(
                 event["meta_info"]["finish_reason"], expected,
                 "{reason}, logprobs {with_logprobs}"
+            );
+        }
+    }
+}
+
+/// A stop the engine names what it matched, a stop string or a stop token's
+/// id, writes it in the finish reason, as SGLang writes it, on the plain
+/// loop as on the one that carries logprobs.
+#[tokio::test]
+async fn a_stream_stopped_by_a_match_writes_what_it_matched() {
+    for (matched, expected) in [
+        (
+            MatchedStop::MatchedStopStr("END".to_string()),
+            serde_json::json!({"type": "stop", "matched": "END"}),
+        ),
+        (
+            MatchedStop::MatchedTokenId(7),
+            serde_json::json!({"type": "stop", "matched": 7}),
+        ),
+    ] {
+        for with_logprobs in [false, true] {
+            let mut terminal = complete(0, "stop");
+            if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
+                complete.matched_stop = Some(matched.clone());
+            }
+            let event = finish_event_of(terminal, with_logprobs).await;
+            assert_eq!(
+                event["meta_info"]["finish_reason"], expected,
+                "{matched:?}, logprobs {with_logprobs}"
             );
         }
     }

@@ -271,6 +271,7 @@ fn generate_settlement_takes_the_shared_prompt_once_and_sums_the_choices() {
                 id: "gen".to_string(),
                 finish_reason: GenerateFinishReason::Stop {
                     finish_type: GenerateFinishType::Stop,
+                    matched: None,
                 },
                 prompt_tokens: 9,
                 weight_version: "default".to_string(),

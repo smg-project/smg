@@ -712,11 +712,14 @@ impl ResponseProcessor {
             let decoded_text = decoded.text;
 
             let output_ids = complete.output_ids().to_vec();
+            // What the stop matched rides in the finish reason, as SGLang
+            // writes it, and in `matched_stop`, which smg's clients read.
+            let matched_stop = matched_stop_value(stop_decoder, &complete);
             let finish_reason = utils::parse_finish_reason(
                 finish_after_local_stop(decoded.stopped, &complete),
                 complete.completion_tokens(),
+                matched_stop.clone(),
             );
-            let matched_stop = matched_stop_value(stop_decoder, &complete);
 
             // Extract logprobs if requested (convert proto types to Generate format)
             let input_token_logprobs = if request_logprobs {

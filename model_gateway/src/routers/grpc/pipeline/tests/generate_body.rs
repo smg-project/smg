@@ -13,6 +13,7 @@ fn response(weight_version: &str) -> GenerateResponse {
             id: "req-1".to_string(),
             finish_reason: GenerateFinishReason::Stop {
                 finish_type: GenerateFinishType::Stop,
+                matched: None,
             },
             prompt_tokens: 3,
             weight_version: weight_version.to_string(),

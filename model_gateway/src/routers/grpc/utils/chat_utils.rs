@@ -1612,10 +1612,12 @@ pub(crate) fn completion_finish_reason(local_stop: bool, engine: &str) -> &'stat
 pub(crate) fn parse_finish_reason(
     reason_str: &str,
     completion_tokens: u32,
+    matched: Option<Value>,
 ) -> GenerateFinishReason {
     if reason_str == "stop" {
         return GenerateFinishReason::Stop {
             finish_type: openai_protocol::generate::GenerateFinishType::Stop,
+            matched,
         };
     }
 

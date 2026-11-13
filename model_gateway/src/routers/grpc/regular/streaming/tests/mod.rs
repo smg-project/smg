@@ -232,7 +232,7 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
                     ("chunk", None, None),
                     (
                         "finish",
-                        Some(utils::parse_finish_reason("length", 7)),
+                        Some(utils::parse_finish_reason("length", 7, None)),
                         Some(0.0123),
                     ),
                 ] {

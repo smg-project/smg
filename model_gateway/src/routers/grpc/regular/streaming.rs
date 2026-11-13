@@ -978,6 +978,7 @@ impl StreamingProcessor {
                                 finish_reason: Some(utils::parse_finish_reason(
                                     complete.finish_reason(),
                                     complete.completion_tokens(),
+                                    complete.matched_stop_json(),
                                 )),
                                 prompt_tokens: complete.prompt_tokens(),
                                 weight_version: effective_weight_version(
@@ -1272,6 +1273,7 @@ impl StreamingProcessor {
                         let finish_reason = utils::parse_finish_reason(
                             complete.finish_reason(),
                             complete.completion_tokens(),
+                            complete.matched_stop_json(),
                         );
 
                         // Send final chunk with finish_reason

@@ -365,6 +365,10 @@ pub enum GenerateFinishReason {
     Stop {
         #[serde(rename = "type")]
         finish_type: GenerateFinishType,
+        /// What the stop matched, as SGLang writes it: the stop string, or
+        /// the stop token's id (one or a list).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matched: Option<Value>,
     },
     Other(Value),
 }
@@ -394,6 +398,27 @@ mod tests {
 
         let back: GenerateRequest = serde_json::from_value(v).expect("roundtrip");
         assert!(!back.return_hidden_states);
+    }
+
+    /// SGLang writes a stop's finish reason with what it matched: the stop
+    /// string, or the stop token's id, one or a list. It reads into `Stop`
+    /// and is written back with it; a stop without it stays without.
+    #[test]
+    fn a_stop_finish_reason_keeps_what_it_matched() {
+        for finish in [
+            serde_json::json!({"type": "stop", "matched": 2}),
+            serde_json::json!({"type": "stop", "matched": "</answer>"}),
+            serde_json::json!({"type": "stop", "matched": [128001, 128009]}),
+            serde_json::json!({"type": "stop"}),
+        ] {
+            let read: GenerateFinishReason =
+                serde_json::from_value(finish.clone()).expect("a finish reason");
+            assert!(
+                matches!(read, GenerateFinishReason::Stop { .. }),
+                "{finish}"
+            );
+            assert_eq!(serde_json::to_value(&read).expect("serialize"), finish);
+        }
     }
 
     #[test]

@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A generate answer's stop finish reason carries what it matched, as SGLang writes it
+  (`{"type": "stop", "matched": ...}`, the stop string or the stop token's id): the type read
+  `matched` into `Stop` and dropped it, and the gRPC path wrote it only in `meta_info.matched_stop`,
+  which stays for smg's clients. The unary answer and the stream's finish event fill it.
+  Breaking: `GenerateFinishReason::Stop` gains `matched`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
