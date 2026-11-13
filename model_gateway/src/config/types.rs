@@ -1392,6 +1392,16 @@ impl PowerOfTwoLoadMetric {
             _ => None,
         }
     }
+
+    /// The CLI spelling `parse` reads back.
+    pub fn spell(&self) -> String {
+        match self {
+            Self::ExpectedWait => "expected_wait".to_string(),
+            Self::Requests => "requests".to_string(),
+            Self::LeastRequests => "least_requests".to_string(),
+            Self::ResidentTokens { request_tokens } => format!("resident_tokens:{request_tokens}"),
+        }
+    }
 }
 
 /// The encode policy of an encode-prefill-decode deployment that names none:
@@ -3392,6 +3402,16 @@ mod tests {
         );
         assert_eq!(PowerOfTwoLoadMetric::parse("resident_tokens"), None);
         assert_eq!(PowerOfTwoLoadMetric::parse("resident_tokens:-1"), None);
+        for metric in [
+            PowerOfTwoLoadMetric::ExpectedWait,
+            PowerOfTwoLoadMetric::Requests,
+            PowerOfTwoLoadMetric::LeastRequests,
+            PowerOfTwoLoadMetric::ResidentTokens {
+                request_tokens: 4096,
+            },
+        ] {
+            assert_eq!(PowerOfTwoLoadMetric::parse(&metric.spell()), Some(metric));
+        }
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::LeastRequests,
         };

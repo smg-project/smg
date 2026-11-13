@@ -11,6 +11,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::LazyLock,
 };
 
 use serde_json::Value;
@@ -127,6 +128,17 @@ pub struct Field {
     pub path: String,
     pub value: Value,
     pub shown: String,
+    pub presence: Presence,
+}
+
+/// What a row's field asks of the document: the value held, the field
+/// written with any value (a structure read from its presence), or the
+/// field left out (a structure the flag's policy must not take).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    Held,
+    Present,
+    Absent,
 }
 
 impl Field {
@@ -136,6 +148,17 @@ impl Field {
             path,
             value: Value::Null,
             shown: "present".to_string(),
+            presence: Presence::Present,
+        }
+    }
+
+    /// An absence mark: the field must be left out.
+    fn absent(path: String) -> Self {
+        Field {
+            path,
+            value: Value::Null,
+            shown: "absent".to_string(),
+            presence: Presence::Absent,
         }
     }
 }
@@ -194,10 +217,9 @@ impl Consumed {
             .iter()
             .map(|(head, paths)| {
                 let paths = paths.join(" and ");
-                if head.value.is_null() {
-                    format!("{paths} {}", head.shown)
-                } else {
-                    format!("{paths} = {}", head.shown)
+                match head.presence {
+                    Presence::Held => format!("{paths} = {}", head.shown),
+                    Presence::Present | Presence::Absent => format!("{paths} {}", head.shown),
                 }
             })
             .collect();
@@ -885,10 +907,14 @@ impl Compiler<'_> {
                     policy,
                     None,
                 ),
-                None => self.notes.push(format!(
-                    "no --encode-policy given: the default encode profile {} was written",
-                    DEFAULT_ENCODE_POLICY.name()
-                )),
+                None => {
+                    // No flag, no claims: the default profile's marks go.
+                    self.claims("encode");
+                    self.notes.push(format!(
+                        "no --encode-policy given: the default encode profile {} was written",
+                        DEFAULT_ENCODE_POLICY.name()
+                    ));
+                }
             }
             self.profiles.insert("encode".to_string(), encode_profile);
         }
@@ -1064,6 +1090,11 @@ impl Compiler<'_> {
                     self.header(MANUAL_SESSION_HEADER);
                     self.header(TARGET_WORKER_HEADER);
                 }
+                // The ring keys by the session, unbounded: a prefix key or a
+                // bound written under the name would route another way.
+                let at = |field: &str| format!("{p}.score.consistent-hash.{field}");
+                self.implied.push(Field::absent(at("prefix_tokens")));
+                self.implied.push(Field::absent(at("bounded_load")));
                 ProfileSpec {
                     filter: side.filters(&STANDARD),
                     score: vec!["consistent-hash".into()],
@@ -1131,27 +1162,31 @@ impl Compiler<'_> {
     /// the engine's count-first pickers (the fewest in flight, then the
     /// expected wait); the resident-tokens form over every candidate.
     fn power_of_two(&mut self, p: &str, side: Side, metric: PowerOfTwoLoadMetric) -> ProfileSpec {
+        let typed = metric.spell();
         let (score, pick, resident) = power_of_two_form(metric);
-        self.row(
+        self.row_shown(
             POWER_OF_TWO_LOAD_METRIC,
             vec![format!("{p}.pick")],
             &pick,
             Some(&"power-of-two"),
+            typed.clone(),
         );
         let stage = stage_name(&serde_json::to_value(&score).unwrap_or(Value::Null));
         let stage = stage.as_str().unwrap_or_default().to_string();
-        self.row(
+        self.row_shown(
             POWER_OF_TWO_LOAD_METRIC,
             vec![format!("{p}.score")],
             &vec![stage],
             Some(&vec!["least-load".to_string()]),
+            typed.clone(),
         );
         if let Some(request_tokens) = resident {
-            self.row(
+            self.row_shown(
                 POWER_OF_TWO_LOAD_METRIC,
                 vec![format!("{p}.score.resident-work.request_tokens")],
                 &request_tokens,
                 None,
+                typed,
             );
         }
         ProfileSpec {
@@ -1465,17 +1500,12 @@ impl Compiler<'_> {
             &margin,
             Some(&10_u32),
         );
-        // The prefix form and its bound are read from the presence of these
-        // fields: the policy flag implies their presence when their knobs are
-        // at default, and the document keeps its own values (a presence mark).
-        for (flag, path) in [
-            (PREFIX_TOKEN_COUNT, at("prefix_tokens")),
-            (PREFIX_HASH_LOAD_FACTOR, at("bounded_load.factor")),
-        ] {
-            if !self.consumed.iter().any(|row| row.id == flag.id) {
-                self.implied.push(Field::present(path));
-            }
-        }
+        // The prefix form is read from the presence of `prefix_tokens` and
+        // the bound from the presence of its block (an empty block is the
+        // bound with its defaults), so the policy flag marks both present
+        // whatever the knobs say; the knob rows hold the values.
+        self.implied.push(Field::present(at("prefix_tokens")));
+        self.implied.push(Field::present(at("bounded_load")));
         // Written whole: the engine reads the prefix form from the presence
         // of `prefix_tokens` and the bound from the presence of its block,
         // so the defaults are the meaning here, not an omission.
@@ -1526,18 +1556,20 @@ impl Compiler<'_> {
         let ttl = "bindings[0].sessions.ttl_s".to_string();
         let sweep_field = "bindings[0].sessions.sweep_s".to_string();
         if idle == 0 {
-            self.row(
+            self.row_shown(
                 MAX_IDLE_SECS,
                 vec![ttl, sweep_field.clone()],
                 &ttl_s,
                 Some(&14_400_u32),
+                idle.to_string(),
             );
             if sweep == 0 {
-                self.row(
+                self.row_shown(
                     EVICTION_INTERVAL,
                     vec![sweep_field],
                     &sweep_s,
                     Some(&120_u32),
+                    sweep.to_string(),
                 );
             } else if self.given.contains(EVICTION_INTERVAL.id) || sweep != 120 {
                 self.unused_row(
@@ -1548,11 +1580,12 @@ impl Compiler<'_> {
                 );
             }
         } else if sweep == 0 {
-            self.row(
+            self.row_shown(
                 EVICTION_INTERVAL,
                 vec![sweep_field, ttl],
                 &sweep_s,
                 Some(&120_u32),
+                sweep.to_string(),
             );
             if self.given.contains(MAX_IDLE_SECS.id) || idle != 14_400 {
                 self.unused_row(
@@ -1759,7 +1792,26 @@ impl Compiler<'_> {
         value: &dyn Rendered,
         default: Option<&dyn Rendered>,
     ) {
+        self.row_shown(flag, fields, value, default, value.shown());
+    }
+
+    /// A row whose flag was typed otherwise than its fields read (a metric's
+    /// spelling, an idle time the schema writes as for ever): `shown` is the
+    /// flag's own value, for the refusal line; the fields keep theirs.
+    fn row_shown(
+        &mut self,
+        flag: Flag,
+        fields: Vec<String>,
+        value: &dyn Rendered,
+        default: Option<&dyn Rendered>,
+        shown: String,
+    ) {
         let rendered = value.value();
+        debug_assert!(
+            !rendered.is_null(),
+            "a held field of {} renders null",
+            flag.id
+        );
         let (default, at_default) = match default {
             Some(default) => {
                 let default = default.value();
@@ -1771,13 +1823,14 @@ impl Compiler<'_> {
         if self.skips(&flag, at_default) {
             return;
         }
-        let shown = value.shown();
+        let field_shown = value.shown();
         let fields = fields
             .into_iter()
             .map(|path| Field {
                 path,
                 value: rendered.clone(),
-                shown: shown.clone(),
+                shown: field_shown.clone(),
+                presence: Presence::Held,
             })
             .collect();
         self.push(flag, fields, shown, rendered, default, at_default);
@@ -1789,6 +1842,18 @@ impl Compiler<'_> {
     /// [`fixed_shape`]); the line shows the policy's name. A policy at its
     /// default is consumed only when the front end saw the flag, as a
     /// value is.
+    /// The marks the profile builders left for `name`'s policy row, taken
+    /// out of the implied set.
+    fn claims(&mut self, name: &str) -> Vec<Field> {
+        let prefix = format!("profiles.{name}.");
+        let (mine, rest): (Vec<Field>, Vec<Field>) = self
+            .implied
+            .drain(..)
+            .partition(|field| field.path.starts_with(&prefix));
+        self.implied = rest;
+        mine
+    }
+
     fn profile_row(
         &mut self,
         flag: Flag,
@@ -1800,6 +1865,9 @@ impl Compiler<'_> {
     ) {
         let shown = policy.name();
         let at_default = default == Some(shown);
+        // The profile's marks are the flag's claims: a row skipped (the flag
+        // at its default, not given) makes none, so they go with it.
+        let mine = self.claims(name);
         if self.skips(&flag, at_default) {
             return;
         }
@@ -1808,19 +1876,15 @@ impl Compiler<'_> {
                 path: binding.to_string(),
                 value: Value::String(name.to_string()),
                 shown: name.to_string(),
+                presence: Presence::Held,
             },
             Field {
                 path: format!("profiles.{name}"),
                 value: fixed_shape(policy, profile),
                 shown: shown.to_string(),
+                presence: Presence::Held,
             },
         ];
-        let prefix = format!("profiles.{name}.");
-        let (mine, rest): (Vec<Field>, Vec<Field>) = self
-            .implied
-            .drain(..)
-            .partition(|field| field.path.starts_with(&prefix));
-        self.implied = rest;
         fields.extend(mine);
         let rendered = Value::String(shown.to_string());
         let default = default.map_or(Value::Null, |default| Value::String(default.to_string()));
@@ -1899,21 +1963,27 @@ impl Compiler<'_> {
 /// metric's four forms (`forms`), the cache-aware picker one of the two
 /// `--selection-temperature` selects; a knob flag given pins its own
 /// choice on its row. The parameters are the knob rows' to check.
+/// The power-of-two profile's four forms as a range, built once: the
+/// shape of each metric's form, the request tokens not among them.
+static POWER_OF_TWO_FORMS: LazyLock<Value> = LazyLock::new(|| {
+    let forms: Vec<Value> = [
+        PowerOfTwoLoadMetric::ExpectedWait,
+        PowerOfTwoLoadMetric::Requests,
+        PowerOfTwoLoadMetric::LeastRequests,
+        PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 0 },
+    ]
+    .into_iter()
+    .map(|metric| {
+        let (score, pick, _) = power_of_two_form(metric);
+        serde_json::json!({ "score": [stage_name(&serde_json::to_value(&score).unwrap_or(Value::Null))], "pick": pick })
+    })
+    .collect();
+    serde_json::json!({ "forms": forms })
+});
+
 fn fixed_shape(policy: &PolicyConfig, profile: &ProfileSpec) -> Value {
     if matches!(policy, PolicyConfig::PowerOfTwo { .. }) {
-        let forms: Vec<Value> = [
-            PowerOfTwoLoadMetric::ExpectedWait,
-            PowerOfTwoLoadMetric::Requests,
-            PowerOfTwoLoadMetric::LeastRequests,
-            PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 0 },
-        ]
-        .into_iter()
-        .map(|metric| {
-            let (score, pick, _) = power_of_two_form(metric);
-            serde_json::json!({ "score": [stage_name(&serde_json::to_value(&score).unwrap_or(Value::Null))], "pick": pick })
-        })
-        .collect();
-        return serde_json::json!({ "forms": forms });
+        return POWER_OF_TWO_FORMS.clone();
     }
     let mut shape = shape_of_value(&serde_json::to_value(profile).unwrap_or(Value::Null));
     if let Value::Object(map) = &mut shape {
@@ -2070,14 +2140,17 @@ impl Compiled {
             for field in &row.fields {
                 let found = lookup(&document, &field.path);
                 let profile = is_profile_path(&field.path);
-                let agrees = match found {
-                    Some(found) if profile => shape_holds(&shape_of_value(found), &field.value),
-                    Some(_) if field.value.is_null() => true,
-                    Some(found) if is_score_path(&field.path) => {
+                let agrees = match (field.presence, found) {
+                    (Presence::Present, found) => found.is_some(),
+                    (Presence::Absent, found) => found.is_none(),
+                    (Presence::Held, Some(found)) if profile => {
+                        shape_holds(&shape_of_value(found), &field.value)
+                    }
+                    (Presence::Held, Some(found)) if is_score_path(&field.path) => {
                         stages_present(found, &field.value)
                     }
-                    Some(found) => holds(found, &field.value),
-                    None => !profile && !field.value.is_null() && same(&row.default, &field.value),
+                    (Presence::Held, Some(found)) => holds(found, &field.value),
+                    (Presence::Held, None) => !profile && same(&row.default, &field.value),
                 };
                 if !agrees {
                     let held = match found {
@@ -3465,7 +3538,7 @@ bindings:
                 "bindings[0].profile",
                 "profiles.prefix_hash",
                 "profiles.prefix_hash.score.consistent-hash.prefix_tokens",
-                "profiles.prefix_hash.score.consistent-hash.bounded_load.factor"
+                "profiles.prefix_hash.score.consistent-hash.bounded_load"
             ]
         );
         let plain = doc("\
@@ -3548,7 +3621,7 @@ bindings:
                 "bindings[0].profiles.decode",
                 "profiles.decode",
                 "profiles.decode.score.consistent-hash.prefix_tokens",
-                "profiles.decode.score.consistent-hash.bounded_load.factor"
+                "profiles.decode.score.consistent-hash.bounded_load"
             ]
         );
         let mut document = serde_json::to_value(&compiled.spec).unwrap();
@@ -3767,6 +3840,170 @@ bindings:
             .map(|row| row.id)
             .collect();
         assert_eq!(rows, ["disable_worker_overload_protection"]);
+        assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+    }
+
+    fn prefix_hash_given(ids: &[&str]) -> Compiled {
+        compile_given(
+            &regular(PolicyConfig::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: Vec::new(),
+            }),
+            &given(ids),
+        )
+    }
+
+    /// The bound is read from its block: an empty block is the bound with
+    /// the engine's defaults and passes under the bare policy flag; the
+    /// block left out is plain hashing and is refused on it.
+    #[test]
+    fn an_empty_bound_block_is_the_bound_under_the_bare_prefix_flag() {
+        let compiled = prefix_hash_given(&["policy"]);
+        let mut document = serde_json::to_value(&compiled.spec).unwrap();
+        let hash = &mut document["profiles"]["prefix_hash"]["score"][0]["consistent-hash"];
+        hash["bounded_load"] = serde_json::json!({});
+        let bare: PolicySpec = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(compiled.check_against(&bare), Ok(()));
+        document["profiles"]["prefix_hash"]["score"][0]["consistent-hash"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bounded_load");
+        let unbounded: PolicySpec = serde_json::from_value(document).unwrap();
+        let refused = compiled
+            .check_against(&unbounded)
+            .expect_err("the bound dropped");
+        assert_eq!(refused.flag, "--policy");
+        assert_eq!(
+            refused.field,
+            "profiles.prefix_hash.score.consistent-hash.bounded_load"
+        );
+        assert_eq!(refused.held, "nothing");
+    }
+
+    /// A knob given at its default keeps the policy's mark: the field left
+    /// out is refused on the policy flag, another value on the knob's.
+    #[test]
+    fn a_knob_given_at_its_default_keeps_the_prefix_mark() {
+        let compiled = prefix_hash_given(&["policy", "prefix_token_count"]);
+        let path = "profiles.prefix_hash.score.consistent-hash.prefix_tokens";
+        let mut document = serde_json::to_value(&compiled.spec).unwrap();
+        document["profiles"]["prefix_hash"]["score"][0]["consistent-hash"]["prefix_tokens"] =
+            serde_json::json!(512);
+        let longer: PolicySpec = serde_json::from_value(document.clone()).unwrap();
+        let refused = compiled
+            .check_against(&longer)
+            .expect_err("the knob's value moved");
+        assert_eq!(
+            (refused.flag, refused.field.as_str()),
+            ("--prefix-token-count", path)
+        );
+        document["profiles"]["prefix_hash"]["score"][0]["consistent-hash"]
+            .as_object_mut()
+            .unwrap()
+            .remove("prefix_tokens");
+        let plain: PolicySpec = serde_json::from_value(document).unwrap();
+        let refused = compiled
+            .check_against(&plain)
+            .expect_err("the prefix form dropped");
+        assert_eq!((refused.flag, refused.field.as_str()), ("--policy", path));
+    }
+
+    /// The session ring takes neither a prefix key nor a bound: a document
+    /// writing one under the name routes another way and is refused.
+    #[test]
+    fn a_prefix_key_under_the_session_ring_is_refused() {
+        let compiled = compile_given(
+            &regular(PolicyConfig::ConsistentHashing),
+            &given(&["policy"]),
+        );
+        assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+        let mut document = serde_json::to_value(&compiled.spec).unwrap();
+        let profiles = document["profiles"].as_object_mut().unwrap();
+        let name = profiles.keys().next().unwrap().clone();
+        profiles[&name]["score"] =
+            serde_json::json!([{ "consistent-hash": { "prefix_tokens": 512 } }]);
+        let keyed: PolicySpec = serde_json::from_value(document).unwrap();
+        let refused = compiled
+            .check_against(&keyed)
+            .expect_err("a prefix key under the ring");
+        assert_eq!(refused.flag, "--policy");
+        assert_eq!(
+            refused.field,
+            format!("profiles.{name}.score.consistent-hash.prefix_tokens")
+        );
+        assert_eq!(refused.held, "512");
+    }
+
+    /// A refusal names the flag's value as typed: the metric's spelling on
+    /// its multi-field row, the idle seconds the schema writes as for ever.
+    #[test]
+    fn a_refusal_shows_the_flag_as_typed() {
+        let compiled = compile_given(
+            &regular(PolicyConfig::PowerOfTwo {
+                load_metric: PowerOfTwoLoadMetric::ResidentTokens {
+                    request_tokens: 4096,
+                },
+            }),
+            &given(&["policy", "power_of_two_load_metric"]),
+        );
+        let mut document = serde_json::to_value(&compiled.spec).unwrap();
+        document["profiles"]["power_of_two"]["score"][0]["resident-work"]["request_tokens"] =
+            serde_json::json!(2048);
+        let shorter: PolicySpec = serde_json::from_value(document).unwrap();
+        let refused = compiled
+            .check_against(&shorter)
+            .expect_err("the request tokens moved");
+        assert_eq!(refused.flag, "--power-of-two-load-metric");
+        assert_eq!(refused.shown, "resident_tokens:4096");
+        assert_eq!(
+            refused.field,
+            "profiles.power_of_two.score.resident-work.request_tokens"
+        );
+        assert_eq!(refused.held, "2048");
+
+        let compiled = compile_given(
+            &regular(PolicyConfig::Manual {
+                eviction_interval_secs: 120,
+                max_idle_secs: 0,
+                assignment_mode: ManualAssignmentMode::Random,
+            }),
+            &given(&["policy", "max_idle_secs"]),
+        );
+        let mut document = serde_json::to_value(&compiled.spec).unwrap();
+        document["bindings"][0]["sessions"]["ttl_s"] = serde_json::json!(600);
+        let bounded: PolicySpec = serde_json::from_value(document).unwrap();
+        let refused = compiled
+            .check_against(&bounded)
+            .expect_err("the idle time moved");
+        assert_eq!(
+            (refused.flag, refused.shown.as_str()),
+            ("--max-idle-secs", "0")
+        );
+        assert_eq!(refused.field, "bindings[0].sessions.ttl_s");
+    }
+
+    /// A zero idle time keeps keys for ever: a sweep off its default beside
+    /// it is unused and has its row with the reason, a given set or not.
+    #[test]
+    fn a_sweep_off_default_beside_a_zero_idle_time_has_its_row_without_a_given_set() {
+        let compiled = compile(&regular(PolicyConfig::Manual {
+            eviction_interval_secs: 7,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::Random,
+        }));
+        assert_eq!(
+            ids(&compiled.report),
+            ["max_idle_secs", "eviction_interval", "policy"]
+        );
+        let sweep = &compiled.report.consumed[1];
+        assert!(sweep.fields.is_empty());
+        assert_eq!(sweep.shown, "7");
+        assert_eq!(
+            sweep.unused.as_deref(),
+            Some("a zero idle time keeps keys for ever, so the sweep is for ever too")
+        );
         assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
     }
 }

@@ -2804,6 +2804,44 @@ mod tests {
 
     use super::*;
 
+    /// Every `DEFAULT_*` name the constructor's signature carries is a
+    /// constant of this file with a literal value, so the signature's
+    /// defaults stay readable to the parity tests that read this source.
+    #[test]
+    fn every_signature_default_names_a_literal_constant() {
+        let source = include_str!("lib.rs");
+        let router = source.find("impl Router {").expect("the Router block");
+        let start = router
+            + source[router..]
+                .find("#[pyo3(signature = (")
+                .expect("its signature");
+        let block = &source[start..source[start..].find("))]").expect("its end") + start];
+        let names: BTreeSet<&str> = block
+            .split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .filter(|word| word.starts_with("DEFAULT_"))
+            .collect();
+        assert!(
+            names.len() > 30,
+            "the signature names {} constants",
+            names.len()
+        );
+        for name in names {
+            let definition = format!("\nconst {name}: ");
+            let at = source
+                .find(&definition)
+                .unwrap_or_else(|| panic!("{name} is not a constant"));
+            let line = &source[at + 1..at + 1 + source[at + 1..].find('\n').unwrap()];
+            let value = line
+                .split_once(" = ")
+                .map(|(_, value)| value)
+                .unwrap_or_default();
+            assert!(
+                line.ends_with(';') && !value.is_empty() && !value.contains("DEFAULT_"),
+                "{name} is not one literal line"
+            );
+        }
+    }
+
     /// The given set's keyword table and the converter's keyword set are one
     /// set, and the flags they name are every routing flag: a new flag cannot
     /// go unwarned silently and a mark cannot name a flag the converter lacks.

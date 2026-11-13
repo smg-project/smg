@@ -432,9 +432,12 @@ def signature_literal(raw: str) -> object:
     and a ``vec![...]`` read as the value they stand for."""
     if raw in ("true", "false"):
         return raw == "true"
-    quoted = re.fullmatch(r'String::from\("([^"]*)"\)', raw)
+    quoted = re.fullmatch(r'(?:String::from\()?"([^"]*)"\)?', raw)
     if quoted:
         return quoted.group(1)
+    shifted = re.fullmatch(r"(\d+)(?:[ui](?:8|16|32|64|128|size))?\s*<<\s*(\d+)", raw)
+    if shifted:
+        return int(shifted.group(1)) << int(shifted.group(2))
     wrapped = re.fullmatch(r"Some\((.*)\)", raw)
     if wrapped:
         return signature_literal(wrapped.group(1).strip())
@@ -473,15 +476,36 @@ def constructor_defaults() -> dict[str, tuple[str, object]]:
     text = (MAIN_RS.parents[2] / "bindings" / "python" / "src" / "lib.rs").read_text()
     start = text.index("#[pyo3(signature = (", text.index("impl Router {"))
     block = text[start : text.index("))]", start)]
+    constants = named_constants(text)
     defaults: dict[str, tuple[str, object]] = {}
     for line in block.splitlines()[1:]:
         entry = line.split("//", 1)[0].strip().rstrip(",")
         if not entry or entry == "*":
             continue
         name, _, raw = entry.partition("=")
-        raw = raw.strip()
+        raw = re.sub(r"\bDEFAULT_[A-Z0-9_]+\b", lambda m: constants.get(m.group(0), m.group(0)), raw.strip())
         defaults[name.strip()] = (raw, signature_literal(raw) if raw else None)
     return defaults
+
+
+def named_constants(text: str) -> dict[str, str]:
+    """The ``const DEFAULT_*`` definitions of a Rust source, name to the text of
+    the value: the constructor's signature names its defaults through them."""
+    return {
+        name: value.strip()
+        for name, value in re.findall(r"^const (DEFAULT_[A-Z0-9_]+): [^=]+ = (.+);$", text, re.M)
+    }
+
+
+def test_the_constructor_reader_resolves_a_named_default():
+    """A signature default spelled as a constant reads as the constant's literal."""
+    defaults = constructor_defaults()
+    assert defaults["eviction_interval_secs"] == ("120", 120)
+    assert defaults["policy"] == ("PolicyType::CacheAware", "cache_aware")
+    assert defaults["cache_index"] == ('String::from("tree")', "tree")
+    assert defaults["routing_key_headers"] == ('vec![String::from("x-smg-routing-key")]', "x-smg-routing-key")
+    unresolved = sorted(name for name, (raw, _) in defaults.items() if "DEFAULT_" in raw)
+    assert unresolved == [], unresolved
 
 
 def test_the_constructor_defaults_are_the_cli_defaults(rust):
@@ -572,15 +596,14 @@ def test_the_eviction_interval_default_is_one_value_on_every_surface(rust, launc
     on one cadence. The launcher's 60 s predated the CLI's 120 s and was never
     followed; the three other surfaces agreed on 120."""
     repo = MAIN_RS.parents[2]
-    lib_rs = repo / "bindings" / "python" / "src" / "lib.rs"
     chart_values = repo / "deploy" / "helm" / "smg" / "values.yaml"
-    signature = re.search(r"\beviction_interval_secs = (\d+)", lib_rs.read_text())
+    signature = constructor_defaults()["eviction_interval_secs"][1]
     chart = re.search(r"^\s*evictionIntervalSecs:\s*(\d+)\s*$", chart_values.read_text(), re.M)
-    assert signature and chart, "the Python Router's signature or the chart's value moved"
+    assert isinstance(signature, int) and chart, "the Python Router's signature or the chart's value moved"
     surfaces = {
         "cli": rust.flags["--eviction-interval"],
         "launcher": launcher["--eviction-interval"].default,
-        "python_router": int(signature.group(1)),
+        "python_router": signature,
         "chart": int(chart.group(1)),
     }
     assert set(surfaces.values()) == {120}, surfaces
